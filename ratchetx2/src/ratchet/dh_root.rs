@@ -4,7 +4,7 @@ use ring::hkdf::{HKDF_SHA256, Salt};
 use ring::rand::SystemRandom;
 
 #[derive(Debug)]
-pub struct DhRootRatchet {
+pub(super) struct DhRootRatchet {
     root_key: RootKey,
     private_key: EphemeralPrivateKey,
     /// - true: next step will update private key
