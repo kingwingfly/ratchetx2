@@ -1,0 +1,17 @@
+[package]
+name = "ratchetx2"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.86"
+keywords = ["double-ratchet"]
+license = "MIT"
+authors = ["Louis <836250617@qq.com>"]
+repository = "https://github.com/kingwingfly/ratchetx2"
+documentation = "https://docs.rs/ratchetx2"
+description = "A double-ratchet encryption implementation for building an E2EE chat app."
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]

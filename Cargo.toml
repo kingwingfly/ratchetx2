@@ -1,0 +1,3 @@
+[workspace]
+members = ["ratchetx2"]
+resolver = "2"
