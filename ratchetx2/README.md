@@ -7,7 +7,7 @@ My code is much more object-oriented.
 1. There's no global party state, instead, it is each ratchet having its own state.
 2. It's really double-ratchet (2 kinds of ratchets), DhRootRatchet and MessageRatchet.
 3. HeaderKey support.
-4. Do nothing about messag/header encryption/decryption, instead, provide correct message/header keys only.
+4. Do nothing about message/header encryption/decryption, instead, provide correct message/header keys only.
 
 # Example
 ```rust
