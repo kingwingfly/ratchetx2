@@ -23,7 +23,7 @@ impl MessageRatchet {
         }
     }
 
-    /// New a empty MessageRatchet, supposed to be only used in Bob's initialization.
+    /// New a empty MessageRatchet, supposed to be only used in initialization.
     pub fn empty(next_header_key: HeaderKey) -> Self {
         Self {
             chain_key: ChainKey::default(),

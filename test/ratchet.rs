@@ -2,13 +2,13 @@ use ratchetx2::SharedKeys;
 
 #[test]
 fn ratchet_test() {
-    let shared_key = SharedKeys {
+    let shared_keys = SharedKeys {
         secret_key: [0; 32],
         header_key_alice: [1; 32],
         header_key_bob: [2; 32],
     };
-    let mut alice = shared_key.alice();
-    let mut bob = shared_key.bob();
+    let mut alice = shared_keys.alice();
+    let mut bob = shared_keys.bob();
 
     alice.step_dh_root(bob.public_key());
     bob.step_dh_root(alice.public_key());

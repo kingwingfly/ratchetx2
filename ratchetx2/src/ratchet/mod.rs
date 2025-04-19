@@ -8,6 +8,36 @@ use ring::agreement::{PublicKey, UnparsedPublicKey};
 use crate::key::{HeaderKey, MessageKey, SecretKey};
 
 /// Double ratchet
+/// # Example
+/// ```
+/// use ratchetx2::SharedKeys;
+///
+/// let shared_keys = SharedKeys {
+///     secret_key: [0; 32],
+///     header_key_alice: [1; 32],
+///     header_key_bob: [2; 32],
+/// };
+/// let mut alice = shared_keys.alice();
+/// let mut bob = shared_keys.bob();
+///
+/// alice.step_dh_root(bob.public_key());
+/// bob.step_dh_root(alice.public_key());
+/// assert_eq!(alice, bob);
+/// assert_eq!(alice.step_msgs(), bob.step_msgr());
+/// assert_eq!(alice.step_msgs(), bob.step_msgr());
+///
+/// bob.step_dh_root(alice.public_key());
+/// alice.step_dh_root(bob.public_key());
+/// assert_eq!(alice, bob);
+/// assert_eq!(bob.step_msgs(), alice.step_msgr());
+/// assert_eq!(bob.step_msgs(), alice.step_msgr());
+///
+/// alice.step_dh_root(bob.public_key());
+/// bob.step_dh_root(alice.public_key());
+/// assert_eq!(alice, bob);
+/// assert_eq!(alice.step_msgs(), bob.step_msgr());
+/// assert_eq!(alice.step_msgs(), bob.step_msgr());
+/// ```
 #[derive(Debug)]
 pub struct Ratchetx2 {
     dh_root: DhRootRatchet,
@@ -82,7 +112,7 @@ impl Ratchetx2 {
     }
 
     /// Perform ratchet step on DH-Root retchet
-    /// Update DH pair if needed, update root key, and update message ratchet if needed.
+    /// Update DH pair if needed, update root key, and update one of message ratchets.
     pub fn step_dh_root(&mut self, public_key: UnparsedPublicKey<PublicKey>) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {
