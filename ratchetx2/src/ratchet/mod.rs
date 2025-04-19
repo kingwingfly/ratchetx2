@@ -111,7 +111,8 @@ impl Ratchetx2 {
 
     /// Get next message receiving HeaderKey.
     /// Classically, if failed with current HeaderKey when decrypting enc-header,
-    /// one should try next HeaderKey and cache it for future if succeed (for it's message out of order).
+    /// one should try next HeaderKey, if succeed, do DhRootRatchet step and cache MessageKey
+    /// for future (for it's message out of order).
     pub fn next_header_key_r(&self) -> HeaderKey {
         self.msgr.next_header_key
     }
