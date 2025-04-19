@@ -51,7 +51,7 @@ impl DhRootRatchet {
         UnparsedPublicKey::new(&X25519, self.private_key.compute_public_key().unwrap())
     }
 
-    /// Perform ratchet step, update DH pair, RootKey, and return current ChainKey, next HeaderKey.
+    /// Perform ratchet step, update DH pair if needed, update RootKey, and return current ChainKey, next HeaderKey.
     pub fn step(&mut self, public_key: UnparsedPublicKey<PublicKey>) -> (ChainKey, HeaderKey) {
         let private_key = match self.update_private_key {
             true => core::mem::replace(

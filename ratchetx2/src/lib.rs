@@ -12,4 +12,5 @@ mod ratchet;
 
 const SKIP: usize = 1024;
 
+pub use key::SharedKeys;
 pub use ratchet::Ratchetx2;

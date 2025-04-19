@@ -64,22 +64,25 @@ impl Ratchetx2 {
         }
     }
 
-    /// Get current public key
+    /// Get current public key.
     pub fn public_key(&self) -> UnparsedPublicKey<PublicKey> {
         self.dh_root.public_key()
     }
 
-    /// Perform ratchet step on message sending retchet
+    /// Perform ratchet step on message sending retchet.
+    /// Updating message sending ratchet's ChainKey, and return MessageKey.
     pub fn step_msgs(&mut self) -> MessageKey {
         self.msgs.step()
     }
 
     /// Perform ratchet step on message receiving retchet
+    /// Update message receiving ratchet's ChainKey, and return MessageKey.
     pub fn step_msgr(&mut self) -> MessageKey {
         self.msgr.step()
     }
 
     /// Perform ratchet step on DH-Root retchet
+    /// Update DH pair if needed, update root key, and update message ratchet if needed.
     pub fn step_dh_root(&mut self, public_key: UnparsedPublicKey<PublicKey>) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {

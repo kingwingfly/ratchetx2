@@ -32,7 +32,7 @@ impl MessageRatchet {
         }
     }
 
-    /// Perform ratchet step, update chain_key, and return message key.
+    /// Perform ratchet step, update ChainKey, and return MessageKey.
     pub fn step(&mut self) -> MessageKey {
         let key = Key::new(HMAC_SHA256, &self.chain_key);
         let message_key = sign(&key, &[1]);
