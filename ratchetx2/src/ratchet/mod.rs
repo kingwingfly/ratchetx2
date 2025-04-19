@@ -129,7 +129,7 @@ impl Ratchetx2 {
     }
 
     /// Perform ratchet step on DH-Root ratchet.
-    /// Update DH pair if needed, update root key, and update one of message ratchets (ChainKey and HeaderKey).
+    /// Update DH pair if needed, update root key, and update one of message ratchets.
     pub fn step_dh_root(&mut self, public_key: UnparsedPublicKey<PublicKey>) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {
