@@ -5,8 +5,8 @@ use ring::hmac::{HMAC_SHA256, Key, sign};
 #[cfg_attr(debug_assertions, derive(PartialEq))]
 pub struct MessageRatchet {
     chain_key: ChainKey,
-    pub header_key: HeaderKey,
-    pub next_header_key: HeaderKey,
+    pub(super) header_key: HeaderKey,
+    pub(super) next_header_key: HeaderKey,
 }
 
 impl MessageRatchet {

@@ -22,7 +22,7 @@ use crate::key::{HeaderKey, MessageKey, SecretKey};
 ///
 /// alice.step_dh_root(bob.public_key());
 /// bob.step_dh_root(alice.public_key());
-/// assert_eq!(alice, bob);
+/// assert_eq!(alice, bob); // debug_assertions only
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
 ///
@@ -99,20 +99,37 @@ impl Ratchetx2 {
         self.dh_root.public_key()
     }
 
-    /// Perform ratchet step on message sending retchet.
+    /// Get current message sending HeaderKey.
+    pub fn header_key_s(&self) -> HeaderKey {
+        self.msgs.header_key
+    }
+
+    /// Get current message receiving HeaderKey.
+    pub fn header_key_r(&self) -> HeaderKey {
+        self.msgr.header_key
+    }
+
+    /// Get next message receiving HeaderKey.
+    /// Classically, if failed with current HeaderKey when decrypting enc-header,
+    /// one should try next HeaderKey and cache it for future if succeed (for it's message out of order).
+    pub fn next_header_key_r(&self) -> HeaderKey {
+        self.msgr.next_header_key
+    }
+
+    /// Perform ratchet step on message sending ratchet.
     /// Updating message sending ratchet's ChainKey, and return MessageKey.
     pub fn step_msgs(&mut self) -> MessageKey {
         self.msgs.step()
     }
 
-    /// Perform ratchet step on message receiving retchet
+    /// Perform ratchet step on message receiving ratchet.
     /// Update message receiving ratchet's ChainKey, and return MessageKey.
     pub fn step_msgr(&mut self) -> MessageKey {
         self.msgr.step()
     }
 
-    /// Perform ratchet step on DH-Root retchet
-    /// Update DH pair if needed, update root key, and update one of message ratchets.
+    /// Perform ratchet step on DH-Root ratchet.
+    /// Update DH pair if needed, update root key, and update one of message ratchets (ChainKey and HeaderKey).
     pub fn step_dh_root(&mut self, public_key: UnparsedPublicKey<PublicKey>) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {
