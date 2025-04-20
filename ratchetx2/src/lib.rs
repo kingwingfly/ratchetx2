@@ -13,5 +13,6 @@ pub mod ratchet;
 pub mod transport;
 
 pub use key::SharedKeys;
+pub use party::Party;
 pub use ratchet::Ratchetx2;
 pub use transport::Transport;

@@ -30,6 +30,30 @@ struct Header {
 }
 
 /// The party who participates in the E2EE chat.
+/// # Example
+/// ```
+/// use ratchetx2::{transport::ChannelTransport, Party, SharedKeys};
+///
+/// #[tokio::main]
+/// async fn main() {
+/// let shared_keys = SharedKeys {
+///     secret_key: [0; 32],
+///     header_key_alice: [1; 32],
+///     header_key_bob: [2; 32],
+/// };
+/// let (a, b) = ChannelTransport::new();
+/// let bob = shared_keys.bob();
+/// let alice = shared_keys.alice(bob.public_key());
+/// let mut alice = Party::new(alice, a);
+/// let mut bob = Party::new(bob, b);
+/// alice.send(b"hello world", b"").await.unwrap();
+/// assert_eq!(bob.recv(b"").await.unwrap(), b"hello world");
+/// alice.send(b"hello Bob", b"").await.unwrap();
+/// assert_eq!(bob.recv(b"").await.unwrap(), b"hello Bob");
+/// bob.send(b"hello Alice", b"").await.unwrap();
+/// assert_eq!(alice.recv(b"").await.unwrap(), b"hello Alice");
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Party<T: Transport> {
     ratchetx2: Ratchetx2,
@@ -253,31 +277,4 @@ fn decrypt(
     Ok(opening_key
         .open_in_place(additional_authenticated_data, &mut in_out)?
         .to_vec())
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::key::SharedKeys;
-    use crate::transport::ChannelTransport;
-
-    #[tokio::test]
-    async fn party() {
-        let shared_keys = SharedKeys {
-            secret_key: [0; 32],
-            header_key_alice: [1; 32],
-            header_key_bob: [2; 32],
-        };
-        let (a, b) = ChannelTransport::new();
-        let bob = shared_keys.bob();
-        let alice = shared_keys.alice(bob.public_key());
-        let mut alice = Party::new(alice, a);
-        let mut bob = Party::new(bob, b);
-        alice.send(b"hello world", b"").await.unwrap();
-        assert_eq!(bob.recv(b"").await.unwrap(), b"hello world");
-        alice.send(b"hello Bob", b"").await.unwrap();
-        assert_eq!(bob.recv(b"").await.unwrap(), b"hello Bob");
-        bob.send(b"hello Alice", b"").await.unwrap();
-        assert_eq!(alice.recv(b"").await.unwrap(), b"hello Alice");
-    }
 }
