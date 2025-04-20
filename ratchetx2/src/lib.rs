@@ -6,9 +6,11 @@
 )]
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
-mod error;
-mod key;
-mod ratchet;
+pub mod key;
+pub mod party;
+pub mod ratchet;
+pub mod transport;
 
 pub use key::SharedKeys;
 pub use ratchet::Ratchetx2;
+pub use transport::Transport;

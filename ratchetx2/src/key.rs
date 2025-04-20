@@ -1,3 +1,4 @@
+//! Key types.
 #![allow(missing_docs)]
 
 use crate::Ratchetx2;

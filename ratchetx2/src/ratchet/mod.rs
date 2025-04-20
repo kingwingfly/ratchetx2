@@ -1,3 +1,5 @@
+//! Double Ratchet Algorithm.
+
 mod dh_root;
 mod message;
 
@@ -22,8 +24,8 @@ use crate::key::{HeaderKey, MessageKey, SecretKey};
 ///
 /// alice.step_dh_root(bob.public_key());
 /// bob.step_dh_root(alice.public_key());
-/// assert_eq!(alice, bob); // debug_assertions only
-/// assert_eq!(alice.step_msgs(), bob.step_msgr());
+/// assert_eq!(alice, bob); // test only
+/// assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
 ///
 /// bob.step_dh_root(alice.public_key());
@@ -48,7 +50,7 @@ pub struct Ratchetx2 {
     dh_step_s: bool,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(test)]
 impl PartialEq for Ratchetx2 {
     /// Alice and Bob have the same DhRootRatchet,
     /// and Alice's message sending ratchet is the same as Bob's message receiving ratchet,

@@ -14,6 +14,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+bincode = "2.0.1"
+futures = "0.3.31"
 ring = "0.17.14"
 thiserror = "2.0.12"
 tracing = "0.1.41"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }

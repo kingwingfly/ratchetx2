@@ -7,7 +7,6 @@ My code is much more object-oriented.
 1. There's no global party state, instead, it is each ratchet having its own state.
 2. It's really double-ratchet (2 kinds of ratchets), DhRootRatchet and MessageRatchet (AKA ChainRatchet).
 3. HeaderKey support.
-4. Do nothing about message/header encryption/decryption, instead, provide correct message/header keys only.
 
 # Example
 ```rust
@@ -24,7 +23,7 @@ let mut bob = shared_keys.bob();
 // Alice sends first
 alice.step_dh_root(bob.public_key());
 bob.step_dh_root(alice.public_key());
-assert_eq!(alice, bob); // debug_assertions only, Alice and Bob have the "same" state
+assert_eq!(alice, bob); // test only, Alice and Bob have the "same" state
 assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
 assert_eq!(alice.step_msgs(), bob.step_msgr());
 

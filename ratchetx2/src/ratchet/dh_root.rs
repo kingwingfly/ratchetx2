@@ -12,7 +12,7 @@ pub(super) struct DhRootRatchet {
     update_private_key: bool,
 }
 
-#[cfg(debug_assertions)]
+#[cfg(test)]
 impl PartialEq for DhRootRatchet {
     fn eq(&self, other: &Self) -> bool {
         let self_public_key =
