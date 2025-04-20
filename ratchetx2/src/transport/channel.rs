@@ -1,4 +1,4 @@
-//! Transport implementation by futures::channel::mpsc.
+//! Transport implementation with futures::channel::mpsc.
 
 use futures::channel::mpsc::{Receiver, Sender, channel};
 use std::sync::Mutex;
@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use super::Transport;
 use super::error::Result;
 
-/// Transport implementation by futures::channel::mpsc.
+/// Transport implementation with futures::channel::mpsc.
 #[derive(Debug)]
 pub struct ChannelTransport {
     tx: Mutex<Sender<Vec<u8>>>,

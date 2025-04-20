@@ -34,8 +34,8 @@ struct Header {
 /// ```
 /// use ratchetx2::{transport::ChannelTransport, Party, SharedKeys};
 ///
-/// #[tokio::main]
-/// async fn main() {
+/// # #[tokio::main]
+/// # async fn main() {
 /// let shared_keys = SharedKeys {
 ///     secret_key: [0; 32],
 ///     header_key_alice: [1; 32],
@@ -52,7 +52,7 @@ struct Header {
 /// assert_eq!(bob.recv(b"").await.unwrap(), b"hello Bob");
 /// bob.send(b"hello Alice", b"").await.unwrap();
 /// assert_eq!(alice.recv(b"").await.unwrap(), b"hello Alice");
-/// }
+/// # }
 /// ```
 #[derive(Debug)]
 pub struct Party<T: Transport> {
@@ -82,7 +82,6 @@ impl<T: Transport> Party<T> {
     /// # Args
     /// - content: the bytes to send, not encrypted
     /// - aad: additional authenticated data
-    /// - public_key: if is_some, perform DhRootRatchet step
     pub async fn send(&mut self, content: &[u8], aad: &[u8]) -> Result<()> {
         let header = Header {
             public_key: self.ratchetx2.public_key(),
@@ -110,6 +109,8 @@ impl<T: Transport> Party<T> {
     /// Receive a messgae.
     /// # Args
     /// - aad: additional authenticated data
+    ///
+    /// Returns decrypted bytes.
     pub async fn recv(&mut self, aad: &[u8]) -> Result<Vec<u8>> {
         let encrypted_message = self.transport.recv().await?;
         for header_key in self

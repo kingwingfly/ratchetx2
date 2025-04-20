@@ -47,6 +47,7 @@ assert_eq!(alice.step_msgs(), bob.step_msgr());
 E2EE chat app example:
 ```rust
 use ratchetx2::{transport::ChannelTransport, Party, SharedKeys};
+
 # #[tokio::main]
 # async fn main() {
 let shared_keys = SharedKeys {
