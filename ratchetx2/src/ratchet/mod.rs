@@ -5,7 +5,6 @@ mod message;
 
 use dh_root::DhRootRatchet;
 use message::MessageRatchet;
-use ring::agreement::{PublicKey, UnparsedPublicKey};
 
 use crate::key::{HeaderKey, MessageKey, SecretKey};
 
@@ -19,12 +18,11 @@ use crate::key::{HeaderKey, MessageKey, SecretKey};
 ///     header_key_alice: [1; 32],
 ///     header_key_bob: [2; 32],
 /// };
-/// let mut alice = shared_keys.alice();
 /// let mut bob = shared_keys.bob();
+/// let mut alice = shared_keys.alice(bob.public_key());
 ///
-/// alice.step_dh_root(bob.public_key());
 /// bob.step_dh_root(alice.public_key());
-/// assert_eq!(alice, bob); // test only
+/// assert_eq!(alice, bob);
 /// assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
 ///
@@ -50,7 +48,6 @@ pub struct Ratchetx2 {
     dh_step_s: bool,
 }
 
-#[cfg(test)]
 impl PartialEq for Ratchetx2 {
     /// Alice and Bob have the same DhRootRatchet,
     /// and Alice's message sending ratchet is the same as Bob's message receiving ratchet,
@@ -69,15 +66,18 @@ impl Ratchetx2 {
     /// - secret_key, header_key_alice, header_key_bob: shared keys for initialization
     pub fn alice(
         secret_key: SecretKey,
+        public_key: Vec<u8>,
         header_key_alice: HeaderKey,
         header_key_bob: HeaderKey,
     ) -> Self {
-        Self {
+        let mut this = Self {
             dh_root: DhRootRatchet::alice(secret_key),
             msgs: MessageRatchet::empty(header_key_alice),
             msgr: MessageRatchet::empty(header_key_bob),
             dh_step_s: true,
-        }
+        };
+        this.step_dh_root(public_key);
+        this
     }
 
     /// New a party who waits for the message first.
@@ -97,7 +97,7 @@ impl Ratchetx2 {
     }
 
     /// Get current public key.
-    pub fn public_key(&self) -> UnparsedPublicKey<PublicKey> {
+    pub fn public_key(&self) -> Vec<u8> {
         self.dh_root.public_key()
     }
 
@@ -133,7 +133,7 @@ impl Ratchetx2 {
 
     /// Perform ratchet step on DH-Root ratchet.
     /// Update DH pair if needed, update root key, and update one of message ratchets.
-    pub fn step_dh_root(&mut self, public_key: UnparsedPublicKey<PublicKey>) {
+    pub fn step_dh_root(&mut self, public_key: Vec<u8>) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {
             true => {

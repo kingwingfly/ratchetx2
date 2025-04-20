@@ -3,6 +3,8 @@
 pub mod channel;
 pub mod error;
 
+pub use channel::ChannelTransport;
+
 use bincode::{Decode, Encode, config};
 use error::Result;
 

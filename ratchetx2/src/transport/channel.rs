@@ -65,5 +65,11 @@ mod test {
         };
         alice.send(msg.clone()).await.unwrap();
         assert_eq!(bob.recv().await.unwrap(), msg);
+        let msg = EncryptedMessage {
+            enc_header: vec![4, 5, 6],
+            enc_content: vec![1, 2, 3],
+        };
+        alice.send(msg.clone()).await.unwrap();
+        assert_eq!(bob.recv().await.unwrap(), msg);
     }
 }

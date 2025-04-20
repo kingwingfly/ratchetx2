@@ -19,9 +19,21 @@ pub struct SharedKeys {
 }
 
 impl SharedKeys {
+    /// New Alice and Bob.
+    pub fn init(&self) -> (Ratchetx2, Ratchetx2) {
+        let bob = self.bob();
+        let alice = self.alice(bob.public_key());
+        (alice, bob)
+    }
+
     /// New a party who sends message first.
-    pub fn alice(&self) -> Ratchetx2 {
-        Ratchetx2::alice(self.secret_key, self.header_key_alice, self.header_key_bob)
+    pub fn alice(&self, public_key: Vec<u8>) -> Ratchetx2 {
+        Ratchetx2::alice(
+            self.secret_key,
+            public_key,
+            self.header_key_alice,
+            self.header_key_bob,
+        )
     }
 
     /// New a party who waits for the message first.

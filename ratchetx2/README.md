@@ -17,13 +17,12 @@ let shared_keys = SharedKeys {
     header_key_alice: [1; 32],
     header_key_bob: [2; 32],
 };
-let mut alice = shared_keys.alice();
 let mut bob = shared_keys.bob();
+let mut alice = shared_keys.alice(bob.public_key());
 
 // Alice sends first
-alice.step_dh_root(bob.public_key());
 bob.step_dh_root(alice.public_key());
-assert_eq!(alice, bob); // test only, Alice and Bob have the "same" state
+assert_eq!(alice, bob); // Alice and Bob have the "same" state
 assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
 assert_eq!(alice.step_msgs(), bob.step_msgr());
 

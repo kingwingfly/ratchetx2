@@ -1,5 +1,5 @@
 use crate::key::{ChainKey, HeaderKey, RootKey, SecretKey};
-use ring::agreement::{EphemeralPrivateKey, PublicKey, UnparsedPublicKey, X25519, agree_ephemeral};
+use ring::agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral};
 use ring::hkdf::{HKDF_SHA256, Salt};
 use ring::rand::SystemRandom;
 
@@ -12,7 +12,6 @@ pub(super) struct DhRootRatchet {
     update_private_key: bool,
 }
 
-#[cfg(test)]
 impl PartialEq for DhRootRatchet {
     fn eq(&self, other: &Self) -> bool {
         let self_public_key =
@@ -47,12 +46,16 @@ impl DhRootRatchet {
     }
 
     /// Get current publict key.
-    pub fn public_key(&self) -> UnparsedPublicKey<PublicKey> {
-        UnparsedPublicKey::new(&X25519, self.private_key.compute_public_key().unwrap())
+    pub fn public_key(&self) -> Vec<u8> {
+        self.private_key
+            .compute_public_key()
+            .unwrap()
+            .as_ref()
+            .to_vec()
     }
 
     /// Perform ratchet step, update DH pair if needed, update RootKey, and return current ChainKey, next HeaderKey.
-    pub fn step(&mut self, public_key: UnparsedPublicKey<PublicKey>) -> (ChainKey, HeaderKey) {
+    pub fn step(&mut self, public_key: Vec<u8>) -> (ChainKey, HeaderKey) {
         let private_key = match self.update_private_key {
             true => core::mem::replace(
                 &mut self.private_key,
@@ -62,21 +65,25 @@ impl DhRootRatchet {
             false => unsafe { core::mem::transmute_copy(&self.private_key) },
         };
         self.update_private_key = !self.update_private_key;
-        agree_ephemeral(private_key, &public_key, |dh_shared| {
-            let salt = Salt::new(HKDF_SHA256, &self.root_key);
-            let prk = salt.extract(dh_shared);
-            let okm = prk.expand(&[b"RootKey"], HKDF_SHA256).unwrap();
-            let mut root_key = RootKey::default();
-            okm.fill(&mut root_key).unwrap();
-            self.root_key = root_key;
-            let okm = prk.expand(&[b"ChainKey"], HKDF_SHA256).unwrap();
-            let mut chain_key = ChainKey::default();
-            okm.fill(&mut chain_key).unwrap();
-            let okm = prk.expand(&[b"HeaderKey"], HKDF_SHA256).unwrap();
-            let mut header_key = HeaderKey::default();
-            okm.fill(&mut header_key).unwrap();
-            (chain_key, header_key)
-        })
+        agree_ephemeral(
+            private_key,
+            &UnparsedPublicKey::new(&X25519, public_key),
+            |dh_shared| {
+                let salt = Salt::new(HKDF_SHA256, &self.root_key);
+                let prk = salt.extract(dh_shared);
+                let okm = prk.expand(&[b"RootKey"], HKDF_SHA256).unwrap();
+                let mut root_key = RootKey::default();
+                okm.fill(&mut root_key).unwrap();
+                self.root_key = root_key;
+                let okm = prk.expand(&[b"ChainKey"], HKDF_SHA256).unwrap();
+                let mut chain_key = ChainKey::default();
+                okm.fill(&mut chain_key).unwrap();
+                let okm = prk.expand(&[b"HeaderKey"], HKDF_SHA256).unwrap();
+                let mut header_key = HeaderKey::default();
+                okm.fill(&mut header_key).unwrap();
+                (chain_key, header_key)
+            },
+        )
         .unwrap()
     }
 }
