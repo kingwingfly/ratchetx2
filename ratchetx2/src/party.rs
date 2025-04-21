@@ -222,25 +222,35 @@ impl NonceSequence for CounterNonceSequence {
     }
 }
 
+/// Hmac based key derive function. Return 2 32-byte keys.
+fn hkdf32x2(key: &[u8], info: &[&[u8]]) -> core::result::Result<([u8; 32], [u8; 32]), Unspecified> {
+    let salt = Salt::new(HKDF_SHA256, &[0; 32]);
+    let prk = salt.extract(key);
+    let okm = prk.expand(info, HkdfBytes64)?;
+    let mut keys = [0; 64];
+    okm.fill(&mut keys)?;
+    let encryption_key = &keys[..32];
+    let authentication_key = &keys[32..64];
+    Ok((
+        encryption_key.try_into().unwrap(),
+        authentication_key.try_into().unwrap(),
+    ))
+}
+
 fn encrypt(
     key: [u8; 32],
     info: &[&[u8]],
     aad: &[u8],
     content: &[u8],
 ) -> core::result::Result<Vec<u8>, Unspecified> {
-    let salt = Salt::new(HKDF_SHA256, &[0; 32]);
-    let prk = salt.extract(&key);
-    let okm = prk.expand(info, HkdfBytes64)?;
-    let mut keys = [0; 64];
-    okm.fill(&mut keys)?;
-    let encryption_key = &keys[..32];
-    let authentication_key = &keys[32..64];
-    let unbound_key = UnboundKey::new(&AES_256_GCM, encryption_key)?;
+    let (encryption_key, authentication_key) = hkdf32x2(&key, info)?;
+
+    let unbound_key = UnboundKey::new(&AES_256_GCM, &encryption_key)?;
     let mut sealing_key = SealingKey::new(unbound_key, CounterNonceSequence(0));
     let additional_authenticated_data = Aad::from(aad);
     let mut in_out = content.to_vec();
     sealing_key.seal_in_place_append_tag(additional_authenticated_data, &mut in_out)?;
-    let hmac_key = Key::new(HMAC_SHA256, authentication_key);
+    let hmac_key = Key::new(HMAC_SHA256, &authentication_key);
     let mut to_sign = aad.to_vec();
     to_sign.extend(in_out.clone());
     let tag = sign(&hmac_key, &to_sign);
@@ -257,20 +267,14 @@ fn decrypt(
     if encrypted.len() < 32 {
         return Err(Unspecified);
     }
-    let salt = Salt::new(HKDF_SHA256, &[0; 32]);
-    let prk = salt.extract(&key);
-    let okm = prk.expand(info, HkdfBytes64)?;
-    let mut keys = [0; 64];
-    okm.fill(&mut keys)?;
-    let encryption_key = &keys[..32];
-    let authentication_key = &keys[32..64];
+    let (encryption_key, authentication_key) = hkdf32x2(&key, info)?;
 
-    let hmac_key = Key::new(HMAC_SHA256, authentication_key);
+    let hmac_key = Key::new(HMAC_SHA256, &authentication_key);
     let mut to_verify = aad.to_vec();
     to_verify.extend(&encrypted[..encrypted.len() - 32]);
     verify(&hmac_key, &to_verify, &encrypted[encrypted.len() - 32..])?;
 
-    let unbound_key = UnboundKey::new(&AES_256_GCM, encryption_key)?;
+    let unbound_key = UnboundKey::new(&AES_256_GCM, &encryption_key)?;
     let mut opening_key = OpeningKey::new(unbound_key, CounterNonceSequence(0));
     let mut in_out = encrypted[..encrypted.len() - 32].to_vec();
     let additional_authenticated_data = Aad::from(aad);
