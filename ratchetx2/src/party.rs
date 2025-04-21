@@ -176,7 +176,8 @@ impl<T: Transport> Party<T> {
                     .insert((self.ratchetx2.header_key_r(), self.nr), messgage_key);
                 self.nr += 1;
             }
-            self.ratchetx2.step_dh_root(header.public_key);
+            self.ratchetx2.step_dh_root(&header.public_key);
+            self.ratchetx2.step_dh_root(&header.public_key);
             self.pn = self.ns; // about to = other.nr
             self.ns = 0;
             self.nr = 0;
@@ -250,6 +251,7 @@ fn encrypt(
     let additional_authenticated_data = Aad::from(aad);
     let mut in_out = content.to_vec();
     sealing_key.seal_in_place_append_tag(additional_authenticated_data, &mut in_out)?;
+
     let hmac_key = Key::new(HMAC_SHA256, &authentication_key);
     let mut to_sign = aad.to_vec();
     to_sign.extend(in_out.clone());

@@ -66,7 +66,7 @@ impl Ratchetx2 {
     /// - secret_key, header_key_alice, header_key_bob: shared keys for initialization
     pub fn alice(
         secret_key: SecretKey,
-        public_key: Vec<u8>,
+        public_key: impl AsRef<[u8]>,
         header_key_alice: HeaderKey,
         header_key_bob: HeaderKey,
     ) -> Self {
@@ -83,6 +83,11 @@ impl Ratchetx2 {
     /// New a party who waits for the message first.
     /// # Args
     /// - secret_key, header_key_alice, header_key_bob: shared keys for initialization
+    ///
+    /// # Caution
+    /// Bob is initialized with [0; 32] as message key and header key, therefore,
+    /// step_dh_root to update message receiving chain before first receiving,
+    /// and step_dh_root again before first sending.
     pub fn bob(
         secret_key: SecretKey,
         header_key_alice: HeaderKey,
@@ -132,8 +137,14 @@ impl Ratchetx2 {
     }
 
     /// Perform ratchet step on DH-Root ratchet.
-    /// Update DH pair if needed, update root key, and update one of message ratchets.
-    pub fn step_dh_root(&mut self, public_key: Vec<u8>) {
+    /// Update DH pair if needed, update root key, and update **one of** message ratchets.
+    /// # Caution
+    /// In the Signal document, one dh-root step will update both message sending and receiving chain,
+    /// however, notice that, when initialize Alice, only message sending chain is updated,
+    /// so in this implementation, dh-root step will update message sending and receiving chain in rotation.
+    ///
+    /// In other words, dh-root should step twice when receiving next-header-key encrypted header.
+    pub fn step_dh_root(&mut self, public_key: impl AsRef<[u8]>) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {
             true => {

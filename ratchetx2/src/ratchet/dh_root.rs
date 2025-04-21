@@ -55,7 +55,7 @@ impl DhRootRatchet {
     }
 
     /// Perform ratchet step, update DH pair if needed, update RootKey, and return current ChainKey, next HeaderKey.
-    pub fn step(&mut self, public_key: Vec<u8>) -> (ChainKey, HeaderKey) {
+    pub fn step(&mut self, public_key: impl AsRef<[u8]>) -> (ChainKey, HeaderKey) {
         let private_key = match self.update_private_key {
             true => core::mem::replace(
                 &mut self.private_key,
