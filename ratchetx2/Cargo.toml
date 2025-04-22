@@ -19,6 +19,11 @@ futures = "0.3.31"
 ring = { version = "0.17.14", features = ["std"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
+tonic = "*"
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "*"
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = ["macros", "rt-multi-thread"] }

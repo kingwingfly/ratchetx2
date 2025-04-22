@@ -19,6 +19,9 @@ use ring::{
 
 use crate::{Ratchetx2, key::MessageKey};
 
+/// Maximum number of skipped messages allowed.
+pub const SKIP_MAX: usize = 1024;
+
 #[derive(Debug, Encode, Decode)]
 struct Header {
     /// UnparsedPublicKey: AsRef<[u8]>
@@ -47,11 +50,11 @@ struct Header {
 /// let mut alice = Party::new(alice, a);
 /// let mut bob = Party::new(bob, b);
 /// alice.send(b"hello world", b"").await.unwrap();
-/// assert_eq!(bob.recv(b"").await.unwrap(), b"hello world");
+/// assert_eq!(bob.recv(b"").await.unwrap().remove(0).unwrap(), b"hello world");
 /// alice.send(b"hello Bob", b"").await.unwrap();
-/// assert_eq!(bob.recv(b"").await.unwrap(), b"hello Bob");
+/// assert_eq!(bob.recv(b"").await.unwrap().remove(0).unwrap(), b"hello Bob");
 /// bob.send(b"hello Alice", b"").await.unwrap();
-/// assert_eq!(alice.recv(b"").await.unwrap(), b"hello Alice");
+/// assert_eq!(alice.recv(b"").await.unwrap().remove(0).unwrap(), b"hello Alice");
 /// # }
 /// ```
 #[derive(Debug)]
@@ -106,97 +109,121 @@ impl<T: Transport> Party<T> {
         Ok(())
     }
 
-    /// Receive a messgae.
+    /// Receive messgaes.
     /// # Args
     /// - aad: additional authenticated data
     ///
     /// Returns decrypted bytes.
-    pub async fn recv(&mut self, aad: &[u8]) -> Result<Vec<u8>> {
-        let encrypted_message = self.transport.recv().await?;
-        for header_key in self
-            .skipped_mk
-            .keys()
-            .map(|(k, _)| *k)
-            .collect::<HashSet<_>>()
+    pub async fn recv(&mut self, aad: &[u8]) -> Result<Vec<Result<Vec<u8>>>> {
+        let encrypted_messages = self.transport.recv().await?;
+        let decrypted_messages = encrypted_messages
             .into_iter()
-        {
-            if let Ok(header) =
-                decrypt(header_key, &[b"Header"], aad, &encrypted_message.enc_header)
-            {
-                let (header, _): (Header, _) =
-                    bincode::decode_from_slice(&header, config::standard())
-                        .map_err(|_| Error::Failed("Recv: deserialize error.".to_string()))?;
-                match self.skipped_mk.remove(&(header_key, header.n)) {
-                    Some(message_key) => {
-                        return Ok(decrypt(
-                            message_key,
-                            &[b"Content"],
-                            aad,
-                            &encrypted_message.enc_content,
-                        )?);
+            .map(|encrypted_message| {
+                for header_key in self
+                    .skipped_mk
+                    .keys()
+                    .map(|(k, _)| *k)
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                {
+                    if let Ok(header) =
+                        decrypt(header_key, &[b"Header"], aad, &encrypted_message.enc_header)
+                    {
+                        let (header, _): (Header, _) =
+                            bincode::decode_from_slice(&header, config::standard()).map_err(
+                                |_| Error::Failed("Recv: deserialize error.".to_string()),
+                            )?;
+                        match self.skipped_mk.remove(&(header_key, header.n)) {
+                            Some(message_key) => {
+                                return Ok(decrypt(
+                                    message_key,
+                                    &[b"Content"],
+                                    aad,
+                                    &encrypted_message.enc_content,
+                                )?);
+                            }
+                            None => break,
+                        }
                     }
-                    None => break,
                 }
-            }
-        }
-        if let Ok(header) = decrypt(
-            self.ratchetx2.header_key_r(),
-            &[b"Header"],
-            aad,
-            &encrypted_message.enc_header,
-        ) {
-            let (header, _): (Header, _) = bincode::decode_from_slice(&header, config::standard())
-                .map_err(|_| Error::Failed("Recv: deserialize error.".to_string()))?;
-            while self.nr < header.n {
-                let messgage_key = self.ratchetx2.step_msgr();
-                self.skipped_mk
-                    .insert((self.ratchetx2.header_key_r(), self.nr), messgage_key);
-                self.nr += 1;
-            }
-            let message_key = self.ratchetx2.step_msgr();
-            self.nr += 1;
-            return Ok(decrypt(
-                message_key,
-                &[b"Content"],
-                aad,
-                &encrypted_message.enc_content,
-            )?);
-        }
-        if let Ok(header) = decrypt(
-            self.ratchetx2.next_header_key_r(),
-            &[b"Header"],
-            aad,
-            &encrypted_message.enc_header,
-        ) {
-            let (header, _): (Header, _) = bincode::decode_from_slice(&header, config::standard())
-                .map_err(|_| Error::Failed("Recv: deserialize error.".to_string()))?;
-            while self.nr < header.pn {
-                let messgage_key = self.ratchetx2.step_msgr();
-                self.skipped_mk
-                    .insert((self.ratchetx2.header_key_r(), self.nr), messgage_key);
-                self.nr += 1;
-            }
-            self.ratchetx2.step_dh_root(&header.public_key);
-            self.ratchetx2.step_dh_root(&header.public_key);
-            self.pn = self.ns; // about to = other.nr
-            self.ns = 0;
-            self.nr = 0;
-            while self.nr < header.n {
-                let messgage_key = self.ratchetx2.step_msgr();
-                self.skipped_mk
-                    .insert((self.ratchetx2.header_key_r(), self.nr), messgage_key);
-                self.nr += 1;
-            }
-            let message_key = self.ratchetx2.step_msgr();
-            self.nr += 1;
-            return Ok(decrypt(
-                message_key,
-                &[b"Content"],
-                aad,
-                &encrypted_message.enc_content,
-            )?);
-        }
-        Err(Error::Failed("Recv: cannot decrypt.".to_string()))
+                if let Ok(header) = decrypt(
+                    self.ratchetx2.header_key_r(),
+                    &[b"Header"],
+                    aad,
+                    &encrypted_message.enc_header,
+                ) {
+                    let (header, _): (Header, _) =
+                        bincode::decode_from_slice(&header, config::standard())
+                            .map_err(|_| Error::Failed("Recv: deserialize error.".to_string()))?;
+                    if self.skipped_mk.len() + header.n - self.nr > SKIP_MAX {
+                        return Err(Error::Failed(
+                            "Recv: too many skipped messages.".to_string(),
+                        ));
+                    }
+                    while self.nr < header.n {
+                        let messgage_key = self.ratchetx2.step_msgr();
+                        self.skipped_mk
+                            .insert((self.ratchetx2.header_key_r(), self.nr), messgage_key);
+                        self.nr += 1;
+                    }
+                    let message_key = self.ratchetx2.step_msgr();
+                    self.nr += 1;
+                    return Ok(decrypt(
+                        message_key,
+                        &[b"Content"],
+                        aad,
+                        &encrypted_message.enc_content,
+                    )?);
+                }
+                if let Ok(header) = decrypt(
+                    self.ratchetx2.next_header_key_r(),
+                    &[b"Header"],
+                    aad,
+                    &encrypted_message.enc_header,
+                ) {
+                    let (header, _): (Header, _) =
+                        bincode::decode_from_slice(&header, config::standard())
+                            .map_err(|_| Error::Failed("Recv: deserialize error.".to_string()))?;
+                    if self.skipped_mk.len() + header.pn - self.nr > SKIP_MAX {
+                        return Err(Error::Failed(
+                            "Recv: too many skipped messages.".to_string(),
+                        ));
+                    }
+                    while self.nr < header.pn {
+                        let message_key = self.ratchetx2.step_msgr();
+                        self.skipped_mk
+                            .insert((self.ratchetx2.header_key_r(), self.nr), message_key);
+                        self.nr += 1;
+                    }
+                    self.ratchetx2.step_dh_root(&header.public_key);
+                    self.ratchetx2.step_dh_root(&header.public_key);
+                    self.pn = self.ns; // about to = other.nr
+                    self.ns = 0;
+                    self.nr = 0;
+                    if self.skipped_mk.len() + header.n - self.nr > SKIP_MAX {
+                        return Err(Error::Failed(
+                            "Recv: too many skipped messages.".to_string(),
+                        ));
+                    }
+                    while self.nr < header.n {
+                        let messgage_key = self.ratchetx2.step_msgr();
+                        self.skipped_mk
+                            .insert((self.ratchetx2.header_key_r(), self.nr), messgage_key);
+                        self.nr += 1;
+                    }
+                    let message_key = self.ratchetx2.step_msgr();
+                    self.nr += 1;
+                    return Ok(decrypt(
+                        message_key,
+                        &[b"Content"],
+                        aad,
+                        &encrypted_message.enc_content,
+                    )?);
+                }
+                Err(Error::Failed("Recv: cannot decrypt.".to_string()))
+            })
+            .collect();
+        Ok(decrypted_messages)
     }
 }
 

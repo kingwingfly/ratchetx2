@@ -1,7 +1,6 @@
 //! Transport implementation with futures::channel::mpsc.
 
 use futures::channel::mpsc::{Receiver, Sender, channel};
-use std::sync::Mutex;
 
 use super::Transport;
 use super::error::Result;
@@ -9,8 +8,8 @@ use super::error::Result;
 /// Transport implementation with futures::channel::mpsc.
 #[derive(Debug)]
 pub struct ChannelTransport {
-    tx: Mutex<Sender<Vec<u8>>>,
-    rx: Mutex<Receiver<Vec<u8>>>,
+    tx: Sender<Vec<u8>>,
+    rx: Receiver<Vec<u8>>,
 }
 
 impl ChannelTransport {
@@ -20,12 +19,12 @@ impl ChannelTransport {
         let (tx_bob, rx_alice) = channel(1024);
         (
             Self {
-                tx: Mutex::new(tx_alice),
-                rx: Mutex::new(rx_alice),
+                tx: tx_alice,
+                rx: rx_alice,
             },
             Self {
-                tx: Mutex::new(tx_bob),
-                rx: Mutex::new(rx_bob),
+                tx: tx_bob,
+                rx: rx_bob,
             },
         )
     }
@@ -33,19 +32,16 @@ impl ChannelTransport {
 
 #[allow(clippy::manual_async_fn)]
 impl Transport for ChannelTransport {
-    fn send_bytes(&self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
-        let mut tx = self.tx.lock().unwrap();
-        tx.try_send(bytes).unwrap();
+    fn send_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
+        self.tx.try_send(bytes).unwrap();
         async { Ok(()) }
     }
 
-    fn recv_bytes(&self) -> impl Future<Output = Result<Vec<u8>>> + Send + 'static {
-        let mut rx = self.rx.lock().unwrap();
-        let ret = loop {
-            if let Ok(Some(ret)) = rx.try_next() {
-                break ret;
-            }
-        };
+    fn recv_bytes(&mut self) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
+        let mut ret = vec![];
+        while let Ok(Some(enc_msg)) = self.rx.try_next() {
+            ret.push(enc_msg);
+        }
         async { Ok(ret) }
     }
 }
@@ -58,18 +54,18 @@ mod test {
 
     #[tokio::test]
     async fn channel_transport() {
-        let (alice, bob) = ChannelTransport::new();
+        let (mut alice, mut bob) = ChannelTransport::new();
         let msg = EncryptedMessage {
             enc_header: vec![1, 2, 3],
             enc_content: vec![4, 5, 6],
         };
         alice.send(msg.clone()).await.unwrap();
-        assert_eq!(bob.recv().await.unwrap(), msg);
+        assert_eq!(bob.recv().await.unwrap()[0], msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
         alice.send(msg.clone()).await.unwrap();
-        assert_eq!(bob.recv().await.unwrap(), msg);
+        assert_eq!(bob.recv().await.unwrap()[0], msg);
     }
 }
