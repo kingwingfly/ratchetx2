@@ -144,6 +144,9 @@ impl Ratchetx2 {
     /// so in this implementation, dh-root step will update message sending and receiving chain in rotation.
     ///
     /// In other words, dh-root should step twice when receiving next-header-key encrypted header.
+    ///
+    /// Additionally, by doing so, it's more convenient to check whether states of parties are matching
+    /// when writing tests.
     pub fn step_dh_root(&mut self, public_key: impl AsRef<[u8]>) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {

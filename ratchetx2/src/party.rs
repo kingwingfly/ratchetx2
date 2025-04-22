@@ -216,9 +216,9 @@ impl NonceSequence for CounterNonceSequence {
         let mut nonce_bytes = vec![0; NONCE_LEN];
 
         let bytes = self.0.to_be_bytes();
-        nonce_bytes[8..].copy_from_slice(&bytes);
+        nonce_bytes[NONCE_LEN - 4..].copy_from_slice(&bytes);
 
-        self.0 += 1; // advance the counter
+        self.0 += 1;
         Nonce::try_assume_unique_for_key(&nonce_bytes)
     }
 }
