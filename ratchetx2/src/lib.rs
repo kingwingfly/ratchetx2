@@ -7,6 +7,7 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 pub mod error;
+pub mod init;
 pub mod key;
 pub mod party;
 pub mod ratchet;

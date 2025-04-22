@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use chat::chat_service_client::ChatServiceClient;
 use chat::chat_service_server::{ChatService, ChatServiceServer};
-use chat::{
-    ReceiveMessagesRequest, ReceiveMessagesResponse, SendMessageRequest, SendMessageResponse,
-};
+use chat::{FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse};
 use tonic::transport::Channel;
 use tonic::transport::Server;
 use tonic::{Request, Response, Result as RpcResult};
@@ -40,29 +38,29 @@ impl RpcTransport {
 
 #[allow(clippy::manual_async_fn)]
 impl Transport for RpcTransport {
-    fn send_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
-        let req = SendMessageRequest { enc_message: bytes };
+    fn push_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
+        let req = PushMessageRequest { enc_message: bytes };
         let mut client = self.rpc_client.clone();
         async move {
             let _resp = client
-                .send_message(req)
+                .push_message(req)
                 .await
-                .map_err(|_| TransportError::Send)?;
+                .map_err(|_| TransportError::Push)?;
             Ok(())
         }
     }
 
-    fn recv_bytes(&mut self) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
-        let req = ReceiveMessagesRequest {
+    fn fetch_bytes(&mut self) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
+        let req = FetchMessagesRequest {
             last_sync_timestamp: self.last_sync_timestamp.load(Ordering::Relaxed),
         };
         let mut client = self.rpc_client.clone();
         let last_sync_timestamp = self.last_sync_timestamp.clone();
         async move {
             let resp = client
-                .receive_messages(req)
+                .fetch_messages(req)
                 .await
-                .map_err(|_| TransportError::Recv)?;
+                .map_err(|_| TransportError::Fetch)?;
             last_sync_timestamp.store(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -100,10 +98,10 @@ struct RpcServerInner {
 
 #[tonic::async_trait]
 impl ChatService for RpcServerInner {
-    async fn send_message(
+    async fn push_message(
         &self,
-        request: Request<SendMessageRequest>,
-    ) -> RpcResult<Response<SendMessageResponse>> {
+        request: Request<PushMessageRequest>,
+    ) -> RpcResult<Response<PushMessageResponse>> {
         let enc_msg = request.into_inner().enc_message;
         self.db.write().unwrap().insert(
             std::time::SystemTime::now()
@@ -112,13 +110,13 @@ impl ChatService for RpcServerInner {
                 .as_secs(),
             enc_msg,
         );
-        Ok(Response::new(SendMessageResponse {}))
+        Ok(Response::new(PushMessageResponse {}))
     }
 
-    async fn receive_messages(
+    async fn fetch_messages(
         &self,
-        request: Request<ReceiveMessagesRequest>,
-    ) -> RpcResult<Response<ReceiveMessagesResponse>> {
+        request: Request<FetchMessagesRequest>,
+    ) -> RpcResult<Response<FetchMessagesResponse>> {
         let last_sync_timestamp = request.into_inner().last_sync_timestamp;
         let enc_messages = self
             .db
@@ -127,7 +125,7 @@ impl ChatService for RpcServerInner {
             .range(last_sync_timestamp..)
             .map(|(_, v)| v.clone())
             .collect::<Vec<_>>();
-        Ok(Response::new(ReceiveMessagesResponse { enc_messages }))
+        Ok(Response::new(FetchMessagesResponse { enc_messages }))
     }
 }
 
@@ -150,13 +148,13 @@ mod test {
             enc_header: vec![1, 2, 3],
             enc_content: vec![4, 5, 6],
         };
-        alice.send(msg.clone()).await.unwrap();
-        assert_eq!(bob.recv().await.unwrap()[0], msg);
+        alice.push(msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch().await.unwrap()[0], msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
-        alice.send(msg.clone()).await.unwrap();
-        assert_eq!(bob.recv().await.unwrap()[0], msg);
+        alice.push(msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch().await.unwrap()[0], msg);
     }
 }

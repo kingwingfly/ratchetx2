@@ -61,11 +61,11 @@ let bob = shared_keys.bob();
 let alice = shared_keys.alice(bob.public_key());
 let mut alice = Party::new(alice, a);
 let mut bob = Party::new(bob, b);
-alice.send(b"hello world", b"").await.unwrap();
-assert_eq!(bob.recv(b"").await.unwrap().remove(0).unwrap(), b"hello world");
-alice.send(b"hello Bob", b"").await.unwrap();
-assert_eq!(bob.recv(b"").await.unwrap().remove(0).unwrap(), b"hello Bob");
-bob.send(b"hello Alice", b"").await.unwrap();
-assert_eq!(alice.recv(b"").await.unwrap().remove(0).unwrap(), b"hello Alice");
+alice.push(b"hello world", b"").await.unwrap();
+assert_eq!(bob.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello world");
+alice.push(b"hello Bob", b"").await.unwrap();
+assert_eq!(bob.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Bob");
+bob.push(b"hello Alice", b"").await.unwrap();
+assert_eq!(alice.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Alice");
 # }
 ```

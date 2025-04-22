@@ -1,0 +1,28 @@
+syntax = "proto3";
+package x3dh;
+
+service X3DH {
+    rpc PublishKeys(PublishKeysRequest) returns (PublishKeysResponse) {}
+    rpc FetchKeys(FetchKeysRequest) returns (FetchKeysResponse) {}
+}
+
+message PublishKeysRequest {
+    bytes identity_key_bob = 1;
+    bytes prekey = 2;
+    bytes prekey_signature = 3;
+    repeated bytes one_time_keys = 4;
+}
+
+message PublishKeysResponse {
+}
+
+message FetchKeysRequest {
+    bytes identity_key_bob = 1;
+}
+
+message FetchKeysResponse {
+    bytes identity_key_bob = 1;
+    bytes prekey = 2;
+    bytes prekey_signature = 3;
+    repeated bytes one_time_keys = 4;
+}

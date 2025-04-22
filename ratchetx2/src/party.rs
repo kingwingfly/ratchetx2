@@ -49,12 +49,12 @@ struct Header {
 /// let alice = shared_keys.alice(bob.public_key());
 /// let mut alice = Party::new(alice, a);
 /// let mut bob = Party::new(bob, b);
-/// alice.send(b"hello world", b"").await.unwrap();
-/// assert_eq!(bob.recv(b"").await.unwrap().remove(0).unwrap(), b"hello world");
-/// alice.send(b"hello Bob", b"").await.unwrap();
-/// assert_eq!(bob.recv(b"").await.unwrap().remove(0).unwrap(), b"hello Bob");
-/// bob.send(b"hello Alice", b"").await.unwrap();
-/// assert_eq!(alice.recv(b"").await.unwrap().remove(0).unwrap(), b"hello Alice");
+/// alice.push(b"hello world", b"").await.unwrap();
+/// assert_eq!(bob.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello world");
+/// alice.push(b"hello Bob", b"").await.unwrap();
+/// assert_eq!(bob.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Bob");
+/// bob.push(b"hello Alice", b"").await.unwrap();
+/// assert_eq!(alice.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Alice");
 /// # }
 /// ```
 #[derive(Debug)]
@@ -81,11 +81,11 @@ impl<T: Transport> Party<T> {
         }
     }
 
-    /// Send a message.
+    /// Push a message.
     /// # Args
-    /// - content: the bytes to send, not encrypted
+    /// - content: the bytes to push, not encrypted
     /// - aad: additional authenticated data
-    pub async fn send(&mut self, content: &[u8], aad: &[u8]) -> Result<()> {
+    pub async fn push(&mut self, content: &[u8], aad: &[u8]) -> Result<()> {
         let header = Header {
             public_key: self.ratchetx2.public_key(),
             pn: self.pn,
@@ -99,7 +99,7 @@ impl<T: Transport> Party<T> {
         let enc_content = encrypt(message_key, &[b"Content"], aad, content)?;
 
         self.transport
-            .send(EncryptedMessage {
+            .push(EncryptedMessage {
                 enc_header,
                 enc_content,
             })
@@ -109,13 +109,13 @@ impl<T: Transport> Party<T> {
         Ok(())
     }
 
-    /// Receive messgaes.
+    /// Fetch messgaes.
     /// # Args
     /// - aad: additional authenticated data
     ///
     /// Returns decrypted bytes.
-    pub async fn recv(&mut self, aad: &[u8]) -> Result<Vec<Result<Vec<u8>>>> {
-        let encrypted_messages = self.transport.recv().await?;
+    pub async fn fetch(&mut self, aad: &[u8]) -> Result<Vec<Result<Vec<u8>>>> {
+        let encrypted_messages = self.transport.fetch().await?;
         let decrypted_messages = encrypted_messages
             .into_iter()
             .map(|encrypted_message| {
@@ -197,7 +197,7 @@ impl<T: Transport> Party<T> {
                     }
                     self.ratchetx2.step_dh_root(&header.public_key);
                     self.ratchetx2.step_dh_root(&header.public_key);
-                    self.pn = self.ns; // about to = other.nr
+                    self.pn = self.ns;
                     self.ns = 0;
                     self.nr = 0;
                     if self.skipped_mk.len() + header.n - self.nr > SKIP_MAX {

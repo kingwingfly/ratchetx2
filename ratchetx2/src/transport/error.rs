@@ -5,12 +5,12 @@ use thiserror::Error;
 /// Error type for transport operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
-    /// Failed to send.
-    #[error("Failed to send.")]
-    Send,
-    /// Failed to receive.
-    #[error("Failed to receive.")]
-    Recv,
+    /// Failed to push.
+    #[error("Failed to push.")]
+    Push,
+    /// Failed to fetch.
+    #[error("Failed to fetch.")]
+    Fetch,
     /// Server error.
     #[error("Server error.")]
     Server,

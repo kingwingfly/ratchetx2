@@ -32,12 +32,12 @@ impl ChannelTransport {
 
 #[allow(clippy::manual_async_fn)]
 impl Transport for ChannelTransport {
-    fn send_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn push_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
         self.tx.try_send(bytes).unwrap();
         async { Ok(()) }
     }
 
-    fn recv_bytes(&mut self) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
+    fn fetch_bytes(&mut self) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
         let mut ret = vec![];
         while let Ok(Some(enc_msg)) = self.rx.try_next() {
             ret.push(enc_msg);
@@ -59,13 +59,13 @@ mod test {
             enc_header: vec![1, 2, 3],
             enc_content: vec![4, 5, 6],
         };
-        alice.send(msg.clone()).await.unwrap();
-        assert_eq!(bob.recv().await.unwrap()[0], msg);
+        alice.push(msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch().await.unwrap()[0], msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
-        alice.send(msg.clone()).await.unwrap();
-        assert_eq!(bob.recv().await.unwrap()[0], msg);
+        alice.push(msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch().await.unwrap()[0], msg);
     }
 }
