@@ -85,7 +85,7 @@ assert!(public_key.verify(b"goodbye world", &signature).is_err());
 let alice = XEdDSAPrivateKey::generate(&SystemRandom::new());
 let bob = XEdDSAPrivateKey::generate(&SystemRandom::new());
 assert_eq!(
-    alice.agree_ephemeral(&bob.compute_public_key()),
-    bob.agree_ephemeral(&alice.compute_public_key())
+    alice.agree_ephemeral(&bob.compute_public_key()).unwrap(),
+    bob.agree_ephemeral(&alice.compute_public_key()).unwrap()
 );
 ```

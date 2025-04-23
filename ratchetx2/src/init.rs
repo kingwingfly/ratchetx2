@@ -103,10 +103,7 @@ impl X3DHClient {
         let xeddsa_public_key = XEdDSAPublicKey::new(&keys.identity_key_bob);
         xeddsa_public_key.verify(&keys.prekey, &keys.prekey_signature)?;
         let mut key_meterial = vec![0xFF; 32];
-        key_meterial.extend(
-            self.private_identity_key
-                .agree_ephemeral(&xeddsa_public_key),
-        );
+        key_meterial.extend(self.private_identity_key.agree_ephemeral(&keys.prekey)?);
         let ephemeral_private_key =
             EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap();
         let ephemeral_public_key = ephemeral_private_key
@@ -117,7 +114,7 @@ impl X3DHClient {
         key_meterial.extend(
             agree_ephemeral(
                 unsafe { core::mem::transmute_copy(&ephemeral_private_key) },
-                &DHUnparsedPublicKey::new(&X25519, &keys.identity_key_bob),
+                &DHUnparsedPublicKey::new(&X25519, xeddsa_public_key),
                 |k| k.to_vec(),
             )
             .unwrap(),

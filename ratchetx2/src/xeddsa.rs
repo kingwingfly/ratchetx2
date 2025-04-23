@@ -15,8 +15,8 @@
 //! let alice = XEdDSAPrivateKey::generate(&SystemRandom::new());
 //! let bob = XEdDSAPrivateKey::generate(&SystemRandom::new());
 //! assert_eq!(
-//!     alice.agree_ephemeral(&bob.compute_public_key()),
-//!     bob.agree_ephemeral(&alice.compute_public_key())
+//!     alice.agree_ephemeral(&bob.compute_public_key()).unwrap(),
+//!     bob.agree_ephemeral(&alice.compute_public_key()).unwrap()
 //! );
 //! ```
 
@@ -49,10 +49,16 @@ impl XEdDSAPrivateKey {
     }
 
     /// DH with the X25519(Montgomery) private key for the key pair.
-    pub fn agree_ephemeral(&self, peer_public_key: &XEdDSAPublicKey) -> Vec<u8> {
-        (self.montgomery_private_key * peer_public_key.montgomery_public_key)
-            .as_bytes()
-            .to_vec()
+    pub fn agree_ephemeral(&self, peer_public_key: impl AsRef<[u8]>) -> Result<Vec<u8>> {
+        Ok((self.montgomery_private_key
+            * MontgomeryPoint(
+                peer_public_key
+                    .as_ref()
+                    .try_into()
+                    .map_err(|_| Error::Failed("Invalid DH public key.".to_string()))?,
+            ))
+        .as_bytes()
+        .to_vec())
     }
 
     /// Sign with the Ed25519(Edwards) private key for the key pair.
