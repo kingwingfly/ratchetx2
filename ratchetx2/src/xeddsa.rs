@@ -1,6 +1,24 @@
 //! [XEdDSA](https://signal.org/docs/specifications/xeddsa/) enables use of a single key pair format for both elliptic curve Diffie-Hellman and signatures.
 //!
 //! Based on Ed25519 and X25519.
+//!
+//! # Example
+//! ```
+//! use ratchetx2::xeddsa::XEdDSAPrivateKey;
+//! use ratchetx2::rand::SystemRandom;
+//!
+//! let xeddsa = XEdDSAPrivateKey::generate(&SystemRandom::new());
+//! let signature = xeddsa.sign(b"hello world");
+//! let public_key = xeddsa.compute_public_key();
+//! public_key.verify(b"hello world", &signature).unwrap();
+//! assert!(public_key.verify(b"goodbye world", &signature).is_err());
+//! let alice = XEdDSAPrivateKey::generate(&SystemRandom::new());
+//! let bob = XEdDSAPrivateKey::generate(&SystemRandom::new());
+//! assert_eq!(
+//!     alice.agree_ephemeral(&bob.compute_public_key()),
+//!     bob.agree_ephemeral(&alice.compute_public_key())
+//! );
+//! ```
 
 use crate::error::{Error, Result};
 
@@ -123,25 +141,5 @@ impl XEdDSAPublicKey {
 impl AsRef<[u8]> for XEdDSAPublicKey {
     fn as_ref(&self) -> &[u8] {
         self.montgomery_public_key.as_bytes()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn xdedsa() {
-        let xdedsa = XEdDSAPrivateKey::generate(&SystemRandom::new());
-        let signature = xdedsa.sign(b"hello world");
-        let public_key = xdedsa.compute_public_key();
-        public_key.verify(b"hello world", &signature).unwrap();
-        assert!(public_key.verify(b"goodbye world", &signature).is_err());
-        let alice = XEdDSAPrivateKey::generate(&SystemRandom::new());
-        let bob = XEdDSAPrivateKey::generate(&SystemRandom::new());
-        assert_eq!(
-            alice.agree_ephemeral(&bob.compute_public_key()),
-            bob.agree_ephemeral(&alice.compute_public_key())
-        );
     }
 }

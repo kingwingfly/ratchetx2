@@ -1,5 +1,7 @@
 A double-ratchet implementation following [Signal](https://signal.org/docs/specifications/doubleratchet/).
 
+Also with X3DH and XEdDSA implementation.
+
 # Compared to others
 
 1. There's no global party state, instead, it is each ratchet having its own state.
@@ -8,6 +10,7 @@ A double-ratchet implementation following [Signal](https://signal.org/docs/speci
 4. Provide chat parties implementation.
 5. Provide gRPC transport implementation.
 6. Provide X3DH shared key initialization implementation.
+7. Provide XEdDSA implementation.
 
 # Example
 
@@ -67,4 +70,22 @@ assert_eq!(bob.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Bob");
 bob.push(b"hello Alice", b"").await.unwrap();
 assert_eq!(alice.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Alice");
 # }
+```
+
+XEdDSA example:
+```rust
+use ratchetx2::xeddsa::XEdDSAPrivateKey;
+use ratchetx2::rand::SystemRandom;
+//!
+let xeddsa = XEdDSAPrivateKey::generate(&SystemRandom::new());
+let signature = xeddsa.sign(b"hello world");
+let public_key = xeddsa.compute_public_key();
+public_key.verify(b"hello world", &signature).unwrap();
+assert!(public_key.verify(b"goodbye world", &signature).is_err());
+let alice = XEdDSAPrivateKey::generate(&SystemRandom::new());
+let bob = XEdDSAPrivateKey::generate(&SystemRandom::new());
+assert_eq!(
+    alice.agree_ephemeral(&bob.compute_public_key()),
+    bob.agree_ephemeral(&alice.compute_public_key())
+);
 ```

@@ -21,7 +21,7 @@ use x3dh::x3dh_service_server::{X3dhService, X3dhServiceServer};
 use x3dh::{FetchKeysRequest, FetchKeysResponse, PublishKeysRequest, PublishKeysResponse};
 
 use super::error::{Result, TransportError};
-use crate::xdedsa::{XEdDSAPrivateKey, XEdDSAPublicKey};
+use crate::xeddsa::{XEdDSAPrivateKey, XEdDSAPublicKey};
 
 /// X3DH gRPC client.
 pub struct X3DHClient {
@@ -100,12 +100,12 @@ impl X3DHClient {
     /// Alice fetches a "prekey bundle" from the server, and constructs an initial message to Bob.
     pub async fn initial_message(&mut self, identity_key_bob: Vec<u8>) -> Result<Vec<u8>> {
         let keys = self.fetch_keys(identity_key_bob).await?;
-        let xdedsa_public_key = XEdDSAPublicKey::new(&keys.identity_key_bob);
-        xdedsa_public_key.verify(&keys.prekey, &keys.prekey_signature)?;
+        let xeddsa_public_key = XEdDSAPublicKey::new(&keys.identity_key_bob);
+        xeddsa_public_key.verify(&keys.prekey, &keys.prekey_signature)?;
         let mut key_meterial = vec![0xFF; 32];
         key_meterial.extend(
             self.private_identity_key
-                .agree_ephemeral(&xdedsa_public_key),
+                .agree_ephemeral(&xeddsa_public_key),
         );
         let ephemeral_private_key =
             EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap();

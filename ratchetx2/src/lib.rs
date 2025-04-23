@@ -13,7 +13,10 @@ pub mod party;
 pub mod ratchet;
 pub mod server;
 pub mod transport;
-pub mod xdedsa;
+pub mod xeddsa;
+
+/// Re-export.
+pub use ring::rand;
 
 pub use key::SharedKeys;
 pub use party::Party;
