@@ -11,7 +11,9 @@ pub mod init;
 pub mod key;
 pub mod party;
 pub mod ratchet;
+pub mod server;
 pub mod transport;
+pub mod xdedsa;
 
 pub use key::SharedKeys;
 pub use party::Party;

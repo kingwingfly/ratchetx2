@@ -3,7 +3,7 @@
 use futures::channel::mpsc::{Receiver, Sender, channel};
 
 use super::Transport;
-use super::error::Result;
+use crate::error::Result;
 
 /// Transport implementation with futures::channel::mpsc.
 #[derive(Debug)]

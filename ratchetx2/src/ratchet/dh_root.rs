@@ -2,10 +2,12 @@ use crate::key::{ChainKey, HeaderKey, RootKey, SecretKey};
 use ring::agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral};
 use ring::hkdf::{HKDF_SHA256, Salt};
 use ring::rand::SystemRandom;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-#[derive(Debug)]
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 pub(super) struct DhRootRatchet {
     root_key: RootKey,
+    #[zeroize(skip)]
     private_key: EphemeralPrivateKey,
     /// - true: next step will update private key
     /// - false: next step will not update private key

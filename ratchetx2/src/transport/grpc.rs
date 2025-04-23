@@ -1,7 +1,7 @@
 //! Transport implementation with gRPC (by [tonic](https://crates.io/crates/tonic)).
 
 /// Tonic generated gRPC module.
-mod chat {
+pub(crate) mod chat {
     tonic::include_proto!("chat");
 }
 
@@ -16,16 +16,16 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Result as RpcResult};
 
 use super::Transport;
-use super::error::{Result, TransportError};
+use crate::error::{Result, TransportError};
 
-/// Transport implementation with gRPC (by [tonic](https://crates.io/crates/tonic)).
+/// Message transport gRPC client.
 pub struct RpcTransport {
     rpc_client: ChatServiceClient<Channel>,
     last_sync_timestamp: Arc<AtomicU64>,
 }
 
 impl RpcTransport {
-    /// Connect to a gRPC server.
+    /// Connect to a message gRPC server.
     pub async fn new(dst: impl AsRef<str>) -> Self {
         Self {
             rpc_client: ChatServiceClient::connect(dst.as_ref().to_owned())
@@ -76,14 +76,14 @@ impl Transport for RpcTransport {
 /// The gRPC server to store and distribute encrypted messages.
 ///
 /// Using BTreeMap as a data structure to store encrypted messages.
-pub struct RpcServer {}
+pub struct RpcMessageServer {}
 
-impl RpcServer {
-    /// Run a RpcServer listening on addr.
+impl RpcMessageServer {
+    /// Run a RpcMessageServer listening on addr.
     pub async fn run(addr: impl AsRef<str>) -> Result<()> {
         let addr = addr.as_ref().parse().unwrap();
         Server::builder()
-            .add_service(ChatServiceServer::new(RpcServerInner::default()))
+            .add_service(ChatServiceServer::new(RpcMessageServerInner::default()))
             .serve(addr)
             .await
             .map_err(|_| TransportError::Server)?;
@@ -92,12 +92,12 @@ impl RpcServer {
 }
 
 #[derive(Debug, Default)]
-struct RpcServerInner {
+pub(crate) struct RpcMessageServerInner {
     db: std::sync::RwLock<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 #[tonic::async_trait]
-impl ChatService for RpcServerInner {
+impl ChatService for RpcMessageServerInner {
     async fn push_message(
         &self,
         request: Request<PushMessageRequest>,
@@ -138,7 +138,7 @@ mod test {
     #[tokio::test]
     async fn grpc_transport() {
         tokio::spawn(async {
-            RpcServer::run("[::1]:3000").await.unwrap();
+            RpcMessageServer::run("[::1]:3000").await.unwrap();
         });
         // wait server start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -1,6 +1,7 @@
 //! The party who participates in the E2EE chat.
 
 use crate::error::{Error, Result};
+use crate::{Ratchetx2, key::MessageKey};
 use crate::{
     key::HeaderKey,
     transport::{EncryptedMessage, Transport},
@@ -16,8 +17,6 @@ use ring::{
     hkdf::{HKDF_SHA256, KeyType, Salt},
     hmac::{HMAC_SHA256, Key, sign, verify},
 };
-
-use crate::{Ratchetx2, key::MessageKey};
 
 /// Maximum number of skipped messages allowed.
 pub const SKIP_MAX: usize = 1024;

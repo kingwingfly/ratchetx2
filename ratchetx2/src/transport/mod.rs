@@ -1,14 +1,14 @@
 //! Message transport.
 
 pub mod channel;
-pub mod error;
 pub mod grpc;
 
 pub use channel::ChannelTransport;
-pub use grpc::{RpcServer, RpcTransport};
+pub use grpc::{RpcMessageServer, RpcTransport};
 
 use bincode::{Decode, Encode, config};
-use error::{Result, TransportError};
+
+use crate::error::{Result, TransportError};
 
 /// Encrypted message.
 #[derive(Debug, Clone, Encode, Decode)]

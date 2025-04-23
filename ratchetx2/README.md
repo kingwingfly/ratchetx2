@@ -2,13 +2,12 @@ A double-ratchet implementation following [Signal](https://signal.org/docs/speci
 
 # Compared to others
 
-My code is much more object-oriented.
-
 1. There's no global party state, instead, it is each ratchet having its own state.
 2. It's really double-ratchet (2 kinds of ratchets), DhRootRatchet and MessageRatchet (AKA ChainRatchet).
 3. Header encryption support.
 4. Provide chat parties implementation.
 5. Provide gRPC transport implementation.
+6. Provide X3DH shared key initialization implementation.
 
 # Example
 

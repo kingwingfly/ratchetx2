@@ -17,6 +17,8 @@ rustdoc-args = ["--cfg", "docsrs"]
 bincode = "2.0.1"
 futures = "0.3.31"
 ring = { version = "0.17.14", features = ["std"] }
+curve25519-dalek = "4.1"
+zeroize = { version = "1.8.1", features = ["derive"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
 tonic = "*"
