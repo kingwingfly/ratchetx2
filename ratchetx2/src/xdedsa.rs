@@ -4,6 +4,7 @@
 
 use crate::error::{Error, Result};
 
+use curve25519_dalek::edwards::CompressedEdwardsY;
 use curve25519_dalek::{EdwardsPoint, MontgomeryPoint, Scalar};
 use ring::digest::{SHA512, digest};
 use ring::rand::{SecureRandom, SystemRandom, generate};
@@ -83,16 +84,27 @@ impl XEdDSAPublicKey {
 
     /// Verify with the Ed25519(Edwards) public key for the key pair.
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<()> {
+        if signature.len() != 64 {
+            return Err(Error::Signature);
+        }
         let edwards_point = self
             .montgomery_public_key
             .to_edwards(0)
             .ok_or(Error::Signature)?;
-        ring::signature::UnparsedPublicKey::new(
-            &ring::signature::ED25519,
-            edwards_point.compress().as_bytes(),
-        )
-        .verify(message, signature)
-        .map_err(|_| Error::Signature)?;
+        let r = CompressedEdwardsY::from_slice(&signature[..32])
+            .map_err(|_| Error::Signature)?
+            .decompress()
+            .ok_or(Error::Signature)?;
+        let mut to_digest = signature[..32].to_vec();
+        to_digest.extend(edwards_point.compress().as_bytes());
+        to_digest.extend(message);
+        let h = Scalar::from_bytes_mod_order_wide(
+            digest(&SHA512, &to_digest).as_ref().try_into().unwrap(),
+        );
+        let s = Scalar::from_bytes_mod_order(signature[32..].try_into().unwrap());
+        if EdwardsPoint::mul_base(&s) - h * edwards_point != r {
+            return Err(Error::Signature);
+        }
         Ok(())
     }
 }
@@ -114,5 +126,11 @@ mod test {
         let public_key = xdedsa.compute_public_key();
         public_key.verify(b"hello world", &signature).unwrap();
         assert!(public_key.verify(b"goodbye world", &signature).is_err());
+        let alice = XEdDSAPrivateKey::generate(&SystemRandom::new());
+        let bob = XEdDSAPrivateKey::generate(&SystemRandom::new());
+        assert_eq!(
+            alice.agree_ephemeral(&bob.compute_public_key()),
+            bob.agree_ephemeral(&alice.compute_public_key())
+        );
     }
 }
