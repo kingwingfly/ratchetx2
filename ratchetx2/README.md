@@ -76,7 +76,7 @@ XEdDSA example:
 ```rust
 use ratchetx2::xeddsa::XEdDSAPrivateKey;
 use ratchetx2::rand::SystemRandom;
-//!
+
 let xeddsa = XEdDSAPrivateKey::generate(&SystemRandom::new());
 let signature = xeddsa.sign(b"hello world");
 let public_key = xeddsa.compute_public_key();
