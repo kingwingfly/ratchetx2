@@ -1,4 +1,4 @@
-//! Initialize the shared keys between two parties with [Extended Triple Diffie-Hellman])(https://signal.org/docs/specifications/x3dh/).
+//! Initialize the shared keys between two parties with [Extended Triple Diffie-Hellman](https://signal.org/docs/specifications/x3dh/).
 //!
 //! # Example
 //! ```
