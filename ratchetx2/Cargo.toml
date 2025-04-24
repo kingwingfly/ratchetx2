@@ -21,11 +21,11 @@ curve25519-dalek = "4.1"
 zeroize = { version = "1.8.1", features = ["derive"] }
 thiserror = "2.0.12"
 tracing = "0.1.41"
-tonic = "*"
+tonic = "0.13"
 prost = "0.13"
 
 [build-dependencies]
-tonic-build = "*"
+tonic-build = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
