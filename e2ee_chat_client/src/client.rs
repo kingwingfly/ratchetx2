@@ -55,8 +55,7 @@ impl Client {
             self.terminal.draw(|f| {
                 f.render_stateful_widget(App {}, f.area(), &mut state);
             })?;
-            let mut screen = state.screen.write().await;
-            match &*screen {
+            match &state.screen {
                 Screen::Quit => {
                     if matches!(
                         event::read()?,
@@ -68,7 +67,7 @@ impl Client {
                     ) {
                         break;
                     }
-                    *screen = Screen::default();
+                    state.screen = Screen::default();
                     continue;
                 }
                 Screen::Hint(_) => {
@@ -79,32 +78,32 @@ impl Client {
                             ..
                         })
                     ) {
-                        *screen = Screen::default();
+                        state.screen = Screen::default();
                         continue;
                     }
                 }
                 Screen::Settings => match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Char('p') => {
-                            *screen = match state.x3dh_client.write().await.publish_keys().await {
+                            state.screen = match state.x3dh_client.publish_keys().await {
                                 Ok(_) => Screen::Hint("Keys published".to_string()),
                                 Err(err) => Screen::Hint(err.to_string()),
                             };
                         }
                         KeyCode::Char('r') => {
-                            *state.x3dh_client.write().await =
-                                X3DHClient::connect(&state.server_addr).await;
-                            *screen = Screen::Hint("Keys refreshed".to_string());
+                            state.x3dh_client = X3DHClient::connect(&state.server_addr).await;
+                            state.screen = Screen::Hint("Keys refreshed".to_string());
                         }
-                        KeyCode::Char('s') => *screen = Screen::PushInitMsg,
-                        KeyCode::Char('h') => *screen = Screen::HandleInitMsg,
-                        KeyCode::Esc => *screen = Screen::Main,
+                        KeyCode::Char('s') => state.screen = Screen::PushInitMsg,
+                        KeyCode::Char('h') => state.screen = Screen::HandleInitMsg,
+                        KeyCode::Esc => state.screen = Screen::Main,
                         _ => {}
                     },
                     _ => {}
                 },
                 Screen::PushInitMsg | Screen::HandleInitMsg => match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Esc => state.screen = Screen::Main,
                         KeyCode::Enter => {
                             let content = state.textarea.lines().join("\n");
                             match BASE64_STANDARD.decode(&content) {
@@ -112,11 +111,9 @@ impl Client {
                                     let mut textarea = TextArea::default();
                                     textarea.set_line_number_style(Style::default().gray());
                                     state.textarea = textarea;
-                                    match &*screen {
+                                    match &state.screen {
                                         Screen::PushInitMsg => match state
                                             .x3dh_client
-                                            .write()
-                                            .await
                                             .push_initial_message(&identity_key, &state.server_addr)
                                             .await
                                         {
@@ -124,14 +121,12 @@ impl Client {
                                                 state
                                                     .parties
                                                     .insert(content, Arc::new(RwLock::new(party)));
-                                                *screen = Screen::Main;
+                                                state.screen = Screen::Main;
                                             }
-                                            Err(e) => *screen = Screen::Hint(e.to_string()),
+                                            Err(e) => state.screen = Screen::Hint(e.to_string()),
                                         },
                                         Screen::HandleInitMsg => match state
                                             .x3dh_client
-                                            .write()
-                                            .await
                                             .handle_initial_message(
                                                 &identity_key,
                                                 &state.server_addr,
@@ -142,18 +137,18 @@ impl Client {
                                                 state
                                                     .parties
                                                     .insert(content, Arc::new(RwLock::new(party)));
-                                                *screen = Screen::Main;
+                                                state.screen = Screen::Main;
                                             }
-                                            Err(e) => *screen = Screen::Hint(e.to_string()),
+                                            Err(e) => state.screen = Screen::Hint(e.to_string()),
                                         },
                                         _ => unreachable!(),
                                     }
                                 }
-                                Err(e) => *screen = Screen::Hint(e.to_string()),
+                                Err(e) => state.screen = Screen::Hint(e.to_string()),
                             }
                         }
                         _ => {
-                            state.chat_textarea.input(key);
+                            state.textarea.input(key);
                         }
                     },
                     _ => {}
@@ -161,7 +156,7 @@ impl Client {
                 Screen::Main => match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Char(',') if key.modifiers == KeyModifiers::ALT => {
-                            *screen = Screen::Settings;
+                            state.screen = Screen::Settings;
                         }
                         KeyCode::Up if key.modifiers == KeyModifiers::ALT => state.navi.up(),
                         KeyCode::Down if key.modifiers == KeyModifiers::ALT => state.navi.down(),
@@ -199,7 +194,7 @@ impl Client {
                                 }
                             }
                         }
-                        KeyCode::Esc => *screen = Screen::Quit,
+                        KeyCode::Esc => state.screen = Screen::Quit,
                         _ if state.navi.current == Navigation::Input => {
                             state.chat_textarea.input(key);
                         }

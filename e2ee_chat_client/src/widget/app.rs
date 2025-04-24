@@ -24,7 +24,7 @@ use super::{
 };
 
 pub struct AppState {
-    pub x3dh_client: Arc<RwLock<X3DHClient>>,
+    pub x3dh_client: X3DHClient,
     pub parties: HashMap<String, Arc<RwLock<Party<RpcTransport>>>>,
     pub server_addr: String,
     pub navi: Navigator,
@@ -33,7 +33,7 @@ pub struct AppState {
     /// Current activated conversation
     pub current: Option<String>,
     pub conversation: HashMap<String, Vec<Message>>,
-    pub screen: Arc<RwLock<Screen>>,
+    pub screen: Screen,
 }
 
 impl AppState {
@@ -41,7 +41,7 @@ impl AppState {
         let mut text_area = TextArea::default();
         text_area.set_line_number_style(Style::default().gray());
         Ok(Self {
-            x3dh_client: Arc::new(RwLock::new(X3DHClient::connect(&server_addr).await)),
+            x3dh_client: X3DHClient::connect(&server_addr).await,
             parties: HashMap::default(),
             server_addr: server_addr.as_ref().to_owned(),
             navi: Navigator::default(),
@@ -49,7 +49,7 @@ impl AppState {
             textarea: TextArea::default(),
             current: None,
             conversation: HashMap::default(),
-            screen: Arc::new(RwLock::new(Screen::default())),
+            screen: Screen::default(),
         })
     }
 }
@@ -109,38 +109,33 @@ impl StatefulWidget for App {
         input_block.render(chunks[1], buf);
         state.chat_textarea.render(input, buf);
 
-        if let Ok(screen) = state.screen.try_read() {
-            match &*screen {
-                Screen::Main => {}
-                Screen::Settings => PopUpStateful { inner: Setting {} }.render(
-                    area,
-                    buf,
-                    &mut SettingState {
-                        server_addr: state.server_addr.to_owned(),
-                        public_identity_key: match state.x3dh_client.try_read() {
-                            Ok(client) => client.public_identity_key(),
-                            Err(_) => vec![],
-                        },
-                    },
-                ),
-                Screen::Quit => PopUp { inner: Quite {} }.render(area, buf),
-                Screen::Hint(hint) => PopUp {
-                    inner: Hint {
-                        hint: hint.to_owned(),
-                    },
+        match &state.screen {
+            Screen::Main => {}
+            Screen::Settings => PopUpStateful { inner: Setting {} }.render(
+                area,
+                buf,
+                &mut SettingState {
+                    server_addr: state.server_addr.to_owned(),
+                    public_identity_key: state.x3dh_client.public_identity_key(),
+                },
+            ),
+            Screen::Quit => PopUp { inner: Quite {} }.render(area, buf),
+            Screen::Hint(hint) => PopUp {
+                inner: Hint {
+                    hint: hint.to_owned(),
+                },
+            }
+            .render(area, buf),
+            Screen::PushInitMsg | Screen::HandleInitMsg => {
+                state.textarea.set_block(
+                    Block::bordered()
+                        .title(state.screen.to_string())
+                        .padding(Padding::proportional(2)),
+                );
+                PopUp {
+                    inner: &state.textarea,
                 }
-                .render(area, buf),
-                Screen::PushInitMsg | Screen::HandleInitMsg => {
-                    state.textarea.set_block(
-                        Block::bordered()
-                            .title(screen.to_string())
-                            .padding(Padding::proportional(2)),
-                    );
-                    PopUp {
-                        inner: &state.textarea,
-                    }
-                    .render(area, buf);
-                }
+                .render(area, buf);
             }
         }
     }
