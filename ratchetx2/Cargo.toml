@@ -2,7 +2,7 @@
 name = "ratchetx2"
 version = "0.1.0-alpha.4"
 edition = "2024"
-keywords = ["double-ratchet", "double ratchet", "xeddsa", "XEdDSA", "signal"]
+keywords = ["double-ratchet", "xeddsa", "XEdDSA", "signal"]
 license = "MIT"
 authors = ["Louis <836250617@qq.com>"]
 repository = "https://github.com/kingwingfly/ratchetx2"
