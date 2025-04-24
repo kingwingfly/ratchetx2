@@ -1,6 +1,9 @@
 //! Key types.
 #![allow(missing_docs)]
 
+use ring::agreement::EphemeralPrivateKey;
+use zeroize::{Zeroize, ZeroizeOnDrop};
+
 use crate::Ratchetx2;
 
 /// The first shared RootKey.
@@ -11,6 +14,8 @@ pub type ChainKey = [u8; 32];
 pub type HeaderKey = [u8; 32];
 
 /// Shared keys to initialize Ratchetx2.
+#[derive(Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(test, derive(Debug))]
 pub struct SharedKeys {
     /// The first shared RootKey.
     pub secret_key: SecretKey,
@@ -30,7 +35,12 @@ impl SharedKeys {
     }
 
     /// New a party who waits for the message first.
-    pub fn bob(&self) -> Ratchetx2 {
-        Ratchetx2::bob(self.secret_key, self.header_key_alice, self.header_key_bob)
+    pub fn bob(&self, private_key: EphemeralPrivateKey) -> Ratchetx2 {
+        Ratchetx2::bob(
+            self.secret_key,
+            private_key,
+            self.header_key_alice,
+            self.header_key_bob,
+        )
     }
 }

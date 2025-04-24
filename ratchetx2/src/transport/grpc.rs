@@ -1,16 +1,19 @@
 //! Transport implementation with gRPC (by [tonic](https://crates.io/crates/tonic)).
 
 /// Tonic generated gRPC module.
-pub(crate) mod chat {
-    tonic::include_proto!("chat");
+pub(crate) mod message_rpc {
+    tonic::include_proto!("message");
 }
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
-use chat::chat_service_client::ChatServiceClient;
-use chat::chat_service_server::{ChatService, ChatServiceServer};
-use chat::{FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse};
+use message_rpc::message_service_client::MessageServiceClient;
+use message_rpc::message_service_server::{MessageService, MessageServiceServer};
+use message_rpc::{
+    FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse,
+};
 use tonic::transport::Channel;
 use tonic::transport::Server;
 use tonic::{Request, Response, Result as RpcResult};
@@ -20,7 +23,7 @@ use crate::error::{Result, TransportError};
 
 /// Message transport gRPC client.
 pub struct RpcTransport {
-    rpc_client: ChatServiceClient<Channel>,
+    rpc_client: MessageServiceClient<Channel>,
     last_sync_timestamp: Arc<AtomicU64>,
 }
 
@@ -28,7 +31,7 @@ impl RpcTransport {
     /// Connect to a message gRPC server.
     pub async fn new(dst: impl AsRef<str>) -> Self {
         Self {
-            rpc_client: ChatServiceClient::connect(dst.as_ref().to_owned())
+            rpc_client: MessageServiceClient::connect(dst.as_ref().to_owned())
                 .await
                 .unwrap(),
             last_sync_timestamp: Arc::new(AtomicU64::default()),
@@ -38,8 +41,15 @@ impl RpcTransport {
 
 #[allow(clippy::manual_async_fn)]
 impl Transport for RpcTransport {
-    fn push_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
-        let req = PushMessageRequest { enc_message: bytes };
+    fn push_bytes(
+        &mut self,
+        target: impl AsRef<[u8]>,
+        bytes: impl AsRef<[u8]>,
+    ) -> impl Future<Output = Result<()>> + Send + 'static {
+        let req = PushMessageRequest {
+            target: target.as_ref().to_vec(),
+            enc_message: bytes.as_ref().to_vec(),
+        };
         let mut client = self.rpc_client.clone();
         async move {
             let _resp = client
@@ -50,8 +60,12 @@ impl Transport for RpcTransport {
         }
     }
 
-    fn fetch_bytes(&mut self) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
+    fn fetch_bytes(
+        &mut self,
+        target: impl AsRef<[u8]>,
+    ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
         let req = FetchMessagesRequest {
+            target: target.as_ref().to_vec(),
             last_sync_timestamp: self.last_sync_timestamp.load(Ordering::Relaxed),
         };
         let mut client = self.rpc_client.clone();
@@ -83,7 +97,7 @@ impl RpcMessageServer {
     pub async fn run(addr: impl AsRef<str>) -> Result<()> {
         let addr = addr.as_ref().parse().unwrap();
         Server::builder()
-            .add_service(ChatServiceServer::new(RpcMessageServerInner::default()))
+            .add_service(MessageServiceServer::new(RpcMessageServerInner::default()))
             .serve(addr)
             .await
             .map_err(|_| TransportError::Server)?;
@@ -91,24 +105,33 @@ impl RpcMessageServer {
     }
 }
 
+#[allow(clippy::type_complexity)]
 #[derive(Debug, Default)]
 pub(crate) struct RpcMessageServerInner {
-    db: std::sync::RwLock<std::collections::BTreeMap<u64, Vec<u8>>>,
+    db: RwLock<HashMap<Vec<u8>, Arc<RwLock<BTreeMap<u64, Vec<u8>>>>>>,
 }
 
 #[tonic::async_trait]
-impl ChatService for RpcMessageServerInner {
+impl MessageService for RpcMessageServerInner {
     async fn push_message(
         &self,
         request: Request<PushMessageRequest>,
     ) -> RpcResult<Response<PushMessageResponse>> {
-        let enc_msg = request.into_inner().enc_message;
-        self.db.write().unwrap().insert(
+        let req = request.into_inner();
+        let map = {
+            self.db
+                .write()
+                .unwrap()
+                .entry(req.target)
+                .or_default()
+                .clone()
+        };
+        map.write().unwrap().insert(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
-            enc_msg,
+            req.enc_message,
         );
         Ok(Response::new(PushMessageResponse {}))
     }
@@ -117,12 +140,19 @@ impl ChatService for RpcMessageServerInner {
         &self,
         request: Request<FetchMessagesRequest>,
     ) -> RpcResult<Response<FetchMessagesResponse>> {
-        let last_sync_timestamp = request.into_inner().last_sync_timestamp;
-        let enc_messages = self
-            .db
+        let req = request.into_inner();
+        let map = {
+            self.db
+                .write()
+                .unwrap()
+                .entry(req.target)
+                .or_default()
+                .clone()
+        };
+        let enc_messages = map
             .read()
             .unwrap()
-            .range(last_sync_timestamp..)
+            .range(req.last_sync_timestamp..)
             .map(|(_, v)| v.clone())
             .collect::<Vec<_>>();
         Ok(Response::new(FetchMessagesResponse { enc_messages }))
@@ -148,13 +178,13 @@ mod test {
             enc_header: vec![1, 2, 3],
             enc_content: vec![4, 5, 6],
         };
-        alice.push(msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch().await.unwrap()[0], msg);
+        alice.push("AliceBob", msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch("AliceBob").await.unwrap()[0], msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
-        alice.push(msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch().await.unwrap()[0], msg);
+        alice.push("AliceBob", msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch("AliceBob").await.unwrap()[0], msg);
     }
 }

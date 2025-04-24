@@ -39,10 +39,10 @@ impl DhRootRatchet {
     }
 
     /// New a DhRootRatchet for Bob.
-    pub fn bob(secret_key: SecretKey) -> Self {
+    pub fn bob(secret_key: SecretKey, private_key: EphemeralPrivateKey) -> Self {
         Self {
             root_key: secret_key,
-            private_key: EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap(),
+            private_key,
             update_private_key: true,
         }
     }

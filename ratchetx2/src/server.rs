@@ -3,8 +3,10 @@
 use tonic::transport::Server;
 
 use super::error::{Result, TransportError};
-use crate::init::{RpcX3DHInner, x3dh::x3dh_service_server::X3dhServiceServer};
-use crate::transport::grpc::{RpcMessageServerInner, chat::chat_service_server::ChatServiceServer};
+use crate::transport::grpc::{
+    RpcMessageServerInner, message_rpc::message_service_server::MessageServiceServer,
+};
+use crate::x3dh::{RpcX3DHInner, x3dh_rpc::x3dh_service_server::X3dhServiceServer};
 
 /// The gRPC server combines the Message and X3DH.
 pub struct RpcServer {}
@@ -15,7 +17,7 @@ impl RpcServer {
         let addr = addr.as_ref().parse().unwrap();
         Server::builder()
             .add_service(X3dhServiceServer::new(RpcX3DHInner::default()))
-            .add_service(ChatServiceServer::new(RpcMessageServerInner::default()))
+            .add_service(MessageServiceServer::new(RpcMessageServerInner::default()))
             .serve(addr)
             .await
             .map_err(|_| TransportError::Server)?;

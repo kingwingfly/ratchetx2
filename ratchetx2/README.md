@@ -17,13 +17,15 @@ Also with X3DH and XEdDSA implementation.
 Ratchet only example:
 ```rust
 use ratchetx2::SharedKeys;
+use ratchetx2::rand::SystemRandom;
+use ratchetx2::agreement::{EphemeralPrivateKey, X25519};
 
 let shared_keys = SharedKeys {
     secret_key: [0; 32],
     header_key_alice: [1; 32],
     header_key_bob: [2; 32],
 };
-let mut bob = shared_keys.bob();
+let mut bob = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
 let mut alice = shared_keys.alice(bob.public_key());
 
 // Alice sends first
@@ -50,6 +52,8 @@ assert_eq!(alice.step_msgs(), bob.step_msgr());
 E2EE chat app example:
 ```rust
 use ratchetx2::{transport::ChannelTransport, Party, SharedKeys};
+use ratchetx2::rand::SystemRandom;
+use ratchetx2::agreement::{EphemeralPrivateKey, X25519};
 
 # #[tokio::main]
 # async fn main() {
@@ -58,17 +62,17 @@ let shared_keys = SharedKeys {
     header_key_alice: [1; 32],
     header_key_bob: [2; 32],
 };
+let bob_ratchetx2 = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
+let alice_ratchetx2 = shared_keys.alice(bob_ratchetx2.public_key());
 let (a, b) = ChannelTransport::new();
-let bob = shared_keys.bob();
-let alice = shared_keys.alice(bob.public_key());
-let mut alice = Party::new(alice, a);
-let mut bob = Party::new(bob, b);
-alice.push(b"hello world", b"").await.unwrap();
-assert_eq!(bob.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello world");
-alice.push(b"hello Bob", b"").await.unwrap();
-assert_eq!(bob.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Bob");
-bob.push(b"hello Alice", b"").await.unwrap();
-assert_eq!(alice.fetch(b"").await.unwrap().remove(0).unwrap(), b"hello Alice");
+let mut alice = Party::new(alice_ratchetx2, a);
+let mut bob = Party::new(bob_ratchetx2, b);
+alice.push("hello world", "AliceBob").await.unwrap();
+assert_eq!(bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello world");
+alice.push("hello Bob", "AliceBob").await.unwrap();
+assert_eq!(bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello Bob");
+bob.push("hello Alice", "AliceBob").await.unwrap();
+assert_eq!(alice.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello Alice");
 # }
 ```
 
@@ -88,4 +92,48 @@ assert_eq!(
     alice.agree_ephemeral(&bob.compute_public_key()).unwrap(),
     bob.agree_ephemeral(&alice.compute_public_key()).unwrap()
 );
+```
+
+X3DH initialize example:
+```rust
+use ratchetx2::server::RpcServer;
+use ratchetx2::x3dh::X3DHClient;
+
+# #[tokio::main]
+# async fn main() {
+tokio::spawn(async {
+    RpcServer::run("127.0.0.1:3002").await.unwrap();
+});
+// wait server start
+tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+const SERVER_ADDR: &str = "http://127.0.0.1:3002";
+
+let mut alice_x3dh = X3DHClient::new(SERVER_ADDR).await;
+let mut bob_x3dh = X3DHClient::new(SERVER_ADDR).await;
+bob_x3dh.publish_keys().await.unwrap();
+let mut alice = alice_x3dh
+    .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)
+    .await
+    .unwrap();
+let mut bob = bob_x3dh
+    .handle_initial_message(&alice_x3dh.public_identity_key(), SERVER_ADDR)
+    .await
+    .unwrap();
+alice.push("hello world", "AliceBob").await.unwrap();
+assert_eq!(
+    bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+    b"hello world"
+);
+alice.push("hello Bob", "AliceBob").await.unwrap();
+assert_eq!(
+    bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+    b"hello Bob"
+);
+bob.push("hello Alice", "AliceBob").await.unwrap();
+assert_eq!(
+    alice.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+    b"hello Alice"
+);
+# }
 ```

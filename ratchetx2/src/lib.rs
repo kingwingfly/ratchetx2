@@ -7,16 +7,16 @@
 #![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 pub mod error;
-pub mod init;
 pub mod key;
 pub mod party;
 pub mod ratchet;
 pub mod server;
 pub mod transport;
+pub mod x3dh;
 pub mod xeddsa;
 
 /// Re-export.
-pub use ring::rand;
+pub use ring::{agreement, rand};
 
 pub use key::SharedKeys;
 pub use party::Party;
