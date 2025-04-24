@@ -226,11 +226,11 @@ impl X3DHClient {
         messgae_transport
             .push_bytes(
                 &associated_data,
-                &bincode::encode_to_vec(&init_msg, bincode::config::standard()).unwrap(),
+                bincode::encode_to_vec(&init_msg, bincode::config::standard()).unwrap(),
             )
             .await?;
 
-        let alice = Party::new(shared_keys.alice(keys.prekey), messgae_transport);
+        let alice = Party::new(shared_keys.alice(&keys.prekey), messgae_transport);
         Ok(alice)
     }
 

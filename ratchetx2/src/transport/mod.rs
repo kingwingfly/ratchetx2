@@ -26,7 +26,7 @@ pub trait Transport {
     fn push_bytes(
         &mut self,
         target: impl AsRef<[u8]>,
-        bytes: impl AsRef<[u8]>,
+        bytes: Vec<u8>,
     ) -> impl Future<Output = Result<()>> + Send + 'static;
     /// Fetch bytes from target message bucket.
     fn fetch_bytes(

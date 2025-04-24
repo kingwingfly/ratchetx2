@@ -26,24 +26,24 @@ let shared_keys = SharedKeys {
     header_key_bob: [2; 32],
 };
 let mut bob = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
-let mut alice = shared_keys.alice(bob.public_key());
+let mut alice = shared_keys.alice(&bob.public_key());
 
 // Alice sends first
-bob.step_dh_root(alice.public_key());
+bob.step_dh_root(&alice.public_key());
 assert_eq!(alice, bob); // Alice and Bob have the "same" state
 assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
 assert_eq!(alice.step_msgs(), bob.step_msgr());
 
 // Bob sends
-bob.step_dh_root(alice.public_key());
-alice.step_dh_root(bob.public_key());
+bob.step_dh_root(&alice.public_key());
+alice.step_dh_root(&bob.public_key());
 assert_eq!(alice, bob);
 assert_eq!(bob.step_msgs(), alice.step_msgr());
 assert_eq!(bob.step_msgs(), alice.step_msgr());
 
 // Alice sends
-alice.step_dh_root(bob.public_key());
-bob.step_dh_root(alice.public_key());
+alice.step_dh_root(&bob.public_key());
+bob.step_dh_root(&alice.public_key());
 assert_eq!(alice, bob);
 assert_eq!(alice.step_msgs(), bob.step_msgr());
 assert_eq!(alice.step_msgs(), bob.step_msgr());
@@ -63,7 +63,7 @@ let shared_keys = SharedKeys {
     header_key_bob: [2; 32],
 };
 let bob_ratchetx2 = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
-let alice_ratchetx2 = shared_keys.alice(bob_ratchetx2.public_key());
+let alice_ratchetx2 = shared_keys.alice(&bob_ratchetx2.public_key());
 let (a, b) = ChannelTransport::new();
 let mut alice = Party::new(alice_ratchetx2, a);
 let mut bob = Party::new(bob_ratchetx2, b);
@@ -82,15 +82,15 @@ use ratchetx2::xeddsa::XEdDSAPrivateKey;
 use ratchetx2::rand::SystemRandom;
 
 let xeddsa = XEdDSAPrivateKey::generate(&SystemRandom::new());
-let signature = xeddsa.sign(b"hello world");
+let signature = xeddsa.sign("hello world");
 let public_key = xeddsa.compute_public_key();
-public_key.verify(b"hello world", &signature).unwrap();
-assert!(public_key.verify(b"goodbye world", &signature).is_err());
+public_key.verify("hello world", &signature).unwrap();
+assert!(public_key.verify("goodbye world", &signature).is_err());
 let alice = XEdDSAPrivateKey::generate(&SystemRandom::new());
 let bob = XEdDSAPrivateKey::generate(&SystemRandom::new());
 assert_eq!(
-    alice.agree_ephemeral(&bob.compute_public_key()).unwrap(),
-    bob.agree_ephemeral(&alice.compute_public_key()).unwrap()
+    alice.agree_ephemeral(bob.compute_public_key().as_ref()).unwrap(),
+    bob.agree_ephemeral(alice.compute_public_key().as_ref()).unwrap()
 );
 ```
 

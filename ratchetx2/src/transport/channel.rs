@@ -27,7 +27,7 @@ impl Transport for ChannelTransport {
     fn push_bytes(
         &mut self,
         target: impl AsRef<[u8]>,
-        bytes: impl AsRef<[u8]>,
+        bytes: Vec<u8>,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let mut tx = {
             self.channels
@@ -38,7 +38,7 @@ impl Transport for ChannelTransport {
                 .0
                 .clone()
         };
-        tx.try_send(bytes.as_ref().to_vec()).unwrap();
+        tx.try_send(bytes).unwrap();
         async { Ok(()) }
     }
 

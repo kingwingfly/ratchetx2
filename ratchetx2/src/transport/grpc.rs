@@ -44,11 +44,11 @@ impl Transport for RpcTransport {
     fn push_bytes(
         &mut self,
         target: impl AsRef<[u8]>,
-        bytes: impl AsRef<[u8]>,
+        bytes: Vec<u8>,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let req = PushMessageRequest {
             target: target.as_ref().to_vec(),
-            enc_message: bytes.as_ref().to_vec(),
+            enc_message: bytes,
         };
         let mut client = self.rpc_client.clone();
         async move {

@@ -25,7 +25,7 @@ pub struct SharedKeys {
 
 impl SharedKeys {
     /// New a party who sends message first.
-    pub fn alice(&self, public_key: impl AsRef<[u8]>) -> Ratchetx2 {
+    pub fn alice(&self, public_key: &[u8]) -> Ratchetx2 {
         Ratchetx2::alice(
             self.secret_key,
             public_key,

@@ -46,7 +46,7 @@ struct Header {
 ///     header_key_bob: [2; 32],
 /// };
 /// let bob_ratchetx2 = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
-/// let alice_ratchetx2 = shared_keys.alice(bob_ratchetx2.public_key());
+/// let alice_ratchetx2 = shared_keys.alice(&bob_ratchetx2.public_key());
 /// let (a, b) = ChannelTransport::new();
 /// let mut alice = Party::new(alice_ratchetx2, a);
 /// let mut bob = Party::new(bob_ratchetx2, b);

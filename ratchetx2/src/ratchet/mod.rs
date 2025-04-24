@@ -22,21 +22,21 @@ use crate::key::{HeaderKey, MessageKey, SecretKey};
 ///     header_key_bob: [2; 32],
 /// };
 /// let mut bob = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
-/// let mut alice = shared_keys.alice(bob.public_key());
+/// let mut alice = shared_keys.alice(&bob.public_key());
 ///
-/// bob.step_dh_root(alice.public_key());
+/// bob.step_dh_root(&alice.public_key());
 /// assert_eq!(alice, bob);
 /// assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
 ///
-/// bob.step_dh_root(alice.public_key());
-/// alice.step_dh_root(bob.public_key());
+/// bob.step_dh_root(&alice.public_key());
+/// alice.step_dh_root(&bob.public_key());
 /// assert_eq!(alice, bob);
 /// assert_eq!(bob.step_msgs(), alice.step_msgr());
 /// assert_eq!(bob.step_msgs(), alice.step_msgr());
 ///
-/// alice.step_dh_root(bob.public_key());
-/// bob.step_dh_root(alice.public_key());
+/// alice.step_dh_root(&bob.public_key());
+/// bob.step_dh_root(&alice.public_key());
 /// assert_eq!(alice, bob);
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
@@ -69,7 +69,7 @@ impl Ratchetx2 {
     /// - secret_key, header_key_alice, header_key_bob: shared keys for initialization
     pub fn alice(
         secret_key: SecretKey,
-        public_key: impl AsRef<[u8]>,
+        public_key: &[u8],
         header_key_alice: HeaderKey,
         header_key_bob: HeaderKey,
     ) -> Self {
@@ -151,7 +151,7 @@ impl Ratchetx2 {
     ///
     /// Additionally, by doing so, it's more convenient to check whether states of parties are matching
     /// when writing tests.
-    pub fn step_dh_root(&mut self, public_key: impl AsRef<[u8]>) {
+    pub fn step_dh_root(&mut self, public_key: &[u8]) {
         let (chain_key, next_header_key) = self.dh_root.step(public_key);
         match self.dh_step_s {
             true => {
