@@ -62,7 +62,7 @@ impl XEdDSAPrivateKey {
     }
 
     /// Sign with the Ed25519(Edwards) private key for the key pair.
-    pub fn sign(&self, msg: &[u8]) -> Vec<u8> {
+    pub fn sign(&self, message: impl AsRef<[u8]>) -> Vec<u8> {
         let mut edwards_private_key = self.montgomery_private_key;
         let edwards_public_key = EdwardsPoint::mul_base(&edwards_private_key);
         let mut edwards_public_key_y = edwards_public_key.compress().to_bytes();
@@ -73,7 +73,7 @@ impl XEdDSAPrivateKey {
         }
         let mut to_digest = vec![0xFF; 32];
         to_digest.extend(edwards_private_key.as_bytes());
-        to_digest.extend(msg);
+        to_digest.extend(message.as_ref());
         to_digest.extend(generate::<[u8; 64]>(&SystemRandom::new()).unwrap().expose());
         let r = Scalar::from_bytes_mod_order_wide(
             &digest(&SHA512, &to_digest).as_ref().try_into().unwrap(),
@@ -81,7 +81,7 @@ impl XEdDSAPrivateKey {
         let r_ = EdwardsPoint::mul_base(&r);
         let mut to_digest = r_.compress().as_bytes().to_vec();
         to_digest.extend(edwards_public_key_y);
-        to_digest.extend(msg);
+        to_digest.extend(message.as_ref());
         let h = Scalar::from_bytes_mod_order_wide(
             &digest(&SHA512, &to_digest).as_ref().try_into().unwrap(),
         );
@@ -107,7 +107,7 @@ impl XEdDSAPublicKey {
     }
 
     /// Verify with the Ed25519(Edwards) public key for the key pair.
-    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<()> {
+    pub fn verify(&self, message: impl AsRef<[u8]>, signature: &[u8]) -> Result<()> {
         if signature.len() != 64 {
             return Err(Error::Signature);
         }
@@ -120,7 +120,7 @@ impl XEdDSAPublicKey {
             &ring::signature::ED25519,
             edwards_public_key.compress().as_bytes(),
         )
-        .verify(message, signature)
+        .verify(message.as_ref(), signature)
         .map_err(|_| Error::Signature)?;
         // // Below is manual verification.
         // let r_check = curve25519_dalek::edwards::CompressedEdwardsY::from_slice(&signature[..32])
