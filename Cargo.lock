@@ -1605,7 +1605,7 @@ dependencies = [
 
 [[package]]
 name = "ratchetx2"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bincode",
  "curve25519-dalek",

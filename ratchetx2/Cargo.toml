@@ -1,6 +1,6 @@
 [package]
 name = "ratchetx2"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
 license = "MIT"
@@ -16,7 +16,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dependencies]
 bincode = "2.0.1"
 futures = "0.3.31"
-ring = { version = "0.17.14", features = ["std"] }  # std is needed to convert error
+ring = { version = "0.17.14", features = [
+    "std",
+] } # std is needed to convert error
 curve25519-dalek = "4.1"
 zeroize = { version = "1.8.1", features = ["derive"] }
 thiserror = "2.0.12"
