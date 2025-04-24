@@ -1,8 +1,8 @@
 [package]
 name = "ratchetx2"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
-keywords = ["double-ratchet", "xeddsa", "XEdDSA", "signal"]
+keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
 license = "MIT"
 authors = ["Louis <836250617@qq.com>"]
 repository = "https://github.com/kingwingfly/ratchetx2"

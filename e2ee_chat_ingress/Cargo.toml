@@ -1,0 +1,7 @@
+[package]
+name = "e2ee_chat_ingress"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pingora = { git = "https://github.com/cloudflare/pingora" }

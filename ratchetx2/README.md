@@ -109,8 +109,8 @@ tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 const SERVER_ADDR: &str = "http://127.0.0.1:3002";
 
-let mut alice_x3dh = X3DHClient::new(SERVER_ADDR).await;
-let mut bob_x3dh = X3DHClient::new(SERVER_ADDR).await;
+let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR).await;
+let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR).await;
 bob_x3dh.publish_keys().await.unwrap();
 let mut alice = alice_x3dh
     .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)

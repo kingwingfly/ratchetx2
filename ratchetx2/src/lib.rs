@@ -21,4 +21,5 @@ pub use ring::{agreement, rand};
 pub use key::SharedKeys;
 pub use party::Party;
 pub use ratchet::Ratchetx2;
-pub use transport::Transport;
+pub use server::RpcServer;
+pub use x3dh::X3DHClient;

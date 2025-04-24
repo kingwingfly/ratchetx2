@@ -29,7 +29,7 @@ pub struct RpcTransport {
 
 impl RpcTransport {
     /// Connect to a message gRPC server.
-    pub async fn new(dst: impl AsRef<str>) -> Self {
+    pub async fn connect(dst: impl AsRef<str>) -> Self {
         Self {
             rpc_client: MessageServiceClient::connect(dst.as_ref().to_owned())
                 .await
@@ -172,8 +172,8 @@ mod test {
         });
         // wait server start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut alice = RpcTransport::new("http://[::1]:3000").await;
-        let mut bob = RpcTransport::new("http://[::1]:3000").await;
+        let mut alice = RpcTransport::connect("http://[::1]:3000").await;
+        let mut bob = RpcTransport::connect("http://[::1]:3000").await;
         let msg = EncryptedMessage {
             enc_header: vec![1, 2, 3],
             enc_content: vec![4, 5, 6],
