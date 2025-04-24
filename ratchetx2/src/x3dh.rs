@@ -26,19 +26,19 @@
 //!     .handle_initial_message(&alice_x3dh.public_identity_key(), SERVER_ADDR)
 //!     .await
 //!     .unwrap();
-//! alice.push("hello world", "AliceBob").await.unwrap();
+//! alice.push("hello world").await.unwrap();
 //! assert_eq!(
-//!     bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+//!     bob.fetch().await.unwrap().remove(0).unwrap(),
 //!     b"hello world"
 //! );
-//! alice.push("hello Bob", "AliceBob").await.unwrap();
+//! alice.push("hello Bob").await.unwrap();
 //! assert_eq!(
-//!     bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+//!     bob.fetch().await.unwrap().remove(0).unwrap(),
 //!     b"hello Bob"
 //! );
-//! bob.push("hello Alice", "AliceBob").await.unwrap();
+//! bob.push("hello Alice").await.unwrap();
 //! assert_eq!(
-//!     alice.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+//!     alice.fetch().await.unwrap().remove(0).unwrap(),
 //!     b"hello Alice"
 //! );
 //! # }
@@ -230,7 +230,11 @@ impl X3DHClient {
             )
             .await?;
 
-        let alice = Party::new(shared_keys.alice(&keys.prekey), messgae_transport);
+        let alice = Party::new(
+            shared_keys.alice(&keys.prekey),
+            messgae_transport,
+            associated_data,
+        );
         Ok(alice)
     }
 
@@ -312,6 +316,7 @@ impl X3DHClient {
         Ok(Party::new(
             shared_keys.bob(private_prekey),
             messgae_transport,
+            associated_data,
         ))
     }
 }

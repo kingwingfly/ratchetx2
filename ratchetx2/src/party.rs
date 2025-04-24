@@ -48,14 +48,14 @@ struct Header {
 /// let bob_ratchetx2 = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
 /// let alice_ratchetx2 = shared_keys.alice(&bob_ratchetx2.public_key());
 /// let (a, b) = ChannelTransport::new();
-/// let mut alice = Party::new(alice_ratchetx2, a);
-/// let mut bob = Party::new(bob_ratchetx2, b);
-/// alice.push("hello world", "AliceBob").await.unwrap();
-/// assert_eq!(bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello world");
-/// alice.push("hello Bob", "AliceBob").await.unwrap();
-/// assert_eq!(bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello Bob");
-/// bob.push("hello Alice", "AliceBob").await.unwrap();
-/// assert_eq!(alice.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello Alice");
+/// let mut alice = Party::new(alice_ratchetx2, a, "AliceBob");
+/// let mut bob = Party::new(bob_ratchetx2, b, "AliceBob");
+/// alice.push("hello world").await.unwrap();
+/// assert_eq!(bob.fetch().await.unwrap().remove(0).unwrap(), b"hello world");
+/// alice.push("hello Bob").await.unwrap();
+/// assert_eq!(bob.fetch().await.unwrap().remove(0).unwrap(), b"hello Bob");
+/// bob.push("hello Alice").await.unwrap();
+/// assert_eq!(alice.fetch().await.unwrap().remove(0).unwrap(), b"hello Alice");
 /// # }
 /// ```
 #[derive(Debug)]
@@ -67,11 +67,15 @@ pub struct Party<T: Transport> {
     pn: usize,
     ns: usize,
     nr: usize,
+    associated_data: Vec<u8>,
 }
 
 impl<T: Transport> Party<T> {
     /// New a party.
-    pub fn new(ratchetx2: Ratchetx2, transport: T) -> Self {
+    ///
+    /// # Args
+    /// - associated_data: used in enryption, apart from that, the server distribute message based on it.
+    pub fn new(ratchetx2: Ratchetx2, transport: T, associated_data: impl AsRef<[u8]>) -> Self {
         Self {
             ratchetx2,
             transport,
@@ -79,6 +83,7 @@ impl<T: Transport> Party<T> {
             pn: 0,
             ns: 0,
             nr: 0,
+            associated_data: associated_data.as_ref().to_vec(),
         }
     }
 
@@ -86,7 +91,7 @@ impl<T: Transport> Party<T> {
     /// # Args
     /// - content: the bytes to push, not encrypted
     /// - aad: additional authenticated data
-    pub async fn push(&mut self, content: impl AsRef<[u8]>, aad: impl AsRef<[u8]>) -> Result<()> {
+    pub async fn push(&mut self, content: impl AsRef<[u8]>) -> Result<()> {
         let header = Header {
             public_key: self.ratchetx2.public_key(),
             pn: self.pn,
@@ -94,14 +99,19 @@ impl<T: Transport> Party<T> {
         };
         let header = bincode::encode_to_vec(&header, config::standard()).unwrap();
         let header_key = self.ratchetx2.header_key_s();
-        let enc_header = encrypt(header_key, &[b"Header"], aad.as_ref(), &header)?;
+        let enc_header = encrypt(header_key, &[b"Header"], &self.associated_data, &header)?;
 
         let message_key = self.ratchetx2.step_msgs();
-        let enc_content = encrypt(message_key, &[b"Content"], aad.as_ref(), content.as_ref())?;
+        let enc_content = encrypt(
+            message_key,
+            &[b"Content"],
+            &self.associated_data,
+            content.as_ref(),
+        )?;
 
         self.transport
             .push(
-                aad,
+                &self.associated_data,
                 EncryptedMessage {
                     enc_header,
                     enc_content,
@@ -118,8 +128,8 @@ impl<T: Transport> Party<T> {
     /// - aad: additional authenticated data
     ///
     /// Returns decrypted bytes.
-    pub async fn fetch(&mut self, aad: impl AsRef<[u8]>) -> Result<Vec<Result<Vec<u8>>>> {
-        let encrypted_messages = self.transport.fetch(aad.as_ref()).await?;
+    pub async fn fetch(&mut self) -> Result<Vec<Result<Vec<u8>>>> {
+        let encrypted_messages = self.transport.fetch(&self.associated_data).await?;
         let decrypted_messages = encrypted_messages
             .into_iter()
             .map(|encrypted_message| {
@@ -133,7 +143,7 @@ impl<T: Transport> Party<T> {
                     if let Ok(header) = decrypt(
                         header_key,
                         &[b"Header"],
-                        aad.as_ref(),
+                        &self.associated_data,
                         &encrypted_message.enc_header,
                     ) {
                         let (header, _): (Header, _) =
@@ -145,7 +155,7 @@ impl<T: Transport> Party<T> {
                                 return Ok(decrypt(
                                     message_key,
                                     &[b"Content"],
-                                    aad.as_ref(),
+                                    &self.associated_data,
                                     &encrypted_message.enc_content,
                                 )?);
                             }
@@ -156,7 +166,7 @@ impl<T: Transport> Party<T> {
                 if let Ok(header) = decrypt(
                     self.ratchetx2.header_key_r(),
                     &[b"Header"],
-                    aad.as_ref(),
+                    &self.associated_data,
                     &encrypted_message.enc_header,
                 ) {
                     let (header, _): (Header, _) =
@@ -178,14 +188,14 @@ impl<T: Transport> Party<T> {
                     return Ok(decrypt(
                         message_key,
                         &[b"Content"],
-                        aad.as_ref(),
+                        &self.associated_data,
                         &encrypted_message.enc_content,
                     )?);
                 }
                 if let Ok(header) = decrypt(
                     self.ratchetx2.next_header_key_r(),
                     &[b"Header"],
-                    aad.as_ref(),
+                    &self.associated_data,
                     &encrypted_message.enc_header,
                 ) {
                     let (header, _): (Header, _) =
@@ -223,7 +233,7 @@ impl<T: Transport> Party<T> {
                     return Ok(decrypt(
                         message_key,
                         &[b"Content"],
-                        aad.as_ref(),
+                        &self.associated_data,
                         &encrypted_message.enc_content,
                     )?);
                 }

@@ -65,14 +65,14 @@ let shared_keys = SharedKeys {
 let bob_ratchetx2 = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
 let alice_ratchetx2 = shared_keys.alice(&bob_ratchetx2.public_key());
 let (a, b) = ChannelTransport::new();
-let mut alice = Party::new(alice_ratchetx2, a);
-let mut bob = Party::new(bob_ratchetx2, b);
-alice.push("hello world", "AliceBob").await.unwrap();
-assert_eq!(bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello world");
-alice.push("hello Bob", "AliceBob").await.unwrap();
-assert_eq!(bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello Bob");
-bob.push("hello Alice", "AliceBob").await.unwrap();
-assert_eq!(alice.fetch("AliceBob").await.unwrap().remove(0).unwrap(), b"hello Alice");
+let mut alice = Party::new(alice_ratchetx2, a, "AliceBob");
+let mut bob = Party::new(bob_ratchetx2, b, "AliceBob");
+alice.push("hello world").await.unwrap();
+assert_eq!(bob.fetch().await.unwrap().remove(0).unwrap(), b"hello world");
+alice.push("hello Bob").await.unwrap();
+assert_eq!(bob.fetch().await.unwrap().remove(0).unwrap(), b"hello Bob");
+bob.push("hello Alice").await.unwrap();
+assert_eq!(alice.fetch().await.unwrap().remove(0).unwrap(), b"hello Alice");
 # }
 ```
 
@@ -120,19 +120,19 @@ let mut bob = bob_x3dh
     .handle_initial_message(&alice_x3dh.public_identity_key(), SERVER_ADDR)
     .await
     .unwrap();
-alice.push("hello world", "AliceBob").await.unwrap();
+alice.push("hello world").await.unwrap();
 assert_eq!(
-    bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+    bob.fetch().await.unwrap().remove(0).unwrap(),
     b"hello world"
 );
-alice.push("hello Bob", "AliceBob").await.unwrap();
+alice.push("hello Bob").await.unwrap();
 assert_eq!(
-    bob.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+    bob.fetch().await.unwrap().remove(0).unwrap(),
     b"hello Bob"
 );
-bob.push("hello Alice", "AliceBob").await.unwrap();
+bob.push("hello Alice").await.unwrap();
 assert_eq!(
-    alice.fetch("AliceBob").await.unwrap().remove(0).unwrap(),
+    alice.fetch().await.unwrap().remove(0).unwrap(),
     b"hello Alice"
 );
 # }
