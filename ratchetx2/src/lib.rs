@@ -1,4 +1,4 @@
-//! Some documents and examples are hidden here: [`doc`].
+//! Some documents and examples are hidden here: [`document`].
 #![deny(
     missing_docs,
     rustdoc::broken_intra_doc_links,
