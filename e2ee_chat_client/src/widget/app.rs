@@ -6,8 +6,6 @@ use ratatui::{
     widgets::{Block, Padding},
 };
 use ratchetx2::{Party, X3DHClient, transport::RpcTransport};
-use std::sync::Arc;
-use tokio::sync::RwLock;
 use tui_textarea::TextArea;
 
 use crate::{
@@ -17,6 +15,10 @@ use crate::{
 };
 
 use super::{
+    contacts::Contacts,
+    conversation::Conversation,
+    footer::Footer,
+    form::Form,
     hint::Hint,
     pop_up::{PopUp, PopUpStateful},
     quit::Quite,
@@ -25,14 +27,18 @@ use super::{
 
 pub struct AppState {
     pub x3dh_client: X3DHClient,
-    pub parties: HashMap<String, Arc<RwLock<Party<RpcTransport>>>>,
+
+    pub parties: HashMap<String, Party<RpcTransport>>,
+    pub contacts: Vec<String>,
+    pub current_activated_contact: usize,
+    pub conversation: HashMap<String, Vec<Message>>,
+    pub current_activated_message: usize,
+
     pub server_addr: String,
     pub navi: Navigator,
     pub chat_textarea: TextArea<'static>,
-    pub textarea: TextArea<'static>,
-    /// Current activated conversation
-    pub current: Option<String>,
-    pub conversation: HashMap<String, Vec<Message>>,
+    pub textareas: Vec<(String, TextArea<'static>)>,
+    pub current_activated_textarea: usize,
     pub screen: Screen,
 }
 
@@ -41,14 +47,17 @@ impl AppState {
         let mut text_area = TextArea::default();
         text_area.set_line_number_style(Style::default().gray());
         Ok(Self {
-            x3dh_client: X3DHClient::connect(&server_addr).await,
+            x3dh_client: X3DHClient::connect(&server_addr).await?,
             parties: HashMap::default(),
+            contacts: vec![],
+            current_activated_contact: 0,
+            conversation: HashMap::default(),
+            current_activated_message: 0,
             server_addr: server_addr.as_ref().to_owned(),
             navi: Navigator::default(),
             chat_textarea: text_area,
-            textarea: TextArea::default(),
-            current: None,
-            conversation: HashMap::default(),
+            textareas: vec![],
+            current_activated_textarea: 0,
             screen: Screen::default(),
         })
     }
@@ -63,19 +72,15 @@ impl StatefulWidget for App {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(4),
+                Constraint::Length(1),
                 Constraint::Fill(1),
-                Constraint::Length(4),
+                Constraint::Length(1),
             ])
             .split(area);
 
-        let header_block = Block::bordered();
-        let header = header_block.inner(chunks[0]);
-        header_block.render(chunks[0], buf);
+        Text::from("E2EE Chat").centered().render(chunks[0], buf);
 
-        let footer_block = Block::bordered();
-        let footer = footer_block.inner(chunks[2]);
-        footer_block.render(chunks[2], buf);
+        Footer {}.render(chunks[2], buf, &mut state.navi.current);
 
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
@@ -88,6 +93,10 @@ impl StatefulWidget for App {
         }
         let contacts = contacts_block.inner(chunks[0]);
         contacts_block.render(chunks[0], buf);
+        Contacts {
+            contacts: &state.contacts,
+        }
+        .render(contacts, buf, &mut state.current_activated_contact);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -100,6 +109,17 @@ impl StatefulWidget for App {
         }
         let conversation = conversation_block.inner(chunks[0]);
         conversation_block.render(chunks[0], buf);
+        if let Some(messages) = state
+            .contacts
+            .get(state.current_activated_contact)
+            .and_then(|c| state.conversation.get_mut(c))
+        {
+            Conversation { messages }.render(
+                conversation,
+                buf,
+                &mut state.current_activated_message,
+            );
+        }
 
         let mut textarea_block = Block::bordered().padding(Padding::proportional(1));
         if state.navi.current == Navigation::Input {
@@ -127,15 +147,12 @@ impl StatefulWidget for App {
             }
             .render(area, buf),
             Screen::PushInitMsg | Screen::HandleInitMsg => {
-                state.textarea.set_block(
-                    Block::bordered()
-                        .title(state.screen.to_string())
-                        .padding(Padding::proportional(2)),
-                );
-                PopUp {
-                    inner: &state.textarea,
+                PopUpStateful {
+                    inner: Form {
+                        fields: &state.textareas,
+                    },
                 }
-                .render(area, buf);
+                .render(area, buf, &mut state.current_activated_textarea);
             }
         }
     }

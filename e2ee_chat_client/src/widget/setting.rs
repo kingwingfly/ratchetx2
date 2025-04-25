@@ -1,7 +1,7 @@
 use base64::prelude::*;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Cell, Padding, Paragraph, Row, Table},
+    widgets::{Block, Cell, Padding, Row, Table},
 };
 
 pub struct Setting {}
@@ -16,7 +16,7 @@ impl StatefulWidget for Setting {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let block = Block::bordered()
-            .style(Style::default().green())
+            .border_style(Style::default().green())
             .padding(Padding::proportional(2));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -26,7 +26,11 @@ impl StatefulWidget for Setting {
         Widget::render(
             Table::default()
                 .widths([Constraint::Fill(1), Constraint::Min(44)])
-                .header(Row::new([Cell::from("Setting"), Cell::from("value")]).bottom_margin(1))
+                .header(
+                    Row::new([Cell::from("Setting"), Cell::from("Value")])
+                        .bottom_margin(1)
+                        .bold(),
+                )
                 .rows([
                     Row::new([
                         Cell::from("Server Address"),
@@ -40,8 +44,19 @@ impl StatefulWidget for Setting {
             chunks[0],
             buf,
         );
-        Paragraph::new("(P)ublish keys | (R)efresh keys | (S)end/(H)anle initial message")
+        Line::default()
+            .spans([
+                Span::raw("P").underlined(),
+                Span::raw("ublish Keys | "),
+                Span::raw("R").underlined(),
+                Span::raw("efresh Keys | "),
+                Span::raw("S").underlined(),
+                Span::raw("end/"),
+                Span::raw("H").underlined(),
+                Span::raw("andle InitialMessage"),
+            ])
             .centered()
+            .gray()
             .render(chunks[1], buf);
     }
 }

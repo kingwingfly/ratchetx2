@@ -15,8 +15,8 @@
 //!
 //! const SERVER_ADDR: &str = "http://127.0.0.1:3001";
 //!
-//! let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR).await;
-//! let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR).await;
+//! let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR).await.unwrap();
+//! let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR).await.unwrap();
 //! bob_x3dh.publish_keys().await.unwrap();
 //! let mut alice = alice_x3dh
 //!     .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)
@@ -79,15 +79,15 @@ pub struct X3DHClient {
 
 impl X3DHClient {
     /// Connect to a X3DH gRPC server.
-    pub async fn connect(x3dh_server_addr: impl AsRef<str>) -> Self {
-        Self {
+    pub async fn connect(x3dh_server_addr: impl AsRef<str>) -> Result<Self> {
+        Ok(Self {
             rpc_client: X3dhServiceClient::connect(x3dh_server_addr.as_ref().to_owned())
                 .await
-                .unwrap(),
+                .map_err(|_| TransportError::Connect)?,
             private_identity_key: XEdDSAPrivateKey::generate(&SystemRandom::new()),
             prekeys: HashMap::new(),
             one_time_prekeys: HashMap::new(),
-        }
+        })
     }
 
     /// Get public identity key.
@@ -222,7 +222,7 @@ impl X3DHClient {
             prekey_bob: keys.prekey.clone(),
             one_time_prekey_bob: keys.one_time_key,
         };
-        let mut messgae_transport = RpcTransport::connect(message_server_addr).await;
+        let mut messgae_transport = RpcTransport::connect(message_server_addr).await?;
         messgae_transport
             .push_bytes(
                 &associated_data,
@@ -251,7 +251,7 @@ impl X3DHClient {
         associated_data.extend(identity_key_alice);
         associated_data.extend(self.public_identity_key());
 
-        let mut messgae_transport = RpcTransport::connect(message_server_addr).await;
+        let mut messgae_transport = RpcTransport::connect(message_server_addr).await?;
         let (initial_message, _): (InitMassage, _) = bincode::decode_from_slice(
             messgae_transport
                 .fetch_bytes(&associated_data)

@@ -3,6 +3,7 @@ pub mod connecting;
 pub mod contacts;
 pub mod conversation;
 pub mod footer;
+pub mod form;
 pub mod header;
 pub mod hint;
 pub mod message;

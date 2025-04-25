@@ -23,6 +23,9 @@ pub enum Error {
 /// Error type for transport operations.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// Failed to connect.
+    #[error("Failed to connect.")]
+    Connect,
     /// Failed to push.
     #[error("Failed to push.")]
     Push,

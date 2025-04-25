@@ -1,15 +1,13 @@
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug)]
 pub struct Message {
     pub content: MessageContent,
-    pub state: Arc<RwLock<MessageState>>,
+    pub state: MessageState,
 }
 
 #[derive(Debug)]
 pub enum MessageState {
-    Sending,
     Sent,
     Recved,
     Error(String),
@@ -19,4 +17,22 @@ pub enum MessageState {
 pub enum MessageContent {
     Text(String),
     Image(Vec<u8>),
+}
+
+impl Message {
+    pub fn line_num(&self, width: u16) -> u16 {
+        let mut lines = 0;
+        match &self.content {
+            MessageContent::Text(text) => {
+                for line in text.lines() {
+                    lines += line.width_cjk() as u16 / width + 1;
+                }
+            }
+            MessageContent::Image(_) => todo!(),
+        }
+        if let MessageState::Error(err) = &self.state {
+            lines += err.width_cjk() as u16 / width + 1;
+        }
+        lines
+    }
 }
