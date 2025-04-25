@@ -155,7 +155,10 @@ impl Client {
                 },
                 Screen::Main => match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                        KeyCode::Char(',') if key.modifiers == KeyModifiers::ALT => {
+                        KeyCode::Char(',')
+                            if key.modifiers == KeyModifiers::ALT
+                                || key.modifiers == KeyModifiers::CONTROL =>
+                        {
                             state.screen = Screen::Settings;
                         }
                         KeyCode::Up if key.modifiers == KeyModifiers::ALT => state.navi.up(),

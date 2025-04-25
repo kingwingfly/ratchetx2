@@ -101,13 +101,13 @@ impl StatefulWidget for App {
         let conversation = conversation_block.inner(chunks[0]);
         conversation_block.render(chunks[0], buf);
 
-        let mut input_block = Block::bordered().padding(Padding::proportional(2));
+        let mut textarea_block = Block::bordered().padding(Padding::proportional(1));
         if state.navi.current == Navigation::Input {
-            input_block = input_block.border_style(Style::default().light_green());
+            textarea_block = textarea_block.border_style(Style::default().light_green());
         }
-        let input = input_block.inner(chunks[1]);
-        input_block.render(chunks[1], buf);
-        state.chat_textarea.render(input, buf);
+        let textarea = textarea_block.inner(chunks[1]);
+        textarea_block.render(chunks[1], buf);
+        state.chat_textarea.render(textarea, buf);
 
         match &state.screen {
             Screen::Main => {}
