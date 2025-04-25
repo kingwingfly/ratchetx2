@@ -205,13 +205,8 @@ impl X3DHClient {
         };
 
         let mut associated_data: Vec<u8> = vec![];
-        associated_data.extend(
-            &self
-                .private_identity_key
-                .compute_public_key()
-                .as_ref()
-                .to_vec(),
-        );
+        let my_identity_key = self.public_identity_key();
+        associated_data.extend(&my_identity_key);
         associated_data.extend(&keys.identity_key_bob);
         let init_msg = InitMassage {
             identity_key_alice: self
@@ -223,12 +218,10 @@ impl X3DHClient {
             prekey_bob: keys.prekey.clone(),
             one_time_prekey_bob: keys.one_time_key,
         };
-        let mut messgae_transport = RpcTransport::connect(message_server_addr).await?;
+        let mut messgae_transport =
+            RpcTransport::connect(message_server_addr, &my_identity_key, identity_key_bob).await?;
         messgae_transport
-            .push_bytes(
-                &associated_data,
-                bincode::encode_to_vec(&init_msg, bincode::config::standard()).unwrap(),
-            )
+            .push_bytes(bincode::encode_to_vec(&init_msg, bincode::config::standard()).unwrap())
             .await?;
 
         let alice = Party::new(
@@ -248,14 +241,17 @@ impl X3DHClient {
         identity_key_alice: &[u8],
         message_server_addr: impl AsRef<str>,
     ) -> Result<Party<RpcTransport>> {
+        let my_identity_key = self.public_identity_key();
         let mut associated_data: Vec<u8> = vec![];
         associated_data.extend(identity_key_alice);
-        associated_data.extend(self.public_identity_key());
+        associated_data.extend(&my_identity_key);
 
-        let mut messgae_transport = RpcTransport::connect(message_server_addr).await?;
+        let mut message_transport =
+            RpcTransport::connect(message_server_addr, &my_identity_key, identity_key_alice)
+                .await?;
         let (initial_message, _): (InitMassage, _) = bincode::decode_from_slice(
-            messgae_transport
-                .fetch_bytes(&associated_data, Some(1))
+            message_transport
+                .fetch_bytes(Some(1))
                 .await?
                 .first()
                 .ok_or(Error::Failed("No initial message found.".to_string()))?,
@@ -316,7 +312,7 @@ impl X3DHClient {
 
         Ok(Party::new(
             shared_keys.bob(private_prekey),
-            messgae_transport,
+            message_transport,
             associated_data,
         ))
     }

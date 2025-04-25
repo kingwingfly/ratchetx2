@@ -2,6 +2,10 @@ A double-ratchet implementation following [Signal](https://signal.org/docs/speci
 
 Also with X3DH and XEdDSA implementation.
 
+# E2EE chat app (TUI)
+
+An E2EE chat server-client TUI app base on this crate is available [here](https://github.com/kingwingfly/ratchetx2).
+
 # Compared to others
 
 1. There's no global party state, instead, it is each ratchet having its own state.

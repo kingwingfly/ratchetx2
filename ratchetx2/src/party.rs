@@ -74,7 +74,7 @@ impl<T: Transport> Party<T> {
     /// New a party.
     ///
     /// # Args
-    /// - associated_data: used in enryption, apart from that, the server distribute message based on it.
+    /// - associated_data: used in enryption
     pub fn new(ratchetx2: Ratchetx2, transport: T, associated_data: impl AsRef<[u8]>) -> Self {
         Self {
             ratchetx2,
@@ -110,13 +110,10 @@ impl<T: Transport> Party<T> {
         )?;
 
         self.transport
-            .push(
-                &self.associated_data,
-                EncryptedMessage {
-                    enc_header,
-                    enc_content,
-                },
-            )
+            .push(EncryptedMessage {
+                enc_header,
+                enc_content,
+            })
             .await?;
 
         self.ns += 1;
@@ -124,12 +121,10 @@ impl<T: Transport> Party<T> {
     }
 
     /// Fetch messgaes.
-    /// # Args
-    /// - aad: additional authenticated data
     ///
     /// Returns decrypted bytes.
     pub async fn fetch(&mut self) -> Result<Vec<Result<Vec<u8>>>> {
-        let encrypted_messages = self.transport.fetch(&self.associated_data, None).await?;
+        let encrypted_messages = self.transport.fetch(None).await?;
         let decrypted_messages = encrypted_messages
             .into_iter()
             .map(|encrypted_message| {

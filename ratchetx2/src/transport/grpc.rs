@@ -26,29 +26,33 @@ use crate::error::{Result, TransportError};
 pub struct RpcTransport {
     rpc_client: MessageServiceClient<Channel>,
     last_sync_id: Arc<AtomicU64>,
+    push_target: Vec<u8>,
+    fetch_target: Vec<u8>,
 }
 
 impl RpcTransport {
     /// Connect to a message gRPC server.
-    pub async fn connect(dst: impl AsRef<str>) -> Result<Self> {
+    pub async fn connect(
+        dst: impl AsRef<str>,
+        my_identity_key: &[u8],
+        peer_identity_key: &[u8],
+    ) -> Result<Self> {
         Ok(Self {
             rpc_client: MessageServiceClient::connect(dst.as_ref().to_owned())
                 .await
                 .map_err(|_| TransportError::Connect)?,
             last_sync_id: Arc::new(AtomicU64::default()),
+            push_target: [my_identity_key, peer_identity_key].concat().to_vec(),
+            fetch_target: [peer_identity_key, my_identity_key].concat().to_vec(),
         })
     }
 }
 
 #[allow(clippy::manual_async_fn)]
 impl Transport for RpcTransport {
-    fn push_bytes(
-        &mut self,
-        target: impl AsRef<[u8]>,
-        bytes: Vec<u8>,
-    ) -> impl Future<Output = Result<()>> + Send + 'static {
+    fn push_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
         let req = PushMessageRequest {
-            target: target.as_ref().to_vec(),
+            target: self.push_target.clone(),
             enc_message: bytes,
         };
         let mut client = self.rpc_client.clone();
@@ -63,11 +67,10 @@ impl Transport for RpcTransport {
 
     fn fetch_bytes(
         &mut self,
-        target: impl AsRef<[u8]>,
         limit: Option<usize>,
     ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
         let req = FetchMessagesRequest {
-            target: target.as_ref().to_vec(),
+            target: self.fetch_target.clone(),
             last_sync_id: self.last_sync_id.load(Ordering::Relaxed),
             limit: limit.map(|limit| limit as u64),
         };
@@ -154,21 +157,25 @@ mod test {
         });
         // wait server start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut alice = RpcTransport::connect("http://[::1]:3000").await.unwrap();
-        let mut bob = RpcTransport::connect("http://[::1]:3000").await.unwrap();
+        let mut alice = RpcTransport::connect("http://[::1]:3000", b"Alice", b"Bob")
+            .await
+            .unwrap();
+        let mut bob = RpcTransport::connect("http://[::1]:3000", b"Bob", b"Alice")
+            .await
+            .unwrap();
         let msg = EncryptedMessage {
             enc_header: vec![1, 2, 3],
             enc_content: vec![4, 5, 6],
         };
-        alice.push("AliceBob", msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
-        alice.push("AliceBob", msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
+        alice.push(msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
+        alice.push(msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
-        alice.push("AliceBob", msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
+        alice.push(msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
     }
 }

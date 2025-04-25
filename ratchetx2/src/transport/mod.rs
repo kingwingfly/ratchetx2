@@ -22,35 +22,28 @@ pub struct EncryptedMessage {
 
 /// To send/recv encrtpted data.
 pub trait Transport {
-    /// Push bytes to target message bucket.
-    fn push_bytes(
-        &mut self,
-        target: impl AsRef<[u8]>,
-        bytes: Vec<u8>,
-    ) -> impl Future<Output = Result<()>> + Send + 'static;
-    /// Fetch bytes from target message bucket.
+    /// Push bytes to A-B message bucket.
+    fn push_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static;
+    /// Fetch bytes from B-A message bucket.
     fn fetch_bytes(
         &mut self,
-        target: impl AsRef<[u8]>,
         limit: Option<usize>,
     ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static;
-    /// Push encrypted message to target message bucket.
+    /// Push encrypted message to A-B message bucket.
     fn push(
         &mut self,
-        target: impl AsRef<[u8]>,
         enc_msg: EncryptedMessage,
     ) -> impl Future<Output = Result<()>> + Send + 'static {
         let config = config::standard();
         let bytes = bincode::encode_to_vec(enc_msg, config).unwrap();
-        self.push_bytes(target, bytes)
+        self.push_bytes(bytes)
     }
-    /// Fetch encrypted message from target message bucket.
+    /// Fetch encrypted message from B-A message bucket.
     fn fetch(
         &mut self,
-        target: impl AsRef<[u8]>,
         limit: Option<usize>,
     ) -> impl Future<Output = Result<Vec<EncryptedMessage>>> + Send + 'static {
-        let enc_msgs_fut = self.fetch_bytes(target, limit);
+        let enc_msgs_fut = self.fetch_bytes(limit);
         async {
             let enc_msgs = enc_msgs_fut.await?;
             let mut ret = vec![];
