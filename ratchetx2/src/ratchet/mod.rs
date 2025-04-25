@@ -9,7 +9,7 @@ use ring::agreement::EphemeralPrivateKey;
 
 use crate::key::{HeaderKey, MessageKey, SecretKey};
 
-/// Double ratchet
+/// Double ratchet.
 /// # Example
 /// ```
 /// use ratchetx2::SharedKeys;
@@ -25,7 +25,7 @@ use crate::key::{HeaderKey, MessageKey, SecretKey};
 /// let mut alice = shared_keys.alice(&bob.public_key());
 ///
 /// bob.step_dh_root(&alice.public_key());
-/// assert_eq!(alice, bob);
+/// assert_eq!(alice, bob); // Alice and Bob have the "same" state
 /// assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
 /// assert_eq!(alice.step_msgs(), bob.step_msgr());
 ///

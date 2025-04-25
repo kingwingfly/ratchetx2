@@ -89,7 +89,7 @@ impl Transport for RpcTransport {
 
 /// The gRPC server to store and distribute encrypted messages.
 ///
-/// Using BTreeMap as a data structure to store encrypted messages.
+/// Using Vec as a data structure to store encrypted messages.
 pub struct RpcMessageServer {}
 
 impl RpcMessageServer {

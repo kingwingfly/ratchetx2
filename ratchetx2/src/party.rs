@@ -90,7 +90,6 @@ impl<T: Transport> Party<T> {
     /// Push a message.
     /// # Args
     /// - content: the bytes to push, not encrypted
-    /// - aad: additional authenticated data
     pub async fn push(&mut self, content: impl AsRef<[u8]>) -> Result<()> {
         let header = Header {
             public_key: self.ratchetx2.public_key(),
@@ -120,7 +119,7 @@ impl<T: Transport> Party<T> {
         Ok(())
     }
 
-    /// Fetch messgaes.
+    /// Fetch messages.
     ///
     /// Returns decrypted bytes.
     pub async fn fetch(&mut self) -> Result<Vec<Result<Vec<u8>>>> {
