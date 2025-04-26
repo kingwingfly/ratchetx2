@@ -1,6 +1,6 @@
 [package]
 name = "e2ee_chat_ingress"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "An E2EE chat reverse proxy."
 keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
