@@ -3,6 +3,7 @@ use pingora::prelude::*;
 use std::env;
 use tracing::info;
 
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
