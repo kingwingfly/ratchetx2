@@ -1,0 +1,49 @@
+name: publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      ratchet2:
+        description: "publish ratchet2"
+        type: boolean
+        default: false
+      e2ee_chat_server:
+        description: "publish e2ee_chat_server"
+        type: boolean
+        default: false
+      e2ee_chat_client:
+        description: "publish e2ee_chat_client"
+        type: boolean
+        default: false
+      e2ee_chat_ingress:
+        description: "publish e2ee_chat_ingress"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install cargo components
+        run: rustup component add clippy
+
+      - name: login to crates.io
+        run: cargo login ${{ secrets.CRATESIO }}
+
+      - name: publish ratchet2
+        if: ${{ inputs.ratchet2 }}
+        run: .github/scripts/publish_test.sh ratchet2 && .github/scripts/publish.sh ratchet2
+      - name: publish e2ee_chat_server
+        if: ${{ inputs.e2ee_chat_server }}
+        run: .github/scripts/publish_test.sh e2ee_chat_server && .github/scripts/publish.sh e2ee_chat_server
+      - name: publish e2ee_chat_client
+        if: ${{ inputs.e2ee_chat_client }}
+        run: .github/scripts/publish_test.sh e2ee_chat_client && .github/scripts/publish.sh e2ee_chat_client
+      - name: publish e2ee_chat_ingress
+        if: ${{ inputs.e2ee_chat_ingress }}
+        run: .github/scripts/publish_test.sh e2ee_chat_ingress && .github/scripts/publish.sh e2ee_chat_ingress

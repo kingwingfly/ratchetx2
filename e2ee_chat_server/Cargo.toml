@@ -3,6 +3,10 @@ name = "e2ee_chat_server"
 version = "0.1.0"
 edition = "2024"
 description = "An E2EE chat server."
+keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
+license = "MIT"
+authors = ["Louis <836250617@qq.com>"]
+repository = "https://github.com/kingwingfly/ratchetx2"
 
 [dependencies]
 ratchetx2 = { path = "../ratchetx2", version = "0.2" }
