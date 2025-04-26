@@ -29,7 +29,7 @@ impl Message {
                     lines += line.width_cjk() as u16 / width + 1;
                 }
             }
-            MessageContent::Image(_) => todo!(),
+            MessageContent::Image(_) => lines += 16,
         }
         if let MessageState::Error(err) = &self.state {
             lines += err.width_cjk() as u16 / width + 1;

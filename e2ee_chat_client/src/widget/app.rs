@@ -7,6 +7,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Padding},
 };
+use ratatui_image::picker::Picker;
 use ratchetx2::{Party, X3DHClient, transport::RpcTransport};
 use tokio::sync::RwLock as AsyncRwLock;
 use tui_textarea::TextArea;
@@ -20,6 +21,7 @@ use crate::{
 use super::{
     contacts::Contacts,
     conversation::Conversation,
+    explore::{Explore, ExploreState},
     footer::Footer,
     form::Form,
     hint::Hint,
@@ -44,6 +46,10 @@ pub struct AppState {
     pub textareas: Vec<(String, TextArea<'static>)>,
     pub current_activated_textarea: usize,
     pub screen: Screen,
+
+    pub explore_state: ExploreState,
+
+    picker: Picker,
 }
 
 impl AppState {
@@ -63,6 +69,8 @@ impl AppState {
             textareas: vec![],
             current_activated_textarea: 0,
             screen: Screen::default(),
+            explore_state: Default::default(),
+            picker: Picker::from_query_stdio()?,
         })
     }
 }
@@ -120,11 +128,11 @@ impl StatefulWidget for App {
                 .get(state.current_activated_contact)
                 .and_then(|c| conversations_r.get(&c.1))
             {
-                Conversation { messages }.render(
-                    conversation,
-                    buf,
-                    &mut state.current_activated_message,
-                );
+                Conversation {
+                    messages,
+                    picker: &state.picker,
+                }
+                .render(conversation, buf, &mut state.current_activated_message);
             }
         }
 
@@ -160,6 +168,9 @@ impl StatefulWidget for App {
                     },
                 }
                 .render(area, buf, &mut state.current_activated_textarea);
+            }
+            Screen::SelectFile => {
+                PopUpStateful { inner: Explore {} }.render(area, buf, &mut state.explore_state);
             }
         }
     }

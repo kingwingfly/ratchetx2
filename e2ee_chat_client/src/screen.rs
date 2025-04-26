@@ -9,6 +9,7 @@ pub enum Screen {
     Hint(String),
     PushInitMsg,
     HandleInitMsg,
+    SelectFile,
 }
 
 impl fmt::Display for Screen {
@@ -20,6 +21,7 @@ impl fmt::Display for Screen {
             Screen::Hint(msg) => write!(f, "Hint: {}", msg),
             Screen::PushInitMsg => write!(f, "PushInitMsg"),
             Screen::HandleInitMsg => write!(f, "HandleInitMsg"),
+            Screen::SelectFile => write!(f, "SelectFile"),
         }
     }
 }

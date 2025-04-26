@@ -23,7 +23,11 @@ impl StatefulWidget for Form<'_> {
             .constraints([Constraint::Fill(1), Constraint::Length(1)])
             .split(inner);
 
-        Text::from("Tab/↓ | BackTab/↑ | Enter(Submit)")
+        let mut hint = "Enter(Submit)".to_string();
+        if self.fields.len() > 1 {
+            hint.push_str(" | Tab/↓ | BackTab/↑");
+        }
+        Text::from(hint)
             .centered()
             .left_aligned()
             .render(chunks[1], buf);

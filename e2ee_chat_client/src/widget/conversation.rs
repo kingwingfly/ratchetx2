@@ -2,11 +2,15 @@ use ratatui::{
     prelude::*,
     widgets::{Scrollbar, ScrollbarState},
 };
+use ratatui_image::picker::Picker;
 
 use crate::message::Message;
 
+use super::bubble::Bubble;
+
 pub struct Conversation<'a> {
     pub messages: &'a Vec<Message>,
+    pub picker: &'a Picker,
 }
 
 impl StatefulWidget for Conversation<'_> {
@@ -25,7 +29,7 @@ impl StatefulWidget for Conversation<'_> {
         let lines = chunks[0].height;
         let mut used = 0;
         for message in self.messages[..=*state].iter().rev() {
-            let line_num = message.line_num((chunks[0].width * 4 / 5).max(7) - 6) + 2; // border and padding
+            let line_num = message.line_num((chunks[0].width * 3 / 5).max(7) - 6) + 2; // border and padding
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -34,7 +38,11 @@ impl StatefulWidget for Conversation<'_> {
                     Constraint::Length(used),
                 ])
                 .split(chunks[0]);
-            message.render(chunks[1], buf);
+            Bubble {
+                message,
+                picker: self.picker,
+            }
+            .render(chunks[1], buf);
             used += line_num;
             if used >= lines {
                 break;

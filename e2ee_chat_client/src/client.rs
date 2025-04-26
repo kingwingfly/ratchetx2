@@ -36,6 +36,12 @@ pub struct Client {
 
 impl Client {
     pub fn new() -> Result<Self> {
+        let original_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            disable_raw_mode().unwrap();
+            execute!(std::io::stderr(), LeaveAlternateScreen).unwrap();
+            original_hook(panic);
+        }));
         enable_raw_mode()?;
         let mut stderr = std::io::stderr();
         #[cfg(windows)]
@@ -210,7 +216,7 @@ impl Client {
                                                     .insert(identity_key.clone(), party);
                                                 state.contacts.push((name, identity_key));
                                                 state.current_activated_contact =
-                                                    state.contacts.len() - 1;
+                                                    state.contacts.len().saturating_sub(1);
                                                 state.screen = Screen::Main;
                                             }
                                             Err(e) => state.screen = Screen::Hint(e.to_string()),
@@ -231,7 +237,7 @@ impl Client {
                                                     .insert(identity_key.clone(), party);
                                                 state.contacts.push((name, identity_key));
                                                 state.current_activated_contact =
-                                                    state.contacts.len() - 1;
+                                                    state.contacts.len().saturating_sub(1);
                                                 state.screen = Screen::Main;
                                             }
                                             Err(e) => state.screen = Screen::Hint(e.to_string()),
@@ -246,6 +252,31 @@ impl Client {
                             state.textareas[state.current_activated_textarea]
                                 .1
                                 .input(key);
+                        }
+                    },
+                    _ => {}
+                },
+                Screen::SelectFile => match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Esc => state.screen = Screen::Main,
+                        KeyCode::Up => {
+                            state.explore_state.selected =
+                                state.explore_state.selected.saturating_sub(1);
+                        }
+                        KeyCode::Down => {
+                            state.explore_state.selected = (state.explore_state.selected + 1)
+                                .min(state.explore_state.paths.len().saturating_sub(1));
+                        }
+                        KeyCode::Right => state.explore_state.forward(),
+                        KeyCode::Left => state.explore_state.back(),
+                        KeyCode::Enter => {
+                            if let Some(content) = state.explore_state.message() {
+                                let _ = self.send(&mut state, content).await;
+                                state.screen = Screen::Main;
+                            }
+                        }
+                        _ => {
+                            state.explore_state.input(key);
                         }
                     },
                     _ => {}
@@ -303,42 +334,19 @@ impl Client {
                             if key.modifiers == CONTROL
                                 && state.navi.current == Navigation::Input =>
                         {
-                            if let Some((_, key)) =
-                                state.contacts.get(state.current_activated_contact)
-                            {
-                                if let Some(party) = state.parties.write().await.get_mut(key) {
-                                    let content = MessageContent::Text(
-                                        state.chat_textarea.lines().join("\n"),
-                                    );
-                                    let mut textarea = TextArea::default();
-                                    textarea.set_line_number_style(Style::default().gray());
-                                    state.chat_textarea = textarea;
-                                    let message = Message {
-                                        state: match party
-                                            .push(
-                                                bincode::encode_to_vec(
-                                                    &content,
-                                                    config::standard(),
-                                                )
-                                                .unwrap(),
-                                            )
-                                            .await
-                                        {
-                                            Ok(_) => MessageState::Sent,
-                                            Err(e) => MessageState::Error(e.to_string()),
-                                        },
-                                        content,
-                                    };
-                                    state
-                                        .conversations
-                                        .write()
-                                        .entry(key.clone())
-                                        .or_default()
-                                        .push(message);
-                                    state.current_activated_message =
-                                        state.conversations.read()[key].len() - 1;
-                                }
+                            let content =
+                                MessageContent::Text(state.chat_textarea.lines().join("\n"));
+                            if self.send(&mut state, content).await {
+                                let mut textarea = TextArea::default();
+                                textarea.set_line_number_style(Style::default().gray());
+                                state.chat_textarea = textarea;
                             }
+                        }
+                        KeyCode::Char('e')
+                            if key.modifiers == CONTROL
+                                && state.navi.current == Navigation::Input =>
+                        {
+                            state.screen = Screen::SelectFile;
                         }
                         KeyCode::Esc if state.navi.current != Navigation::Contacts => {
                             state.navi.left()
@@ -354,6 +362,36 @@ impl Client {
             }
         }
         Ok(())
+    }
+
+    /// true: tried sending
+    /// false: did not send at all
+    #[must_use = "Clean textarea according to the result."]
+    async fn send(&mut self, state: &mut AppState, content: MessageContent) -> bool {
+        if let Some((_, key)) = state.contacts.get(state.current_activated_contact) {
+            if let Some(party) = state.parties.write().await.get_mut(key) {
+                let message = Message {
+                    state: match party
+                        .push(bincode::encode_to_vec(&content, config::standard()).unwrap())
+                        .await
+                    {
+                        Ok(_) => MessageState::Sent,
+                        Err(e) => MessageState::Error(e.to_string()),
+                    },
+                    content,
+                };
+                state
+                    .conversations
+                    .write()
+                    .entry(key.clone())
+                    .or_default()
+                    .push(message);
+                state.current_activated_message =
+                    state.conversations.read()[key].len().saturating_sub(1);
+                return true;
+            }
+        }
+        false
     }
 }
 

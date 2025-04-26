@@ -1,12 +1,12 @@
 pub mod app;
+pub mod bubble;
 pub mod connecting;
 pub mod contacts;
 pub mod conversation;
+pub mod explore;
 pub mod footer;
 pub mod form;
-pub mod header;
 pub mod hint;
-pub mod message;
 pub mod pop_up;
 pub mod quit;
 pub mod setting;

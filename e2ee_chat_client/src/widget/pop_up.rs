@@ -18,8 +18,8 @@ impl<W: Widget> Widget for PopUp<W> {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Fill(1),
-                        Constraint::Fill(1),
-                        Constraint::Fill(1),
+                        Constraint::Fill(4),
+                        Constraint::Percentage(30),
                     ])
                     .split(area)[1],
             )[1];
@@ -48,8 +48,8 @@ impl<W: StatefulWidget> StatefulWidget for PopUpStateful<W> {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Fill(1),
-                        Constraint::Fill(1),
-                        Constraint::Fill(1),
+                        Constraint::Fill(4),
+                        Constraint::Percentage(30),
                     ])
                     .split(area)[1],
             )[1];

@@ -1,3 +1,18 @@
 [workspace]
-members = [ "e2ee_chat_client", "e2ee_chat_server", "e2ee_chat_ingress","ratchetx2"]
+members = [
+    "e2ee_chat_client",
+    "e2ee_chat_server",
+    "e2ee_chat_ingress",
+    "ratchetx2",
+]
 resolver = "2"
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.release]
+lto = "fat"
+opt-level = 3
+codegen-units = 1
+strip = "debuginfo"
+panic = "abort"

@@ -13,9 +13,12 @@ impl StatefulWidget for Footer {
                 Line::default().spans([Span::raw("Tab").underlined(), Span::raw("(Settings)")])
             }
             Navigation::Conversation => Line::default().spans([Span::raw("↑"), Span::raw("↓ ")]),
-            Navigation::Input => {
-                Line::default().spans([Span::raw("^s").underlined(), Span::raw("(Send)")])
-            }
+            Navigation::Input => Line::default().spans([
+                Span::raw("^S").underlined(),
+                Span::raw("end | "),
+                Span::raw("^E").underlined(),
+                Span::raw("xplore"),
+            ]),
         }
         .gray()
         .right_aligned()
