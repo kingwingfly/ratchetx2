@@ -1,14 +1,8 @@
 Start gRPC Message and X3DH server.
 
-```sh
-An E2EE chat server.
-
-Usage: e2ee_chat_server [LISTENING_ON]
-
-Arguments:
-  [LISTENING_ON]  The E2EE chat server address [default: 127.0.0.1:8080]
-
-Options:
-  -h, --help     Print help
-  -V, --version  Print version
+```rust
+// "UPSTREAM" of Pingora reverse proxy
+let upstream_addr = env::var("UPSTREAM_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
+let cert_path = env::var("TLS_CERT_PATH").unwrap_or_else(|_| "cert/cert.pem".to_string());
+let key_path = env::var("TLS_KEY_PATH").unwrap_or_else(|_| "cert/key.pem".to_string());
 ```

@@ -57,8 +57,8 @@ use ring::agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephe
 use ring::hkdf::{HKDF_SHA256, KeyType, Salt};
 use ring::rand::SystemRandom;
 use tonic::Status;
-use tonic::transport::Channel;
 use tonic::transport::Server;
+use tonic::transport::{Channel, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Result as RpcResult};
 use x3dh_rpc::x3dh_service_client::X3dhServiceClient;
 use x3dh_rpc::x3dh_service_server::{X3dhService, X3dhServiceServer};
@@ -323,9 +323,15 @@ pub struct RpcX3DHServer {}
 
 impl RpcX3DHServer {
     /// Run a RpcX3DHServer listening on addr.
-    pub async fn run(addr: impl AsRef<str>) -> Result<()> {
+    pub async fn run(
+        addr: impl AsRef<str>,
+        cert: impl AsRef<[u8]>,
+        key: impl AsRef<[u8]>,
+    ) -> Result<()> {
         let addr = addr.as_ref().parse().unwrap();
         Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
+            .map_err(|_| TransportError::Server)?
             .add_service(X3dhServiceServer::new(RpcX3DHInner::default()))
             .serve(addr)
             .await

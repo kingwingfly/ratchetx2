@@ -15,8 +15,8 @@ use message_rpc::message_service_server::{MessageService, MessageServiceServer};
 use message_rpc::{
     FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse,
 };
-use tonic::transport::Channel;
 use tonic::transport::Server;
+use tonic::transport::{Channel, Identity, ServerTlsConfig};
 use tonic::{Request, Response, Result as RpcResult};
 
 use super::Transport;
@@ -94,9 +94,15 @@ pub struct RpcMessageServer {}
 
 impl RpcMessageServer {
     /// Run a RpcMessageServer listening on addr.
-    pub async fn run(addr: impl AsRef<str>) -> Result<()> {
+    pub async fn run(
+        addr: impl AsRef<str>,
+        cert: impl AsRef<[u8]>,
+        key: impl AsRef<[u8]>,
+    ) -> Result<()> {
         let addr = addr.as_ref().parse().unwrap();
         Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
+            .map_err(|_| TransportError::Server)?
             .add_service(MessageServiceServer::new(RpcMessageServerInner::default()))
             .serve(addr)
             .await

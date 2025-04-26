@@ -23,6 +23,9 @@ spec:
   containers:
     - name: e2ee_chat_server
       image: e2ee_chat_server
+      envFrom:
+        - configMapRef:
+            name: config
 
     - name: e2ee_chat_ingress
       image: e2ee_chat_ingress
