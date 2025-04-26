@@ -44,7 +44,11 @@ impl Widget for &Message {
                     lines.push(Line::default().spans([Span::raw(e)]).yellow());
                 }
                 let mut p = Paragraph::new(lines)
-                    .block(Block::bordered().padding(Padding::horizontal(2)))
+                    .block(
+                        Block::bordered()
+                            .padding(Padding::horizontal(2))
+                            .border_style(Style::default().fg(Color::Gray)),
+                    )
                     .wrap(Wrap::default());
                 p = match self.state {
                     MessageState::Sent => p.right_aligned(),

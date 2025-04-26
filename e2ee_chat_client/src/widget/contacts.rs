@@ -4,7 +4,7 @@ use ratatui::{
 };
 
 pub struct Contacts<'a> {
-    pub contacts: &'a Vec<String>,
+    pub contacts: &'a Vec<(String, Vec<u8>)>,
 }
 
 impl StatefulWidget for Contacts<'_> {
@@ -33,7 +33,7 @@ impl StatefulWidget for Contacts<'_> {
             .take(lines)
             .enumerate()
         {
-            let mut text = Text::from(contact.as_str());
+            let mut text = Text::from(contact.0.as_str());
             if i == (*state % lines) {
                 text = text.fg(Color::Green).underlined();
             }

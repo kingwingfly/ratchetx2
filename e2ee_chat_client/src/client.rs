@@ -1,5 +1,6 @@
 use anyhow::Result;
 use base64::prelude::*;
+use bincode::config;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -13,6 +14,7 @@ use ratchetx2::X3DHClient;
 use tui_textarea::TextArea;
 
 use std::io::Stderr;
+use std::time::Duration;
 
 use crate::{
     message::{Message, MessageContent, MessageState},
@@ -72,6 +74,39 @@ impl Client {
                 return Ok(());
             }
         };
+
+        let parties = state.parties.clone();
+        let conversations = state.conversations.clone();
+        tokio::spawn(async move {
+            let mut sync = true;
+            loop {
+                tokio::select! {
+                    _ = async {
+                        for (key, party) in parties.write().await.iter_mut() {
+                            if let Ok(messages) = party.fetch().await {
+                                for message in messages.into_iter().filter_map(|m| m.ok()) {
+                                    if let Ok((content, _)) = bincode::decode_from_slice::<MessageContent, _>(
+                                        &message,
+                                        config::standard(),
+                                    ) {
+                                        conversations
+                                            .write()
+                                            .entry(key.clone())
+                                            .or_default()
+                                            .push(Message {
+                                                content,
+                                                state: MessageState::Recved,
+                                            });
+                                    }
+                                }
+                            }
+                        }
+                    }, if sync => sync = false,
+                    _ = tokio::time::sleep(Duration::from_secs(8)), if !sync => sync = true,
+                }
+            }
+        });
+
         loop {
             self.terminal.draw(|f| {
                 f.render_stateful_widget(App {}, f.area(), &mut state);
@@ -168,8 +203,12 @@ impl Client {
                                             .await
                                         {
                                             Ok(party) => {
-                                                state.parties.insert(name.to_owned(), party);
-                                                state.contacts.push(name);
+                                                state
+                                                    .parties
+                                                    .write()
+                                                    .await
+                                                    .insert(identity_key.clone(), party);
+                                                state.contacts.push((name, identity_key));
                                                 state.current_activated_contact =
                                                     state.contacts.len() - 1;
                                                 state.screen = Screen::Main;
@@ -185,8 +224,12 @@ impl Client {
                                             .await
                                         {
                                             Ok(party) => {
-                                                state.parties.insert(name.to_owned(), party);
-                                                state.contacts.push(name);
+                                                state
+                                                    .parties
+                                                    .write()
+                                                    .await
+                                                    .insert(identity_key.clone(), party);
+                                                state.contacts.push((name, identity_key));
                                                 state.current_activated_contact =
                                                     state.contacts.len() - 1;
                                                 state.screen = Screen::Main;
@@ -219,13 +262,27 @@ impl Client {
                         KeyCode::Up if state.navi.current == Navigation::Contacts => {
                             state.current_activated_contact =
                                 state.current_activated_contact.saturating_sub(1);
+                            if let Some(len) = state
+                                .contacts
+                                .get(state.current_activated_contact)
+                                .and_then(|c| state.conversations.read().get(&c.1).map(|m| m.len()))
+                            {
+                                state.current_activated_message = len.saturating_sub(1);
+                            }
                         }
                         KeyCode::Down if state.navi.current == Navigation::Contacts => {
                             state.current_activated_contact =
                                 (state.contacts.len().saturating_sub(1))
                                     .min(state.current_activated_contact + 1);
+                            if let Some(len) = state
+                                .contacts
+                                .get(state.current_activated_contact)
+                                .and_then(|c| state.conversations.read().get(&c.1).map(|m| m.len()))
+                            {
+                                state.current_activated_message = len.saturating_sub(1);
+                            }
                         }
-                        KeyCode::Enter if state.navi.current == Navigation::Contacts => {
+                        KeyCode::Enter if state.navi.current != Navigation::Input => {
                             state.navi.down();
                         }
                         KeyCode::Up if state.navi.current == Navigation::Conversation => {
@@ -233,41 +290,53 @@ impl Client {
                                 state.current_activated_message.saturating_sub(1);
                         }
                         KeyCode::Down if state.navi.current == Navigation::Conversation => {
-                            if let Some(messages) = state
+                            if let Some(len) = state
                                 .contacts
                                 .get(state.current_activated_contact)
-                                .and_then(|c| state.conversation.get(c))
+                                .and_then(|c| state.conversations.read().get(&c.1).map(|m| m.len()))
                             {
-                                state.current_activated_message =
-                                    (messages.len().saturating_sub(1))
-                                        .min(state.current_activated_message + 1);
+                                state.current_activated_message = (len.saturating_sub(1))
+                                    .min(state.current_activated_message + 1);
                             }
                         }
                         KeyCode::Char('s')
                             if key.modifiers == CONTROL
                                 && state.navi.current == Navigation::Input =>
                         {
-                            if let Some(name) = state.contacts.get(state.current_activated_contact)
+                            if let Some((_, key)) =
+                                state.contacts.get(state.current_activated_contact)
                             {
-                                if let Some(party) = state.parties.get_mut(name) {
-                                    let content = state.chat_textarea.lines().join("\n");
+                                if let Some(party) = state.parties.write().await.get_mut(key) {
+                                    let content = MessageContent::Text(
+                                        state.chat_textarea.lines().join("\n"),
+                                    );
                                     let mut textarea = TextArea::default();
                                     textarea.set_line_number_style(Style::default().gray());
                                     state.chat_textarea = textarea;
                                     let message = Message {
-                                        content: MessageContent::Text(content.clone()),
-                                        state: match party.push(content.to_owned()).await {
+                                        state: match party
+                                            .push(
+                                                bincode::encode_to_vec(
+                                                    &content,
+                                                    config::standard(),
+                                                )
+                                                .unwrap(),
+                                            )
+                                            .await
+                                        {
                                             Ok(_) => MessageState::Sent,
                                             Err(e) => MessageState::Error(e.to_string()),
                                         },
+                                        content,
                                     };
                                     state
-                                        .conversation
-                                        .entry(name.to_owned())
+                                        .conversations
+                                        .write()
+                                        .entry(key.clone())
                                         .or_default()
                                         .push(message);
                                     state.current_activated_message =
-                                        state.conversation[name].len() - 1;
+                                        state.conversations.read()[key].len() - 1;
                                 }
                             }
                         }

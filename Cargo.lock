@@ -597,8 +597,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "bincode",
  "clap 4.5.37",
  "crossterm",
+ "parking_lot",
  "ratatui",
  "ratchetx2",
  "tokio",
@@ -1611,6 +1613,7 @@ dependencies = [
  "bincode",
  "curve25519-dalek",
  "futures",
+ "parking_lot",
  "prost",
  "ring",
  "thiserror 2.0.12",

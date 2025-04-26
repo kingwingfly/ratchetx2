@@ -129,7 +129,7 @@ impl<T: Transport> Party<T> {
     ///
     /// Returns decrypted bytes.
     pub async fn fetch(&mut self) -> Result<Vec<Result<Vec<u8>>>> {
-        let encrypted_messages = self.transport.fetch(&self.associated_data).await?;
+        let encrypted_messages = self.transport.fetch(&self.associated_data, None).await?;
         let decrypted_messages = encrypted_messages
             .into_iter()
             .map(|encrypted_message| {

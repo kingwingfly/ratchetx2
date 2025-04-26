@@ -32,6 +32,7 @@ pub trait Transport {
     fn fetch_bytes(
         &mut self,
         target: impl AsRef<[u8]>,
+        limit: Option<usize>,
     ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static;
     /// Push encrypted message to target message bucket.
     fn push(
@@ -47,8 +48,9 @@ pub trait Transport {
     fn fetch(
         &mut self,
         target: impl AsRef<[u8]>,
+        limit: Option<usize>,
     ) -> impl Future<Output = Result<Vec<EncryptedMessage>>> + Send + 'static {
-        let enc_msgs_fut = self.fetch_bytes(target);
+        let enc_msgs_fut = self.fetch_bytes(target, limit);
         async {
             let enc_msgs = enc_msgs_fut.await?;
             let mut ret = vec![];

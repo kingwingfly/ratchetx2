@@ -20,12 +20,12 @@ impl StatefulWidget for Setting {
             .padding(Padding::proportional(2));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(2)])
+            .constraints([Constraint::Fill(1), Constraint::Length(1)])
             .split(block.inner(area));
         block.render(area, buf);
         Widget::render(
             Table::default()
-                .widths([Constraint::Fill(1), Constraint::Min(44)])
+                .widths([Constraint::Max(32), Constraint::Min(44)])
                 .header(
                     Row::new([Cell::from("Setting"), Cell::from("Value")])
                         .bottom_margin(1)
@@ -57,6 +57,7 @@ impl StatefulWidget for Setting {
             ])
             .centered()
             .gray()
+            .left_aligned()
             .render(chunks[1], buf);
     }
 }

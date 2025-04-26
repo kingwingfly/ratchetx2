@@ -9,9 +9,9 @@ impl<W: Widget> Widget for PopUp<W> {
         let pop_up = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
+                Constraint::Percentage(15),
                 Constraint::Fill(1),
-                Constraint::Fill(2),
-                Constraint::Fill(1),
+                Constraint::Percentage(5),
             ])
             .split(
                 Layout::default()
@@ -39,9 +39,9 @@ impl<W: StatefulWidget> StatefulWidget for PopUpStateful<W> {
         let pop_up = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
+                Constraint::Percentage(15),
                 Constraint::Fill(1),
-                Constraint::Fill(2),
-                Constraint::Fill(1),
+                Constraint::Percentage(5),
             ])
             .split(
                 Layout::default()

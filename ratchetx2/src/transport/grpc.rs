@@ -5,9 +5,10 @@ pub(crate) mod message_rpc {
     tonic::include_proto!("message");
 }
 
-use std::collections::{BTreeMap, HashMap};
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 use message_rpc::message_service_client::MessageServiceClient;
 use message_rpc::message_service_server::{MessageService, MessageServiceServer};
@@ -24,7 +25,7 @@ use crate::error::{Result, TransportError};
 /// Message transport gRPC client.
 pub struct RpcTransport {
     rpc_client: MessageServiceClient<Channel>,
-    last_sync_timestamp: Arc<AtomicU64>,
+    last_sync_id: Arc<AtomicU64>,
 }
 
 impl RpcTransport {
@@ -34,7 +35,7 @@ impl RpcTransport {
             rpc_client: MessageServiceClient::connect(dst.as_ref().to_owned())
                 .await
                 .map_err(|_| TransportError::Connect)?,
-            last_sync_timestamp: Arc::new(AtomicU64::default()),
+            last_sync_id: Arc::new(AtomicU64::default()),
         })
     }
 }
@@ -63,25 +64,21 @@ impl Transport for RpcTransport {
     fn fetch_bytes(
         &mut self,
         target: impl AsRef<[u8]>,
+        limit: Option<usize>,
     ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
         let req = FetchMessagesRequest {
             target: target.as_ref().to_vec(),
-            last_sync_timestamp: self.last_sync_timestamp.load(Ordering::Relaxed),
+            last_sync_id: self.last_sync_id.load(Ordering::Relaxed),
+            limit: limit.map(|limit| limit as u64),
         };
         let mut client = self.rpc_client.clone();
-        let last_sync_timestamp = self.last_sync_timestamp.clone();
+        let last_sync_id = self.last_sync_id.clone();
         async move {
             let resp = client
                 .fetch_messages(req)
                 .await
                 .map_err(|_| TransportError::Fetch)?;
-            last_sync_timestamp.store(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-                Ordering::Relaxed,
-            );
+            last_sync_id.fetch_add(resp.get_ref().enc_messages.len() as u64, Ordering::Relaxed);
             Ok(resp.into_inner().enc_messages)
         }
     }
@@ -108,7 +105,7 @@ impl RpcMessageServer {
 #[allow(clippy::type_complexity)]
 #[derive(Debug, Default)]
 pub(crate) struct RpcMessageServerInner {
-    db: RwLock<HashMap<Vec<u8>, Arc<RwLock<BTreeMap<u64, Vec<u8>>>>>>,
+    db: RwLock<HashMap<Vec<u8>, Arc<RwLock<Vec<Vec<u8>>>>>>,
 }
 
 #[tonic::async_trait]
@@ -118,21 +115,8 @@ impl MessageService for RpcMessageServerInner {
         request: Request<PushMessageRequest>,
     ) -> RpcResult<Response<PushMessageResponse>> {
         let req = request.into_inner();
-        let map = {
-            self.db
-                .write()
-                .unwrap()
-                .entry(req.target)
-                .or_default()
-                .clone()
-        };
-        map.write().unwrap().insert(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            req.enc_message,
-        );
+        let q = self.db.write().entry(req.target).or_default().clone();
+        q.write().push(req.enc_message);
         Ok(Response::new(PushMessageResponse {}))
     }
 
@@ -141,20 +125,18 @@ impl MessageService for RpcMessageServerInner {
         request: Request<FetchMessagesRequest>,
     ) -> RpcResult<Response<FetchMessagesResponse>> {
         let req = request.into_inner();
-        let map = {
-            self.db
-                .write()
-                .unwrap()
-                .entry(req.target)
-                .or_default()
-                .clone()
-        };
-        let enc_messages = map
-            .read()
-            .unwrap()
-            .range(req.last_sync_timestamp..)
-            .map(|(_, v)| v.clone())
-            .collect::<Vec<_>>();
+        let q = self.db.write().entry(req.target).or_default().clone();
+        let q = q.read();
+        let enc_messages = q
+            .get(
+                req.last_sync_id as usize
+                    ..req
+                        .limit
+                        .map(|limit| ((req.last_sync_id + limit) as usize).max(q.len()))
+                        .unwrap_or(q.len()),
+            )
+            .map(|x| x.to_vec())
+            .unwrap_or_default();
         Ok(Response::new(FetchMessagesResponse { enc_messages }))
     }
 }
@@ -179,12 +161,14 @@ mod test {
             enc_content: vec![4, 5, 6],
         };
         alice.push("AliceBob", msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch("AliceBob").await.unwrap()[0], msg);
+        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
+        alice.push("AliceBob", msg.clone()).await.unwrap();
+        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
         alice.push("AliceBob", msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch("AliceBob").await.unwrap()[0], msg);
+        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
     }
 }

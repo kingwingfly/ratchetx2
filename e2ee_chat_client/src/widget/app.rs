@@ -1,11 +1,14 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
+use parking_lot::RwLock;
 use ratatui::{
     prelude::*,
     widgets::{Block, Padding},
 };
 use ratchetx2::{Party, X3DHClient, transport::RpcTransport};
+use tokio::sync::RwLock as AsyncRwLock;
 use tui_textarea::TextArea;
 
 use crate::{
@@ -28,10 +31,11 @@ use super::{
 pub struct AppState {
     pub x3dh_client: X3DHClient,
 
-    pub parties: HashMap<String, Party<RpcTransport>>,
-    pub contacts: Vec<String>,
+    /// (Name, PublicKey)
+    pub contacts: Vec<(String, Vec<u8>)>,
+    pub parties: Arc<AsyncRwLock<HashMap<Vec<u8>, Party<RpcTransport>>>>,
     pub current_activated_contact: usize,
-    pub conversation: HashMap<String, Vec<Message>>,
+    pub conversations: Arc<RwLock<HashMap<Vec<u8>, Vec<Message>>>>,
     pub current_activated_message: usize,
 
     pub server_addr: String,
@@ -48,10 +52,10 @@ impl AppState {
         text_area.set_line_number_style(Style::default().gray());
         Ok(Self {
             x3dh_client: X3DHClient::connect(&server_addr).await?,
-            parties: HashMap::default(),
             contacts: vec![],
+            parties: Default::default(),
             current_activated_contact: 0,
-            conversation: HashMap::default(),
+            conversations: Default::default(),
             current_activated_message: 0,
             server_addr: server_addr.as_ref().to_owned(),
             navi: Navigator::default(),
@@ -84,7 +88,7 @@ impl StatefulWidget for App {
 
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(20), Constraint::Fill(1)])
+            .constraints([Constraint::Percentage(10), Constraint::Fill(1)])
             .split(chunks[1]);
 
         let mut contacts_block = Block::bordered().title("Contacts");
@@ -109,16 +113,19 @@ impl StatefulWidget for App {
         }
         let conversation = conversation_block.inner(chunks[0]);
         conversation_block.render(chunks[0], buf);
-        if let Some(messages) = state
-            .contacts
-            .get(state.current_activated_contact)
-            .and_then(|c| state.conversation.get_mut(c))
         {
-            Conversation { messages }.render(
-                conversation,
-                buf,
-                &mut state.current_activated_message,
-            );
+            let conversations_r = state.conversations.read();
+            if let Some(messages) = state
+                .contacts
+                .get(state.current_activated_contact)
+                .and_then(|c| conversations_r.get(&c.1))
+            {
+                Conversation { messages }.render(
+                    conversation,
+                    buf,
+                    &mut state.current_activated_message,
+                );
+            }
         }
 
         let mut textarea_block = Block::bordered().padding(Padding::proportional(1));

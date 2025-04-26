@@ -52,6 +52,7 @@ pub(crate) mod x3dh_rpc {
 use std::collections::HashMap;
 
 use bincode::{Decode, Encode};
+use parking_lot::RwLock;
 use ring::agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephemeral};
 use ring::hkdf::{HKDF_SHA256, KeyType, Salt};
 use ring::rand::SystemRandom;
@@ -254,7 +255,7 @@ impl X3DHClient {
         let mut messgae_transport = RpcTransport::connect(message_server_addr).await?;
         let (initial_message, _): (InitMassage, _) = bincode::decode_from_slice(
             messgae_transport
-                .fetch_bytes(&associated_data)
+                .fetch_bytes(&associated_data, Some(1))
                 .await?
                 .first()
                 .ok_or(Error::Failed("No initial message found.".to_string()))?,
@@ -339,7 +340,7 @@ impl RpcX3DHServer {
 
 #[derive(Debug, Default)]
 pub(crate) struct RpcX3DHInner {
-    db: std::sync::RwLock<HashMap<Vec<u8>, PublishedKeys>>,
+    db: RwLock<HashMap<Vec<u8>, PublishedKeys>>,
 }
 
 #[derive(Debug)]
@@ -356,7 +357,7 @@ impl X3dhService for RpcX3DHInner {
         request: Request<PublishKeysRequest>,
     ) -> RpcResult<Response<PublishKeysResponse>> {
         let keys = request.into_inner();
-        self.db.write().unwrap().insert(
+        self.db.write().insert(
             keys.identity_key_bob.clone(),
             PublishedKeys {
                 prekey: keys.prekey,
@@ -372,7 +373,7 @@ impl X3dhService for RpcX3DHInner {
         request: Request<FetchKeysRequest>,
     ) -> RpcResult<Response<FetchKeysResponse>> {
         let identity_key_bob = request.into_inner().identity_key_bob;
-        match self.db.write().unwrap().get_mut(&identity_key_bob) {
+        match self.db.write().get_mut(&identity_key_bob) {
             Some(keys) => Ok(Response::new(FetchKeysResponse {
                 identity_key_bob,
                 prekey: keys.prekey.clone(),

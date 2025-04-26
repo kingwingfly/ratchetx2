@@ -1,3 +1,4 @@
+use bincode::{Decode, Encode};
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug)]
@@ -13,7 +14,7 @@ pub enum MessageState {
     Error(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Decode, Encode)]
 pub enum MessageContent {
     Text(String),
     Image(Vec<u8>),

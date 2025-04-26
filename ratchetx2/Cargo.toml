@@ -23,6 +23,7 @@ thiserror = "2.0"
 tracing = "0.1"
 tonic = "0.13"
 prost = "0.13"
+parking_lot = "0.12"
 
 [build-dependencies]
 tonic-build = "0.13"

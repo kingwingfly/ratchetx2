@@ -16,7 +16,8 @@ message PushMessageResponse {
 
 message FetchMessagesRequest {
     bytes target = 1;
-    uint64 last_sync_timestamp = 2;
+    uint64 last_sync_id = 2;
+    optional uint64 limit = 3;
 }
 
 message FetchMessagesResponse {

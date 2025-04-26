@@ -20,11 +20,12 @@ impl StatefulWidget for Form<'_> {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Fill(1), Constraint::Length(2)])
+            .constraints([Constraint::Fill(1), Constraint::Length(1)])
             .split(inner);
 
         Text::from("Tab/↓ | BackTab/↑ | Enter(Submit)")
             .centered()
+            .left_aligned()
             .render(chunks[1], buf);
 
         let chunks = Layout::default()
@@ -35,7 +36,7 @@ impl StatefulWidget for Form<'_> {
         for (i, (label, textarea)) in self.fields.iter().enumerate() {
             let line_chunks = Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints(vec![Constraint::Fill(1), Constraint::Min(48)])
+                .constraints([Constraint::Max(32), Constraint::Min(44)])
                 .split(chunks[i]);
 
             let mut text = Text::from(label.as_str()).bold();

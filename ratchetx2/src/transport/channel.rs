@@ -1,8 +1,9 @@
 //! Transport implementation with futures::channel::mpsc.
 
 use futures::channel::mpsc::{Receiver, Sender, channel};
+use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use super::Transport;
 use crate::error::Result;
@@ -32,7 +33,6 @@ impl Transport for ChannelTransport {
         let mut tx = {
             self.channels
                 .write()
-                .unwrap()
                 .entry(target.as_ref().to_vec())
                 .or_insert(channel(1024))
                 .0
@@ -45,15 +45,21 @@ impl Transport for ChannelTransport {
     fn fetch_bytes(
         &mut self,
         target: impl AsRef<[u8]>,
+        limit: Option<usize>,
     ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
         let mut ret = vec![];
-        let mut channels = self.channels.write().unwrap();
+        let mut channels = self.channels.write();
         let rx = &mut channels
             .entry(target.as_ref().to_vec())
             .or_insert(channel(1024))
             .1;
         while let Ok(Some(enc_msg)) = rx.try_next() {
             ret.push(enc_msg);
+            if let Some(limit) = limit {
+                if ret.len() == limit {
+                    break;
+                }
+            }
         }
         async { Ok(ret) }
     }
@@ -73,12 +79,12 @@ mod test {
             enc_content: vec![4, 5, 6],
         };
         alice.push("AliceBob", msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch("AliceBob").await.unwrap()[0], msg);
+        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
         alice.push("AliceBob", msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch("AliceBob").await.unwrap()[0], msg);
+        assert_eq!(bob.fetch("AliceBob", None).await.unwrap()[0], msg);
     }
 }
