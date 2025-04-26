@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Protoc Linux
         if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: apt install -y protobuf-compiler
+        run: sudo apt install -y protobuf-compiler
       - name: Install Protoc Mac
         if: ${{ matrix.os == 'macos-latest' }}
         run: brew install protobuf
