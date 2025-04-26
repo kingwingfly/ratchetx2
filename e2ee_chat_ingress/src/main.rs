@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use pingora::prelude::*;
+use pingora::{prelude::*, protocols::ALPN};
 use std::env;
 use tracing::info;
 
@@ -22,8 +22,9 @@ impl ProxyHttp for ReverseProxy {
         _session: &mut Session,
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let peer = Box::new(HttpPeer::new(&self.upstream_addr, false, "".to_string()));
-        Ok(peer)
+        let mut grpc_peer = HttpPeer::new(&self.upstream_addr, false, "".to_string());
+        grpc_peer.options.alpn = ALPN::H2;
+        Ok(Box::new(grpc_peer))
     }
 }
 
