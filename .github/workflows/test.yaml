@@ -35,7 +35,7 @@ jobs:
         run: rustup component add clippy
 
       - name: Install Protoc
-        run: apt install -y protobuf-compiler
+        run: sudo apt install -y protobuf-compiler
 
       - name: Run build
         if: steps.cache-cargo-restore.outputs.cache-hit != 'true'

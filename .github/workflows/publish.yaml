@@ -36,7 +36,7 @@ jobs:
         run: cargo login ${{ secrets.CRATESIO }}
 
       - name: Install Protoc
-        run: apt install -y protobuf-compiler
+        run: sudo apt install -y protobuf-compiler
 
       - name: publish ratchet2
         if: ${{ inputs.ratchet2 }}
