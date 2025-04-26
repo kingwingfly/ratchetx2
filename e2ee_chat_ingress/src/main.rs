@@ -29,7 +29,7 @@ impl ProxyHttp for ReverseProxy {
 
 fn main() {
     let filter = tracing_subscriber::filter::EnvFilter::from_default_env()
-        .add_directive("ingress=info".parse().unwrap());
+        .add_directive("e2ee_chat_ingress=info".parse().unwrap());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stdout)
