@@ -15,8 +15,8 @@ use message_rpc::message_service_server::{MessageService, MessageServiceServer};
 use message_rpc::{
     FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse,
 };
-use tonic::transport::Channel;
 use tonic::transport::Server;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Request, Response, Result as RpcResult};
 
 use super::Transport;
@@ -33,14 +33,19 @@ pub struct RpcTransport {
 impl RpcTransport {
     /// Connect to a message gRPC server.
     pub async fn connect(
-        dst: impl AsRef<str>,
+        msg_server_addr: impl AsRef<str>,
         my_identity_key: &[u8],
         peer_identity_key: &[u8],
     ) -> Result<Self> {
         Ok(Self {
-            rpc_client: MessageServiceClient::connect(dst.as_ref().to_owned())
-                .await
-                .map_err(|_| TransportError::Connect)?,
+            rpc_client: MessageServiceClient::new(
+                Channel::builder(msg_server_addr.as_ref().try_into().unwrap())
+                    .tls_config(ClientTlsConfig::new())
+                    .map_err(|_| TransportError::Connect)?
+                    .connect()
+                    .await
+                    .map_err(|_| TransportError::Connect)?,
+            ),
             last_sync_id: Arc::new(AtomicU64::default()),
             push_target: [my_identity_key, peer_identity_key].concat().to_vec(),
             fetch_target: [peer_identity_key, my_identity_key].concat().to_vec(),

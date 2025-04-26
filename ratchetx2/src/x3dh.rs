@@ -57,8 +57,8 @@ use ring::agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephe
 use ring::hkdf::{HKDF_SHA256, KeyType, Salt};
 use ring::rand::SystemRandom;
 use tonic::Status;
-use tonic::transport::Channel;
 use tonic::transport::Server;
+use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Request, Response, Result as RpcResult};
 use x3dh_rpc::x3dh_service_client::X3dhServiceClient;
 use x3dh_rpc::x3dh_service_server::{X3dhService, X3dhServiceServer};
@@ -82,9 +82,14 @@ impl X3DHClient {
     /// Connect to a X3DH gRPC server.
     pub async fn connect(x3dh_server_addr: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
-            rpc_client: X3dhServiceClient::connect(x3dh_server_addr.as_ref().to_owned())
-                .await
-                .map_err(|_| TransportError::Connect)?,
+            rpc_client: X3dhServiceClient::new(
+                Channel::builder(x3dh_server_addr.as_ref().try_into().unwrap())
+                    .tls_config(ClientTlsConfig::new())
+                    .map_err(|_| TransportError::Connect)?
+                    .connect()
+                    .await
+                    .map_err(|_| TransportError::Connect)?,
+            ),
             private_identity_key: XEdDSAPrivateKey::generate(&SystemRandom::new()),
             prekeys: HashMap::new(),
             one_time_prekeys: HashMap::new(),
