@@ -1,0 +1,28 @@
+FROM docker.io/rust:1.86.0-alpine AS ingress-builder
+
+RUN apk update \
+    && apk add --no-cache --purge protobuf make cmake gcc g++ libc-dev pkgconfig
+
+WORKDIR /build
+
+COPY . .
+
+RUN cargo build --release
+
+########################################
+
+FROM docker.io/alpine:latest AS ingress
+
+WORKDIR /app
+
+RUN apk update \
+    && apk add --no-cache --purge bash
+
+COPY --from=ingress-builder /build/target/release/e2ee_chat_ingress .
+
+VOLUME [ "/app/cert" ]
+
+STOPSIGNAL SIGQUIT
+EXPOSE 443
+
+ENTRYPOINT ["./e2ee_chat_ingress"]

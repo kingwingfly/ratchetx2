@@ -23,6 +23,45 @@ jobs:
           # (required) GitHub token for creating GitHub Releases.
           token: ${{ secrets.GITHUB_TOKEN }}
 
+  build-images:
+    needs: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: setup podman
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman
+      - name: retrieve version
+        id: version
+        run: |
+          echo "SERVER=$(cargo pkgid -p e2ee_chat_server | sed -n "s/.*[#|@]//p")" >> "$GITHUB_OUTPUT"
+          echo "INGRESS=$(cargo pkgid -p e2ee_chat_ingress | sed -n "s/.*[#|@]//p")" >> "$GITHUB_OUTPUT"
+      - name: build server images
+        env:
+          VERSION: ${{ steps.version.outputs.SERVER }}
+        run: |
+          podman build --target server -t e2ee_chat_server:$VERSION --network host e2ee_chat_server
+          podman save localhost/e2ee_chat_server:$VERSION | gzip > e2ee_chat_server-$VERSION.tar.gz
+      - name: Release server
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            e2ee_chat_server-${{ steps.version.outputs.SERVER }}.tar.gz
+      - name: build ingress images
+        env:
+          VERSION: ${{ steps.version.outputs.INGRESS }}
+        run: |
+          podman build --target ingress -t e2ee_chat_ingress:$VERSION --network host e2ee_chat_ingress
+          podman save localhost/e2ee_chat_ingress:$VERSION | gzip > e2ee_chat_ingress-$VERSION.tar.gz
+      - name: Release ingress
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            e2ee_chat_ingress-${{ steps.version.outputs.SERVER }}.tar.gz
+
   upload-assets:
     needs: create-release
     strategy:

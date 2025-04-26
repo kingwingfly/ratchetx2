@@ -1,0 +1,26 @@
+FROM docker.io/rust:1.86.0-alpine AS server-builder
+
+RUN apk update \
+    && apk add --no-cache --purge protobuf libc-dev openssl openssl-dev openssl-libs-static pkgconfig
+
+WORKDIR /build
+
+COPY . .
+
+RUN cargo build --release
+
+########################################
+
+FROM docker.io/alpine:latest AS server
+
+WORKDIR /app
+
+RUN apk update \
+    && apk add --no-cache --purge bash
+
+COPY --from=server-builder /build/target/release/e2ee_chat_server .
+
+STOPSIGNAL SIGINT
+EXPOSE 8000
+
+ENTRYPOINT ["./e2ee_chat_server"]
