@@ -6,7 +6,7 @@ data:
   # TEST: openssl req -x509 -newkey rsa:4096 -keyout cert/key.pem -out cert/cert.pem -days 365 -nodes
   TLS_CERT_PATH: cert/cert.pem
   TLS_KEY_PATH: cert/key.pem
-  UPSTREAM_ADDR: 127.0.0.1:8000
+  UPSTREAM_ADDR: 127.0.0.1:8080
   BIND_ADDR: 0.0.0.0:443
 ---
 apiVersion: v1
