@@ -60,7 +60,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         with:
           files: |
-            e2ee_chat_ingress-${{ steps.version.outputs.SERVER }}.tar.gz
+            e2ee_chat_ingress-${{ steps.version.outputs.INGRESS }}.tar.gz
 
   upload-assets:
     needs: create-release
