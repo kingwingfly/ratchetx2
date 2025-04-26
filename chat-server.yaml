@@ -3,9 +3,9 @@ Kind: ConfigMap
 metadata:
   name: config
 data:
-  # TEST: openssl req -x509 -newkey rsa:4096 -keyout cert/key.pem -out cert/cert.pem -days 365 -nodes
-  TLS_CERT_PATH: cert/cert.pem
-  TLS_KEY_PATH: cert/key.pem
+  # TEST: openssl req -x509 -newkey rsa:4096 -keyout tls/key.pem -out tls/cert.pem -days 365 --noenc
+  TLS_CERT_PATH: tls/cert.pem
+  TLS_KEY_PATH: tls/key.pem
   UPSTREAM_ADDR: 127.0.0.1:8080
   BIND_ADDR: 0.0.0.0:443
 ---
@@ -15,9 +15,9 @@ metadata:
   name: chat-server
 spec:
   volumes:
-    - name: cert
+    - name: tls
       hostPath:
-        path: cert
+        path: tls
         type: Directory
 
   containers:
@@ -36,5 +36,5 @@ spec:
         - containerPort: 443
           hostPort: 443
       volumeMounts:
-        - mountPath: /app/cert
-          name: cert
+        - mountPath: /app/tls
+          name: tls

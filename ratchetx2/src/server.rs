@@ -1,6 +1,6 @@
 //! The gRPC server combines the Message and X3DH.
 
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::Server;
 
 use super::error::{Result, TransportError};
 use crate::transport::grpc::{
@@ -13,15 +13,9 @@ pub struct RpcServer {}
 
 impl RpcServer {
     /// Run the gRPC server.
-    pub async fn run(
-        addr: impl AsRef<str>,
-        cert: impl AsRef<[u8]>,
-        key: impl AsRef<[u8]>,
-    ) -> Result<()> {
+    pub async fn run(addr: impl AsRef<str>) -> Result<()> {
         let addr = addr.as_ref().parse().unwrap();
         Server::builder()
-            .tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))
-            .map_err(|_| TransportError::Server)?
             .add_service(X3dhServiceServer::new(RpcX3DHInner::default()))
             .add_service(MessageServiceServer::new(RpcMessageServerInner::default()))
             .serve(addr)

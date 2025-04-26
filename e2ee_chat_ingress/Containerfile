@@ -20,7 +20,7 @@ RUN apk update \
 
 COPY --from=ingress-builder /build/target/release/e2ee_chat_ingress .
 
-VOLUME [ "/app/cert" ]
+VOLUME [ "/app/tls" ]
 
 STOPSIGNAL SIGQUIT
 EXPOSE 443
