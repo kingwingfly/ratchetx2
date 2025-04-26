@@ -35,6 +35,9 @@ jobs:
       - name: login to crates.io
         run: cargo login ${{ secrets.CRATESIO }}
 
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+
       - name: publish ratchet2
         if: ${{ inputs.ratchet2 }}
         run: .github/scripts/publish_test.sh ratchet2 && .github/scripts/publish.sh ratchet2

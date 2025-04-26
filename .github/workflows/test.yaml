@@ -34,6 +34,9 @@ jobs:
         if: steps.cache-cargo-restore.outputs.cache-hit != 'true'
         run: rustup component add clippy
 
+      - name: Install Protoc
+        uses: arduino/setup-protoc@v3
+
       - name: Run build
         if: steps.cache-cargo-restore.outputs.cache-hit != 'true'
         run: cargo build --all-features --all-targets
