@@ -1,20 +1,36 @@
+use std::num::NonZero;
+
+use lru::LruCache;
 use ratatui::{
     prelude::*,
     widgets::{Scrollbar, ScrollbarState},
 };
-use ratatui_image::picker::Picker;
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 
 use crate::message::Message;
 
 use super::bubble::Bubble;
 
+pub struct ConversationState {
+    lru_image: LruCache<Vec<u8>, Option<StatefulProtocol>>,
+}
+
+impl Default for ConversationState {
+    fn default() -> Self {
+        Self {
+            lru_image: LruCache::new(NonZero::new(16).unwrap()),
+        }
+    }
+}
+
 pub struct Conversation<'a> {
     pub messages: &'a Vec<Message>,
+    pub current: usize,
     pub picker: &'a Picker,
 }
 
 impl StatefulWidget for Conversation<'_> {
-    type State = usize;
+    type State = ConversationState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let chunks = Layout::default()
@@ -24,11 +40,11 @@ impl StatefulWidget for Conversation<'_> {
         Scrollbar::default().render(
             chunks[1],
             buf,
-            &mut ScrollbarState::new(self.messages.len()).position(*state),
+            &mut ScrollbarState::new(self.messages.len()).position(self.current),
         );
         let lines = chunks[0].height;
         let mut used = 0;
-        for message in self.messages[..=*state].iter().rev() {
+        for message in self.messages[..=self.current].iter().rev() {
             let line_num = message.line_num((chunks[0].width * 3 / 5).max(7) - 6) + 2; // border and padding
             if used + line_num >= lines {
                 break;
@@ -45,7 +61,7 @@ impl StatefulWidget for Conversation<'_> {
                 message,
                 picker: self.picker,
             }
-            .render(chunks[1], buf);
+            .render(chunks[1], buf, &mut state.lru_image);
             used += line_num;
         }
     }

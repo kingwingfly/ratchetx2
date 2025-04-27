@@ -1,9 +1,13 @@
 use image::load_from_memory;
+use lru::LruCache;
 use ratatui::{
     prelude::*,
     widgets::{Block, Padding, Paragraph, Wrap},
 };
-use ratatui_image::{FilterType, Resize, StatefulImage, picker::Picker};
+use ratatui_image::{
+    FilterType, Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol,
+};
+use ring::digest::{SHA256, digest};
 
 use crate::message::{Message, MessageContent, MessageState};
 
@@ -12,8 +16,10 @@ pub struct Bubble<'a> {
     pub message: &'a Message,
 }
 
-impl Widget for Bubble<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl StatefulWidget for Bubble<'_> {
+    type State = LruCache<Vec<u8>, Option<StatefulProtocol>>;
+
+    fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let chunk = match self.message.state {
             MessageState::Sent => {
                 let chunks = Layout::default()
@@ -64,10 +70,16 @@ impl Widget for Bubble<'_> {
                 p.render(inner, buf);
             }
             MessageContent::Image(bytes) => {
-                if let Ok(image) = load_from_memory(bytes) {
-                    let mut image = self.picker.new_resize_protocol(image);
-                    image.resize_encode(&Resize::Fit(Some(FilterType::CatmullRom)), inner);
-                    StatefulImage::default().render(inner, buf, &mut image);
+                if let Some(image) =
+                    state.get_or_insert_mut(digest(&SHA256, bytes).as_ref().to_vec(), || {
+                        load_from_memory(bytes).ok().map(|image| {
+                            let mut image = self.picker.new_resize_protocol(image);
+                            image.resize_encode(&Resize::Fit(Some(FilterType::CatmullRom)), inner);
+                            image
+                        })
+                    })
+                {
+                    StatefulImage::default().render(inner, buf, image);
                 }
             }
         }

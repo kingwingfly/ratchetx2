@@ -12,22 +12,26 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarState},
 };
-use ratatui_image::{FilterType, Resize, StatefulImage, picker::Picker};
+use ratatui_image::{
+    FilterType, Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol,
+};
 use regex::Regex;
 use tui_textarea::{Input, TextArea};
 use unicode_width::UnicodeWidthStr;
 
 use crate::message::MessageContent;
 
-pub struct Explore {}
+pub struct Explore<'a> {
+    pub picker: &'a Picker,
+}
 
 #[derive(Debug)]
 pub struct ExploreState {
     pub selected: usize,
     pub paths: Vec<PathBuf>,
     textarea: TextArea<'static>,
-    lru: LruCache<PathBuf, Vec<u8>>,
-    picker: Picker,
+    lru_bytes: LruCache<PathBuf, Option<Vec<u8>>>,
+    lru_image: LruCache<PathBuf, Option<StatefulProtocol>>,
 }
 
 impl Default for ExploreState {
@@ -36,8 +40,8 @@ impl Default for ExploreState {
             selected: 0,
             paths: collect_paths(std::env::current_dir().unwrap()),
             textarea: Default::default(),
-            lru: LruCache::new(NonZeroUsize::new(16).unwrap()),
-            picker: Picker::from_query_stdio().unwrap(),
+            lru_bytes: LruCache::new(NonZeroUsize::new(16).unwrap()),
+            lru_image: LruCache::new(NonZeroUsize::new(16).unwrap()),
         }
     }
 }
@@ -100,7 +104,7 @@ impl ExploreState {
     }
 }
 
-impl StatefulWidget for Explore {
+impl StatefulWidget for Explore<'_> {
     type State = ExploreState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
@@ -168,7 +172,7 @@ impl StatefulWidget for Explore {
         if let Some(mime) = mime_guess::from_path(selected).first() {
             match mime.type_() {
                 TEXT => {
-                    let bytes = state.lru.get_or_insert(selected.clone(), || {
+                    if let Some(bytes) = state.lru_bytes.get_or_insert(selected.clone(), || {
                         fs::File::open(selected)
                             .map(|mut file| {
                                 let mut lines = 0;
@@ -189,20 +193,28 @@ impl StatefulWidget for Explore {
                                 }
                                 bytes
                             })
-                            .unwrap_or_default()
-                    });
-                    let text = String::from_utf8_lossy(bytes);
-                    let lines = text.lines().map(Into::into).collect::<Vec<_>>();
-                    Paragraph::new(lines).render(preview, buf);
+                            .ok()
+                    }) {
+                        let text = String::from_utf8_lossy(bytes);
+                        let lines = text.lines().map(Into::into).collect::<Vec<_>>();
+                        Paragraph::new(lines).render(preview, buf);
+                    }
                 }
                 IMAGE => {
-                    let bytes = state.lru.get_or_insert(selected.clone(), || {
-                        std::fs::read(selected).unwrap_or_default()
-                    });
-                    if let Ok(image) = load_from_memory(bytes) {
-                        let mut image = state.picker.new_resize_protocol(image);
-                        image.resize_encode(&Resize::Fit(Some(FilterType::CatmullRom)), preview);
-                        StatefulImage::default().render(preview, buf, &mut image);
+                    if let Some(image) = state.lru_image.get_or_insert_mut(selected.clone(), || {
+                        std::fs::read(selected)
+                            .ok()
+                            .and_then(|bytes| load_from_memory(&bytes).ok())
+                            .map(|image| {
+                                let mut image = self.picker.new_resize_protocol(image);
+                                image.resize_encode(
+                                    &Resize::Fit(Some(FilterType::CatmullRom)),
+                                    preview,
+                                );
+                                image
+                            })
+                    }) {
+                        StatefulImage::default().render(preview, buf, image);
                     }
                 }
                 _ => {}

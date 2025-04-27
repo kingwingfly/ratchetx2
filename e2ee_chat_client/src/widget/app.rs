@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     contacts::Contacts,
-    conversation::Conversation,
+    conversation::{Conversation, ConversationState},
     explore::{Explore, ExploreState},
     footer::Footer,
     form::Form,
@@ -48,6 +48,7 @@ pub struct AppState {
     pub screen: Screen,
 
     pub explore_state: ExploreState,
+    conversation_state: ConversationState,
 
     picker: Picker,
 }
@@ -73,6 +74,7 @@ impl AppState {
             current_activated_textarea: 0,
             screen: Screen::default(),
             explore_state: Default::default(),
+            conversation_state: Default::default(),
             picker: Picker::from_query_stdio()?,
         })
     }
@@ -133,9 +135,10 @@ impl StatefulWidget for App {
             {
                 Conversation {
                     messages,
+                    current: state.current_activated_message,
                     picker: &state.picker,
                 }
-                .render(conversation, buf, &mut state.current_activated_message);
+                .render(conversation, buf, &mut state.conversation_state);
             }
         }
 
@@ -153,7 +156,7 @@ impl StatefulWidget for App {
                 area,
                 buf,
                 &mut SettingState {
-                    server_addr: state.server_addr.to_string(),
+                    server_addr: state.server_addr.clone(),
                     public_identity_key: state.x3dh_client.public_identity_key(),
                 },
             ),
@@ -173,7 +176,12 @@ impl StatefulWidget for App {
                 .render(area, buf, &mut state.current_activated_textarea);
             }
             Screen::SelectFile => {
-                PopUpStateful { inner: Explore {} }.render(area, buf, &mut state.explore_state);
+                PopUpStateful {
+                    inner: Explore {
+                        picker: &state.picker,
+                    },
+                }
+                .render(area, buf, &mut state.explore_state);
             }
         }
     }
