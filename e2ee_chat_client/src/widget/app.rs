@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, Padding},
 };
 use ratatui_image::picker::Picker;
-use ratchetx2::{Party, X3DHClient, transport::RpcTransport};
+use ratchetx2::{Certificate, Party, Uri, X3DHClient, transport::RpcTransport};
 use tokio::sync::RwLock as AsyncRwLock;
 use tui_textarea::TextArea;
 
@@ -40,7 +40,7 @@ pub struct AppState {
     pub conversations: Arc<RwLock<HashMap<Vec<u8>, Vec<Message>>>>,
     pub current_activated_message: usize,
 
-    pub server_addr: String,
+    pub server_addr: Uri,
     pub navi: Navigator,
     pub chat_textarea: TextArea<'static>,
     pub textareas: Vec<(String, TextArea<'static>)>,
@@ -53,17 +53,20 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn connect(server_addr: impl AsRef<str>) -> Result<Self> {
+    pub async fn connect(server_addr: impl TryInto<Uri>, ca: Option<Certificate>) -> Result<Self> {
+        let server_addr = server_addr
+            .try_into()
+            .unwrap_or_else(|_| panic!("Invalid server address."));
         let mut text_area = TextArea::default();
         text_area.set_line_number_style(Style::default().gray());
         Ok(Self {
-            x3dh_client: X3DHClient::connect(&server_addr).await?,
+            x3dh_client: X3DHClient::connect(&server_addr, ca).await?,
             contacts: vec![],
             parties: Default::default(),
             current_activated_contact: 0,
             conversations: Default::default(),
             current_activated_message: 0,
-            server_addr: server_addr.as_ref().to_owned(),
+            server_addr,
             navi: Navigator::default(),
             chat_textarea: text_area,
             textareas: vec![],
@@ -150,7 +153,7 @@ impl StatefulWidget for App {
                 area,
                 buf,
                 &mut SettingState {
-                    server_addr: state.server_addr.to_owned(),
+                    server_addr: state.server_addr.to_string(),
                     public_identity_key: state.x3dh_client.public_identity_key(),
                 },
             ),

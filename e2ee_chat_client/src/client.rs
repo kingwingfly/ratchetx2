@@ -10,7 +10,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, prelude::*};
-use ratchetx2::X3DHClient;
+use ratchetx2::{Certificate, Uri, X3DHClient};
 use tui_textarea::TextArea;
 
 use std::io::Stderr;
@@ -52,18 +52,25 @@ impl Client {
         Ok(Self { terminal })
     }
 
-    pub async fn run(&mut self, server_addr: impl AsRef<str>) -> Result<()> {
+    pub async fn run(
+        &mut self,
+        server_addr: impl TryInto<Uri>,
+        ca: Option<Certificate>,
+    ) -> Result<()> {
+        let server_addr: Uri = server_addr
+            .try_into()
+            .unwrap_or_else(|_| panic!("Invalid server address."));
         self.terminal.draw(|f| {
             f.render_widget(
                 PopUp {
                     inner: Connecting {
-                        server_addr: server_addr.as_ref().to_owned(),
+                        server_addr: server_addr.to_string(),
                     },
                 },
                 f.area(),
             )
         })?;
-        let mut state = match AppState::connect(server_addr).await {
+        let mut state = match AppState::connect(server_addr, ca.clone()).await {
             Ok(state) => state,
             Err(e) => {
                 self.terminal.draw(|f| {
@@ -153,13 +160,14 @@ impl Client {
                             };
                         }
                         KeyCode::Char('r') => {
-                            state.screen = match X3DHClient::connect(&state.server_addr).await {
-                                Ok(client) => {
-                                    state.x3dh_client = client;
-                                    Screen::Hint("Keys refreshed".to_string())
+                            state.screen =
+                                match X3DHClient::connect(&state.server_addr, ca.clone()).await {
+                                    Ok(client) => {
+                                        state.x3dh_client = client;
+                                        Screen::Hint("Keys refreshed".to_string())
+                                    }
+                                    Err(e) => Screen::Hint(e.to_string()),
                                 }
-                                Err(e) => Screen::Hint(e.to_string()),
-                            }
                         }
                         KeyCode::Char('s') => {
                             state.textareas = vec![

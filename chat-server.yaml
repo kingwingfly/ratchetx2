@@ -3,11 +3,7 @@ Kind: ConfigMap
 metadata:
   name: config
 data:
-  # TEST: openssl req -x509 -newkey rsa:4096 -keyout tls/key.pem -out tls/cert.pem -days 365 --noenc
-  TLS_CERT_PATH: tls/cert.pem
-  TLS_KEY_PATH: tls/key.pem
-  UPSTREAM_ADDR: 127.0.0.1:8080
-  BIND_ADDR: 0.0.0.0:443
+
 ---
 apiVersion: v1
 kind: Pod
@@ -23,18 +19,14 @@ spec:
   containers:
     - name: e2ee_chat_server
       image: e2ee_chat_server
-      envFrom:
-        - configMapRef:
-            name: config
-
-    - name: e2ee_chat_ingress
-      image: e2ee_chat_ingress
-      envFrom:
-        - configMapRef:
-            name: config
-      ports:
-        - containerPort: 443
-          hostPort: 443
+      args:
+        [
+          "-c",
+          "/app/tls/server.crt",
+          "-k",
+          "/app/tls/server.key",
+          "0.0.0.0:443",
+        ]
       volumeMounts:
         - mountPath: /app/tls
           name: tls

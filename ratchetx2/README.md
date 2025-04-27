@@ -106,15 +106,15 @@ use ratchetx2::x3dh::X3DHClient;
 # #[tokio::main]
 # async fn main() {
 tokio::spawn(async {
-    RpcServer::run("127.0.0.1:3002").await.unwrap();
+    RpcServer::run("127.0.0.1:3002", None).await.unwrap();
 });
 // wait server start
 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
 const SERVER_ADDR: &str = "http://127.0.0.1:3002";
 
-let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR).await.unwrap();
-let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR).await.unwrap();
+let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR, None).await.unwrap();
+let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR, None).await.unwrap();
 bob_x3dh.publish_keys().await.unwrap();
 let mut alice = alice_x3dh
     .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)

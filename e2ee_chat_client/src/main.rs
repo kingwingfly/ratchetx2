@@ -1,4 +1,7 @@
+use std::fs;
+
 use clap::Parser;
+use ratchetx2::Certificate;
 
 mod cli;
 mod client;
@@ -12,7 +15,10 @@ async fn main() {
     let args = cli::Cli::parse();
     client::Client::new()
         .unwrap()
-        .run(args.server_addr)
+        .run(
+            args.server_addr,
+            args.ca.map(|p| Certificate::from_pem(fs::read(p).unwrap())),
+        )
         .await
         .unwrap();
 }

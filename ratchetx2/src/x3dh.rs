@@ -8,15 +8,15 @@
 //! # #[tokio::main]
 //! # async fn main() {
 //! tokio::spawn(async {
-//!     RpcServer::run("127.0.0.1:3001").await.unwrap();
+//!     RpcServer::run("127.0.0.1:3001", None).await.unwrap();
 //! });
 //! // wait server start
 //! tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 //!
 //! const SERVER_ADDR: &str = "http://127.0.0.1:3001";
 //!
-//! let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR).await.unwrap();
-//! let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR).await.unwrap();
+//! let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR, None).await.unwrap();
+//! let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR, None).await.unwrap();
 //! bob_x3dh.publish_keys().await.unwrap();
 //! let mut alice = alice_x3dh
 //!     .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)
@@ -57,7 +57,7 @@ use ring::agreement::{EphemeralPrivateKey, UnparsedPublicKey, X25519, agree_ephe
 use ring::hkdf::{HKDF_SHA256, KeyType, Salt};
 use ring::rand::SystemRandom;
 use tonic::Status;
-use tonic::transport::Server;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig, Uri};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Request, Response, Result as RpcResult};
 use x3dh_rpc::x3dh_service_client::X3dhServiceClient;
@@ -76,28 +76,41 @@ pub struct X3DHClient {
     private_identity_key: XEdDSAPrivateKey,
     prekeys: HashMap<Vec<u8>, EphemeralPrivateKey>,
     one_time_prekeys: HashMap<Vec<u8>, EphemeralPrivateKey>,
+    ca: Option<Certificate>,
 }
 
 impl X3DHClient {
     /// Connect to a X3DH gRPC server.
-    pub async fn connect(x3dh_server_addr: impl AsRef<str>) -> Result<Self> {
+    pub async fn connect(
+        x3dh_server_addr: impl TryInto<Uri>,
+        ca: Option<Certificate>,
+    ) -> Result<Self> {
+        let uri: Uri = x3dh_server_addr
+            .try_into()
+            .unwrap_or_else(|_| panic!("Invalid x3dh server address."));
+        let mut endpoint = Channel::builder(uri.clone());
+        if uri.scheme_str() == Some("https") {
+            endpoint = endpoint
+                .tls_config({
+                    let mut config = ClientTlsConfig::new().with_native_roots();
+                    if let Some(ca) = ca.clone() {
+                        config = config.ca_certificate(ca).domain_name("127.0.0.1");
+                    }
+                    config
+                })
+                .unwrap();
+        }
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|_| TransportError::Connect)?;
+        let rpc_client = X3dhServiceClient::new(channel);
         Ok(Self {
-            rpc_client: X3dhServiceClient::new(
-                Channel::builder(
-                    x3dh_server_addr
-                        .as_ref()
-                        .try_into()
-                        .unwrap_or_else(|_| panic!("Invalid x3dh server address.")),
-                )
-                .tls_config(ClientTlsConfig::new().with_native_roots())
-                .unwrap()
-                .connect()
-                .await
-                .map_err(|_| TransportError::Connect)?,
-            ),
+            rpc_client,
             private_identity_key: XEdDSAPrivateKey::generate(&SystemRandom::new()),
             prekeys: HashMap::new(),
             one_time_prekeys: HashMap::new(),
+            ca,
         })
     }
 
@@ -167,7 +180,7 @@ impl X3DHClient {
     pub async fn push_initial_message(
         &mut self,
         identity_key_bob: &[u8],
-        message_server_addr: impl AsRef<str>,
+        message_server_addr: impl TryInto<Uri>,
     ) -> Result<Party<RpcTransport>> {
         let keys = self.fetch_keys(identity_key_bob).await?;
 
@@ -228,8 +241,13 @@ impl X3DHClient {
             prekey_bob: keys.prekey.clone(),
             one_time_prekey_bob: keys.one_time_key,
         };
-        let mut messgae_transport =
-            RpcTransport::connect(message_server_addr, &my_identity_key, identity_key_bob).await?;
+        let mut messgae_transport = RpcTransport::connect(
+            message_server_addr,
+            &my_identity_key,
+            identity_key_bob,
+            self.ca.clone(),
+        )
+        .await?;
         messgae_transport
             .push_bytes(bincode::encode_to_vec(&init_msg, bincode::config::standard()).unwrap())
             .await?;
@@ -249,16 +267,20 @@ impl X3DHClient {
     pub async fn handle_initial_message(
         &mut self,
         identity_key_alice: &[u8],
-        message_server_addr: impl AsRef<str>,
+        message_server_addr: impl TryInto<Uri>,
     ) -> Result<Party<RpcTransport>> {
         let my_identity_key = self.public_identity_key();
         let mut associated_data: Vec<u8> = vec![];
         associated_data.extend(identity_key_alice);
         associated_data.extend(&my_identity_key);
 
-        let mut message_transport =
-            RpcTransport::connect(message_server_addr, &my_identity_key, identity_key_alice)
-                .await?;
+        let mut message_transport = RpcTransport::connect(
+            message_server_addr,
+            &my_identity_key,
+            identity_key_alice,
+            self.ca.clone(),
+        )
+        .await?;
         let (initial_message, _): (InitMassage, _) = bincode::decode_from_slice(
             message_transport
                 .fetch_bytes(Some(1))
@@ -333,9 +355,15 @@ pub struct RpcX3DHServer {}
 
 impl RpcX3DHServer {
     /// Run a RpcX3DHServer listening on addr.
-    pub async fn run(addr: impl AsRef<str>) -> Result<()> {
+    pub async fn run(addr: impl AsRef<str>, identity: Option<Identity>) -> Result<()> {
         let addr = addr.as_ref().parse().unwrap();
-        Server::builder()
+        let mut server = Server::builder();
+        if let Some(identity) = identity {
+            server = server
+                .tls_config(ServerTlsConfig::new().identity(identity))
+                .unwrap()
+        }
+        server
             .add_service(X3dhServiceServer::new(RpcX3DHInner::default()))
             .serve(addr)
             .await

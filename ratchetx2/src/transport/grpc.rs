@@ -15,7 +15,7 @@ use message_rpc::message_service_server::{MessageService, MessageServiceServer};
 use message_rpc::{
     FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse,
 };
-use tonic::transport::Server;
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig, Uri};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Request, Response, Result as RpcResult};
 
@@ -33,24 +33,33 @@ pub struct RpcTransport {
 impl RpcTransport {
     /// Connect to a message gRPC server.
     pub async fn connect(
-        msg_server_addr: impl AsRef<str>,
+        msg_server_addr: impl TryInto<Uri>,
         my_identity_key: &[u8],
         peer_identity_key: &[u8],
+        ca: Option<Certificate>,
     ) -> Result<Self> {
+        let uri: Uri = msg_server_addr
+            .try_into()
+            .unwrap_or_else(|_| panic!("Invalid message server address."));
+        let mut endpoint = Channel::builder(uri.clone());
+        if uri.scheme_str() == Some("https") {
+            endpoint = endpoint
+                .tls_config({
+                    let mut config = ClientTlsConfig::new().with_native_roots();
+                    if let Some(ca) = ca {
+                        config = config.ca_certificate(ca);
+                    }
+                    config
+                })
+                .unwrap();
+        }
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|_| TransportError::Connect)?;
+        let rpc_client = MessageServiceClient::new(channel);
         Ok(Self {
-            rpc_client: MessageServiceClient::new(
-                Channel::builder(
-                    msg_server_addr
-                        .as_ref()
-                        .try_into()
-                        .unwrap_or_else(|_| panic!("Invalid message server address.")),
-                )
-                .tls_config(ClientTlsConfig::new().with_native_roots())
-                .unwrap()
-                .connect()
-                .await
-                .map_err(|_| TransportError::Connect)?,
-            ),
+            rpc_client,
             last_sync_id: Arc::new(AtomicU64::default()),
             push_target: [my_identity_key, peer_identity_key].concat().to_vec(),
             fetch_target: [peer_identity_key, my_identity_key].concat().to_vec(),
@@ -104,9 +113,15 @@ pub struct RpcMessageServer {}
 
 impl RpcMessageServer {
     /// Run a RpcMessageServer listening on addr.
-    pub async fn run(addr: impl AsRef<str>) -> Result<()> {
+    pub async fn run(addr: impl AsRef<str>, identity: Option<Identity>) -> Result<()> {
         let addr = addr.as_ref().parse().unwrap();
-        Server::builder()
+        let mut server = Server::builder();
+        if let Some(identity) = identity {
+            server = server
+                .tls_config(ServerTlsConfig::new().identity(identity))
+                .unwrap()
+        }
+        server
             .add_service(MessageServiceServer::new(RpcMessageServerInner::default()))
             .serve(addr)
             .await
@@ -163,14 +178,14 @@ mod test {
     #[tokio::test]
     async fn grpc_transport() {
         tokio::spawn(async {
-            RpcMessageServer::run("[::1]:3000").await.unwrap();
+            RpcMessageServer::run("[::1]:3000", None).await.unwrap();
         });
         // wait server start
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut alice = RpcTransport::connect("http://[::1]:3000", b"Alice", b"Bob")
+        let mut alice = RpcTransport::connect("http://[::1]:3000", b"Alice", b"Bob", None)
             .await
             .unwrap();
-        let mut bob = RpcTransport::connect("http://[::1]:3000", b"Bob", b"Alice")
+        let mut bob = RpcTransport::connect("http://[::1]:3000", b"Bob", b"Alice", None)
             .await
             .unwrap();
         let msg = EncryptedMessage {

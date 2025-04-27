@@ -16,8 +16,10 @@ pub mod transport;
 pub mod x3dh;
 pub mod xeddsa;
 
-/// Re-export.
+/// Re-export ring.
 pub use ring::{agreement, rand};
+/// Re-export tonic.
+pub use tonic::transport::{Certificate, Identity, Uri};
 
 pub use key::SharedKeys;
 pub use party::Party;

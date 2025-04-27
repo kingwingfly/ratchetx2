@@ -1,3 +1,5 @@
+**(Deprecated: Pingora cannot work with tonic gRPC, use tonic tls instead)**
+
 A reverse proxy with Pingora.
 
 # ENV VARS
