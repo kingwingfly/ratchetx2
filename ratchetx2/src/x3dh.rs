@@ -83,12 +83,17 @@ impl X3DHClient {
     pub async fn connect(x3dh_server_addr: impl AsRef<str>) -> Result<Self> {
         Ok(Self {
             rpc_client: X3dhServiceClient::new(
-                Channel::builder(x3dh_server_addr.as_ref().try_into().unwrap())
-                    .tls_config(ClientTlsConfig::new().with_native_roots())
-                    .map_err(|_| TransportError::Connect)?
-                    .connect()
-                    .await
-                    .map_err(|_| TransportError::Connect)?,
+                Channel::builder(
+                    x3dh_server_addr
+                        .as_ref()
+                        .try_into()
+                        .unwrap_or_else(|_| panic!("Invalid x3dh server address.")),
+                )
+                .tls_config(ClientTlsConfig::new().with_native_roots())
+                .unwrap()
+                .connect()
+                .await
+                .map_err(|_| TransportError::Connect)?,
             ),
             private_identity_key: XEdDSAPrivateKey::generate(&SystemRandom::new()),
             prekeys: HashMap::new(),

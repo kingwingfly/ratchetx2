@@ -39,12 +39,17 @@ impl RpcTransport {
     ) -> Result<Self> {
         Ok(Self {
             rpc_client: MessageServiceClient::new(
-                Channel::builder(msg_server_addr.as_ref().try_into().unwrap())
-                    .tls_config(ClientTlsConfig::new().with_native_roots())
-                    .map_err(|_| TransportError::Connect)?
-                    .connect()
-                    .await
-                    .map_err(|_| TransportError::Connect)?,
+                Channel::builder(
+                    msg_server_addr
+                        .as_ref()
+                        .try_into()
+                        .unwrap_or_else(|_| panic!("Invalid message server address.")),
+                )
+                .tls_config(ClientTlsConfig::new().with_native_roots())
+                .unwrap()
+                .connect()
+                .await
+                .map_err(|_| TransportError::Connect)?,
             ),
             last_sync_id: Arc::new(AtomicU64::default()),
             push_target: [my_identity_key, peer_identity_key].concat().to_vec(),
