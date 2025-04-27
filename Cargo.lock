@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "e2ee_chat_client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -584,7 +584,7 @@ dependencies = [
  "parking_lot",
  "ratatui",
  "ratatui-image",
- "ratchetx2",
+ "ratchetx2 0.3.0",
  "regex",
  "tokio",
  "tui-textarea",
@@ -593,10 +593,10 @@ dependencies = [
 
 [[package]]
 name = "e2ee_chat_server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
- "ratchetx2",
+ "ratchetx2 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "ratchetx2"
-version = "0.2.3"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "curve25519-dalek",
@@ -1685,6 +1685,25 @@ dependencies = [
  "ring",
  "thiserror 2.0.12",
  "tokio",
+ "tonic",
+ "tonic-build",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "ratchetx2"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d73c27fecf731fd9e562b0de7f29a657b9dfe8b5f5a0233afe634b66822f7f0c"
+dependencies = [
+ "bincode",
+ "curve25519-dalek",
+ "futures",
+ "parking_lot",
+ "prost",
+ "ring",
+ "thiserror 2.0.12",
  "tonic",
  "tonic-build",
  "tracing",
