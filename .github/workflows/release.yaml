@@ -49,18 +49,6 @@ jobs:
         with:
           files: |
             e2ee_chat_server-${{ steps.version.outputs.SERVER }}.tar.gz
-      - name: build ingress images
-        env:
-          VERSION: ${{ steps.version.outputs.INGRESS }}
-        run: |
-          podman build --target ingress -t e2ee_chat_ingress:$VERSION --network host e2ee_chat_ingress
-          podman save localhost/e2ee_chat_ingress:$VERSION | gzip > e2ee_chat_ingress-$VERSION.tar.gz
-      - name: Release ingress
-        uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: |
-            e2ee_chat_ingress-${{ steps.version.outputs.INGRESS }}.tar.gz
 
   upload-assets:
     needs: create-release
@@ -121,14 +109,6 @@ jobs:
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: e2ee_chat_client
-          target: ${{ matrix.target }}
-          archive: $bin-$tag-$target
-          tar: unix
-          zip: windows
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: taiki-e/upload-rust-binary-action@v1
-        with:
-          bin: e2ee_chat_ingress
           target: ${{ matrix.target }}
           archive: $bin-$tag-$target
           tar: unix

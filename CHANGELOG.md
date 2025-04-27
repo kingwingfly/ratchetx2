@@ -9,6 +9,10 @@ Note: In this file, do not use the hard wrap in the middle of a sentence for com
 -->
 
 ## [Unreleased]
+## [0.2.0] - 2025-04-27
+
+- TLS support
+
 ## [0.1.1-alpha.1] - 2025-04-27
 
 - Fix tonic over Pingora

@@ -1,6 +1,6 @@
 **(Deprecated: Pingora cannot work with tonic gRPC, use tonic tls instead)**
 
-A reverse proxy with Pingora.
+A reverse proxy with Pingora for [e2ee-chat-server](https://crates.io/crates/e2ee_chat_server).
 
 # ENV VARS
 

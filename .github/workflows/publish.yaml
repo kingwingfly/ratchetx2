@@ -3,8 +3,8 @@ name: publish
 on:
   workflow_dispatch:
     inputs:
-      ratchet2:
-        description: "publish ratchet2"
+      ratchetx2:
+        description: "publish ratchetx2"
         type: boolean
         default: false
       e2ee_chat_server:
@@ -13,10 +13,6 @@ on:
         default: false
       e2ee_chat_client:
         description: "publish e2ee_chat_client"
-        type: boolean
-        default: false
-      e2ee_chat_ingress:
-        description: "publish e2ee_chat_ingress"
         type: boolean
         default: false
 
@@ -38,15 +34,12 @@ jobs:
       - name: Install Protoc
         run: sudo apt install -y protobuf-compiler
 
-      - name: publish ratchet2
-        if: ${{ inputs.ratchet2 }}
-        run: .github/scripts/publish_test.sh ratchet2 && .github/scripts/publish.sh ratchet2
+      - name: publish ratchetx2
+        if: ${{ inputs.ratchetx2 }}
+        run: .github/scripts/publish_test.sh ratchetx2 && .github/scripts/publish.sh ratchetx2
       - name: publish e2ee_chat_server
         if: ${{ inputs.e2ee_chat_server }}
         run: .github/scripts/publish_test.sh e2ee_chat_server && .github/scripts/publish.sh e2ee_chat_server
       - name: publish e2ee_chat_client
         if: ${{ inputs.e2ee_chat_client }}
         run: .github/scripts/publish_test.sh e2ee_chat_client && .github/scripts/publish.sh e2ee_chat_client
-      - name: publish e2ee_chat_ingress
-        if: ${{ inputs.e2ee_chat_ingress }}
-        run: .github/scripts/publish_test.sh e2ee_chat_ingress && .github/scripts/publish.sh e2ee_chat_ingress
