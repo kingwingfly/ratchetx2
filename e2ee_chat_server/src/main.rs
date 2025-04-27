@@ -18,7 +18,6 @@ async fn main() {
         .with_env_filter(filter)
         .with_writer(std::io::stdout)
         .pretty()
-        .without_time()
         .init();
     let args = Cli::parse();
 

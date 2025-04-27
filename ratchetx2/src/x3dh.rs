@@ -84,7 +84,7 @@ impl X3DHClient {
         Ok(Self {
             rpc_client: X3dhServiceClient::new(
                 Channel::builder(x3dh_server_addr.as_ref().try_into().unwrap())
-                    .tls_config(ClientTlsConfig::new())
+                    .tls_config(ClientTlsConfig::new().with_native_roots())
                     .map_err(|_| TransportError::Connect)?
                     .connect()
                     .await

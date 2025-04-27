@@ -40,7 +40,7 @@ impl RpcTransport {
         Ok(Self {
             rpc_client: MessageServiceClient::new(
                 Channel::builder(msg_server_addr.as_ref().try_into().unwrap())
-                    .tls_config(ClientTlsConfig::new())
+                    .tls_config(ClientTlsConfig::new().with_native_roots())
                     .map_err(|_| TransportError::Connect)?
                     .connect()
                     .await

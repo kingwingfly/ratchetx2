@@ -35,7 +35,6 @@ fn main() {
         .with_env_filter(filter)
         .with_writer(std::io::stdout)
         .pretty()
-        .without_time()
         .init();
 
     // Load configuration from environment variables
