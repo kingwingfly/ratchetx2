@@ -21,6 +21,6 @@ RUN apk update \
 COPY --from=server-builder /build/target/release/e2ee_chat_server .
 
 STOPSIGNAL SIGINT
-EXPOSE 8080
+EXPOSE 443
 
 ENTRYPOINT ["./e2ee_chat_server"]
