@@ -1,6 +1,6 @@
 [package]
 name = "e2ee_chat_client"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "An E2EE chat client."
 keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]

@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "e2ee_chat_client"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "e2ee_chat_server"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "ratchetx2 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
