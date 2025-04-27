@@ -30,6 +30,9 @@ impl StatefulWidget for Conversation<'_> {
         let mut used = 0;
         for message in self.messages[..=*state].iter().rev() {
             let line_num = message.line_num((chunks[0].width * 3 / 5).max(7) - 6) + 2; // border and padding
+            if used + line_num >= lines {
+                break;
+            }
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
@@ -44,9 +47,6 @@ impl StatefulWidget for Conversation<'_> {
             }
             .render(chunks[1], buf);
             used += line_num;
-            if used >= lines {
-                break;
-            }
         }
     }
 }
