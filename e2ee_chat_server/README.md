@@ -3,12 +3,19 @@ Start gRPC Message and X3DH server.
 ```sh
 An E2EE chat server.
 
-Usage: e2ee_chat_server [LISTENING_ON]
+Usage: e2ee_chat_server [OPTIONS] <LISTENING_ON>
 
 Arguments:
-  [LISTENING_ON]  The E2EE chat server address [default: 127.0.0.1:8080]
+  <LISTENING_ON>  The E2EE chat server address
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+  -c, --cert <CERT>  The path to cert(pem)
+  -k, --key <KEY>    The path to key(pem)
+  -h, --help         Print help
+  -V, --version      Print version
+```
+
+```sh
+# copy cert
+acme.sh --install-cert -d chat.louisfly.icu --fullchain-file tls/server.crt --key-file tls/server.key
 ```
