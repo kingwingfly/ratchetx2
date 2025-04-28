@@ -17,5 +17,5 @@ Options:
 
 ```sh
 # copy cert
-acme.sh --install-cert -d chat.louisfly.icu --fullchain-file tls/server.crt --key-file tls/server.key
+acme.sh --install-cert -d example.com --fullchain-file tls/server.crt --key-file tls/server.key
 ```
