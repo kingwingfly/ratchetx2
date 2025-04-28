@@ -33,6 +33,15 @@ pub struct XEdDSAPrivateKey {
     montgomery_private_key: Scalar,
 }
 
+impl From<Scalar> for XEdDSAPrivateKey {
+    /// New a XEdDSAPrivateKey with give Scalar (private key).
+    fn from(montgomery_private_key: Scalar) -> Self {
+        XEdDSAPrivateKey {
+            montgomery_private_key,
+        }
+    }
+}
+
 impl XEdDSAPrivateKey {
     /// Generate a new XEdDSA private key.
     pub fn generate(rng: &impl SecureRandom) -> Self {

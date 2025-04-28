@@ -18,6 +18,8 @@ pub mod transport;
 pub mod x3dh;
 pub mod xeddsa;
 
+/// Re-export curve25519_dalek.
+pub use curve25519_dalek::Scalar;
 /// Re-export ring.
 pub use ring::{agreement, rand};
 /// Re-export tonic.

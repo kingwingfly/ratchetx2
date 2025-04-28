@@ -15,8 +15,8 @@
 //!
 //! const SERVER_ADDR: &str = "http://127.0.0.1:3001";
 //!
-//! let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR, None).await.unwrap();
-//! let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR, None).await.unwrap();
+//! let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR, None, None).await.unwrap();
+//! let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR, None, None).await.unwrap();
 //! bob_x3dh.publish_keys().await.unwrap();
 //! let mut alice = alice_x3dh
 //!     .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)
@@ -80,7 +80,13 @@ pub struct X3DHClient {
 }
 
 impl X3DHClient {
-    /// Connect to a X3DH gRPC server.
+    /// Connect to a X3DH gRPC server, generate XEdDSA private_identity_key randomly.
+    ///
+    /// If x3dh_server_addr scheme is https, native root certificate will be used.
+    ///
+    /// # Args:
+    /// - x3dh_server_addr
+    /// - ca: self-signed ca certificate if x3dh_server_addr scheme is https
     pub async fn connect(
         x3dh_server_addr: impl TryInto<Uri>,
         ca: Option<Certificate>,
@@ -112,6 +118,14 @@ impl X3DHClient {
             one_time_prekeys: HashMap::new(),
             ca,
         })
+    }
+
+    /// With given XEdDSA private identity key.
+    pub fn with_xeddsa_private_key(self, private_identity_key: XEdDSAPrivateKey) -> Self {
+        Self {
+            private_identity_key,
+            ..self
+        }
     }
 
     /// Get public identity key.
