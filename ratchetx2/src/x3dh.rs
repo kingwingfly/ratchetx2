@@ -240,11 +240,7 @@ impl X3DHClient {
         associated_data.extend(&my_identity_key);
         associated_data.extend(&keys.identity_key_bob);
         let init_msg = InitMassage {
-            identity_key_alice: self
-                .private_identity_key
-                .compute_public_key()
-                .as_ref()
-                .to_vec(),
+            identity_key_alice: self.public_identity_key(),
             ephemeral_public_key_alice: ephemeral_public_key,
             prekey_bob: keys.prekey.clone(),
             one_time_prekey_bob: keys.one_time_key,
