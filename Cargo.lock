@@ -584,7 +584,7 @@ dependencies = [
  "parking_lot",
  "ratatui",
  "ratatui-image",
- "ratchetx2 0.3.2",
+ "ratchetx2 0.3.3",
  "regex",
  "ring",
  "tokio",
@@ -1695,7 +1695,7 @@ dependencies = [
 
 [[package]]
 name = "ratchetx2"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "bincode",
  "curve25519-dalek",

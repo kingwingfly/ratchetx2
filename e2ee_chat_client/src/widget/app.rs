@@ -61,7 +61,7 @@ impl AppState {
         let mut text_area = TextArea::default();
         text_area.set_line_number_style(Style::default().gray());
         Ok(Self {
-            x3dh_client: X3DHClient::connect(&server_addr, ca).await?,
+            x3dh_client: X3DHClient::connect(&server_addr, None, ca).await?,
             contacts: vec![],
             parties: Default::default(),
             current_activated_contact: 0,

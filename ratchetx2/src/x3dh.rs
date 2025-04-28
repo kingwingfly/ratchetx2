@@ -89,6 +89,7 @@ impl X3DHClient {
     /// - ca: self-signed ca certificate if x3dh_server_addr scheme is https
     pub async fn connect(
         x3dh_server_addr: impl TryInto<Uri>,
+        private_identity_key: Option<XEdDSAPrivateKey>,
         ca: Option<Certificate>,
     ) -> Result<Self> {
         let uri: Uri = x3dh_server_addr
@@ -113,19 +114,12 @@ impl X3DHClient {
         let rpc_client = X3dhServiceClient::new(channel);
         Ok(Self {
             rpc_client,
-            private_identity_key: XEdDSAPrivateKey::generate(&SystemRandom::new()),
+            private_identity_key: private_identity_key
+                .unwrap_or(XEdDSAPrivateKey::generate(&SystemRandom::new())),
             prekeys: HashMap::new(),
             one_time_prekeys: HashMap::new(),
             ca,
         })
-    }
-
-    /// With given XEdDSA private identity key.
-    pub fn with_xeddsa_private_key(self, private_identity_key: XEdDSAPrivateKey) -> Self {
-        Self {
-            private_identity_key,
-            ..self
-        }
     }
 
     /// Get public identity key.

@@ -161,7 +161,9 @@ impl Client {
                         }
                         KeyCode::Char('r') => {
                             state.screen =
-                                match X3DHClient::connect(&state.server_addr, ca.clone()).await {
+                                match X3DHClient::connect(&state.server_addr, None, ca.clone())
+                                    .await
+                                {
                                     Ok(client) => {
                                         state.x3dh_client = client;
                                         Screen::Hint("Keys refreshed".to_string())
