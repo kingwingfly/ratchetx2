@@ -1,6 +1,6 @@
 [package]
 name = "ratchetx2"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
 license = "MIT"
@@ -33,3 +33,7 @@ tokio = { version = "1", default-features = false, features = [
     "macros",
     "rt-multi-thread",
 ] }
+
+[features]
+default = ["grpc"]
+grpc = []

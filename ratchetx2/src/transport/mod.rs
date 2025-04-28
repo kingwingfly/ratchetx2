@@ -1,9 +1,11 @@
 //! Message transport.
 
 pub mod channel;
+#[cfg(feature = "grpc")]
 pub mod grpc;
 
 pub use channel::ChannelTransport;
+#[cfg(feature = "grpc")]
 pub use grpc::{RpcMessageServer, RpcTransport};
 
 use bincode::{Decode, Encode, config};

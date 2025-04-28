@@ -16,6 +16,10 @@ An E2EE chat server-client TUI app base on this crate is available [here](https:
 6. Provide X3DH shared key initialization implementation.
 7. Provide XEdDSA implementation.
 
+# Features
+
+- **grpc** (enabled by default): enable tonic-based X3DHServer/Client and MessageServer/Client (protoc is needed).
+
 # Example
 
 Ratchet only example:
@@ -100,6 +104,8 @@ assert_eq!(
 
 X3DH initialize example:
 ```rust
+# #[cfg(feature = "grpc")]
+# {
 use ratchetx2::server::RpcServer;
 use ratchetx2::x3dh::X3DHClient;
 
@@ -139,5 +145,6 @@ assert_eq!(
     alice.fetch().await.unwrap().remove(0).unwrap(),
     b"hello Alice"
 );
+# }
 # }
 ```
