@@ -78,7 +78,7 @@ impl AppState {
             #[cfg(not(windows))]
             picker: Picker::from_query_stdio()?,
             #[cfg(windows)]
-            picker: Picker::from_fontsize((7, 14))?,
+            picker: Picker::from_fontsize((7, 14)),
         })
     }
 }
