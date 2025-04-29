@@ -75,7 +75,10 @@ impl AppState {
             screen: Screen::default(),
             explore_state: Default::default(),
             conversation_state: Default::default(),
+            #[cfg(not(windows))]
             picker: Picker::from_query_stdio()?,
+            #[cfg(windows)]
+            picker: Picker::from_fontsize((7, 14))?,
         })
     }
 }
