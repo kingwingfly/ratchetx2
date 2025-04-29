@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use ratchetx2::Identity;
 use ratchetx2::server::RpcServer;
-use tracing::info;
+use tracing::{error, info};
 
 #[derive(Debug, Parser)]
 #[clap(version, about, long_about)]
@@ -32,7 +32,7 @@ async fn main() {
     let args = Cli::parse();
 
     info!("Listening on {}", args.listening_on);
-    RpcServer::run(
+    if let Err(e) = RpcServer::run(
         args.listening_on,
         match (args.cert, args.key) {
             (Some(cert), Some(key)) => {
@@ -45,5 +45,7 @@ async fn main() {
         },
     )
     .await
-    .unwrap();
+    {
+        error!("{}", e);
+    }
 }
