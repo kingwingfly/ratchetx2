@@ -78,7 +78,11 @@ impl AppState {
             #[cfg(not(windows))]
             picker: Picker::from_query_stdio()?,
             #[cfg(windows)]
-            picker: Picker::from_fontsize((7, 14)),
+            picker: {
+                let mut picker = Picker::from_fontsize((7, 14));
+                picker.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
+                picker
+            },
         })
     }
 }
