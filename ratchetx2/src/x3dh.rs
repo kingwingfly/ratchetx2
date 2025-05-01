@@ -86,6 +86,7 @@ impl X3DHClient {
     ///
     /// # Args:
     /// - x3dh_server_addr
+    /// - private_identity_key: use provided private key instead of the randomly generated
     /// - ca: self-signed ca certificate if x3dh_server_addr scheme is https
     pub async fn connect(
         x3dh_server_addr: impl TryInto<Uri>,
