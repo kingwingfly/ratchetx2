@@ -126,6 +126,10 @@ let mut alice = alice_x3dh
     .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)
     .await
     .unwrap();
+assert_eq!(
+    bob_x3dh.list_attempt(&bob_x3dh.public_identity_key()).await.unwrap().pop().unwrap(),
+    alice_x3dh.public_identity_key()
+);
 let mut bob = bob_x3dh
     .handle_initial_message(&alice_x3dh.public_identity_key(), SERVER_ADDR)
     .await

@@ -22,6 +22,10 @@
 //!     .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)
 //!     .await
 //!     .unwrap();
+//! assert_eq!(
+//!     bob_x3dh.list_attempt(&bob_x3dh.public_identity_key()).await.unwrap().pop().unwrap(),
+//!     alice_x3dh.public_identity_key()
+//! );
 //! let mut bob = bob_x3dh
 //!     .handle_initial_message(&alice_x3dh.public_identity_key(), SERVER_ADDR)
 //!     .await
@@ -62,7 +66,10 @@ use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Request, Response, Result as RpcResult};
 use x3dh_rpc::x3dh_service_client::X3dhServiceClient;
 use x3dh_rpc::x3dh_service_server::{X3dhService, X3dhServiceServer};
-use x3dh_rpc::{FetchKeysRequest, FetchKeysResponse, PublishKeysRequest, PublishKeysResponse};
+use x3dh_rpc::{
+    AddAttemptRequest, AddAttemptResponse, FetchKeysRequest, FetchKeysResponse, ListAttemptRequest,
+    ListAttemptResponse, PublishKeysRequest, PublishKeysResponse,
+};
 
 use crate::error::Error;
 use crate::error::{Result, TransportError};
@@ -256,6 +263,13 @@ impl X3DHClient {
         messgae_transport
             .push_bytes(bincode::encode_to_vec(&init_msg, bincode::config::standard()).unwrap())
             .await?;
+        self.rpc_client
+            .add_attempt(Request::new(AddAttemptRequest {
+                identity_key_alice: my_identity_key,
+                identity_key_bob: identity_key_bob.to_vec(),
+            }))
+            .await
+            .map_err(|_| Error::Transport(TransportError::Push))?;
 
         let alice = Party::new(
             shared_keys.alice(&keys.prekey),
@@ -263,6 +277,17 @@ impl X3DHClient {
             associated_data,
         );
         Ok(alice)
+    }
+
+    /// List identity keys of Alices who want to connect to Bob with provided identity_key_bob.
+    pub async fn list_attempt(&mut self, identity_key_bob: &[u8]) -> Result<Vec<Vec<u8>>> {
+        self.rpc_client
+            .list_attempt(Request::new(ListAttemptRequest {
+                identity_key_bob: identity_key_bob.to_vec(),
+            }))
+            .await
+            .map_err(|_| Error::Transport(TransportError::Fetch))
+            .map(|resp| resp.into_inner().identity_key_alice)
     }
 
     /// Perform X3DH, handle the initial message, return Bob Party.
@@ -379,7 +404,8 @@ impl RpcX3DHServer {
 
 #[derive(Debug, Default)]
 pub(crate) struct RpcX3DHInner {
-    db: RwLock<HashMap<Vec<u8>, PublishedKeys>>,
+    published_keys: RwLock<HashMap<Vec<u8>, PublishedKeys>>,
+    attempts: RwLock<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
 }
 
 #[derive(Debug)]
@@ -396,7 +422,7 @@ impl X3dhService for RpcX3DHInner {
         request: Request<PublishKeysRequest>,
     ) -> RpcResult<Response<PublishKeysResponse>> {
         let keys = request.into_inner();
-        self.db.write().insert(
+        self.published_keys.write().insert(
             keys.identity_key_bob.clone(),
             PublishedKeys {
                 prekey: keys.prekey,
@@ -412,7 +438,7 @@ impl X3dhService for RpcX3DHInner {
         request: Request<FetchKeysRequest>,
     ) -> RpcResult<Response<FetchKeysResponse>> {
         let identity_key_bob = request.into_inner().identity_key_bob;
-        match self.db.write().get_mut(&identity_key_bob) {
+        match self.published_keys.write().get_mut(&identity_key_bob) {
             Some(keys) => Ok(Response::new(FetchKeysResponse {
                 identity_key_bob,
                 prekey: keys.prekey.clone(),
@@ -421,6 +447,37 @@ impl X3dhService for RpcX3DHInner {
             })),
             None => Err(Status::not_found("identity_key_bob not found".to_string())),
         }
+    }
+
+    async fn add_attempt(
+        &self,
+        request: Request<AddAttemptRequest>,
+    ) -> RpcResult<Response<AddAttemptResponse>> {
+        let AddAttemptRequest {
+            identity_key_alice,
+            identity_key_bob,
+        } = request.into_inner();
+        self.attempts
+            .write()
+            .entry(identity_key_bob)
+            .or_default()
+            .push(identity_key_alice);
+        Ok(Response::new(AddAttemptResponse {}))
+    }
+
+    async fn list_attempt(
+        &self,
+        request: Request<ListAttemptRequest>,
+    ) -> RpcResult<Response<ListAttemptResponse>> {
+        let identity_key_bob = request.into_inner().identity_key_bob;
+        Ok(Response::new(ListAttemptResponse {
+            identity_key_alice: self
+                .attempts
+                .read()
+                .get(&identity_key_bob)
+                .cloned()
+                .unwrap_or_default(),
+        }))
     }
 }
 

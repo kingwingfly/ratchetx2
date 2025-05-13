@@ -4,6 +4,8 @@ package x3dh;
 service X3DHService {
     rpc PublishKeys(PublishKeysRequest) returns (PublishKeysResponse) {}
     rpc FetchKeys(FetchKeysRequest) returns (FetchKeysResponse) {}
+    rpc AddAttempt(AddAttemptRequest) returns (AddAttemptResponse) {}
+    rpc ListAttempt(ListAttemptRequest) returns (ListAttemptResponse) {}
 }
 
 message PublishKeysRequest {
@@ -25,4 +27,20 @@ message FetchKeysResponse {
     bytes prekey = 2;
     bytes prekey_signature = 3;
     optional bytes one_time_key = 4;
+}
+
+message AddAttemptRequest {
+    bytes identity_key_alice = 1;
+    bytes identity_key_bob = 2;
+}
+
+message AddAttemptResponse {
+}
+
+message ListAttemptRequest {
+    bytes identity_key_bob = 1;
+}
+
+message ListAttemptResponse {
+    repeated bytes identity_key_alice = 1;
 }

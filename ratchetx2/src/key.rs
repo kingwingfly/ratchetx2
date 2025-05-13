@@ -24,7 +24,7 @@ pub struct SharedKeys {
 }
 
 impl SharedKeys {
-    /// New a party who sends message first.
+    /// New a double-ratchet who sends message first.
     pub fn alice(&self, public_key: &[u8]) -> Ratchetx2 {
         Ratchetx2::alice(
             self.secret_key,
@@ -34,7 +34,7 @@ impl SharedKeys {
         )
     }
 
-    /// New a party who waits for the message first.
+    /// New a double-ratchet who waits for the message first.
     pub fn bob(&self, private_key: EphemeralPrivateKey) -> Ratchetx2 {
         Ratchetx2::bob(
             self.secret_key,
