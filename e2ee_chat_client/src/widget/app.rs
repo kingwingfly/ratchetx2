@@ -5,7 +5,7 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Padding},
+    widgets::{Block, List, ListState, Padding},
 };
 use ratatui_image::picker::Picker;
 use ratchetx2::{Certificate, Party, Uri, X3DHClient, transport::RpcTransport};
@@ -45,6 +45,8 @@ pub struct AppState {
     pub chat_textarea: TextArea<'static>,
     pub textareas: Vec<(String, TextArea<'static>)>,
     pub current_activated_textarea: usize,
+    pub attempt_list: Vec<String>,
+    pub current_selected_attempt: usize,
     pub screen: Screen,
 
     pub explore_state: ExploreState,
@@ -72,6 +74,8 @@ impl AppState {
             chat_textarea: text_area,
             textareas: vec![],
             current_activated_textarea: 0,
+            attempt_list: vec![],
+            current_selected_attempt: 0,
             screen: Screen::default(),
             explore_state: Default::default(),
             conversation_state: Default::default(),
@@ -181,6 +185,18 @@ impl StatefulWidget for App {
                     },
                 }
                 .render(area, buf, &mut state.current_activated_textarea);
+            }
+            Screen::ListInitMsg => {
+                PopUpStateful {
+                    inner: List::new(state.attempt_list.clone())
+                        .highlight_style(Style::default().green())
+                        .block(Block::bordered().padding(Padding::proportional(2))),
+                }
+                .render(
+                    area,
+                    buf,
+                    &mut ListState::default().with_selected(Some(state.current_selected_attempt)),
+                );
             }
             Screen::SelectFile => {
                 PopUpStateful {

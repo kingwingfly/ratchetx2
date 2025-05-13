@@ -87,7 +87,7 @@ impl<T: Transport> Party<T> {
         }
     }
 
-    /// Push a message.
+    /// Encrypt and push a message.
     /// # Args
     /// - content: the bytes to push, not encrypted
     pub async fn push(&mut self, content: impl AsRef<[u8]>) -> Result<()> {
@@ -119,7 +119,7 @@ impl<T: Transport> Party<T> {
         Ok(())
     }
 
-    /// Fetch messages.
+    /// Fetch and decrypt messages.
     ///
     /// Returns decrypted bytes.
     pub async fn fetch(&mut self) -> Result<Vec<Result<Vec<u8>>>> {

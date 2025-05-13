@@ -62,7 +62,9 @@ impl StatefulWidget for Setting {
                 Span::raw("S").underlined(),
                 Span::raw("end/"),
                 Span::raw("H").underlined(),
-                Span::raw("andle InitialMessage"),
+                Span::raw("andle/"),
+                Span::raw("L").underlined(),
+                Span::raw("ist InitialMessage"),
             ])
             .centered()
             .gray()

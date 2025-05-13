@@ -190,6 +190,26 @@ impl Client {
                             state.current_activated_textarea = 0;
                             state.screen = Screen::HandleInitMsg;
                         }
+                        KeyCode::Char('l') => {
+                            match state
+                                .x3dh_client
+                                .list_attempt(&state.x3dh_client.public_identity_key())
+                                .await
+                            {
+                                Ok(identity_key_alice) if !identity_key_alice.is_empty() => {
+                                    state.attempt_list = identity_key_alice
+                                        .into_iter()
+                                        .map(|key| BASE64_STANDARD.encode(key))
+                                        .collect();
+                                    state.current_selected_attempt = 0;
+                                    state.screen = Screen::ListInitMsg;
+                                }
+                                Ok(_) => {
+                                    state.screen = Screen::Hint("No init message.".to_string());
+                                }
+                                Err(e) => state.screen = Screen::Hint(e.to_string()),
+                            }
+                        }
                         KeyCode::Esc | KeyCode::Tab => state.screen = Screen::Main,
                         _ => {}
                     },
@@ -263,6 +283,35 @@ impl Client {
                                 .1
                                 .input(key);
                         }
+                    },
+                    _ => {}
+                },
+                Screen::ListInitMsg => match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Esc => state.screen = Screen::Main,
+                        KeyCode::Tab | KeyCode::Down => {
+                            state.current_selected_attempt += 1;
+                            state.current_selected_attempt %= state.attempt_list.len();
+                        }
+                        KeyCode::BackTab | KeyCode::Up => {
+                            state.current_selected_attempt += state.attempt_list.len() - 1;
+                            state.current_selected_attempt %= state.attempt_list.len();
+                        }
+                        KeyCode::Enter => {
+                            state.textareas = vec![
+                                ("Name".to_string(), TextArea::default()),
+                                (
+                                    "Public IndentityKey (Alice)".to_string(),
+                                    TextArea::new(vec![
+                                        state.attempt_list[state.current_selected_attempt]
+                                            .to_owned(),
+                                    ]),
+                                ),
+                            ];
+                            state.current_activated_textarea = 0;
+                            state.screen = Screen::HandleInitMsg;
+                        }
+                        _ => {}
                     },
                     _ => {}
                 },
@@ -344,8 +393,11 @@ impl Client {
                             if key.modifiers == CONTROL
                                 && state.navi.current == Navigation::Input =>
                         {
-                            let content =
-                                MessageContent::Text(state.chat_textarea.lines().join("\n"));
+                            let content = state.chat_textarea.lines().join("\n");
+                            if content.trim().is_empty() {
+                                continue;
+                            }
+                            let content = MessageContent::Text(content);
                             if self.send(&mut state, content).await {
                                 let mut textarea = TextArea::default();
                                 textarea.set_line_number_style(Style::default().gray());
