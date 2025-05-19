@@ -11,6 +11,11 @@ impl StatefulWidget for Contacts<'_> {
     type State = usize;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
+        let lines = area.height as usize;
+        if lines == 0 {
+            return;
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Fill(1), Constraint::Length(1)])
@@ -20,7 +25,6 @@ impl StatefulWidget for Contacts<'_> {
             buf,
             &mut ScrollbarState::new(self.contacts.len()).position(*state),
         );
-        let lines = chunks[0].height as usize;
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(vec![Constraint::Length(1); lines])
