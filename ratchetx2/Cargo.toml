@@ -22,7 +22,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 thiserror = "2.0"
 tracing = "0.1"
 tonic = { version = "0.13", features = ["tls-ring", "tls-native-roots"] }
-prost = "0.13"
+prost = "0.14"
 parking_lot = "0.12"
 
 [build-dependencies]
