@@ -9,6 +9,11 @@ Note: In this file, do not use the hard wrap in the middle of a sentence for com
 -->
 
 ## [Unreleased]
+## [0.2.7] - 2025-07-09
+
+- bump deps
+- make it compile even if no protoc with feature grpc disabled
+
 ## [0.2.6] - 2025-05-19
 
 - bug fix

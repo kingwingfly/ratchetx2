@@ -1,6 +1,6 @@
 [package]
 name = "ratchetx2"
-version = "0.3.7"
+version = "0.3.8"
 edition = "2024"
 keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
 license = "MIT"
@@ -21,12 +21,12 @@ curve25519-dalek = "4.1"
 zeroize = { version = "1.8", features = ["derive"] }
 thiserror = "2.0"
 tracing = "0.1"
-tonic = { version = "0.13", features = ["tls-ring", "tls-native-roots"] }
-prost = "0.13"
 parking_lot = "0.12"
+tonic = { version = "0.13", features = ["tls-ring", "tls-native-roots"], optional = true }
+prost = { version = "0.13", optional = true }
 
 [build-dependencies]
-tonic-build = "0.13"
+tonic-build = { version = "0.13", optional = true}
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
@@ -36,4 +36,4 @@ tokio = { version = "1", default-features = false, features = [
 
 [features]
 default = ["grpc"]
-grpc = []
+grpc = ["dep:tonic", "dep:tonic-build", "dep:prost"]
