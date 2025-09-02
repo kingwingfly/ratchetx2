@@ -15,7 +15,7 @@ jobs:
   create-release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: taiki-e/create-gh-release-action@v1
         with:
           # (optional) Path to changelog.
@@ -27,7 +27,7 @@ jobs:
     needs: create-release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: setup podman
         run: |
           sudo apt-get update
@@ -66,7 +66,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Protoc Linux
         if: ${{ matrix.os == 'ubuntu-latest' }}
         run: sudo apt install -y protobuf-compiler
