@@ -22,11 +22,11 @@ zeroize = { version = "1.8", features = ["derive"] }
 thiserror = "2.0"
 tracing = "0.1"
 parking_lot = "0.12"
-tonic = { version = "0.13", features = ["tls-ring", "tls-native-roots"], optional = true }
-prost = { version = "0.13", optional = true }
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"], optional = true }
+prost = { version = "0.14", optional = true }
 
 [build-dependencies]
-tonic-build = { version = "0.13", optional = true}
+tonic-build = { version = "0.14", optional = true}
 
 [dev-dependencies]
 tokio = { version = "1", default-features = false, features = [
