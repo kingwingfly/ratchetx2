@@ -1,0 +1,30 @@
+[package]
+name = "x3dh"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Louis <836250617@qq.com>"]
+repository = "https://github.com/kingwingfly/ratchetx2"
+description = "X3DH shared key initialization over gRPC."
+publish = false
+
+[dependencies]
+ratchetx2 = { path = "../ratchetx2", version = "0.4" }
+primitives = { path = "../primitives" }
+xeddsa = { path = "../xeddsa" }
+hkdf = "0.13"
+parking_lot = "0.12"
+prost = "0.14"
+sha2 = "0.11"
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
+tonic-prost = "0.14"
+zeroize = "1.9"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+] }

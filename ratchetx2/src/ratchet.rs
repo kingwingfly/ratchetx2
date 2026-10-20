@@ -5,23 +5,20 @@ mod message;
 
 use dh_root::DhRootRatchet;
 use message::MessageRatchet;
-use ring::agreement::EphemeralPrivateKey;
 
-use crate::key::{HeaderKey, MessageKey, SecretKey};
+use crate::key::{DhPrivateKey, HeaderKey, MessageKey, SecretKey};
 
 /// Double ratchet.
 /// # Example
 /// ```
-/// use ratchetx2::SharedKeys;
-/// use ratchetx2::rand::SystemRandom;
-/// use ratchetx2::agreement::{EphemeralPrivateKey, X25519};
+/// use ratchetx2::{DhPrivateKey, SharedKeys};
 ///
 /// let shared_keys = SharedKeys {
 ///     secret_key: [0; 32],
 ///     header_key_alice: [1; 32],
 ///     header_key_bob: [2; 32],
 /// };
-/// let mut bob = shared_keys.bob(EphemeralPrivateKey::generate(&X25519, &SystemRandom::new()).unwrap());
+/// let mut bob = shared_keys.bob(DhPrivateKey::generate());
 /// let mut alice = shared_keys.alice(&bob.public_key());
 ///
 /// bob.step_dh_root(&alice.public_key());
@@ -65,6 +62,7 @@ impl PartialEq for Ratchetx2 {
 
 impl Ratchetx2 {
     /// New a party who sends message first.
+    ///
     /// # Args
     /// - secret_key, header_key_alice, header_key_bob: shared keys for initialization
     pub fn alice(
@@ -84,16 +82,17 @@ impl Ratchetx2 {
     }
 
     /// New a party who waits for the message first.
+    ///
     /// # Args
     /// - secret_key, header_key_alice, header_key_bob: shared keys for initialization
     ///
     /// # Caution
     /// Bob is initialized with [0; 32] as message key and header key, therefore,
-    /// step_dh_root to update message receiving chain before first receiving,
-    /// and step_dh_root again before first sending.
+    /// `step_dh_root` to update message receiving chain before first receiving,
+    /// and `step_dh_root` again before first sending.
     pub fn bob(
         secret_key: SecretKey,
-        private_key: EphemeralPrivateKey,
+        private_key: DhPrivateKey,
         header_key_alice: HeaderKey,
         header_key_bob: HeaderKey,
     ) -> Self {

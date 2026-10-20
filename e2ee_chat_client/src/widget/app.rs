@@ -3,14 +3,15 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use parking_lot::RwLock;
+use primitives::{Party, transport::RpcTransport};
 use ratatui::{
     prelude::*,
     widgets::{Block, List, ListState, Padding},
 };
 use ratatui_image::picker::Picker;
-use ratchetx2::{Certificate, Party, Uri, X3DHClient, transport::RpcTransport};
 use tokio::sync::RwLock as AsyncRwLock;
 use tui_textarea::TextArea;
+use x3dh::{Certificate, Uri, X3DHClient};
 
 use crate::{
     message::Message,
@@ -83,7 +84,9 @@ impl AppState {
             picker: Picker::from_query_stdio()?,
             #[cfg(windows)]
             picker: {
-                let mut picker = Picker::from_fontsize((7, 14));
+                // Deprecated, but the only way to pair iTerm2 with a fixed font size.
+                #[allow(deprecated)]
+                let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(7, 14));
                 picker.set_protocol_type(ratatui_image::picker::ProtocolType::Iterm2);
                 picker
             },

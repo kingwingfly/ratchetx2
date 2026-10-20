@@ -13,7 +13,8 @@ use ratatui::{
     widgets::{Block, Borders, Padding, Paragraph, Scrollbar, ScrollbarState},
 };
 use ratatui_image::{
-    FilterType, Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol,
+    FilterType, Resize, ResizeEncodeRender, StatefulImage, picker::Picker,
+    protocol::StatefulProtocol,
 };
 use regex::Regex;
 use tui_textarea::{Input, TextArea};
@@ -209,7 +210,7 @@ impl StatefulWidget for Explore<'_> {
                                 let mut image = self.picker.new_resize_protocol(image);
                                 image.resize_encode(
                                     &Resize::Fit(Some(FilterType::CatmullRom)),
-                                    preview,
+                                    preview.as_size(),
                                 );
                                 image
                             })

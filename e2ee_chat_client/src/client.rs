@@ -1,6 +1,5 @@
 use anyhow::Result;
 use base64::prelude::*;
-use bincode::config;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -10,8 +9,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, prelude::*};
-use ratchetx2::{Certificate, Uri, X3DHClient};
 use tui_textarea::TextArea;
+use x3dh::{Certificate, Uri, X3DHClient};
 
 use std::io::Stderr;
 use std::time::Duration;
@@ -98,10 +97,7 @@ impl Client {
                         for (key, party) in parties.write().await.iter_mut() {
                             if let Ok(messages) = party.fetch().await {
                                 for message in messages.into_iter().filter_map(|m| m.ok()) {
-                                    if let Ok((content, _)) = bincode::decode_from_slice::<MessageContent, _>(
-                                        &message,
-                                        config::standard(),
-                                    ) {
+                                    if let Some(content) = MessageContent::from_bytes(&message) {
                                         conversations
                                             .write()
                                             .entry(key.clone())
@@ -430,28 +426,25 @@ impl Client {
     /// false: did not send at all
     #[must_use = "Clean textarea according to the result."]
     async fn send(&mut self, state: &mut AppState, content: MessageContent) -> bool {
-        if let Some((_, key)) = state.contacts.get(state.current_activated_contact) {
-            if let Some(party) = state.parties.write().await.get_mut(key) {
-                let message = Message {
-                    state: match party
-                        .push(bincode::encode_to_vec(&content, config::standard()).unwrap())
-                        .await
-                    {
-                        Ok(_) => MessageState::Sent,
-                        Err(e) => MessageState::Error(e.to_string()),
-                    },
-                    content,
-                };
-                state
-                    .conversations
-                    .write()
-                    .entry(key.clone())
-                    .or_default()
-                    .push(message);
-                state.current_activated_message =
-                    state.conversations.read()[key].len().saturating_sub(1);
-                return true;
-            }
+        if let Some((_, key)) = state.contacts.get(state.current_activated_contact)
+            && let Some(party) = state.parties.write().await.get_mut(key)
+        {
+            let message = Message {
+                state: match party.push(content.to_bytes()).await {
+                    Ok(_) => MessageState::Sent,
+                    Err(e) => MessageState::Error(e.to_string()),
+                },
+                content,
+            };
+            state
+                .conversations
+                .write()
+                .entry(key.clone())
+                .or_default()
+                .push(message);
+            state.current_activated_message =
+                state.conversations.read()[key].len().saturating_sub(1);
+            return true;
         }
         false
     }

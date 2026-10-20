@@ -36,9 +36,8 @@ impl ChannelTransport {
     }
 }
 
-#[allow(clippy::manual_async_fn)]
 impl Transport for ChannelTransport {
-    fn push_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
+    async fn push_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
         let mut tx = {
             self.channels
                 .write()
@@ -48,25 +47,22 @@ impl Transport for ChannelTransport {
                 .clone()
         };
         tx.try_send(bytes).unwrap();
-        async { Ok(()) }
+        Ok(())
     }
 
-    fn fetch_bytes(
-        &mut self,
-        limit: Option<usize>,
-    ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
+    async fn fetch_bytes(&mut self, limit: Option<usize>) -> Result<Vec<Vec<u8>>> {
         let mut ret = vec![];
         let mut channels = self.channels.write();
         let rx = &mut channels.entry(self.fetch_target).or_insert(channel(1024)).1;
-        while let Ok(Some(enc_msg)) = rx.try_next() {
+        while let Ok(enc_msg) = rx.try_recv() {
             ret.push(enc_msg);
-            if let Some(limit) = limit {
-                if ret.len() == limit {
-                    break;
-                }
+            if let Some(limit) = limit
+                && ret.len() == limit
+            {
+                break;
             }
         }
-        async { Ok(ret) }
+        Ok(ret)
     }
 }
 

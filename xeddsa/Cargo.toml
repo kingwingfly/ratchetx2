@@ -1,0 +1,17 @@
+[package]
+name = "xeddsa"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Louis <836250617@qq.com>"]
+repository = "https://github.com/kingwingfly/ratchetx2"
+description = "XEdDSA: one key pair for both X25519 Diffie-Hellman and Ed25519-style signatures."
+publish = false
+
+[dependencies]
+curve25519-dalek = "5.0"
+ed25519-dalek = "3.0"
+getrandom = "0.4"
+sha2 = "0.11"
+thiserror = "2.0"
+zeroize = { version = "1.9", features = ["derive"] }

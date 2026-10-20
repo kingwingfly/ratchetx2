@@ -1,0 +1,41 @@
+//! Error types.
+use thiserror::Error;
+
+use ratchetx2::error::CryptoError;
+
+/// Error types.
+#[derive(Debug, Error)]
+pub enum Error {
+    /// Transport error.
+    #[error("Transport error: {0}")]
+    Transport(#[from] TransportError),
+    /// Crypto error.
+    #[error("Crypto error")]
+    Crypto(#[from] CryptoError),
+    /// Signature verify failed.
+    #[error("Signature verify failed.")]
+    Signature,
+    /// Failed
+    #[error("Failed: {0}")]
+    Failed(String),
+}
+
+/// Error type for transport operations.
+#[derive(Debug, Error)]
+pub enum TransportError {
+    /// Failed to connect.
+    #[error("Failed to connect.")]
+    Connect,
+    /// Failed to push.
+    #[error("Failed to push.")]
+    Push,
+    /// Failed to fetch.
+    #[error("Failed to fetch.")]
+    Fetch,
+    /// Server error.
+    #[error("Server error.")]
+    Server,
+}
+
+/// Result type with [`Error`](enum@Error).
+pub type Result<T> = core::result::Result<T, Error>;

@@ -3,7 +3,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Cell, Padding, Row, Table},
 };
-use ratchetx2::Uri;
+use x3dh::Uri;
 
 pub struct Setting {}
 

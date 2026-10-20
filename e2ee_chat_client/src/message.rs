@@ -1,4 +1,4 @@
-use bincode::{Decode, Encode};
+use prost::Message as _;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug)]
@@ -14,10 +14,32 @@ pub enum MessageState {
     Error(String),
 }
 
-#[derive(Debug, Decode, Encode)]
+#[derive(prost::Oneof)]
 pub enum MessageContent {
+    #[prost(string, tag = "1")]
     Text(String),
+    #[prost(bytes = "vec", tag = "2")]
     Image(Vec<u8>),
+}
+
+/// A oneof can't be a top-level protobuf message, so [`MessageContent`] travels inside this.
+#[derive(prost::Message)]
+struct WireContent {
+    #[prost(oneof = "MessageContent", tags = "1, 2")]
+    content: Option<MessageContent>,
+}
+
+impl MessageContent {
+    /// Same bytes as encoding `WireContent { content: Some(self) }`, without cloning `self`.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(self.encoded_len());
+        self.encode(&mut buf);
+        buf
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        WireContent::decode(bytes).ok()?.content
+    }
 }
 
 impl Message {

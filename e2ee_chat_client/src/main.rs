@@ -1,7 +1,7 @@
 use std::fs;
 
 use clap::Parser;
-use ratchetx2::Certificate;
+use x3dh::Certificate;
 
 mod cli;
 mod client;

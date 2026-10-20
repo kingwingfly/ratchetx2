@@ -5,19 +5,27 @@ pub(crate) mod message_rpc {
     tonic::include_proto!("message");
 }
 
-use parking_lot::RwLock;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
-use message_rpc::message_service_client::MessageServiceClient;
-use message_rpc::message_service_server::{MessageService, MessageServiceServer};
 use message_rpc::{
     FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse,
 };
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig, Uri};
-use tonic::transport::{Channel, ClientTlsConfig};
-use tonic::{Request, Response, Result as RpcResult};
+use message_rpc::{
+    message_service_client::MessageServiceClient,
+    message_service_server::{MessageService, MessageServiceServer},
+};
+use parking_lot::RwLock;
+use tonic::{
+    Request, Response, Result as RpcResult,
+    service::Routes,
+    transport::{Certificate, Channel, ClientTlsConfig, Identity, Server, ServerTlsConfig, Uri},
+};
 
 use super::Transport;
 use crate::error::{Result, TransportError};
@@ -67,42 +75,34 @@ impl RpcTransport {
     }
 }
 
-#[allow(clippy::manual_async_fn)]
 impl Transport for RpcTransport {
-    fn push_bytes(&mut self, bytes: Vec<u8>) -> impl Future<Output = Result<()>> + Send + 'static {
+    async fn push_bytes(&mut self, bytes: Vec<u8>) -> Result<()> {
         let req = PushMessageRequest {
             target: self.push_target.clone(),
             enc_message: bytes,
         };
-        let mut client = self.rpc_client.clone();
-        async move {
-            let _resp = client
-                .push_message(req)
-                .await
-                .map_err(|_| TransportError::Push)?;
-            Ok(())
-        }
+        let _resp = self
+            .rpc_client
+            .push_message(req)
+            .await
+            .map_err(|_| TransportError::Push)?;
+        Ok(())
     }
 
-    fn fetch_bytes(
-        &mut self,
-        limit: Option<usize>,
-    ) -> impl Future<Output = Result<Vec<Vec<u8>>>> + Send + 'static {
+    async fn fetch_bytes(&mut self, limit: Option<usize>) -> Result<Vec<Vec<u8>>> {
         let req = FetchMessagesRequest {
             target: self.fetch_target.clone(),
             last_sync_id: self.last_sync_id.load(Ordering::Relaxed),
             limit: limit.map(|limit| limit as u64),
         };
-        let mut client = self.rpc_client.clone();
-        let last_sync_id = self.last_sync_id.clone();
-        async move {
-            let resp = client
-                .fetch_messages(req)
-                .await
-                .map_err(|_| TransportError::Fetch)?;
-            last_sync_id.fetch_add(resp.get_ref().enc_messages.len() as u64, Ordering::Relaxed);
-            Ok(resp.into_inner().enc_messages)
-        }
+        let resp = self
+            .rpc_client
+            .fetch_messages(req)
+            .await
+            .map_err(|_| TransportError::Fetch)?;
+        self.last_sync_id
+            .fetch_add(resp.get_ref().enc_messages.len() as u64, Ordering::Relaxed);
+        Ok(resp.into_inner().enc_messages)
     }
 }
 
@@ -127,6 +127,11 @@ impl RpcMessageServer {
             .await
             .map_err(|_| TransportError::Server)?;
         Ok(())
+    }
+
+    /// The message service as tonic [`Routes`], to serve it together with other services.
+    pub fn routes() -> Routes {
+        Routes::new(MessageServiceServer::new(RpcMessageServerInner::default()))
     }
 }
 

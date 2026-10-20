@@ -5,9 +5,10 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph, Wrap},
 };
 use ratatui_image::{
-    FilterType, Resize, StatefulImage, picker::Picker, protocol::StatefulProtocol,
+    FilterType, Resize, ResizeEncodeRender, StatefulImage, picker::Picker,
+    protocol::StatefulProtocol,
 };
-use ring::digest::{SHA256, digest};
+use sha2::{Digest, Sha256};
 
 use crate::message::{Message, MessageContent, MessageState};
 
@@ -70,15 +71,16 @@ impl StatefulWidget for Bubble<'_> {
                 p.render(inner, buf);
             }
             MessageContent::Image(bytes) => {
-                if let Some(image) =
-                    state.get_or_insert_mut(digest(&SHA256, bytes).as_ref().to_vec(), || {
-                        load_from_memory(bytes).ok().map(|image| {
-                            let mut image = self.picker.new_resize_protocol(image);
-                            image.resize_encode(&Resize::Fit(Some(FilterType::CatmullRom)), inner);
-                            image
-                        })
+                if let Some(image) = state.get_or_insert_mut(Sha256::digest(bytes).to_vec(), || {
+                    load_from_memory(bytes).ok().map(|image| {
+                        let mut image = self.picker.new_resize_protocol(image);
+                        image.resize_encode(
+                            &Resize::Fit(Some(FilterType::CatmullRom)),
+                            inner.as_size(),
+                        );
+                        image
                     })
-                {
+                }) {
                     StatefulImage::default().render(inner, buf, image);
                 }
             }
