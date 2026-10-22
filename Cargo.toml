@@ -2,8 +2,11 @@
 members = [
     "e2ee_chat_client",
     "e2ee_chat_server",
-    "primitives",
+    "party",
+    "protocol",
     "ratchetx2",
+    "session",
+    "storage",
     "x3dh",
     "xeddsa",
 ]

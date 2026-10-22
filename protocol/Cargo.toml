@@ -1,0 +1,47 @@
+[package]
+name = "protocol"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Louis <836250617@qq.com>"]
+repository = "https://github.com/kingwingfly/ratchetx2"
+description = "The E2EE chat's wire protocol: the handshake and mailbox services, their clients and servers."
+publish = false
+
+[dependencies]
+bon = { version = "3.10", optional = true }
+bytes = "1"
+party = { path = "../party", default-features = false }
+prost = "0.14"
+rkyv = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+storage = { path = "../storage", default-features = false, optional = true }
+thiserror = "2.0"
+tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"], optional = true }
+tonic-prost = { version = "0.14", optional = true }
+trait-variant = "0.1"
+x3dh = { path = "../x3dh" }
+xeddsa = { path = "../xeddsa" }
+
+[build-dependencies]
+prost-build = "0.14"
+protox = { version = "0.10", optional = true }
+tonic-prost-build = { version = "0.14", optional = true }
+
+[dev-dependencies]
+storage = { path = "../storage" }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+] }
+
+[features]
+default = ["protox"]
+# Compile the .proto files with protox, so protoc is not needed.
+protox = ["dep:protox", "party/protox"]
+serde = ["dep:serde", "bytes/serde", "party/serde"]
+rkyv = ["dep:rkyv", "rkyv/bytes-1", "party/rkyv"]
+# The servers' logic, over the `storage` traits.
+server = ["dep:bon", "dep:storage"]
+# gRPC (tonic) clients, and services for the servers.
+grpc = ["dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build"]

@@ -9,10 +9,11 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{Terminal, prelude::*};
+use session::protocol::grpc::{Certificate, GrpcHandshake, GrpcMailbox, Uri};
 use tui_textarea::TextArea;
-use x3dh::{Certificate, Uri, X3DHClient};
 
 use std::io::Stderr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::{
@@ -20,7 +21,7 @@ use crate::{
     navi::Navigation,
     screen::Screen,
     widget::{
-        app::{App, AppState},
+        app::{App, AppState, PublicKey},
         connecting::Connecting,
         hint::Hint,
         pop_up::PopUp,
@@ -28,6 +29,8 @@ use crate::{
 };
 
 const CONTROL: KeyModifiers = KeyModifiers::CONTROL;
+/// How many one-time prekeys to publish.
+const ONE_TIME_PREKEYS: usize = 16;
 
 pub struct Client {
     terminal: Terminal<CrosstermBackend<Stderr>>,
@@ -76,7 +79,7 @@ impl Client {
                     f.render_widget(
                         PopUp {
                             inner: Hint {
-                                hint: e.to_string(),
+                                hint: format!("{e:#}"),
                             },
                         },
                         f.area(),
@@ -87,25 +90,35 @@ impl Client {
             }
         };
 
-        let parties = state.parties.clone();
+        let sessions = state.sessions.clone();
         let conversations = state.conversations.clone();
         tokio::spawn(async move {
             let mut sync = true;
             loop {
                 tokio::select! {
                     _ = async {
-                        for (key, party) in parties.write().await.iter_mut() {
-                            if let Ok(messages) = party.fetch().await {
-                                for message in messages.into_iter().filter_map(|m| m.ok()) {
+                        let sessions: Vec<_> = sessions
+                            .read()
+                            .iter()
+                            .map(|(key, session)| (*key, session.clone()))
+                            .collect();
+                        for (key, session) in sessions {
+                            // Lock the session for one page at a time, so sending to this peer
+                            // waits for one fetch at most.
+                            loop {
+                                let page = session.lock().await.receive().await;
+                                let Ok(page) = page else { break };
+                                if page.is_empty() {
+                                    break;
+                                }
+                                for message in page.into_iter().filter_map(|m| m.ok()) {
                                     if let Some(content) = MessageContent::from_bytes(&message) {
-                                        conversations
-                                            .write()
-                                            .entry(key.clone())
-                                            .or_default()
-                                            .push(Message {
+                                        conversations.write().entry(key).or_default().push(
+                                            Message {
                                                 content,
                                                 state: MessageState::Recved,
-                                            });
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -150,22 +163,20 @@ impl Client {
                 Screen::Settings => match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Char('p') => {
-                            state.screen = match state.x3dh_client.publish_keys().await {
+                            state.screen = match state.client.publish_keys(ONE_TIME_PREKEYS).await {
                                 Ok(_) => Screen::Hint("Keys published".to_string()),
-                                Err(err) => Screen::Hint(err.to_string()),
+                                Err(err) => Screen::Hint(describe(err)),
                             };
                         }
                         KeyCode::Char('r') => {
-                            state.screen =
-                                match X3DHClient::connect(&state.server_addr, None, ca.clone())
-                                    .await
-                                {
-                                    Ok(client) => {
-                                        state.x3dh_client = client;
-                                        Screen::Hint("Keys refreshed".to_string())
-                                    }
-                                    Err(e) => Screen::Hint(e.to_string()),
-                                }
+                            state.client =
+                                session::Client::new(GrpcHandshake::new(state.channel.clone()));
+                            // They were sent to the old identity, whose prekeys are gone.
+                            state.introductions.clear();
+                            state.screen = Screen::Hint(
+                                "New identity created, publish its keys to be reachable"
+                                    .to_string(),
+                            );
                         }
                         KeyCode::Char('s') => {
                             state.textareas = vec![
@@ -186,26 +197,20 @@ impl Client {
                             state.current_activated_textarea = 0;
                             state.screen = Screen::HandleInitMsg;
                         }
-                        KeyCode::Char('l') => {
-                            match state
-                                .x3dh_client
-                                .list_attempt(&state.x3dh_client.public_identity_key())
-                                .await
-                            {
-                                Ok(identity_key_alice) if !identity_key_alice.is_empty() => {
-                                    state.attempt_list = identity_key_alice
-                                        .into_iter()
-                                        .map(|key| BASE64_STANDARD.encode(key))
-                                        .collect();
-                                    state.current_selected_attempt = 0;
-                                    state.screen = Screen::ListInitMsg;
-                                }
-                                Ok(_) => {
-                                    state.screen = Screen::Hint("No init message.".to_string());
-                                }
-                                Err(e) => state.screen = Screen::Hint(e.to_string()),
+                        KeyCode::Char('l') => match state.client.take_introductions().await {
+                            // Taken introductions are gone from the server, so keep them
+                            // until accepted.
+                            Ok(introductions) => {
+                                state.introductions.extend(introductions);
+                                state.screen = if state.introductions.is_empty() {
+                                    Screen::Hint("No init message.".to_string())
+                                } else {
+                                    state.current_selected_introduction = 0;
+                                    Screen::ListInitMsg
+                                };
                             }
-                        }
+                            Err(e) => state.screen = Screen::Hint(describe(e)),
+                        },
                         KeyCode::Esc | KeyCode::Tab => state.screen = Screen::Main,
                         _ => {}
                     },
@@ -225,53 +230,64 @@ impl Client {
                         KeyCode::Enter => {
                             let name = state.textareas[0].1.lines().join("\n");
                             let content = state.textareas[1].1.lines().join("\n");
-                            match BASE64_STANDARD.decode(&content) {
-                                Ok(identity_key) => {
-                                    state.textareas = vec![];
-                                    match &state.screen {
-                                        Screen::PushInitMsg => match state
-                                            .x3dh_client
-                                            .push_initial_message(&identity_key, &state.server_addr)
-                                            .await
-                                        {
-                                            Ok(party) => {
-                                                state
-                                                    .parties
-                                                    .write()
-                                                    .await
-                                                    .insert(identity_key.clone(), party);
-                                                state.contacts.push((name, identity_key));
-                                                state.current_activated_contact =
-                                                    state.contacts.len().saturating_sub(1);
-                                                state.screen = Screen::Main;
-                                            }
-                                            Err(e) => state.screen = Screen::Hint(e.to_string()),
-                                        },
-                                        Screen::HandleInitMsg => match state
-                                            .x3dh_client
-                                            .handle_initial_message(
-                                                &identity_key,
-                                                &state.server_addr,
-                                            )
-                                            .await
-                                        {
-                                            Ok(party) => {
-                                                state
-                                                    .parties
-                                                    .write()
-                                                    .await
-                                                    .insert(identity_key.clone(), party);
-                                                state.contacts.push((name, identity_key));
-                                                state.current_activated_contact =
-                                                    state.contacts.len().saturating_sub(1);
-                                                state.screen = Screen::Main;
-                                            }
-                                            Err(e) => state.screen = Screen::Hint(e.to_string()),
-                                        },
-                                        _ => unreachable!(),
-                                    }
+                            let Some(identity_key) = BASE64_STANDARD
+                                .decode(content.trim())
+                                .ok()
+                                .and_then(|key| PublicKey::try_from(key).ok())
+                            else {
+                                state.screen = Screen::Hint("Invalid identity key".to_string());
+                                continue;
+                            };
+                            state.textareas = vec![];
+                            let mailbox = GrpcMailbox::new(state.channel.clone());
+                            let session = match &state.screen {
+                                Screen::PushInitMsg => state
+                                    .client
+                                    .initiate(&identity_key, mailbox)
+                                    .await
+                                    .map_err(describe),
+                                // The newest one from this key: a peer who started again
+                                // only keeps the session of the last.
+                                Screen::HandleInitMsg => match state
+                                    .introductions
+                                    .iter()
+                                    .rposition(|i| i.identity_key == identity_key)
+                                {
+                                    // Accepting fails for good or not at all, so remove it.
+                                    Some(index) => state
+                                        .client
+                                        .accept(
+                                            &identity_key,
+                                            &state.introductions.remove(index),
+                                            mailbox,
+                                        )
+                                        .map_err(describe),
+                                    None => Err("No init message from this key, list them first"
+                                        .to_string()),
+                                },
+                                _ => unreachable!(),
+                            };
+                            match session {
+                                Ok(session) => {
+                                    state.sessions.write().insert(
+                                        identity_key,
+                                        Arc::new(tokio::sync::Mutex::new(session)),
+                                    );
+                                    // A new session with a known contact replaces its old one.
+                                    state.current_activated_contact = match state
+                                        .contacts
+                                        .iter()
+                                        .position(|(_, key)| *key == identity_key)
+                                    {
+                                        Some(index) => index,
+                                        None => {
+                                            state.contacts.push((name, identity_key));
+                                            state.contacts.len() - 1
+                                        }
+                                    };
+                                    state.screen = Screen::Main;
                                 }
-                                Err(e) => state.screen = Screen::Hint(e.to_string()),
+                                Err(e) => state.screen = Screen::Hint(e),
                             }
                         }
                         _ => {
@@ -286,12 +302,12 @@ impl Client {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Esc => state.screen = Screen::Main,
                         KeyCode::Tab | KeyCode::Down => {
-                            state.current_selected_attempt += 1;
-                            state.current_selected_attempt %= state.attempt_list.len();
+                            state.current_selected_introduction += 1;
+                            state.current_selected_introduction %= state.introductions.len();
                         }
                         KeyCode::BackTab | KeyCode::Up => {
-                            state.current_selected_attempt += state.attempt_list.len() - 1;
-                            state.current_selected_attempt %= state.attempt_list.len();
+                            state.current_selected_introduction += state.introductions.len() - 1;
+                            state.current_selected_introduction %= state.introductions.len();
                         }
                         KeyCode::Enter => {
                             state.textareas = vec![
@@ -299,8 +315,11 @@ impl Client {
                                 (
                                     "Public IndentityKey (Alice)".to_string(),
                                     TextArea::new(vec![
-                                        state.attempt_list[state.current_selected_attempt]
-                                            .to_owned(),
+                                        BASE64_STANDARD.encode(
+                                            state.introductions
+                                                [state.current_selected_introduction]
+                                                .identity_key,
+                                        ),
                                     ]),
                                 ),
                             ];
@@ -426,28 +445,35 @@ impl Client {
     /// false: did not send at all
     #[must_use = "Clean textarea according to the result."]
     async fn send(&mut self, state: &mut AppState, content: MessageContent) -> bool {
-        if let Some((_, key)) = state.contacts.get(state.current_activated_contact)
-            && let Some(party) = state.parties.write().await.get_mut(key)
-        {
-            let message = Message {
-                state: match party.push(content.to_bytes()).await {
-                    Ok(_) => MessageState::Sent,
-                    Err(e) => MessageState::Error(e.to_string()),
-                },
-                content,
-            };
-            state
-                .conversations
-                .write()
-                .entry(key.clone())
-                .or_default()
-                .push(message);
-            state.current_activated_message =
-                state.conversations.read()[key].len().saturating_sub(1);
-            return true;
-        }
-        false
+        let Some(&(_, key)) = state.contacts.get(state.current_activated_contact) else {
+            return false;
+        };
+        // A statement of its own, so the map's lock is released before the `await`.
+        let Some(session) = state.sessions.read().get(&key).cloned() else {
+            return false;
+        };
+        let message = Message {
+            state: match session.lock().await.send(&content.to_bytes()).await {
+                Ok(_) => MessageState::Sent,
+                Err(e) => MessageState::Error(describe(e)),
+            },
+            content,
+        };
+        state
+            .conversations
+            .write()
+            .entry(key)
+            .or_default()
+            .push(message);
+        state.current_activated_message = state.conversations.read()[&key].len().saturating_sub(1);
+        true
     }
+}
+
+/// An error and its sources, e.g. "server error: status: Unavailable, ...", since an error's
+/// kind alone rarely says what to do.
+fn describe(error: session::Error) -> String {
+    format!("{:#}", anyhow::Error::new(error))
 }
 
 impl Drop for Client {

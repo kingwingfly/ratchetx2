@@ -2,7 +2,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::key::{ChainKey, HeaderKey, MessageKey};
+use crate::key::{ChainKey, HeaderKey, KEY_LENGTH, MessageKey};
 
 /// An established chain: its ChainKey and the HeaderKey of its messages.
 #[derive(Debug, Clone, PartialEq, Zeroize)]
@@ -56,7 +56,7 @@ impl MessageRatchet {
     }
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LENGTH] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(data);
     mac.finalize().into_bytes().into()

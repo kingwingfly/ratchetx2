@@ -1,10 +1,11 @@
+use crate::widget::app::PublicKey;
 use ratatui::{
     prelude::*,
     widgets::{Scrollbar, ScrollbarState},
 };
 
 pub struct Contacts<'a> {
-    pub contacts: &'a Vec<(String, Vec<u8>)>,
+    pub contacts: &'a [(String, PublicKey)],
 }
 
 impl StatefulWidget for Contacts<'_> {

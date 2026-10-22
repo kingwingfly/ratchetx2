@@ -1,0 +1,33 @@
+[package]
+name = "party"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Louis <836250617@qq.com>"]
+repository = "https://github.com/kingwingfly/ratchetx2"
+description = "Double-ratchet message encryption with header encryption, without I/O."
+publish = false
+
+[dependencies]
+ratchetx2 = { path = "../ratchetx2", version = "0.4" }
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+bytes = "1"
+getrandom = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
+prost = "0.14"
+rkyv = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = "0.11"
+thiserror = "2.0"
+
+[build-dependencies]
+prost-build = "0.14"
+protox = { version = "0.10", optional = true }
+
+[features]
+default = ["protox"]
+# Compile the .proto files with protox, so protoc is not needed.
+protox = ["dep:protox"]
+serde = ["dep:serde", "bytes/serde"]
+rkyv = ["dep:rkyv", "rkyv/bytes-1"]

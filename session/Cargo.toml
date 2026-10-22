@@ -1,0 +1,35 @@
+[package]
+name = "session"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Louis <836250617@qq.com>"]
+repository = "https://github.com/kingwingfly/ratchetx2"
+description = "The E2EE chat's client flow: publish prekeys, start or accept sessions, send and receive."
+publish = false
+
+[dependencies]
+bon = "3.10"
+bytes = "1"
+party = { path = "../party", default-features = false }
+protocol = { path = "../protocol", default-features = false }
+ratchetx2 = { path = "../ratchetx2", version = "0.4" }
+thiserror = "2.0"
+web-time = "1.1"
+x3dh = { path = "../x3dh" }
+xeddsa = { path = "../xeddsa" }
+
+[dev-dependencies]
+protocol = { path = "../protocol", features = ["server", "grpc"] }
+storage = { path = "../storage" }
+tokio = { version = "1", default-features = false, features = [
+    "macros",
+    "rt-multi-thread",
+] }
+
+[features]
+default = ["protox"]
+# Compile the .proto files with protox, so protoc is not needed.
+protox = ["party/protox", "protocol/protox"]
+# gRPC clients, see `protocol::grpc`.
+grpc = ["protocol/grpc"]

@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+// The message format of a double-ratchet party with header encryption.
+package party.v1;
+
+// A message as sent from one party to the other.
+message EncryptedMessage {
+  // The encrypted `Header`.
+  bytes header = 1;
+  // The encrypted content.
+  bytes content = 2;
+}
+
+// The plaintext of `EncryptedMessage.header`.
+message Header {
+  // The sender's current ratchet public key.
+  bytes public_key = 1;
+  // Number of messages in the sender's previous sending chain.
+  uint64 previous_chain_length = 2;
+  // Index of this message in the sender's current sending chain.
+  uint64 message_number = 3;
+}

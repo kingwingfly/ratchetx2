@@ -3,13 +3,14 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Cell, Padding, Row, Table},
 };
-use x3dh::Uri;
+use session::PublicKey;
+use session::protocol::grpc::Uri;
 
 pub struct Setting {}
 
 pub struct SettingState {
     pub server_addr: Uri,
-    pub public_identity_key: Vec<u8>,
+    pub public_identity_key: PublicKey,
 }
 
 impl StatefulWidget for Setting {
@@ -47,7 +48,7 @@ impl StatefulWidget for Setting {
                     ]),
                     Row::new([
                         Cell::from("Public Identity Key"),
-                        Cell::from(BASE64_STANDARD.encode(&state.public_identity_key).as_str()),
+                        Cell::from(BASE64_STANDARD.encode(state.public_identity_key).as_str()),
                     ]),
                 ]),
             chunks[0],
@@ -58,13 +59,13 @@ impl StatefulWidget for Setting {
                 Span::raw("P").underlined(),
                 Span::raw("ublish Keys | "),
                 Span::raw("R").underlined(),
-                Span::raw("efresh Keys | "),
+                Span::raw("enew Identity | "),
                 Span::raw("S").underlined(),
                 Span::raw("end/"),
                 Span::raw("H").underlined(),
                 Span::raw("andle/"),
                 Span::raw("L").underlined(),
-                Span::raw("ist InitialMessage"),
+                Span::raw("ist Initial Messages"),
             ])
             .centered()
             .gray()

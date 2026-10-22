@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+// The handshake service: Bob publishes prekeys, Alice fetches them and leaves her
+// initial message in Bob's inbox.
+package handshake.v1;
+
+// Bob's prekeys, replacing his previous ones. Signed with his identity key.
+message PublishRequest {
+  // Bob's identity key (32 bytes, XEdDSA).
+  bytes identity_key = 1;
+  // Bob's signed prekey (32 bytes, X25519).
+  bytes signed_prekey = 2;
+  // The identity key's XEdDSA signature of `signed_prekey` (64 bytes).
+  bytes signed_prekey_signature = 3;
+  // Bob's one-time prekeys (32 bytes each, X25519).
+  repeated bytes one_time_prekeys = 4;
+  // Milliseconds since the Unix epoch; must be greater than in Bob's previous publish.
+  uint64 timestamp = 5;
+  // The identity key's XEdDSA signature of this request (64 bytes).
+  bytes signature = 6;
+}
+
+// Reply to `PublishRequest`.
+message PublishResponse {}
+
+// Fetch Bob's prekey bundle, consuming one of his one-time prekeys.
+message FetchBundleRequest {
+  // Bob's identity key.
+  bytes identity_key = 1;
+}
+
+// Bob's prekey bundle.
+message FetchBundleResponse {
+  // Bob's signed prekey.
+  bytes signed_prekey = 1;
+  // The identity key's XEdDSA signature of `signed_prekey`.
+  bytes signed_prekey_signature = 2;
+  // One of Bob's one-time prekeys, unless none is left.
+  optional bytes one_time_prekey = 3;
+}
+
+// Alice's X3DH initial message to Bob.
+message InitialMessage {
+  // Alice's identity key.
+  bytes identity_key = 1;
+  // Alice's ephemeral key.
+  bytes ephemeral_key = 2;
+  // Bob's signed prekey that Alice used.
+  bytes signed_prekey = 3;
+  // Bob's one-time prekey that Alice used, if any.
+  optional bytes one_time_prekey = 4;
+}
+
+// Leave an initial message in Bob's inbox.
+message IntroduceRequest {
+  // Bob's identity key.
+  bytes recipient = 1;
+  // Alice's initial message.
+  InitialMessage message = 2;
+}
+
+// Reply to `IntroduceRequest`.
+message IntroduceResponse {}
+
+// Take every initial message in Bob's inbox. Signed with his identity key.
+message TakeIntroductionsRequest {
+  // Bob's identity key.
+  bytes identity_key = 1;
+  // Milliseconds since the Unix epoch; must be greater than in Bob's previous take.
+  uint64 timestamp = 2;
+  // The identity key's XEdDSA signature of this request (64 bytes).
+  bytes signature = 3;
+}
+
+// The initial messages that were in Bob's inbox.
+message TakeIntroductionsResponse {
+  // The initial messages, oldest first.
+  repeated InitialMessage messages = 1;
+}
+
+// The handshake service.
+service HandshakeService {
+  // Publish Bob's prekeys.
+  rpc Publish(PublishRequest) returns (PublishResponse);
+  // Fetch Bob's prekey bundle.
+  rpc FetchBundle(FetchBundleRequest) returns (FetchBundleResponse);
+  // Leave Alice's initial message in Bob's inbox.
+  rpc Introduce(IntroduceRequest) returns (IntroduceResponse);
+  // Take the initial messages in Bob's inbox.
+  rpc TakeIntroductions(TakeIntroductionsRequest) returns (TakeIntroductionsResponse);
+}

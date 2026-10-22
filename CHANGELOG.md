@@ -12,24 +12,31 @@ Note: In this file, do not use the hard wrap in the middle of a sentence for com
 
 ## [0.3.0] - 2026-10-19
 
-- split ratchetx2 into `ratchetx2` (double ratchet, the only published crate) and the repo-only crates `primitives` (`Party`, transports), `x3dh` and `xeddsa`
-- ring -> pure-Rust crypto (curve25519-dalek, ed25519-dalek, RustCrypto); `ratchetx2`, `xeddsa` and `primitives` (without `grpc`) build for `wasm32-unknown-unknown`
+The wire protocol changed, so 0.3 clients and servers cannot talk to 0.2 ones.
+
+- split ratchetx2 into crates: `ratchetx2` (double ratchet, the only published crate) and the repo-only `xeddsa`, `x3dh` (key agreement without I/O), `party` (header encryption), `storage` (typed records behind the `HandshakeStore`/`MailboxStore` traits, with an in-memory backend), `protocol` (wire protocol, client traits, server logic, gRPC) and `session` (the client flow)
+- the protocol is defined in `.proto` files (packages `handshake.v1`, `mailbox.v1`, `party.v1`) so other languages can implement it; protox compiles them by default, so `protoc` is not needed
+- serde, rkyv and gRPC are optional features; except for gRPC, every library builds for `wasm32-unknown-unknown`, and the client and server traits have `Local` variants whose futures need not be `Send`
+- ring -> pure-Rust crypto (curve25519-dalek, ed25519-dalek, RustCrypto)
 - bump deps (tonic/prost 0.14, curve25519-dalek 5; client: ratatui 0.30, ratatui-image 11)
-- replace bincode with protobuf (prost derive, no `protoc` needed); the wire format changed, so 0.3.x clients cannot talk to 0.2.x clients
-- the published `ratchetx2` crate goes to 0.4.0, see [its changelog](ratchetx2/CHANGELOG.md); `XEdDSAPrivateKey::generate()` no longer takes an RNG
+- the published `ratchetx2` crate goes to 0.4.0, see [its changelog](ratchetx2/CHANGELOG.md); `XEdDSAPrivateKey::generate()` no longer takes an RNG, `sign` returns a `[u8; SIGNATURE_LENGTH]` and public keys have `to_bytes()`
+- key, nonce, tag and signature lengths come from the crypto crates (digest, aead, ed25519, curve25519) instead of literals
+- X3DH follows the spec: SK = HKDF(32 zero bytes, 32 × 0xFF ‖ DH1..DH4, `"x3dh.v1"`), AD = IK_A ‖ IK_B, and the ratchet's keys come from SK via `SharedKeys::from_secret`
+- server: publishing keys and taking initial messages need a signature by the identity key with an increasing timestamp; initial messages are deleted once taken; one-time prekeys, inboxes, message size and fetch size (in messages and bytes) are limited
+- client: "list initial messages" takes them from the server and keeps them until accepted; "refresh keys" is now "renew identity"; errors show their causes
 - fix: X3DH and the DH ratchet no longer duplicate private keys with `transmute_copy`
-- fix: header encryption reused the AES-GCM nonce under each chain's header key; every encryption now uses a fresh random nonce (wire format change)
+- fix: header encryption reused the AES-GCM nonce under each chain's header key; every encryption now uses a fresh random nonce
 - fix: xeddsa `agree_ephemeral` is renamed `diffie_hellman` and rejects peer keys outside the prime-order subgroup, which let a peer learn the identity key modulo 8
-- fix: X3DH now deletes Alice's ephemeral private key and zeroizes the DH outputs as soon as the shared keys are derived, instead of keeping them across network calls
+- fix: X3DH deletes Alice's ephemeral private key and zeroizes the DH outputs as soon as the shared keys are derived, instead of keeping them across network calls
 - fix: sessions started with all-zero header and chain keys; chains are now unset until the first DH step, and Bob can only send after receiving Alice's first message
-- fix: X3DH now checks both identities: Alice ignores the identity key returned by the server, and Bob rejects an initial message from an unexpected identity
-- fix: the message server ignored fetch limits, so messages Alice sent before Bob accepted were lost
-- fix: receiving rejects duplicates and out-of-range header counters, keeps one undecodable message from dropping the rest of a fetch, and only changes state when a message decrypts
-- fix: invalid keys from the network return errors instead of panicking; a failed push no longer desynchronizes the sending chain
-- fix: xeddsa no longer prints private keys in `Debug`, uses the spec's hash1 prefix for signing nonces, and zeroizes signing and DH temporaries
-- fix: the X3DH client no longer pins the TLS server name to 127.0.0.1
-- `Party` takes any `LocalTransport`, so transports whose futures are not `Send` (e.g. in the browser) can be used
-- `primitives` and `x3dh` errors are `Error` + `ErrorKind` like `std::io`: match on `err.kind()` instead of strings; the underlying error is kept as `source()`
+- fix: X3DH checks both identities: Alice uses the identity key she asked for, not one returned by the server, and Bob rejects an initial message from an unexpected identity (`session::Client::accept` takes the expected peer)
+- fix: Bob kept every prekey's private key forever; now only the last two generations are kept, so older ones cannot reveal sessions later
+- fix: messages Alice sent before Bob accepted were lost; mailboxes are now sequenced queues read from a cursor
+- fix: receiving rejects duplicates and out-of-range header counters, keeps one undecryptable message from blocking the rest, and only changes state when a message decrypts
+- fix: invalid keys from the network return errors instead of panicking
+- fix: `Debug` no longer prints keys (xeddsa, the ratchet, parties); xeddsa uses the spec's hash1 prefix for signing nonces, and zeroizes signing and DH temporaries
+- fix: the client no longer pins the TLS server name to 127.0.0.1
+- errors are `Error` + `ErrorKind` like `std::io`: match on `err.kind()` instead of strings; the underlying error is kept as `source()`
 - remove the deprecated e2ee_chat_ingress
 
 ## [0.2.7] - 2025-07-09

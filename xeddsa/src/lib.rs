@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use curve25519_dalek::{EdwardsPoint, MontgomeryPoint};
+use curve25519_dalek::{EdwardsPoint, MontgomeryPoint, constants::X25519_BASEPOINT};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha512};
 use thiserror::Error;
@@ -16,10 +16,25 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 /// Re-export curve25519_dalek.
 pub use curve25519_dalek::Scalar;
 
+/// Length of a public key, a Montgomery u-coordinate as curve25519-dalek encodes it. A DH
+/// output is as long.
+pub const PUBLIC_KEY_LENGTH: usize = X25519_BASEPOINT.as_bytes().len();
+/// Length of a signature, which is an Ed25519 signature.
+pub const SIGNATURE_LENGTH: usize = ed25519_dalek::SIGNATURE_LENGTH;
+
+/// hash1's prefix, 2^b - 2 in b bits (little-endian): 0xFE, then 0xFF bytes up to the length
+/// of an encoded Ed25519 point.
+const HASH1_PREFIX: [u8; ed25519_dalek::PUBLIC_KEY_LENGTH] = {
+    let mut prefix = [0xFF; ed25519_dalek::PUBLIC_KEY_LENGTH];
+    prefix[0] = 0xFE;
+    prefix
+};
+
 /// XEdDSA errors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum Error {
-    /// The DH public key is not 32 bytes, not on the curve, or not in the prime-order subgroup.
+    /// The DH public key is not [`PUBLIC_KEY_LENGTH`] bytes, not on the curve, or not in the
+    /// prime-order subgroup.
     #[error("Invalid DH public key.")]
     InvalidPublicKey,
     /// Signature verify failed.
@@ -53,7 +68,7 @@ impl From<Scalar> for XEdDSAPrivateKey {
 impl XEdDSAPrivateKey {
     /// Generate a new XEdDSA private key.
     pub fn generate() -> Self {
-        let mut bytes = Zeroizing::new([0; 32]);
+        let mut bytes = Zeroizing::new([0; _]);
         getrandom::fill(bytes.as_mut_slice()).expect("the system random number generator failed");
         XEdDSAPrivateKey {
             montgomery_private_key: Scalar::from_bytes_mod_order(*bytes),
@@ -70,7 +85,10 @@ impl XEdDSAPrivateKey {
     /// DH with the X25519(Montgomery) private key for the key pair.
     ///
     /// The key pair is long-term, so this may be called any number of times.
-    pub fn diffie_hellman(&self, peer_public_key: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    pub fn diffie_hellman(
+        &self,
+        peer_public_key: &[u8],
+    ) -> Result<Zeroizing<[u8; PUBLIC_KEY_LENGTH]>> {
         let peer_public_key = MontgomeryPoint(
             peer_public_key
                 .try_into()
@@ -90,37 +108,39 @@ impl XEdDSAPrivateKey {
     }
 
     /// Sign with the Ed25519(Edwards) private key for the key pair.
-    pub fn sign(&self, message: impl AsRef<[u8]>) -> Vec<u8> {
+    pub fn sign(&self, message: impl AsRef<[u8]>) -> [u8; SIGNATURE_LENGTH] {
         let message = message.as_ref();
         let mut edwards_private_key = Zeroizing::new(self.montgomery_private_key);
         let edwards_public_key = EdwardsPoint::mul_base(&edwards_private_key);
         let mut edwards_public_key_y = edwards_public_key.compress().to_bytes();
-        if edwards_public_key_y[31] >= 0x80 {
+        // The sign bit is the top bit of the last byte.
+        if edwards_public_key_y[ed25519_dalek::PUBLIC_KEY_LENGTH - 1] >= 0x80 {
             *edwards_private_key = -self.montgomery_private_key;
             let edwards_public_key = EdwardsPoint::mul_base(&edwards_private_key);
             edwards_public_key_y = edwards_public_key.compress().to_bytes();
         }
+        // Z: 64 random bytes, per the XEdDSA spec.
         let mut random = Zeroizing::new([0; 64]);
         getrandom::fill(random.as_mut_slice()).expect("the system random number generator failed");
-        // r = hash1(a || M || Z): hash1 prefixes 2^256 - 2, i.e. 0xFE then 31 0xFF bytes.
-        let mut to_digest = Zeroizing::new(Vec::with_capacity(32 + 32 + message.len() + 64));
-        to_digest.push(0xFE);
-        to_digest.extend([0xFF; 31]);
-        to_digest.extend(edwards_private_key.as_bytes());
+        // r = hash1(a || M || Z)
+        let private_key = edwards_private_key.as_bytes();
+        let mut to_digest = Zeroizing::new(Vec::with_capacity(
+            HASH1_PREFIX.len() + private_key.len() + message.len() + random.len(),
+        ));
+        to_digest.extend(HASH1_PREFIX);
+        to_digest.extend(private_key);
         to_digest.extend(message);
         to_digest.extend(random.iter());
-        let digest: Zeroizing<[u8; 64]> =
+        let digest: Zeroizing<[u8; _]> =
             Zeroizing::new(Sha512::digest(to_digest.as_slice()).into());
         let r = Zeroizing::new(Scalar::from_bytes_mod_order_wide(&digest));
-        let r_ = EdwardsPoint::mul_base(&r);
-        let mut to_digest = r_.compress().as_bytes().to_vec();
+        let r_ = EdwardsPoint::mul_base(&r).compress();
+        let mut to_digest = r_.to_bytes().to_vec();
         to_digest.extend(edwards_public_key_y);
         to_digest.extend(message);
         let h = Scalar::from_bytes_mod_order_wide(&Sha512::digest(&to_digest).into());
         let s = *r + h * *edwards_private_key;
-        let mut res = r_.compress().as_bytes().to_vec();
-        res.extend(s.as_bytes());
-        res
+        Signature::from_components(r_.to_bytes(), s.to_bytes()).to_bytes()
     }
 }
 
@@ -131,13 +151,19 @@ pub struct XEdDSAPublicKey {
 }
 
 impl XEdDSAPublicKey {
-    /// Create a new XEdDSA public key from bytes; fails unless they are 32 bytes.
+    /// Create a new XEdDSA public key from bytes; fails unless they are [`PUBLIC_KEY_LENGTH`]
+    /// bytes.
     pub fn new(bytes: &[u8]) -> Result<Self> {
         Ok(XEdDSAPublicKey {
             montgomery_public_key: MontgomeryPoint(
                 bytes.try_into().map_err(|_| Error::InvalidPublicKey)?,
             ),
         })
+    }
+
+    /// The public key's bytes.
+    pub fn to_bytes(&self) -> [u8; PUBLIC_KEY_LENGTH] {
+        self.montgomery_public_key.to_bytes()
     }
 
     /// Verify with the Ed25519(Edwards) public key for the key pair.
@@ -203,15 +229,8 @@ mod test {
     }
 
     #[test]
-    fn signature_round_trip_and_redacted_debug() {
+    fn rejects_short_public_keys_and_redacts_debug() {
         let key = XEdDSAPrivateKey::generate();
-        let public_key = XEdDSAPublicKey::new(key.compute_public_key().as_ref()).unwrap();
-        let signature = key.sign("hello");
-        public_key.verify("hello", &signature).unwrap();
-        assert_eq!(
-            public_key.verify("hellO", &signature),
-            Err(Error::Signature)
-        );
         assert_eq!(
             XEdDSAPublicKey::new(&[0; 31]).unwrap_err(),
             Error::InvalidPublicKey

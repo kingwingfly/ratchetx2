@@ -7,10 +7,11 @@
 
 pub mod error;
 pub mod party;
-pub mod transport;
 
-/// Re-export tonic.
-#[cfg(feature = "grpc")]
-pub use tonic::transport::{Certificate, Identity, Uri};
+/// The message format, generated from `proto/party.proto` (package `party.v1`).
+pub mod proto {
+    include!(concat!(env!("OUT_DIR"), "/party.v1.rs"));
+}
 
 pub use party::Party;
+pub use proto::EncryptedMessage;

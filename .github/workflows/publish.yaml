@@ -7,14 +7,6 @@ on:
         description: "publish ratchetx2"
         type: boolean
         default: false
-      e2ee_chat_server:
-        description: "publish e2ee_chat_server"
-        type: boolean
-        default: false
-      e2ee_chat_client:
-        description: "publish e2ee_chat_client"
-        type: boolean
-        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,15 +23,6 @@ jobs:
       - name: login to crates.io
         run: cargo login ${{ secrets.CRATESIO }}
 
-      - name: Install Protoc
-        run: sudo apt install -y protobuf-compiler
-
       - name: publish ratchetx2
         if: ${{ inputs.ratchetx2 }}
         run: .github/scripts/publish_test.sh ratchetx2 && .github/scripts/publish.sh ratchetx2
-      - name: publish e2ee_chat_server
-        if: ${{ inputs.e2ee_chat_server }}
-        run: .github/scripts/publish_test.sh e2ee_chat_server && .github/scripts/publish.sh e2ee_chat_server
-      - name: publish e2ee_chat_client
-        if: ${{ inputs.e2ee_chat_client }}
-        run: .github/scripts/publish_test.sh e2ee_chat_client && .github/scripts/publish.sh e2ee_chat_client

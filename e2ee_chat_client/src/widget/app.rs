@@ -2,16 +2,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
+use base64::prelude::*;
 use parking_lot::RwLock;
-use primitives::{Party, transport::RpcTransport};
 use ratatui::{
     prelude::*,
     widgets::{Block, List, ListState, Padding},
 };
 use ratatui_image::picker::Picker;
-use tokio::sync::RwLock as AsyncRwLock;
+use session::protocol::grpc::{Certificate, Channel, GrpcHandshake, GrpcMailbox, Uri, connect};
+use session::{Client, Introduction, Session};
+use tokio::sync::Mutex as AsyncMutex;
 use tui_textarea::TextArea;
-use x3dh::{Certificate, Uri, X3DHClient};
 
 use crate::{
     message::Message,
@@ -31,14 +32,20 @@ use super::{
     setting::{Setting, SettingState},
 };
 
+pub use session::PublicKey;
+/// A session, locked on its own so using one never waits for the others.
+pub type SharedSession = Arc<AsyncMutex<Session<GrpcMailbox>>>;
+
 pub struct AppState {
-    pub x3dh_client: X3DHClient,
+    pub client: Client<GrpcHandshake>,
+    pub channel: Channel,
 
     /// (Name, PublicKey)
-    pub contacts: Vec<(String, Vec<u8>)>,
-    pub parties: Arc<AsyncRwLock<HashMap<Vec<u8>, Party<RpcTransport>>>>,
+    pub contacts: Vec<(String, PublicKey)>,
+    /// Only locked to look sessions up, never across an `await`.
+    pub sessions: Arc<RwLock<HashMap<PublicKey, SharedSession>>>,
     pub current_activated_contact: usize,
-    pub conversations: Arc<RwLock<HashMap<Vec<u8>, Vec<Message>>>>,
+    pub conversations: Arc<RwLock<HashMap<PublicKey, Vec<Message>>>>,
     pub current_activated_message: usize,
 
     pub server_addr: Uri,
@@ -46,8 +53,9 @@ pub struct AppState {
     pub chat_textarea: TextArea<'static>,
     pub textareas: Vec<(String, TextArea<'static>)>,
     pub current_activated_textarea: usize,
-    pub attempt_list: Vec<String>,
-    pub current_selected_attempt: usize,
+    /// Initial messages taken from the server but not accepted yet.
+    pub introductions: Vec<Introduction>,
+    pub current_selected_introduction: usize,
     pub screen: Screen,
 
     pub explore_state: ExploreState,
@@ -63,10 +71,12 @@ impl AppState {
             .unwrap_or_else(|_| panic!("Invalid server address."));
         let mut text_area = TextArea::default();
         text_area.set_line_number_style(Style::default().gray());
+        let channel = connect(server_addr.clone(), ca).await?;
         Ok(Self {
-            x3dh_client: X3DHClient::connect(&server_addr, None, ca).await?,
+            client: Client::new(GrpcHandshake::new(channel.clone())),
+            channel,
             contacts: vec![],
-            parties: Default::default(),
+            sessions: Default::default(),
             current_activated_contact: 0,
             conversations: Default::default(),
             current_activated_message: 0,
@@ -75,8 +85,8 @@ impl AppState {
             chat_textarea: text_area,
             textareas: vec![],
             current_activated_textarea: 0,
-            attempt_list: vec![],
-            current_selected_attempt: 0,
+            introductions: vec![],
+            current_selected_introduction: 0,
             screen: Screen::default(),
             explore_state: Default::default(),
             conversation_state: Default::default(),
@@ -171,7 +181,7 @@ impl StatefulWidget for App {
                 buf,
                 &mut SettingState {
                     server_addr: state.server_addr.clone(),
-                    public_identity_key: state.x3dh_client.public_identity_key(),
+                    public_identity_key: state.client.identity_key(),
                 },
             ),
             Screen::Quit => PopUp { inner: Quite {} }.render(area, buf),
@@ -191,14 +201,20 @@ impl StatefulWidget for App {
             }
             Screen::ListInitMsg => {
                 PopUpStateful {
-                    inner: List::new(state.attempt_list.clone())
-                        .highlight_style(Style::default().green())
-                        .block(Block::bordered().padding(Padding::proportional(2))),
+                    inner: List::new(
+                        state
+                            .introductions
+                            .iter()
+                            .map(|introduction| BASE64_STANDARD.encode(introduction.identity_key)),
+                    )
+                    .highlight_style(Style::default().green())
+                    .block(Block::bordered().padding(Padding::proportional(2))),
                 }
                 .render(
                     area,
                     buf,
-                    &mut ListState::default().with_selected(Some(state.current_selected_attempt)),
+                    &mut ListState::default()
+                        .with_selected(Some(state.current_selected_introduction)),
                 );
             }
             Screen::SelectFile => {

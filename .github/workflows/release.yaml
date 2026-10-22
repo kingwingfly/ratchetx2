@@ -40,7 +40,7 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.SERVER }}
         run: |
-          podman build --target server -t e2ee_chat_server:$VERSION --network host e2ee_chat_server
+          podman build -f e2ee_chat_server/Containerfile --target server -t e2ee_chat_server:$VERSION --network host .
           podman save localhost/e2ee_chat_server:$VERSION | gzip > e2ee_chat_server-$VERSION.tar.gz
       - name: Release server
         uses: softprops/action-gh-release@v3
@@ -66,15 +66,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - name: Install Protoc Linux
-        if: ${{ matrix.os == 'ubuntu-latest' }}
-        run: sudo apt install -y protobuf-compiler
-      - name: Install Protoc Mac
-        if: ${{ matrix.os == 'macos-latest' }}
-        run: brew install protobuf
-      - name: Install Protoc Windows
-        if: ${{ matrix.os == 'windows-latest' }}
-        run: choco install -y protoc
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           # (required) Comma-separated list of binary names (non-extension portion of filename) to build and upload.

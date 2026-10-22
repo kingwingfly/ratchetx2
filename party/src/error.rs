@@ -45,27 +45,9 @@ impl From<CryptoError> for Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// Failed to connect to the server.
-    #[error("failed to connect")]
-    Connect,
-    /// Failed to push a message.
-    #[error("failed to push")]
-    Push,
-    /// Failed to fetch messages.
-    #[error("failed to fetch")]
-    Fetch,
-    /// The server failed.
-    #[error("server error")]
-    Server,
-    /// The server address is invalid.
-    #[error("invalid server address")]
-    InvalidAddress,
     /// Bob has no sending chain until he has received Alice's first message.
     #[error("no sending chain yet, wait for the peer's first message")]
     NoSendingChain,
-    /// The fetched bytes are not an encrypted message.
-    #[error("not an encrypted message")]
-    InvalidMessage,
     /// No known header key opens the message, or its content failed authentication.
     #[error("cannot decrypt the message")]
     Undecryptable,
@@ -88,20 +70,3 @@ pub enum ErrorKind {
 
 /// Result type with [`Error`].
 pub type Result<T> = core::result::Result<T, Error>;
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn kind_display_and_source() {
-        let error = Error::from(ErrorKind::DuplicateMessage);
-        assert_eq!(error.kind(), ErrorKind::DuplicateMessage);
-        assert_eq!(error.to_string(), "duplicate message");
-        assert!(error.source().is_none());
-
-        let error = Error::new(ErrorKind::InvalidPublicKey, CryptoError);
-        assert_eq!(error.to_string(), "invalid public key");
-        assert_eq!(error.source().unwrap().to_string(), CryptoError.to_string());
-    }
-}

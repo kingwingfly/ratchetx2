@@ -6,433 +6,423 @@
 )]
 
 pub mod error;
-pub mod server;
 
-/// Re-export tonic.
-pub use tonic::transport::{Certificate, Identity, Uri};
-
-pub use server::RpcServer;
-
-/// Tonic generated gRPC module.
-pub(crate) mod x3dh_rpc {
-    tonic::include_proto!("x3dh");
-}
-
-use std::{collections::HashMap, iter::repeat_with};
+use core::fmt;
+use std::collections::{HashMap, VecDeque};
 
 use hkdf::Hkdf;
-use parking_lot::RwLock;
-use primitives::{
-    Party,
-    transport::{RpcTransport, Transport},
-};
-use prost::Message as _;
-use ratchetx2::{DhPrivateKey, SharedKeys};
 use sha2::Sha256;
-use tonic::{
-    Request, Response, Result as RpcResult, Status,
-    transport::{Channel, ClientTlsConfig, Server, ServerTlsConfig},
-};
-use x3dh_rpc::{
-    AddAttemptRequest, AddAttemptResponse, FetchKeysRequest, FetchKeysResponse, ListAttemptRequest,
-    ListAttemptResponse, PublishKeysRequest, PublishKeysResponse,
-    x3dh_service_client::X3dhServiceClient,
-    x3dh_service_server::{X3dhService, X3dhServiceServer},
-};
-use xeddsa::{XEdDSAPrivateKey, XEdDSAPublicKey};
+use sha2::digest::{OutputSizeUser, typenum::Unsigned};
+use x25519_dalek::SharedSecret;
+use xeddsa::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, XEdDSAPrivateKey, XEdDSAPublicKey};
 use zeroize::Zeroizing;
 
-use crate::error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorKind, Result};
+/// Re-export x25519_dalek's private key, which [`bob`] returns.
+pub use x25519_dalek::StaticSecret;
 
-/// X3DH gRPC client.
-pub struct X3DHClient {
-    rpc_client: X3dhServiceClient<Channel>,
-    private_identity_key: XEdDSAPrivateKey,
-    prekeys: HashMap<Vec<u8>, DhPrivateKey>,
-    one_time_prekeys: HashMap<Vec<u8>, DhPrivateKey>,
-    ca: Option<Certificate>,
+/// An X25519 (or XEdDSA identity) public key.
+pub type PublicKey = [u8; PUBLIC_KEY_LENGTH];
+/// An XEdDSA signature.
+pub type Signature = [u8; SIGNATURE_LENGTH];
+
+/// Length of the shared secret key (SK), as the X3DH spec sets it.
+pub const SECRET_KEY_LENGTH: usize = 32;
+/// Length of SHA-256's output, and so of the HKDF salt.
+const HASH_LENGTH: usize = <Sha256 as OutputSizeUser>::OutputSize::USIZE;
+
+/// The info of the KDF deriving the shared secret key.
+const INFO: &[u8] = b"x3dh.v1";
+
+/// How many generations of prekeys [`LocalPrekeys`] keeps: the latest, and the one before it
+/// for initial messages that were on their way when the latest was published.
+pub const KEPT_GENERATIONS: usize = 2;
+
+/// Bob's prekeys, as Alice receives them to start a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+pub struct PrekeyBundle {
+    /// Bob's signed prekey.
+    pub signed_prekey: PublicKey,
+    /// Bob's identity key's signature of `signed_prekey`.
+    #[cfg_attr(feature = "serde", serde(with = "serde_big_array::BigArray"))]
+    pub signed_prekey_signature: Signature,
+    /// One of Bob's one-time prekeys, if any is left.
+    pub one_time_prekey: Option<PublicKey>,
 }
 
-impl X3DHClient {
-    /// Connect to a X3DH gRPC server, generate XEdDSA private_identity_key randomly.
-    ///
-    /// If x3dh_server_addr scheme is https, native root certificate will be used.
-    ///
-    /// # Args:
-    /// - x3dh_server_addr
-    /// - private_identity_key: use provided private key instead of the randomly generated
-    /// - ca: self-signed ca certificate if it's needed and x3dh_server_addr scheme is https
-    pub async fn connect(
-        x3dh_server_addr: impl TryInto<Uri>,
-        private_identity_key: Option<XEdDSAPrivateKey>,
-        ca: Option<Certificate>,
-    ) -> Result<Self> {
-        let uri: Uri = x3dh_server_addr
-            .try_into()
-            .map_err(|_| ErrorKind::InvalidAddress)?;
-        let mut endpoint = Channel::builder(uri.clone());
-        if uri.scheme_str() == Some("https") {
-            endpoint = endpoint
-                .tls_config({
-                    let mut config = ClientTlsConfig::new().with_native_roots();
-                    if let Some(ca) = ca.clone() {
-                        config = config.ca_certificate(ca);
-                    }
-                    config
-                })
-                .map_err(|e| Error::new(ErrorKind::Connect, e))?;
-        }
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(|e| Error::new(ErrorKind::Connect, e))?;
-        let rpc_client = X3dhServiceClient::new(channel);
-        Ok(Self {
-            rpc_client,
-            private_identity_key: private_identity_key.unwrap_or_else(XEdDSAPrivateKey::generate),
-            prekeys: HashMap::new(),
-            one_time_prekeys: HashMap::new(),
-            ca,
-        })
+/// Alice's initial message to Bob, which lets him derive the same shared secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+pub struct InitialMessage {
+    /// Alice's identity key.
+    pub identity_key: PublicKey,
+    /// Alice's ephemeral key.
+    pub ephemeral_key: PublicKey,
+    /// Bob's signed prekey that Alice used.
+    pub signed_prekey: PublicKey,
+    /// Bob's one-time prekey that Alice used, if any.
+    pub one_time_prekey: Option<PublicKey>,
+}
+
+/// The outcome of X3DH, the same for Alice and Bob.
+pub struct Agreement {
+    /// The shared secret key (SK).
+    pub secret_key: Zeroizing<[u8; SECRET_KEY_LENGTH]>,
+    /// The associated data (AD): Alice's identity key, then Bob's.
+    pub associated_data: [u8; 2 * PUBLIC_KEY_LENGTH],
+}
+
+impl fmt::Debug for Agreement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Agreement")
+            .field("associated_data", &self.associated_data)
+            .finish_non_exhaustive()
     }
+}
 
-    /// Get public identity key.
-    pub fn public_identity_key(&self) -> Vec<u8> {
-        self.private_identity_key
-            .compute_public_key()
-            .as_ref()
-            .to_vec()
-    }
+/// Keys Bob publishes after [`LocalPrekeys::generate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedPrekeys {
+    /// The new signed prekey.
+    pub signed_prekey: PublicKey,
+    /// The identity key's signature of `signed_prekey`.
+    pub signed_prekey_signature: Signature,
+    /// The new one-time prekeys.
+    pub one_time_prekeys: Vec<PublicKey>,
+}
 
-    /// Publish keys to X3DH server.
-    pub async fn publish_keys(&mut self) -> Result<()> {
-        let private_prekey = DhPrivateKey::generate();
-        let public_prekey = private_prekey.public_key().to_vec();
-        let prekey_signature = self.private_identity_key.sign(&public_prekey);
-        let one_time_keys = repeat_with(|| {
-            let private_one_time_key = DhPrivateKey::generate();
-            let public_one_time_key = private_one_time_key.public_key().to_vec();
-            (public_one_time_key, private_one_time_key)
-        })
-        .take(16)
-        .collect::<Vec<_>>();
-        let req = PublishKeysRequest {
-            identity_key_bob: self.public_identity_key(),
-            prekey: public_prekey.clone(),
-            prekey_signature,
-            one_time_keys: one_time_keys
-                .iter()
-                .map(|(public_key, _)| public_key.clone())
-                .collect(),
-        };
-        let _resp = self
-            .rpc_client
-            .publish_keys(req)
-            .await
-            .map_err(|status| Error::new(ErrorKind::Push, status))?;
-        self.prekeys.insert(public_prekey, private_prekey);
-        self.one_time_prekeys.extend(one_time_keys);
-        Ok(())
-    }
+/// Bob's private prekeys, kept on his device.
+///
+/// Each [`generate`](Self::generate) starts a generation of prekeys, and only the last
+/// [`KEPT_GENERATIONS`] are kept, so a deleted private key cannot reveal anything later. An
+/// initial message using an older generation can no longer be accepted.
+#[derive(Default)]
+pub struct LocalPrekeys {
+    /// Oldest first.
+    generations: VecDeque<Generation>,
+}
 
-    /// Fetch keys from X3DH server
-    async fn fetch_keys(&mut self, identity_key_bob: &[u8]) -> Result<FetchKeysResponse> {
-        Ok(self
-            .rpc_client
-            .fetch_keys(FetchKeysRequest {
-                identity_key_bob: identity_key_bob.to_vec(),
-            })
-            .await
-            .map_err(|status| Error::new(ErrorKind::Fetch, status))?
-            .into_inner())
-    }
+/// The prekeys of one [`LocalPrekeys::generate`].
+struct Generation {
+    signed_prekey: PublicKey,
+    signed_secret: StaticSecret,
+    /// The ones not used yet.
+    one_time: HashMap<PublicKey, StaticSecret>,
+}
 
-    /// Perform X3DH, push the initial message, return Alice Party.
-    ///
-    /// Alice fetches Bob's "prekey bundle" from the X3DH server,
-    /// and derive shared keys, push the initial message and the associated data to message server.
-    pub async fn push_initial_message(
-        &mut self,
-        identity_key_bob: &[u8],
-        message_server_addr: impl TryInto<Uri>,
-    ) -> Result<Party<RpcTransport>> {
-        let keys = self.fetch_keys(identity_key_bob).await?;
-
-        // Use the identity key Alice asked for, never the one the server sends back.
-        XEdDSAPublicKey::new(identity_key_bob)?.verify(&keys.prekey, &keys.prekey_signature)?;
-
-        // Alice deletes her ephemeral private key and the DH outputs once SK is derived: they
-        // live only in this block, which ends before any network round-trip.
-        let (ephemeral_public_key, shared_keys) = {
-            let ephemeral_private_key = DhPrivateKey::generate();
-            let mut key_meterial = new_key_meterial();
-            key_meterial
-                .extend_from_slice(&*self.private_identity_key.diffie_hellman(&keys.prekey)?);
-            key_meterial
-                .extend_from_slice(&*ephemeral_private_key.diffie_hellman(identity_key_bob)?);
-            key_meterial.extend_from_slice(&*ephemeral_private_key.diffie_hellman(&keys.prekey)?);
-            if let Some(one_time_key) = keys.one_time_key.as_ref() {
-                key_meterial
-                    .extend_from_slice(&*ephemeral_private_key.diffie_hellman(one_time_key)?);
-            }
-            (
-                ephemeral_private_key.public_key().to_vec(),
-                derive_shared_keys(&key_meterial),
+impl fmt::Debug for LocalPrekeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LocalPrekeys")
+            .field("signed", &self.generations.len())
+            .field(
+                "one_time",
+                &self
+                    .generations
+                    .iter()
+                    .map(|g| g.one_time.len())
+                    .sum::<usize>(),
             )
-        };
+            .finish()
+    }
+}
 
-        let mut associated_data: Vec<u8> = vec![];
-        let my_identity_key = self.public_identity_key();
-        associated_data.extend(&my_identity_key);
-        associated_data.extend(identity_key_bob);
-        let init_msg = InitMassage {
-            identity_key_alice: self.public_identity_key(),
-            ephemeral_public_key_alice: ephemeral_public_key,
-            prekey_bob: keys.prekey.clone(),
-            one_time_prekey_bob: keys.one_time_key,
-        };
-        let mut messgae_transport = RpcTransport::connect(
-            message_server_addr,
-            &my_identity_key,
-            identity_key_bob,
-            self.ca.clone(),
-        )
-        .await?;
-        messgae_transport
-            .push_bytes(init_msg.encode_to_vec())
-            .await?;
-        self.rpc_client
-            .add_attempt(Request::new(AddAttemptRequest {
-                identity_key_alice: my_identity_key,
-                identity_key_bob: identity_key_bob.to_vec(),
-            }))
-            .await
-            .map_err(|status| Error::new(ErrorKind::Push, status))?;
-
-        let alice = Party::new(
-            shared_keys.alice(&keys.prekey)?,
-            messgae_transport,
-            associated_data,
-        );
-        Ok(alice)
+impl LocalPrekeys {
+    /// No prekeys yet.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// List identity keys of Alices who want to connect to Bob with provided identity_key_bob.
-    pub async fn list_attempt(&mut self, identity_key_bob: &[u8]) -> Result<Vec<Vec<u8>>> {
-        self.rpc_client
-            .list_attempt(Request::new(ListAttemptRequest {
-                identity_key_bob: identity_key_bob.to_vec(),
-            }))
-            .await
-            .map_err(|status| Error::new(ErrorKind::Fetch, status))
-            .map(|resp| resp.into_inner().identity_key_alice)
-    }
-
-    /// Perform X3DH, handle the initial message, return Bob Party.
+    /// Generate a signed prekey, signed by `identity`, and `one_time_count` one-time prekeys, as
+    /// a new generation.
     ///
-    /// After publishing keys and Alice's pushing initial message,
-    /// Bob should initialize itself with the initial message.
-    pub async fn handle_initial_message(
+    /// Deletes the private keys of the generations before the last [`KEPT_GENERATIONS`].
+    pub fn generate(
         &mut self,
-        identity_key_alice: &[u8],
-        message_server_addr: impl TryInto<Uri>,
-    ) -> Result<Party<RpcTransport>> {
-        let my_identity_key = self.public_identity_key();
-        let mut associated_data: Vec<u8> = vec![];
-        associated_data.extend(identity_key_alice);
-        associated_data.extend(&my_identity_key);
-
-        let mut message_transport = RpcTransport::connect(
-            message_server_addr,
-            &my_identity_key,
-            identity_key_alice,
-            self.ca.clone(),
-        )
-        .await?;
-        let initial_message = InitMassage::decode(
-            message_transport
-                .fetch_bytes(Some(1))
-                .await?
-                .first()
-                .ok_or(ErrorKind::InitialMessageNotFound)?
-                .as_slice(),
-        )
-        .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
-        // X3DH authenticates Alice through DH1 with her identity key, so it must be the one
-        // Bob expects; otherwise anyone could start a session as Alice.
-        if initial_message.identity_key_alice != identity_key_alice {
-            return Err(ErrorKind::UnexpectedIdentity.into());
+        identity: &XEdDSAPrivateKey,
+        one_time_count: usize,
+    ) -> PublishedPrekeys {
+        let (signed_prekey, signed_secret) = generate_key_pair();
+        let signed_prekey_signature = identity.sign(signed_prekey);
+        let mut one_time = HashMap::with_capacity(one_time_count);
+        let one_time_prekeys = (0..one_time_count)
+            .map(|_| {
+                let (public_key, secret) = generate_key_pair();
+                one_time.insert(public_key, secret);
+                public_key
+            })
+            .collect();
+        while self.generations.len() >= KEPT_GENERATIONS {
+            self.generations.pop_front();
         }
+        self.generations.push_back(Generation {
+            signed_prekey,
+            signed_secret,
+            one_time,
+        });
+        PublishedPrekeys {
+            signed_prekey,
+            signed_prekey_signature,
+            one_time_prekeys,
+        }
+    }
+}
 
-        let mut key_meterial = new_key_meterial();
-        let private_prekey = self
-            .prekeys
-            .get(&initial_message.prekey_bob)
-            .ok_or(ErrorKind::PrekeyNotFound)?;
-        key_meterial.extend_from_slice(&*private_prekey.diffie_hellman(identity_key_alice)?);
-        key_meterial.extend_from_slice(
-            &*self
-                .private_identity_key
-                .diffie_hellman(&initial_message.ephemeral_public_key_alice)?,
-        );
-        key_meterial.extend_from_slice(
-            &*private_prekey.diffie_hellman(&initial_message.ephemeral_public_key_alice)?,
-        );
-        if let Some(one_time_public_prekey) = initial_message.one_time_prekey_bob {
-            key_meterial.extend_from_slice(
-                &*self
-                    .one_time_prekeys
-                    .remove(&one_time_public_prekey)
-                    .ok_or(ErrorKind::OneTimePrekeyNotFound)?
-                    .diffie_hellman(&initial_message.ephemeral_public_key_alice)?,
+/// Alice's side: start a session with Bob from his identity key and prekey bundle.
+///
+/// Returns the initial message to send to Bob, and the agreement. Alice's first ratchet uses
+/// `bundle.signed_prekey` as Bob's public key.
+pub fn alice(
+    identity: &XEdDSAPrivateKey,
+    bob_identity_key: &PublicKey,
+    bundle: &PrekeyBundle,
+) -> Result<(InitialMessage, Agreement)> {
+    XEdDSAPublicKey::new(bob_identity_key)?
+        .verify(bundle.signed_prekey, &bundle.signed_prekey_signature)?;
+
+    let (ephemeral_key, ephemeral_secret) = generate_key_pair();
+    let mut key_material = KeyMaterial::new();
+    key_material.extend(&*identity.diffie_hellman(&bundle.signed_prekey)?);
+    key_material.extend(diffie_hellman(&ephemeral_secret, bob_identity_key)?.as_bytes());
+    key_material.extend(diffie_hellman(&ephemeral_secret, &bundle.signed_prekey)?.as_bytes());
+    if let Some(one_time_prekey) = &bundle.one_time_prekey {
+        key_material.extend(diffie_hellman(&ephemeral_secret, one_time_prekey)?.as_bytes());
+    }
+
+    let identity_key = identity.compute_public_key().to_bytes();
+    let message = InitialMessage {
+        identity_key,
+        ephemeral_key,
+        signed_prekey: bundle.signed_prekey,
+        one_time_prekey: bundle.one_time_prekey,
+    };
+    Ok((message, key_material.agree(&identity_key, bob_identity_key)))
+}
+
+/// Bob's side: accept Alice's initial message, which must come from `alice_identity_key`.
+///
+/// Consumes the one-time prekey it uses, which must be of the same generation as its signed
+/// prekey. Returns the agreement and the private key of the signed prekey it uses, which is
+/// Bob's first ratchet key pair.
+pub fn bob(
+    identity: &XEdDSAPrivateKey,
+    prekeys: &mut LocalPrekeys,
+    alice_identity_key: &PublicKey,
+    message: &InitialMessage,
+) -> Result<(Agreement, StaticSecret)> {
+    if message.identity_key != *alice_identity_key {
+        return Err(ErrorKind::UnexpectedIdentity.into());
+    }
+    let generation = prekeys
+        .generations
+        .iter_mut()
+        .find(|generation| generation.signed_prekey == message.signed_prekey)
+        .ok_or(ErrorKind::PrekeyNotFound)?;
+    let signed_prekey = &generation.signed_secret;
+
+    let mut key_material = KeyMaterial::new();
+    key_material.extend(diffie_hellman(signed_prekey, alice_identity_key)?.as_bytes());
+    key_material.extend(&*identity.diffie_hellman(&message.ephemeral_key)?);
+    key_material.extend(diffie_hellman(signed_prekey, &message.ephemeral_key)?.as_bytes());
+    if let Some(one_time_prekey) = &message.one_time_prekey {
+        let secret = generation
+            .one_time
+            .remove(one_time_prekey)
+            .ok_or(ErrorKind::OneTimePrekeyNotFound)?;
+        key_material.extend(diffie_hellman(&secret, &message.ephemeral_key)?.as_bytes());
+    }
+
+    let agreement = key_material.agree(
+        alice_identity_key,
+        &identity.compute_public_key().to_bytes(),
+    );
+    Ok((agreement, signed_prekey.clone()))
+}
+
+/// X3DH key material: the X25519 domain separator, 0xFF bytes as many as in a key, then the DH
+/// outputs, each as long as a key.
+struct KeyMaterial(Zeroizing<Vec<u8>>);
+
+impl KeyMaterial {
+    fn new() -> Self {
+        // Room for the separator and all four DH outputs, so growing never leaves copies behind.
+        let mut key_material = Zeroizing::new(Vec::with_capacity(5 * PUBLIC_KEY_LENGTH));
+        key_material.extend([0xFF; PUBLIC_KEY_LENGTH]);
+        Self(key_material)
+    }
+
+    fn extend(&mut self, dh_output: &[u8; PUBLIC_KEY_LENGTH]) {
+        self.0.extend_from_slice(dh_output);
+    }
+
+    /// SK = HKDF-SHA256(salt = zero bytes as long as a hash, ikm = key material, info =
+    /// "x3dh.v1").
+    fn agree(self, alice_identity_key: &PublicKey, bob_identity_key: &PublicKey) -> Agreement {
+        let mut secret_key = Zeroizing::new([0; SECRET_KEY_LENGTH]);
+        Hkdf::<Sha256>::new(Some(&[0; HASH_LENGTH]), &self.0)
+            .expand(INFO, secret_key.as_mut_slice())
+            .expect("SK's length is a valid HKDF-SHA256 output length");
+        let mut associated_data = [0; 2 * PUBLIC_KEY_LENGTH];
+        let (alice, bob) = associated_data.split_at_mut(PUBLIC_KEY_LENGTH);
+        alice.copy_from_slice(alice_identity_key);
+        bob.copy_from_slice(bob_identity_key);
+        Agreement {
+            secret_key,
+            associated_data,
+        }
+    }
+}
+
+/// X25519, rejecting a public key that makes the shared secret all zeros.
+fn diffie_hellman(secret: &StaticSecret, public_key: &PublicKey) -> Result<SharedSecret> {
+    let shared_secret = secret.diffie_hellman(&x25519_dalek::PublicKey::from(*public_key));
+    if !shared_secret.was_contributory() {
+        return Err(ErrorKind::InvalidPublicKey.into());
+    }
+    Ok(shared_secret)
+}
+
+fn generate_key_pair() -> (PublicKey, StaticSecret) {
+    let mut bytes = Zeroizing::new([0; _]);
+    getrandom::fill(bytes.as_mut_slice()).expect("the system random number generator failed");
+    let secret = StaticSecret::from(*bytes);
+    (x25519_dalek::PublicKey::from(&secret).to_bytes(), secret)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn public_key(identity: &XEdDSAPrivateKey) -> PublicKey {
+        identity.compute_public_key().to_bytes()
+    }
+
+    fn bob_setup(one_time_count: usize) -> (XEdDSAPrivateKey, LocalPrekeys, PrekeyBundle) {
+        let bob = XEdDSAPrivateKey::generate();
+        let mut prekeys = LocalPrekeys::new();
+        let published = prekeys.generate(&bob, one_time_count);
+        let bundle = PrekeyBundle {
+            signed_prekey: published.signed_prekey,
+            signed_prekey_signature: published.signed_prekey_signature,
+            one_time_prekey: published.one_time_prekeys.first().copied(),
+        };
+        (bob, prekeys, bundle)
+    }
+
+    #[test]
+    fn alice_and_bob_agree() {
+        for one_time_count in [0, 1] {
+            let alice = XEdDSAPrivateKey::generate();
+            let (bob, mut prekeys, bundle) = bob_setup(one_time_count);
+            let alice_key = public_key(&alice);
+            let bob_key = public_key(&bob);
+
+            let (message, alice_agreement) = super::alice(&alice, &bob_key, &bundle).unwrap();
+            assert_eq!(message.one_time_prekey, bundle.one_time_prekey);
+            let (bob_agreement, signed_prekey) =
+                super::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
+            assert_eq!(*alice_agreement.secret_key, *bob_agreement.secret_key);
+            assert_eq!(
+                alice_agreement.associated_data,
+                bob_agreement.associated_data
+            );
+            assert_eq!(
+                alice_agreement.associated_data[..PUBLIC_KEY_LENGTH],
+                alice_key
+            );
+            // Bob's first ratchet key pair is his signed prekey.
+            assert_eq!(
+                x25519_dalek::PublicKey::from(&signed_prekey).to_bytes(),
+                bundle.signed_prekey
             );
         }
-        // The signed prekey stays published for other Alices, so Bob's ratchet gets a copy.
-        let private_prekey = private_prekey.clone();
-        let shared_keys = derive_shared_keys(&key_meterial);
-
-        Ok(Party::new(
-            shared_keys.bob(private_prekey),
-            message_transport,
-            associated_data,
-        ))
     }
-}
 
-/// X3DH key material, starting with the 32 0xFF bytes of the X25519 domain separator.
-fn new_key_meterial() -> Zeroizing<Vec<u8>> {
-    // Room for the separator and all four DH outputs, so growing never leaves unzeroized copies.
-    let mut key_meterial = Zeroizing::new(Vec::with_capacity(32 * 5));
-    key_meterial.extend([0xFF; 32]);
-    key_meterial
-}
+    #[test]
+    fn rejections() {
+        let alice = XEdDSAPrivateKey::generate();
+        let (bob, mut prekeys, bundle) = bob_setup(1);
+        let alice_key = public_key(&alice);
+        let bob_key = public_key(&bob);
 
-/// Derive SK from the key material and split it into the root key and both header keys.
-fn derive_shared_keys(key_meterial: &[u8]) -> SharedKeys {
-    let mut secret_key = Zeroizing::new([0; 96]);
-    Hkdf::<Sha256>::new(Some(&[0; 96]), key_meterial)
-        .expand(b"X3DH", secret_key.as_mut_slice())
-        .unwrap();
-    SharedKeys {
-        secret_key: secret_key[..32].try_into().unwrap(),
-        header_key_alice: secret_key[32..64].try_into().unwrap(),
-        header_key_bob: secret_key[64..].try_into().unwrap(),
+        // A bundle whose signature is not by the identity Alice asked for.
+        let other = XEdDSAPrivateKey::generate();
+        let error = super::alice(&alice, &public_key(&other), &bundle).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidSignature);
+        // A low-order signed prekey, signed by Bob.
+        let low_order = PrekeyBundle {
+            signed_prekey: [0; 32],
+            signed_prekey_signature: bob.sign([0; 32]),
+            one_time_prekey: None,
+        };
+        let error = super::alice(&alice, &bob_key, &low_order).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidPublicKey);
+
+        let (message, _) = super::alice(&alice, &bob_key, &bundle).unwrap();
+        let error = super::bob(&bob, &mut prekeys, &bob_key, &message)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::UnexpectedIdentity);
+        let unknown_prekey = InitialMessage {
+            signed_prekey: [9; 32],
+            ..message.clone()
+        };
+        let error = super::bob(&bob, &mut prekeys, &alice_key, &unknown_prekey)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::PrekeyNotFound);
+        // The one-time prekey works once.
+        super::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
+        let error = super::bob(&bob, &mut prekeys, &alice_key, &message)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::OneTimePrekeyNotFound);
     }
-}
 
-/// The gRPC server to store and distribute the public keys.
-pub struct RpcX3DHServer {}
+    #[test]
+    fn keeps_the_last_generations() {
+        let alice = XEdDSAPrivateKey::generate();
+        let (bob, mut prekeys, first) = bob_setup(2);
+        let alice_key = public_key(&alice);
+        let bob_key = public_key(&bob);
+        let (message, _) = super::alice(&alice, &bob_key, &first).unwrap();
 
-impl RpcX3DHServer {
-    /// Run a RpcX3DHServer listening on addr.
-    pub async fn run(addr: impl AsRef<str>, identity: Option<Identity>) -> Result<()> {
-        let addr = addr
-            .as_ref()
-            .parse()
-            .map_err(|e| Error::new(ErrorKind::InvalidAddress, e))?;
-        let mut server = Server::builder();
-        if let Some(identity) = identity {
-            server = server
-                .tls_config(ServerTlsConfig::new().identity(identity))
-                .map_err(|e| Error::new(ErrorKind::Server, e))?;
-        }
-        server
-            .add_service(X3dhServiceServer::new(RpcX3DHInner::default()))
-            .serve(addr)
-            .await
-            .map_err(|e| Error::new(ErrorKind::Server, e))?;
-        Ok(())
-    }
-}
+        // Bob publishes again before taking Alice's message: it still works.
+        let second = prekeys.generate(&bob, 1);
+        super::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
+        // A one-time prekey must be of the same generation as the signed prekey.
+        let mixed = PrekeyBundle {
+            one_time_prekey: second.one_time_prekeys.first().copied(),
+            ..first.clone()
+        };
+        let (message, _) = super::alice(&alice, &bob_key, &mixed).unwrap();
+        let error = super::bob(&bob, &mut prekeys, &alice_key, &message)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::OneTimePrekeyNotFound);
 
-#[derive(Debug, Default)]
-pub(crate) struct RpcX3DHInner {
-    published_keys: RwLock<HashMap<Vec<u8>, PublishedKeys>>,
-    attempts: RwLock<HashMap<Vec<u8>, Vec<Vec<u8>>>>,
-}
-
-#[derive(Debug)]
-struct PublishedKeys {
-    prekey: Vec<u8>,
-    prekey_signature: Vec<u8>,
-    one_time_keys: Vec<Vec<u8>>,
-}
-
-#[tonic::async_trait]
-impl X3dhService for RpcX3DHInner {
-    async fn publish_keys(
-        &self,
-        request: Request<PublishKeysRequest>,
-    ) -> RpcResult<Response<PublishKeysResponse>> {
-        let keys = request.into_inner();
-        self.published_keys.write().insert(
-            keys.identity_key_bob.clone(),
-            PublishedKeys {
-                prekey: keys.prekey,
-                prekey_signature: keys.prekey_signature,
-                one_time_keys: keys.one_time_keys,
-            },
+        // After one more, the first generation is deleted.
+        let without_one_time_prekey = PrekeyBundle {
+            one_time_prekey: None,
+            ..first
+        };
+        let (message, _) = super::alice(&alice, &bob_key, &without_one_time_prekey).unwrap();
+        prekeys.generate(&bob, 1);
+        let error = super::bob(&bob, &mut prekeys, &alice_key, &message)
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), ErrorKind::PrekeyNotFound);
+        assert_eq!(
+            format!("{prekeys:?}"),
+            "LocalPrekeys { signed: 2, one_time: 2 }"
         );
-        Ok(Response::new(PublishKeysResponse {}))
     }
-
-    async fn fetch_keys(
-        &self,
-        request: Request<FetchKeysRequest>,
-    ) -> RpcResult<Response<FetchKeysResponse>> {
-        let identity_key_bob = request.into_inner().identity_key_bob;
-        match self.published_keys.write().get_mut(&identity_key_bob) {
-            Some(keys) => Ok(Response::new(FetchKeysResponse {
-                identity_key_bob,
-                prekey: keys.prekey.clone(),
-                prekey_signature: keys.prekey_signature.clone(),
-                one_time_key: keys.one_time_keys.pop(),
-            })),
-            None => Err(Status::not_found("identity_key_bob not found".to_string())),
-        }
-    }
-
-    async fn add_attempt(
-        &self,
-        request: Request<AddAttemptRequest>,
-    ) -> RpcResult<Response<AddAttemptResponse>> {
-        let AddAttemptRequest {
-            identity_key_alice,
-            identity_key_bob,
-        } = request.into_inner();
-        self.attempts
-            .write()
-            .entry(identity_key_bob)
-            .or_default()
-            .push(identity_key_alice);
-        Ok(Response::new(AddAttemptResponse {}))
-    }
-
-    async fn list_attempt(
-        &self,
-        request: Request<ListAttemptRequest>,
-    ) -> RpcResult<Response<ListAttemptResponse>> {
-        let identity_key_bob = request.into_inner().identity_key_bob;
-        Ok(Response::new(ListAttemptResponse {
-            identity_key_alice: self
-                .attempts
-                .read()
-                .get(&identity_key_bob)
-                .cloned()
-                .unwrap_or_default(),
-        }))
-    }
-}
-
-/// The initial message.
-#[derive(prost::Message)]
-pub struct InitMassage {
-    #[prost(bytes = "vec", tag = "1")]
-    identity_key_alice: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    ephemeral_public_key_alice: Vec<u8>,
-    #[prost(bytes = "vec", tag = "3")]
-    prekey_bob: Vec<u8>,
-    #[prost(bytes = "vec", optional, tag = "4")]
-    one_time_prekey_bob: Option<Vec<u8>>,
 }

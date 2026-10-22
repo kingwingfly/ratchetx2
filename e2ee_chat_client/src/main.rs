@@ -1,7 +1,7 @@
 use std::fs;
 
 use clap::Parser;
-use x3dh::Certificate;
+use session::protocol::grpc::Certificate;
 
 mod cli;
 mod client;

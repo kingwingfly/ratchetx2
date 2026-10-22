@@ -1,51 +1,39 @@
-Initialize the shared keys between two parties with [Extended Triple Diffie-Hellman](https://signal.org/docs/specifications/x3dh/), over gRPC (by [tonic](https://crates.io/crates/tonic); protoc is needed to build).
+[X3DH](https://signal.org/docs/specifications/x3dh/) (Extended Triple Diffie-Hellman) key agreement, without I/O.
 
-The result is a pair of `primitives` chat parties. Identity keys are `xeddsa` keys.
+Alice and Bob derive the same 32-byte shared secret key and associated data. Identity keys are [xeddsa](../xeddsa) keys; prekeys and Alice's ephemeral key are X25519 keys. How bundles and initial messages travel is up to the caller.
+
+Parameters: curve X25519, hash SHA-256, info `"x3dh.v1"`, HKDF salt of 32 zero bytes, public keys encoded as their 32 raw bytes, and associated data `IK_A ‖ IK_B`.
+
+Bob's [`LocalPrekeys`] keeps the private keys of the last [`KEPT_GENERATIONS`] generations of prekeys only, deleting older ones so they cannot reveal anything later.
+
+# Features
+
+- **serde**, **rkyv**: derive their traits on [`PrekeyBundle`] and [`InitialMessage`].
+
+On `wasm32-unknown-unknown`, enable getrandom's `wasm_js` feature in the final application.
 
 # Example
 
 ```rust
-use x3dh::{RpcServer, X3DHClient};
+use x3dh::{LocalPrekeys, PrekeyBundle};
+use xeddsa::XEdDSAPrivateKey;
 
-# #[tokio::main]
-# async fn main() {
-tokio::spawn(async {
-    RpcServer::run("127.0.0.1:3001", None).await.unwrap();
-});
-// wait server start
-tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+let (alice, bob) = (XEdDSAPrivateKey::generate(), XEdDSAPrivateKey::generate());
+let alice_key = alice.compute_public_key().to_bytes();
+let bob_key = bob.compute_public_key().to_bytes();
 
-const SERVER_ADDR: &str = "http://127.0.0.1:3001";
+// Bob generates prekeys and publishes them.
+let mut prekeys = LocalPrekeys::new();
+let published = prekeys.generate(&bob, 10);
+let bundle = PrekeyBundle {
+    signed_prekey: published.signed_prekey,
+    signed_prekey_signature: published.signed_prekey_signature,
+    one_time_prekey: published.one_time_prekeys.first().copied(),
+};
 
-let mut alice_x3dh = X3DHClient::connect(SERVER_ADDR, None, None).await.unwrap();
-let mut bob_x3dh = X3DHClient::connect(SERVER_ADDR, None, None).await.unwrap();
-bob_x3dh.publish_keys().await.unwrap();
-let mut alice = alice_x3dh
-    .push_initial_message(&bob_x3dh.public_identity_key(), SERVER_ADDR)
-    .await
-    .unwrap();
-assert_eq!(
-    bob_x3dh.list_attempt(&bob_x3dh.public_identity_key()).await.unwrap().pop().unwrap(),
-    alice_x3dh.public_identity_key()
-);
-let mut bob = bob_x3dh
-    .handle_initial_message(&alice_x3dh.public_identity_key(), SERVER_ADDR)
-    .await
-    .unwrap();
-alice.push("hello world").await.unwrap();
-assert_eq!(
-    bob.fetch().await.unwrap().remove(0).unwrap(),
-    b"hello world"
-);
-alice.push("hello Bob").await.unwrap();
-assert_eq!(
-    bob.fetch().await.unwrap().remove(0).unwrap(),
-    b"hello Bob"
-);
-bob.push("hello Alice").await.unwrap();
-assert_eq!(
-    alice.fetch().await.unwrap().remove(0).unwrap(),
-    b"hello Alice"
-);
-# }
+// Alice starts the session and sends `message` to Bob.
+let (message, alice_agreement) = x3dh::alice(&alice, &bob_key, &bundle).unwrap();
+// Bob accepts it.
+let (bob_agreement, _signed_prekey) = x3dh::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
+assert_eq!(*alice_agreement.secret_key, *bob_agreement.secret_key);
 ```

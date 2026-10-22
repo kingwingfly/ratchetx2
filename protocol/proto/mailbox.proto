@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+// The mailbox service: one queue of encrypted messages per sender and recipient.
+package mailbox.v1;
+
+import "party.proto";
+
+// Append a message to the queue from `sender` to `recipient`.
+message PushRequest {
+  // The sender's identity key (32 bytes).
+  bytes sender = 1;
+  // The recipient's identity key (32 bytes).
+  bytes recipient = 2;
+  // The message.
+  party.v1.EncryptedMessage message = 3;
+}
+
+// Reply to `PushRequest`.
+message PushResponse {
+  // The message's position in the queue, starting at 1.
+  uint64 sequence = 1;
+}
+
+// Read messages from the queue from `sender` to `recipient`.
+message FetchRequest {
+  // The sender's identity key (32 bytes).
+  bytes sender = 1;
+  // The recipient's identity key (32 bytes).
+  bytes recipient = 2;
+  // Fetch the messages after this sequence number; 0 for the start of the queue.
+  uint64 after = 3;
+  // At most this many messages; 0 for the server's maximum.
+  uint32 limit = 4;
+}
+
+// The fetched messages, in order.
+message FetchResponse {
+  // The messages.
+  repeated Envelope messages = 1;
+}
+
+// A message and its position in the queue.
+message Envelope {
+  // Position in the queue.
+  uint64 sequence = 1;
+  // The message.
+  party.v1.EncryptedMessage message = 2;
+}
+
+// The mailbox service.
+service MailboxService {
+  // Append a message to a queue.
+  rpc Push(PushRequest) returns (PushResponse);
+  // Read messages from a queue.
+  rpc Fetch(FetchRequest) returns (FetchResponse);
+}

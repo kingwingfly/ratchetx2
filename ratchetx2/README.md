@@ -4,7 +4,7 @@ Pure Rust (no C dependencies), so it also builds for `wasm32-unknown-unknown`.
 
 # E2EE chat app (TUI)
 
-An E2EE chat server-client TUI app base on this crate is available [here](https://github.com/kingwingfly/ratchetx2). The repository also has unpublished companion crates: `primitives` (chat parties with header encryption, message transports), `x3dh` (X3DH over gRPC) and `xeddsa` (XEdDSA).
+An E2EE chat server-client TUI app base on this crate is available [here](https://github.com/kingwingfly/ratchetx2). The repository also has unpublished companion crates: `xeddsa` (XEdDSA), `x3dh` (X3DH key agreement), `party` (header encryption over this crate), and `storage`, `protocol` and `session` for the chat itself.
 
 # Compared to others
 
@@ -22,7 +22,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 # Example
 
-Ratchet only example:
+After a key agreement such as X3DH, derive the shared keys from its secret with `SharedKeys::from_secret`. Ratchet only example:
 ```rust
 use ratchetx2::{DhPrivateKey, SharedKeys};
 
@@ -34,25 +34,32 @@ let shared_keys = SharedKeys {
 let mut bob = shared_keys.bob(DhPrivateKey::generate());
 let mut alice = shared_keys.alice(&bob.public_key()).unwrap();
 // Bob has no sending chain until he has received from Alice.
-assert_eq!(bob.step_msgs(), None);
+assert_eq!(bob.step_message_ratchet_sender(), None);
 
 // Alice sends first
 bob.step_dh_root(&alice.public_key()).unwrap();
 assert_eq!(alice, bob); // Alice and Bob have the "same" state
-assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap()); // returning the same message key
-assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap());
+// The receiver steps to the same message keys as the sender.
+for _ in 0..2 {
+    let message_key = alice.step_message_ratchet_sender().unwrap();
+    assert_eq!(message_key, bob.step_message_ratchet_receiver().unwrap());
+}
 
 // Bob sends
 bob.step_dh_root(&alice.public_key()).unwrap();
 alice.step_dh_root(&bob.public_key()).unwrap();
 assert_eq!(alice, bob);
-assert_eq!(bob.step_msgs().unwrap(), alice.step_msgr().unwrap());
-assert_eq!(bob.step_msgs().unwrap(), alice.step_msgr().unwrap());
+for _ in 0..2 {
+    let message_key = bob.step_message_ratchet_sender().unwrap();
+    assert_eq!(message_key, alice.step_message_ratchet_receiver().unwrap());
+}
 
 // Alice sends
 alice.step_dh_root(&bob.public_key()).unwrap();
 bob.step_dh_root(&alice.public_key()).unwrap();
 assert_eq!(alice, bob);
-assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap());
-assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap());
+for _ in 0..2 {
+    let message_key = alice.step_message_ratchet_sender().unwrap();
+    assert_eq!(message_key, bob.step_message_ratchet_receiver().unwrap());
+}
 ```

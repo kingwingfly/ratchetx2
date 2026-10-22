@@ -1,7 +1,0 @@
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(feature = "grpc")]
-    tonic_prost_build::configure()
-        .emit_rerun_if_changed(true)
-        .compile_protos(&["proto/message.proto"], &["proto"])?;
-    Ok(())
-}

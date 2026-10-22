@@ -2,6 +2,7 @@
 name = "e2ee_chat_client"
 version = "0.3.0"
 edition = "2024"
+publish = false
 description = "An E2EE chat client."
 keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
 license = "MIT"
@@ -17,8 +18,7 @@ crossterm = "0.29"
 ratatui = { version = "0.30" }
 unicode-width = "0.2"
 tui-textarea-2 = "0.13.2"
-primitives = { path = "../primitives" }
-x3dh = { path = "../x3dh" }
+session = { path = "../session", features = ["grpc"] }
 tokio = { version = "1", default-features = false, features = [
     "macros",
     "rt-multi-thread",

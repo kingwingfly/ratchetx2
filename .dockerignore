@@ -1,0 +1,4 @@
+target
+.git
+# TLS keys and certificates are mounted at run time, never built into an image.
+tls
