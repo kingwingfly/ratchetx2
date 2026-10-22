@@ -34,6 +34,7 @@ The wire protocol changed, so 0.3 clients and servers cannot talk to 0.2 ones.
 - fix: Bob kept every prekey's private key forever; now only the last two generations are kept, so older ones cannot reveal sessions later
 - fix: messages Alice sent before Bob accepted were lost; mailboxes are now sequenced queues read from a cursor
 - fix: receiving rejects duplicates and out-of-range header counters, keeps one undecryptable message from blocking the rest, and only changes state when a message decrypts
+- fix: skipped message keys were kept until used, so the keys of lost messages took up the room for skipped keys for good, and then every message after a gap was rejected; now the keys of the peer's last 5 chains (`MAX_SKIPPED_CHAINS`) are kept, and beyond `SKIP_MAX` keys the oldest are dropped
 - fix: invalid keys from the network return errors instead of panicking
 - fix: `Debug` no longer prints keys (xeddsa, the ratchet, parties); xeddsa uses the spec's hash1 prefix for signing nonces, and zeroizes signing and DH temporaries
 - fix: the client no longer pins the TLS server name to 127.0.0.1

@@ -1,9 +1,11 @@
 //! The party who participates in the E2EE chat.
 
+mod skipped;
+
 use crate::error::{Error, ErrorKind, Result};
 use crate::proto::{EncryptedMessage, Header};
+use skipped::{SkippedChain, SkippedKeys};
 
-use std::collections::HashMap;
 use std::fmt;
 
 use aes_gcm::{
@@ -21,13 +23,18 @@ use ratchetx2::{
 };
 use sha2::Sha256;
 
-/// Maximum number of skipped messages allowed.
+/// Maximum number of message keys that receiving one message may skip, and that are kept for
+/// messages arriving late; beyond it, the oldest are dropped.
 pub const SKIP_MAX: u64 = 1024;
+/// Number of the peer's chains, its current one and those before, whose skipped message keys are
+/// kept; a message delayed longer cannot be decrypted.
+pub const MAX_SKIPPED_CHAINS: usize = 5;
 
 /// The party who participates in the E2EE chat: encrypts and decrypts messages, without I/O.
 /// See the example in the [crate docs](crate).
 pub struct Party {
     ratchet: Ratchet,
+    /// Keys of the messages skipped over while receiving, for when they arrive late.
     skipped_message_keys: SkippedKeys,
     /// Number of messages in the previous sending chain.
     previous_chain_length: u64,
@@ -45,14 +52,10 @@ impl fmt::Debug for Party {
             .field("previous_chain_length", &self.previous_chain_length)
             .field("message_number_sender", &self.message_number_sender)
             .field("message_number_receiver", &self.message_number_receiver)
-            .field("skipped", &self.skipped_count())
+            .field("skipped", &self.skipped_message_keys.len())
             .finish_non_exhaustive()
     }
 }
-
-/// Message keys skipped over while receiving: by the header key of their chain, then by message
-/// number. A header key is only kept while its chain has skipped keys left.
-type SkippedKeys = HashMap<HeaderKey, HashMap<u64, MessageKey>>;
 
 impl Party {
     /// New a party.
@@ -62,7 +65,7 @@ impl Party {
     pub fn new(ratchet: Ratchet, associated_data: impl AsRef<[u8]>) -> Self {
         Self {
             ratchet,
-            skipped_message_keys: HashMap::new(),
+            skipped_message_keys: SkippedKeys::default(),
             previous_chain_length: 0,
             message_number_sender: 0,
             message_number_receiver: 0,
@@ -127,26 +130,21 @@ impl Party {
     fn receive_skipped(&mut self, message: &EncryptedMessage) -> Result<Option<Vec<u8>>> {
         let Some((header_key, header)) = self
             .skipped_message_keys
-            .keys()
-            .find_map(|&header_key| Some((header_key, self.open_header(header_key, message)?)))
+            .header_keys()
+            .find_map(|header_key| Some((header_key, self.open_header(header_key, message)?)))
         else {
             return Ok(None);
         };
         let header = header?;
-        let Some(&message_key) = self.skipped_message_keys[&header_key].get(&header.message_number)
+        let Some(message_key) = self
+            .skipped_message_keys
+            .get(&header_key, header.message_number)
         else {
             return Ok(None);
         };
         let content = self.open_content(message_key, message)?;
-
-        let message_keys = self
-            .skipped_message_keys
-            .get_mut(&header_key)
-            .expect("the message key was found above");
-        message_keys.remove(&header.message_number);
-        if message_keys.is_empty() {
-            self.skipped_message_keys.remove(&header_key);
-        }
+        self.skipped_message_keys
+            .remove(&header_key, header.message_number);
         Ok(Some(content))
     }
 
@@ -160,15 +158,13 @@ impl Party {
         if header.message_number < self.message_number_receiver {
             return Err(ErrorKind::DuplicateMessage.into());
         }
-        self.check_skip_count(header.message_number - self.message_number_receiver)?;
+        check_skip_count(header.message_number - self.message_number_receiver)?;
 
         let mut ratchet = self.ratchet.clone();
-        let mut skipped = SkippedKeys::new();
-        skip_message_keys(
+        let skipped = skip_message_keys(
             &mut ratchet,
             self.message_number_receiver,
             header.message_number,
-            &mut skipped,
         )?;
         let message_key = ratchet
             .step_message_ratchet_receiver()
@@ -176,7 +172,7 @@ impl Party {
         let content = self.open_content(message_key, message)?;
 
         self.ratchet = ratchet;
-        self.keep_skipped(skipped);
+        self.skipped_message_keys.extend(skipped);
         self.message_number_receiver = header.message_number + 1;
         Ok(content)
     }
@@ -192,59 +188,36 @@ impl Party {
         if header.previous_chain_length < self.message_number_receiver {
             return Err(ErrorKind::InvalidHeader.into());
         }
-        self.check_skip_count(
+        check_skip_count(
             (header.previous_chain_length - self.message_number_receiver)
                 .saturating_add(header.message_number),
         )?;
 
         let mut ratchet = self.ratchet.clone();
-        let mut skipped = SkippedKeys::new();
-        skip_message_keys(
+        let skipped_previous = skip_message_keys(
             &mut ratchet,
             self.message_number_receiver,
             header.previous_chain_length,
-            &mut skipped,
         )?;
         for _ in 0..2 {
             ratchet
                 .step_dh_root(&header.public_key)
                 .map_err(|e| Error::new(ErrorKind::InvalidPublicKey, e))?;
         }
-        skip_message_keys(&mut ratchet, 0, header.message_number, &mut skipped)?;
+        let skipped_next = skip_message_keys(&mut ratchet, 0, header.message_number)?;
         let message_key = ratchet
             .step_message_ratchet_receiver()
             .ok_or(ErrorKind::InvalidHeader)?;
         let content = self.open_content(message_key, message)?;
 
         self.ratchet = ratchet;
-        self.keep_skipped(skipped);
+        self.skipped_message_keys.extend(skipped_previous);
+        self.skipped_message_keys.next_chain();
+        self.skipped_message_keys.extend(skipped_next);
         self.previous_chain_length = self.message_number_sender;
         self.message_number_sender = 0;
         self.message_number_receiver = header.message_number + 1;
         Ok(content)
-    }
-
-    /// Keep the message keys skipped while receiving a message, once it has decrypted.
-    fn keep_skipped(&mut self, skipped: SkippedKeys) {
-        for (header_key, message_keys) in skipped {
-            self.skipped_message_keys
-                .entry(header_key)
-                .or_default()
-                .extend(message_keys);
-        }
-    }
-
-    /// Number of skipped message keys kept, over all chains.
-    fn skipped_count(&self) -> usize {
-        self.skipped_message_keys.values().map(HashMap::len).sum()
-    }
-
-    /// Fails if skipping `count` more message keys would exceed [`SKIP_MAX`].
-    fn check_skip_count(&self, count: u64) -> Result<()> {
-        match (self.skipped_count() as u64).checked_add(count) {
-            Some(total) if total <= SKIP_MAX => Ok(()),
-            _ => Err(ErrorKind::TooManySkipped.into()),
-        }
     }
 
     /// Decrypt the header with `header_key`; None if it is not the key of this header.
@@ -291,27 +264,31 @@ fn content_associated_data(associated_data: &[u8], header: &[u8]) -> Vec<u8> {
     aad
 }
 
-/// Step `ratchet`'s receiving chain from index `from` up to `until`, collecting the message keys.
-fn skip_message_keys(
-    ratchet: &mut Ratchet,
-    from: u64,
-    until: u64,
-    skipped: &mut SkippedKeys,
-) -> Result<()> {
+/// Fails if receiving a message would skip more than [`SKIP_MAX`] message keys.
+fn check_skip_count(count: u64) -> Result<()> {
+    if count > SKIP_MAX {
+        return Err(ErrorKind::TooManySkipped.into());
+    }
+    Ok(())
+}
+
+/// Step `ratchet`'s receiving chain from index `from` up to `until`, collecting the message keys;
+/// None if there are none to skip.
+fn skip_message_keys(ratchet: &mut Ratchet, from: u64, until: u64) -> Result<Option<SkippedChain>> {
     if from >= until {
-        return Ok(());
+        return Ok(None);
     }
     let header_key = ratchet
         .header_key_receiver()
         .ok_or(ErrorKind::InvalidHeader)?;
-    let message_keys = skipped.entry(header_key).or_default();
+    let mut skipped = SkippedChain::new(header_key);
     for message_number in from..until {
         let message_key = ratchet
             .step_message_ratchet_receiver()
             .ok_or(ErrorKind::InvalidHeader)?;
-        message_keys.insert(message_number, message_key);
+        skipped.insert(message_number, message_key);
     }
-    Ok(())
+    Ok(Some(skipped))
 }
 
 /// HKDF info of header encryption.
@@ -492,7 +469,7 @@ mod test {
         assert_eq!(bob.decrypt(&sent[0]).unwrap(), b"m0");
         assert_eq!(bob.decrypt(&sent[1]).unwrap(), b"m1");
         // Both skipped keys are used up, and with them their chain's header key.
-        assert!(bob.skipped_message_keys.is_empty());
+        assert_eq!(bob.skipped_message_keys.header_keys().count(), 0);
         assert_eq!(
             bob.decrypt(&sent[0]).unwrap_err().kind(),
             ErrorKind::DuplicateMessage
@@ -518,6 +495,58 @@ mod test {
         // Each arrives after its receiver has moved on to the sender's next chain.
         assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
         assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
+    }
+
+    #[test]
+    fn lost_messages_do_not_block_later_ones() {
+        let (mut alice, mut bob) = session();
+        // The keys of SKIP_MAX lost messages fill Bob's room for skipped keys.
+        for _ in 0..SKIP_MAX {
+            alice.encrypt(b"lost").unwrap();
+        }
+        let message = alice.encrypt(b"m").unwrap();
+        assert_eq!(bob.decrypt(&message).unwrap(), b"m");
+        assert_eq!(bob.skipped_message_keys.len(), SKIP_MAX);
+
+        // After another gap, the oldest keys make room instead of the message being rejected.
+        let delayed = alice.encrypt(b"delayed").unwrap();
+        alice.encrypt(b"lost").unwrap();
+        let message = alice.encrypt(b"after a gap").unwrap();
+        assert_eq!(bob.decrypt(&message).unwrap(), b"after a gap");
+        assert_eq!(bob.skipped_message_keys.len(), SKIP_MAX);
+        assert_eq!(bob.decrypt(&delayed).unwrap(), b"delayed");
+    }
+
+    /// Bob sends a message to Alice, and Alice one to Bob: each moves on to the other's next
+    /// chain.
+    fn round_trip(alice: &mut Party, bob: &mut Party) {
+        let message = bob.encrypt(b"b").unwrap();
+        assert_eq!(alice.decrypt(&message).unwrap(), b"b");
+        let message = alice.encrypt(b"a").unwrap();
+        assert_eq!(bob.decrypt(&message).unwrap(), b"a");
+    }
+
+    #[test]
+    fn skipped_keys_go_after_max_skipped_chains() {
+        let (mut alice, mut bob) = session();
+        let delayed: Vec<_> = ["d0", "d1"]
+            .into_iter()
+            .map(|content| alice.encrypt(content.as_bytes()).unwrap())
+            .collect();
+        let message = alice.encrypt(b"m").unwrap();
+        assert_eq!(bob.decrypt(&message).unwrap(), b"m");
+
+        for _ in 1..MAX_SKIPPED_CHAINS {
+            round_trip(&mut alice, &mut bob);
+        }
+        // Alice's first chain is the oldest of her last MAX_SKIPPED_CHAINS.
+        assert_eq!(bob.decrypt(&delayed[0]).unwrap(), b"d0");
+        round_trip(&mut alice, &mut bob);
+        assert_eq!(
+            bob.decrypt(&delayed[1]).unwrap_err().kind(),
+            ErrorKind::Undecryptable
+        );
+        assert_eq!(bob.skipped_message_keys.len(), 0);
     }
 
     #[test]
