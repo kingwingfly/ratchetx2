@@ -16,6 +16,7 @@ hkdf = "0.13"
 parking_lot = "0.12"
 prost = "0.14"
 sha2 = "0.11"
+thiserror = "2.0"
 tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"] }
 tonic-prost = "0.14"
 zeroize = "1.9"

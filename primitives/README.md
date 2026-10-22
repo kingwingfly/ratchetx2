@@ -20,7 +20,7 @@ let shared_keys = SharedKeys {
     header_key_bob: [2; 32],
 };
 let bob_ratchetx2 = shared_keys.bob(DhPrivateKey::generate());
-let alice_ratchetx2 = shared_keys.alice(&bob_ratchetx2.public_key());
+let alice_ratchetx2 = shared_keys.alice(&bob_ratchetx2.public_key()).unwrap();
 let (a, b) = ChannelTransport::new();
 let mut alice = Party::new(alice_ratchetx2, a, "AliceBob");
 let mut bob = Party::new(bob_ratchetx2, b, "AliceBob");

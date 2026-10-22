@@ -32,25 +32,27 @@ let shared_keys = SharedKeys {
     header_key_bob: [2; 32],
 };
 let mut bob = shared_keys.bob(DhPrivateKey::generate());
-let mut alice = shared_keys.alice(&bob.public_key());
+let mut alice = shared_keys.alice(&bob.public_key()).unwrap();
+// Bob has no sending chain until he has received from Alice.
+assert_eq!(bob.step_msgs(), None);
 
 // Alice sends first
-bob.step_dh_root(&alice.public_key());
+bob.step_dh_root(&alice.public_key()).unwrap();
 assert_eq!(alice, bob); // Alice and Bob have the "same" state
-assert_eq!(alice.step_msgs(), bob.step_msgr()); // returning the same message key
-assert_eq!(alice.step_msgs(), bob.step_msgr());
+assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap()); // returning the same message key
+assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap());
 
 // Bob sends
-bob.step_dh_root(&alice.public_key());
-alice.step_dh_root(&bob.public_key());
+bob.step_dh_root(&alice.public_key()).unwrap();
+alice.step_dh_root(&bob.public_key()).unwrap();
 assert_eq!(alice, bob);
-assert_eq!(bob.step_msgs(), alice.step_msgr());
-assert_eq!(bob.step_msgs(), alice.step_msgr());
+assert_eq!(bob.step_msgs().unwrap(), alice.step_msgr().unwrap());
+assert_eq!(bob.step_msgs().unwrap(), alice.step_msgr().unwrap());
 
 // Alice sends
-alice.step_dh_root(&bob.public_key());
-bob.step_dh_root(&alice.public_key());
+alice.step_dh_root(&bob.public_key()).unwrap();
+bob.step_dh_root(&alice.public_key()).unwrap();
 assert_eq!(alice, bob);
-assert_eq!(alice.step_msgs(), bob.step_msgr());
-assert_eq!(alice.step_msgs(), bob.step_msgr());
+assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap());
+assert_eq!(alice.step_msgs().unwrap(), bob.step_msgr().unwrap());
 ```

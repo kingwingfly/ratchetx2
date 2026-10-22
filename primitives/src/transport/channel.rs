@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::Transport;
-use crate::error::Result;
+use crate::error::{Error, ErrorKind, Result};
 
 /// Transport implementation with futures::channel::mpsc.
 #[allow(clippy::type_complexity)]
@@ -46,7 +46,8 @@ impl Transport for ChannelTransport {
                 .0
                 .clone()
         };
-        tx.try_send(bytes).unwrap();
+        tx.try_send(bytes)
+            .map_err(|e| Error::new(ErrorKind::Push, e.into_send_error()))?;
         Ok(())
     }
 
@@ -80,12 +81,12 @@ mod test {
             enc_content: vec![4, 5, 6],
         };
         alice.push(msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
+        assert_eq!(bob.fetch(None).await.unwrap().remove(0).unwrap(), msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
         alice.push(msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
+        assert_eq!(bob.fetch(None).await.unwrap().remove(0).unwrap(), msg);
     }
 }

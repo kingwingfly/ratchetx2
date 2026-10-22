@@ -16,11 +16,20 @@ Note: In this file, do not use the hard wrap in the middle of a sentence for com
 - ring -> pure-Rust crypto (curve25519-dalek, ed25519-dalek, RustCrypto); `ratchetx2`, `xeddsa` and `primitives` (without `grpc`) build for `wasm32-unknown-unknown`
 - bump deps (tonic/prost 0.14, curve25519-dalek 5; client: ratatui 0.30, ratatui-image 11)
 - replace bincode with protobuf (prost derive, no `protoc` needed); the wire format changed, so 0.3.x clients cannot talk to 0.2.x clients
-- ratchetx2: `SharedKeys::bob`/`Ratchetx2::bob` take `DhPrivateKey` instead of ring's `EphemeralPrivateKey`; `XEdDSAPrivateKey::generate()` no longer takes an RNG
+- the published `ratchetx2` crate goes to 0.4.0, see [its changelog](ratchetx2/CHANGELOG.md); `XEdDSAPrivateKey::generate()` no longer takes an RNG
 - fix: X3DH and the DH ratchet no longer duplicate private keys with `transmute_copy`
 - fix: header encryption reused the AES-GCM nonce under each chain's header key; every encryption now uses a fresh random nonce (wire format change)
 - fix: xeddsa `agree_ephemeral` is renamed `diffie_hellman` and rejects peer keys outside the prime-order subgroup, which let a peer learn the identity key modulo 8
 - fix: X3DH now deletes Alice's ephemeral private key and zeroizes the DH outputs as soon as the shared keys are derived, instead of keeping them across network calls
+- fix: sessions started with all-zero header and chain keys; chains are now unset until the first DH step, and Bob can only send after receiving Alice's first message
+- fix: X3DH now checks both identities: Alice ignores the identity key returned by the server, and Bob rejects an initial message from an unexpected identity
+- fix: the message server ignored fetch limits, so messages Alice sent before Bob accepted were lost
+- fix: receiving rejects duplicates and out-of-range header counters, keeps one undecodable message from dropping the rest of a fetch, and only changes state when a message decrypts
+- fix: invalid keys from the network return errors instead of panicking; a failed push no longer desynchronizes the sending chain
+- fix: xeddsa no longer prints private keys in `Debug`, uses the spec's hash1 prefix for signing nonces, and zeroizes signing and DH temporaries
+- fix: the X3DH client no longer pins the TLS server name to 127.0.0.1
+- `Party` takes any `LocalTransport`, so transports whose futures are not `Send` (e.g. in the browser) can be used
+- `primitives` and `x3dh` errors are `Error` + `ErrorKind` like `std::io`: match on `err.kind()` instead of strings; the underlying error is kept as `source()`
 - remove the deprecated e2ee_chat_ingress
 
 ## [0.2.7] - 2025-07-09

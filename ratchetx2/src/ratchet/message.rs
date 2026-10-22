@@ -4,10 +4,17 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::key::{ChainKey, HeaderKey, MessageKey};
 
-#[derive(Debug, PartialEq, Zeroize, ZeroizeOnDrop)]
-pub struct MessageRatchet {
+/// An established chain: its ChainKey and the HeaderKey of its messages.
+#[derive(Debug, Clone, PartialEq, Zeroize)]
+struct Chain {
     chain_key: ChainKey,
-    pub header_key: HeaderKey,
+    header_key: HeaderKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+pub struct MessageRatchet {
+    /// None until a DH-root step sets up this chain.
+    chain: Option<Chain>,
     pub next_header_key: HeaderKey,
 }
 
@@ -19,26 +26,33 @@ impl MessageRatchet {
         next_header_key: HeaderKey,
     ) -> Self {
         Self {
-            chain_key,
-            header_key,
+            chain: Some(Chain {
+                chain_key,
+                header_key,
+            }),
             next_header_key,
         }
     }
 
-    /// New a empty MessageRatchet, supposed to be only used in initialization.
+    /// New a MessageRatchet without a chain yet, supposed to be only used in initialization.
     pub fn empty(next_header_key: HeaderKey) -> Self {
         Self {
-            chain_key: ChainKey::default(),
-            header_key: HeaderKey::default(),
+            chain: None,
             next_header_key,
         }
     }
 
-    /// Perform ratchet step, update ChainKey, and return MessageKey.
-    pub fn step(&mut self) -> MessageKey {
-        let message_key = hmac_sha256(&self.chain_key, &[1]);
-        self.chain_key = hmac_sha256(&self.chain_key, &[2]);
-        message_key
+    /// HeaderKey of the current chain, if there is one.
+    pub fn header_key(&self) -> Option<HeaderKey> {
+        self.chain.as_ref().map(|chain| chain.header_key)
+    }
+
+    /// Perform ratchet step, update ChainKey, and return MessageKey; None if there is no chain yet.
+    pub fn step(&mut self) -> Option<MessageKey> {
+        let chain = self.chain.as_mut()?;
+        let message_key = hmac_sha256(&chain.chain_key, &[1]);
+        chain.chain_key = hmac_sha256(&chain.chain_key, &[2]);
+        Some(message_key)
     }
 }
 

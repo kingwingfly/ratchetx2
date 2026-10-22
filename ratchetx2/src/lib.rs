@@ -12,4 +12,4 @@ pub mod key;
 pub mod ratchet;
 
 pub use key::{DhPrivateKey, SharedKeys};
-pub use ratchet::Ratchetx2;
+pub use ratchet::Ratchet;

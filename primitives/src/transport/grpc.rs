@@ -5,13 +5,7 @@ pub(crate) mod message_rpc {
     tonic::include_proto!("message");
 }
 
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{collections::HashMap, sync::Arc};
 
 use message_rpc::{
     FetchMessagesRequest, FetchMessagesResponse, PushMessageRequest, PushMessageResponse,
@@ -28,12 +22,12 @@ use tonic::{
 };
 
 use super::Transport;
-use crate::error::{Result, TransportError};
+use crate::error::{Error, ErrorKind, Result};
 
 /// Message transport gRPC client.
 pub struct RpcTransport {
     rpc_client: MessageServiceClient<Channel>,
-    last_sync_id: Arc<AtomicU64>,
+    last_sync_id: u64,
     push_target: Vec<u8>,
     fetch_target: Vec<u8>,
 }
@@ -48,7 +42,7 @@ impl RpcTransport {
     ) -> Result<Self> {
         let uri: Uri = msg_server_addr
             .try_into()
-            .unwrap_or_else(|_| panic!("Invalid message server address."));
+            .map_err(|_| ErrorKind::InvalidAddress)?;
         let mut endpoint = Channel::builder(uri.clone());
         if uri.scheme_str() == Some("https") {
             endpoint = endpoint
@@ -59,16 +53,16 @@ impl RpcTransport {
                     }
                     config
                 })
-                .unwrap();
+                .map_err(|e| Error::new(ErrorKind::Connect, e))?;
         }
         let channel = endpoint
             .connect()
             .await
-            .map_err(|_| TransportError::Connect)?;
+            .map_err(|e| Error::new(ErrorKind::Connect, e))?;
         let rpc_client = MessageServiceClient::new(channel);
         Ok(Self {
             rpc_client,
-            last_sync_id: Arc::new(AtomicU64::default()),
+            last_sync_id: 0,
             push_target: [my_identity_key, peer_identity_key].concat().to_vec(),
             fetch_target: [peer_identity_key, my_identity_key].concat().to_vec(),
         })
@@ -85,23 +79,22 @@ impl Transport for RpcTransport {
             .rpc_client
             .push_message(req)
             .await
-            .map_err(|_| TransportError::Push)?;
+            .map_err(|status| Error::new(ErrorKind::Push, status))?;
         Ok(())
     }
 
     async fn fetch_bytes(&mut self, limit: Option<usize>) -> Result<Vec<Vec<u8>>> {
         let req = FetchMessagesRequest {
             target: self.fetch_target.clone(),
-            last_sync_id: self.last_sync_id.load(Ordering::Relaxed),
+            last_sync_id: self.last_sync_id,
             limit: limit.map(|limit| limit as u64),
         };
         let resp = self
             .rpc_client
             .fetch_messages(req)
             .await
-            .map_err(|_| TransportError::Fetch)?;
-        self.last_sync_id
-            .fetch_add(resp.get_ref().enc_messages.len() as u64, Ordering::Relaxed);
+            .map_err(|status| Error::new(ErrorKind::Fetch, status))?;
+        self.last_sync_id += resp.get_ref().enc_messages.len() as u64;
         Ok(resp.into_inner().enc_messages)
     }
 }
@@ -114,18 +107,21 @@ pub struct RpcMessageServer {}
 impl RpcMessageServer {
     /// Run a RpcMessageServer listening on addr.
     pub async fn run(addr: impl AsRef<str>, identity: Option<Identity>) -> Result<()> {
-        let addr = addr.as_ref().parse().unwrap();
+        let addr = addr
+            .as_ref()
+            .parse()
+            .map_err(|e| Error::new(ErrorKind::InvalidAddress, e))?;
         let mut server = Server::builder();
         if let Some(identity) = identity {
             server = server
                 .tls_config(ServerTlsConfig::new().identity(identity))
-                .unwrap()
+                .map_err(|e| Error::new(ErrorKind::Server, e))?;
         }
         server
-            .add_service(MessageServiceServer::new(RpcMessageServerInner::default()))
+            .add_routes(Self::routes())
             .serve(addr)
             .await
-            .map_err(|_| TransportError::Server)?;
+            .map_err(|e| Error::new(ErrorKind::Server, e))?;
         Ok(())
     }
 
@@ -160,16 +156,16 @@ impl MessageService for RpcMessageServerInner {
         let req = request.into_inner();
         let q = self.db.write().entry(req.target).or_default().clone();
         let q = q.read();
-        let enc_messages = q
-            .get(
-                req.last_sync_id as usize
-                    ..req
-                        .limit
-                        .map(|limit| ((req.last_sync_id + limit) as usize).max(q.len()))
-                        .unwrap_or(q.len()),
-            )
-            .map(|x| x.to_vec())
-            .unwrap_or_default();
+        // Both numbers come from the client: clamp them to the queue instead of trusting them.
+        let start = usize::try_from(req.last_sync_id)
+            .unwrap_or(usize::MAX)
+            .min(q.len());
+        let end = req.limit.map_or(q.len(), |limit| {
+            start
+                .saturating_add(usize::try_from(limit).unwrap_or(usize::MAX))
+                .min(q.len())
+        });
+        let enc_messages = q[start..end].to_vec();
         Ok(Response::new(FetchMessagesResponse { enc_messages }))
     }
 }
@@ -198,14 +194,38 @@ mod test {
             enc_content: vec![4, 5, 6],
         };
         alice.push(msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
+        assert_eq!(bob.fetch(None).await.unwrap().remove(0).unwrap(), msg);
         alice.push(msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
+        assert_eq!(bob.fetch(None).await.unwrap().remove(0).unwrap(), msg);
         let msg = EncryptedMessage {
             enc_header: vec![4, 5, 6],
             enc_content: vec![1, 2, 3],
         };
         alice.push(msg.clone()).await.unwrap();
-        assert_eq!(bob.fetch(None).await.unwrap()[0], msg);
+        assert_eq!(bob.fetch(None).await.unwrap().remove(0).unwrap(), msg);
+    }
+
+    #[tokio::test]
+    async fn fetch_respects_limit() {
+        tokio::spawn(async {
+            RpcMessageServer::run("[::1]:3010", None).await.unwrap();
+        });
+        // wait server start
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut alice = RpcTransport::connect("http://[::1]:3010", b"Alice", b"Bob", None)
+            .await
+            .unwrap();
+        let mut bob = RpcTransport::connect("http://[::1]:3010", b"Bob", b"Alice", None)
+            .await
+            .unwrap();
+        for i in 0..3 {
+            alice.push_bytes(vec![i]).await.unwrap();
+        }
+        assert_eq!(bob.fetch_bytes(Some(1)).await.unwrap(), vec![vec![0]]);
+        assert_eq!(
+            bob.fetch_bytes(Some(5)).await.unwrap(),
+            vec![vec![1], vec![2]]
+        );
+        assert!(bob.fetch_bytes(None).await.unwrap().is_empty());
     }
 }

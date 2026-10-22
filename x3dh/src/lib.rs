@@ -5,6 +5,7 @@
     elided_lifetimes_in_paths
 )]
 
+pub mod error;
 pub mod server;
 
 /// Re-export tonic.
@@ -23,7 +24,6 @@ use hkdf::Hkdf;
 use parking_lot::RwLock;
 use primitives::{
     Party,
-    error::{Error, Result, TransportError},
     transport::{RpcTransport, Transport},
 };
 use prost::Message as _;
@@ -41,6 +41,8 @@ use x3dh_rpc::{
 };
 use xeddsa::{XEdDSAPrivateKey, XEdDSAPublicKey};
 use zeroize::Zeroizing;
+
+use crate::error::{Error, ErrorKind, Result};
 
 /// X3DH gRPC client.
 pub struct X3DHClient {
@@ -67,27 +69,27 @@ impl X3DHClient {
     ) -> Result<Self> {
         let uri: Uri = x3dh_server_addr
             .try_into()
-            .unwrap_or_else(|_| panic!("Invalid x3dh server address."));
+            .map_err(|_| ErrorKind::InvalidAddress)?;
         let mut endpoint = Channel::builder(uri.clone());
         if uri.scheme_str() == Some("https") {
             endpoint = endpoint
                 .tls_config({
                     let mut config = ClientTlsConfig::new().with_native_roots();
                     if let Some(ca) = ca.clone() {
-                        config = config.ca_certificate(ca).domain_name("127.0.0.1");
+                        config = config.ca_certificate(ca);
                     }
                     config
                 })
-                .unwrap();
+                .map_err(|e| Error::new(ErrorKind::Connect, e))?;
         }
         let channel = endpoint
             .connect()
             .await
-            .map_err(|_| TransportError::Connect)?;
+            .map_err(|e| Error::new(ErrorKind::Connect, e))?;
         let rpc_client = X3dhServiceClient::new(channel);
         Ok(Self {
             rpc_client,
-            private_identity_key: private_identity_key.unwrap_or(XEdDSAPrivateKey::generate()),
+            private_identity_key: private_identity_key.unwrap_or_else(XEdDSAPrivateKey::generate),
             prekeys: HashMap::new(),
             one_time_prekeys: HashMap::new(),
             ca,
@@ -127,7 +129,7 @@ impl X3DHClient {
             .rpc_client
             .publish_keys(req)
             .await
-            .map_err(|_| TransportError::Push)?;
+            .map_err(|status| Error::new(ErrorKind::Push, status))?;
         self.prekeys.insert(public_prekey, private_prekey);
         self.one_time_prekeys.extend(one_time_keys);
         Ok(())
@@ -141,7 +143,7 @@ impl X3DHClient {
                 identity_key_bob: identity_key_bob.to_vec(),
             })
             .await
-            .map_err(|_| TransportError::Fetch)?
+            .map_err(|status| Error::new(ErrorKind::Fetch, status))?
             .into_inner())
     }
 
@@ -156,25 +158,22 @@ impl X3DHClient {
     ) -> Result<Party<RpcTransport>> {
         let keys = self.fetch_keys(identity_key_bob).await?;
 
-        let xeddsa_public_key = XEdDSAPublicKey::new(&keys.identity_key_bob);
-        xeddsa_public_key
-            .verify(&keys.prekey, &keys.prekey_signature)
-            .map_err(|_| Error::Signature)?;
+        // Use the identity key Alice asked for, never the one the server sends back.
+        XEdDSAPublicKey::new(identity_key_bob)?.verify(&keys.prekey, &keys.prekey_signature)?;
 
         // Alice deletes her ephemeral private key and the DH outputs once SK is derived: they
         // live only in this block, which ends before any network round-trip.
         let (ephemeral_public_key, shared_keys) = {
             let ephemeral_private_key = DhPrivateKey::generate();
             let mut key_meterial = new_key_meterial();
-            key_meterial.extend(
-                self.private_identity_key
-                    .diffie_hellman(&keys.prekey)
-                    .map_err(|e| Error::Failed(e.to_string()))?,
-            );
-            key_meterial.extend(ephemeral_private_key.diffie_hellman(xeddsa_public_key.as_ref())?);
-            key_meterial.extend(ephemeral_private_key.diffie_hellman(&keys.prekey)?);
+            key_meterial
+                .extend_from_slice(&*self.private_identity_key.diffie_hellman(&keys.prekey)?);
+            key_meterial
+                .extend_from_slice(&*ephemeral_private_key.diffie_hellman(identity_key_bob)?);
+            key_meterial.extend_from_slice(&*ephemeral_private_key.diffie_hellman(&keys.prekey)?);
             if let Some(one_time_key) = keys.one_time_key.as_ref() {
-                key_meterial.extend(ephemeral_private_key.diffie_hellman(one_time_key)?);
+                key_meterial
+                    .extend_from_slice(&*ephemeral_private_key.diffie_hellman(one_time_key)?);
             }
             (
                 ephemeral_private_key.public_key().to_vec(),
@@ -185,7 +184,7 @@ impl X3DHClient {
         let mut associated_data: Vec<u8> = vec![];
         let my_identity_key = self.public_identity_key();
         associated_data.extend(&my_identity_key);
-        associated_data.extend(&keys.identity_key_bob);
+        associated_data.extend(identity_key_bob);
         let init_msg = InitMassage {
             identity_key_alice: self.public_identity_key(),
             ephemeral_public_key_alice: ephemeral_public_key,
@@ -208,10 +207,10 @@ impl X3DHClient {
                 identity_key_bob: identity_key_bob.to_vec(),
             }))
             .await
-            .map_err(|_| Error::Transport(TransportError::Push))?;
+            .map_err(|status| Error::new(ErrorKind::Push, status))?;
 
         let alice = Party::new(
-            shared_keys.alice(&keys.prekey),
+            shared_keys.alice(&keys.prekey)?,
             messgae_transport,
             associated_data,
         );
@@ -225,7 +224,7 @@ impl X3DHClient {
                 identity_key_bob: identity_key_bob.to_vec(),
             }))
             .await
-            .map_err(|_| Error::Transport(TransportError::Fetch))
+            .map_err(|status| Error::new(ErrorKind::Fetch, status))
             .map(|resp| resp.into_inner().identity_key_alice)
     }
 
@@ -255,29 +254,36 @@ impl X3DHClient {
                 .fetch_bytes(Some(1))
                 .await?
                 .first()
-                .ok_or(Error::Failed("No initial message found.".to_string()))?
+                .ok_or(ErrorKind::InitialMessageNotFound)?
                 .as_slice(),
         )
-        .map_err(|_| Error::Failed("Invalid initial message.".to_string()))?;
+        .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
+        // X3DH authenticates Alice through DH1 with her identity key, so it must be the one
+        // Bob expects; otherwise anyone could start a session as Alice.
+        if initial_message.identity_key_alice != identity_key_alice {
+            return Err(ErrorKind::UnexpectedIdentity.into());
+        }
 
         let mut key_meterial = new_key_meterial();
         let private_prekey = self
             .prekeys
             .get(&initial_message.prekey_bob)
-            .ok_or(Error::Failed("Prekey not found.".to_string()))?;
-        key_meterial.extend(private_prekey.diffie_hellman(&initial_message.identity_key_alice)?);
-        key_meterial.extend(
-            self.private_identity_key
-                .diffie_hellman(&initial_message.ephemeral_public_key_alice)
-                .map_err(|e| Error::Failed(e.to_string()))?,
+            .ok_or(ErrorKind::PrekeyNotFound)?;
+        key_meterial.extend_from_slice(&*private_prekey.diffie_hellman(identity_key_alice)?);
+        key_meterial.extend_from_slice(
+            &*self
+                .private_identity_key
+                .diffie_hellman(&initial_message.ephemeral_public_key_alice)?,
         );
-        key_meterial
-            .extend(private_prekey.diffie_hellman(&initial_message.ephemeral_public_key_alice)?);
+        key_meterial.extend_from_slice(
+            &*private_prekey.diffie_hellman(&initial_message.ephemeral_public_key_alice)?,
+        );
         if let Some(one_time_public_prekey) = initial_message.one_time_prekey_bob {
-            key_meterial.extend(
-                self.one_time_prekeys
+            key_meterial.extend_from_slice(
+                &*self
+                    .one_time_prekeys
                     .remove(&one_time_public_prekey)
-                    .ok_or(Error::Failed("One-time prekey not found.".to_string()))?
+                    .ok_or(ErrorKind::OneTimePrekeyNotFound)?
                     .diffie_hellman(&initial_message.ephemeral_public_key_alice)?,
             );
         }
@@ -320,18 +326,21 @@ pub struct RpcX3DHServer {}
 impl RpcX3DHServer {
     /// Run a RpcX3DHServer listening on addr.
     pub async fn run(addr: impl AsRef<str>, identity: Option<Identity>) -> Result<()> {
-        let addr = addr.as_ref().parse().unwrap();
+        let addr = addr
+            .as_ref()
+            .parse()
+            .map_err(|e| Error::new(ErrorKind::InvalidAddress, e))?;
         let mut server = Server::builder();
         if let Some(identity) = identity {
             server = server
                 .tls_config(ServerTlsConfig::new().identity(identity))
-                .unwrap()
+                .map_err(|e| Error::new(ErrorKind::Server, e))?;
         }
         server
             .add_service(X3dhServiceServer::new(RpcX3DHInner::default()))
             .serve(addr)
             .await
-            .map_err(|_| TransportError::Server)?;
+            .map_err(|e| Error::new(ErrorKind::Server, e))?;
         Ok(())
     }
 }

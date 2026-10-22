@@ -1,12 +1,13 @@
 //! The gRPC server combines the Message and X3DH.
 
-use primitives::{
-    error::{Result, TransportError},
-    transport::RpcMessageServer,
-};
+use primitives::transport::RpcMessageServer;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
 
-use crate::{RpcX3DHInner, x3dh_rpc::x3dh_service_server::X3dhServiceServer};
+use crate::{
+    RpcX3DHInner,
+    error::{Error, ErrorKind, Result},
+    x3dh_rpc::x3dh_service_server::X3dhServiceServer,
+};
 
 /// The gRPC server combines the Message and X3DH.
 pub struct RpcServer {}
@@ -17,12 +18,12 @@ impl RpcServer {
         let addr = addr
             .as_ref()
             .parse()
-            .unwrap_or_else(|_| panic!("Invalid SocketAddr"));
+            .map_err(|e| Error::new(ErrorKind::InvalidAddress, e))?;
         let mut server = Server::builder();
         if let Some(identity) = identity {
             server = server
                 .tls_config(ServerTlsConfig::new().identity(identity))
-                .unwrap()
+                .map_err(|e| Error::new(ErrorKind::Server, e))?;
         }
         server
             .add_routes(
@@ -31,7 +32,7 @@ impl RpcServer {
             )
             .serve(addr)
             .await
-            .map_err(|_| TransportError::Server)?;
+            .map_err(|e| Error::new(ErrorKind::Server, e))?;
         Ok(())
     }
 }

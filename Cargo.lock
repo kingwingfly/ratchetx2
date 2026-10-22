@@ -4382,6 +4382,7 @@ dependencies = [
  "prost 0.14.4",
  "ratchetx2 0.4.0",
  "sha2 0.11.1",
+ "thiserror 2.0.21",
  "tokio",
  "tonic 0.14.6",
  "tonic-prost",

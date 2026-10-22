@@ -4,9 +4,9 @@
 use core::fmt;
 
 use curve25519_dalek::MontgomeryPoint;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::Ratchetx2;
+use crate::Ratchet;
 use crate::error::CryptoError;
 
 /// The first shared RootKey.
@@ -37,10 +37,13 @@ impl DhPrivateKey {
     ///
     /// Fails if the public key is not 32 bytes or the shared secret is all zeros
     /// (a low-order public key).
-    pub fn diffie_hellman(&self, peer_public_key: &[u8]) -> Result<[u8; 32], CryptoError> {
+    pub fn diffie_hellman(
+        &self,
+        peer_public_key: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, CryptoError> {
         let peer_public_key = MontgomeryPoint(peer_public_key.try_into().map_err(|_| CryptoError)?);
-        let shared_secret = peer_public_key.mul_clamped(self.0).to_bytes();
-        if shared_secret == [0; 32] {
+        let shared_secret = Zeroizing::new(peer_public_key.mul_clamped(self.0).to_bytes());
+        if *shared_secret == [0; 32] {
             return Err(CryptoError);
         }
         Ok(shared_secret)
@@ -72,8 +75,10 @@ pub struct SharedKeys {
 
 impl SharedKeys {
     /// New a double-ratchet who sends message first.
-    pub fn alice(&self, public_key: &[u8]) -> Ratchetx2 {
-        Ratchetx2::alice(
+    ///
+    /// Fails if `public_key` (Bob's) is not a valid X25519 public key.
+    pub fn alice(&self, public_key: &[u8]) -> Result<Ratchet, CryptoError> {
+        Ratchet::alice(
             self.secret_key,
             public_key,
             self.header_key_alice,
@@ -82,8 +87,8 @@ impl SharedKeys {
     }
 
     /// New a double-ratchet who waits for the message first.
-    pub fn bob(&self, private_key: DhPrivateKey) -> Ratchetx2 {
-        Ratchetx2::bob(
+    pub fn bob(&self, private_key: DhPrivateKey) -> Ratchet {
+        Ratchet::bob(
             self.secret_key,
             private_key,
             self.header_key_alice,

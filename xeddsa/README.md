@@ -15,7 +15,7 @@ assert!(public_key.verify("goodbye world", &signature).is_err());
 let alice = XEdDSAPrivateKey::generate();
 let bob = XEdDSAPrivateKey::generate();
 assert_eq!(
-    alice.diffie_hellman(bob.compute_public_key().as_ref()).unwrap(),
-    bob.diffie_hellman(alice.compute_public_key().as_ref()).unwrap()
+    *alice.diffie_hellman(bob.compute_public_key().as_ref()).unwrap(),
+    *bob.diffie_hellman(alice.compute_public_key().as_ref()).unwrap()
 );
 ```
