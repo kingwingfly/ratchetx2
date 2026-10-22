@@ -10,6 +10,7 @@ use core::fmt;
 use curve25519_dalek::{EdwardsPoint, MontgomeryPoint, constants::X25519_BASEPOINT};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha512};
+use subtle::{Choice, ConditionallyNegatable};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -47,7 +48,7 @@ type Result<T> = core::result::Result<T, Error>;
 /// XEdDSA private key.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct XEdDSAPrivateKey {
-    montgomery_private_key: Scalar,
+    private_key: Scalar,
 }
 
 impl fmt::Debug for XEdDSAPrivateKey {
@@ -58,10 +59,8 @@ impl fmt::Debug for XEdDSAPrivateKey {
 
 impl From<Scalar> for XEdDSAPrivateKey {
     /// New a XEdDSAPrivateKey with give Scalar (private key).
-    fn from(montgomery_private_key: Scalar) -> Self {
-        XEdDSAPrivateKey {
-            montgomery_private_key,
-        }
+    fn from(private_key: Scalar) -> Self {
+        XEdDSAPrivateKey { private_key }
     }
 }
 
@@ -71,18 +70,18 @@ impl XEdDSAPrivateKey {
         let mut bytes = Zeroizing::new([0; _]);
         getrandom::fill(bytes.as_mut_slice()).expect("the system random number generator failed");
         XEdDSAPrivateKey {
-            montgomery_private_key: Scalar::from_bytes_mod_order(*bytes),
+            private_key: Scalar::from_bytes_mod_order(*bytes),
         }
     }
 
     /// The XEdDSA public key for the key pair.
     pub fn compute_public_key(&self) -> XEdDSAPublicKey {
         XEdDSAPublicKey {
-            montgomery_public_key: MontgomeryPoint::mul_base(&self.montgomery_private_key),
+            montgomery_public_key: MontgomeryPoint::mul_base(&self.private_key),
         }
     }
 
-    /// DH with the X25519(Montgomery) private key for the key pair.
+    /// DH, as X25519, with the key pair's private key.
     ///
     /// The key pair is long-term, so this may be called any number of times.
     pub fn diffie_hellman(
@@ -103,32 +102,30 @@ impl XEdDSAPrivateKey {
             return Err(Error::InvalidPublicKey);
         }
         Ok(Zeroizing::new(
-            (self.montgomery_private_key * peer_public_key).to_bytes(),
+            (self.private_key * peer_public_key).to_bytes(),
         ))
     }
 
-    /// Sign with the Ed25519(Edwards) private key for the key pair.
+    /// Sign, as Ed25519, with the key pair's private key.
     pub fn sign(&self, message: impl AsRef<[u8]>) -> [u8; SIGNATURE_LENGTH] {
         let message = message.as_ref();
-        let mut edwards_private_key = Zeroizing::new(self.montgomery_private_key);
-        let edwards_public_key = EdwardsPoint::mul_base(&edwards_private_key);
-        let mut edwards_public_key_y = edwards_public_key.compress().to_bytes();
-        // The sign bit is the top bit of the last byte.
-        if edwards_public_key_y[ed25519_dalek::PUBLIC_KEY_LENGTH - 1] >= 0x80 {
-            *edwards_private_key = -self.montgomery_private_key;
-            let edwards_public_key = EdwardsPoint::mul_base(&edwards_private_key);
-            edwards_public_key_y = edwards_public_key.compress().to_bytes();
-        }
+        let mut private_key = Zeroizing::new(self.private_key);
+        let mut edwards_public_key_y = EdwardsPoint::mul_base(&private_key).compress().to_bytes();
+        // The sign bit is the top bit of the last byte. The verifier takes the Edwards point
+        // with sign 0, so if ours is 1, negate the key: -A = (-x, y) has the same y and sign 0.
+        // Branch-free, as the sign bit is secret.
+        let sign = Choice::from(edwards_public_key_y[ed25519_dalek::PUBLIC_KEY_LENGTH - 1] >> 7);
+        private_key.conditional_negate(sign);
+        edwards_public_key_y[ed25519_dalek::PUBLIC_KEY_LENGTH - 1] &= 0x7F;
         // Z: 64 random bytes, per the XEdDSA spec.
         let mut random = Zeroizing::new([0; 64]);
         getrandom::fill(random.as_mut_slice()).expect("the system random number generator failed");
         // r = hash1(a || M || Z)
-        let private_key = edwards_private_key.as_bytes();
         let mut to_digest = Zeroizing::new(Vec::with_capacity(
-            HASH1_PREFIX.len() + private_key.len() + message.len() + random.len(),
+            HASH1_PREFIX.len() + private_key.as_bytes().len() + message.len() + random.len(),
         ));
         to_digest.extend(HASH1_PREFIX);
-        to_digest.extend(private_key);
+        to_digest.extend(private_key.as_bytes());
         to_digest.extend(message);
         to_digest.extend(random.iter());
         let digest: Zeroizing<[u8; _]> =
@@ -139,7 +136,7 @@ impl XEdDSAPrivateKey {
         to_digest.extend(edwards_public_key_y);
         to_digest.extend(message);
         let h = Scalar::from_bytes_mod_order_wide(&Sha512::digest(&to_digest).into());
-        let s = *r + h * *edwards_private_key;
+        let s = *r + h * *private_key;
         Signature::from_components(r_.to_bytes(), s.to_bytes()).to_bytes()
     }
 }
@@ -226,6 +223,18 @@ mod test {
         let expected = "67d234661315d06ead7a5cf135ffaaba27ac631d757d724f25900c5d1a196344";
         let hex: String = shared.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(hex, expected);
+    }
+
+    #[test]
+    fn signs_whatever_the_edwards_sign_bit() {
+        // k and -k share a public key, and their Edwards public keys have opposite sign bits.
+        let key = Scalar::from_bytes_mod_order([7; 32]);
+        let public_key = XEdDSAPrivateKey::from(key).compute_public_key();
+        for key in [key, -key] {
+            let key = XEdDSAPrivateKey::from(key);
+            assert_eq!(key.compute_public_key().to_bytes(), public_key.to_bytes());
+            public_key.verify("hello", &key.sign("hello")).unwrap();
+        }
     }
 
     #[test]
