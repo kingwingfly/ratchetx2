@@ -25,7 +25,8 @@ The wire protocol changed, so 0.3 clients and servers cannot talk to 0.2 ones.
 - server: publishing keys and taking initial messages need a signature by the identity key with an increasing timestamp; initial messages are deleted once taken; one-time prekeys, inboxes, message size and fetch size (in messages and bytes) are limited
 - client: "list initial messages" takes them from the server and keeps them until accepted; "refresh keys" is now "renew identity"; errors show their causes
 - fix: X3DH and the DH ratchet no longer duplicate private keys with `transmute_copy`
-- fix: header encryption reused the AES-GCM nonce under each chain's header key; every encryption now uses a fresh random nonce
+- fix: header encryption reused the AES-GCM nonce under each chain's header key; every encryption now draws a random 256-bit nonce and derives its own AES-GCM key and nonce from it, as the Double Ratchet spec asks for at least 128 random bits
+- fix: a message's content was not bound to its encrypted header, so someone with a header key could alter a header and the content still decrypted, e.g. lower the previous chain length so that the receiver dropped the keys of delayed messages; the content now also authenticates the encrypted header, as the spec requires
 - fix: xeddsa `agree_ephemeral` is renamed `diffie_hellman` and rejects peer keys outside the prime-order subgroup, which let a peer learn the identity key modulo 8
 - fix: X3DH deletes Alice's ephemeral private key and zeroizes the DH outputs as soon as the shared keys are derived, instead of keeping them across network calls
 - fix: sessions started with all-zero header and chain keys; chains are now unset until the first DH step, and Bob can only send after receiving Alice's first message

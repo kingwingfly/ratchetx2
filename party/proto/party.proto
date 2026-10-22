@@ -5,9 +5,9 @@ package party.v1;
 
 // A message as sent from one party to the other.
 message EncryptedMessage {
-  // The encrypted `Header`.
+  // The encrypted `Header`, authenticated with the session's associated data.
   bytes header = 1;
-  // The encrypted content.
+  // The encrypted content, authenticated with the session's associated data and `header`.
   bytes content = 2;
 }
 

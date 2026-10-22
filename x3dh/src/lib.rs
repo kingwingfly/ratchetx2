@@ -226,12 +226,12 @@ pub fn bob(
         .iter_mut()
         .find(|generation| generation.signed_prekey == message.signed_prekey)
         .ok_or(ErrorKind::PrekeyNotFound)?;
-    let signed_prekey = &generation.signed_secret;
 
     let mut key_material = KeyMaterial::new();
-    key_material.extend(diffie_hellman(signed_prekey, alice_identity_key)?.as_bytes());
+    key_material.extend(diffie_hellman(&generation.signed_secret, alice_identity_key)?.as_bytes());
     key_material.extend(&*identity.diffie_hellman(&message.ephemeral_key)?);
-    key_material.extend(diffie_hellman(signed_prekey, &message.ephemeral_key)?.as_bytes());
+    key_material
+        .extend(diffie_hellman(&generation.signed_secret, &message.ephemeral_key)?.as_bytes());
     if let Some(one_time_prekey) = &message.one_time_prekey {
         let secret = generation
             .one_time
@@ -244,7 +244,7 @@ pub fn bob(
         alice_identity_key,
         &identity.compute_public_key().to_bytes(),
     );
-    Ok((agreement, signed_prekey.clone()))
+    Ok((agreement, generation.signed_secret.clone()))
 }
 
 /// X3DH key material: the X25519 domain separator, 0xFF bytes as many as in a key, then the DH
