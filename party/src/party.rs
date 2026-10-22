@@ -118,7 +118,7 @@ impl Party {
             return self.receive_current_chain(&header?, message);
         }
         if let Some(header) = self.open_header(self.ratchet.next_header_key_receiver(), message) {
-            return self.receive_new_chain(&header?, message);
+            return self.receive_next_chain(&header?, message);
         }
         Err(ErrorKind::Undecryptable.into())
     }
@@ -181,8 +181,9 @@ impl Party {
         Ok(content)
     }
 
-    /// The first message of the peer's next chain, which steps the DH-root ratchet.
-    fn receive_new_chain(
+    /// A message of the peer's next chain, the first received from it, which steps the DH-root
+    /// ratchet.
+    fn receive_next_chain(
         &mut self,
         header: &Header,
         message: &EncryptedMessage,
