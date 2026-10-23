@@ -8,8 +8,10 @@
 use bytes::Bytes;
 use x3dh::{PrekeyBundle, PublicKey, PublishedPrekeys};
 
-use crate::error::{Error, Result};
-use crate::fixed;
+use crate::{
+    error::{Error, Result},
+    fixed,
+};
 
 #[allow(missing_docs)]
 mod generated {

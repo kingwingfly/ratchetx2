@@ -1,19 +1,20 @@
 //! gRPC (tonic) clients, and with the `server` feature, services for the servers.
 
-use tonic::transport::ClientTlsConfig;
-use tonic::{Code, Response, Status};
+use tonic::{Code, Response, Status, transport::ClientTlsConfig};
 
 pub use tonic::transport::{Certificate, Channel, Identity, Uri};
 
-use crate::error::{Error, ErrorKind, Result};
-use crate::handshake::{
-    self, FetchBundleRequest, FetchBundleResponse, IntroduceRequest, IntroduceResponse,
-    PublishRequest, PublishResponse, TakeIntroductionsRequest, TakeIntroductionsResponse,
-    handshake_service_client::HandshakeServiceClient,
-};
-use crate::mailbox::{
-    self, FetchRequest, FetchResponse, PushRequest, PushResponse,
-    mailbox_service_client::MailboxServiceClient,
+use crate::{
+    error::{Error, ErrorKind, Result},
+    handshake::{
+        self, FetchBundleRequest, FetchBundleResponse, IntroduceRequest, IntroduceResponse,
+        PublishRequest, PublishResponse, TakeIntroductionsRequest, TakeIntroductionsResponse,
+        handshake_service_client::HandshakeServiceClient,
+    },
+    mailbox::{
+        self, FetchRequest, FetchResponse, PushRequest, PushResponse,
+        mailbox_service_client::MailboxServiceClient,
+    },
 };
 
 /// Connect to a server. With an `https` address, its certificate is checked against the native
