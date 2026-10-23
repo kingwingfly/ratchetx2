@@ -27,8 +27,7 @@ mod server {
     use storage::LocalMailboxStore;
 
     use super::*;
-    use crate::error::ErrorKind;
-    use crate::fixed;
+    use crate::{error::ErrorKind, fixed};
 
     /// Limits of a [`MailboxServer`].
     #[derive(Debug, Clone, Copy)]

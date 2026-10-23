@@ -1,5 +1,4 @@
-use ratatui::prelude::*;
-use ratatui::widgets::Widget;
+use ratatui::{prelude::*, widgets::Widget};
 
 pub struct Connecting {
     pub server_addr: String,

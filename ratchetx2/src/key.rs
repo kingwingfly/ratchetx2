@@ -5,8 +5,10 @@ use core::fmt;
 
 use curve25519_dalek::{MontgomeryPoint, constants::X25519_BASEPOINT};
 use hkdf::Hkdf;
-use sha2::Sha256;
-use sha2::digest::{OutputSizeUser, typenum::Unsigned};
+use sha2::{
+    Sha256,
+    digest::{OutputSizeUser, typenum::Unsigned},
+};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::CryptoError;

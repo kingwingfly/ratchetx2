@@ -7,9 +7,8 @@ use ratatui::{
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol};
 
-use crate::message::Message;
-
 use super::bubble::Bubble;
+use crate::message::Message;
 
 pub struct ConversationState {
     lru_image: LruCache<Vec<u8>, Option<StatefulProtocol>>,

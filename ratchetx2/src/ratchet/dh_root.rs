@@ -1,8 +1,11 @@
-use crate::error::CryptoError;
-use crate::key::{ChainKey, DH_KEY_LENGTH, DhPrivateKey, HeaderKey, RootKey, SecretKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
+
+use crate::{
+    error::CryptoError,
+    key::{ChainKey, DH_KEY_LENGTH, DhPrivateKey, HeaderKey, RootKey, SecretKey},
+};
 
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
 pub struct DhRootRatchet {

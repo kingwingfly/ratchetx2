@@ -2,10 +2,6 @@
 
 mod skipped;
 
-use crate::error::{Error, ErrorKind, Result};
-use crate::proto::{EncryptedMessage, Header};
-use skipped::{SkippedChain, SkippedKeys};
-
 use std::fmt;
 
 use aes_gcm::{
@@ -22,6 +18,12 @@ use ratchetx2::{
     key::{HeaderKey, KEY_LENGTH, MessageKey},
 };
 use sha2::Sha256;
+
+use self::skipped::{SkippedChain, SkippedKeys};
+use crate::{
+    error::{Error, ErrorKind, Result},
+    proto::{EncryptedMessage, Header},
+};
 
 /// Maximum number of message keys that receiving one message may skip, and that are kept for
 /// messages arriving late; beyond it, the oldest are dropped.

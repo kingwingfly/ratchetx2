@@ -1,10 +1,11 @@
-use std::fs;
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use clap::Parser;
-use protocol::grpc::{Identity, TcpIncoming, serve};
-use protocol::handshake::HandshakeServer;
-use protocol::mailbox::MailboxServer;
+use protocol::{
+    grpc::{Identity, TcpIncoming, serve},
+    handshake::HandshakeServer,
+    mailbox::MailboxServer,
+};
 use storage::MemoryStore;
 use tracing::{error, info};
 

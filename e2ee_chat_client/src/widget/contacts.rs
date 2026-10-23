@@ -1,8 +1,9 @@
-use crate::widget::app::PublicKey;
 use ratatui::{
     prelude::*,
     widgets::{Scrollbar, ScrollbarState},
 };
+
+use crate::widget::app::PublicKey;
 
 pub struct Contacts<'a> {
     pub contacts: &'a [(String, PublicKey)],

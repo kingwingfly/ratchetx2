@@ -7,15 +7,14 @@
 
 use core::fmt;
 
+/// Re-export curve25519_dalek.
+pub use curve25519_dalek::Scalar;
 use curve25519_dalek::{EdwardsPoint, MontgomeryPoint, constants::X25519_BASEPOINT};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha512};
 use subtle::{Choice, ConditionallyNegatable};
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
-
-/// Re-export curve25519_dalek.
-pub use curve25519_dalek::Scalar;
 
 /// Length of a public key, a Montgomery u-coordinate as curve25519-dalek encodes it. A DH
 /// output is as long.

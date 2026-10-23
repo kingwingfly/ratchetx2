@@ -1,8 +1,7 @@
 //! gRPC (tonic) clients, and with the `server` feature, services for the servers.
 
-use tonic::{Code, Response, Status, transport::ClientTlsConfig};
-
 pub use tonic::transport::{Certificate, Channel, Identity, Uri};
+use tonic::{Code, Response, Status, transport::ClientTlsConfig};
 
 use crate::{
     error::{Error, ErrorKind, Result},
@@ -112,13 +111,16 @@ pub use tonic::transport::server::TcpIncoming;
 #[cfg(feature = "server")]
 mod server {
     use storage::{HandshakeStore, MailboxStore};
-    use tonic::transport::server::TcpIncoming;
-    use tonic::transport::{Server, ServerTlsConfig};
-    use tonic::{Request, Response, Status};
+    use tonic::{
+        Request, Response, Status,
+        transport::{Server, ServerTlsConfig, server::TcpIncoming},
+    };
 
     use super::*;
-    use crate::handshake::{HandshakeServer, LocalHandshake as _, handshake_service_server};
-    use crate::mailbox::{LocalMailbox as _, MailboxServer, mailbox_service_server};
+    use crate::{
+        handshake::{HandshakeServer, LocalHandshake as _, handshake_service_server},
+        mailbox::{LocalMailbox as _, MailboxServer, mailbox_service_server},
+    };
 
     /// Serve the handshake and mailbox servers over gRPC on `incoming`, e.g.
     /// `TcpIncoming::bind(address)?`, with TLS if `identity` is given.

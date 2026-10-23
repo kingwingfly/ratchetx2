@@ -9,19 +9,20 @@ pub mod error;
 
 use bon::Builder;
 use bytes::Bytes;
+pub use error::{Error, ErrorKind, Result};
 use party::{EncryptedMessage, Party};
-use protocol::handshake::{
-    FetchBundleRequest, InitialMessage, IntroduceRequest, LocalHandshake, PublishRequest,
-    TakeIntroductionsRequest,
+pub use protocol;
+use protocol::{
+    handshake::{
+        FetchBundleRequest, InitialMessage, IntroduceRequest, LocalHandshake, PublishRequest,
+        TakeIntroductionsRequest,
+    },
+    mailbox::{FetchRequest, LocalMailbox, PushRequest},
 };
-use protocol::mailbox::{FetchRequest, LocalMailbox, PushRequest};
 use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
+pub use x3dh::PublicKey;
 use x3dh::{LocalPrekeys, PrekeyBundle};
 use xeddsa::XEdDSAPrivateKey;
-
-pub use error::{Error, ErrorKind, Result};
-pub use protocol;
-pub use x3dh::PublicKey;
 
 /// An initial message from a peer who wants to start a session; accept it with
 /// [`Client::accept`].
@@ -224,11 +225,13 @@ impl<M: LocalMailbox> Session<M> {
 
 #[cfg(test)]
 mod test {
-    use protocol::handshake::{
-        FetchBundleResponse, HandshakeServer, IntroduceResponse, PublishResponse,
-        TakeIntroductionsResponse,
+    use protocol::{
+        handshake::{
+            FetchBundleResponse, HandshakeServer, IntroduceResponse, PublishResponse,
+            TakeIntroductionsResponse,
+        },
+        mailbox::{FetchResponse, MailboxServer, PushResponse},
     };
-    use protocol::mailbox::{FetchResponse, MailboxServer, PushResponse};
     use storage::MemoryStore;
 
     use super::*;

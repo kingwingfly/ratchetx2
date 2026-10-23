@@ -1,3 +1,5 @@
+use std::{io::Stderr, sync::Arc, time::Duration};
+
 use anyhow::Result;
 use base64::prelude::*;
 use crossterm::{
@@ -11,10 +13,6 @@ use crossterm::{
 use ratatui::{Terminal, prelude::*};
 use session::protocol::grpc::{Certificate, GrpcHandshake, GrpcMailbox, Uri};
 use tui_textarea::TextArea;
-
-use std::io::Stderr;
-use std::sync::Arc;
-use std::time::Duration;
 
 use crate::{
     message::{Message, MessageContent, MessageState},

@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
 use base64::prelude::*;
@@ -9,16 +8,13 @@ use ratatui::{
     widgets::{Block, List, ListState, Padding},
 };
 use ratatui_image::picker::Picker;
-use session::protocol::grpc::{Certificate, Channel, GrpcHandshake, GrpcMailbox, Uri, connect};
-use session::{Client, Introduction, Session};
+pub use session::PublicKey;
+use session::{
+    Client, Introduction, Session,
+    protocol::grpc::{Certificate, Channel, GrpcHandshake, GrpcMailbox, Uri, connect},
+};
 use tokio::sync::Mutex as AsyncMutex;
 use tui_textarea::TextArea;
-
-use crate::{
-    message::Message,
-    navi::{Navigation, Navigator},
-    screen::Screen,
-};
 
 use super::{
     contacts::Contacts,
@@ -31,8 +27,11 @@ use super::{
     quit::Quit,
     setting::{Setting, SettingState},
 };
-
-pub use session::PublicKey;
+use crate::{
+    message::Message,
+    navi::{Navigation, Navigator},
+    screen::Screen,
+};
 /// A session, locked on its own so using one never waits for the others.
 pub type SharedSession = Arc<AsyncMutex<Session<GrpcMailbox>>>;
 

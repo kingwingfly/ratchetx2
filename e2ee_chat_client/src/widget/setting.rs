@@ -3,8 +3,7 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Cell, Padding, Row, Table},
 };
-use session::PublicKey;
-use session::protocol::grpc::Uri;
+use session::{PublicKey, protocol::grpc::Uri};
 
 pub struct Setting {}
 

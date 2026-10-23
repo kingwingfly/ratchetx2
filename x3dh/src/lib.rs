@@ -10,16 +10,17 @@ pub mod error;
 use core::fmt;
 use std::collections::{HashMap, VecDeque};
 
-use hkdf::Hkdf;
-use sha2::Sha256;
-use sha2::digest::{OutputSizeUser, typenum::Unsigned};
-use x25519_dalek::SharedSecret;
-use xeddsa::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, XEdDSAPrivateKey, XEdDSAPublicKey};
-use zeroize::Zeroizing;
-
 pub use error::{Error, ErrorKind, Result};
+use hkdf::Hkdf;
+use sha2::{
+    Sha256,
+    digest::{OutputSizeUser, typenum::Unsigned},
+};
+use x25519_dalek::SharedSecret;
 /// Re-export x25519_dalek's private key, which [`LocalPrekeys::accept`] returns.
 pub use x25519_dalek::StaticSecret;
+use xeddsa::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, XEdDSAPrivateKey, XEdDSAPublicKey};
+use zeroize::Zeroizing;
 
 /// An X25519 (or XEdDSA identity) public key.
 pub type PublicKey = [u8; PUBLIC_KEY_LENGTH];

@@ -5,11 +5,11 @@ mod message;
 
 use core::fmt;
 
-use dh_root::DhRootRatchet;
-use message::MessageRatchet;
-
-use crate::error::CryptoError;
-use crate::key::{DH_KEY_LENGTH, DhPrivateKey, HeaderKey, MessageKey, SharedKeys};
+use self::{dh_root::DhRootRatchet, message::MessageRatchet};
+use crate::{
+    error::CryptoError,
+    key::{DH_KEY_LENGTH, DhPrivateKey, HeaderKey, MessageKey, SharedKeys},
+};
 
 /// Double ratchet. See the example in [`document`](crate::document).
 #[derive(Clone)]
