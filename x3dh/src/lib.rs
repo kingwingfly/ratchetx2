@@ -18,7 +18,7 @@ use xeddsa::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, XEdDSAPrivateKey, XEdDSAPublic
 use zeroize::Zeroizing;
 
 pub use error::{Error, ErrorKind, Result};
-/// Re-export x25519_dalek's private key, which [`bob`] returns.
+/// Re-export x25519_dalek's private key, which [`LocalPrekeys::accept`] returns.
 pub use x25519_dalek::StaticSecret;
 
 /// An X25519 (or XEdDSA identity) public key.
@@ -174,77 +174,81 @@ impl LocalPrekeys {
             one_time_prekeys,
         }
     }
+
+    /// Bob's side: accept Alice's initial message, which must come from `alice_identity_key`.
+    ///
+    /// Consumes the one-time prekey it uses, which must be of the same generation as its signed
+    /// prekey. Returns the agreement and the private key of the signed prekey it uses, which is
+    /// Bob's first ratchet key pair.
+    pub fn accept(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        alice_identity_key: &PublicKey,
+        message: &InitialMessage,
+    ) -> Result<(Agreement, StaticSecret)> {
+        if message.identity_key != *alice_identity_key {
+            return Err(ErrorKind::UnexpectedIdentity.into());
+        }
+        let generation = self
+            .generations
+            .iter_mut()
+            .find(|generation| generation.signed_prekey == message.signed_prekey)
+            .ok_or(ErrorKind::PrekeyNotFound)?;
+
+        let mut key_material = KeyMaterial::new();
+        key_material
+            .extend(diffie_hellman(&generation.signed_secret, alice_identity_key)?.as_bytes());
+        key_material.extend(&*identity.diffie_hellman(&message.ephemeral_key)?);
+        key_material
+            .extend(diffie_hellman(&generation.signed_secret, &message.ephemeral_key)?.as_bytes());
+        if let Some(one_time_prekey) = &message.one_time_prekey {
+            let secret = generation
+                .one_time
+                .remove(one_time_prekey)
+                .ok_or(ErrorKind::OneTimePrekeyNotFound)?;
+            key_material.extend(diffie_hellman(&secret, &message.ephemeral_key)?.as_bytes());
+        }
+
+        let agreement = key_material.agree(
+            alice_identity_key,
+            &identity.compute_public_key().to_bytes(),
+        );
+        Ok((agreement, generation.signed_secret.clone()))
+    }
 }
 
-/// Alice's side: start a session with Bob from his identity key and prekey bundle.
-///
-/// Returns the initial message to send to Bob, and the agreement. Alice's first ratchet uses
-/// `bundle.signed_prekey` as Bob's public key.
-pub fn alice(
-    identity: &XEdDSAPrivateKey,
-    bob_identity_key: &PublicKey,
-    bundle: &PrekeyBundle,
-) -> Result<(InitialMessage, Agreement)> {
-    XEdDSAPublicKey::new(bob_identity_key)?
-        .verify(bundle.signed_prekey, &bundle.signed_prekey_signature)?;
+impl PrekeyBundle {
+    /// Alice's side: start a session with Bob, whose identity key is `bob_identity_key`, from
+    /// his bundle.
+    ///
+    /// Returns the initial message to send to Bob, and the agreement. Alice's first ratchet uses
+    /// `self.signed_prekey` as Bob's public key.
+    pub fn initiate(
+        &self,
+        identity: &XEdDSAPrivateKey,
+        bob_identity_key: &PublicKey,
+    ) -> Result<(InitialMessage, Agreement)> {
+        XEdDSAPublicKey::new(bob_identity_key)?
+            .verify(self.signed_prekey, &self.signed_prekey_signature)?;
 
-    let (ephemeral_key, ephemeral_secret) = generate_key_pair();
-    let mut key_material = KeyMaterial::new();
-    key_material.extend(&*identity.diffie_hellman(&bundle.signed_prekey)?);
-    key_material.extend(diffie_hellman(&ephemeral_secret, bob_identity_key)?.as_bytes());
-    key_material.extend(diffie_hellman(&ephemeral_secret, &bundle.signed_prekey)?.as_bytes());
-    if let Some(one_time_prekey) = &bundle.one_time_prekey {
-        key_material.extend(diffie_hellman(&ephemeral_secret, one_time_prekey)?.as_bytes());
+        let (ephemeral_key, ephemeral_secret) = generate_key_pair();
+        let mut key_material = KeyMaterial::new();
+        key_material.extend(&*identity.diffie_hellman(&self.signed_prekey)?);
+        key_material.extend(diffie_hellman(&ephemeral_secret, bob_identity_key)?.as_bytes());
+        key_material.extend(diffie_hellman(&ephemeral_secret, &self.signed_prekey)?.as_bytes());
+        if let Some(one_time_prekey) = &self.one_time_prekey {
+            key_material.extend(diffie_hellman(&ephemeral_secret, one_time_prekey)?.as_bytes());
+        }
+
+        let identity_key = identity.compute_public_key().to_bytes();
+        let message = InitialMessage {
+            identity_key,
+            ephemeral_key,
+            signed_prekey: self.signed_prekey,
+            one_time_prekey: self.one_time_prekey,
+        };
+        Ok((message, key_material.agree(&identity_key, bob_identity_key)))
     }
-
-    let identity_key = identity.compute_public_key().to_bytes();
-    let message = InitialMessage {
-        identity_key,
-        ephemeral_key,
-        signed_prekey: bundle.signed_prekey,
-        one_time_prekey: bundle.one_time_prekey,
-    };
-    Ok((message, key_material.agree(&identity_key, bob_identity_key)))
-}
-
-/// Bob's side: accept Alice's initial message, which must come from `alice_identity_key`.
-///
-/// Consumes the one-time prekey it uses, which must be of the same generation as its signed
-/// prekey. Returns the agreement and the private key of the signed prekey it uses, which is
-/// Bob's first ratchet key pair.
-pub fn bob(
-    identity: &XEdDSAPrivateKey,
-    prekeys: &mut LocalPrekeys,
-    alice_identity_key: &PublicKey,
-    message: &InitialMessage,
-) -> Result<(Agreement, StaticSecret)> {
-    if message.identity_key != *alice_identity_key {
-        return Err(ErrorKind::UnexpectedIdentity.into());
-    }
-    let generation = prekeys
-        .generations
-        .iter_mut()
-        .find(|generation| generation.signed_prekey == message.signed_prekey)
-        .ok_or(ErrorKind::PrekeyNotFound)?;
-
-    let mut key_material = KeyMaterial::new();
-    key_material.extend(diffie_hellman(&generation.signed_secret, alice_identity_key)?.as_bytes());
-    key_material.extend(&*identity.diffie_hellman(&message.ephemeral_key)?);
-    key_material
-        .extend(diffie_hellman(&generation.signed_secret, &message.ephemeral_key)?.as_bytes());
-    if let Some(one_time_prekey) = &message.one_time_prekey {
-        let secret = generation
-            .one_time
-            .remove(one_time_prekey)
-            .ok_or(ErrorKind::OneTimePrekeyNotFound)?;
-        key_material.extend(diffie_hellman(&secret, &message.ephemeral_key)?.as_bytes());
-    }
-
-    let agreement = key_material.agree(
-        alice_identity_key,
-        &identity.compute_public_key().to_bytes(),
-    );
-    Ok((agreement, generation.signed_secret.clone()))
 }
 
 /// X3DH key material: the X25519 domain separator, 0xFF bytes as many as in a key, then the DH
@@ -325,10 +329,10 @@ mod test {
             let alice_key = public_key(&alice);
             let bob_key = public_key(&bob);
 
-            let (message, alice_agreement) = super::alice(&alice, &bob_key, &bundle).unwrap();
+            let (message, alice_agreement) = bundle.initiate(&alice, &bob_key).unwrap();
             assert_eq!(message.one_time_prekey, bundle.one_time_prekey);
             let (bob_agreement, signed_prekey) =
-                super::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
+                prekeys.accept(&bob, &alice_key, &message).unwrap();
             assert_eq!(*alice_agreement.secret_key, *bob_agreement.secret_key);
             assert_eq!(
                 alice_agreement.associated_data,
@@ -355,7 +359,7 @@ mod test {
 
         // A bundle whose signature is not by the identity Alice asked for.
         let other = XEdDSAPrivateKey::generate();
-        let error = super::alice(&alice, &public_key(&other), &bundle).unwrap_err();
+        let error = bundle.initiate(&alice, &public_key(&other)).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidSignature);
         // A low-order signed prekey, signed by Bob.
         let low_order = PrekeyBundle {
@@ -363,27 +367,24 @@ mod test {
             signed_prekey_signature: bob.sign([0; 32]),
             one_time_prekey: None,
         };
-        let error = super::alice(&alice, &bob_key, &low_order).unwrap_err();
+        let error = low_order.initiate(&alice, &bob_key).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidPublicKey);
 
-        let (message, _) = super::alice(&alice, &bob_key, &bundle).unwrap();
-        let error = super::bob(&bob, &mut prekeys, &bob_key, &message)
-            .err()
-            .unwrap();
+        let (message, _) = bundle.initiate(&alice, &bob_key).unwrap();
+        let error = prekeys.accept(&bob, &bob_key, &message).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::UnexpectedIdentity);
         let unknown_prekey = InitialMessage {
             signed_prekey: [9; 32],
             ..message.clone()
         };
-        let error = super::bob(&bob, &mut prekeys, &alice_key, &unknown_prekey)
+        let error = prekeys
+            .accept(&bob, &alice_key, &unknown_prekey)
             .err()
             .unwrap();
         assert_eq!(error.kind(), ErrorKind::PrekeyNotFound);
         // The one-time prekey works once.
-        super::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
-        let error = super::bob(&bob, &mut prekeys, &alice_key, &message)
-            .err()
-            .unwrap();
+        prekeys.accept(&bob, &alice_key, &message).unwrap();
+        let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::OneTimePrekeyNotFound);
     }
 
@@ -393,20 +394,18 @@ mod test {
         let (bob, mut prekeys, first) = bob_setup(2);
         let alice_key = public_key(&alice);
         let bob_key = public_key(&bob);
-        let (message, _) = super::alice(&alice, &bob_key, &first).unwrap();
+        let (message, _) = first.initiate(&alice, &bob_key).unwrap();
 
         // Bob publishes again before taking Alice's message: it still works.
         let second = prekeys.generate(&bob, 1);
-        super::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
+        prekeys.accept(&bob, &alice_key, &message).unwrap();
         // A one-time prekey must be of the same generation as the signed prekey.
         let mixed = PrekeyBundle {
             one_time_prekey: second.one_time_prekeys.first().copied(),
             ..first.clone()
         };
-        let (message, _) = super::alice(&alice, &bob_key, &mixed).unwrap();
-        let error = super::bob(&bob, &mut prekeys, &alice_key, &message)
-            .err()
-            .unwrap();
+        let (message, _) = mixed.initiate(&alice, &bob_key).unwrap();
+        let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::OneTimePrekeyNotFound);
 
         // After one more, the first generation is deleted.
@@ -414,11 +413,9 @@ mod test {
             one_time_prekey: None,
             ..first
         };
-        let (message, _) = super::alice(&alice, &bob_key, &without_one_time_prekey).unwrap();
+        let (message, _) = without_one_time_prekey.initiate(&alice, &bob_key).unwrap();
         prekeys.generate(&bob, 1);
-        let error = super::bob(&bob, &mut prekeys, &alice_key, &message)
-            .err()
-            .unwrap();
+        let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::PrekeyNotFound);
         assert_eq!(
             format!("{prekeys:?}"),

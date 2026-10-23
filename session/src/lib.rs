@@ -81,7 +81,7 @@ impl<H: LocalHandshake> Client<H> {
             })
             .await?;
         let bundle = PrekeyBundle::try_from(&response)?;
-        let (message, agreement) = x3dh::alice(&self.identity, peer, &bundle)?;
+        let (message, agreement) = bundle.initiate(&self.identity, peer)?;
         let ratchet =
             SharedKeys::from_secret(&agreement.secret_key).alice(&bundle.signed_prekey)?;
         self.handshake
@@ -126,8 +126,7 @@ impl<H: LocalHandshake> Client<H> {
         introduction: &Introduction,
         mailbox: M,
     ) -> Result<Session<M>> {
-        let (agreement, signed_prekey) =
-            x3dh::bob(&self.identity, &mut self.prekeys, peer, introduction)?;
+        let (agreement, signed_prekey) = self.prekeys.accept(&self.identity, peer, introduction)?;
         let ratchet = SharedKeys::from_secret(&agreement.secret_key)
             .bob(DhPrivateKey::from(signed_prekey.to_bytes()));
         Ok(Session {

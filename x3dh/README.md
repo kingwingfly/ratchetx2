@@ -32,8 +32,8 @@ let bundle = PrekeyBundle {
 };
 
 // Alice starts the session and sends `message` to Bob.
-let (message, alice_agreement) = x3dh::alice(&alice, &bob_key, &bundle).unwrap();
+let (message, alice_agreement) = bundle.initiate(&alice, &bob_key).unwrap();
 // Bob accepts it.
-let (bob_agreement, _signed_prekey) = x3dh::bob(&bob, &mut prekeys, &alice_key, &message).unwrap();
+let (bob_agreement, _signed_prekey) = prekeys.accept(&bob, &alice_key, &message).unwrap();
 assert_eq!(*alice_agreement.secret_key, *bob_agreement.secret_key);
 ```
