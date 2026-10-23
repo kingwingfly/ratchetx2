@@ -36,14 +36,15 @@ const HASH1_PREFIX: [u8; ed25519_dalek::PUBLIC_KEY_LENGTH] = {
 pub enum Error {
     /// The DH public key is not [`PUBLIC_KEY_LENGTH`] bytes, not on the curve, or not in the
     /// prime-order subgroup.
-    #[error("Invalid DH public key.")]
+    #[error("invalid public key")]
     InvalidPublicKey,
-    /// Signature verify failed.
-    #[error("Signature verify failed.")]
+    /// The signature does not verify.
+    #[error("invalid signature")]
     Signature,
 }
 
-type Result<T> = core::result::Result<T, Error>;
+/// Result type with [`Error`](enum@Error).
+pub type Result<T> = core::result::Result<T, Error>;
 
 /// XEdDSA private key.
 #[derive(Zeroize, ZeroizeOnDrop)]
