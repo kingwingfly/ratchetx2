@@ -9,7 +9,7 @@ use dh_root::DhRootRatchet;
 use message::MessageRatchet;
 
 use crate::error::CryptoError;
-use crate::key::{DhPrivateKey, HeaderKey, MessageKey, SharedKeys};
+use crate::key::{DH_KEY_LENGTH, DhPrivateKey, HeaderKey, MessageKey, SharedKeys};
 
 /// Double ratchet. See the example in [`document`](crate::document).
 #[derive(Clone)]
@@ -76,7 +76,7 @@ impl Ratchet {
     }
 
     /// Get current public key.
-    pub fn public_key(&self) -> Vec<u8> {
+    pub fn public_key(&self) -> [u8; DH_KEY_LENGTH] {
         self.dh_root.public_key()
     }
 

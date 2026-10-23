@@ -22,6 +22,7 @@ The crate now only contains the double ratchet. `Party` (header encryption), X3D
 - `Ratchet::bob` takes the new `DhPrivateKey` instead of ring's `EphemeralPrivateKey`
 - `Ratchet::alice` and `Ratchet::step_dh_root` return `Result` and fail on an invalid peer public key, leaving the state unchanged, instead of panicking
 - `Ratchet::header_key_sender`, `header_key_receiver`, `step_message_ratchet_sender` and `step_message_ratchet_receiver` return `Option`: `None` until the chain is set up by a DH step
+- `Ratchet::public_key` returns a `[u8; DH_KEY_LENGTH]` instead of a `Vec<u8>`, like `DhPrivateKey::public_key`
 - `Ratchet` is `Clone`
 
 ### Added

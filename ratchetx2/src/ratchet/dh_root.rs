@@ -1,5 +1,5 @@
 use crate::error::CryptoError;
-use crate::key::{ChainKey, DhPrivateKey, HeaderKey, RootKey, SecretKey};
+use crate::key::{ChainKey, DH_KEY_LENGTH, DhPrivateKey, HeaderKey, RootKey, SecretKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -45,9 +45,9 @@ impl DhRootRatchet {
         }
     }
 
-    /// Get current publict key.
-    pub fn public_key(&self) -> Vec<u8> {
-        self.private_key.public_key().to_vec()
+    /// Get current public key.
+    pub fn public_key(&self) -> [u8; DH_KEY_LENGTH] {
+        self.private_key.public_key()
     }
 
     /// Perform ratchet step, update DH pair if needed, update RootKey, and return current ChainKey, next HeaderKey.

@@ -83,7 +83,7 @@ impl Party {
             .header_key_sender()
             .ok_or(ErrorKind::NoSendingChain)?;
         let header = Header {
-            public_key: Bytes::from(self.ratchet.public_key()),
+            public_key: Bytes::copy_from_slice(&self.ratchet.public_key()),
             previous_chain_length: self.previous_chain_length,
             message_number: self.message_number_sender,
         };
@@ -555,7 +555,7 @@ mod test {
         // A message made from Alice's state, whose header claims u64::MAX earlier messages.
         let mut sender = alice.ratchet.clone();
         let header = Header {
-            public_key: Bytes::from(sender.public_key()),
+            public_key: Bytes::copy_from_slice(&sender.public_key()),
             previous_chain_length: 0,
             message_number: u64::MAX,
         };
