@@ -28,7 +28,7 @@ use super::{
     form::Form,
     hint::Hint,
     pop_up::{PopUp, PopUpStateful},
-    quit::Quite,
+    quit::Quit,
     setting::{Setting, SettingState},
 };
 
@@ -184,7 +184,7 @@ impl StatefulWidget for App {
                     public_identity_key: state.client.identity_key(),
                 },
             ),
-            Screen::Quit => PopUp { inner: Quite {} }.render(area, buf),
+            Screen::Quit => PopUp { inner: Quit {} }.render(area, buf),
             Screen::Hint(hint) => PopUp {
                 inner: Hint {
                     hint: hint.to_owned(),

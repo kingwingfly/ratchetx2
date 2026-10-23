@@ -29,7 +29,7 @@ impl StatefulWidget for Bubble<'_> {
                     .split(area);
                 chunks[1]
             }
-            MessageState::Recved => {
+            MessageState::Received => {
                 let chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
@@ -65,7 +65,7 @@ impl StatefulWidget for Bubble<'_> {
                 let mut p = Paragraph::new(lines).wrap(Wrap::default());
                 p = match self.message.state {
                     MessageState::Sent => p.left_aligned(),
-                    MessageState::Recved => p.left_aligned(),
+                    MessageState::Received => p.left_aligned(),
                     MessageState::Error(_) => p.centered(),
                 };
                 p.render(inner, buf);

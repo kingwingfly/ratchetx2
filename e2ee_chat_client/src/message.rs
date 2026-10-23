@@ -10,7 +10,7 @@ pub struct Message {
 #[derive(Debug)]
 pub enum MessageState {
     Sent,
-    Recved,
+    Received,
     Error(String),
 }
 

@@ -3,9 +3,9 @@ use ratatui::{
     widgets::{Block, Padding, Paragraph},
 };
 
-pub struct Quite {}
+pub struct Quit {}
 
-impl Widget for Quite {
+impl Widget for Quit {
     fn render(self, area: Rect, buf: &mut Buffer)
     where
         Self: Sized,
@@ -18,7 +18,7 @@ impl Widget for Quite {
             .constraints([Constraint::Length(2), Constraint::Fill(1)])
             .split(block.inner(area));
         block.render(area, buf);
-        Paragraph::new("Quite?[y/*]")
+        Paragraph::new("Quit?[y/*]")
             .centered()
             .render(chunks[0], buf);
         Paragraph::new("WARNING: All data won't be saved and will be lost.")

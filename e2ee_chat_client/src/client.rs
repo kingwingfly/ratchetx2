@@ -116,7 +116,7 @@ impl Client {
                                         conversations.write().entry(key).or_default().push(
                                             Message {
                                                 content,
-                                                state: MessageState::Recved,
+                                                state: MessageState::Received,
                                             },
                                         );
                                     }
