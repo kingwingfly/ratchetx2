@@ -15,7 +15,6 @@ use protocol::handshake::{
     TakeIntroductionsRequest,
 };
 use protocol::mailbox::{FetchRequest, LocalMailbox, PushRequest};
-use protocol::signing;
 use ratchetx2::{DhPrivateKey, SharedKeys};
 use x3dh::{LocalPrekeys, PrekeyBundle};
 use xeddsa::XEdDSAPrivateKey;
@@ -67,8 +66,7 @@ impl<H: LocalHandshake> Client<H> {
     pub async fn publish_keys(&mut self, one_time_count: usize) -> Result<()> {
         let published = self.prekeys.generate(&self.identity, one_time_count);
         let timestamp = self.next_timestamp();
-        let mut request = PublishRequest::new(&self.identity_key, &published, timestamp);
-        signing::sign_publish(&self.identity, &mut request)?;
+        let request = PublishRequest::sign(&self.identity, &published, timestamp)?;
         self.handshake.publish(request).await?;
         Ok(())
     }
@@ -106,12 +104,8 @@ impl<H: LocalHandshake> Client<H> {
     /// The server deletes them, so keep the ones to accept later. Malformed ones, which could
     /// never be accepted, are left out.
     pub async fn take_introductions(&mut self) -> Result<Vec<Introduction>> {
-        let mut request = TakeIntroductionsRequest {
-            identity_key: Bytes::copy_from_slice(&self.identity_key),
-            timestamp: self.next_timestamp(),
-            signature: Bytes::new(),
-        };
-        signing::sign_take_introductions(&self.identity, &mut request)?;
+        let timestamp = self.next_timestamp();
+        let request = TakeIntroductionsRequest::sign(&self.identity, timestamp);
         let response = self.handshake.take_introductions(request).await?;
         // The server has deleted them already, so one malformed message must not fail the
         // call and lose the others with it.

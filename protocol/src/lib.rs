@@ -10,7 +10,6 @@ pub mod error;
 pub mod grpc;
 pub mod handshake;
 pub mod mailbox;
-pub mod signing;
 
 pub use error::{Error, ErrorKind, Result};
 
