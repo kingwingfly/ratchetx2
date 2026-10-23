@@ -15,7 +15,7 @@ use protocol::handshake::{
     TakeIntroductionsRequest,
 };
 use protocol::mailbox::{FetchRequest, LocalMailbox, PushRequest};
-use ratchetx2::{DhPrivateKey, SharedKeys};
+use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 use x3dh::{LocalPrekeys, PrekeyBundle};
 use xeddsa::XEdDSAPrivateKey;
 
@@ -82,8 +82,10 @@ impl<H: LocalHandshake> Client<H> {
             .await?;
         let bundle = PrekeyBundle::try_from(&response)?;
         let (message, agreement) = bundle.initiate(&self.identity, peer)?;
-        let ratchet =
-            SharedKeys::from_secret(&agreement.secret_key).alice(&bundle.signed_prekey)?;
+        let ratchet = Ratchet::alice(
+            &SharedKeys::from_secret(&agreement.secret_key),
+            &bundle.signed_prekey,
+        )?;
         self.handshake
             .introduce(IntroduceRequest {
                 recipient: Bytes::copy_from_slice(peer),
@@ -127,8 +129,10 @@ impl<H: LocalHandshake> Client<H> {
         mailbox: M,
     ) -> Result<Session<M>> {
         let (agreement, signed_prekey) = self.prekeys.accept(&self.identity, peer, introduction)?;
-        let ratchet = SharedKeys::from_secret(&agreement.secret_key)
-            .bob(DhPrivateKey::from(signed_prekey.to_bytes()));
+        let ratchet = Ratchet::bob(
+            &SharedKeys::from_secret(&agreement.secret_key),
+            DhPrivateKey::from(signed_prekey.to_bytes()),
+        );
         Ok(Session {
             party: Party::new(ratchet, agreement.associated_data),
             mailbox,

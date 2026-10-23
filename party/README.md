@@ -15,15 +15,15 @@ On `wasm32-unknown-unknown`, enable getrandom's `wasm_js` feature in the final a
 
 ```rust
 use party::Party;
-use ratchetx2::{DhPrivateKey, SharedKeys};
+use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 
 let shared_keys = SharedKeys {
     secret_key: [0; 32],
     header_key_alice: [1; 32],
     header_key_bob: [2; 32],
 };
-let bob_ratchet = shared_keys.bob(DhPrivateKey::generate());
-let alice_ratchet = shared_keys.alice(&bob_ratchet.public_key()).unwrap();
+let bob_ratchet = Ratchet::bob(&shared_keys, DhPrivateKey::generate());
+let alice_ratchet = Ratchet::alice(&shared_keys, &bob_ratchet.public_key()).unwrap();
 let mut alice = Party::new(alice_ratchet, "AliceBob");
 let mut bob = Party::new(bob_ratchet, "AliceBob");
 

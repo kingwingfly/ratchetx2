@@ -24,15 +24,15 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 After a key agreement such as X3DH, derive the shared keys from its secret with `SharedKeys::from_secret`. Ratchet only example:
 ```rust
-use ratchetx2::{DhPrivateKey, SharedKeys};
+use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 
 let shared_keys = SharedKeys {
     secret_key: [0; 32],
     header_key_alice: [1; 32],
     header_key_bob: [2; 32],
 };
-let mut bob = shared_keys.bob(DhPrivateKey::generate());
-let mut alice = shared_keys.alice(&bob.public_key()).unwrap();
+let mut bob = Ratchet::bob(&shared_keys, DhPrivateKey::generate());
+let mut alice = Ratchet::alice(&shared_keys, &bob.public_key()).unwrap();
 // Bob has no sending chain until he has received from Alice.
 assert_eq!(bob.step_message_ratchet_sender(), None);
 

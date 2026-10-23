@@ -9,7 +9,6 @@ use sha2::Sha256;
 use sha2::digest::{OutputSizeUser, typenum::Unsigned};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-use crate::Ratchet;
 use crate::error::CryptoError;
 
 /// Length of the keys below: the output size of SHA-256, as HKDF-SHA256 and HMAC-SHA256
@@ -72,7 +71,8 @@ impl fmt::Debug for DhPrivateKey {
     }
 }
 
-/// Shared keys to initialize a [`Ratchet`].
+/// Shared keys to initialize a [`Ratchet`](crate::Ratchet), with
+/// [`Ratchet::alice`](crate::Ratchet::alice) and [`Ratchet::bob`](crate::Ratchet::bob).
 #[derive(Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(test, derive(Debug))]
 pub struct SharedKeys {
@@ -96,28 +96,6 @@ impl SharedKeys {
             header_key_alice,
             header_key_bob,
         }
-    }
-
-    /// New a double-ratchet who sends message first.
-    ///
-    /// Fails if `public_key` (Bob's) is not a valid X25519 public key.
-    pub fn alice(&self, public_key: &[u8]) -> Result<Ratchet, CryptoError> {
-        Ratchet::alice(
-            self.secret_key,
-            public_key,
-            self.header_key_alice,
-            self.header_key_bob,
-        )
-    }
-
-    /// New a double-ratchet who waits for the message first.
-    pub fn bob(&self, private_key: DhPrivateKey) -> Ratchet {
-        Ratchet::bob(
-            self.secret_key,
-            private_key,
-            self.header_key_alice,
-            self.header_key_bob,
-        )
     }
 }
 

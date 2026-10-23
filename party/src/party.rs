@@ -407,8 +407,8 @@ mod test {
             header_key_alice: [2; 32],
             header_key_bob: [3; 32],
         };
-        let bob = keys.bob(DhPrivateKey::generate());
-        let alice = keys.alice(&bob.public_key()).unwrap();
+        let bob = Ratchet::bob(&keys, DhPrivateKey::generate());
+        let alice = Ratchet::alice(&keys, &bob.public_key()).unwrap();
         (Party::new(alice, "AD"), Party::new(bob, "AD"))
     }
 

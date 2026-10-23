@@ -18,8 +18,9 @@ The crate now only contains the double ratchet. `Party` (header encryption), X3D
 
 - renamed `Ratchetx2` to `Ratchet`, and its abbreviated methods: `header_key_s`, `header_key_r`, `next_header_key_r`, `step_msgs` and `step_msgr` are now `header_key_sender`, `header_key_receiver`, `next_header_key_receiver`, `step_message_ratchet_sender` and `step_message_ratchet_receiver`
 - removed the `party`, `transport`, `x3dh`, `xeddsa` and `server` modules, the `grpc` feature, and the re-exports of `ring`/`aws-lc-rs` (`agreement`, `rand`), `Scalar` and tonic types
-- `SharedKeys::bob`/`Ratchet::bob` take the new `DhPrivateKey` instead of ring's `EphemeralPrivateKey`
-- `SharedKeys::alice`, `Ratchet::alice` and `Ratchet::step_dh_root` return `Result` and fail on an invalid peer public key, leaving the state unchanged, instead of panicking
+- `SharedKeys::alice` and `SharedKeys::bob` are removed: `Ratchet::alice` and `Ratchet::bob` take the `SharedKeys` instead of its three keys
+- `Ratchet::bob` takes the new `DhPrivateKey` instead of ring's `EphemeralPrivateKey`
+- `Ratchet::alice` and `Ratchet::step_dh_root` return `Result` and fail on an invalid peer public key, leaving the state unchanged, instead of panicking
 - `Ratchet::header_key_sender`, `header_key_receiver`, `step_message_ratchet_sender` and `step_message_ratchet_receiver` return `Option`: `None` until the chain is set up by a DH step
 - `Ratchet` is `Clone`
 
