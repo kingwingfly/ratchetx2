@@ -171,9 +171,9 @@ mod server {
         }
     }
 
-    impl<S: LocalHandshakeStore> HandshakeServer<S> {
+    impl<S: LocalHandshakeStore> LocalHandshake for HandshakeServer<S> {
         /// Check and store Bob's prekeys.
-        pub async fn publish(&self, request: PublishRequest) -> Result<PublishResponse> {
+        async fn publish(&self, request: PublishRequest) -> Result<PublishResponse> {
             if request.one_time_prekeys.len() > self.limits.max_one_time_prekeys {
                 return Err(ErrorKind::LimitExceeded.into());
             }
@@ -195,10 +195,7 @@ mod server {
         }
 
         /// Bob's bundle, with one of his one-time prekeys, which is removed.
-        pub async fn fetch_bundle(
-            &self,
-            request: FetchBundleRequest,
-        ) -> Result<FetchBundleResponse> {
+        async fn fetch_bundle(&self, request: FetchBundleRequest) -> Result<FetchBundleResponse> {
             let (bundle, one_time_prekey) = self
                 .store
                 .take_bundle(&fixed(&request.identity_key)?)
@@ -212,7 +209,7 @@ mod server {
         }
 
         /// Store Alice's initial message in Bob's inbox.
-        pub async fn introduce(&self, request: IntroduceRequest) -> Result<IntroduceResponse> {
+        async fn introduce(&self, request: IntroduceRequest) -> Result<IntroduceResponse> {
             let message = request.message.as_ref().ok_or(ErrorKind::Malformed)?;
             let message = x3dh::InitialMessage::try_from(message)?;
             let introduction = Introduction {
@@ -233,7 +230,7 @@ mod server {
         }
 
         /// Take the initial messages in Bob's inbox.
-        pub async fn take_introductions(
+        async fn take_introductions(
             &self,
             request: TakeIntroductionsRequest,
         ) -> Result<TakeIntroductionsResponse> {
@@ -256,27 +253,6 @@ mod server {
                 })
                 .collect();
             Ok(TakeIntroductionsResponse { messages })
-        }
-    }
-
-    impl<S: LocalHandshakeStore> LocalHandshake for HandshakeServer<S> {
-        async fn publish(&self, request: PublishRequest) -> Result<PublishResponse> {
-            HandshakeServer::publish(self, request).await
-        }
-
-        async fn fetch_bundle(&self, request: FetchBundleRequest) -> Result<FetchBundleResponse> {
-            HandshakeServer::fetch_bundle(self, request).await
-        }
-
-        async fn introduce(&self, request: IntroduceRequest) -> Result<IntroduceResponse> {
-            HandshakeServer::introduce(self, request).await
-        }
-
-        async fn take_introductions(
-            &self,
-            request: TakeIntroductionsRequest,
-        ) -> Result<TakeIntroductionsResponse> {
-            HandshakeServer::take_introductions(self, request).await
         }
     }
 

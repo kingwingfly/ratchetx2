@@ -117,8 +117,8 @@ mod server {
     use tonic::{Request, Response, Status};
 
     use super::*;
-    use crate::handshake::{HandshakeServer, handshake_service_server};
-    use crate::mailbox::{MailboxServer, mailbox_service_server};
+    use crate::handshake::{HandshakeServer, LocalHandshake as _, handshake_service_server};
+    use crate::mailbox::{LocalMailbox as _, MailboxServer, mailbox_service_server};
 
     /// Serve the handshake and mailbox servers over gRPC on `incoming`, e.g.
     /// `TcpIncoming::bind(address)?`, with TLS if `identity` is given.
@@ -229,8 +229,6 @@ mod server {
         use storage::MemoryStore;
 
         use super::*;
-        use crate::handshake::Handshake as _;
-        use crate::mailbox::Mailbox as _;
 
         #[tokio::test]
         async fn over_grpc() {

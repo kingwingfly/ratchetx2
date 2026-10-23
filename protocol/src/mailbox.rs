@@ -73,9 +73,9 @@ mod server {
         }
     }
 
-    impl<S: LocalMailboxStore> MailboxServer<S> {
+    impl<S: LocalMailboxStore> LocalMailbox for MailboxServer<S> {
         /// Append a message to its queue.
-        pub async fn push(&self, request: PushRequest) -> Result<PushResponse> {
+        async fn push(&self, request: PushRequest) -> Result<PushResponse> {
             let (sender, recipient) = (fixed(&request.sender)?, fixed(&request.recipient)?);
             let message = request.message.ok_or(ErrorKind::Malformed)?;
             if message.header.len() + message.content.len() > self.limits.max_message_size {
@@ -89,7 +89,7 @@ mod server {
         }
 
         /// Read messages from a queue.
-        pub async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
+        async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
             let (sender, recipient) = (fixed(&request.sender)?, fixed(&request.recipient)?);
             let limit = match request.limit {
                 0 => self.limits.max_fetch,
@@ -118,16 +118,6 @@ mod server {
                 messages.push(envelope);
             }
             Ok(FetchResponse { messages })
-        }
-    }
-
-    impl<S: LocalMailboxStore> LocalMailbox for MailboxServer<S> {
-        async fn push(&self, request: PushRequest) -> Result<PushResponse> {
-            MailboxServer::push(self, request).await
-        }
-
-        async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
-            MailboxServer::fetch(self, request).await
         }
     }
 
