@@ -1,0 +1,12 @@
+version: v2
+# Mirrors the include paths in protocol/build.rs, so editors resolve `import "party.proto"`.
+modules:
+  - path: party/proto
+  - path: protocol/proto
+lint:
+  use:
+    - STANDARD
+  # The proto directories are flat, one file per package.
+  except:
+    - PACKAGE_DIRECTORY_MATCH
+    - DIRECTORY_SAME_PACKAGE
