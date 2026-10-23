@@ -14,11 +14,11 @@ use crate::{
 };
 
 #[allow(missing_docs)]
-mod generated {
+mod proto {
     include!(concat!(env!("OUT_DIR"), "/handshake.v1.rs"));
 }
 
-pub use generated::*;
+pub use proto::*;
 #[cfg(feature = "server")]
 pub use server::{HandshakeLimits, HandshakeServer};
 

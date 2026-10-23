@@ -3,11 +3,11 @@
 use crate::error::Result;
 
 #[allow(missing_docs)]
-mod generated {
+mod proto {
     include!(concat!(env!("OUT_DIR"), "/mailbox.v1.rs"));
 }
 
-pub use generated::*;
+pub use proto::*;
 #[cfg(feature = "server")]
 pub use server::{MailboxLimits, MailboxServer};
 
