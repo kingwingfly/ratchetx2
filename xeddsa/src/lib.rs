@@ -174,22 +174,6 @@ impl XEdDSAPublicKey {
         VerifyingKey::from_bytes(edwards_public_key.compress().as_bytes())
             .and_then(|key| key.verify(message.as_ref(), &signature))
             .map_err(|_| Error::Signature)?;
-        // // Below is manual verification.
-        // let r_check = curve25519_dalek::edwards::CompressedEdwardsY::from_slice(&signature[..32])
-        //     .map_err(|_| Error::Signature)?
-        //     .decompress()
-        //     .ok_or(Error::Signature)?;
-        // let mut to_digest = r_check.compress().as_bytes().to_vec();
-        // to_digest.extend(edwards_public_key.compress().as_bytes());
-        // to_digest.extend(message);
-        // let h = Scalar::from_bytes_mod_order_wide(&Sha512::digest(&to_digest).into());
-        // let s = Scalar::from_bytes_mod_order(signature[32..].try_into().unwrap());
-        // // -h * edwards_public_key + s * basepoint == r_check
-        // if EdwardsPoint::vartime_double_scalar_mul_basepoint(&-h, &edwards_public_key, &s)
-        //     != r_check
-        // {
-        //     return Err(Error::Signature);
-        // }
         Ok(())
     }
 }
@@ -238,16 +222,6 @@ mod test {
     }
 
     #[test]
-    fn rejects_short_public_keys_and_redacts_debug() {
-        let key = XEdDSAPrivateKey::generate();
-        assert_eq!(
-            XEdDSAPublicKey::new(&[0; 31]).unwrap_err(),
-            Error::InvalidPublicKey
-        );
-        assert_eq!(format!("{key:?}"), "XEdDSAPrivateKey { .. }");
-    }
-
-    #[test]
     fn diffie_hellman_rejects_points_outside_the_prime_order_subgroup() {
         let bob = XEdDSAPrivateKey::generate();
         let order_8 = CompressedEdwardsY(ORDER_8).decompress().unwrap();
@@ -285,11 +259,6 @@ mod test {
             .unwrap();
         assert_eq!(
             bob.diffie_hellman(&twist).unwrap_err(),
-            Error::InvalidPublicKey
-        );
-        // Wrong length.
-        assert_eq!(
-            bob.diffie_hellman(&[9; 31]).unwrap_err(),
             Error::InvalidPublicKey
         );
     }

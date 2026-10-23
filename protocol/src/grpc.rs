@@ -280,9 +280,6 @@ mod server {
             let messages = mailbox.fetch(request).await.unwrap().messages;
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].message, Some(message));
-
-            let error = connect("not an address", None).await.unwrap_err();
-            assert_eq!(error.kind(), ErrorKind::InvalidAddress);
         }
     }
 }

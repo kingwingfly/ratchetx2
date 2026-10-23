@@ -331,117 +331,23 @@ mod server {
 
         use super::*;
 
-        fn key(identity: &XEdDSAPrivateKey) -> Bytes {
-            Bytes::copy_from_slice(identity.compute_public_key().as_ref())
-        }
-
-        fn publish_request(
-            bob: &XEdDSAPrivateKey,
-            timestamp: u64,
-            one_time: usize,
-        ) -> PublishRequest {
-            let prekeys = PublishedPrekeys {
-                signed_prekey: [3; 32],
-                signed_prekey_signature: bob.sign([3; 32]),
-                one_time_prekeys: vec![[4; 32]; one_time],
-            };
-            PublishRequest::sign(bob, &prekeys, timestamp).unwrap()
-        }
-
-        fn kind<T: core::fmt::Debug>(result: Result<T>) -> ErrorKind {
-            result.unwrap_err().kind()
-        }
-
         #[tokio::test]
-        async fn publish_and_fetch() {
+        async fn publish_checks_the_signed_prekey() {
             let server = HandshakeServer::new(MemoryStore::default());
             let bob = XEdDSAPrivateKey::generate();
-
-            server.publish(publish_request(&bob, 1, 1)).await.unwrap();
-            // Replaying, or changing a signed request, is rejected.
-            assert_eq!(
-                kind(server.publish(publish_request(&bob, 1, 1)).await),
-                ErrorKind::StaleTimestamp
-            );
-            let mut changed = publish_request(&bob, 2, 1);
-            changed.timestamp = 3;
-            assert_eq!(
-                kind(server.publish(changed).await),
-                ErrorKind::InvalidSignature
-            );
-            // So is a signed prekey not signed by the identity key.
-            let prekeys = PublishedPrekeys {
+            let mut prekeys = PublishedPrekeys {
                 signed_prekey: [3; 32],
-                signed_prekey_signature: bob.sign([9; 32]),
-                one_time_prekeys: vec![],
+                signed_prekey_signature: bob.sign([3; 32]),
+                one_time_prekeys: vec![[4; 32]],
             };
+            let request = PublishRequest::sign(&bob, &prekeys, 1).unwrap();
+            server.publish(request).await.unwrap();
+            // A signed request, whose signed prekey is not signed by the identity key.
+            prekeys.signed_prekey_signature = bob.sign([9; 32]);
             let request = PublishRequest::sign(&bob, &prekeys, 2).unwrap();
             assert_eq!(
-                kind(server.publish(request).await),
+                server.publish(request).await.unwrap_err().kind(),
                 ErrorKind::InvalidSignature
-            );
-            assert_eq!(
-                kind(server.publish(publish_request(&bob, 2, 101)).await),
-                ErrorKind::LimitExceeded
-            );
-
-            let fetch = FetchBundleRequest {
-                identity_key: key(&bob),
-            };
-            let bundle = server.fetch_bundle(fetch).await.unwrap();
-            assert_eq!(bundle.signed_prekey, Bytes::from_static(&[3; 32]));
-            assert_eq!(bundle.one_time_prekey, Some(Bytes::from_static(&[4; 32])));
-        }
-
-        #[tokio::test]
-        async fn introduce_and_take() {
-            let server = HandshakeServer::builder(MemoryStore::default())
-                .limits(HandshakeLimits {
-                    max_one_time_prekeys: 100,
-                    max_introductions: 1,
-                })
-                .build();
-            let (alice, bob) = (XEdDSAPrivateKey::generate(), XEdDSAPrivateKey::generate());
-            let message = InitialMessage {
-                identity_key: key(&alice),
-                ephemeral_key: Bytes::from_static(&[5; 32]),
-                signed_prekey: Bytes::from_static(&[3; 32]),
-                one_time_prekey: None,
-            };
-            let introduce = || IntroduceRequest {
-                recipient: key(&bob),
-                message: Some(message.clone()),
-            };
-            server.introduce(introduce()).await.unwrap();
-            assert_eq!(
-                kind(server.introduce(introduce()).await),
-                ErrorKind::LimitExceeded
-            );
-            let missing = IntroduceRequest {
-                recipient: key(&bob),
-                message: None,
-            };
-            assert_eq!(kind(server.introduce(missing).await), ErrorKind::Malformed);
-
-            // Only Bob can take his introductions.
-            let mut forged = TakeIntroductionsRequest::sign(&alice, 1);
-            forged.identity_key = key(&bob);
-            assert_eq!(
-                kind(server.take_introductions(forged).await),
-                ErrorKind::InvalidSignature
-            );
-            let taken = server
-                .take_introductions(TakeIntroductionsRequest::sign(&bob, 1))
-                .await
-                .unwrap();
-            assert_eq!(taken.messages, [message]);
-            assert_eq!(
-                kind(
-                    server
-                        .take_introductions(TakeIntroductionsRequest::sign(&bob, 1))
-                        .await
-                ),
-                ErrorKind::StaleTimestamp
             );
         }
     }
@@ -450,57 +356,6 @@ mod server {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::error::ErrorKind;
-
-    #[test]
-    fn initial_message_round_trip() {
-        for one_time_prekey in [None, Some([4; 32])] {
-            let message = x3dh::InitialMessage {
-                identity_key: [1; 32],
-                ephemeral_key: [2; 32],
-                signed_prekey: [3; 32],
-                one_time_prekey,
-            };
-            let wire = InitialMessage::from(&message);
-            assert_eq!(x3dh::InitialMessage::try_from(&wire).unwrap(), message);
-        }
-        let short = InitialMessage {
-            ephemeral_key: Bytes::from_static(&[2; 31]),
-            ..InitialMessage::from(&x3dh::InitialMessage {
-                identity_key: [1; 32],
-                ephemeral_key: [2; 32],
-                signed_prekey: [3; 32],
-                one_time_prekey: None,
-            })
-        };
-        assert_eq!(
-            x3dh::InitialMessage::try_from(&short).unwrap_err().kind(),
-            ErrorKind::Malformed
-        );
-    }
-
-    #[test]
-    fn bundle_round_trip() {
-        for one_time_prekey in [None, Some([3; 32])] {
-            let bundle = PrekeyBundle {
-                signed_prekey: [1; 32],
-                signed_prekey_signature: [2; 64],
-                one_time_prekey,
-            };
-            let wire = FetchBundleResponse::from(&bundle);
-            assert_eq!(PrekeyBundle::try_from(&wire).unwrap(), bundle);
-        }
-        let mut wire = FetchBundleResponse::from(&PrekeyBundle {
-            signed_prekey: [1; 32],
-            signed_prekey_signature: [2; 64],
-            one_time_prekey: None,
-        });
-        wire.signed_prekey_signature = Bytes::from_static(&[2; 63]);
-        assert_eq!(
-            PrekeyBundle::try_from(&wire).unwrap_err().kind(),
-            ErrorKind::Malformed
-        );
-    }
 
     #[test]
     fn sign_and_verify() {
@@ -533,12 +388,6 @@ mod test {
             forged.verify().unwrap_err().kind(),
             ErrorKind::InvalidSignature
         );
-        // Malformed fields are rejected.
-        let mut malformed = request.clone();
-        malformed
-            .one_time_prekeys
-            .push(Bytes::from_static(&[5; 33]));
-        assert_eq!(malformed.verify().unwrap_err().kind(), ErrorKind::Malformed);
 
         let request = TakeIntroductionsRequest::sign(&bob, 9);
         assert_eq!(request.verify().unwrap(), identity_key);

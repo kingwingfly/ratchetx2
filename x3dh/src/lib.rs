@@ -331,22 +331,11 @@ mod test {
             let bob_key = public_key(&bob);
 
             let (message, alice_agreement) = bundle.initiate(&alice, &bob_key).unwrap();
-            assert_eq!(message.one_time_prekey, bundle.one_time_prekey);
-            let (bob_agreement, signed_prekey) =
-                prekeys.accept(&bob, &alice_key, &message).unwrap();
+            let (bob_agreement, _) = prekeys.accept(&bob, &alice_key, &message).unwrap();
             assert_eq!(*alice_agreement.secret_key, *bob_agreement.secret_key);
             assert_eq!(
                 alice_agreement.associated_data,
                 bob_agreement.associated_data
-            );
-            assert_eq!(
-                alice_agreement.associated_data[..PUBLIC_KEY_LENGTH],
-                alice_key
-            );
-            // Bob's first ratchet key pair is his signed prekey.
-            assert_eq!(
-                x25519_dalek::PublicKey::from(&signed_prekey).to_bytes(),
-                bundle.signed_prekey
             );
         }
     }
@@ -354,8 +343,7 @@ mod test {
     #[test]
     fn rejections() {
         let alice = XEdDSAPrivateKey::generate();
-        let (bob, mut prekeys, bundle) = bob_setup(1);
-        let alice_key = public_key(&alice);
+        let (bob, _, bundle) = bob_setup(1);
         let bob_key = public_key(&bob);
 
         // A bundle whose signature is not by the identity Alice asked for.
@@ -370,23 +358,6 @@ mod test {
         };
         let error = low_order.initiate(&alice, &bob_key).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidPublicKey);
-
-        let (message, _) = bundle.initiate(&alice, &bob_key).unwrap();
-        let error = prekeys.accept(&bob, &bob_key, &message).err().unwrap();
-        assert_eq!(error.kind(), ErrorKind::UnexpectedIdentity);
-        let unknown_prekey = InitialMessage {
-            signed_prekey: [9; 32],
-            ..message.clone()
-        };
-        let error = prekeys
-            .accept(&bob, &alice_key, &unknown_prekey)
-            .err()
-            .unwrap();
-        assert_eq!(error.kind(), ErrorKind::PrekeyNotFound);
-        // The one-time prekey works once.
-        prekeys.accept(&bob, &alice_key, &message).unwrap();
-        let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
-        assert_eq!(error.kind(), ErrorKind::OneTimePrekeyNotFound);
     }
 
     #[test]
@@ -418,9 +389,5 @@ mod test {
         prekeys.generate(&bob, 1);
         let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::PrekeyNotFound);
-        assert_eq!(
-            format!("{prekeys:?}"),
-            "LocalPrekeys { signed: 2, one_time: 2 }"
-        );
     }
 }

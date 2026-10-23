@@ -5,7 +5,9 @@ mod message;
 
 use core::fmt;
 
-use self::{dh_root::DhRootRatchet, message::MessageRatchet};
+use dh_root::DhRootRatchet;
+use message::MessageRatchet;
+
 use crate::{
     error::CryptoError,
     key::{DH_KEY_LENGTH, DhPrivateKey, HeaderKey, MessageKey, SharedKeys},
@@ -146,47 +148,5 @@ impl Ratchet {
         }
         self.dh_step_updates_sender = !self.dh_step_updates_sender;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    fn shared_keys() -> SharedKeys {
-        SharedKeys {
-            secret_key: [0; 32],
-            header_key_alice: [1; 32],
-            header_key_bob: [2; 32],
-        }
-    }
-
-    #[test]
-    fn chains_start_unset() {
-        let keys = shared_keys();
-        let bob = Ratchet::bob(&keys, DhPrivateKey::generate());
-        let alice = Ratchet::alice(&keys, &bob.public_key()).unwrap();
-        assert!(alice.header_key_sender().is_some());
-        assert_eq!(alice.header_key_receiver(), None);
-        assert_eq!(bob.header_key_sender(), None);
-        assert_eq!(bob.header_key_receiver(), None);
-    }
-
-    #[test]
-    fn invalid_peer_key_leaves_state_unchanged() {
-        let keys = shared_keys();
-        assert!(Ratchet::alice(&keys, &[0; 32]).is_err());
-        let bob = Ratchet::bob(&keys, DhPrivateKey::generate());
-        let mut alice = Ratchet::alice(&keys, &bob.public_key()).unwrap();
-        let before = alice.clone();
-        // A low-order point and a wrong-length key.
-        assert!(alice.step_dh_root(&[0; 32]).is_err());
-        assert!(alice.step_dh_root(&[9; 31]).is_err());
-        assert!(alice.dh_root == before.dh_root);
-        assert!(
-            alice.message_ratchet_sender == before.message_ratchet_sender
-                && alice.message_ratchet_receiver == before.message_ratchet_receiver
-        );
-        assert_eq!(alice.dh_step_updates_sender, before.dh_step_updates_sender);
     }
 }

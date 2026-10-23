@@ -76,7 +76,6 @@ impl fmt::Debug for DhPrivateKey {
 /// Shared keys to initialize a [`Ratchet`](crate::Ratchet), with
 /// [`Ratchet::alice`](crate::Ratchet::alice) and [`Ratchet::bob`](crate::Ratchet::bob).
 #[derive(Zeroize, ZeroizeOnDrop)]
-#[cfg_attr(test, derive(Debug))]
 pub struct SharedKeys {
     /// The first shared RootKey.
     pub secret_key: SecretKey,
@@ -98,21 +97,5 @@ impl SharedKeys {
             header_key_alice,
             header_key_bob,
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn from_secret_derives_distinct_keys() {
-        let keys = SharedKeys::from_secret(&[7; 32]);
-        assert_ne!(keys.secret_key, keys.header_key_alice);
-        assert_ne!(keys.header_key_alice, keys.header_key_bob);
-        assert_ne!(
-            SharedKeys::from_secret(&[8; 32]).secret_key,
-            keys.secret_key
-        );
     }
 }

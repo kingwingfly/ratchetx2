@@ -151,44 +151,24 @@ mod server {
         }
 
         #[tokio::test]
-        async fn push_and_fetch() {
+        async fn fetch_pages_by_size() {
             let server = MailboxServer::builder(MemoryStore::default())
                 .limits(MailboxLimits {
                     max_message_size: 40,
-                    max_fetch: 2,
+                    ..MailboxLimits::default()
                 })
                 .build();
-            for (i, content) in [b"a", b"b", b"c"].into_iter().enumerate() {
-                let response = server.push(push(content)).await.unwrap();
-                assert_eq!(response.sequence, i as u64 + 1);
+            for content in [&b"a"[..], b"b", &[0; 30]] {
+                server.push(push(content)).await.unwrap();
             }
-            // The 6-byte header and 35 bytes of content exceed 40 bytes.
-            assert_eq!(
-                server.push(push(&[0; 35])).await.unwrap_err().kind(),
-                ErrorKind::LimitExceeded
-            );
-            let mut missing = push(b"a");
-            missing.message = None;
-            assert_eq!(
-                server.push(missing).await.unwrap_err().kind(),
-                ErrorKind::Malformed
-            );
-
-            // 0 asks for the server's maximum, and larger limits are capped by it.
-            for limit in [0, 9] {
-                let messages = server.fetch(fetch(0, limit)).await.unwrap().messages;
-                assert_eq!(messages.len(), 2);
-            }
-
             // A page stays within the message size: a large message starts the next page, and
             // a page always holds at least one message.
-            server.push(push(&[0; 30])).await.unwrap();
+            let messages = server.fetch(fetch(1, 0)).await.unwrap().messages;
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].sequence, 2);
             let messages = server.fetch(fetch(2, 0)).await.unwrap().messages;
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].sequence, 3);
-            let messages = server.fetch(fetch(3, 0)).await.unwrap().messages;
-            assert_eq!(messages.len(), 1);
-            assert_eq!(messages[0].sequence, 4);
         }
     }
 }

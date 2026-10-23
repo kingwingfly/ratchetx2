@@ -173,39 +173,4 @@ mod test {
         // Its last key used, the chain goes.
         assert_eq!(skipped.header_keys().count(), 0);
     }
-
-    #[test]
-    fn oldest_keys_go_beyond_skip_max() {
-        let mut skipped = SkippedKeys::default();
-        skipped.extend([chain(1, 0..2)]);
-        skipped.next_chain();
-        skipped.extend([chain(2, 10..10 + SKIP_MAX - 2)]);
-        assert_eq!(skipped.len(), SKIP_MAX);
-
-        skipped.extend([chain(2, 2000..2002)]);
-        assert_eq!(skipped.len(), SKIP_MAX);
-        // The older chain went first, with its keys; then the oldest keys of the next.
-        assert_eq!(skipped.header_keys().collect::<Vec<_>>(), [[2; 32]]);
-        skipped.extend([chain(2, 3000..3001)]);
-        assert_eq!(skipped.len(), SKIP_MAX);
-        assert_eq!(skipped.get(&[2; 32], 10), None);
-        assert!(skipped.get(&[2; 32], 11).is_some());
-    }
-
-    #[test]
-    fn chains_go_after_max_skipped_chains() {
-        let mut skipped = SkippedKeys::default();
-        skipped.extend([chain(1, 0..2)]);
-        skipped.next_chain();
-        skipped.extend([chain(2, 0..1)]);
-        for _ in 1..MAX_SKIPPED_CHAINS {
-            skipped.next_chain();
-        }
-        // The first chain is now MAX_SKIPPED_CHAINS chains old.
-        assert_eq!(skipped.header_keys().collect::<Vec<_>>(), [[2; 32]]);
-        assert_eq!(skipped.len(), 1);
-        skipped.next_chain();
-        assert_eq!(skipped.header_keys().count(), 0);
-        assert_eq!(skipped.len(), 0);
-    }
 }

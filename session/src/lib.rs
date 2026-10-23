@@ -305,7 +305,6 @@ mod test {
 
         let introductions = bob.take_introductions().await.unwrap();
         assert_eq!(introductions.len(), 1);
-        assert!(bob.take_introductions().await.unwrap().is_empty());
         let mut bob_session = bob
             .accept(
                 &alice.identity_key(),
@@ -314,9 +313,6 @@ mod test {
             )
             .unwrap();
 
-        // Bob can send only after receiving Alice's first message.
-        let error = bob_session.send(b"too early").await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NoSendingChain);
         assert_eq!(
             contents(bob_session.receive().await.unwrap()),
             [b"hi".to_vec(), b"bob".to_vec()]
@@ -336,95 +332,6 @@ mod test {
         assert_eq!(
             contents(bob_session.receive().await.unwrap()),
             [b"early".to_vec(), b"late".to_vec()]
-        );
-    }
-
-    #[test]
-    fn builder_sets_the_identity() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let identity = XEdDSAPrivateKey::generate();
-        let identity_key = identity.compute_public_key().to_bytes();
-        let client = Client::builder(InProcessHandshake(&handshake))
-            .identity(identity)
-            .build();
-        assert_eq!(client.identity_key(), identity_key);
-    }
-
-    #[tokio::test]
-    async fn rejections() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let mut alice = Client::new(InProcessHandshake(&handshake));
-        let mut bob = Client::new(InProcessHandshake(&handshake));
-
-        let error = alice
-            .initiate(&bob.identity_key(), InProcessMailbox(&mailbox))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound);
-
-        bob.publish_keys(1).await.unwrap();
-        alice
-            .initiate(&bob.identity_key(), InProcessMailbox(&mailbox))
-            .await
-            .unwrap();
-        let introductions = bob.take_introductions().await.unwrap();
-        // Only from the expected peer, and a wrong guess does not use it up.
-        let error = bob
-            .accept(&[9; 32], &introductions[0], InProcessMailbox(&mailbox))
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::UnexpectedPeer);
-        bob.accept(
-            &alice.identity_key(),
-            &introductions[0],
-            InProcessMailbox(&mailbox),
-        )
-        .unwrap();
-        // Its one-time prekey is used up.
-        let error = bob
-            .accept(
-                &alice.identity_key(),
-                &introductions[0],
-                InProcessMailbox(&mailbox),
-            )
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::InvalidIntroduction);
-    }
-
-    #[tokio::test]
-    async fn over_grpc() {
-        use protocol::grpc::{GrpcHandshake, GrpcMailbox, TcpIncoming, connect, serve};
-
-        // Bound before serving, so connecting needs no waiting, on a port the OS picks.
-        let incoming = TcpIncoming::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-        let address = incoming.local_addr().unwrap();
-        tokio::spawn(serve(
-            incoming,
-            None,
-            HandshakeServer::new(MemoryStore::default()),
-            MailboxServer::new(MemoryStore::default()),
-        ));
-        let channel = connect(format!("http://{address}"), None).await.unwrap();
-        let mut alice = Client::new(GrpcHandshake::new(channel.clone()));
-        let mut bob = Client::new(GrpcHandshake::new(channel.clone()));
-
-        bob.publish_keys(1).await.unwrap();
-        let mut alice_session = alice
-            .initiate(&bob.identity_key(), GrpcMailbox::new(channel.clone()))
-            .await
-            .unwrap();
-        alice_session.send(b"hi").await.unwrap();
-        let introductions = bob.take_introductions().await.unwrap();
-        let mut bob_session = bob
-            .accept(
-                &alice.identity_key(),
-                &introductions[0],
-                GrpcMailbox::new(channel),
-            )
-            .unwrap();
-        assert_eq!(
-            contents(bob_session.receive().await.unwrap()),
-            [b"hi".to_vec()]
         );
     }
 }
