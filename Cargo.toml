@@ -1,7 +1,9 @@
 [workspace]
 members = [
     "e2ee_chat_client",
-    "e2ee_chat_server",
+    "e2ee_chat_preview",
+    "e2ee_chat_web",
+    "e2ee_chat_worker",
     "party",
     "protocol",
     "ratchetx2",
@@ -21,3 +23,10 @@ opt-level = 3
 codegen-units = 1
 strip = "debuginfo"
 panic = "abort"
+
+# The web client's Mermaid worker, the most Rust code it loads: built for size, it takes 40%
+# less, and still draws a diagram in milliseconds. The grammars' workers are mostly tables, which
+# this would not shrink.
+[profile.size]
+inherits = "release"
+opt-level = "z"

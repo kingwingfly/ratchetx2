@@ -54,25 +54,23 @@ impl From<storage::Error> for Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// The server address is invalid.
-    #[error("invalid server address")]
-    InvalidAddress,
     /// Failed to connect to the server.
     #[error("failed to connect")]
     Connect,
     /// A request or response is malformed, e.g. a key of the wrong length.
     #[error("malformed message")]
     Malformed,
-    /// A request's or a prekey's signature does not verify.
+    /// A request's or a prekey's signature, or an upload token, does not verify.
     #[error("invalid signature")]
     InvalidSignature,
-    /// A signed request's timestamp is not greater than the previous request's.
+    /// A signed request's timestamp is not greater than the previous request's, or a
+    /// subscription's is too far from the server's clock.
     #[error("stale timestamp")]
     StaleTimestamp,
-    /// Nobody published keys for this identity.
+    /// Nobody published keys for this identity, or there is no such attachment or chunk.
     #[error("not found")]
     NotFound,
-    /// Too many one-time prekeys or initial messages, or a message too large.
+    /// Too many one-time prekeys, initial messages or chunks, or a message or chunk too large.
     #[error("limit exceeded")]
     LimitExceeded,
     /// The server's storage failed.

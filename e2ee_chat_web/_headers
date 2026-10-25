@@ -1,0 +1,7 @@
+# Served with the web client by Workers Static Assets. Peers' messages are shown in this page,
+# where the keys live, so it runs no script but its own, and no other page may frame it.
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src * ws: wss:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+  Referrer-Policy: no-referrer
+  X-Content-Type-Options: nosniff
+  Permissions-Policy: camera=(), microphone=(), geolocation=()

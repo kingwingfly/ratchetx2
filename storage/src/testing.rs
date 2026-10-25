@@ -4,7 +4,10 @@
 
 use bytes::Bytes;
 
-use crate::{Bundle, Introduction, LocalHandshakeStore, LocalMailboxStore, StoredMessage};
+use crate::{
+    Bundle, LocalAttachmentStore, LocalHandshakeStore, LocalMailboxStore, StoredAttachment,
+    StoredInitialMessage, StoredMessage,
+};
 
 /// Conformance suite for [`LocalHandshakeStore`].
 pub async fn handshake_store<S: LocalHandshakeStore>(store: &S) {
@@ -47,49 +50,52 @@ pub async fn handshake_store<S: LocalHandshakeStore>(store: &S) {
     );
     assert_eq!(store.take_bundle(&alice).await.unwrap(), None);
 
-    let introduction = Introduction {
+    let initial_message = StoredInitialMessage {
         sender: alice,
         recipient: bob,
         ephemeral_key: [8; 32],
         signed_prekey: [3; 32],
         one_time_prekey: Some([5; 32]),
+        header: Bytes::from_static(b"header"),
+        content: Bytes::from_static(b"content"),
     };
-    let without_one_time_prekey = Introduction {
+    let without_one_time_prekey = StoredInitialMessage {
         one_time_prekey: None,
-        ..introduction.clone()
+        content: Bytes::new(),
+        ..initial_message.clone()
     };
     assert!(
         store
-            .add_introduction(introduction.clone(), 2)
+            .add_initial_message(initial_message.clone(), 2)
             .await
             .unwrap()
     );
     assert!(
         store
-            .add_introduction(without_one_time_prekey.clone(), 2)
+            .add_initial_message(without_one_time_prekey.clone(), 2)
             .await
             .unwrap()
     );
     // The inbox is full.
     assert!(
         !store
-            .add_introduction(introduction.clone(), 2)
+            .add_initial_message(initial_message.clone(), 2)
             .await
             .unwrap()
     );
 
     assert_eq!(
-        store.take_introductions(&bob, 1).await.unwrap(),
-        Some(vec![introduction, without_one_time_prekey])
+        store.take_initial_messages(&bob, 1).await.unwrap(),
+        Some(vec![initial_message, without_one_time_prekey])
     );
     // Taking needs a newer timestamp, and takes only what arrived since.
-    assert_eq!(store.take_introductions(&bob, 1).await.unwrap(), None);
+    assert_eq!(store.take_initial_messages(&bob, 1).await.unwrap(), None);
     assert_eq!(
-        store.take_introductions(&bob, 2).await.unwrap(),
+        store.take_initial_messages(&bob, 2).await.unwrap(),
         Some(vec![])
     );
     assert_eq!(
-        store.take_introductions(&alice, 1).await.unwrap(),
+        store.take_initial_messages(&alice, 1).await.unwrap(),
         Some(vec![])
     );
 }
@@ -143,4 +149,56 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
             .is_empty()
     );
     assert_eq!(store.read(&bob, &alice, 0, 10).await.unwrap().len(), 1);
+}
+
+/// Conformance suite for [`LocalAttachmentStore`].
+pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
+    let attachment = StoredAttachment {
+        id: [1; 16],
+        uploader: [2; 32],
+        chunks: 2,
+        token_hash: [3; 32],
+    };
+    assert_eq!(store.attachment(&attachment.id).await.unwrap(), None);
+    assert!(store.add_attachment(attachment.clone()).await.unwrap());
+    // An ID is taken once.
+    let other = StoredAttachment {
+        chunks: 5,
+        ..attachment.clone()
+    };
+    assert!(!store.add_attachment(other).await.unwrap());
+    assert_eq!(
+        store.attachment(&attachment.id).await.unwrap(),
+        Some(attachment.clone())
+    );
+
+    assert_eq!(store.chunk(&attachment.id, 0).await.unwrap(), None);
+    store
+        .put_chunk(&attachment.id, 1, Bytes::from_static(b"second"))
+        .await
+        .unwrap();
+    store
+        .put_chunk(&attachment.id, 0, Bytes::from_static(b"first"))
+        .await
+        .unwrap();
+    // Putting a chunk again replaces it.
+    store
+        .put_chunk(&attachment.id, 0, Bytes::from_static(b"first again"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.chunk(&attachment.id, 0).await.unwrap(),
+        Some(Bytes::from_static(b"first again"))
+    );
+    assert_eq!(
+        store.chunk(&attachment.id, 1).await.unwrap(),
+        Some(Bytes::from_static(b"second"))
+    );
+    assert_eq!(store.chunk(&[9; 16], 0).await.unwrap(), None);
+
+    // Deleted, it is gone with its chunks, and deleting it again does nothing.
+    store.delete_attachment(&attachment.id).await.unwrap();
+    assert_eq!(store.attachment(&attachment.id).await.unwrap(), None);
+    assert_eq!(store.chunk(&attachment.id, 0).await.unwrap(), None);
+    store.delete_attachment(&attachment.id).await.unwrap();
 }

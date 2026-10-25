@@ -15,14 +15,21 @@ statements=(
     "cargo clippy --all-targets --features rkyv -p ratchetx2 -p xeddsa -p x3dh -p party -p protocol -p session -- -D warnings"
     "cargo clippy --all-targets --features prost -p ratchetx2 -p x3dh -p party -p session -- -D warnings"
     "cargo clippy --all-targets --features server -p protocol -- -D warnings"
-    "cargo clippy --all-targets --features grpc -p protocol -p session -- -D warnings"
+    "cargo clippy --all-targets --features connect -p protocol -p session -- -D warnings"
     "cargo test --all-features"
     "RUSTDOCFLAGS='-D warnings' cargo doc --no-deps $LIBS"
     # The libraries must keep building for the browser. This only checks (no linking), so
     # getrandom's "custom" backend stands in for the wasm_js backend an app would enable.
     "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo check --target wasm32-unknown-unknown $LIBS"
-    "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo check --target wasm32-unknown-unknown --features server,serde,rkyv -p protocol"
+    "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo check --target wasm32-unknown-unknown --features server,serde,rkyv,connect -p protocol"
     "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo check --target wasm32-unknown-unknown --features serde,rkyv,prost -p session"
+    # The web client and the Worker, which enable the wasm_js backend themselves.
+    "cargo clippy --target wasm32-unknown-unknown -p e2ee_chat_web -p e2ee_chat_worker -- -D warnings"
+    "cargo clippy --target wasm32-unknown-unknown --features conformance -p e2ee_chat_worker -- -D warnings"
+    # The previews' workers, each with its features only, as the web client's trunk build compiles them.
+    "cargo clippy --target wasm32-unknown-unknown --features pdf,worker --bins -p e2ee_chat_preview -- -D warnings"
+    "cargo clippy --target wasm32-unknown-unknown --features diagram,worker --bins -p e2ee_chat_preview -- -D warnings"
+    "cargo clippy --target wasm32-unknown-unknown --features code,worker --bins -p e2ee_chat_preview -- -D warnings"
 )
 
 # loop echo and executing statements

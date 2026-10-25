@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use base64::prelude::*;
@@ -10,8 +10,11 @@ use ratatui::{
 use ratatui_image::picker::Picker;
 pub use session::PublicKey;
 use session::{
-    Client, Introduction, Session,
-    protocol::grpc::{Certificate, Channel, GrpcHandshake, GrpcMailbox, Uri, connect},
+    Client, InitialMessage, Session,
+    protocol::{
+        ErrorKind,
+        handshake::{FetchBundleRequest, LocalHandshake as _},
+    },
 };
 use tokio::sync::Mutex as AsyncMutex;
 use tui_textarea::TextArea;
@@ -31,13 +34,17 @@ use crate::{
     message::Message,
     navi::{Navigation, Navigator},
     screen::Screen,
+    transport::{Connect, Http},
 };
 /// A session, locked on its own so using one never waits for the others.
-pub type SharedSession = Arc<AsyncMutex<Session<GrpcMailbox>>>;
+pub type SharedSession = Arc<AsyncMutex<Session<Connect>>>;
 
 pub struct AppState {
-    pub client: Client<GrpcHandshake>,
-    pub channel: Channel,
+    pub client: Client<Connect>,
+    /// The server, for new handshake and mailbox clients.
+    pub http: Http,
+    /// Where saved files go.
+    pub downloads: PathBuf,
 
     /// (Name, PublicKey)
     pub contacts: Vec<(String, PublicKey)>,
@@ -47,14 +54,13 @@ pub struct AppState {
     pub conversations: Arc<RwLock<HashMap<PublicKey, Vec<Message>>>>,
     pub current_activated_message: usize,
 
-    pub server_addr: Uri,
     pub navi: Navigator,
     pub chat_textarea: TextArea<'static>,
     pub textareas: Vec<(String, TextArea<'static>)>,
     pub current_activated_textarea: usize,
     /// Initial messages taken from the server but not accepted yet.
-    pub introductions: Vec<Introduction>,
-    pub current_selected_introduction: usize,
+    pub initial_messages: Vec<InitialMessage>,
+    pub current_selected_initial_message: usize,
     pub screen: Screen,
 
     pub explore_state: ExploreState,
@@ -64,28 +70,39 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub async fn connect(server_addr: impl TryInto<Uri>, ca: Option<Certificate>) -> Result<Self> {
-        let server_addr = server_addr
-            .try_into()
-            .unwrap_or_else(|_| panic!("Invalid server address."));
+    pub async fn connect(server_addr: &str, downloads: PathBuf) -> Result<Self> {
         let mut text_area = TextArea::default();
         text_area.set_line_number_style(Style::default().gray());
-        let channel = connect(server_addr.clone(), ca).await?;
+        let http = Http::new(server_addr)?;
+        let client = Client::new(http.connect());
+        // Fail now if nothing speaks the protocol there: the new identity has no bundle yet, so
+        // the server answers "not found".
+        let probe = http
+            .connect()
+            .fetch_bundle(FetchBundleRequest {
+                identity_key: client.identity_key().to_vec().into(),
+            })
+            .await;
+        if let Err(e) = probe
+            && e.kind() != ErrorKind::NotFound
+        {
+            return Err(anyhow::Error::new(e).context(format!("cannot reach {server_addr}")));
+        }
         Ok(Self {
-            client: Client::new(GrpcHandshake::new(channel.clone())),
-            channel,
+            client,
+            http,
+            downloads,
             contacts: vec![],
             sessions: Default::default(),
             current_activated_contact: 0,
             conversations: Default::default(),
             current_activated_message: 0,
-            server_addr,
             navi: Navigator::default(),
             chat_textarea: text_area,
             textareas: vec![],
             current_activated_textarea: 0,
-            introductions: vec![],
-            current_selected_introduction: 0,
+            initial_messages: vec![],
+            current_selected_initial_message: 0,
             screen: Screen::default(),
             explore_state: Default::default(),
             conversation_state: Default::default(),
@@ -179,7 +196,7 @@ impl StatefulWidget for App {
                 area,
                 buf,
                 &mut SettingState {
-                    server_addr: state.server_addr.clone(),
+                    server_addr: state.http.server().to_string(),
                     public_identity_key: state.client.identity_key(),
                 },
             ),
@@ -200,12 +217,9 @@ impl StatefulWidget for App {
             }
             Screen::ListInitMsg => {
                 PopUpStateful {
-                    inner: List::new(
-                        state
-                            .introductions
-                            .iter()
-                            .map(|introduction| BASE64_STANDARD.encode(introduction.identity_key)),
-                    )
+                    inner: List::new(state.initial_messages.iter().map(|initial_message| {
+                        BASE64_STANDARD.encode(initial_message.x3dh.identity_key)
+                    }))
                     .highlight_style(Style::default().green())
                     .block(Block::bordered().padding(Padding::proportional(2))),
                 }
@@ -213,7 +227,7 @@ impl StatefulWidget for App {
                     area,
                     buf,
                     &mut ListState::default()
-                        .with_selected(Some(state.current_selected_introduction)),
+                        .with_selected(Some(state.current_selected_initial_message)),
                 );
             }
             Screen::SelectFile => {

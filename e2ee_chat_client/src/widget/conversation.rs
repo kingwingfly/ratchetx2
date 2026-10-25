@@ -43,7 +43,9 @@ impl StatefulWidget for Conversation<'_> {
         );
         let lines = chunks[0].height;
         let mut used = 0;
-        for message in self.messages[..=self.current].iter().rev() {
+        // `current` may be left from another contact's, longer, conversation.
+        let shown = self.messages.len().min(self.current + 1);
+        for message in self.messages[..shown].iter().rev() {
             let line_num = message.line_num((chunks[0].width * 3 / 5).max(7) - 6) + 2; // border and padding
             if used + line_num >= lines {
                 break;

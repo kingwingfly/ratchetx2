@@ -11,24 +11,27 @@ publish = false
 [dependencies]
 bon = { version = "3.10", optional = true }
 bytes = "1"
+getrandom = { version = "0.4", optional = true }
 party = { path = "../party", default-features = false }
 prost = "0.14"
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+sha2 = { version = "0.11", optional = true }
 storage = { path = "../storage", default-features = false, optional = true }
 thiserror = "2.0"
-tonic = { version = "0.14", features = ["tls-ring", "tls-native-roots"], optional = true }
-tonic-prost = { version = "0.14", optional = true }
 trait-variant = "0.1"
+web-time = { version = "1.1", optional = true }
 x3dh = { path = "../x3dh" }
 xeddsa = { path = "../xeddsa" }
 
 [build-dependencies]
 prost-build = "0.14"
 protox = { version = "0.10", optional = true }
-tonic-prost-build = { version = "0.14", optional = true }
 
 [dev-dependencies]
+# Reads the services in the .proto files, to check the Connect paths.
+protox = "0.10"
 storage = { path = "../storage" }
 tokio = { version = "1", default-features = false, features = [
     "macros",
@@ -42,6 +45,6 @@ protox = ["dep:protox", "party/protox"]
 serde = ["dep:serde", "bytes/serde", "party/serde"]
 rkyv = ["dep:rkyv", "rkyv/bytes-1", "party/rkyv"]
 # The servers' logic, over the `storage` traits.
-server = ["dep:bon", "dep:storage"]
-# gRPC (tonic) clients, and services for the servers.
-grpc = ["dep:tonic", "dep:tonic-prost", "dep:tonic-prost-build"]
+server = ["dep:bon", "dep:getrandom", "dep:sha2", "dep:storage", "dep:web-time"]
+# Connect clients and call handling over any HTTP stack, e.g. in browsers and Workers.
+connect = ["dep:serde", "dep:serde_json"]

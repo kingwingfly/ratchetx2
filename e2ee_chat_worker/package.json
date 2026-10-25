@@ -1,0 +1,14 @@
+{
+  "name": "e2ee-chat-worker",
+  "version": "0.3.0",
+  "private": true,
+  "description": "The E2EE chat server and web client on Cloudflare Workers",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "migrate": "wrangler d1 migrations apply e2ee-chat --remote"
+  },
+  "devDependencies": {
+    "wrangler": "^4.152.0"
+  }
+}

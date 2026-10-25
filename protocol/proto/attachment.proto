@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+// The attachment service: files too large for a message, encrypted by their sender under a key
+// of their own and uploaded in chunks, which the recipients download. A message carries the key
+// and the attachment's ID; the server only sees ciphertext.
+package attachment.v1;
+
+// Start uploading an attachment. Signed with the uploader's identity key.
+message StartUploadRequest {
+  // The uploader's identity key (32 bytes).
+  bytes identity_key = 1;
+  // Number of chunks to upload.
+  uint32 chunks = 2;
+  // Milliseconds since the Unix epoch; the server takes it only within a few minutes of its own
+  // clock.
+  uint64 timestamp = 3;
+  // The identity key's XEdDSA signature of this request (64 bytes).
+  bytes signature = 4;
+}
+
+// The new attachment.
+message StartUploadResponse {
+  // Its random ID (16 bytes), which downloading it takes.
+  bytes id = 1;
+  // The random token (16 bytes) that uploading its chunks takes; keep it to the uploader.
+  bytes upload_token = 2;
+}
+
+// Upload, or upload again, a chunk of an attachment.
+message PutChunkRequest {
+  // The attachment's ID.
+  bytes id = 1;
+  // Its upload token.
+  bytes upload_token = 2;
+  // The chunk's index, from 0.
+  uint32 index = 3;
+  // The chunk, encrypted, at most 2 MiB.
+  bytes data = 4;
+}
+
+// Reply to `PutChunkRequest`.
+message PutChunkResponse {}
+
+// Download a chunk of an attachment.
+message GetChunkRequest {
+  // The attachment's ID.
+  bytes id = 1;
+  // The chunk's index.
+  uint32 index = 2;
+}
+
+// A chunk of an attachment, or that it is not uploaded yet: the attachment is there, as it is
+// downloaded while uploaded, but not this chunk. An attachment that is gone, expired or cancelled,
+// is a `not_found` error.
+message GetChunkResponse {
+  // The chunk, as uploaded; empty unless `uploaded`.
+  bytes data = 1;
+  // Whether the chunk is uploaded yet.
+  bool uploaded = 2;
+}
+
+// Cancel an upload: the attachment and its chunks go.
+message CancelUploadRequest {
+  // The attachment's ID.
+  bytes id = 1;
+  // Its upload token.
+  bytes upload_token = 2;
+}
+
+// Reply to `CancelUploadRequest`.
+message CancelUploadResponse {}
+
+// The attachment service.
+service AttachmentService {
+  // Start uploading an attachment.
+  rpc StartUpload(StartUploadRequest) returns (StartUploadResponse);
+  // Upload a chunk.
+  rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
+  // Download a chunk.
+  rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
+  // Cancel an upload.
+  rpc CancelUpload(CancelUploadRequest) returns (CancelUploadResponse);
+}

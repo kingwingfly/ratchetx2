@@ -4,17 +4,21 @@
 //! Its messages carry X3DH's, and convert to and from [`x3dh`]'s types; converting from the
 //! wire fails with [`ErrorKind::Malformed`] if a key or signature has the wrong length.
 //!
+//! An [`InitialMessage`] carries the session's first message, X3DH's initial ciphertext: only
+//! its sender can have encrypted it, so its recipient drops an initial message whose first
+//! message does not decrypt. The server cannot tell, and keeps it as it is.
+//!
 //! # Signed requests
 //!
 //! Bob signs the requests that change or read his data with his identity key (XEdDSA): build
-//! them with [`PublishRequest::sign`] and [`TakeIntroductionsRequest::sign`], and read them
+//! them with [`PublishRequest::sign`] and [`TakeInitialMessagesRequest::sign`], and read them
 //! through their `verify`, which checks the signature first. The signature covers fixed bytes
 //! rather than the protobuf encoding, so every implementation signs exactly the same bytes:
 //!
 //! - publish: `"handshake.v1/publish"` ‖ identity key ‖ signed prekey ‖ its signature ‖
 //!   number of one-time prekeys (u32, little-endian) ‖ the one-time prekeys ‖ timestamp
 //!   (u64, little-endian)
-//! - take introductions: `"handshake.v1/take-introductions"` ‖ identity key ‖ timestamp
+//! - take initial messages: `"handshake.v1/take-initial-messages"` ‖ identity key ‖ timestamp
 //!   (u64, little-endian)
 //!
 //! Keys are 32 bytes and signatures 64, so fields cannot shift into each other.
@@ -45,12 +49,15 @@ pub trait LocalHandshake {
     /// Fetch Bob's prekey bundle, consuming one of his one-time prekeys.
     async fn fetch_bundle(&self, request: FetchBundleRequest) -> Result<FetchBundleResponse>;
     /// Leave Alice's initial message in Bob's inbox.
-    async fn introduce(&self, request: IntroduceRequest) -> Result<IntroduceResponse>;
-    /// Take the initial messages in Bob's inbox; see [`TakeIntroductionsRequest::sign`].
-    async fn take_introductions(
+    async fn send_initial_message(
         &self,
-        request: TakeIntroductionsRequest,
-    ) -> Result<TakeIntroductionsResponse>;
+        request: SendInitialMessageRequest,
+    ) -> Result<SendInitialMessageResponse>;
+    /// Take the initial messages in Bob's inbox; see [`TakeInitialMessagesRequest::sign`].
+    async fn take_initial_messages(
+        &self,
+        request: TakeInitialMessagesRequest,
+    ) -> Result<TakeInitialMessagesResponse>;
 }
 
 impl PublishRequest {
@@ -97,11 +104,11 @@ impl PublishRequest {
     }
 }
 
-impl TakeIntroductionsRequest {
+impl TakeInitialMessagesRequest {
     /// A request taking `identity`'s initial messages, signed by it.
     pub fn sign(identity: &XEdDSAPrivateKey, timestamp: u64) -> Self {
         let identity_key = identity.compute_public_key().to_bytes();
-        let signature = identity.sign(take_introductions_message(&identity_key, timestamp));
+        let signature = identity.sign(take_initial_messages_message(&identity_key, timestamp));
         Self {
             identity_key: Bytes::copy_from_slice(&identity_key),
             timestamp,
@@ -114,7 +121,7 @@ impl TakeIntroductionsRequest {
     pub fn verify(&self) -> Result<PublicKey> {
         let identity_key = fixed(&self.identity_key)?;
         XEdDSAPublicKey::new(&identity_key)?.verify(
-            take_introductions_message(&identity_key, self.timestamp),
+            take_initial_messages_message(&identity_key, self.timestamp),
             &self.signature,
         )?;
         Ok(identity_key)
@@ -140,9 +147,9 @@ fn publish_message(
     Ok(message)
 }
 
-/// The bytes a take-introductions request's signature covers.
-fn take_introductions_message(identity_key: &PublicKey, timestamp: u64) -> Vec<u8> {
-    let mut message = b"handshake.v1/take-introductions".to_vec();
+/// The bytes a take-initial-messages request's signature covers.
+fn take_initial_messages_message(identity_key: &PublicKey, timestamp: u64) -> Vec<u8> {
+    let mut message = b"handshake.v1/take-initial-messages".to_vec();
     message.extend(identity_key);
     message.extend(timestamp.to_le_bytes());
     message
@@ -173,6 +180,7 @@ impl TryFrom<&FetchBundleResponse> for PrekeyBundle {
 }
 
 impl From<&x3dh::InitialMessage> for InitialMessage {
+    /// Without the first message, for the caller to add.
     fn from(message: &x3dh::InitialMessage) -> Self {
         Self {
             identity_key: Bytes::copy_from_slice(&message.identity_key),
@@ -181,6 +189,7 @@ impl From<&x3dh::InitialMessage> for InitialMessage {
             one_time_prekey: message
                 .one_time_prekey
                 .map(|key| Bytes::copy_from_slice(&key)),
+            first_message: None,
         }
     }
 }
@@ -188,6 +197,7 @@ impl From<&x3dh::InitialMessage> for InitialMessage {
 impl TryFrom<&InitialMessage> for x3dh::InitialMessage {
     type Error = Error;
 
+    /// X3DH's part, without the first message.
     fn try_from(message: &InitialMessage) -> Result<Self> {
         Ok(Self {
             identity_key: fixed(&message.identity_key)?,
@@ -201,7 +211,8 @@ impl TryFrom<&InitialMessage> for x3dh::InitialMessage {
 #[cfg(feature = "server")]
 mod server {
     use bon::Builder;
-    use storage::{Bundle, Introduction, LocalHandshakeStore};
+    use party::EncryptedMessage;
+    use storage::{Bundle, LocalHandshakeStore, StoredInitialMessage};
 
     use super::*;
 
@@ -211,14 +222,17 @@ mod server {
         /// Most one-time prekeys in one publish.
         pub max_one_time_prekeys: usize,
         /// Most initial messages waiting in one inbox.
-        pub max_introductions: usize,
+        pub max_initial_messages: usize,
+        /// Most bytes in the first message of an initial message, header and content.
+        pub max_first_message_size: usize,
     }
 
     impl Default for HandshakeLimits {
         fn default() -> Self {
             Self {
                 max_one_time_prekeys: 100,
-                max_introductions: 100,
+                max_initial_messages: 100,
+                max_first_message_size: 4 << 10,
             }
         }
     }
@@ -278,50 +292,66 @@ mod server {
             }))
         }
 
-        /// Store Alice's initial message in Bob's inbox.
-        async fn introduce(&self, request: IntroduceRequest) -> Result<IntroduceResponse> {
+        /// Store Alice's initial message in Bob's inbox, with its first message, which only Bob
+        /// can check.
+        async fn send_initial_message(
+            &self,
+            request: SendInitialMessageRequest,
+        ) -> Result<SendInitialMessageResponse> {
             let message = request.message.as_ref().ok_or(ErrorKind::Malformed)?;
+            let first_message = message.first_message.clone().ok_or(ErrorKind::Malformed)?;
+            if first_message.header.len() + first_message.content.len()
+                > self.limits.max_first_message_size
+            {
+                return Err(ErrorKind::LimitExceeded.into());
+            }
             let message = x3dh::InitialMessage::try_from(message)?;
-            let introduction = Introduction {
+            let initial_message = StoredInitialMessage {
                 sender: message.identity_key,
                 recipient: fixed(&request.recipient)?,
                 ephemeral_key: message.ephemeral_key,
                 signed_prekey: message.signed_prekey,
                 one_time_prekey: message.one_time_prekey,
+                header: first_message.header,
+                content: first_message.content,
             };
             if !self
                 .store
-                .add_introduction(introduction, self.limits.max_introductions)
+                .add_initial_message(initial_message, self.limits.max_initial_messages)
                 .await?
             {
                 return Err(ErrorKind::LimitExceeded.into());
             }
-            Ok(IntroduceResponse {})
+            Ok(SendInitialMessageResponse {})
         }
 
         /// Take the initial messages in Bob's inbox.
-        async fn take_introductions(
+        async fn take_initial_messages(
             &self,
-            request: TakeIntroductionsRequest,
-        ) -> Result<TakeIntroductionsResponse> {
+            request: TakeInitialMessagesRequest,
+        ) -> Result<TakeInitialMessagesResponse> {
             let identity_key = request.verify()?;
-            let introductions = self
+            let initial_messages = self
                 .store
-                .take_introductions(&identity_key, request.timestamp)
+                .take_initial_messages(&identity_key, request.timestamp)
                 .await?
                 .ok_or(ErrorKind::StaleTimestamp)?;
-            let messages = introductions
+            let messages = initial_messages
                 .into_iter()
-                .map(|introduction| {
-                    InitialMessage::from(&x3dh::InitialMessage {
-                        identity_key: introduction.sender,
-                        ephemeral_key: introduction.ephemeral_key,
-                        signed_prekey: introduction.signed_prekey,
-                        one_time_prekey: introduction.one_time_prekey,
+                .map(|initial_message| InitialMessage {
+                    first_message: Some(EncryptedMessage {
+                        header: initial_message.header,
+                        content: initial_message.content,
+                    }),
+                    ..InitialMessage::from(&x3dh::InitialMessage {
+                        identity_key: initial_message.sender,
+                        ephemeral_key: initial_message.ephemeral_key,
+                        signed_prekey: initial_message.signed_prekey,
+                        one_time_prekey: initial_message.one_time_prekey,
                     })
                 })
                 .collect();
-            Ok(TakeIntroductionsResponse { messages })
+            Ok(TakeInitialMessagesResponse { messages })
         }
     }
 
@@ -348,6 +378,67 @@ mod server {
             assert_eq!(
                 server.publish(request).await.unwrap_err().kind(),
                 ErrorKind::InvalidSignature
+            );
+        }
+
+        #[tokio::test]
+        async fn initial_messages_carry_their_first_message() {
+            let server = HandshakeServer::builder(MemoryStore::default())
+                .limits(HandshakeLimits {
+                    max_first_message_size: 10,
+                    ..HandshakeLimits::default()
+                })
+                .build();
+            let bob = XEdDSAPrivateKey::generate();
+            let request = |first_message| SendInitialMessageRequest {
+                recipient: Bytes::copy_from_slice(&bob.compute_public_key().to_bytes()),
+                message: Some(InitialMessage {
+                    first_message,
+                    ..InitialMessage::from(&x3dh::InitialMessage {
+                        identity_key: [1; 32],
+                        ephemeral_key: [2; 32],
+                        signed_prekey: [3; 32],
+                        one_time_prekey: None,
+                    })
+                }),
+            };
+            let first_message = EncryptedMessage {
+                header: Bytes::from_static(b"head"),
+                content: Bytes::from_static(b"body"),
+            };
+            // Without one, or with one too large, it is refused.
+            assert_eq!(
+                server
+                    .send_initial_message(request(None))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Malformed
+            );
+            let large = EncryptedMessage {
+                content: Bytes::from_static(b"too long"),
+                ..first_message.clone()
+            };
+            assert_eq!(
+                server
+                    .send_initial_message(request(Some(large)))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::LimitExceeded
+            );
+
+            server
+                .send_initial_message(request(Some(first_message.clone())))
+                .await
+                .unwrap();
+            let taken = server
+                .take_initial_messages(TakeInitialMessagesRequest::sign(&bob, 1))
+                .await
+                .unwrap();
+            assert_eq!(
+                taken.messages,
+                [request(Some(first_message)).message.unwrap()]
             );
         }
     }
@@ -389,7 +480,7 @@ mod test {
             ErrorKind::InvalidSignature
         );
 
-        let request = TakeIntroductionsRequest::sign(&bob, 9);
+        let request = TakeInitialMessagesRequest::sign(&bob, 9);
         assert_eq!(request.verify().unwrap(), identity_key);
         let mut changed = request.clone();
         changed.timestamp = 10;

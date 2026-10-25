@@ -4,6 +4,8 @@ syntax = "proto3";
 // initial message in Bob's inbox.
 package handshake.v1;
 
+import "party.proto";
+
 // Bob's prekeys, replacing his previous ones. Signed with his identity key.
 message PublishRequest {
   // Bob's identity key (32 bytes, XEdDSA).
@@ -49,21 +51,25 @@ message InitialMessage {
   bytes signed_prekey = 3;
   // Bob's one-time prekey that Alice used, if any.
   optional bytes one_time_prekey = 4;
+  // The session's first message, X3DH's initial ciphertext. Nothing else shows that the
+  // initial message is Alice's, and only Alice can have encrypted it, as its keys take her
+  // identity key's: Bob drops the initial message unless it decrypts. The server cannot tell.
+  party.v1.EncryptedMessage first_message = 5;
 }
 
 // Leave an initial message in Bob's inbox.
-message IntroduceRequest {
+message SendInitialMessageRequest {
   // Bob's identity key.
   bytes recipient = 1;
   // Alice's initial message.
   InitialMessage message = 2;
 }
 
-// Reply to `IntroduceRequest`.
-message IntroduceResponse {}
+// Reply to `SendInitialMessageRequest`.
+message SendInitialMessageResponse {}
 
 // Take every initial message in Bob's inbox. Signed with his identity key.
-message TakeIntroductionsRequest {
+message TakeInitialMessagesRequest {
   // Bob's identity key.
   bytes identity_key = 1;
   // Milliseconds since the Unix epoch; must be greater than in Bob's previous take.
@@ -73,7 +79,7 @@ message TakeIntroductionsRequest {
 }
 
 // The initial messages that were in Bob's inbox.
-message TakeIntroductionsResponse {
+message TakeInitialMessagesResponse {
   // The initial messages, oldest first.
   repeated InitialMessage messages = 1;
 }
@@ -85,7 +91,7 @@ service HandshakeService {
   // Fetch Bob's prekey bundle.
   rpc FetchBundle(FetchBundleRequest) returns (FetchBundleResponse);
   // Leave Alice's initial message in Bob's inbox.
-  rpc Introduce(IntroduceRequest) returns (IntroduceResponse);
+  rpc SendInitialMessage(SendInitialMessageRequest) returns (SendInitialMessageResponse);
   // Take the initial messages in Bob's inbox.
-  rpc TakeIntroductions(TakeIntroductionsRequest) returns (TakeIntroductionsResponse);
+  rpc TakeInitialMessages(TakeInitialMessagesRequest) returns (TakeInitialMessagesResponse);
 }

@@ -37,7 +37,7 @@ pub struct Bundle {
 
 /// An initial message waiting in its recipient's inbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Introduction {
+pub struct StoredInitialMessage {
     /// The sender's identity key.
     pub sender: PublicKey,
     /// The recipient's identity key.
@@ -48,6 +48,27 @@ pub struct Introduction {
     pub signed_prekey: PublicKey,
     /// The recipient's one-time prekey it uses, if any.
     pub one_time_prekey: Option<PublicKey>,
+    /// The encrypted header of the session's first message, which comes with it.
+    pub header: Bytes,
+    /// The encrypted content of the session's first message.
+    pub content: Bytes,
+}
+
+/// The random ID of an attachment, which whoever may download it knows.
+pub type AttachmentId = [u8; 16];
+
+/// An attachment: a file uploaded in encrypted chunks, which its recipients download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredAttachment {
+    /// Its random ID.
+    pub id: AttachmentId,
+    /// The identity key that started the upload.
+    pub uploader: PublicKey,
+    /// Number of chunks.
+    pub chunks: u32,
+    /// SHA-256 of the upload token, which only the uploader knows and which writing a chunk
+    /// takes.
+    pub token_hash: [u8; 32],
 }
 
 /// A message in the queue from `sender` to `recipient`.
@@ -76,16 +97,20 @@ pub trait LocalHandshakeStore {
         &self,
         identity_key: &PublicKey,
     ) -> Result<Option<(Bundle, Option<PublicKey>)>>;
-    /// Add `introduction` to its recipient's inbox, unless the inbox already holds `limit`.
+    /// Add `initial_message` to its recipient's inbox, unless the inbox already holds `limit`.
     /// Returns whether it was added.
-    async fn add_introduction(&self, introduction: Introduction, limit: usize) -> Result<bool>;
-    /// Take every introduction to `recipient`, if `timestamp` is greater than the previous
+    async fn add_initial_message(
+        &self,
+        initial_message: StoredInitialMessage,
+        limit: usize,
+    ) -> Result<bool>;
+    /// Take every initial message to `recipient`, if `timestamp` is greater than the previous
     /// take's. Returns `None` otherwise.
-    async fn take_introductions(
+    async fn take_initial_messages(
         &self,
         recipient: &PublicKey,
         timestamp: u64,
-    ) -> Result<Option<Vec<Introduction>>>;
+    ) -> Result<Option<Vec<StoredInitialMessage>>>;
 }
 
 /// Storage for the mailbox server. Every method is atomic.
@@ -108,6 +133,23 @@ pub trait LocalMailboxStore {
         after: u64,
         limit: u32,
     ) -> Result<Vec<StoredMessage>>;
+}
+
+/// Storage for the attachment server. Every method is atomic.
+#[trait_variant::make(AttachmentStore: Send)]
+pub trait LocalAttachmentStore {
+    /// Add `attachment`, with no chunks yet, unless its ID is taken. Returns whether it was
+    /// added.
+    async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool>;
+    /// The attachment `id`, if any.
+    async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>>;
+    /// Store chunk `index` of the attachment `id`, which was added, replacing it if stored
+    /// already.
+    async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()>;
+    /// Chunk `index` of the attachment `id`, if stored.
+    async fn chunk(&self, id: &AttachmentId, index: u32) -> Result<Option<Bytes>>;
+    /// Delete the attachment `id` and its chunks, if any.
+    async fn delete_attachment(&self, id: &AttachmentId) -> Result<()>;
 }
 
 /// The error type of this crate.

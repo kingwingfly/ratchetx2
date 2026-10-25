@@ -120,6 +120,12 @@ impl Party {
         })
     }
 
+    /// Whether a message of the peer's has decrypted, which shows that the peer has this
+    /// session.
+    pub fn has_received(&self) -> bool {
+        self.ratchet.header_key_receiver().is_some()
+    }
+
     /// Decrypt a message. The state only changes if the content decrypts.
     pub fn decrypt(&mut self, message: &EncryptedMessage) -> Result<Vec<u8>> {
         if let Some(content) = self.receive_skipped(message)? {
@@ -495,9 +501,13 @@ mod test {
             ErrorKind::NoSendingChain
         );
         let message = alice.encrypt(b"hi").unwrap();
+        assert!(!bob.has_received());
         assert_eq!(bob.decrypt(&message).unwrap(), b"hi");
+        assert!(bob.has_received());
         let message = bob.encrypt(b"hello").unwrap();
+        assert!(!alice.has_received());
         assert_eq!(alice.decrypt(&message).unwrap(), b"hello");
+        assert!(alice.has_received());
     }
 
     #[test]

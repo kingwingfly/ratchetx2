@@ -5,3 +5,9 @@
 *.pem
 *.csr
 *.srl
+# The Worker's and the web client's builds, and wrangler's local state.
+node_modules
+.wrangler
+.dev.vars
+/e2ee_chat_worker/build
+/e2ee_chat_web/dist

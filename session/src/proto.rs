@@ -23,6 +23,7 @@ impl fmt::Debug for SessionState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionState")
             .field("party", &self.party)
+            .field("others", &self.others)
             .field("me", &self.me)
             .field("peer", &self.peer)
             .field("cursor", &self.cursor)

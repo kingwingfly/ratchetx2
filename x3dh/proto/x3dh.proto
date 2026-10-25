@@ -17,6 +17,9 @@ message Generation {
   bytes signed_secret = 2;
   // The one-time prekeys not used yet.
   repeated OneTimePrekey one_time_prekeys = 3;
+  // The ephemeral keys of the initial messages confirmed (32 bytes each), so that none is
+  // accepted twice.
+  repeated bytes confirmed_ephemeral_keys = 4;
 }
 
 // A one-time prekey.

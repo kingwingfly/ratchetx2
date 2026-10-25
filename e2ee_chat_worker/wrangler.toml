@@ -1,0 +1,44 @@
+name = "e2ee-chat"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+# Builds the web client into ../e2ee_chat_web/dist, then the Worker, passing WORKER_BUILD_ARGS
+# on to cargo, e.g. "--features conformance".
+[build]
+command = "cd ../e2ee_chat_web && trunk build --release && cd ../e2ee_chat_worker && worker-build --release $WORKER_BUILD_ARGS"
+watch_dir = ["src", "../e2ee_chat_web/src", "../e2ee_chat_web/index.html", "../e2ee_chat_web/style.css", "../e2ee_chat_web/_headers", "../e2ee_chat_preview/src"]
+
+# The web client. Files are served before the Worker runs; other paths, such as the Connect
+# procedures', go to the Worker.
+[assets]
+directory = "../e2ee_chat_web/dist"
+
+# Prekeys, initial messages and message queues. Create it with
+# `npx wrangler d1 create e2ee-chat` and put its id here.
+[[d1_databases]]
+binding = "DB"
+database_name = "e2ee-chat"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# Message contents over 64 KiB. Create it with `npx wrangler r2 bucket create e2ee-chat`.
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "e2ee-chat"
+
+# A notifier per identity key, holding its client's WebSockets; SQLite-backed, as the Free plan
+# requires, though it stores nothing.
+[[durable_objects.bindings]]
+name = "NOTIFIER"
+class_name = "Notifier"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Notifier"]
+
+# Daily, delete the messages and initial messages older than RETENTION_DAYS.
+[triggers]
+crons = ["0 4 * * *"]
+
+[vars]
+RETENTION_DAYS = "30"

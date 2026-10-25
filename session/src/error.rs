@@ -37,7 +37,6 @@ impl From<protocol::Error> for Error {
     fn from(error: protocol::Error) -> Self {
         use protocol::ErrorKind as Kind;
         let kind = match error.kind() {
-            Kind::InvalidAddress => ErrorKind::InvalidAddress,
             Kind::NotFound => ErrorKind::NotFound,
             Kind::LimitExceeded => ErrorKind::LimitExceeded,
             Kind::Malformed | Kind::InvalidSignature | Kind::StaleTimestamp => ErrorKind::Protocol,
@@ -54,7 +53,7 @@ impl From<x3dh::Error> for Error {
             Kind::InvalidPublicKey | Kind::InvalidSignature => ErrorKind::InvalidKeys,
             Kind::UnexpectedIdentity => ErrorKind::UnexpectedPeer,
             Kind::MalformedState => ErrorKind::MalformedState,
-            _ => ErrorKind::InvalidIntroduction,
+            _ => ErrorKind::InvalidInitialMessage,
         };
         Self::new(kind, error)
     }
@@ -84,16 +83,13 @@ impl From<ratchetx2::error::CryptoError> for Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// The server address is invalid.
-    #[error("invalid server address")]
-    InvalidAddress,
     /// The server cannot be reached, or failed.
     #[error("server error")]
     Server,
     /// Nobody published keys for this identity.
     #[error("no keys published for this identity")]
     NotFound,
-    /// The peer's inbox is full, or a message is too large.
+    /// The peer's inbox is full, or a message or an attachment is too large.
     #[error("limit exceeded")]
     LimitExceeded,
     /// The server rejected a request, or sent a malformed reply.
@@ -102,11 +98,13 @@ pub enum ErrorKind {
     /// The peer's keys are invalid, e.g. a prekey not signed by the peer's identity key.
     #[error("invalid keys")]
     InvalidKeys,
-    /// The initial message cannot be accepted, e.g. its one-time prekey was used already.
+    /// The initial message cannot be accepted: its first message does not decrypt, so it is not
+    /// from the peer it claims, or it was accepted already, or its prekeys are gone.
     #[error("invalid initial message")]
-    InvalidIntroduction,
-    /// The initial message is not from the expected peer.
-    #[error("the initial message is not from the expected peer")]
+    InvalidInitialMessage,
+    /// The initial message is not from the expected peer, or a session to
+    /// [keep](crate::Session::keep) is with another peer.
+    #[error("not the expected peer")]
     UnexpectedPeer,
     /// Bob can only send after he has received Alice's first message.
     #[error("no sending chain yet, wait for the peer's first message")]

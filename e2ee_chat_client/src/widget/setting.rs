@@ -3,12 +3,12 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Cell, Padding, Row, Table},
 };
-use session::{PublicKey, protocol::grpc::Uri};
+use session::PublicKey;
 
 pub struct Setting {}
 
 pub struct SettingState {
-    pub server_addr: Uri,
+    pub server_addr: String,
     pub public_identity_key: PublicKey,
 }
 
@@ -35,15 +35,13 @@ impl StatefulWidget for Setting {
                 .rows([
                     Row::new([
                         {
-                            if state.server_addr.scheme_str() == Some("http") {
-                                Cell::from("Server Addr (HTTP⚠️)").red()
-                            } else if state.server_addr.scheme_str() == Some("https") {
+                            if state.server_addr.starts_with("https://") {
                                 Cell::from("Server Addr (HTTPS)")
                             } else {
-                                Cell::from("Server Addr (Unknown Type)").yellow()
+                                Cell::from("Server Addr (HTTP⚠️)").red()
                             }
                         },
-                        Cell::from(state.server_addr.to_string()),
+                        Cell::from(state.server_addr.as_str()),
                     ]),
                     Row::new([
                         Cell::from("Public Identity Key"),

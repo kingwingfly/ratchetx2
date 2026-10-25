@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+// Notifications: a client learns at once that something arrived for it, instead of polling. They
+// are only hints, carrying nothing secret: what arrived is still fetched with the handshake and
+// mailbox services. How they travel is up to the server, e.g. over a WebSocket.
+package notify.v1;
+
+// Subscribe to the notifications of an identity. Signed with its identity key.
+message SubscribeRequest {
+  // The subscriber's identity key (32 bytes).
+  bytes identity_key = 1;
+  // Milliseconds since the Unix epoch; the server takes it only within a few minutes of its own
+  // clock.
+  uint64 timestamp = 2;
+  // The identity key's XEdDSA signature of this request (64 bytes).
+  bytes signature = 3;
+}
+
+// Something arrived for the subscriber.
+message Notification {
+  oneof event {
+    // A message from this identity key (32 bytes), in the subscriber's queue from it.
+    bytes message_from = 1;
+    // An initial message, in the subscriber's inbox; always true.
+    bool initial_message = 2;
+  }
+}

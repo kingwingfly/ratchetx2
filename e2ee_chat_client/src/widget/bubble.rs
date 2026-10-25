@@ -10,7 +10,7 @@ use ratatui_image::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::message::{Message, MessageContent, MessageState};
+use crate::message::{File, Message, MessageContent, MessageState};
 
 pub struct Bubble<'a> {
     pub picker: &'a Picker,
@@ -70,6 +70,12 @@ impl StatefulWidget for Bubble<'_> {
                 };
                 p.render(inner, buf);
             }
+            MessageContent::File(File { name, data, .. }) => {
+                file_card(name, data.len() as u64).render(inner, buf);
+            }
+            MessageContent::Attachment(pointer) => {
+                file_card(&pointer.name, pointer.size).render(inner, buf);
+            }
             MessageContent::Image(bytes) => {
                 if let Some(image) = state.get_or_insert_mut(Sha256::digest(bytes).to_vec(), || {
                     load_from_memory(bytes).ok().map(|image| {
@@ -85,5 +91,23 @@ impl StatefulWidget for Bubble<'_> {
                 }
             }
         }
+    }
+}
+
+/// A file's name, then its size and how to save it.
+fn file_card(name: &str, size: u64) -> Paragraph<'_> {
+    Paragraph::new(vec![
+        Line::raw(name).bold(),
+        Line::raw(format!("{} · s to save", human_size(size))).gray(),
+    ])
+    .wrap(Wrap::default())
+}
+
+/// A size in bytes, for people.
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.0} KB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
     }
 }

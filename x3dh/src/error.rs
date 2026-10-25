@@ -62,6 +62,9 @@ pub enum ErrorKind {
     /// The initial message uses a one-time prekey Bob does not have, e.g. one used already.
     #[error("one-time prekey not found")]
     OneTimePrekeyNotFound,
+    /// The initial message was confirmed already, and is sent again.
+    #[error("initial message replayed")]
+    Replayed,
     /// The protobuf state of the local prekeys is malformed, e.g. a key of the wrong length.
     #[error("malformed prekey state")]
     MalformedState,

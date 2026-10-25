@@ -5,10 +5,13 @@ use std::collections::{HashMap, VecDeque};
 use bytes::Bytes;
 use parking_lot::Mutex;
 
-use crate::{Bundle, HandshakeStore, Introduction, MailboxStore, PublicKey, Result, StoredMessage};
+use crate::{
+    AttachmentId, AttachmentStore, Bundle, ErrorKind, HandshakeStore, MailboxStore, PublicKey,
+    Result, StoredAttachment, StoredInitialMessage, StoredMessage,
+};
 
-/// Keeps everything in memory until dropped. Implements both [`HandshakeStore`] and
-/// [`MailboxStore`].
+/// Keeps everything in memory until dropped. Implements [`HandshakeStore`], [`MailboxStore`] and
+/// [`AttachmentStore`].
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     inner: Mutex<Inner>,
@@ -19,12 +22,13 @@ struct Inner {
     bundles: HashMap<PublicKey, (Bundle, VecDeque<PublicKey>)>,
     inboxes: HashMap<PublicKey, Inbox>,
     queues: HashMap<(PublicKey, PublicKey), Vec<StoredMessage>>,
+    attachments: HashMap<AttachmentId, (StoredAttachment, HashMap<u32, Bytes>)>,
 }
 
 #[derive(Debug, Default)]
 struct Inbox {
     last_take: Option<u64>,
-    introductions: Vec<Introduction>,
+    initial_messages: Vec<StoredInitialMessage>,
 }
 
 impl HandshakeStore for MemoryStore {
@@ -52,28 +56,32 @@ impl HandshakeStore for MemoryStore {
             .map(|(bundle, one_time_prekeys)| (bundle.clone(), one_time_prekeys.pop_front())))
     }
 
-    async fn add_introduction(&self, introduction: Introduction, limit: usize) -> Result<bool> {
+    async fn add_initial_message(
+        &self,
+        initial_message: StoredInitialMessage,
+        limit: usize,
+    ) -> Result<bool> {
         let mut inner = self.inner.lock();
-        let inbox = inner.inboxes.entry(introduction.recipient).or_default();
-        if inbox.introductions.len() >= limit {
+        let inbox = inner.inboxes.entry(initial_message.recipient).or_default();
+        if inbox.initial_messages.len() >= limit {
             return Ok(false);
         }
-        inbox.introductions.push(introduction);
+        inbox.initial_messages.push(initial_message);
         Ok(true)
     }
 
-    async fn take_introductions(
+    async fn take_initial_messages(
         &self,
         recipient: &PublicKey,
         timestamp: u64,
-    ) -> Result<Option<Vec<Introduction>>> {
+    ) -> Result<Option<Vec<StoredInitialMessage>>> {
         let mut inner = self.inner.lock();
         let inbox = inner.inboxes.entry(*recipient).or_default();
         if inbox.last_take.is_some_and(|last| last >= timestamp) {
             return Ok(None);
         }
         inbox.last_take = Some(timestamp);
-        Ok(Some(std::mem::take(&mut inbox.introductions)))
+        Ok(Some(std::mem::take(&mut inbox.initial_messages)))
     }
 }
 
@@ -118,6 +126,47 @@ impl MailboxStore for MemoryStore {
     }
 }
 
+impl AttachmentStore for MemoryStore {
+    async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if inner.attachments.contains_key(&attachment.id) {
+            return Ok(false);
+        }
+        inner
+            .attachments
+            .insert(attachment.id, (attachment, HashMap::new()));
+        Ok(true)
+    }
+
+    async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .attachments
+            .get(id)
+            .map(|(attachment, _)| attachment.clone()))
+    }
+
+    async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
+        let mut inner = self.inner.lock();
+        let (_, chunks) = inner.attachments.get_mut(id).ok_or(ErrorKind::Other)?;
+        chunks.insert(index, data);
+        Ok(())
+    }
+
+    async fn chunk(&self, id: &AttachmentId, index: u32) -> Result<Option<Bytes>> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .attachments
+            .get(id)
+            .and_then(|(_, chunks)| chunks.get(&index).cloned()))
+    }
+
+    async fn delete_attachment(&self, id: &AttachmentId) -> Result<()> {
+        self.inner.lock().attachments.remove(id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -127,6 +176,7 @@ mod test {
         futures::executor::block_on(async {
             crate::testing::handshake_store(&MemoryStore::default()).await;
             crate::testing::mailbox_store(&MemoryStore::default()).await;
+            crate::testing::attachment_store(&MemoryStore::default()).await;
         });
     }
 }

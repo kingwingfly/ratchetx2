@@ -1,0 +1,25 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Fixed file names and no inline script, so that the Content-Security-Policy in `_headers` can
+# forbid inline scripts: `init.js` starts the app instead.
+filehash = false
+inject_scripts = false
+
+[serve]
+addresses = ["127.0.0.1"]
+port = 8080
+
+# During `trunk serve`, the Connect calls go to `wrangler dev`, as they would to the Worker.
+[[proxy]]
+backend = "http://127.0.0.1:8787/handshake.v1.HandshakeService/"
+
+[[proxy]]
+backend = "http://127.0.0.1:8787/mailbox.v1.MailboxService/"
+
+[[proxy]]
+backend = "http://127.0.0.1:8787/attachment.v1.AttachmentService/"
+
+[[proxy]]
+backend = "ws://127.0.0.1:8787/notifications"
+ws = true

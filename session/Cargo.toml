@@ -9,26 +9,29 @@ description = "The E2EE chat's client flow: publish prekeys, start or accept ses
 publish = false
 
 [dependencies]
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 bon = "3.10"
 bytes = "1"
+getrandom = "0.4"
 party = { path = "../party", default-features = false }
 prost = { version = "0.14", optional = true }
 protocol = { path = "../protocol", default-features = false }
 ratchetx2 = { path = "../ratchetx2", version = "0.4" }
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+sha2 = "0.11"
 thiserror = "2.0"
 web-time = "1.1"
 x3dh = { path = "../x3dh" }
 xeddsa = { path = "../xeddsa" }
-zeroize = { version = "1.9", features = ["derive"], optional = true }
+zeroize = { version = "1.9", features = ["derive"] }
 
 [build-dependencies]
 prost-build = { version = "0.14", optional = true }
 protox = { version = "0.10", optional = true }
 
 [dev-dependencies]
-protocol = { path = "../protocol", features = ["server", "grpc"] }
+protocol = { path = "../protocol", features = ["server", "connect"] }
 storage = { path = "../storage" }
 tokio = { version = "1", default-features = false, features = [
     "macros",
@@ -46,9 +49,8 @@ rkyv = ["dep:rkyv", "party/rkyv", "x3dh/rkyv", "xeddsa/rkyv"]
 prost = [
     "dep:prost",
     "dep:prost-build",
-    "dep:zeroize",
     "party/prost",
     "x3dh/prost",
 ]
-# gRPC clients, see `protocol::grpc`.
-grpc = ["protocol/grpc"]
+# Connect clients over any HTTP client, see `protocol::connect`.
+connect = ["protocol/connect"]

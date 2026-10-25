@@ -6,6 +6,8 @@ Parameters: curve X25519, hash SHA-256, info `"x3dh.v1"`, HKDF salt of 32 zero b
 
 Bob's [`LocalPrekeys`] keeps the private keys of the last [`KEPT_GENERATIONS`] generations of prekeys only, deleting older ones so they cannot reveal anything later.
 
+Nothing in an initial message shows that it is Alice's: anyone can send one claiming to be. Only Alice can encrypt with the agreement, though, as it takes her identity key's private key, so the X3DH spec has her initial message carry a first ciphertext, and Bob checks that it decrypts. [`LocalPrekeys::accept`] therefore changes nothing; once the ciphertext decrypts, [`LocalPrekeys::confirm`] uses up the one-time prekey and keeps the message from being accepted again, also one without a one-time prekey sent again. Nothing is signed, so neither can prove to others that they talked.
+
 # Features
 
 - **serde**, **rkyv**: derive their traits on [`PrekeyBundle`] and [`InitialMessage`], and on [`LocalPrekeys`], which serializes with its private keys, to keep them between runs.
@@ -34,7 +36,8 @@ let bundle = PrekeyBundle {
 
 // Alice starts the session and sends `message` to Bob.
 let (message, alice_agreement) = bundle.initiate(&alice, &bob_key).unwrap();
-// Bob accepts it.
+// Bob accepts it, and once something Alice encrypted with the agreement decrypts, confirms it.
 let (bob_agreement, _signed_prekey) = prekeys.accept(&bob, &alice_key, &message).unwrap();
 assert_eq!(*alice_agreement.secret_key, *bob_agreement.secret_key);
+prekeys.confirm(&message).unwrap();
 ```

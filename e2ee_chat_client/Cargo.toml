@@ -18,7 +18,11 @@ crossterm = "0.29"
 ratatui = { version = "0.30" }
 unicode-width = "0.2"
 tui-textarea-2 = "0.13.2"
-session = { path = "../session", features = ["grpc"] }
+reqwest = { version = "0.13", default-features = false, features = ["http2", "rustls-no-provider"] }
+# The TLS provider reqwest uses: ring, rather than reqwest's default aws-lc-rs, which needs a C
+# toolchain.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+session = { path = "../session", features = ["connect"] }
 tokio = { version = "1", default-features = false, features = [
     "macros",
     "rt-multi-thread",

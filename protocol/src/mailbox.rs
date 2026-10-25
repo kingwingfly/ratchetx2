@@ -44,8 +44,9 @@ mod server {
     impl Default for MailboxLimits {
         fn default() -> Self {
             Self {
-                // Below gRPC's default limit of 4 MiB per request or response, leaving room
-                // for the rest of a push request or a fetch response.
+                // Below 4 MiB per request or response, a common limit of transports (gRPC's
+                // default, the Worker's), leaving room for the rest of a push request or a fetch
+                // response.
                 max_message_size: (4 << 20) - (64 << 10),
                 max_fetch: 100,
             }

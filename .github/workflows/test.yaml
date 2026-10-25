@@ -34,8 +34,9 @@ jobs:
         if: steps.cache-cargo-restore.outputs.cache-hit != 'true'
         run: rustup component add clippy
 
-      - name: Install Protoc
-        run: sudo apt install -y protobuf-compiler
+      # clang and llvm-ar compile the C grammars of the web client's code previews to WebAssembly.
+      - name: Install Protoc, clang and LLVM
+        run: sudo apt install -y protobuf-compiler clang llvm
 
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown

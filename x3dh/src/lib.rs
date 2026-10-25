@@ -10,7 +10,7 @@ pub mod error;
 pub mod proto;
 
 use core::fmt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 pub use error::{Error, ErrorKind, Result};
 use hkdf::Hkdf;
@@ -109,6 +109,12 @@ pub struct PublishedPrekeys {
 /// [`KEPT_GENERATIONS`] are kept, so a deleted private key cannot reveal anything later. An
 /// initial message using an older generation can no longer be accepted.
 ///
+/// Accepting an initial message takes two steps: [`accept`](Self::accept) agrees on it without
+/// changing anything, and once the caller has checked that it is Alice's, e.g. as the first
+/// message of the session decrypts, [`confirm`](Self::confirm) uses up its one-time prekey and
+/// keeps it from being accepted again. So an initial message anyone could have sent, claiming
+/// to be Alice's, uses up nothing.
+///
 /// With the `serde` or `rkyv` feature, it serializes with its private keys, and with `prost` it
 /// converts to and from `proto::LocalPrekeys`: keep the output secret.
 #[derive(Default)]
@@ -139,6 +145,9 @@ struct Generation {
         rkyv(with = rkyv::with::MapKV<rkyv::with::Identity, StaticSecretDef>)
     )]
     one_time: HashMap<PublicKey, StaticSecret>,
+    /// The ephemeral keys of the initial messages confirmed, so that none is accepted twice, e.g.
+    /// one without a one-time prekey sent again. They go with the generation.
+    confirmed: HashSet<PublicKey>,
 }
 
 /// Archives a [`StaticSecret`] as its bytes.
@@ -232,6 +241,7 @@ impl LocalPrekeys {
             signed_prekey,
             signed_secret,
             one_time,
+            confirmed: HashSet::new(),
         });
         PublishedPrekeys {
             signed_prekey,
@@ -240,13 +250,18 @@ impl LocalPrekeys {
         }
     }
 
-    /// Bob's side: accept Alice's initial message, which must come from `alice_identity_key`.
+    /// Bob's side: agree on Alice's initial message, which must come from `alice_identity_key`,
+    /// without using it up.
     ///
-    /// Consumes the one-time prekey it uses, which must be of the same generation as its signed
-    /// prekey. Returns the agreement and the private key of the signed prekey it uses, which is
-    /// Bob's first ratchet key pair.
+    /// Its one-time prekey must be of the same generation as its signed prekey. Returns the
+    /// agreement and the private key of the signed prekey it uses, which is Bob's first ratchet
+    /// key pair.
+    ///
+    /// Anyone can send an initial message claiming to be Alice's, and nothing in it shows that
+    /// it is: only Alice can encrypt with the agreement, as it takes her identity key's private
+    /// key. Once something encrypted with it decrypts, [`confirm`](Self::confirm) the message.
     pub fn accept(
-        &mut self,
+        &self,
         identity: &XEdDSAPrivateKey,
         alice_identity_key: &PublicKey,
         message: &InitialMessage,
@@ -254,11 +269,7 @@ impl LocalPrekeys {
         if message.identity_key != *alice_identity_key {
             return Err(ErrorKind::UnexpectedIdentity.into());
         }
-        let generation = self
-            .generations
-            .iter_mut()
-            .find(|generation| generation.signed_prekey == message.signed_prekey)
-            .ok_or(ErrorKind::PrekeyNotFound)?;
+        let generation = &self.generations[self.generation(message)?];
 
         let mut key_material = KeyMaterial::new();
         key_material
@@ -269,9 +280,9 @@ impl LocalPrekeys {
         if let Some(one_time_prekey) = &message.one_time_prekey {
             let secret = generation
                 .one_time
-                .remove(one_time_prekey)
+                .get(one_time_prekey)
                 .ok_or(ErrorKind::OneTimePrekeyNotFound)?;
-            key_material.extend(diffie_hellman(&secret, &message.ephemeral_key)?.as_bytes());
+            key_material.extend(diffie_hellman(secret, &message.ephemeral_key)?.as_bytes());
         }
 
         let agreement = key_material.agree(
@@ -279,6 +290,39 @@ impl LocalPrekeys {
             &identity.compute_public_key().to_bytes(),
         );
         Ok((agreement, generation.signed_secret.clone()))
+    }
+
+    /// Use up an initial message [accepted](Self::accept) and shown to be Alice's: delete the
+    /// private key of its one-time prekey, and keep it from being accepted again.
+    ///
+    /// Fails if it cannot be accepted any more, e.g. it was confirmed already.
+    pub fn confirm(&mut self, message: &InitialMessage) -> Result<()> {
+        let index = self.generation(message)?;
+        let generation = &mut self.generations[index];
+        if let Some(one_time_prekey) = &message.one_time_prekey {
+            generation.one_time.remove(one_time_prekey);
+        }
+        generation.confirmed.insert(message.ephemeral_key);
+        Ok(())
+    }
+
+    /// The index of the generation of `message`'s prekeys, if it can be accepted.
+    fn generation(&self, message: &InitialMessage) -> Result<usize> {
+        let index = self
+            .generations
+            .iter()
+            .position(|generation| generation.signed_prekey == message.signed_prekey)
+            .ok_or(ErrorKind::PrekeyNotFound)?;
+        let generation = &self.generations[index];
+        if generation.confirmed.contains(&message.ephemeral_key) {
+            return Err(ErrorKind::Replayed.into());
+        }
+        if let Some(one_time_prekey) = &message.one_time_prekey
+            && !generation.one_time.contains_key(one_time_prekey)
+        {
+            return Err(ErrorKind::OneTimePrekeyNotFound.into());
+        }
+        Ok(index)
     }
 }
 
@@ -298,6 +342,11 @@ impl From<&LocalPrekeys> for proto::LocalPrekeys {
                         public_key: public_key.to_vec(),
                         secret: secret.to_bytes().to_vec(),
                     })
+                    .collect(),
+                confirmed_ephemeral_keys: generation
+                    .confirmed
+                    .iter()
+                    .map(|ephemeral_key| ephemeral_key.to_vec())
                     .collect(),
             })
             .collect();
@@ -333,6 +382,11 @@ impl TryFrom<&proto::LocalPrekeys> for LocalPrekeys {
                                 StaticSecret::from(key(&one_time.secret)?),
                             ))
                         })
+                        .collect::<Result<_>>()?,
+                    confirmed: generation
+                        .confirmed_ephemeral_keys
+                        .iter()
+                        .map(|ephemeral_key| key(ephemeral_key))
                         .collect::<Result<_>>()?,
                 })
             })
@@ -449,7 +503,7 @@ mod test {
     fn alice_and_bob_agree() {
         for one_time_count in [0, 1] {
             let alice = XEdDSAPrivateKey::generate();
-            let (bob, mut prekeys, bundle) = bob_setup(one_time_count);
+            let (bob, prekeys, bundle) = bob_setup(one_time_count);
             let alice_key = public_key(&alice);
             let bob_key = public_key(&bob);
 
@@ -481,6 +535,42 @@ mod test {
         };
         let error = low_order.initiate(&alice, &bob_key).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidPublicKey);
+    }
+
+    #[test]
+    fn only_confirming_uses_up() {
+        let alice = XEdDSAPrivateKey::generate();
+        let (bob, mut prekeys, bundle) = bob_setup(1);
+        let alice_key = public_key(&alice);
+        let bob_key = public_key(&bob);
+        let (message, _) = bundle.initiate(&alice, &bob_key).unwrap();
+
+        // Accepting changes nothing, so a message that turns out not to be Alice's uses up
+        // nothing.
+        prekeys.accept(&bob, &alice_key, &message).unwrap();
+        prekeys.accept(&bob, &alice_key, &message).unwrap();
+        prekeys.confirm(&message).unwrap();
+        // Confirmed, it cannot be accepted again, and its one-time prekey is gone.
+        let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Replayed);
+        let (other, _) = bundle.initiate(&alice, &bob_key).unwrap();
+        let error = prekeys.accept(&bob, &alice_key, &other).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::OneTimePrekeyNotFound);
+
+        // Without a one-time prekey, one sent again is refused too.
+        let without_one_time_prekey = PrekeyBundle {
+            one_time_prekey: None,
+            ..bundle
+        };
+        let (message, _) = without_one_time_prekey.initiate(&alice, &bob_key).unwrap();
+        prekeys.accept(&bob, &alice_key, &message).unwrap();
+        prekeys.confirm(&message).unwrap();
+        let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
+        assert_eq!(error.kind(), ErrorKind::Replayed);
+        assert_eq!(
+            prekeys.confirm(&message).unwrap_err().kind(),
+            ErrorKind::Replayed
+        );
     }
 
     #[test]
@@ -542,12 +632,25 @@ mod test {
             signed_prekey_signature: second.signed_prekey_signature,
             one_time_prekey: second.one_time_prekeys.get(1).copied(),
         };
+        // And one confirmed before saving, which cannot be accepted again.
+        let (confirmed, _) = PrekeyBundle {
+            one_time_prekey: None,
+            ..second.clone()
+        }
+        .initiate(&alice, &public_key(&bob))
+        .unwrap();
+        prekeys.confirm(&confirmed).unwrap();
         let initiated = [first, second].map(|bundle| bundle.initiate(&alice, &public_key(&bob)));
-        for mut restored in restored(&prekeys) {
+        for restored in restored(&prekeys) {
             for (message, agreement) in initiated.iter().map(|result| result.as_ref().unwrap()) {
                 let (accepted, _) = restored.accept(&bob, &public_key(&alice), message).unwrap();
                 assert_eq!(*accepted.secret_key, *agreement.secret_key);
             }
+            let error = restored
+                .accept(&bob, &public_key(&alice), &confirmed)
+                .err()
+                .unwrap();
+            assert_eq!(error.kind(), ErrorKind::Replayed);
         }
     }
 }

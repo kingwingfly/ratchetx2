@@ -18,8 +18,11 @@ message ClientState {
 
 // A session's state.
 message SessionState {
-  // The double-ratchet party.
+  // The double-ratchet party messages are sent with: the one the peer last sent with.
   party.v1.Party party = 1;
+  // The parties of the other sessions with the peer, latest first: messages that `party`
+  // cannot decrypt are tried on them, and the one that decrypts takes over.
+  repeated party.v1.Party others = 5;
   // This client's identity key (32 bytes).
   bytes me = 2;
   // The peer's identity key (32 bytes).
