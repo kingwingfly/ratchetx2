@@ -7,17 +7,13 @@
 //!
 //! A subscription is signed like the handshake's requests: the signature covers
 //! `"notify.v1/subscribe"` ‖ identity key ‖ timestamp (u64, little-endian). The server takes it
-//! only within [`MAX_CLOCK_SKEW`] of its own clock.
+//! only within [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of its own clock.
 
 use bytes::Bytes;
 use x3dh::PublicKey;
-use xeddsa::{XEdDSAPrivateKey, XEdDSAPublicKey};
+use xeddsa::XEdDSAPrivateKey;
 
-use crate::{
-    MAX_CLOCK_SKEW,
-    error::{ErrorKind, Result},
-    fixed,
-};
+use crate::{error::Result, verify_recent};
 
 #[allow(missing_docs)]
 mod proto {
@@ -39,17 +35,16 @@ impl SubscribeRequest {
     }
 
     /// The identity key subscribing, once the signature by that key verifies and the timestamp
-    /// is within [`MAX_CLOCK_SKEW`] of `now`, in milliseconds since the Unix epoch.
+    /// is within [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of `now`, in milliseconds since the
+    /// Unix epoch.
     pub fn verify(&self, now: u64) -> Result<PublicKey> {
-        let identity_key = fixed(&self.identity_key)?;
-        XEdDSAPublicKey::new(&identity_key)?.verify(
-            subscribe_message(&identity_key, self.timestamp),
+        verify_recent(
+            &self.identity_key,
             &self.signature,
-        )?;
-        if self.timestamp.abs_diff(now) > MAX_CLOCK_SKEW {
-            return Err(ErrorKind::StaleTimestamp.into());
-        }
-        Ok(identity_key)
+            self.timestamp,
+            now,
+            |identity_key| subscribe_message(identity_key, self.timestamp),
+        )
     }
 }
 
@@ -80,6 +75,7 @@ impl Notification {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::{MAX_CLOCK_SKEW, error::ErrorKind};
 
     #[test]
     fn sign_and_verify() {

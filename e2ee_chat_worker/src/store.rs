@@ -475,28 +475,37 @@ impl LocalAttachmentStore for Store {
             .transpose()
     }
 
+    /// The row is looked at again once the chunk is in R2: if the attachment was deleted
+    /// meanwhile, e.g. cancelled while the chunk was on its way, the chunk goes too, as no row
+    /// would name it for expiry to delete.
     async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
+        let object = chunk_object(id, index);
         self.bucket
-            .put(chunk_object(id, index), data.to_vec())
+            .put(&object, data.to_vec())
             .execute()
             .await
             .map_err(unavailable)?;
+        if self.attachment(id).await?.is_none() {
+            self.bucket.delete(&object).await.map_err(unavailable)?;
+            return Err(Error::new(ErrorKind::Other, "the attachment was deleted"));
+        }
         Ok(())
     }
 
     /// The chunks go first, so that a failure leaves the row, which expires, rather than chunks
-    /// no row names.
+    /// no row names; and again once the row is gone, as a chunk put meanwhile, which found the
+    /// row still there, would stay.
     async fn delete_attachment(&self, id: &AttachmentId) -> Result<()> {
         let Some(attachment) = self.attachment(id).await? else {
             return Ok(());
         };
-        self.delete_chunks(std::slice::from_ref(&attachment))
-            .await?;
+        let attachment = std::slice::from_ref(&attachment);
+        self.delete_chunks(attachment).await?;
         self.prepare("DELETE FROM attachments WHERE id = ?1", &[blob(id)])?
             .run()
             .await
             .map_err(unavailable)?;
-        Ok(())
+        self.delete_chunks(attachment).await
     }
 
     async fn chunk(&self, id: &AttachmentId, index: u32) -> Result<Option<Bytes>> {
@@ -647,7 +656,7 @@ fn integer(value: u64) -> JsValue {
 }
 
 /// Lowercase hex.
-fn hex(bytes: &[u8]) -> String {
+pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

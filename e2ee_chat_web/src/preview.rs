@@ -8,6 +8,7 @@
 
 use std::io::{Cursor, Read};
 
+pub use e2ee_chat_preview::audio::Tags;
 use e2ee_chat_preview::language::{self, Language};
 use flate2::read::GzDecoder;
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
@@ -21,6 +22,9 @@ pub const HIGHLIGHT_MAX: usize = 1_000_000;
 pub const ROWS_MAX: usize = 1_000;
 /// ... and entries of an archive.
 pub const ENTRIES_MAX: usize = 10_000;
+/// The most bytes a gzipped tar archive is unpacked to, to list it: listing reads through every
+/// file in it, on the page's thread, and a small file can unpack to gigabytes.
+pub const UNPACKED_MAX: u64 = 64 << 20;
 
 /// Office documents, which show no preview, not even as the archives some of them are.
 const OFFICE: [&str; 13] = [
@@ -48,7 +52,7 @@ pub enum Kind {
         language: Option<&'static str>,
     },
     Table(Table),
-    Archive(Vec<Entry>),
+    Archive(Listing),
     /// Contacts or events.
     Cards(Vec<Card>),
     Diff(Vec<(DiffLine, String)>),
@@ -61,6 +65,13 @@ pub struct Table {
     pub rows: Vec<Vec<String>>,
     /// Whether there are more rows than [`ROWS_MAX`], which do not show.
     pub more: bool,
+}
+
+/// The entries of an archive, all of them, or the first, if listing more would take too long.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub entries: Vec<Entry>,
+    pub complete: bool,
 }
 
 /// A file or directory in an archive.
@@ -125,12 +136,15 @@ pub fn kind(name: &str, mime: &str, data: &[u8]) -> Kind {
         "json" => {
             let pretty = serde_json::from_str::<serde_json::Value>(text)
                 .and_then(|value| serde_json::to_string_pretty(&value));
-            code(pretty.unwrap_or_else(|_| text.to_string()), language::named("json"))
+            code(
+                pretty.unwrap_or_else(|_| text.to_string()),
+                language::named("json"),
+            )
         }
         "diff" | "patch" => Kind::Diff(diff(text)),
         "vcf" | "vcard" => Kind::Cards(contacts(text)),
         "ics" | "ical" => Kind::Cards(events(text)),
-        "svg" if text.contains("<svg") => Kind::Image("image/svg+xml"),
+        // An SVG image showed already, as `sniff` found it; any other `.svg` shows as XML.
         _ => code(text.to_string(), language::of_file(name)),
     }
 }
@@ -222,16 +236,18 @@ fn sniff(name: &str, data: &[u8]) -> Option<Kind> {
             Kind::Audio("audio/mpeg")
         }
         [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] => Kind::Archive(zip(data)?),
-        [0x1F, 0x8B, ..] => Kind::Archive(tar(GzDecoder::new(data))?),
-        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(tar(data)?),
+        [0x1F, 0x8B, ..] => Kind::Archive(tar(GzDecoder::new(data), UNPACKED_MAX)?),
+        // Already as large as it gets, and listed as fast as it is read.
+        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(tar(data, u64::MAX)?),
         _ => return None,
     })
 }
 
-/// The entries of the ZIP archive `data`, at most [`ENTRIES_MAX`].
-fn zip(data: &[u8]) -> Option<Vec<Entry>> {
+/// The entries of the ZIP archive `data`, at most [`ENTRIES_MAX`]. They come from its central
+/// directory, unpacking nothing.
+fn zip(data: &[u8]) -> Option<Listing> {
     let mut archive = ::zip::ZipArchive::new(Cursor::new(data)).ok()?;
-    (0..archive.len().min(ENTRIES_MAX))
+    let entries = (0..archive.len().min(ENTRIES_MAX))
         .map(|index| {
             let file = archive.by_index_raw(index).ok()?;
             Some(Entry {
@@ -240,25 +256,40 @@ fn zip(data: &[u8]) -> Option<Vec<Entry>> {
                 directory: file.is_dir(),
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    Some(Listing {
+        complete: entries.len() == archive.len(),
+        entries,
+    })
 }
 
-/// The entries of the tar archive `reader` reads, at most [`ENTRIES_MAX`].
-fn tar(reader: impl Read) -> Option<Vec<Entry>> {
-    let mut archive = ::tar::Archive::new(reader);
-    archive
-        .entries()
-        .ok()?
-        .take(ENTRIES_MAX)
-        .map(|entry| {
-            let entry = entry.ok()?;
+/// The entries of the tar archive `reader` reads, at most [`ENTRIES_MAX`], from no more than
+/// its first `limit` bytes. Listing an entry reads through the one before it, so the listing
+/// stops at the entry that crosses the limit, or that is damaged. Not an archive, if not even
+/// its first entry reads.
+fn tar(reader: impl Read, limit: u64) -> Option<Listing> {
+    let mut archive = ::tar::Archive::new(reader.take(limit));
+    let mut entries = Vec::new();
+    let mut complete = true;
+    for entry in archive.entries().ok()? {
+        let entry = entry.ok().and_then(|entry| {
             Some(Entry {
                 path: entry.path().ok()?.to_string_lossy().into_owned(),
                 size: entry.header().size().ok()?,
                 directory: entry.header().entry_type().is_dir(),
             })
-        })
-        .collect()
+        });
+        match entry {
+            Some(entry) if entries.len() < ENTRIES_MAX => entries.push(entry),
+            _ => {
+                complete = false;
+                break;
+            }
+        }
+    }
+    // Read up to the limit: what came after it went unread.
+    complete &= archive.into_inner().limit() > 0;
+    (complete || !entries.is_empty()).then_some(Listing { entries, complete })
 }
 
 /// Markdown `source` as HTML: GitHub's flavour, with maths, as MathML. Raw HTML shows as
@@ -763,18 +794,21 @@ mod test {
         let data = zip.finish().unwrap().into_inner();
         assert_eq!(
             kind("a.zip", "", &data),
-            Kind::Archive(vec![
-                Entry {
-                    path: "docs/".into(),
-                    size: 0,
-                    directory: true
-                },
-                Entry {
-                    path: "docs/a.txt".into(),
-                    size: 5,
-                    directory: false
-                },
-            ])
+            Kind::Archive(Listing {
+                entries: vec![
+                    Entry {
+                        path: "docs/".into(),
+                        size: 0,
+                        directory: true
+                    },
+                    Entry {
+                        path: "docs/a.txt".into(),
+                        size: 5,
+                        directory: false
+                    },
+                ],
+                complete: true,
+            })
         );
 
         let mut tar = ::tar::Builder::new(vec![]);
@@ -786,12 +820,60 @@ mod test {
         let tar = tar.into_inner().unwrap();
         let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
         gz.write_all(&tar).unwrap();
-        let expected = Kind::Archive(vec![Entry {
-            path: "a.txt".into(),
-            size: 5,
-            directory: false,
-        }]);
+        let expected = Kind::Archive(Listing {
+            entries: vec![Entry {
+                path: "a.txt".into(),
+                size: 5,
+                directory: false,
+            }],
+            complete: true,
+        });
         assert_eq!(kind("a.tar.gz", "", &gz.finish().unwrap()), expected);
         assert_eq!(kind("a.tar", "", &tar), expected);
+    }
+
+    #[test]
+    fn listing_a_tar_stops_at_its_limit() {
+        // A small file, one that unpacks to 4 MiB of zeros, and another after it.
+        let mut builder = ::tar::Builder::new(vec![]);
+        for (name, size) in [("a.txt", 5), ("zeros", 4 << 20), ("b.txt", 5)] {
+            let mut header = ::tar::Header::new_gnu();
+            header.set_size(size);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, std::io::repeat(0).take(size))
+                .unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+        gz.write_all(&builder.into_inner().unwrap()).unwrap();
+        let gz = gz.finish().unwrap();
+        assert!(gz.len() < 64 << 10, "{} bytes", gz.len());
+        let names = |listing: &Listing| -> Vec<String> {
+            listing
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect()
+        };
+
+        // Within the limit, all of it.
+        let whole = tar(GzDecoder::new(&gz[..]), 8 << 20).unwrap();
+        assert_eq!(names(&whole), ["a.txt", "zeros", "b.txt"]);
+        assert!(whole.complete);
+
+        // Past it, what came before, and that there is more.
+        let cut = tar(GzDecoder::new(&gz[..]), 1 << 20).unwrap();
+        assert_eq!(names(&cut), ["a.txt", "zeros"]);
+        assert!(!cut.complete);
+    }
+
+    #[test]
+    fn gzip_that_is_not_a_tar_lists_nothing() {
+        let mut gz = flate2::write::GzEncoder::new(vec![], flate2::Compression::default());
+        gz.write_all(&[0xFF; 4096]).unwrap();
+        assert_eq!(
+            tar(GzDecoder::new(&gz.finish().unwrap()[..]), UNPACKED_MAX),
+            None
+        );
     }
 }

@@ -10,8 +10,8 @@ use std::{
     rc::Rc,
 };
 
-use e2ee_chat_preview::{READY, Worker, language::Language};
-use js_sys::{Array, Float64Array, Function, Promise, Uint8Array, Uint8ClampedArray};
+use e2ee_chat_preview::{READY, Worker, audio::Tags, language::Language};
+use js_sys::{Array, Float64Array, Function, Promise, Uint8Array, Uint8ClampedArray, Uint32Array};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Event, ImageData, MessageEvent};
@@ -167,7 +167,9 @@ async fn call(
         request.push(argument);
     }
     let sent = match &transfer {
-        Some(transfer) => running.worker.post_message_with_transfer(&request, transfer),
+        Some(transfer) => running
+            .worker
+            .post_message_with_transfer(&request, transfer),
         None => running.worker.post_message(&request),
     };
     if let Err(e) = sent {
@@ -200,11 +202,17 @@ async fn call(
 /// `text`, highlighted as `language`, as HTML: escaped text in spans.
 pub async fn highlight(language: &Language, text: &str) -> Result<String, String> {
     let arguments = [language.name.into(), text.into()];
-    call(Worker::Code(language.group), None, "highlight", &arguments, None)
-        .await?
-        .0
-        .as_string()
-        .ok_or_else(|| "no HTML".to_string())
+    call(
+        Worker::Code(language.group),
+        None,
+        "highlight",
+        &arguments,
+        None,
+    )
+    .await?
+    .0
+    .as_string()
+    .ok_or_else(|| "no HTML".to_string())
 }
 
 /// The Mermaid diagram `source`, as SVG.
@@ -214,6 +222,49 @@ pub async fn diagram(source: &str) -> Result<String, String> {
         .0
         .as_string()
         .ok_or_else(|| "no SVG".to_string())
+}
+
+/// What the tags of the audio `data` say of it, if it has any.
+pub async fn audio_tags(data: &[u8]) -> Result<Option<Tags>, String> {
+    let bytes = Uint8Array::from(data);
+    let transfer = Array::of1(&bytes.buffer());
+    let (reply, _) = call(Worker::Audio, None, "tags", &[bytes.into()], Some(transfer)).await?;
+    if reply.is_null() {
+        return Ok(None);
+    }
+    let reply = Array::from(&reply);
+    let cover = reply
+        .get(4)
+        .as_string()
+        .zip(reply.get(5).dyn_into::<Uint8Array>().ok())
+        .map(|(mime, cover)| (mime, cover.to_vec()));
+    Ok(Some(Tags {
+        title: reply.get(0).as_string(),
+        artist: reply.get(1).as_string(),
+        album: reply.get(2).as_string(),
+        year: reply.get(3).as_f64().map(|year| year as u16),
+        cover,
+    }))
+}
+
+/// The matches of `pattern` in `text`, a regular expression unless `regex` says otherwise,
+/// ignoring case unless `case` says otherwise: each one's start and end, in UTF-16 code units,
+/// and whether there are more than these. An invalid pattern says why.
+pub async fn find(
+    text: &str,
+    pattern: &str,
+    case: bool,
+    regex: bool,
+) -> Result<(Vec<(u32, u32)>, bool), String> {
+    let arguments = [text.into(), pattern.into(), case.into(), regex.into()];
+    let (reply, _) = call(Worker::Search, None, "find", &arguments, None).await?;
+    let reply = Array::from(&reply);
+    let flat = Uint32Array::new(&reply.get(0)).to_vec();
+    let (pairs, _) = flat.as_chunks::<2>();
+    Ok((
+        pairs.iter().map(|&[start, end]| (start, end)).collect(),
+        reply.get(1).is_truthy(),
+    ))
 }
 
 /// A PDF document a worker opened.
@@ -234,7 +285,10 @@ pub async fn open_pdf(data: &[u8]) -> Result<(Pdf, Vec<(f64, f64)>), String> {
     let (pages, _) = sizes.as_chunks::<2>();
     Ok((
         Pdf { start, id },
-        pages.iter().map(|&[width, height]| (width, height)).collect(),
+        pages
+            .iter()
+            .map(|&[width, height]| (width, height))
+            .collect(),
     ))
 }
 
@@ -254,6 +308,13 @@ pub async fn render_pdf(pdf: Pdf, index: usize, width: u32) -> Result<ImageData,
 /// Free `pdf`, if its worker still runs.
 pub fn close_pdf(pdf: Pdf) {
     spawn_local(async move {
-        let _ = call(Worker::Pdf, Some(pdf.start), "close", &[pdf.id.into()], None).await;
+        let _ = call(
+            Worker::Pdf,
+            Some(pdf.start),
+            "close",
+            &[pdf.id.into()],
+            None,
+        )
+        .await;
     });
 }

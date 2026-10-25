@@ -58,9 +58,10 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .btn.icon { justify-content: center; width: 36px; height: 36px; padding: 0; }
 .btn.icon.small { width: 30px; height: 30px; }
 .btn.icon.done { color: var(--accent); border-color: var(--accent-line); }
-/* The sync button: its arrows, which turn while it syncs, and the link's dot in its corner. */
-.sync { position: relative; color: var(--muted); }
-.sync .dot { position: absolute; top: 6px; right: 6px; width: 7px; height: 7px; }
+/* The sync button: its arrows, which turn while it syncs, in red while the server cannot be
+   reached. */
+.sync { color: var(--muted); }
+.sync.offline { color: var(--danger); }
 @media (prefers-reduced-motion: no-preference) {
   .sync.syncing .glyph { animation: turn 1s linear infinite; }
 }
@@ -134,7 +135,6 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .composer textarea { flex: 1; min-width: 0; resize: none; max-height: 168px; padding: 9px 12px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--sunken); color: var(--text-bright); line-height: 1.45; }
 .composer textarea:focus { outline: none; border-color: var(--accent-line); }
 .composer textarea::placeholder { color: var(--faint); }
-.composer .busy { align-self: center; font-size: 12px; color: var(--muted); }
 /* As tall as a line of the text box. */
 .composer .btn.icon { width: 40px; height: 40px; }
 
@@ -178,11 +178,45 @@ dialog::backdrop { background: #020706d9; backdrop-filter: blur(4px); }
 .viewer-bar { height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--line); font-size: 13px; }
 .viewer-bar span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .viewer-bar div { display: flex; gap: 8px; flex: none; }
+/* The search box in the viewer's bar; its matches are marked without changing the page. */
+.search { display: flex; align-items: center; gap: 4px; }
+.search input { width: 200px; padding: 4px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--sunken); color: var(--text-bright); font-size: 12px; }
+.search input:focus { outline: none; border-color: var(--accent-line); }
+.search.invalid input { border-color: var(--danger-line); }
+.search-count { min-width: 60px; text-align: center; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.search.invalid .search-count { color: var(--danger); }
+.btn.toggle { font-family: var(--mono); font-size: 11px; }
+.btn.toggle.on { color: var(--accent); border-color: var(--accent-line); background: var(--raised-strong); }
+::highlight(search) { background-color: #ffcb6b40; }
+::highlight(search-current) { background-color: #ffcb6b; color: #0b0f0e; }
+@media (max-width: 600px) {
+  .search .toggle { display: none; }
+  .search input { width: 110px; }
+  .search-count { min-width: 44px; }
+}
 .viewer-content { height: calc(100% - 52px); overflow: auto; }
 /* Of a definite height, so that what it shows, portrait or landscape, scales down to fit whole. */
 .media { height: 100%; display: flex; align-items: center; justify-content: center; padding: 24px; }
 .media img, .media video { display: block; min-width: 0; min-height: 0; max-width: 100%; max-height: 100%; object-fit: contain; }
 .media audio { width: min(560px, 90%); }
+/* A track: its cover, what its tags say, and the player. */
+.track { width: min(420px, 100%); display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; }
+.track .cover { width: min(280px, 100%); aspect-ratio: 1; object-fit: cover; border: 1px solid var(--line); border-radius: 10px; background: var(--sunken); box-shadow: 0 10px 40px #0008; }
+.track-text { display: flex; flex-direction: column; gap: 2px; max-width: 100%; overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
+.track-text strong { color: var(--text-bright); font-size: 17px; font-weight: 600; }
+.track-text .artist { color: var(--text); font-size: 14px; }
+.track audio { width: 100%; }
+/* An attachment being opened: a bar of how much is decrypted, its sizes in figures of one width,
+   so that nothing moves as they change. */
+.opening { width: min(420px, 90%); display: flex; flex-direction: column; gap: 10px; }
+.bar { position: relative; height: 6px; border-radius: 3px; background: var(--raised-strong); overflow: hidden; }
+/* A light that sweeps along it while it fetches, as it fills only a chunk at a time. */
+@media (prefers-reduced-motion: no-preference) {
+  .bar::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, transparent, #9ae6b540, transparent); transform: translateX(-100%); animation: sweep 1.4s ease-in-out infinite; }
+}
+@keyframes sweep { to { transform: translateX(100%); } }
+.bar-fill { height: 100%; background: var(--accent-fill); transform-origin: left; transition: transform .2s; }
+.opening-note { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .no-preview { color: var(--muted); }
 
 /* Previews: code, Markdown, slides, PDFs, tables, archives, cards. */

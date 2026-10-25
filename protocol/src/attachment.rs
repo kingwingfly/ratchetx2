@@ -6,23 +6,19 @@
 //! Starting an upload is signed like the handshake's requests: the signature covers
 //! `"attachment.v1/start-upload"` ‖ identity key ‖ number of chunks (u32, little-endian) ‖
 //! timestamp (u64, little-endian), and the server takes it only within
-//! [`MAX_CLOCK_SKEW`] of its own clock. It returns a random upload token,
-//! which uploading the chunks and cancelling the upload take, and a random ID, which downloading
-//! them takes.
+//! [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of its own clock. It returns a random upload
+//! token, which uploading the chunks and cancelling the upload take, and a random ID, which
+//! downloading them takes.
 //!
 //! An attachment can be downloaded while it is uploaded: a chunk not uploaded yet is a
 //! [`GetChunkResponse`] that says so, while an attachment that is gone, expired or cancelled,
-//! fails with [`ErrorKind::NotFound`].
+//! fails with [`ErrorKind::NotFound`](crate::ErrorKind::NotFound).
 
 use bytes::Bytes;
 use x3dh::PublicKey;
-use xeddsa::{XEdDSAPrivateKey, XEdDSAPublicKey};
+use xeddsa::XEdDSAPrivateKey;
 
-use crate::{
-    MAX_CLOCK_SKEW,
-    error::{ErrorKind, Result},
-    fixed,
-};
+use crate::{error::Result, verify_recent};
 
 #[allow(missing_docs)]
 mod proto {
@@ -69,17 +65,16 @@ impl StartUploadRequest {
     }
 
     /// The identity key uploading, once the signature by that key verifies and the timestamp is
-    /// within [`MAX_CLOCK_SKEW`] of `now`, in milliseconds since the Unix epoch.
+    /// within [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of `now`, in milliseconds since the Unix
+    /// epoch.
     pub fn verify(&self, now: u64) -> Result<PublicKey> {
-        let identity_key = fixed(&self.identity_key)?;
-        XEdDSAPublicKey::new(&identity_key)?.verify(
-            start_upload_message(&identity_key, self.chunks, self.timestamp),
+        verify_recent(
+            &self.identity_key,
             &self.signature,
-        )?;
-        if self.timestamp.abs_diff(now) > MAX_CLOCK_SKEW {
-            return Err(ErrorKind::StaleTimestamp.into());
-        }
-        Ok(identity_key)
+            self.timestamp,
+            now,
+            |identity_key| start_upload_message(identity_key, self.chunks, self.timestamp),
+        )
     }
 }
 
@@ -99,6 +94,7 @@ mod server {
     use storage::{LocalAttachmentStore, StoredAttachment};
 
     use super::*;
+    use crate::{error::ErrorKind, fixed};
 
     /// Limits of an [`AttachmentServer`].
     #[derive(Debug, Clone, Copy)]
@@ -330,6 +326,7 @@ mod server {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::{MAX_CLOCK_SKEW, error::ErrorKind};
 
     #[test]
     fn sign_and_verify() {

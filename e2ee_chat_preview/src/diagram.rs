@@ -24,14 +24,16 @@ fn sized(svg: &str) -> String {
         return svg.to_string();
     };
     let (root, rest) = svg.split_at(end);
-    let Some([_, _, width, height]) = attribute(root, "viewBox").and_then(|view| -> Option<[f64; 4]> {
-        let numbers: Vec<f64> = view
-            .split([' ', ','])
-            .filter(|n| !n.is_empty())
-            .filter_map(|n| n.parse().ok())
-            .collect();
-        numbers.try_into().ok()
-    }) else {
+    let Some([_, _, width, height]) =
+        attribute(root, "viewBox").and_then(|view| -> Option<[f64; 4]> {
+            let numbers: Vec<f64> = view
+                .split([' ', ','])
+                .filter(|n| !n.is_empty())
+                .filter_map(|n| n.parse().ok())
+                .collect();
+            numbers.try_into().ok()
+        })
+    else {
         return svg.to_string();
     };
     let mut root = root.to_string();
@@ -78,7 +80,9 @@ mod tests {
     #[test]
     fn sizes_from_the_view_box() {
         assert_eq!(
-            sized(r#"<svg id="m" width="100%" style="max-width: 572px;" viewBox="0 0 572 61"><g/></svg>"#),
+            sized(
+                r#"<svg id="m" width="100%" style="max-width: 572px;" viewBox="0 0 572 61"><g/></svg>"#
+            ),
             r#"<svg id="m" viewBox="0 0 572 61" width="572" height="61"><g/></svg>"#
         );
     }

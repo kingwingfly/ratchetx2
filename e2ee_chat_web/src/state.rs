@@ -122,6 +122,18 @@ pub struct RemoteFile {
     pub pointer: AttachmentPointer,
 }
 
+/// An attachment being opened: fetched, unless kept here, and decrypted, a chunk at a time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Opening {
+    pub id: [u8; 16],
+    pub name: String,
+    pub size: u64,
+    /// How many of its bytes are decrypted.
+    pub done: u64,
+    /// Whether it waits for its sender to upload the rest.
+    pub waiting: bool,
+}
+
 /// A file sent or received.
 #[derive(Clone)]
 pub struct Attachment {
@@ -171,6 +183,8 @@ pub struct Ui {
     pub syncing: RwSignal<bool>,
     /// Notifications come over the server's WebSocket, so the client rarely polls.
     pub live: RwSignal<bool>,
+    /// The user is away, so the client neither listens nor polls but rarely.
+    pub away: RwSignal<bool>,
     /// The attachments being uploaded, or paused.
     pub uploads: RwSignal<Vec<UploadView>>,
     pub me: RwSignal<Option<Me>>,
@@ -183,11 +197,11 @@ pub struct Ui {
     pub log: RwSignal<Vec<(u64, String)>>,
     /// A message for the notice, and its number, so that a newer one is not hidden early.
     pub notice: RwSignal<Option<(u64, String)>>,
-    /// What the client is busy with.
-    pub busy: RwSignal<Option<String>>,
     pub dialog: RwSignal<Option<Dialog>>,
-    /// The file in the viewer.
+    /// The file in the viewer, ...
     pub viewer: RwSignal<Option<Attachment>>,
+    /// ... or the attachment it waits for, until it is opened.
+    pub opening: RwSignal<Option<Opening>>,
 }
 
 impl Ui {
@@ -197,6 +211,7 @@ impl Ui {
             link: RwSignal::new(Link::Connecting),
             syncing: RwSignal::new(false),
             live: RwSignal::new(false),
+            away: RwSignal::new(false),
             uploads: RwSignal::new(vec![]),
             me: RwSignal::new(None),
             contacts: RwSignal::new(vec![]),
@@ -204,9 +219,9 @@ impl Ui {
             messages: RwSignal::new(vec![]),
             log: RwSignal::new(vec![]),
             notice: RwSignal::new(None),
-            busy: RwSignal::new(None),
             dialog: RwSignal::new(None),
             viewer: RwSignal::new(None),
+            opening: RwSignal::new(None),
         }
     }
 

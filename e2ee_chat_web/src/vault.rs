@@ -414,6 +414,20 @@ impl Vault {
         commit(transaction).await
     }
 
+    /// The upload `id`, in the chat with `peer`, if not done yet.
+    pub async fn upload(&self, peer: &PublicKey, id: &[u8]) -> Result<Option<PendingUpload>> {
+        let name = upload_key(peer, id);
+        let Some(sealed) = get(&self.database, &name).await? else {
+            return Ok(None);
+        };
+        let upload = self
+            .open(&name, &sealed)
+            .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
+        PendingUpload::decode(upload.as_slice())
+            .map(Some)
+            .map_err(|e| Error::Corrupt(e.to_string()))
+    }
+
     /// The uploads not done yet, with the peers of their chats.
     pub async fn uploads(&self) -> Result<Vec<(PublicKey, PendingUpload)>> {
         let range = prefix_range("upload/")?;

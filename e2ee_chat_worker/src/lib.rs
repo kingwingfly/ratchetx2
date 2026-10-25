@@ -6,7 +6,7 @@ mod store;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
-use prost::Message;
+use prost::{Message, bytes::Bytes};
 use protocol::{
     ErrorKind,
     attachment::AttachmentServer,
@@ -84,6 +84,8 @@ async fn call(
     let limits = MailboxLimits::default();
     let response = match read_body(&mut request).await? {
         Some(body) => {
+            // Shared, so that `notify` decodes the call again without copying its message.
+            let body = Bytes::from(body);
             let handshake = HandshakeServer::new(Store::new(env, limits.max_message_size)?);
             let mailbox = MailboxServer::builder(Store::new(env, limits.max_message_size)?)
                 .limits(limits)
@@ -99,7 +101,7 @@ async fn call(
             )
             .await;
             if response.status == 200
-                && let Err(e) = notify(env, context, procedure, &body)
+                && let Err(e) = notify(env, context, procedure, body)
             {
                 console_error!("cannot notify: {e}");
             }
@@ -118,6 +120,13 @@ async fn call(
 /// subscription verifies: a `SubscribeRequest` in the `request` query parameter, as protobuf in
 /// unpadded base64url, as a browser's WebSocket cannot send headers.
 async fn subscribe(request: Request, env: &Env) -> Result<Response> {
+    // Only a WebSocket handshake, a GET: the notifier takes a POST as a notification for every
+    // subscriber, which only the Worker may send.
+    if request.method() != Method::Get {
+        let headers = Headers::new();
+        headers.set("allow", "GET")?;
+        return Ok(Response::error("method not allowed", 405)?.with_headers(headers));
+    }
     let upgrade = request.headers().get("upgrade")?;
     if !upgrade.is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket")) {
         return Response::error("expected a WebSocket", 426);
@@ -142,12 +151,12 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
 }
 
 /// Tell the recipient of a message or an initial message, the call `body` made, that it arrived,
-/// once the response has gone.
+/// once the response has gone. Decoding from `Bytes`, the message the call carries is not copied.
 fn notify(
     env: &Env,
     context: &Context,
     procedure: Procedure,
-    body: &[u8],
+    body: Bytes,
 ) -> core::result::Result<(), String> {
     let (recipient, notification) = match procedure {
         Procedure::Push => {
@@ -181,12 +190,8 @@ fn notify(
 
 /// The notifier of `identity_key`, the Durable Object holding its client's WebSockets.
 fn notifier(env: &Env, identity_key: &PublicKey) -> Result<Stub> {
-    let name: String = identity_key
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
     env.durable_object(NOTIFIER)?
-        .id_from_name(&name)?
+        .id_from_name(&store::hex(identity_key))?
         .get_stub()
 }
 

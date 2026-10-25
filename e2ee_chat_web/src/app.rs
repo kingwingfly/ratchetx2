@@ -17,10 +17,11 @@ use web_sys::{
 
 use crate::{
     content::Content,
-    engine::{Engine, MAX_FILE_SIZE, Sending, invitation, origin, same_server},
+    engine::{Engine, MAX_FILE_SIZE, NAME_MAX, Sending, invitation, origin, same_server},
     glue::copy,
     icon::{Icon, icon},
     preview::{self, DiffLine, Kind},
+    search::Search,
     state::{
         Attachment, Body, ContactView, Delivery, Dialog, Link, Me, MessageView, Phase, RemoteFile,
         Ui, UploadState, UploadView,
@@ -155,8 +156,15 @@ fn TopBar() -> impl IntoView {
                 <button
                     class="btn icon quiet sync"
                     class:syncing=move || ui.syncing.get()
+                    class:offline=offline
                     title=move || {
-                        let notifications = if ui.live.get() { "live" } else { "polling" };
+                        let notifications = if ui.live.get() {
+                            "live"
+                        } else if ui.away.get() {
+                            "paused while you are away"
+                        } else {
+                            "polling"
+                        };
                         format!(
                             "{}: sync now\n{}\nnotifications: {notifications}",
                             status(),
@@ -167,7 +175,6 @@ fn TopBar() -> impl IntoView {
                     on:click=move |_| engine().sync_now()
                 >
                     {icon(Icon::Sync)}
-                    <span class="dot" class:offline=offline></span>
                 </button>
             </Show>
         </header>
@@ -622,18 +629,14 @@ fn extension(name: &str) -> String {
 fn open_attachment(remote: RemoteFile) {
     let (ui, engine) = (ui(), engine());
     spawn_local(async move {
-        let result = engine.open_attachment(remote.peer, remote.pointer).await;
-        ui.busy.set(None);
-        match result {
-            Ok(attachment) => ui.viewer.set(Some(attachment)),
-            Err(e) => ui.notify(e),
+        if let Err(e) = engine.open_attachment(remote.peer, remote.pointer).await {
+            ui.notify(e);
         }
     });
 }
 
 #[component]
 fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
-    let ui = ui();
     let text = RwSignal::new(String::new());
     let textarea = NodeRef::<html::Textarea>::new();
     // Typing goes to the composer when a chat opens.
@@ -679,7 +682,6 @@ fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
                 on:input=move |event| text.set(event_target_value(&event))
                 on:keydown=on_keydown
             ></textarea>
-            <span class="busy">{move || ui.busy.get().unwrap_or_default()}</span>
             <button
                 class="btn icon primary"
                 title="Send (Enter)"
@@ -768,7 +770,6 @@ fn Copyable(text: String, what: &'static str) -> impl IntoView {
         </div>
     }
 }
-
 
 /// A link that opens a chat with `me`, with the name filled in, and the server if it is not the
 /// page's own.
@@ -967,7 +968,7 @@ fn CreateVault() -> impl IntoView {
                 "vault is lost."
             </p>
             <label for="name">"Your name, which new chats see"</label>
-            <input id="name" autocomplete="nickname" bind:value=name />
+            <input id="name" autocomplete="nickname" maxlength=NAME_MAX bind:value=name />
             <label for="password">"Passphrase"</label>
             <input
                 id="password"
@@ -1199,7 +1200,7 @@ fn Identity() -> impl IntoView {
             <label>"Invitation link"</label>
             <Copyable text=invitation_link(&me) what="your invitation link" />
             <label for="my-name">"Your name, which new chats see"</label>
-            <input id="my-name" autocomplete="nickname" bind:value=name />
+            <input id="my-name" autocomplete="nickname" maxlength=NAME_MAX bind:value=name />
             <div class="actions">
                 <button
                     type="button"
@@ -1338,8 +1339,17 @@ fn Viewer() -> impl IntoView {
     let dialog = NodeRef::<html::Dialog>::new();
     // The blob URL on screen, revoked once another file shows or the viewer closes.
     let shown_url = StoredValue::new(None::<String>);
+    // Whether it waits for an attachment, which shows how far it got until it opens.
+    let waiting = Memo::new(move |_| ui.opening.with(Option::is_some));
+    // What it shows, and whether that is text, which can be searched.
+    let shown_content = NodeRef::<html::Div>::new();
+    let searchable = RwSignal::new(false);
+    let close = move || {
+        ui.viewer.set(None);
+        ui.opening.set(None);
+    };
     Effect::new(move || {
-        let open = ui.viewer.with(Option::is_some);
+        let open = ui.viewer.with(Option::is_some) || waiting.get();
         if let Some(dialog) = dialog.get() {
             if open && !dialog.open() {
                 let _ = dialog.show_modal();
@@ -1353,13 +1363,26 @@ fn Viewer() -> impl IntoView {
             let _ = Url::revoke_object_url(&url);
             shown_url.set_value(None);
         }
-        let attachment = ui.viewer.get()?;
+        let Some(attachment) = ui.viewer.get() else {
+            searchable.set(false);
+            return waiting.get().then(opening_view);
+        };
+        let kind = preview::kind(&attachment.name, &attachment.mime, &attachment.data);
+        searchable.set(matches!(
+            kind,
+            Kind::Code { .. }
+                | Kind::Markdown { .. }
+                | Kind::Diff(_)
+                | Kind::Table(_)
+                | Kind::Archive(_)
+                | Kind::Cards(_)
+        ));
         let shown = |url: Option<String>| {
             shown_url.set_value(url.clone().filter(|url| url.starts_with("blob:")));
             url
         };
         Some(
-            match preview::kind(&attachment.name, &attachment.mime, &attachment.data) {
+            match kind {
                 Kind::Image(mime) => match shown(image_url(&attachment.data, mime)) {
                     Some(url) => view! {
                         <div class="media">
@@ -1379,12 +1402,10 @@ fn Viewer() -> impl IntoView {
                     None => no_preview(),
                 },
                 Kind::Audio(mime) => match shown(blob_url(&attachment.data, mime)) {
-                    Some(url) => view! {
-                        <div class="media">
-                            <audio src=url controls></audio>
-                        </div>
+                    Some(url) => {
+                        view! { <AudioView url name=attachment.name.clone() data=attachment.data.clone() /> }
+                            .into_any()
                     }
-                    .into_any(),
                     None => no_preview(),
                 },
                 Kind::Pdf => view! { <PdfView data=attachment.data.clone() /> }.into_any(),
@@ -1400,7 +1421,7 @@ fn Viewer() -> impl IntoView {
                 }
                 .into_any(),
                 Kind::Table(table) => table_view(table),
-                Kind::Archive(entries) => archive_view(entries),
+                Kind::Archive(listing) => archive_view(listing),
                 Kind::Cards(cards) => cards_view(cards),
                 Kind::Diff(lines) => diff_view(lines),
                 Kind::None => no_preview(),
@@ -1414,39 +1435,133 @@ fn Viewer() -> impl IntoView {
                     .as_ref()
                     .map(|a| format!("{} · {}", a.name, size(a.data.len())))
             })
+            .or_else(|| {
+                ui.opening.with(|opening| {
+                    opening
+                        .as_ref()
+                        .map(|o| format!("{} · {}", o.name, size(o.size as usize)))
+                })
+            })
             .unwrap_or_default()
     };
     view! {
-        <dialog class="viewer" node_ref=dialog on:close=move |_| ui.viewer.set(None)>
+        <dialog class="viewer" node_ref=dialog on:close=move |_| close()>
             <div class="viewer-bar">
                 <span>{title}</span>
                 <div>
-                    <button
-                        class="btn icon small"
-                        title="Download"
-                        aria-label="Download"
-                        on:click=move |_| {
-                            if let Some(attachment) = ui.viewer.get_untracked() {
-                                download(&attachment);
+                    <Show when=move || searchable.get()>
+                        <Search content=shown_content />
+                    </Show>
+                    <Show when=move || ui.viewer.with(Option::is_some)>
+                        <button
+                            class="btn icon small"
+                            title="Download"
+                            aria-label="Download"
+                            on:click=move |_| {
+                                if let Some(attachment) = ui.viewer.get_untracked() {
+                                    download(&attachment);
+                                }
                             }
-                        }
-                    >
-                        {icon(Icon::Download)}
-                    </button>
+                        >
+                            {icon(Icon::Download)}
+                        </button>
+                    </Show>
                     <button
                         class="btn icon small"
                         title="Close"
                         aria-label="Close"
-                        on:click=move |_| ui.viewer.set(None)
+                        on:click=move |_| close()
                     >
                         {icon(Icon::Close)}
                     </button>
                 </div>
             </div>
-            <div class="viewer-content">{content}</div>
+            <div class="viewer-content" node_ref=shown_content>{content}</div>
             <Toast />
         </dialog>
     }
+}
+
+/// Audio, named `name`, playing from `url` at once, and, once a worker read them from `data`,
+/// what its tags say of it, if anything: its cover, title, artist, album and year.
+#[component]
+fn AudioView(url: String, name: String, data: Arc<Vec<u8>>) -> impl IntoView {
+    let tags = RwSignal::new(None::<preview::Tags>);
+    spawn_local(async move {
+        if let Ok(Some(found)) = workers::audio_tags(&data).await {
+            tags.try_set(Some(found));
+        }
+    });
+    let shown = move || {
+        let found = tags.get()?;
+        // A data: URL, which needs no revoking; the worker made sure it is an image.
+        let cover = found
+            .cover
+            .map(|(mime, data)| format!("data:{mime};base64,{}", BASE64_STANDARD.encode(data)));
+        let album = match (found.album, found.year) {
+            (Some(album), Some(year)) => Some(format!("{album} · {year}")),
+            (album, year) => album.or(year.map(|year| year.to_string())),
+        };
+        let title = found.title.unwrap_or_else(|| name.clone());
+        Some(view! {
+            {cover.map(|cover| view! { <img class="cover" src=cover alt="cover" /> })}
+            <div class="track-text">
+                <strong>{title}</strong>
+                {found.artist.map(|artist| view! { <span class="artist">{artist}</span> })}
+                {album.map(|album| view! { <span>{album}</span> })}
+            </div>
+        })
+    };
+    view! {
+        <div class="media">
+            <div class="track">
+                {shown}
+                <audio src=url controls></audio>
+            </div>
+        </div>
+    }
+}
+
+/// How far opening an attachment got: how much of it is decrypted, on a bar, and whether it
+/// waits for its sender to upload the rest.
+fn opening_view() -> AnyView {
+    let ui = ui();
+    let fraction = move || {
+        ui.opening.with(|opening| {
+            opening.as_ref().map_or(0.0, |opening| match opening.size {
+                0 => 1.0,
+                total => opening.done as f64 / total as f64,
+            })
+        })
+    };
+    let note = move || {
+        ui.opening.with(|opening| {
+            opening.as_ref().map_or_else(String::new, |opening| {
+                let done = format!(
+                    "{} of {}",
+                    size(opening.done as usize),
+                    size(opening.size as usize)
+                );
+                if opening.waiting {
+                    format!("{done}, waiting for its sender to upload the rest")
+                } else {
+                    done
+                }
+            })
+        })
+    };
+    view! {
+        <div class="media">
+            <div class="opening" role="progressbar" aria-valuemin="0" aria-valuemax="100"
+                aria-valuenow=move || (fraction() * 100.0).round().to_string()>
+                <div class="bar">
+                    <div class="bar-fill" style:transform=move || format!("scaleX({})", fraction())></div>
+                </div>
+                <span class="opening-note">{note}</span>
+            </div>
+        </div>
+    }
+    .into_any()
 }
 
 fn no_preview() -> AnyView {
@@ -1501,10 +1616,7 @@ fn enhance(element: &web_sys::Element) {
                     // A data: URL, not a blob: one of this origin, which would open as a page.
                     let image = document().create_element("img").map_err(js_error)?;
                     image.set_class_name("diagram");
-                    let src = format!(
-                        "data:image/svg+xml;base64,{}",
-                        BASE64_STANDARD.encode(svg)
-                    );
+                    let src = format!("data:image/svg+xml;base64,{}", BASE64_STANDARD.encode(svg));
                     let _ = image.set_attribute("alt", "diagram");
                     let _ = image.set_attribute("src", &src);
                     if let Some(block) = code.parent_element() {
@@ -1606,7 +1718,8 @@ fn Slides(source: String) -> impl IntoView {
         if full.get_untracked() {
             let window = window();
             let size = |size: Result<JsValue, JsValue>| size.ok()?.as_f64();
-            let (Some(width), Some(height)) = (size(window.inner_width()), size(window.inner_height()))
+            let (Some(width), Some(height)) =
+                (size(window.inner_width()), size(window.inner_height()))
             else {
                 return;
             };
@@ -1863,7 +1976,9 @@ async fn draw_page(pdf: workers::Pdf, canvas: &HtmlCanvasElement) -> Result<(), 
         .get_attribute("data-page")
         .and_then(|page| page.parse().ok())
         .ok_or("no page")?;
-    let ratio = web_sys::window().map_or(1.0, |window| window.device_pixel_ratio()).min(2.0);
+    let ratio = web_sys::window()
+        .map_or(1.0, |window| window.device_pixel_ratio())
+        .min(2.0);
     let width = (f64::from(canvas.client_width()) * ratio).round().max(1.0) as u32;
     let image = workers::render_pdf(pdf, index, width).await?;
     canvas.set_width(image.width());
@@ -1911,14 +2026,27 @@ fn table_view(table: preview::Table) -> AnyView {
     .into_any()
 }
 
-fn archive_view(entries: Vec<preview::Entry>) -> AnyView {
-    let files = entries.iter().filter(|entry| !entry.directory).count();
-    let total: u64 = entries.iter().map(|entry| entry.size).sum();
+fn archive_view(listing: preview::Listing) -> AnyView {
+    let files = listing
+        .entries
+        .iter()
+        .filter(|entry| !entry.directory)
+        .count();
+    let total: u64 = listing.entries.iter().map(|entry| entry.size).sum();
+    let note = if listing.complete {
+        format!("{files} files, {} unpacked", size(total as usize))
+    } else {
+        format!(
+            "The first {files} files, {} unpacked; listing the rest would take too long, or it is damaged.",
+            size(total as usize)
+        )
+    };
     view! {
         <div class="archive">
-            <p class="preview-note">{format!("{files} files, {} unpacked", size(total as usize))}</p>
+            <p class="preview-note">{note}</p>
             <ul>
-                {entries
+                {listing
+                    .entries
                     .into_iter()
                     .map(|entry| {
                         let length = if entry.directory { String::new() } else { size(entry.size as usize) };

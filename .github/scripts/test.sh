@@ -28,6 +28,8 @@ statements=(
     "cargo clippy --target wasm32-unknown-unknown --features conformance -p e2ee_chat_worker -- -D warnings"
     # The previews' workers, each with its features only, as the web client's trunk build compiles them.
     "cargo clippy --target wasm32-unknown-unknown --features pdf,worker --bins -p e2ee_chat_preview -- -D warnings"
+    "cargo clippy --target wasm32-unknown-unknown --features audio,worker --bins -p e2ee_chat_preview -- -D warnings"
+    "cargo clippy --target wasm32-unknown-unknown --features search,worker --bins -p e2ee_chat_preview -- -D warnings"
     "cargo clippy --target wasm32-unknown-unknown --features diagram,worker --bins -p e2ee_chat_preview -- -D warnings"
     "cargo clippy --target wasm32-unknown-unknown --features code,worker --bins -p e2ee_chat_preview -- -D warnings"
 )

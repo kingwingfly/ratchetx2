@@ -53,7 +53,7 @@ pub fn serve(mut handle: impl FnMut(&str, &Array) -> Result<Reply, String> + 'st
 }
 
 /// The argument at `index`, as a string.
-#[cfg(any(feature = "diagram", feature = "code"))]
+#[cfg(any(feature = "diagram", feature = "code", feature = "search"))]
 fn string(arguments: &Array, index: u32) -> Result<String, String> {
     arguments
         .get(index)
@@ -113,6 +113,74 @@ pub fn serve_pdf() {
         "close" => {
             documents.remove(&number(arguments, 0)?);
             Ok(Reply::new(JsValue::UNDEFINED))
+        }
+        _ => Err(format!("no method {method}")),
+    });
+}
+
+/// Serve [`Worker::Audio`](crate::Worker::Audio)'s requests.
+#[cfg(feature = "audio")]
+pub fn serve_audio() {
+    use js_sys::Uint8Array;
+
+    serve(|method, arguments| match method {
+        "tags" => {
+            let data = Uint8Array::new(&arguments.get(0)).to_vec();
+            let Some(tags) = crate::audio::tags(&data) else {
+                return Ok(Reply::new(JsValue::NULL));
+            };
+            let text = |text: Option<String>| text.map_or(JsValue::NULL, JsValue::from);
+            let reply = Array::of4(
+                &text(tags.title),
+                &text(tags.artist),
+                &text(tags.album),
+                &tags.year.map_or(JsValue::NULL, JsValue::from),
+            );
+            let mut transfer = None;
+            match tags.cover {
+                Some((mime, bytes)) => {
+                    let cover = Uint8Array::from(&bytes[..]);
+                    transfer = Some(Array::of1(&cover.buffer()));
+                    reply.push(&mime.into());
+                    reply.push(&cover);
+                }
+                None => {
+                    reply.push(&JsValue::NULL);
+                    reply.push(&JsValue::NULL);
+                }
+            }
+            Ok(Reply {
+                value: reply.into(),
+                transfer,
+            })
+        }
+        _ => Err(format!("no method {method}")),
+    });
+}
+
+/// Serve [`Worker::Search`](crate::Worker::Search)'s requests.
+#[cfg(feature = "search")]
+pub fn serve_search() {
+    use js_sys::Uint32Array;
+
+    serve(|method, arguments| match method {
+        "find" => {
+            let found = crate::search::find(
+                &string(arguments, 0)?,
+                &string(arguments, 1)?,
+                arguments.get(2).is_truthy(),
+                arguments.get(3).is_truthy(),
+            )?;
+            let flat: Vec<u32> = found
+                .matches
+                .iter()
+                .flat_map(|&(start, end)| [start, end])
+                .collect();
+            let matches = Uint32Array::from(&flat[..]);
+            Ok(Reply {
+                value: Array::of2(&matches, &found.more.into()).into(),
+                transfer: Some(Array::of1(&matches.buffer())),
+            })
         }
         _ => Err(format!("no method {method}")),
     });

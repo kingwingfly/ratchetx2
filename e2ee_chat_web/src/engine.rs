@@ -11,7 +11,10 @@ use std::{
     sync::Arc,
 };
 
-use futures::lock::Mutex;
+use futures::{
+    future::{Either, select},
+    lock::Mutex,
+};
 use leptos::{prelude::*, task::spawn_local};
 use session::{
     Client, ClientState, ErrorKind, PublicKey, Session, SessionState,
@@ -30,8 +33,8 @@ use crate::{
     content::{AttachmentPointer, Content, Hello, WireContent, image_type},
     notify::{Event, Subscription},
     state::{
-        Attachment, Body, ContactView, Delivery, Dialog, Link, Me, MessageView, Phase, RemoteFile,
-        Ui, UploadState, UploadView,
+        Attachment, Body, ContactView, Delivery, Dialog, Link, Me, MessageView, Opening, Phase,
+        RemoteFile, Ui, UploadState, UploadView,
     },
     transport::{Connect, Fetch},
     util::{describe, js_error, key_from_text, now, short, size, sleep},
@@ -48,6 +51,19 @@ const REPUBLISH_AGE: u64 = 7 * 24 * 60 * 60 * 1000;
 pub const INLINE_FILE_MAX: usize = 1 << 20;
 /// The largest file to send: as many chunks as the server takes, unless it says otherwise.
 pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_CHUNKS as usize * CHUNK_SIZE;
+/// The most characters in this client's name. It goes in the greeting, the first message of each
+/// chat it starts, which the server takes up to 4 KiB of; at 4 bytes a character at most, this
+/// leaves the greeting far below that.
+pub const NAME_MAX: usize = 64;
+
+/// `name`, trimmed, unless it is longer than [`NAME_MAX`].
+fn checked_name(name: &str) -> Result<String, String> {
+    let name = name.trim();
+    if name.chars().count() > NAME_MAX {
+        return Err(format!("A name has at most {NAME_MAX} characters."));
+    }
+    Ok(name.to_string())
+}
 /// Milliseconds between asking for a chunk not uploaded yet, doubling up to the second...
 const POLL_CHUNK_MIN: i32 = 500;
 const POLL_CHUNK_MAX: i32 = 4_000;
@@ -61,11 +77,19 @@ const RETRY_MAX: i32 = 30_000;
 // TODO: these come with their files, up to 1 MiB each; load files when shown instead.
 const HISTORY_SHOWN: u64 = 500;
 /// Milliseconds between syncs: right after something happened, at most while idle, and while
-/// the page is hidden. Workers bill per request, so idle pages back off.
+/// the user is away, when the client has no notifications. Workers bill per request, so idle
+/// pages back off, and pages left alone all but stop: the Worker and its notifiers then scale to
+/// nothing.
 const POLL_FAST: i32 = 3_000;
 const POLL_SLOW: i32 = 30_000;
-const POLL_HIDDEN: i32 = 60_000;
+const POLL_AWAY: i32 = 30 * 60_000;
 const POLL_STEP: i32 = 250;
+/// The user is away once the page has been hidden this long, or out of focus this long, in
+/// milliseconds: a glance at another tab or window keeps the notifications.
+const HIDDEN_GRACE: u64 = 30_000;
+const UNFOCUSED_GRACE: u64 = 5 * 60_000;
+/// Milliseconds between checks of whether the user is away, while subscribed or waiting to.
+const AWAY_CHECK: i32 = 1_000;
 /// Milliseconds between syncs while notifications come, which only catch what they missed.
 const POLL_LIVE: i32 = 300_000;
 /// Milliseconds before subscribing again after the socket closed, doubling up to the second.
@@ -80,14 +104,17 @@ pub struct Engine {
     /// The files of the uploads started or resumed on this page, by attachment ID, which can go
     /// on without the files chosen again.
     files: RefCell<HashMap<[u8; 16], web_sys::File>>,
-    /// The uploads going on.
+    /// The uploads going on, or being resumed.
     running: RefCell<HashSet<[u8; 16]>>,
-    /// The uploads going on that were cancelled, which stop before their next chunk.
+    /// The uploads cancelled, or whose chat was deleted, on this page: those going on stop before
+    /// their next chunk, and none is kept in the vault again.
     cancelled: RefCell<HashSet<[u8; 16]>>,
     /// What was sent and has yet to go, in the order it was sent, and whether a task is sending
     /// it.
     sending: RefCell<VecDeque<Sending>>,
     draining: Cell<bool>,
+    /// Since when the page has been hidden or out of focus, if it is.
+    away_since: Cell<Option<u64>>,
 }
 
 /// What was sent, waiting its turn to go: a message, or a file, which is read, or starts
@@ -126,7 +153,38 @@ impl Engine {
             cancelled: RefCell::default(),
             sending: RefCell::default(),
             draining: Cell::new(false),
+            away_since: Cell::new(None),
         })
+    }
+
+    /// Whether the user is here: the page shown and in focus, or hidden for less than
+    /// [`HIDDEN_GRACE`], or out of focus for less than [`UNFOCUSED_GRACE`]. Notifications are
+    /// for then only, as a WebSocket open keeps a notifier on the server.
+    fn present(&self) -> bool {
+        let document = document();
+        let grace = if document.hidden() {
+            Some(HIDDEN_GRACE)
+        } else if !document.has_focus().unwrap_or(true) {
+            Some(UNFOCUSED_GRACE)
+        } else {
+            None
+        };
+        let present = match grace {
+            Some(grace) => {
+                let now = now();
+                let since = *self.away_since.get().get_or_insert(now);
+                self.away_since.set(Some(since));
+                now - since < grace
+            }
+            None => {
+                self.away_since.set(None);
+                true
+            }
+        };
+        if self.ui.away.get_untracked() == present {
+            self.ui.away.set(!present);
+        }
+        present
     }
 
     /// Send `what` once everything sent before it went: messages go in the order they were
@@ -148,22 +206,22 @@ impl Engine {
                 break;
             };
             let sent = match next {
-                Sending::Content(peer, content) => {
-                    self.ui.busy.set(Some("encrypting…".into()));
-                    self.send(peer, content).await
-                }
+                Sending::Content(peer, content) => self.send(peer, content).await,
                 Sending::File(peer, file) => self.send_file(peer, file).await,
             };
             if let Err(e) = sent {
                 self.ui.notify(e);
             }
         }
-        self.ui.busy.set(None);
         self.draining.set(false);
     }
 
     /// Send `file` to `peer`: a small one in its message, a larger one as an attachment.
-    async fn send_file(self: &Rc<Self>, peer: PublicKey, file: web_sys::File) -> Result<(), String> {
+    async fn send_file(
+        self: &Rc<Self>,
+        peer: PublicKey,
+        file: web_sys::File,
+    ) -> Result<(), String> {
         let name = file.name();
         let bytes = file.size() as usize;
         if bytes > MAX_FILE_SIZE {
@@ -175,10 +233,8 @@ impl Engine {
         }
         // An upload shows how far it got above the composer.
         if bytes > INLINE_FILE_MAX {
-            self.ui.busy.set(None);
             return self.send_attachment(peer, file).await;
         }
-        self.ui.busy.set(Some(format!("encrypting {name}…")));
         let buffer = JsFuture::from(file.array_buffer())
             .await
             .map_err(|e| format!("Cannot read {name}: {}", js_error(e)))?;
@@ -226,7 +282,7 @@ impl Engine {
         let state = AppState {
             client: Some(client.state().into()),
             server,
-            name: name.trim().to_string(),
+            name: checked_name(&name)?,
             ..AppState::default()
         };
         let vault = Vault::create(&passphrase, &state)
@@ -325,19 +381,20 @@ impl Engine {
                     (delay * 3 / 2).min(POLL_SLOW)
                 };
                 let mut waited = 0;
+                let mut was_present = self.present();
                 loop {
                     if self.wake.replace(false) {
                         delay = POLL_FAST;
                         break;
                     }
-                    let hidden = document().hidden();
-                    if waited
-                        >= if hidden {
-                            delay.max(POLL_HIDDEN)
-                        } else {
-                            delay
-                        }
-                    {
+                    let present = self.present();
+                    // Back: what came meanwhile, at once.
+                    if present && !was_present {
+                        delay = POLL_FAST;
+                        break;
+                    }
+                    was_present = present;
+                    if waited >= if present { delay } else { delay.max(POLL_AWAY) } {
                         break;
                     }
                     sleep(POLL_STEP).await;
@@ -347,12 +404,16 @@ impl Engine {
         });
     }
 
-    /// Subscribe to this client's notifications until the page goes, subscribing again whenever
-    /// the socket closes, and act on each.
+    /// Subscribe to this client's notifications while the user is here, until the page goes,
+    /// subscribing again whenever the socket closes, and act on each. Away, the socket closes,
+    /// which tells the server, and opens again on coming back.
     fn listen(self: Rc<Self>) {
         spawn_local(async move {
             let mut retry = RESUBSCRIBE_MIN;
             loop {
+                while !self.present() {
+                    sleep(AWAY_CHECK).await;
+                }
                 let subscribed = {
                     let mut guard = self.inner.lock().await;
                     let Some(inner) = guard.as_mut() else {
@@ -360,17 +421,28 @@ impl Engine {
                     };
                     Subscription::open(&inner.server, &inner.client.subscription())
                 };
+                let mut left = false;
                 match subscribed {
                     Ok(mut subscription) => loop {
-                        match subscription.next().await {
-                            Event::Open => {
+                        let next =
+                            select(Box::pin(subscription.next()), Box::pin(sleep(AWAY_CHECK)));
+                        match next.await {
+                            Either::Left((Event::Open, _)) => {
                                 self.ui.live.set(true);
                                 retry = RESUBSCRIBE_MIN;
                                 // What came while it was closed has no notification.
                                 self.wake();
                             }
-                            Event::Notification(notification) => self.notified(notification).await,
-                            Event::Closed => break,
+                            Either::Left((Event::Notification(notification), _)) => {
+                                self.notified(notification).await
+                            }
+                            Either::Left((Event::Closed, _)) => break,
+                            // Away: dropped, the subscription closes its socket.
+                            Either::Right(_) if !self.present() => {
+                                left = true;
+                                break;
+                            }
+                            Either::Right(_) => {}
                         }
                     },
                     Err(e) => self
@@ -378,6 +450,10 @@ impl Engine {
                         .log(format!("cannot subscribe to notifications: {e}")),
                 }
                 self.ui.live.set(false);
+                if left {
+                    retry = RESUBSCRIBE_MIN;
+                    continue;
+                }
                 sleep(retry).await;
                 retry = (retry * 2).min(RESUBSCRIBE_MAX);
             }
@@ -758,6 +834,8 @@ impl Engine {
         self.save_upload(&peer, &pending).await?;
         self.files.borrow_mut().insert(*upload.id(), file.clone());
         let pending = self.announce(&peer, pending).await?;
+        // A new upload, which nothing else runs.
+        self.running.borrow_mut().insert(*upload.id());
         let engine = self.clone();
         spawn_local(async move {
             if let Err(e) = engine.run_upload(peer, pending, file, Sha256::new()).await {
@@ -805,50 +883,71 @@ impl Engine {
         id: [u8; 16],
         file: Option<web_sys::File>,
     ) -> Result<(), String> {
-        if self.running.borrow().contains(&id) {
+        // Running from here on, so that resuming it again meanwhile, e.g. clicked again while
+        // the file is checked, neither checks the file twice nor sends the attachment twice.
+        if self.cancelled.borrow().contains(&id) || !self.running.borrow_mut().insert(id) {
             return Ok(());
         }
-        let pending = {
-            let guard = self.inner.lock().await;
-            let inner = guard.as_ref().ok_or("locked")?;
-            let uploads = inner.vault.uploads().await.map_err(|e| describe(&e))?;
-            uploads
-                .into_iter()
-                .find(|(of, upload)| *of == peer && upload.id == id)
-                .map(|(_, upload)| upload)
-                .ok_or("that upload is gone")?
-        };
-        let file = file
-            .or_else(|| self.files.borrow().get(&id).cloned())
-            .ok_or("choose the file again")?;
-        let hasher = match self.check(&peer, &pending, &file).await {
-            Ok(hasher) => hasher,
-            Err(e) => {
-                self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
-                return Err(e);
+        let resumed = async {
+            let pending = {
+                let guard = self.inner.lock().await;
+                let inner = guard.as_ref().ok_or("locked")?;
+                inner
+                    .vault
+                    .upload(&peer, &id)
+                    .await
+                    .map_err(|e| describe(&e))?
+                    .ok_or("that upload is gone")?
+            };
+            let file = file
+                .or_else(|| self.files.borrow().get(&id).cloned())
+                .ok_or("choose the file again")?;
+            let hasher = match self.check(&peer, &pending, &file).await {
+                Ok(hasher) => hasher,
+                Err(e) => {
+                    self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
+                    return Err(e);
+                }
+            };
+            // Cancelled while the file was checked: it is not sent.
+            if self.cancelled.borrow().contains(&id) {
+                return Ok(None);
             }
-        };
-        self.files.borrow_mut().insert(id, file.clone());
-        let pending = self.announce(&peer, pending).await?;
-        self.run_upload(peer, pending, file, hasher).await
+            self.files.borrow_mut().insert(id, file.clone());
+            let pending = self.announce(&peer, pending).await?;
+            Ok::<_, String>(Some((pending, file, hasher)))
+        }
+        .await;
+        match resumed {
+            Ok(Some((pending, file, hasher))) => self.run_upload(peer, pending, file, hasher).await,
+            Ok(None) => {
+                self.running.borrow_mut().remove(&id);
+                Ok(())
+            }
+            Err(e) => {
+                self.running.borrow_mut().remove(&id);
+                Err(e)
+            }
+        }
     }
 
     /// Stop the upload `id`, in the chat with `peer`, and forget it. The server deletes what it
     /// has, so the peer finds the attachment gone; if it cannot be reached, what it has expires.
     pub async fn cancel_upload(&self, peer: PublicKey, id: [u8; 16]) -> Result<(), String> {
-        if self.running.borrow().contains(&id) {
-            self.cancelled.borrow_mut().insert(id);
-        }
+        // For good, running or not: what is on its way stops, and keeps nothing of it again.
+        self.cancelled.borrow_mut().insert(id);
         self.files.borrow_mut().remove(&id);
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != id));
         let guard = self.inner.lock().await;
         let inner = guard.as_ref().ok_or("locked")?;
-        let uploads = inner.vault.uploads().await.map_err(|e| describe(&e))?;
-        if let Some((_, pending)) = uploads
-            .iter()
-            .find(|(of, upload)| *of == peer && upload.id == id)
+        let pending = inner
+            .vault
+            .upload(&peer, &id)
+            .await
+            .map_err(|e| describe(&e))?;
+        if let Some(pending) = &pending
             && let Err(e) = upload_of(pending)?
                 .cancel(&Fetch::client(&inner.server))
                 .await
@@ -894,7 +993,7 @@ impl Engine {
 
     /// Upload the chunks of `pending` from where it is: `hasher` has hashed its first
     /// `encrypted` chunks. While it goes, the upload shows in its chat, and if
-    /// it stops, it shows paused, with why.
+    /// it stops, it shows paused, with why. The caller has marked it running, which this ends.
     async fn run_upload(
         &self,
         peer: PublicKey,
@@ -902,16 +1001,17 @@ impl Engine {
         file: web_sys::File,
         hasher: Sha256,
     ) -> Result<(), String> {
-        let upload = upload_of(&pending)?;
-        let id = *upload.id();
-        if !self.running.borrow_mut().insert(id) {
-            return Ok(());
-        }
-        let uploaded = self
-            .upload_chunks(&peer, &mut pending, &upload, &file, hasher)
-            .await;
+        let id: [u8; 16] = pending.id.as_slice().try_into().unwrap_or_default();
+        let uploaded = match upload_of(&pending) {
+            Ok(upload) => {
+                self.upload_chunks(&peer, &mut pending, &upload, &file, hasher)
+                    .await
+            }
+            Err(e) => Err(e),
+        };
         self.running.borrow_mut().remove(&id);
-        if self.cancelled.borrow_mut().remove(&id) {
+        // Cancelled, it stays so: what cancelled it forgot it.
+        if self.cancelled.borrow().contains(&id) {
             return Ok(());
         }
         if let Err(e) = uploaded {
@@ -997,15 +1097,28 @@ impl Engine {
         }
     }
 
-    /// Keep `pending`, of the chat with `peer`, in the vault.
+    /// Keep `pending`, of the chat with `peer`, in the vault, unless it was cancelled or its chat
+    /// deleted meanwhile, which forgot it: it must not come back.
     async fn save_upload(&self, peer: &PublicKey, pending: &PendingUpload) -> Result<(), String> {
         let guard = self.inner.lock().await;
         let inner = guard.as_ref().ok_or("locked")?;
+        if !self.may_keep(inner, peer, &pending.id) {
+            return Err(format!("the upload of {} was cancelled", pending.name));
+        }
         inner
             .vault
             .save_upload(peer, pending)
             .await
             .map_err(|e| describe(&e))
+    }
+
+    /// Whether the vault may keep what goes with the attachment `id`, in the chat with `peer`:
+    /// its upload was not cancelled, and the chat is still there. Asked under the lock, which
+    /// cancelling and deleting take to forget them, so that nothing is kept after.
+    fn may_keep(&self, inner: &Inner, peer: &PublicKey, id: &[u8]) -> bool {
+        let cancelled =
+            <[u8; 16]>::try_from(id).is_ok_and(|id| self.cancelled.borrow().contains(&id));
+        !cancelled && inner.contacts.iter().any(|contact| contact.peer == *peer)
     }
 
     /// Show the upload `pending`, to `peer`, as in `state`.
@@ -1026,15 +1139,68 @@ impl Engine {
         });
     }
 
-    /// The file of the attachment `pointer`, in the chat with `peer`, from the chunks kept here,
-    /// or else from the server, keeping them from then on.
+    /// Open the attachment `pointer`, in the chat with `peer`, in the viewer, from the chunks
+    /// kept here, or else from the server, keeping them from then on. The viewer shows how far
+    /// it got meanwhile, and closing it stops it.
     pub async fn open_attachment(
         &self,
         peer: PublicKey,
         pointer: AttachmentPointer,
-    ) -> Result<Attachment, String> {
+    ) -> Result<(), String> {
+        let Ok(id) = <[u8; 16]>::try_from(pointer.id.as_slice()) else {
+            return Err("the attachment is malformed".to_string());
+        };
+        self.ui.opening.set(Some(Opening {
+            id,
+            name: pointer.name.clone(),
+            size: pointer.size,
+            done: 0,
+            waiting: false,
+        }));
+        let opened = self.fetch_attachment(peer, &id, pointer).await;
+        // Unless the viewer closed, or went on to another file, meanwhile.
+        if !self.opening(&id) {
+            return Ok(());
+        }
+        match opened {
+            Ok(Some(attachment)) => {
+                self.ui.viewer.set(Some(attachment));
+                self.ui.opening.set(None);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => {
+                self.ui.opening.set(None);
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether the viewer still waits for the attachment `id`.
+    fn opening(&self, id: &[u8; 16]) -> bool {
+        self.ui
+            .opening
+            .with_untracked(|opening| opening.as_ref().is_some_and(|opening| opening.id == *id))
+    }
+
+    /// Note how far opening the attachment `id` got.
+    fn opened(&self, id: &[u8; 16], done: u64, waiting: bool) {
+        self.ui.opening.update(|opening| {
+            if let Some(opening) = opening.as_mut().filter(|opening| opening.id == *id) {
+                (opening.done, opening.waiting) = (done, waiting);
+            }
+        });
+    }
+
+    /// The file of the attachment `pointer`, whose ID is `id`, in the chat with `peer`; none if
+    /// the viewer stopped waiting for it.
+    async fn fetch_attachment(
+        &self,
+        peer: PublicKey,
+        id: &[u8; 16],
+        pointer: AttachmentPointer,
+    ) -> Result<Option<Attachment>, String> {
         let malformed = || "the attachment is malformed".to_string();
-        let id = <[u8; 16]>::try_from(pointer.id.as_slice()).map_err(|_| malformed())?;
         let key = Zeroizing::new(
             <[u8; attachment::KEY_LENGTH]>::try_from(pointer.key.as_slice())
                 .map_err(|_| malformed())?,
@@ -1056,51 +1222,63 @@ impl Engine {
         let attachments = Fetch::client(&server);
         let mut data = Vec::with_capacity(pointer.size as usize);
         for index in 0..chunks {
-            let progress = format!("opening {}: {}%", pointer.name, index * 100 / chunks);
-            self.ui.busy.set(Some(progress.clone()));
-            let chunk = match self.kept_chunk(&peer, &id, index).await? {
-                Some(chunk) => chunk,
-                None => {
-                    let chunk = self
-                        .await_chunk(&attachments, &pointer.name, &id, index, &progress)
-                        .await?;
-                    self.keep_chunk(&peer, &id, index, &chunk).await?;
-                    chunk
-                }
+            if !self.opening(id) {
+                return Ok(None);
+            }
+            let (chunk, kept) = match self.kept_chunk(&peer, id, index).await? {
+                Some(chunk) => (chunk, true),
+                None => match self
+                    .await_chunk(&attachments, &pointer.name, id, index)
+                    .await?
+                {
+                    Some(chunk) => (chunk, false),
+                    None => return Ok(None),
+                },
             };
             let plaintext = attachment::decrypt_chunk(&key, index, index + 1 == chunks, &chunk)
                 .map_err(|_| format!("{} does not decrypt", pointer.name))?;
+            // Kept only once it decrypts, so that a chunk that does not is fetched again next
+            // time rather than kept for good.
+            if !kept {
+                self.keep_chunk(&peer, id, index, &chunk).await?;
+            }
             data.extend(plaintext);
+            self.opened(id, data.len() as u64, false);
         }
         if data.len() as u64 != pointer.size {
             return Err(format!("{} is not the size it should be", pointer.name));
         }
-        Ok(Attachment {
+        Ok(Some(Attachment {
             name: pointer.name,
             mime: pointer.mime,
             data: Arc::new(data),
-        })
+        }))
     }
 
     /// Chunk `index` of the attachment `id`, named `name`, from the server, waiting for it while
-    /// it is uploaded, unless no chunk comes for [`STALLED`] milliseconds. `progress` says how far
-    /// the opening got.
+    /// it is uploaded, unless no chunk comes for [`STALLED`] milliseconds; none if the viewer
+    /// stopped waiting for it meanwhile.
     async fn await_chunk(
         &self,
         attachments: &Connect,
         name: &str,
         id: &[u8; 16],
         index: u32,
-        progress: &str,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Option<Vec<u8>>, String> {
         let (mut waited, mut wait) = (0, POLL_CHUNK_MIN);
         loop {
+            if !self.opening(id) {
+                return Ok(None);
+            }
             match attachment::download_chunk(attachments, id, index).await {
-                Ok(Some(chunk)) => return Ok(chunk),
+                Ok(Some(chunk)) => return Ok(Some(chunk)),
                 Ok(None) if waited < STALLED => {
-                    self.ui
-                        .busy
-                        .set(Some(format!("{progress}, as the sender uploads it")));
+                    self.ui.opening.update(|opening| {
+                        if let Some(opening) = opening.as_mut().filter(|opening| opening.id == *id)
+                        {
+                            opening.waiting = true;
+                        }
+                    });
                     sleep(wait).await;
                     waited += wait;
                     wait = (wait * 2).min(POLL_CHUNK_MAX);
@@ -1122,7 +1300,8 @@ impl Engine {
         }
     }
 
-    /// Keep chunk `index` of the attachment `id`, in the chat with `peer`.
+    /// Keep chunk `index` of the attachment `id`, in the chat with `peer`, unless its upload was
+    /// cancelled or the chat deleted meanwhile.
     async fn keep_chunk(
         &self,
         peer: &PublicKey,
@@ -1132,6 +1311,9 @@ impl Engine {
     ) -> Result<(), String> {
         let guard = self.inner.lock().await;
         let inner = guard.as_ref().ok_or("locked")?;
+        if !self.may_keep(inner, peer, id) {
+            return Ok(());
+        }
         inner
             .vault
             .put_chunk(peer, id, index, chunk)
@@ -1315,6 +1497,22 @@ impl Engine {
             .forget(&state, &peer)
             .await
             .map_err(|e| describe(&e))?;
+        // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
+        // chat, which `may_keep` now tells them is gone. What the server has expires.
+        let uploads: Vec<[u8; 16]> = self.ui.uploads.with_untracked(|uploads| {
+            uploads
+                .iter()
+                .filter(|upload| upload.peer == peer)
+                .map(|upload| upload.id)
+                .collect()
+        });
+        for id in uploads {
+            self.cancelled.borrow_mut().insert(id);
+            self.files.borrow_mut().remove(&id);
+        }
+        self.ui
+            .uploads
+            .update(|uploads| uploads.retain(|upload| upload.peer != peer));
         inner.contacts.retain(|contact| contact.peer != peer);
         if self.ui.open.get_untracked() == Some(peer) {
             self.ui.open.set(None);
@@ -1326,9 +1524,10 @@ impl Engine {
 
     /// Go by `name` in the greetings of new chats.
     pub async fn set_name(&self, name: String) -> Result<(), String> {
+        let name = checked_name(&name)?;
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        inner.state.name = name.trim().to_string();
+        inner.state.name = name;
         inner.save(&[]).await.map_err(|e| describe(&e))?;
         self.ui.me.set(Some(inner.me()));
         Ok(())
@@ -1590,5 +1789,23 @@ fn forget_invitation() {
     let location = window().location();
     if let (Ok(history), Ok(path)) = (window().history(), location.pathname()) {
         let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_have_at_most_name_max_characters() {
+        assert_eq!(checked_name("  alice \n").as_deref(), Ok("alice"));
+        // Characters, not bytes: 64 of four bytes each.
+        assert!(checked_name(&"😀".repeat(NAME_MAX)).is_ok());
+        assert!(checked_name(&"a".repeat(NAME_MAX + 1)).is_err());
+        // The longest greeting is far below the 4 KiB a first message may take.
+        let greeting = Content::Hello(Hello {
+            name: "😀".repeat(NAME_MAX),
+        });
+        assert!(greeting.to_bytes().len() < 512);
     }
 }

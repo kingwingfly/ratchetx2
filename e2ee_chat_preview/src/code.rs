@@ -177,13 +177,21 @@ mod tests {
         let html = systems()
             .highlight("rust", "// héllo 世界 😀\nfn main() { let s = \"wörld\"; }")
             .unwrap();
-        assert!(html.contains(r#"<span class="hl-keyword">fn</span>"#), "{html}");
-        assert!(html.contains(r#"<span class="hl-string">&quot;wörld&quot;</span>"#), "{html}");
+        assert!(
+            html.contains(r#"<span class="hl-keyword">fn</span>"#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<span class="hl-string">&quot;wörld&quot;</span>"#),
+            "{html}"
+        );
     }
 
     #[test]
     fn text_is_escaped() {
-        let html = web().highlight("html", "<script>alert(1)</script> &amp;").unwrap();
+        let html = web()
+            .highlight("html", "<script>alert(1)</script> &amp;")
+            .unwrap();
         assert!(!html.contains("<script>"), "{html}");
         assert!(html.contains("&lt;"), "{html}");
     }
@@ -193,7 +201,10 @@ mod tests {
         let html = web()
             .highlight("html", "<script>const x = 1;</script>")
             .unwrap();
-        assert!(html.contains(r#"<span class="hl-keyword">const</span>"#), "{html}");
+        assert!(
+            html.contains(r#"<span class="hl-keyword">const</span>"#),
+            "{html}"
+        );
     }
 
     #[test]

@@ -13,10 +13,11 @@ use crate::util::{js_error, sleep};
 
 /// Where the Worker takes subscriptions.
 const PATH: &str = "/notifications";
-/// What keeps the socket open through idle proxies, answered by the Worker without waking it.
+/// What keeps the socket open through idle proxies, answered by the Worker without waking it,
+/// and shows the Worker it is open still.
 const PING: &str = "ping";
-/// Milliseconds between pings.
-const PING_EVERY: i32 = 30_000;
+/// Milliseconds between pings, often enough for proxies that close idle connections.
+const PING_EVERY: i32 = 60_000;
 
 /// What happens on a subscription's socket.
 pub enum Event {

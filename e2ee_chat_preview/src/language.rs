@@ -52,6 +52,8 @@ const fn language(
 
 use Group::*;
 
+// One language a line, as a table.
+#[rustfmt::skip]
 pub const LANGUAGES: &[Language] = &[
     // The web.
     language("javascript", Web, &["js", "mjs", "cjs", "jsx"], &[], &["node"]),
@@ -168,7 +170,9 @@ mod tests {
     fn names_are_unique() {
         for (i, language) in LANGUAGES.iter().enumerate() {
             assert!(
-                LANGUAGES[..i].iter().all(|other| other.name != language.name),
+                LANGUAGES[..i]
+                    .iter()
+                    .all(|other| other.name != language.name),
                 "{} twice",
                 language.name
             );
