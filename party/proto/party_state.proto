@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+// The state of a double-ratchet party, to keep a session between runs. It holds the session's
+// secret keys, so keep it secret; the Rust types zeroize it on drop.
+package party.v1;
+
+import "ratchetx2.proto";
+
+// The state of a party.
+message Party {
+  // The double ratchet.
+  ratchetx2.v1.Ratchet ratchet = 1;
+  // The keys of messages skipped over while receiving, by the peer's chain, oldest first.
+  repeated SkippedChain skipped_chains = 2;
+  // Number of messages in the previous sending chain.
+  uint64 previous_chain_length = 3;
+  // Number of the next message to send in the current sending chain.
+  uint64 message_number_sender = 4;
+  // Number of the next message expected in the current receiving chain.
+  uint64 message_number_receiver = 5;
+  // The session's associated data.
+  bytes associated_data = 6;
+}
+
+// The keys of the messages skipped in one of the peer's chains.
+message SkippedChain {
+  // The chain's header key (32 bytes).
+  bytes header_key = 1;
+  // The message keys, by message number.
+  repeated MessageKey message_keys = 2;
+  // Number of the peer's chains received after this one.
+  uint64 age = 3;
+}
+
+// The key of a message skipped over.
+message MessageKey {
+  // The message's number in its chain.
+  uint64 message_number = 1;
+  // The message key (32 bytes).
+  bytes key = 2;
+}

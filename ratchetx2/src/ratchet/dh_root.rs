@@ -8,6 +8,11 @@ use crate::{
 };
 
 #[derive(Debug, Clone, Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct DhRootRatchet {
     root_key: RootKey,
     private_key: DhPrivateKey,
@@ -72,5 +77,29 @@ impl DhRootRatchet {
         let mut header_key = HeaderKey::default();
         hkdf.expand(b"HeaderKey", &mut header_key).unwrap();
         Ok((chain_key, header_key))
+    }
+}
+
+#[cfg(feature = "prost")]
+impl From<&DhRootRatchet> for crate::proto::DhRootRatchet {
+    fn from(dh_root: &DhRootRatchet) -> Self {
+        Self {
+            root_key: dh_root.root_key.to_vec(),
+            private_key: dh_root.private_key.as_bytes().to_vec(),
+            update_private_key: dh_root.update_private_key,
+        }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&crate::proto::DhRootRatchet> for DhRootRatchet {
+    type Error = crate::error::MalformedState;
+
+    fn try_from(dh_root: &crate::proto::DhRootRatchet) -> Result<Self, Self::Error> {
+        Ok(Self {
+            root_key: crate::proto::key(&dh_root.root_key)?,
+            private_key: DhPrivateKey::from(crate::proto::key(&dh_root.private_key)?),
+            update_private_key: dh_root.update_private_key,
+        })
     }
 }

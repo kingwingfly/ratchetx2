@@ -40,6 +40,7 @@ The wire protocol changed, so 0.3 clients and servers cannot talk to 0.2 ones.
 - fix: the client no longer pins the TLS server name to 127.0.0.1
 - errors are `Error` + `ErrorKind` like `std::io`: match on `err.kind()` instead of strings; the underlying error is kept as `source()`
 - remove the deprecated e2ee_chat_ingress
+- a client and its sessions can be saved and restored: `Client::state`, `Session::state`, `Client::restore` and `Session::restore`; the states, and the ratchet, party, local prekeys and private keys in them, serialize with the `serde` and `rkyv` features, and with `prost` convert to protobuf messages (`ratchetx2.v1`, `x3dh.v1`, `party.v1`, `session.v1`), which are zeroized on drop
 
 ## [0.2.7] - 2025-07-09
 

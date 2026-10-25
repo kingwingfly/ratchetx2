@@ -12,12 +12,20 @@ publish = false
 bon = "3.10"
 bytes = "1"
 party = { path = "../party", default-features = false }
+prost = { version = "0.14", optional = true }
 protocol = { path = "../protocol", default-features = false }
 ratchetx2 = { path = "../ratchetx2", version = "0.4" }
+rkyv = { version = "0.8", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
 thiserror = "2.0"
 web-time = "1.1"
 x3dh = { path = "../x3dh" }
 xeddsa = { path = "../xeddsa" }
+zeroize = { version = "1.9", features = ["derive"], optional = true }
+
+[build-dependencies]
+prost-build = { version = "0.14", optional = true }
+protox = { version = "0.10", optional = true }
 
 [dev-dependencies]
 protocol = { path = "../protocol", features = ["server", "grpc"] }
@@ -30,6 +38,17 @@ tokio = { version = "1", default-features = false, features = [
 [features]
 default = ["protox"]
 # Compile the .proto files with protox, so protoc is not needed.
-protox = ["party/protox", "protocol/protox"]
+protox = ["dep:protox", "party/protox", "protocol/protox"]
+# Serialize the client's and the sessions' states, to keep them between runs.
+serde = ["dep:serde", "party/serde", "x3dh/serde", "xeddsa/serde"]
+rkyv = ["dep:rkyv", "party/rkyv", "x3dh/rkyv", "xeddsa/rkyv"]
+# The states as protobuf messages too, from proto/session.proto.
+prost = [
+    "dep:prost",
+    "dep:prost-build",
+    "dep:zeroize",
+    "party/prost",
+    "x3dh/prost",
+]
 # gRPC clients, see `protocol::grpc`.
 grpc = ["protocol/grpc"]

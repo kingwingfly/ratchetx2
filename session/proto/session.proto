@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+// What the chat's client keeps between runs. It holds private keys, so keep it secret.
+package session.v1;
+
+import "party_state.proto";
+import "x3dh.proto";
+
+// A client's state: its identity, prekeys and the last signed request's timestamp.
+message ClientState {
+  // The identity's XEdDSA private key (32 bytes).
+  bytes identity = 1;
+  // The private prekeys; none if missing.
+  x3dh.v1.LocalPrekeys prekeys = 2;
+  // Milliseconds since the Unix epoch of the last signed request.
+  uint64 last_timestamp = 3;
+}
+
+// A session's state.
+message SessionState {
+  // The double-ratchet party.
+  party.v1.Party party = 1;
+  // This client's identity key (32 bytes).
+  bytes me = 2;
+  // The peer's identity key (32 bytes).
+  bytes peer = 3;
+  // Sequence number of the last message fetched from the peer's queue.
+  uint64 cursor = 4;
+}

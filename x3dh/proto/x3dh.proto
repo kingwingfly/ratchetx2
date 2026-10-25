@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+// Bob's private prekeys, to keep them between runs. They hold private keys, so keep them secret.
+package x3dh.v1;
+
+// Bob's prekeys of the last generations.
+message LocalPrekeys {
+  // The generations, oldest first.
+  repeated Generation generations = 1;
+}
+
+// The prekeys of one generation.
+message Generation {
+  // The signed prekey (32 bytes, X25519).
+  bytes signed_prekey = 1;
+  // The signed prekey's private key (32 bytes).
+  bytes signed_secret = 2;
+  // The one-time prekeys not used yet.
+  repeated OneTimePrekey one_time_prekeys = 3;
+}
+
+// A one-time prekey.
+message OneTimePrekey {
+  // The public key (32 bytes, X25519).
+  bytes public_key = 1;
+  // Its private key (32 bytes).
+  bytes secret = 2;
+}

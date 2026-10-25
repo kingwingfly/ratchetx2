@@ -14,7 +14,16 @@ use crate::{
 };
 
 /// Double ratchet. See the example in [`document`](crate::document).
+///
+/// With the `serde` or `rkyv` feature, it serializes with all its keys, and with `prost` it
+/// converts to and from `proto::Ratchet`, so a session can be kept between runs: keep the output
+/// secret.
 #[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct Ratchet {
     dh_root: DhRootRatchet,
     message_ratchet_sender: MessageRatchet,
@@ -148,5 +157,82 @@ impl Ratchet {
         }
         self.dh_step_updates_sender = !self.dh_step_updates_sender;
         Ok(())
+    }
+}
+
+#[cfg(feature = "prost")]
+impl From<&Ratchet> for crate::proto::Ratchet {
+    fn from(ratchet: &Ratchet) -> Self {
+        Self {
+            dh_root: Some((&ratchet.dh_root).into()),
+            sender: Some((&ratchet.message_ratchet_sender).into()),
+            receiver: Some((&ratchet.message_ratchet_receiver).into()),
+            dh_step_updates_sender: ratchet.dh_step_updates_sender,
+        }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&crate::proto::Ratchet> for Ratchet {
+    type Error = crate::error::MalformedState;
+
+    fn try_from(ratchet: &crate::proto::Ratchet) -> Result<Self, Self::Error> {
+        use crate::error::MalformedState;
+
+        Ok(Self {
+            dh_root: ratchet.dh_root.as_ref().ok_or(MalformedState)?.try_into()?,
+            message_ratchet_sender: ratchet.sender.as_ref().ok_or(MalformedState)?.try_into()?,
+            message_ratchet_receiver: ratchet
+                .receiver
+                .as_ref()
+                .ok_or(MalformedState)?
+                .try_into()?,
+            dh_step_updates_sender: ratchet.dh_step_updates_sender,
+        })
+    }
+}
+
+#[cfg(all(test, any(feature = "serde", feature = "rkyv", feature = "prost")))]
+mod test {
+    use super::*;
+
+    /// `ratchet` saved and restored, once through each format enabled.
+    fn restored(ratchet: &Ratchet) -> Vec<Ratchet> {
+        Vec::from([
+            #[cfg(feature = "serde")]
+            serde_json::from_str(&serde_json::to_string(ratchet).unwrap()).unwrap(),
+            #[cfg(feature = "rkyv")]
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(
+                &rkyv::to_bytes::<rkyv::rancor::Error>(ratchet).unwrap(),
+            )
+            .unwrap(),
+            #[cfg(feature = "prost")]
+            Ratchet::try_from(&crate::proto::Ratchet::from(ratchet)).unwrap(),
+        ])
+    }
+
+    #[test]
+    fn restored_ratchets_carry_on() {
+        let keys = SharedKeys {
+            secret_key: [1; 32],
+            header_key_alice: [2; 32],
+            header_key_bob: [3; 32],
+        };
+        let mut bob = Ratchet::bob(&keys, DhPrivateKey::generate());
+        let alice = Ratchet::alice(&keys, &bob.public_key()).unwrap();
+        // Bob's chains are still unset.
+        for restored in restored(&bob) {
+            assert_eq!(restored.header_key_sender(), None);
+            assert_eq!(restored.header_key_receiver(), None);
+        }
+
+        bob.step_dh_root(&alice.public_key()).unwrap();
+        for (mut alice, mut bob) in restored(&alice).into_iter().zip(restored(&bob)) {
+            assert_eq!(alice, bob);
+            // So is which chain the next steps update, and with which keys.
+            bob.step_dh_root(&alice.public_key()).unwrap();
+            alice.step_dh_root(&bob.public_key()).unwrap();
+            assert_eq!(alice, bob);
+        }
     }
 }

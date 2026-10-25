@@ -9,6 +9,8 @@
 pub mod document;
 pub mod error;
 pub mod key;
+#[cfg(feature = "prost")]
+pub mod proto;
 pub mod ratchet;
 
 pub use key::{DhPrivateKey, SharedKeys};

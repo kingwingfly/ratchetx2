@@ -6,6 +6,8 @@
 )]
 
 pub mod error;
+#[cfg(feature = "prost")]
+pub mod proto;
 
 use core::fmt;
 use std::collections::{HashMap, VecDeque};
@@ -106,18 +108,80 @@ pub struct PublishedPrekeys {
 /// Each [`generate`](Self::generate) starts a generation of prekeys, and only the last
 /// [`KEPT_GENERATIONS`] are kept, so a deleted private key cannot reveal anything later. An
 /// initial message using an older generation can no longer be accepted.
+///
+/// With the `serde` or `rkyv` feature, it serializes with its private keys, and with `prost` it
+/// converts to and from `proto::LocalPrekeys`: keep the output secret.
 #[derive(Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct LocalPrekeys {
     /// Oldest first.
     generations: VecDeque<Generation>,
 }
 
 /// The prekeys of one [`LocalPrekeys::generate`].
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 struct Generation {
     signed_prekey: PublicKey,
+    #[cfg_attr(feature = "rkyv", rkyv(with = StaticSecretDef))]
     signed_secret: StaticSecret,
     /// The ones not used yet.
+    #[cfg_attr(feature = "serde", serde(with = "pairs"))]
+    #[cfg_attr(
+        feature = "rkyv",
+        rkyv(with = rkyv::with::MapKV<rkyv::with::Identity, StaticSecretDef>)
+    )]
     one_time: HashMap<PublicKey, StaticSecret>,
+}
+
+/// Archives a [`StaticSecret`] as its bytes.
+#[cfg(feature = "rkyv")]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(remote = StaticSecret)]
+struct StaticSecretDef {
+    #[rkyv(getter = StaticSecret::to_bytes)]
+    bytes: [u8; PUBLIC_KEY_LENGTH],
+}
+
+#[cfg(feature = "rkyv")]
+impl From<StaticSecretDef> for StaticSecret {
+    fn from(secret: StaticSecretDef) -> Self {
+        StaticSecret::from(secret.bytes)
+    }
+}
+
+/// Serializes a map as a sequence of key-value pairs, since formats such as JSON only take
+/// string keys.
+#[cfg(feature = "serde")]
+mod pairs {
+    use std::collections::HashMap;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use crate::{PublicKey, StaticSecret};
+
+    /// Each entry as a `(key, value)` tuple, which `deserialize` reads back.
+    pub(super) fn serialize<S: Serializer>(
+        map: &HashMap<PublicKey, StaticSecret>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(map)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<HashMap<PublicKey, StaticSecret>, D::Error> {
+        Ok(Vec::<(PublicKey, StaticSecret)>::deserialize(deserializer)?
+            .into_iter()
+            .collect())
+    }
 }
 
 impl fmt::Debug for LocalPrekeys {
@@ -215,6 +279,65 @@ impl LocalPrekeys {
             &identity.compute_public_key().to_bytes(),
         );
         Ok((agreement, generation.signed_secret.clone()))
+    }
+}
+
+#[cfg(feature = "prost")]
+impl From<&LocalPrekeys> for proto::LocalPrekeys {
+    fn from(prekeys: &LocalPrekeys) -> Self {
+        let generations = prekeys
+            .generations
+            .iter()
+            .map(|generation| proto::Generation {
+                signed_prekey: generation.signed_prekey.to_vec(),
+                signed_secret: generation.signed_secret.to_bytes().to_vec(),
+                one_time_prekeys: generation
+                    .one_time
+                    .iter()
+                    .map(|(public_key, secret)| proto::OneTimePrekey {
+                        public_key: public_key.to_vec(),
+                        secret: secret.to_bytes().to_vec(),
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self { generations }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&proto::LocalPrekeys> for LocalPrekeys {
+    type Error = Error;
+
+    fn try_from(prekeys: &proto::LocalPrekeys) -> Result<Self> {
+        /// A key field, which must be 32 bytes.
+        fn key(bytes: &[u8]) -> Result<[u8; PUBLIC_KEY_LENGTH]> {
+            bytes
+                .try_into()
+                .map_err(|_| ErrorKind::MalformedState.into())
+        }
+
+        let generations = prekeys
+            .generations
+            .iter()
+            .map(|generation| {
+                Ok(Generation {
+                    signed_prekey: key(&generation.signed_prekey)?,
+                    signed_secret: StaticSecret::from(key(&generation.signed_secret)?),
+                    one_time: generation
+                        .one_time_prekeys
+                        .iter()
+                        .map(|one_time| {
+                            Ok((
+                                key(&one_time.public_key)?,
+                                StaticSecret::from(key(&one_time.secret)?),
+                            ))
+                        })
+                        .collect::<Result<_>>()?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self { generations })
     }
 }
 
@@ -389,5 +512,42 @@ mod test {
         prekeys.generate(&bob, 1);
         let error = prekeys.accept(&bob, &alice_key, &message).err().unwrap();
         assert_eq!(error.kind(), ErrorKind::PrekeyNotFound);
+    }
+
+    /// `prekeys` saved and restored, once through each format enabled.
+    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    fn restored(prekeys: &LocalPrekeys) -> Vec<LocalPrekeys> {
+        Vec::from([
+            #[cfg(feature = "serde")]
+            serde_json::from_str(&serde_json::to_string(prekeys).unwrap()).unwrap(),
+            #[cfg(feature = "rkyv")]
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(
+                &rkyv::to_bytes::<rkyv::rancor::Error>(prekeys).unwrap(),
+            )
+            .unwrap(),
+            #[cfg(feature = "prost")]
+            LocalPrekeys::try_from(&proto::LocalPrekeys::from(prekeys)).unwrap(),
+        ])
+    }
+
+    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[test]
+    fn restored_prekeys_accept() {
+        let alice = XEdDSAPrivateKey::generate();
+        let (bob, mut prekeys, first) = bob_setup(1);
+        let second = prekeys.generate(&bob, 2);
+        // An initial message for each generation, with one of its one-time prekeys.
+        let second = PrekeyBundle {
+            signed_prekey: second.signed_prekey,
+            signed_prekey_signature: second.signed_prekey_signature,
+            one_time_prekey: second.one_time_prekeys.get(1).copied(),
+        };
+        let initiated = [first, second].map(|bundle| bundle.initiate(&alice, &public_key(&bob)));
+        for mut restored in restored(&prekeys) {
+            for (message, agreement) in initiated.iter().map(|result| result.as_ref().unwrap()) {
+                let (accepted, _) = restored.accept(&bob, &public_key(&alice), message).unwrap();
+                assert_eq!(*accepted.secret_key, *agreement.secret_key);
+            }
+        }
     }
 }

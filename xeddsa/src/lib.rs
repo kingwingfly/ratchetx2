@@ -21,6 +21,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub const PUBLIC_KEY_LENGTH: usize = X25519_BASEPOINT.as_bytes().len();
 /// Length of a signature, which is an Ed25519 signature.
 pub const SIGNATURE_LENGTH: usize = ed25519_dalek::SIGNATURE_LENGTH;
+/// Length of a private key, a scalar as curve25519-dalek encodes it.
+pub const PRIVATE_KEY_LENGTH: usize = Scalar::ZERO.as_bytes().len();
 
 /// hash1's prefix, 2^b - 2 in b bits (little-endian): 0xFE, then 0xFF bytes up to the length
 /// of an encoded Ed25519 point.
@@ -46,9 +48,34 @@ pub enum Error {
 pub type Result<T> = core::result::Result<T, Error>;
 
 /// XEdDSA private key.
+///
+/// With the `serde` or `rkyv` feature, it serializes as its scalar, like
+/// [`to_bytes`](Self::to_bytes): keep the output secret.
 #[derive(Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct XEdDSAPrivateKey {
+    #[cfg_attr(feature = "rkyv", rkyv(with = ScalarDef))]
     private_key: Scalar,
+}
+
+/// Archives a [`Scalar`] as its canonical bytes.
+#[cfg(feature = "rkyv")]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[rkyv(remote = Scalar)]
+struct ScalarDef {
+    #[rkyv(getter = Scalar::to_bytes)]
+    bytes: [u8; PRIVATE_KEY_LENGTH],
+}
+
+#[cfg(feature = "rkyv")]
+impl From<ScalarDef> for Scalar {
+    fn from(scalar: ScalarDef) -> Self {
+        Scalar::from_bytes_mod_order(scalar.bytes)
+    }
 }
 
 impl fmt::Debug for XEdDSAPrivateKey {
@@ -72,6 +99,20 @@ impl XEdDSAPrivateKey {
         XEdDSAPrivateKey {
             private_key: Scalar::from_bytes_mod_order(*bytes),
         }
+    }
+
+    /// The private key's bytes, its scalar's canonical encoding, e.g. to keep it between runs:
+    /// keep them secret.
+    pub fn to_bytes(&self) -> Zeroizing<[u8; PRIVATE_KEY_LENGTH]> {
+        Zeroizing::new(self.private_key.to_bytes())
+    }
+
+    /// The private key whose [`to_bytes`](Self::to_bytes) are `bytes`; `None` unless they are a
+    /// canonical scalar encoding.
+    pub fn from_bytes(bytes: [u8; PRIVATE_KEY_LENGTH]) -> Option<Self> {
+        Scalar::from_canonical_bytes(bytes)
+            .into_option()
+            .map(|private_key| Self { private_key })
     }
 
     /// The XEdDSA public key for the key pair.

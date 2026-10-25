@@ -8,6 +8,11 @@ use super::{MAX_SKIPPED_CHAINS, SKIP_MAX};
 
 /// The message keys skipped in one of the peer's chains.
 #[cfg_attr(test, derive(Debug, Clone, PartialEq))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub(super) struct SkippedChain {
     header_key: HeaderKey,
     /// By message number, so the oldest comes first.
@@ -34,19 +39,28 @@ impl SkippedChain {
 /// The skipped message keys of the peer's last [`MAX_SKIPPED_CHAINS`] chains, at most
 /// [`SKIP_MAX`] of them: the keys of lost messages neither stay forever nor take the room of later
 /// ones.
+///
+/// It keeps no count of its keys besides the chains, so a state restored with serde or rkyv,
+/// however corrupt, cannot disagree with itself.
 #[derive(Default)]
 #[cfg_attr(test, derive(Debug, Clone, PartialEq))]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub(super) struct SkippedKeys {
     /// The chains with keys left, oldest first.
     chains: VecDeque<SkippedChain>,
-    /// Number of keys over all chains.
-    len: u64,
 }
 
 impl SkippedKeys {
-    /// Number of keys kept.
+    /// Number of keys kept, over at most a few chains.
     pub(super) fn len(&self) -> u64 {
-        self.len
+        self.chains
+            .iter()
+            .map(|chain| chain.keys.len() as u64)
+            .sum()
     }
 
     /// The header keys of the chains with keys left.
@@ -73,9 +87,7 @@ impl SkippedKeys {
         else {
             return;
         };
-        if self.chains[index].keys.remove(&message_number).is_some() {
-            self.len -= 1;
-        }
+        self.chains[index].keys.remove(&message_number);
         if self.chains[index].keys.is_empty() {
             self.chains.remove(index);
         }
@@ -84,14 +96,77 @@ impl SkippedKeys {
     /// The peer has moved on to its next chain: forget the chains that are now too old.
     pub(super) fn next_chain(&mut self) {
         for chain in &mut self.chains {
-            chain.age += 1;
+            chain.age = chain.age.saturating_add(1);
         }
         while let Some(oldest) = self.chains.front()
             && oldest.age >= MAX_SKIPPED_CHAINS
         {
-            self.len -= oldest.keys.len() as u64;
             self.chains.pop_front();
         }
+    }
+}
+
+/// The keys as the party's protobuf state.
+#[cfg(feature = "prost")]
+mod state {
+    use ratchetx2::key::KEY_LENGTH;
+
+    use super::{SkippedChain, SkippedKeys};
+    use crate::{
+        error::{ErrorKind, Result},
+        proto,
+    };
+
+    impl SkippedKeys {
+        /// The chains as protobuf messages, oldest first.
+        pub(in crate::party) fn to_proto(&self) -> Vec<proto::SkippedChain> {
+            self.chains
+                .iter()
+                .map(|chain| proto::SkippedChain {
+                    header_key: chain.header_key.to_vec(),
+                    message_keys: chain
+                        .keys
+                        .iter()
+                        .map(|(message_number, message_key)| proto::MessageKey {
+                            message_number: *message_number,
+                            key: message_key.to_vec(),
+                        })
+                        .collect(),
+                    age: chain.age as u64,
+                })
+                .collect()
+        }
+
+        /// The keys of `chains`, from [`to_proto`](Self::to_proto). Like [`extend`](Self::extend),
+        /// it leaves out empty chains and keeps at most [`SKIP_MAX`](super::SKIP_MAX) keys.
+        pub(in crate::party) fn from_proto(chains: &[proto::SkippedChain]) -> Result<Self> {
+            let chains = chains
+                .iter()
+                .map(|chain| {
+                    Ok(SkippedChain {
+                        header_key: key(&chain.header_key)?,
+                        keys: chain
+                            .message_keys
+                            .iter()
+                            .map(|message_key| {
+                                Ok((message_key.message_number, key(&message_key.key)?))
+                            })
+                            .collect::<Result<_>>()?,
+                        age: usize::try_from(chain.age).map_err(|_| ErrorKind::MalformedState)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut skipped = Self::default();
+            skipped.extend(chains);
+            Ok(skipped)
+        }
+    }
+
+    /// A key field, which must be [`KEY_LENGTH`] bytes.
+    fn key(bytes: &[u8]) -> Result<[u8; KEY_LENGTH]> {
+        bytes
+            .try_into()
+            .map_err(|_| ErrorKind::MalformedState.into())
     }
 }
 
@@ -105,24 +180,18 @@ impl Extend<SkippedChain> for SkippedKeys {
                 .iter_mut()
                 .find(|kept| kept.header_key == chain.header_key)
             {
-                Some(kept) => {
-                    for (message_number, message_key) in chain.keys {
-                        if kept.keys.insert(message_number, message_key).is_none() {
-                            self.len += 1;
-                        }
-                    }
-                }
+                Some(kept) => kept.keys.extend(chain.keys),
                 None if chain.keys.is_empty() => {}
-                None => {
-                    self.len += chain.keys.len() as u64;
-                    self.chains.push_back(chain);
-                }
+                None => self.chains.push_back(chain),
             }
         }
-        while self.len > SKIP_MAX {
-            let oldest = self.chains.front_mut().expect("the chains hold `len` keys");
-            oldest.keys.pop_first();
-            self.len -= 1;
+        let mut len = self.len();
+        while len > SKIP_MAX
+            && let Some(oldest) = self.chains.front_mut()
+        {
+            if oldest.keys.pop_first().is_some() {
+                len -= 1;
+            }
             if oldest.keys.is_empty() {
                 self.chains.pop_front();
             }

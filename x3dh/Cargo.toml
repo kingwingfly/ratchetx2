@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 getrandom = "0.4"
 hkdf = "0.13"
+prost = { version = "0.14", optional = true }
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde-big-array = { version = "0.5", optional = true }
@@ -20,6 +21,15 @@ x25519-dalek = { version = "3.0", features = ["static_secrets", "zeroize"] }
 xeddsa = { path = "../xeddsa" }
 zeroize = { version = "1.9", features = ["derive"] }
 
+[build-dependencies]
+prost-build = { version = "0.14", optional = true }
+protox = { version = "0.10", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+
 [features]
-serde = ["dep:serde", "dep:serde-big-array"]
+serde = ["dep:serde", "dep:serde-big-array", "x25519-dalek/serde"]
 rkyv = ["dep:rkyv"]
+# The local prekeys as protobuf messages, from proto/x3dh.proto, compiled with protox.
+prost = ["dep:prost", "dep:prost-build", "dep:protox"]

@@ -11,8 +11,9 @@ statements=(
     "cargo clippy --all-features --all-targets -- -D warnings"
     # Each optional feature must build on its own too. Without protox, protoc compiles the protos.
     "cargo clippy --all-targets --no-default-features $LIBS -- -D warnings"
-    "cargo clippy --all-targets --features serde -p x3dh -p party -p protocol -- -D warnings"
-    "cargo clippy --all-targets --features rkyv -p x3dh -p party -p protocol -- -D warnings"
+    "cargo clippy --all-targets --features serde -p ratchetx2 -p xeddsa -p x3dh -p party -p protocol -p session -- -D warnings"
+    "cargo clippy --all-targets --features rkyv -p ratchetx2 -p xeddsa -p x3dh -p party -p protocol -p session -- -D warnings"
+    "cargo clippy --all-targets --features prost -p ratchetx2 -p x3dh -p party -p session -- -D warnings"
     "cargo clippy --all-targets --features server -p protocol -- -D warnings"
     "cargo clippy --all-targets --features grpc -p protocol -p session -- -D warnings"
     "cargo test --all-features"
@@ -21,6 +22,7 @@ statements=(
     # getrandom's "custom" backend stands in for the wasm_js backend an app would enable.
     "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo check --target wasm32-unknown-unknown $LIBS"
     "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo check --target wasm32-unknown-unknown --features server,serde,rkyv -p protocol"
+    "RUSTFLAGS='--cfg getrandom_backend=\"custom\"' cargo check --target wasm32-unknown-unknown --features serde,rkyv,prost -p session"
 )
 
 # loop echo and executing statements

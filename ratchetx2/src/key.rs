@@ -28,6 +28,11 @@ pub type HeaderKey = [u8; KEY_LENGTH];
 
 /// X25519 private key of a DH ratchet key pair.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct DhPrivateKey([u8; DH_KEY_LENGTH]);
 
 impl DhPrivateKey {
@@ -36,6 +41,12 @@ impl DhPrivateKey {
         let mut key = Self([0; _]);
         getrandom::fill(&mut key.0).expect("the system random number generator failed");
         key
+    }
+
+    /// The private key's bytes.
+    #[cfg(feature = "prost")]
+    pub(crate) fn as_bytes(&self) -> &[u8; DH_KEY_LENGTH] {
+        &self.0
     }
 
     /// The X25519 public key for the key pair.

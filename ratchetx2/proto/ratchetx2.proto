@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+// The state of a double ratchet, to keep a session between runs. It holds the session's secret
+// keys, so keep it secret.
+package ratchetx2.v1;
+
+// A double ratchet.
+message Ratchet {
+  // The DH-root ratchet.
+  DhRootRatchet dh_root = 1;
+  // The sending message ratchet.
+  MessageRatchet sender = 2;
+  // The receiving message ratchet.
+  MessageRatchet receiver = 3;
+  // Whether the next DH step sets up the sending chain; otherwise, the receiving one.
+  bool dh_step_updates_sender = 4;
+}
+
+// The DH-root ratchet: the root key and the current DH key pair.
+message DhRootRatchet {
+  // The root key (32 bytes).
+  bytes root_key = 1;
+  // The current X25519 private key (32 bytes).
+  bytes private_key = 2;
+  // Whether the next step generates a new key pair.
+  bool update_private_key = 3;
+}
+
+// A message ratchet: one direction's chain.
+message MessageRatchet {
+  // The current chain, unless a DH step has yet to set it up.
+  Chain chain = 1;
+  // The header key of the next chain (32 bytes).
+  bytes next_header_key = 2;
+}
+
+// A chain of message keys.
+message Chain {
+  // The chain key (32 bytes).
+  bytes chain_key = 1;
+  // The header key of the chain's messages (32 bytes).
+  bytes header_key = 2;
+}

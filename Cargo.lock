@@ -789,6 +789,7 @@ dependencies = [
  "digest 0.11.3",
  "fiat-crypto",
  "rustc_version",
+ "serde",
  "subtle",
  "zeroize",
 ]
@@ -2212,8 +2213,10 @@ dependencies = [
  "ratchetx2",
  "rkyv",
  "serde",
+ "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
+ "zeroize",
 ]
 
 [[package]]
@@ -2933,6 +2936,12 @@ dependencies = [
  "getrandom 0.4.3",
  "hkdf",
  "hmac",
+ "prost",
+ "prost-build",
+ "protox",
+ "rkyv",
+ "serde",
+ "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "zeroize",
@@ -3333,20 +3342,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_json"
+version = "1.0.154"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6"
+dependencies = [
+ "itoa",
+ "memchr",
+ "serde",
+ "serde_core",
+ "zmij",
+]
+
+[[package]]
 name = "session"
 version = "0.1.0"
 dependencies = [
  "bon",
  "bytes",
  "party",
+ "prost",
+ "prost-build",
  "protocol",
+ "protox",
  "ratchetx2",
+ "rkyv",
+ "serde",
  "storage",
  "thiserror 2.0.21",
  "tokio",
  "web-time",
  "x3dh",
  "xeddsa",
+ "zeroize",
 ]
 
 [[package]]
@@ -4518,6 +4546,7 @@ checksum = "e7e8131a03190127fb2263afc72b322ecadae46b6ff8c6f399ff5d02f5559af6"
 dependencies = [
  "curve25519-dalek",
  "rand_core 0.10.1",
+ "serde",
  "zeroize",
 ]
 
@@ -4527,9 +4556,13 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "hkdf",
+ "prost",
+ "prost-build",
+ "protox",
  "rkyv",
  "serde",
  "serde-big-array",
+ "serde_json",
  "sha2 0.11.1",
  "thiserror 2.0.21",
  "x25519-dalek",
@@ -4544,6 +4577,8 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "getrandom 0.4.3",
+ "rkyv",
+ "serde",
  "sha2 0.11.1",
  "subtle",
  "thiserror 2.0.21",
@@ -4601,6 +4636,12 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
+
+[[package]]
+name = "zmij"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zune-core"

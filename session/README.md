@@ -5,9 +5,13 @@ The E2EE chat's client flow: X3DH over the [handshake](../protocol) service, the
 
 Both take any client of the [protocol](../protocol) traits, so the same flow runs over gRPC, in-process, or a transport of your own. Bob can send only after he has received Alice's first message ([`ErrorKind::NoSendingChain`]).
 
+To keep them between runs, save their states ([`Client::state`], [`Session::state`]) and restore them with [`Client::restore`] and [`Session::restore`]. The states serialize with serde or rkyv, or convert to and from protobuf messages, as the features below enable. They hold private keys, so keep them secret, e.g. encrypted.
+
 # Features
 
 - **protox** (default): compile the `.proto` files with [protox](https://crates.io/crates/protox); without it, `protoc` must be installed.
+- **serde**, **rkyv**: serialize [`ClientState`] and [`SessionState`].
+- **prost**: the states as protobuf messages too, defined in `proto/session.proto` (package `session.v1`), in the `proto` module; they are zeroized on drop.
 - **grpc**: gRPC clients, in `protocol::grpc`.
 
 On `wasm32-unknown-unknown`, enable getrandom's `wasm_js` feature in the final application.

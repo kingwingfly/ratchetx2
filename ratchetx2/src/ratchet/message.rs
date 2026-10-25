@@ -6,12 +6,22 @@ use crate::key::{ChainKey, HeaderKey, KEY_LENGTH, MessageKey};
 
 /// An established chain: its ChainKey and the HeaderKey of its messages.
 #[derive(Debug, Clone, PartialEq, Zeroize)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 struct Chain {
     chain_key: ChainKey,
     header_key: HeaderKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct MessageRatchet {
     /// None until a DH-root step sets up this chain.
     chain: Option<Chain>,
@@ -53,6 +63,41 @@ impl MessageRatchet {
         let message_key = hmac_sha256(&chain.chain_key, &[1]);
         chain.chain_key = hmac_sha256(&chain.chain_key, &[2]);
         Some(message_key)
+    }
+}
+
+#[cfg(feature = "prost")]
+impl From<&MessageRatchet> for crate::proto::MessageRatchet {
+    fn from(message_ratchet: &MessageRatchet) -> Self {
+        Self {
+            chain: message_ratchet
+                .chain
+                .as_ref()
+                .map(|chain| crate::proto::Chain {
+                    chain_key: chain.chain_key.to_vec(),
+                    header_key: chain.header_key.to_vec(),
+                }),
+            next_header_key: message_ratchet.next_header_key.to_vec(),
+        }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&crate::proto::MessageRatchet> for MessageRatchet {
+    type Error = crate::error::MalformedState;
+
+    fn try_from(message_ratchet: &crate::proto::MessageRatchet) -> Result<Self, Self::Error> {
+        let chain = match &message_ratchet.chain {
+            Some(chain) => Some(Chain {
+                chain_key: crate::proto::key(&chain.chain_key)?,
+                header_key: crate::proto::key(&chain.header_key)?,
+            }),
+            None => None,
+        };
+        Ok(Self {
+            chain,
+            next_header_key: crate::proto::key(&message_ratchet.next_header_key)?,
+        })
     }
 }
 

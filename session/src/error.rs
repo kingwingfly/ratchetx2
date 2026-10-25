@@ -53,6 +53,7 @@ impl From<x3dh::Error> for Error {
         let kind = match error.kind() {
             Kind::InvalidPublicKey | Kind::InvalidSignature => ErrorKind::InvalidKeys,
             Kind::UnexpectedIdentity => ErrorKind::UnexpectedPeer,
+            Kind::MalformedState => ErrorKind::MalformedState,
             _ => ErrorKind::InvalidIntroduction,
         };
         Self::new(kind, error)
@@ -66,6 +67,7 @@ impl From<party::error::Error> for Error {
             Kind::NoSendingChain => ErrorKind::NoSendingChain,
             Kind::Undecryptable => ErrorKind::Undecryptable,
             Kind::DuplicateMessage => ErrorKind::DuplicateMessage,
+            Kind::MalformedState => ErrorKind::MalformedState,
             _ => ErrorKind::InvalidMessage,
         };
         Self::new(kind, error)
@@ -118,6 +120,9 @@ pub enum ErrorKind {
     /// A received message is malformed.
     #[error("invalid message")]
     InvalidMessage,
+    /// A saved client or session state is malformed.
+    #[error("malformed saved state")]
+    MalformedState,
 }
 
 /// Result type with [`Error`].

@@ -34,6 +34,14 @@ pub const MAX_SKIPPED_CHAINS: usize = 5;
 
 /// The party who participates in the E2EE chat: encrypts and decrypts messages, without I/O.
 /// See the example in the [crate docs](crate).
+///
+/// To keep a session between runs, it serializes with the `serde` or `rkyv` feature, and with
+/// `prost` it converts to and from `proto::Party`, all with its keys: keep the output secret.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct Party {
     ratchet: Ratchet,
     /// Keys of the messages skipped over while receiving, for when they arrive late.
@@ -248,6 +256,38 @@ impl Party {
             &message.content,
         )
         .map_err(|e| Error::new(ErrorKind::Undecryptable, e))
+    }
+}
+
+#[cfg(feature = "prost")]
+impl From<&Party> for crate::proto::Party {
+    fn from(party: &Party) -> Self {
+        Self {
+            ratchet: Some((&party.ratchet).into()),
+            skipped_chains: party.skipped_message_keys.to_proto(),
+            previous_chain_length: party.previous_chain_length,
+            message_number_sender: party.message_number_sender,
+            message_number_receiver: party.message_number_receiver,
+            associated_data: party.associated_data.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&crate::proto::Party> for Party {
+    type Error = Error;
+
+    fn try_from(party: &crate::proto::Party) -> Result<Self> {
+        let ratchet = party.ratchet.as_ref().ok_or(ErrorKind::MalformedState)?;
+        Ok(Self {
+            ratchet: Ratchet::try_from(ratchet)
+                .map_err(|e| Error::new(ErrorKind::MalformedState, e))?,
+            skipped_message_keys: SkippedKeys::from_proto(&party.skipped_chains)?,
+            previous_chain_length: party.previous_chain_length,
+            message_number_sender: party.message_number_sender,
+            message_number_receiver: party.message_number_receiver,
+            associated_data: party.associated_data.clone(),
+        })
     }
 }
 
@@ -650,5 +690,40 @@ mod test {
         assert_eq!(bob.decrypt(&sent[0]).unwrap(), b"m0");
         assert_eq!(bob.decrypt(&sent[3]).unwrap(), b"m3");
         assert_eq!(bob.decrypt(&sent[1]).unwrap(), b"m1");
+    }
+
+    /// `party` saved and restored, once through each format enabled.
+    #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+    fn restored(party: &Party) -> Vec<Party> {
+        Vec::from([
+            #[cfg(feature = "prost")]
+            Party::try_from(&crate::proto::Party::from(party)).unwrap(),
+            #[cfg(feature = "serde")]
+            serde_json::from_str(&serde_json::to_string(party).unwrap()).unwrap(),
+            #[cfg(feature = "rkyv")]
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(
+                &rkyv::to_bytes::<rkyv::rancor::Error>(party).unwrap(),
+            )
+            .unwrap(),
+        ])
+    }
+
+    #[test]
+    #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+    fn restored_parties_carry_on() {
+        let (mut alice, mut bob) = session();
+        let delayed = alice.encrypt(b"delayed").unwrap();
+        let message = alice.encrypt(b"m").unwrap();
+        assert_eq!(bob.decrypt(&message).unwrap(), b"m");
+        let reply = bob.encrypt(b"reply").unwrap();
+
+        let before = state(&bob);
+        for (mut alice, mut bob) in restored(&alice).into_iter().zip(restored(&bob)) {
+            assert_eq!(state(&bob), before);
+            // The skipped key, the receiving chain, then the sending chains and DH steps.
+            assert_eq!(bob.decrypt(&delayed).unwrap(), b"delayed");
+            assert_eq!(alice.decrypt(&reply).unwrap(), b"reply");
+            round_trip(&mut alice, &mut bob);
+        }
     }
 }

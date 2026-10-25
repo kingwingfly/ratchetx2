@@ -11,6 +11,11 @@ An E2EE chat server-client TUI app base on this crate is available [here](https:
 1. There's no global party state, instead, it is each ratchet having its own state.
 2. It's really double-ratchet (2 kinds of ratchets), DhRootRatchet and MessageRatchet (AKA ChainRatchet).
 
+# Features
+
+- **serde**, **rkyv**: serialize a `Ratchet`, with its keys, to keep a session between runs.
+- **prost**: the same as protobuf messages, defined in `proto/ratchetx2.proto` (package `ratchetx2.v1`) so other languages can read them; [protox](https://crates.io/crates/protox) compiles it, so `protoc` is not needed.
+
 # WebAssembly
 
 On `wasm32-unknown-unknown`, randomness comes from [getrandom](https://docs.rs/getrandom), which needs its JavaScript backend enabled by the final application:

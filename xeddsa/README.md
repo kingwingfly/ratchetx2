@@ -2,6 +2,10 @@
 
 Based on Ed25519 and X25519. Pure Rust, so it also builds for `wasm32-unknown-unknown` (enable getrandom's `wasm_js` feature in the final application there).
 
+# Features
+
+- **serde**, **rkyv**: serialize private keys, to keep them between runs. For protobuf, a private key is the bytes of `XEdDSAPrivateKey::to_bytes`.
+
 # Example
 
 ```rust

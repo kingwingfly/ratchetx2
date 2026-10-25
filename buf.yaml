@@ -1,8 +1,12 @@
 version: v2
-# Mirrors the include paths in protocol/build.rs, so editors resolve `import "party.proto"`.
+# Mirrors the include paths in the build scripts, so editors resolve imports such as
+# `import "party.proto"`.
 modules:
+  - path: ratchetx2/proto
+  - path: x3dh/proto
   - path: party/proto
   - path: protocol/proto
+  - path: session/proto
 lint:
   use:
     - STANDARD

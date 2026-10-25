@@ -20,14 +20,20 @@ rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = "0.11"
 thiserror = "2.0"
+zeroize = { version = "1.9", features = ["derive"], optional = true }
 
 [build-dependencies]
 prost-build = "0.14"
 protox = { version = "0.10", optional = true }
 
+[dev-dependencies]
+serde_json = "1"
+
 [features]
 default = ["protox"]
 # Compile the .proto files with protox, so protoc is not needed.
 protox = ["dep:protox"]
-serde = ["dep:serde", "bytes/serde"]
-rkyv = ["dep:rkyv", "rkyv/bytes-1"]
+serde = ["dep:serde", "bytes/serde", "ratchetx2/serde"]
+rkyv = ["dep:rkyv", "rkyv/bytes-1", "ratchetx2/rkyv"]
+# The party's state as protobuf messages too, from proto/party_state.proto.
+prost = ["dep:zeroize", "ratchetx2/prost"]

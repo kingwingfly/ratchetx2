@@ -66,6 +66,9 @@ pub enum ErrorKind {
     /// Another cryptographic operation failed.
     #[error("crypto error")]
     Crypto,
+    /// A party's protobuf state is malformed, e.g. a key of the wrong length.
+    #[error("malformed party state")]
+    MalformedState,
 }
 
 /// Result type with [`Error`].

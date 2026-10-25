@@ -27,6 +27,8 @@ The crate now only contains the double ratchet. `Party` (header encryption), X3D
 
 ### Added
 
+- the `serde` and `rkyv` features: `Ratchet` and `DhPrivateKey` implement their traits, so a session can be kept between runs
+- the `prost` feature: the `proto` module has the ratchet's state as protobuf messages (`proto/ratchetx2.proto`, package `ratchetx2.v1`), zeroized on drop, converting with `proto::Ratchet::from(&ratchet)` and `Ratchet::try_from(&message)`, which fails with the new `error::MalformedState`
 - `SharedKeys::from_secret`, deriving the root key and both header keys from a 32-byte shared secret such as X3DH's SK
 - `key::KEY_LENGTH` and `key::DH_KEY_LENGTH`, the key lengths, taken from SHA-256's output size and curve25519-dalek's X25519 encoding
 
