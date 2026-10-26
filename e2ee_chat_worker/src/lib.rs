@@ -86,11 +86,10 @@ async fn call(
         Some(body) => {
             // Shared, so that `notify` decodes the call again without copying its message.
             let body = Bytes::from(body);
-            let handshake = HandshakeServer::new(Store::new(env, limits.max_message_size)?);
-            let mailbox = MailboxServer::builder(Store::new(env, limits.max_message_size)?)
-                .limits(limits)
-                .build();
-            let attachments = AttachmentServer::new(Store::new(env, limits.max_message_size)?);
+            let store = Store::new(env, limits.max_message_size)?;
+            let handshake = HandshakeServer::new(store.clone());
+            let mailbox = MailboxServer::builder(store.clone()).limits(limits).build();
+            let attachments = AttachmentServer::new(store);
             let response = connect::handle(
                 &handshake,
                 &mailbox,

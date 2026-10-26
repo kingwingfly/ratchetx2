@@ -6,6 +6,8 @@
 //! condition, such as a newer timestamp, every statement checks it against the rows as they were,
 //! before the statement that changes them, which comes last.
 
+use std::rc::Rc;
+
 use futures_util::future::try_join_all;
 use serde::Deserialize;
 use storage::{
@@ -23,9 +25,11 @@ pub const INLINE_CONTENT_MAX: usize = 64 << 10;
 /// JavaScript's largest exact integer, as D1 takes integers as JavaScript numbers.
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
-/// The stores over the D1 database `DB` and the R2 bucket `BUCKET`.
+/// The stores over the D1 database `DB` and the R2 bucket `BUCKET`. Its clones share the
+/// bindings.
+#[derive(Clone)]
 pub struct Store {
-    db: D1Database,
+    db: Rc<D1Database>,
     bucket: Bucket,
     /// Most bytes, headers and contents, one read returns, unless its first message alone is
     /// larger.
@@ -37,7 +41,7 @@ impl Store {
     /// unless the first message alone is larger.
     pub fn new(env: &Env, max_read_size: usize) -> worker::Result<Self> {
         Ok(Self {
-            db: env.d1("DB")?,
+            db: Rc::new(env.d1("DB")?),
             bucket: env.bucket("BUCKET")?,
             max_read_size,
         })
@@ -60,7 +64,9 @@ impl Store {
     }
 
     /// Delete the attachments created before `before`, in pages, their chunks first, so that a
-    /// failure leaves rows, which the next run picks up, rather than chunks no row names.
+    /// failure leaves rows, which the next run picks up, rather than chunks no row names; and
+    /// again once the rows are gone, as in [`delete_attachment`](Self::delete_attachment), for a
+    /// chunk put meanwhile, which found its row still there.
     async fn expire_attachments(&self, before: u64) -> Result<usize> {
         const PAGE: &str =
             "SELECT id FROM attachments WHERE created_at < ?1 ORDER BY created_at, id LIMIT 100";
@@ -92,6 +98,7 @@ impl Store {
             .run()
             .await
             .map_err(unavailable)?;
+            self.delete_chunks(&attachments).await?;
             deleted += rows.len();
             if rows.len() < 100 {
                 return Ok(deleted);

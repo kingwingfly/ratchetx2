@@ -20,7 +20,7 @@ use regex::Regex;
 use tui_textarea::{Input, TextArea};
 use unicode_width::UnicodeWidthStr;
 
-use crate::message::MessageContent;
+use crate::message::Kind;
 
 pub struct Explore<'a> {
     pub picker: &'a Picker,
@@ -93,13 +93,13 @@ impl ExploreState {
         }
     }
 
-    pub fn message(&self) -> Option<MessageContent> {
+    pub fn message(&self) -> Option<Kind> {
         let selected = &self.paths[self.selected];
         mime_guess::from_path(selected)
             .first()
             .and_then(|mime| match mime.type_() {
-                TEXT => fs::read_to_string(selected).map(MessageContent::Text).ok(),
-                IMAGE => fs::read(selected).map(MessageContent::Image).ok(),
+                TEXT => fs::read_to_string(selected).map(Kind::Text).ok(),
+                IMAGE => fs::read(selected).map(Kind::Image).ok(),
                 _ => None,
             })
     }

@@ -18,18 +18,18 @@ use crossterm::{
 };
 use ratatui::{Terminal, prelude::*};
 use session::{
-    ErrorKind,
+    ErrorKind, Session,
     attachment::{self, KEY_LENGTH},
     protocol::attachment::ID_LENGTH,
 };
 use tui_textarea::TextArea;
 
 use crate::{
-    message::{AttachmentPointer, Message, MessageContent, MessageState, greeting},
+    message::{self, AttachmentPointer, Kind, Message, MessageState, greeting},
     navi::Navigation,
     save,
     screen::Screen,
-    transport::Connect,
+    transport::{Connect, Http},
     widget::{
         app::{App, AppState, PublicKey},
         connecting::Connecting,
@@ -120,7 +120,7 @@ impl Client {
                                     break;
                                 }
                                 for message in page.into_iter().filter_map(|m| m.ok()) {
-                                    if let Some(content) = MessageContent::from_bytes(&message) {
+                                    if let Some(content) = message::shown(&message) {
                                         conversations.write().entry(key).or_default().push(
                                             Message {
                                                 content,
@@ -271,9 +271,7 @@ impl Client {
                                         mailbox,
                                     ) {
                                         Ok((session, first)) => {
-                                            if let Some(content) =
-                                                MessageContent::from_bytes(&first)
-                                            {
+                                            if let Some(content) = message::shown(&first) {
                                                 state
                                                     .conversations
                                                     .write()
@@ -295,9 +293,8 @@ impl Client {
                             };
                             match session {
                                 Ok(session) => {
-                                    // A new session with a known contact takes over, keeping
-                                    // the old one for the messages sent on it, and in case the
-                                    // peer never gets the new one.
+                                    // A new session with a known contact joins the old one,
+                                    // kept only to decrypt the messages sent on it.
                                     let known = state.sessions.read().get(&identity_key).cloned();
                                     match known {
                                         Some(known) => {
@@ -461,7 +458,7 @@ impl Client {
                             if content.trim().is_empty() {
                                 continue;
                             }
-                            let content = MessageContent::Text(content);
+                            let content = Kind::Text(content);
                             if self.send(&mut state, content).await {
                                 let mut textarea = TextArea::default();
                                 textarea.set_line_number_style(Style::default().gray());
@@ -505,16 +502,16 @@ impl Client {
                 .and_then(|messages| messages.get(state.current_activated_message))
                 .context("No message selected")?;
             match &message.content {
-                MessageContent::Text(_) => bail!("Only files and images can be saved"),
-                MessageContent::Image(data) => {
+                Kind::Text(_) | Kind::Hello(_) => bail!("Only files and images can be saved"),
+                Kind::Image(data) => {
                     let extension = image::guess_format(data)
                         .ok()
                         .and_then(|format| format.extensions_str().first().copied())
                         .unwrap_or("img");
                     Ok((format!("image.{extension}"), data.clone()))
                 }
-                MessageContent::File(file) => Ok((file.name.clone(), file.data.clone())),
-                MessageContent::Attachment(pointer) => Err(pointer.clone()),
+                Kind::File(file) => Ok((file.name.clone(), file.data.clone())),
+                Kind::Attachment(pointer) => Err(pointer.clone()),
             }
         };
         match content {
@@ -619,7 +616,7 @@ impl Client {
     /// true: tried sending
     /// false: did not send at all
     #[must_use = "Clean textarea according to the result."]
-    async fn send(&mut self, state: &mut AppState, content: MessageContent) -> bool {
+    async fn send(&mut self, state: &mut AppState, content: Kind) -> bool {
         let Some(&(_, key)) = state.contacts.get(state.current_activated_contact) else {
             return false;
         };
@@ -627,9 +624,17 @@ impl Client {
         let Some(session) = state.sessions.read().get(&key).cloned() else {
             return false;
         };
+        let sent = send_on(
+            &mut state.client,
+            &state.http,
+            &mut *session.lock().await,
+            &key,
+            &content.to_bytes(),
+        )
+        .await;
         let message = Message {
-            state: match session.lock().await.send(&content.to_bytes()).await {
-                Ok(_) => MessageState::Sent,
+            state: match sent {
+                Ok(()) => MessageState::Sent,
                 Err(e) => MessageState::Error(describe(e)),
             },
             content,
@@ -643,6 +648,23 @@ impl Client {
         state.current_activated_message = state.conversations.read()[&key].len().saturating_sub(1);
         true
     }
+}
+
+/// Send `content` to `peer` on `session`; if it has none to send on, as the two kept missing
+/// each other, a new session starts first, greeting the peer, and the content goes on it.
+async fn send_on(
+    client: &mut session::Client<Connect>,
+    http: &Http,
+    session: &mut Session<Connect>,
+    peer: &PublicKey,
+    content: &[u8],
+) -> session::Result<()> {
+    if session.needs_new_session() {
+        let started = client.initiate(peer, &greeting(), http.connect()).await?;
+        let older = std::mem::replace(session, started);
+        session.keep(older)?;
+    }
+    session.send(content).await
 }
 
 /// An error and its sources, e.g. "server error: status: Unavailable, ...", since an error's

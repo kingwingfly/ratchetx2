@@ -16,7 +16,7 @@ use web_sys::{
 };
 
 use crate::{
-    content::Content,
+    content,
     engine::{Engine, MAX_FILE_SIZE, NAME_MAX, Sending, invitation, origin, same_server},
     glue::copy,
     icon::{Icon, icon},
@@ -651,7 +651,7 @@ fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
             return;
         }
         text.set(String::new());
-        send(peer, Content::Text(message.trim().to_string()));
+        send(peer, content::Kind::Text(message.trim().to_string()));
     };
     let on_keydown = move |event: ev::KeyboardEvent| {
         if event.key() == "Enter" && !event.shift_key() && !event.is_composing() {
@@ -796,7 +796,7 @@ fn invited_server() -> Option<String> {
 }
 
 /// Send `content` to `peer`, after what was sent before it.
-fn send(peer: PublicKey, content: Content) {
+fn send(peer: PublicKey, content: content::Kind) {
     engine().queue(Sending::Content(peer, content));
 }
 
@@ -1750,6 +1750,17 @@ fn Slides(source: String) -> impl IntoView {
         })
     };
     let keys = window_event_listener(ev::keydown, move |event| {
+        // Typing, e.g. in the viewer's search box, is not for the slides.
+        let typing = event
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::HtmlElement>().ok())
+            .is_some_and(|element| {
+                element.is_content_editable()
+                    || matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA")
+            });
+        if typing {
+            return;
+        }
         let modified = event.ctrl_key() || event.meta_key() || event.alt_key();
         let (right, down) = match event.key().as_str() {
             "ArrowRight" | "PageDown" => (1, 0),

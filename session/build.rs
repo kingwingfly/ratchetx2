@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .extern_path(".x3dh.v1", "::x3dh::proto")
             // They hold keys: zeroized on drop, so they have no `Bytes`, which cannot be, and
             // their `Debug` is written by hand, without them.
-            .type_attribute(
+            .message_attribute(
                 ".",
                 "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
             )

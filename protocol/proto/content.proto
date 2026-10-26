@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+// What a chat message carries, which a session encrypts, so the server never sees it. The web
+// and TUI clients both read it, and drop the kinds they do not show.
+package content.v1;
+
+// A message's content.
+message Content {
+  oneof kind {
+    // Text.
+    string text = 1;
+    // An image in a format the TUI client shows: PNG, JPEG, GIF or WebP.
+    bytes image = 2;
+    // Any file small enough for its message.
+    File file = 3;
+    // The greeting that starts a session, as its first message, which the recipient needs
+    // before it can write back.
+    Hello hello = 4;
+    // A file too large for its message, uploaded encrypted as an attachment.
+    AttachmentPointer attachment = 5;
+  }
+}
+
+// A file.
+message File {
+  // Its name, as the sender gave it.
+  string name = 1;
+  // Its MIME type, as the sender gave it; only a hint.
+  string mime = 2;
+  // Its bytes.
+  bytes data = 3;
+}
+
+// A greeting.
+message Hello {
+  // The name the sender goes by; empty if it has none.
+  string name = 1;
+}
+
+// Where an attachment is, and its key.
+message AttachmentPointer {
+  // Its ID at the attachment service (16 bytes).
+  bytes id = 1;
+  // The key its chunks are encrypted under (32 bytes).
+  bytes key = 2;
+  // Its size, in bytes, decrypted.
+  uint64 size = 3;
+  // Its name, as the sender gave it.
+  string name = 4;
+  // Its MIME type, as the sender gave it; only a hint.
+  string mime = 5;
+}

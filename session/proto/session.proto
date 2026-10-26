@@ -18,10 +18,16 @@ message ClientState {
 
 // A session's state.
 message SessionState {
-  // The double-ratchet party messages are sent with: the one the peer last sent with.
+  // The double-ratchet party of the active session, which messages are sent on; none once it
+  // was retired, until a new session starts.
   party.v1.Party party = 1;
-  // The parties of the other sessions with the peer, latest first: messages that `party`
-  // cannot decrypt are tried on them, and the one that decrypts takes over.
+  // The active session's ID, the X3DH ephemeral key of the one who started it (32 bytes).
+  bytes id = 6;
+  // Whether the peer is known to have the active session: it started it, or a message on it
+  // decrypted.
+  bool known_by_peer = 7;
+  // The parties of earlier sessions with the peer, latest first, which only decrypt: messages
+  // that `party` cannot decrypt are tried on them.
   repeated party.v1.Party others = 5;
   // This client's identity key (32 bytes).
   bytes me = 2;
@@ -29,4 +35,21 @@ message SessionState {
   bytes peer = 3;
   // Sequence number of the last message fetched from the peer's queue.
   uint64 cursor = 4;
+  // What was done last.
+  LastAction last = 8;
+  // How many times the peers turned between sending on the active session and receiving on an
+  // earlier one; past a few, the active session is retired.
+  uint32 direction_changes = 9;
+}
+
+// What was done last on a session.
+enum LastAction {
+  // Nothing yet.
+  LAST_ACTION_NONE = 0;
+  // A message was encrypted on the active session.
+  LAST_ACTION_SENT = 1;
+  // A message decrypted on the active session.
+  LAST_ACTION_RECEIVED_ACTIVE = 2;
+  // A message decrypted on an earlier session.
+  LAST_ACTION_RECEIVED_EARLIER = 3;
 }

@@ -1859,7 +1859,6 @@ dependencies = [
  "mime",
  "mime_guess",
  "parking_lot",
- "prost",
  "ratatui",
  "ratatui-image",
  "regex",

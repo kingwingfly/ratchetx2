@@ -109,6 +109,10 @@ pub enum ErrorKind {
     /// Bob can only send after he has received Alice's first message.
     #[error("no sending chain yet, wait for the peer's first message")]
     NoSendingChain,
+    /// The session has none to send on, as the peers kept missing each other: start a new one,
+    /// see [`Session::needs_new_session`](crate::Session::needs_new_session).
+    #[error("no session to send on, start a new one")]
+    NoSession,
     /// A received message cannot be decrypted.
     #[error("cannot decrypt the message")]
     Undecryptable,

@@ -1,5 +1,6 @@
-const PROTOS: [&str; 4] = [
+const PROTOS: [&str; 5] = [
     "proto/attachment.proto",
+    "proto/content.proto",
     "proto/handshake.proto",
     "proto/mailbox.proto",
     "proto/notify.proto",
@@ -16,8 +17,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut config = prost_build::Config::new();
     config
-        .bytes(["."])
+        // A message's content stays in `Vec`s, as its clients take its files.
+        .bytes([".attachment", ".handshake", ".mailbox", ".notify"])
         .extern_path(".party.v1", "::party::proto")
+        // It holds a key: its `Debug` is written by hand, without it.
+        .skip_debug([".content.v1.AttachmentPointer"])
         .type_attribute(".", SERDE)
         .type_attribute(".", RKYV);
     #[cfg(feature = "protox")]

@@ -7,7 +7,7 @@ Both take any client of the [protocol](../protocol) traits, so the same flow run
 
 Anyone can send an initial message claiming to be anyone, but only the real sender can have encrypted its first message, as X3DH's keys take the sender's identity key: [`Client::accept`] fails unless it decrypts, and then uses up nothing, so a forged initial message changes nothing. Nothing is signed, so neither peer can prove to others that they talked.
 
-When a known peer starts a new session, or this client does, the new one becomes the session, and [`Session::keep`] keeps the old one behind it: messages sent on the old one still decrypt, and if the new one gets no answer, e.g. as its initial message was lost, the old one takes over again. Two peers who start a session at once each keep both, so no message is lost.
+When a known peer starts a new session, or this client does, [`Session::keep`] keeps the old one with it, only to decrypt the messages sent on it: as in Signal's session management (Tahini), an earlier session never becomes the one sent on again, so whoever stole its keys cannot draw the chat back to it once the ratchet has locked them out. Of two sessions the peers start at once, both pick the one with the higher ID. If the peers still miss each other, e.g. as an initial message was lost, the session is retired after a few turns, and the next message goes on a new one ([`Session::needs_new_session`]).
 
 Files too large for a message go as attachments ([`attachment`]): [`Client::start_upload`] starts one under a new key, its chunks are encrypted and uploaded, and a message carries the attachment's ID and key, so that its recipients download and decrypt the chunks.
 

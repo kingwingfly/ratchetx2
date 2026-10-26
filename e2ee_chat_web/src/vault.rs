@@ -28,7 +28,7 @@ use wasm_bindgen::JsValue;
 use zeroize::Zeroizing;
 
 use crate::{
-    content::WireContent,
+    content::Content,
     util::{from_hex, hex},
 };
 
@@ -194,7 +194,7 @@ pub struct HistoryEntry {
     #[prost(uint64, tag = "2")]
     pub at: u64,
     #[prost(message, optional, tag = "3")]
-    pub content: Option<WireContent>,
+    pub content: Option<Content>,
 }
 
 /// The name of a history entry's record.

@@ -11,7 +11,7 @@ pub mod error;
 pub mod proto;
 mod safety;
 
-use core::{iter, mem};
+use core::mem;
 
 use bon::Builder;
 use bytes::Bytes;
@@ -45,8 +45,14 @@ pub struct InitialMessage {
     pub first_message: EncryptedMessage,
 }
 
-/// Number of earlier sessions with its peer that a [`Session`] keeps, see [`Session::keep`].
-pub const KEPT_SESSIONS: usize = 4;
+/// Number of earlier sessions with its peer that a [`Session`] keeps, only to decrypt the
+/// messages sent on them; see [`Session::keep`].
+pub const KEPT_SESSIONS: usize = 3;
+
+/// How many times the peers may turn between one sending on its session and the other's
+/// message decrypting only on an earlier one, before the session is retired; see
+/// [`Session::keep`].
+pub const MAX_DIRECTION_CHANGES: u32 = 5;
 
 /// An identity on a handshake server: publishes prekeys, starts and accepts sessions.
 ///
@@ -209,7 +215,16 @@ impl<H: LocalHandshake> Client<H> {
                 }),
             })
             .await?;
-        Ok(Session::new(mailbox, party, self.identity_key, *peer))
+        Ok(Session::new(
+            mailbox,
+            Active {
+                party,
+                id: message.ephemeral_key,
+                known_by_peer: false,
+            },
+            self.identity_key,
+            *peer,
+        ))
     }
 
     /// Take the initial messages waiting in this client's inbox.
@@ -261,8 +276,13 @@ impl<H: LocalHandshake> Client<H> {
             .decrypt(&initial_message.first_message)
             .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
         self.state.prekeys.confirm(&initial_message.x3dh)?;
+        let active = Active {
+            party,
+            id: initial_message.x3dh.ephemeral_key,
+            known_by_peer: true,
+        };
         Ok((
-            Session::new(mailbox, party, self.identity_key, *peer),
+            Session::new(mailbox, active, self.identity_key, *peer),
             content,
         ))
     }
@@ -274,14 +294,15 @@ impl<H: LocalHandshake> Client<H> {
     ///
     /// Fails with [`ErrorKind::LimitExceeded`] if the service takes no attachment that large.
     pub async fn start_upload(
-        &mut self,
+        &self,
         attachments: &impl LocalAttachments,
         size: u64,
     ) -> Result<attachment::Upload> {
         let chunks = u32::try_from(attachment::chunk_count(size))
             .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
-        let timestamp = self.next_timestamp();
-        let request = StartUploadRequest::sign(&self.state.identity, chunks, timestamp);
+        // The server takes it within a few minutes of its clock, so it is signed with this
+        // device's, not the strictly increasing timestamp, which may have run ahead of it.
+        let request = StartUploadRequest::sign(&self.state.identity, chunks, now());
         let response = attachments.start_upload(request).await?;
         Ok(attachment::Upload {
             id: protocol::fixed(&response.id)?,
@@ -293,22 +314,29 @@ impl<H: LocalHandshake> Client<H> {
 
     /// A subscription to this client's notifications, signed by its identity key, for a server
     /// that sends them; see `protocol::notify`. It is good for a few minutes.
-    pub fn subscription(&mut self) -> SubscribeRequest {
-        let timestamp = self.next_timestamp();
-        SubscribeRequest::sign(&self.state.identity, timestamp)
+    pub fn subscription(&self) -> SubscribeRequest {
+        // Within a few minutes of the server's clock, like an upload's start.
+        SubscribeRequest::sign(&self.state.identity, now())
     }
 
-    /// Milliseconds since the Unix epoch, strictly increasing, as the server requires.
+    /// Milliseconds since the Unix epoch, strictly increasing, as the server requires of
+    /// publishing and taking initial messages.
     fn next_timestamp(&mut self) -> u64 {
-        let now = web_time::SystemTime::now()
-            .duration_since(web_time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis() as u64);
-        self.state.last_timestamp = now.max(self.state.last_timestamp + 1);
+        self.state.last_timestamp = now().max(self.state.last_timestamp + 1);
         self.state.last_timestamp
     }
 }
 
+/// Milliseconds since the Unix epoch, by this device's clock.
+fn now() -> u64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
 /// A session with one peer: encrypts with a [`Party`] and exchanges messages through a mailbox.
+///
+/// It may hold earlier sessions with the peer too, which only decrypt, see [`Session::keep`].
 ///
 /// [`Session::restore`] brings back a session from its saved [`state`](Session::state).
 #[derive(Debug)]
@@ -330,14 +358,49 @@ pub struct Session<M> {
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
 pub struct SessionState {
-    /// The party messages are sent with.
-    party: Party,
-    /// The parties of earlier sessions with the peer, latest first, see [`Session::keep`].
+    /// The session messages are sent on; none once retired, until a new one starts.
+    active: Option<Active>,
+    /// The parties of earlier sessions with the peer, latest first, which only decrypt, see
+    /// [`Session::keep`].
     others: Vec<Party>,
     me: PublicKey,
     peer: PublicKey,
     /// Sequence number of the last fetched message.
     cursor: u64,
+    /// What was done last, and how many times the peers turned between sending on the active
+    /// session and receiving on an earlier one, see [`Session::keep`].
+    last: LastAction,
+    direction_changes: u32,
+}
+
+/// The session a [`SessionState`] sends on.
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+struct Active {
+    party: Party,
+    /// The session's ID, which both peers have: the X3DH ephemeral key of the one who started
+    /// it.
+    id: PublicKey,
+    /// Whether the peer is known to have it: it started it, or a message on it decrypted.
+    known_by_peer: bool,
+}
+
+/// What was done last on a [`SessionState`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+enum LastAction {
+    None,
+    Sent,
+    ReceivedActive,
+    ReceivedEarlier,
 }
 
 impl SessionState {
@@ -345,17 +408,58 @@ impl SessionState {
     pub fn peer(&self) -> &PublicKey {
         &self.peer
     }
+
+    /// Keep `party` of an earlier session, only to decrypt, dropping the oldest beyond
+    /// [`KEPT_SESSIONS`].
+    fn archive(&mut self, party: Party) {
+        self.others.insert(0, party);
+        self.others.truncate(KEPT_SESSIONS);
+    }
+
+    /// A message decrypted on an earlier session. If the peers keep turning between this client
+    /// sending on the active session and the peer's messages decrypting only on earlier ones,
+    /// neither uses the other's: the active session is retired, and the next message goes on a
+    /// new one.
+    fn received_earlier(&mut self) {
+        if self.last == LastAction::Sent {
+            self.direction_changes += 1;
+        }
+        self.last = LastAction::ReceivedEarlier;
+        if self.direction_changes > MAX_DIRECTION_CHANGES {
+            if let Some(active) = self.active.take() {
+                self.archive(active.party);
+            }
+            self.direction_changes = 0;
+        }
+    }
 }
 
 #[cfg(feature = "prost")]
 impl From<&SessionState> for proto::SessionState {
     fn from(state: &SessionState) -> Self {
         Self {
-            party: Some((&state.party).into()),
+            party: state.active.as_ref().map(|active| (&active.party).into()),
+            id: state
+                .active
+                .as_ref()
+                .map(|active| active.id.to_vec())
+                .unwrap_or_default(),
+            known_by_peer: state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.known_by_peer),
             others: state.others.iter().map(Into::into).collect(),
             me: state.me.to_vec(),
             peer: state.peer.to_vec(),
             cursor: state.cursor,
+            last: match state.last {
+                LastAction::None => proto::LastAction::None,
+                LastAction::Sent => proto::LastAction::Sent,
+                LastAction::ReceivedActive => proto::LastAction::ReceivedActive,
+                LastAction::ReceivedEarlier => proto::LastAction::ReceivedEarlier,
+            }
+            .into(),
+            direction_changes: state.direction_changes,
         }
     }
 }
@@ -365,16 +469,30 @@ impl TryFrom<&proto::SessionState> for SessionState {
     type Error = Error;
 
     fn try_from(state: &proto::SessionState) -> Result<Self> {
-        /// An identity key field, which must be 32 bytes.
+        /// An identity or ephemeral key field, which must be 32 bytes.
         fn key(bytes: &[u8]) -> Result<PublicKey> {
             bytes
                 .try_into()
                 .map_err(|_| ErrorKind::MalformedState.into())
         }
 
-        let party = state.party.as_ref().ok_or(ErrorKind::MalformedState)?;
+        let active = match &state.party {
+            Some(party) => Some(Active {
+                party: Party::try_from(party)?,
+                id: key(&state.id)?,
+                known_by_peer: state.known_by_peer,
+            }),
+            None => None,
+        };
+        let last = match proto::LastAction::try_from(state.last) {
+            Ok(proto::LastAction::None) => LastAction::None,
+            Ok(proto::LastAction::Sent) => LastAction::Sent,
+            Ok(proto::LastAction::ReceivedActive) => LastAction::ReceivedActive,
+            Ok(proto::LastAction::ReceivedEarlier) => LastAction::ReceivedEarlier,
+            Err(_) => return Err(ErrorKind::MalformedState.into()),
+        };
         Ok(Self {
-            party: Party::try_from(party)?,
+            active,
             others: state
                 .others
                 .iter()
@@ -383,20 +501,31 @@ impl TryFrom<&proto::SessionState> for SessionState {
             me: key(&state.me)?,
             peer: key(&state.peer)?,
             cursor: state.cursor,
+            last,
+            direction_changes: state.direction_changes,
         })
     }
 }
 
 impl<M> Session<M> {
-    fn new(mailbox: M, party: Party, me: PublicKey, peer: PublicKey) -> Self {
+    /// A session that begins a chat, sending on `active`.
+    fn new(mailbox: M, active: Active, me: PublicKey, peer: PublicKey) -> Self {
+        let last = if active.known_by_peer {
+            // Its first message was received.
+            LastAction::ReceivedActive
+        } else {
+            LastAction::None
+        };
         Self::restore(
             mailbox,
             SessionState {
-                party,
+                active: Some(active),
                 others: vec![],
                 me,
                 peer,
                 cursor: 0,
+                last,
+                direction_changes: 0,
             },
         )
     }
@@ -417,47 +546,94 @@ impl<M> Session<M> {
         &self.state.peer
     }
 
-    /// Keep `older`, an earlier session with the same peer, behind this one, which the peer or
-    /// this client has just started: the messages this session cannot decrypt are tried on it,
-    /// such as the ones the peer sent on it before starting this one. Of two sessions the peer
-    /// and this client started at once, each keeping the other's, neither loses messages.
+    /// Whether this session has none to send on, as the peers kept missing each other, see
+    /// [`Session::keep`]: start a new one with [`Client::initiate`] and keep this one with it,
+    /// before sending.
+    pub fn needs_new_session(&self) -> bool {
+        self.state.active.is_none()
+    }
+
+    /// Keep `older`, the chat with the same peer so far, with this session, which the peer or
+    /// this client has just started. The last [`KEPT_SESSIONS`] earlier sessions are kept, only
+    /// to decrypt, such as the messages the peer sent on `older` before starting this one; and
+    /// they go on from the later of the two positions in the peer's queue.
     ///
-    /// A kept session takes over if a message on it decrypts while nothing has on this one, as
-    /// the peer may never have got this one, e.g. if this client started it and its initial
-    /// message was lost. Once one has, the peer has this session, so the earlier ones never take
-    /// over again. The last [`KEPT_SESSIONS`] are kept, and they go on from the later of the
-    /// two positions in the peer's queue.
+    /// Of the sessions, one is active: messages are sent on it, so each peer answers the other
+    /// on it and its ratchet keeps stepping, as Signal's session management (Tahini) does. An
+    /// earlier session never becomes active again, as whoever stole its keys could otherwise
+    /// make this client send on it again, where they read everything, though the ratchet has
+    /// since locked them out of the active one. A session this client starts becomes active.
+    /// One the peer starts does too, unless the active one is this client's and the peer has
+    /// not answered it: then both started one at once, and the one whose ID, the X3DH ephemeral
+    /// key of who started it, is higher wins, on both sides. If the peers still miss each
+    /// other, e.g. as an initial message was lost or a chat deleted, the peer's messages
+    /// decrypt only on earlier sessions while this client sends on the active one; after
+    /// [`MAX_DIRECTION_CHANGES`] turns between the two, the active session is retired, and the
+    /// next message goes on a new one, see [`Session::needs_new_session`].
     pub fn keep(&mut self, older: Session<M>) -> Result<()> {
         if older.state.me != self.state.me || older.state.peer != self.state.peer {
             return Err(ErrorKind::UnexpectedPeer.into());
         }
-        self.state.cursor = self.state.cursor.max(older.state.cursor);
-        self.state.others.splice(
-            0..0,
-            iter::once(older.state.party).chain(older.state.others),
-        );
-        self.state.others.truncate(KEPT_SESSIONS);
+        let new = mem::replace(&mut self.state, older.state);
+        let state = &mut self.state;
+        state.cursor = state.cursor.max(new.cursor);
+        for party in new.others.into_iter().rev() {
+            state.archive(party);
+        }
+        if let Some(active) = new.active {
+            // One this client started is not known by the peer yet.
+            let started_here = !active.known_by_peer;
+            let takes_over = started_here
+                || state
+                    .active
+                    .as_ref()
+                    .is_none_or(|current| current.known_by_peer || active.id > current.id);
+            if takes_over {
+                if let Some(current) = state.active.replace(active) {
+                    state.archive(current.party);
+                }
+                state.last = if started_here {
+                    LastAction::None
+                } else {
+                    LastAction::ReceivedActive
+                };
+                state.direction_changes = 0;
+            } else {
+                // Its first message decrypted, on what is now an earlier session.
+                state.archive(active.party);
+                state.received_earlier();
+            }
+        }
         Ok(())
     }
 
-    /// Decrypt `message` with the party, or else with a kept one, which takes over if nothing
-    /// has decrypted on the party.
+    /// Decrypt `message` with the active party, or else with an earlier one, which only counts
+    /// towards retiring the active one, see [`Session::keep`].
     fn decrypt(&mut self, message: &EncryptedMessage) -> Result<Vec<u8>> {
-        let error = match self.state.party.decrypt(message) {
-            Ok(content) => return Ok(content),
-            Err(error) => error,
-        };
-        for index in 0..self.state.others.len() {
-            if let Ok(content) = self.state.others[index].decrypt(message) {
-                if !self.state.party.has_received() {
-                    let party = self.state.others.remove(index);
-                    let previous = mem::replace(&mut self.state.party, party);
-                    self.state.others.insert(0, previous);
+        let state = &mut self.state;
+        let mut error = None;
+        if let Some(active) = &mut state.active {
+            match active.party.decrypt(message) {
+                Ok(content) => {
+                    active.known_by_peer = true;
+                    state.last = LastAction::ReceivedActive;
+                    return Ok(content);
                 }
-                return Ok(content);
+                Err(e) => error = Some(e),
             }
         }
-        Err(error.into())
+        let decrypted = state
+            .others
+            .iter_mut()
+            .find_map(|party| party.decrypt(message).ok());
+        match (decrypted, error) {
+            (Some(content), _) => {
+                state.received_earlier();
+                Ok(content)
+            }
+            (None, Some(error)) => Err(error.into()),
+            (None, None) => Err(ErrorKind::Undecryptable.into()),
+        }
     }
 }
 
@@ -471,9 +647,18 @@ impl<M: LocalMailbox> Session<M> {
         self.push(message).await
     }
 
-    /// Encrypt `content` for the peer.
+    /// Encrypt `content` for the peer, on the active session.
+    ///
+    /// Fails with [`ErrorKind::NoSession`] if it has none, see [`Session::needs_new_session`].
     pub fn encrypt(&mut self, content: &[u8]) -> Result<EncryptedMessage> {
-        self.state.party.encrypt(content).map_err(Into::into)
+        let state = &mut self.state;
+        let active = state.active.as_mut().ok_or(ErrorKind::NoSession)?;
+        let message = active.party.encrypt(content)?;
+        if state.last == LastAction::ReceivedEarlier {
+            state.direction_changes += 1;
+        }
+        state.last = LastAction::Sent;
+        Ok(message)
     }
 
     /// Push an encrypted message to the peer; it can be pushed again if this fails.
@@ -491,7 +676,7 @@ impl<M: LocalMailbox> Session<M> {
     /// Fetch the next page of the peer's messages and decrypt them: one result per message, in
     /// order. Returns an empty page once there are no new messages.
     ///
-    /// A message is tried on the sessions [kept](Session::keep) too. One that fails to decrypt
+    /// A message is tried on the earlier sessions [kept](Session::keep) too. One that fails to decrypt
     /// is still consumed, so it cannot block the ones after it.
     /// Cancel-safe: if the future is dropped, no message is consumed.
     pub async fn receive(&mut self) -> Result<Vec<Result<Vec<u8>>>> {
@@ -769,89 +954,280 @@ mod test {
         assert!(alice_session.receive().await.unwrap()[0].is_err());
     }
 
+    /// Whether `a` and `b` send on one session.
+    fn on_one_session<M>(a: &Session<M>, b: &Session<M>) -> bool {
+        matches!(
+            (&a.state.active, &b.state.active),
+            (Some(a), Some(b)) if a.id == b.id
+        )
+    }
+
+    /// Accept the initial message `client` has from `peer`, keeping `session`, the chat so far.
+    async fn accept_keeping<'a>(
+        client: &mut Client<InProcessHandshake<'a>>,
+        peer: &PublicKey,
+        session: &mut Session<InProcessMailbox<'a>>,
+        mailbox: &'a MailboxServer<MemoryStore>,
+    ) -> Vec<u8> {
+        let initial_messages = client.take_initial_messages().await.unwrap();
+        let (accepted, first) = client
+            .accept(peer, &initial_messages[0], InProcessMailbox(mailbox))
+            .unwrap();
+        let older = mem::replace(session, accepted);
+        session.keep(older).unwrap();
+        first
+    }
+
+    /// Start a new session from `client` to `peer`, keeping `session`, the chat so far.
+    async fn start_keeping<'a>(
+        client: &mut Client<InProcessHandshake<'a>>,
+        peer: &PublicKey,
+        session: &mut Session<InProcessMailbox<'a>>,
+        mailbox: &'a MailboxServer<MemoryStore>,
+        first: &[u8],
+    ) {
+        let started = client
+            .initiate(peer, first, InProcessMailbox(mailbox))
+            .await
+            .unwrap();
+        let older = mem::replace(session, started);
+        session.keep(older).unwrap();
+    }
+
     #[tokio::test]
-    async fn an_earlier_session_takes_over_if_the_new_one_gets_no_answer() {
+    async fn a_session_the_peer_never_gets_is_retired_for_a_new_one() {
         let handshake = HandshakeServer::new(MemoryStore::default());
         let mailbox = MailboxServer::new(MemoryStore::default());
         let (mut alice, mut alice_session, mut bob, mut bob_session) =
             talking(&handshake, &mailbox).await;
 
-        // Bob starts again, but Alice never gets his initial message.
+        // Bob starts again, but Alice loses his initial message, and writes on the old session.
         alice.publish_keys(1).await.unwrap();
-        let session = bob
-            .initiate(&alice.identity_key(), b"new", InProcessMailbox(&mailbox))
-            .await
-            .unwrap();
-        let older = mem::replace(&mut bob_session, session);
-        bob_session.keep(older).unwrap();
+        let alice_key = alice.identity_key();
+        start_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox, b"lost").await;
+        assert_eq!(alice.take_initial_messages().await.unwrap().len(), 1);
 
-        // Alice writes on the old session, so Bob goes back to it.
-        alice_session.send(b"still here").await.unwrap();
+        // Bob reads her on the old session, which never becomes active again, and she cannot
+        // read him on the new one; after a few turns, he retires it.
+        let mut turns = 0;
+        loop {
+            alice_session.send(b"still here").await.unwrap();
+            assert_eq!(
+                contents(bob_session.receive().await.unwrap()),
+                [b"still here"]
+            );
+            if bob_session.needs_new_session() {
+                break;
+            }
+            bob_session.send(b"lost too").await.unwrap();
+            assert!(alice_session.receive().await.unwrap()[0].is_err());
+            turns += 1;
+        }
+        assert!(turns <= MAX_DIRECTION_CHANGES);
         assert_eq!(
-            contents(bob_session.receive().await.unwrap()),
-            [b"still here"]
+            bob_session.encrypt(b"no").unwrap_err().kind(),
+            ErrorKind::NoSession
         );
-        bob_session.send(b"back on it").await.unwrap();
+
+        // He starts a new one, which Alice gets this time, and they talk on it.
+        start_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox, b"again").await;
+        let first = accept_keeping(
+            &mut alice,
+            &bob.identity_key(),
+            &mut alice_session,
+            &mailbox,
+        )
+        .await;
+        assert_eq!(first, b"again");
+        assert!(on_one_session(&alice_session, &bob_session));
+        bob_session.send(b"hello again").await.unwrap();
         assert_eq!(
             contents(alice_session.receive().await.unwrap()),
-            [b"back on it"]
+            [b"hello again"]
         );
+        alice_session.send(b"hi").await.unwrap();
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"hi"]);
     }
 
     #[tokio::test]
-    async fn sessions_started_at_once_lose_nothing() {
+    async fn sessions_started_at_once_end_as_one() {
+        // Each accepts the other's; or one answers the other's before the other accepts its
+        // own, which a client does before it receives.
+        for answered_first in [false, true] {
+            let handshake = HandshakeServer::new(MemoryStore::default());
+            let mailbox = MailboxServer::new(MemoryStore::default());
+            let mut alice = Client::new(InProcessHandshake(&handshake));
+            let mut bob = Client::new(InProcessHandshake(&handshake));
+            alice.publish_keys(1).await.unwrap();
+            bob.publish_keys(1).await.unwrap();
+            let mut alice_session = alice
+                .initiate(&bob.identity_key(), b"hi bob", InProcessMailbox(&mailbox))
+                .await
+                .unwrap();
+            let mut bob_session = bob
+                .initiate(
+                    &alice.identity_key(),
+                    b"hi alice",
+                    InProcessMailbox(&mailbox),
+                )
+                .await
+                .unwrap();
+
+            let first =
+                accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
+            assert_eq!(first, b"hi bob");
+            if answered_first {
+                bob_session.send(b"b0").await.unwrap();
+            }
+            let first = accept_keeping(
+                &mut alice,
+                &bob.identity_key(),
+                &mut alice_session,
+                &mailbox,
+            )
+            .await;
+            assert_eq!(first, b"hi alice");
+            if answered_first {
+                assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b0"]);
+            }
+
+            // The session with the higher ID won on both sides, and whatever each sends, at once
+            // or in turn, arrives.
+            assert!(on_one_session(&alice_session, &bob_session));
+            alice_session.send(b"a1").await.unwrap();
+            bob_session.send(b"b1").await.unwrap();
+            assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b1"]);
+            assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a1"]);
+            alice_session.send(b"a2").await.unwrap();
+            assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a2"]);
+            bob_session.send(b"b2").await.unwrap();
+            assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b2"]);
+            assert!(on_one_session(&alice_session, &bob_session));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chat_deleted_while_a_session_waits_ends_on_one() {
         let handshake = HandshakeServer::new(MemoryStore::default());
         let mailbox = MailboxServer::new(MemoryStore::default());
         let mut alice = Client::new(InProcessHandshake(&handshake));
         let mut bob = Client::new(InProcessHandshake(&handshake));
         alice.publish_keys(1).await.unwrap();
-        bob.publish_keys(1).await.unwrap();
-        let mut alice_session = alice
-            .initiate(&bob.identity_key(), b"hi bob", InProcessMailbox(&mailbox))
-            .await
-            .unwrap();
-        let mut bob_session = bob
-            .initiate(
-                &alice.identity_key(),
-                b"hi alice",
-                InProcessMailbox(&mailbox),
-            )
-            .await
-            .unwrap();
+        bob.publish_keys(2).await.unwrap();
+        let (alice_key, bob_key) = (alice.identity_key(), bob.identity_key());
 
-        // Each takes the other's session, keeping its own.
-        let initial_messages = alice.take_initial_messages().await.unwrap();
-        let (session, first) = alice
-            .accept(
-                &bob.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
-            )
+        // Both start at once, but Bob deletes his chat before he takes Alice's initial message,
+        // which then begins his chat again; Alice accepts the one he deleted.
+        let mut alice_session = alice
+            .initiate(&bob_key, b"hi bob", InProcessMailbox(&mailbox))
+            .await
             .unwrap();
-        assert_eq!(first, b"hi alice");
-        let older = mem::replace(&mut alice_session, session);
-        alice_session.keep(older).unwrap();
+        let deleted = bob
+            .initiate(&alice_key, b"hi alice", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        drop(deleted);
         let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (session, first) = bob
-            .accept(
-                &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
-            )
+        let (mut bob_session, first) = bob
+            .accept(&alice_key, &initial_messages[0], InProcessMailbox(&mailbox))
             .unwrap();
         assert_eq!(first, b"hi bob");
-        let older = mem::replace(&mut bob_session, session);
-        bob_session.keep(older).unwrap();
+        let first = accept_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox).await;
+        assert_eq!(first, b"hi alice");
 
-        // Whatever each sends, at once or in turn, arrives.
-        alice_session.send(b"a1").await.unwrap();
-        bob_session.send(b"b1").await.unwrap();
-        assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b1"]);
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a1"]);
-        alice_session.send(b"a2").await.unwrap();
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a2"]);
-        bob_session.send(b"b2").await.unwrap();
-        assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b2"]);
+        // If Bob's won, what Alice sends on it is lost, while what Bob sends decrypts on hers,
+        // until she retires his and starts a new one.
+        let mut lost = 0;
+        while !on_one_session(&alice_session, &bob_session) {
+            assert!(lost <= MAX_DIRECTION_CHANGES, "they never settle");
+            if alice_session.needs_new_session() {
+                start_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox, b"again").await;
+                let first = accept_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox).await;
+                assert_eq!(first, b"again");
+                continue;
+            }
+            alice_session.send(b"from alice").await.unwrap();
+            assert!(bob_session.receive().await.unwrap()[0].is_err());
+            lost += 1;
+            bob_session.send(b"from bob").await.unwrap();
+            assert_eq!(
+                contents(alice_session.receive().await.unwrap()),
+                [b"from bob"]
+            );
+        }
+        alice_session.send(b"on one").await.unwrap();
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"on one"]);
+        bob_session.send(b"at last").await.unwrap();
+        assert_eq!(
+            contents(alice_session.receive().await.unwrap()),
+            [b"at last"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_message_from_before_a_chat_was_deleted_changes_nothing() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut deleted, mut bob, mut bob_session) =
+            talking(&handshake, &mailbox).await;
+
+        // Alice sends on her session, deletes the chat and starts again; Bob takes the new
+        // session before the message sent on the old one.
+        deleted.send(b"late").await.unwrap();
+        drop(deleted);
+        let mut alice_session = alice
+            .initiate(&bob.identity_key(), b"again", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        let first =
+            accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
+        assert_eq!(first, b"again");
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"late"]);
+        bob_session.send(b"on the new one").await.unwrap();
+        // The new session reads the queue from its start, where the reply to the old one is.
+        let received = alice_session.receive().await.unwrap();
+        assert!(received[0].is_err());
+        assert_eq!(received[1].as_ref().unwrap(), b"on the new one");
+        assert!(on_one_session(&alice_session, &bob_session));
+    }
+
+    #[tokio::test]
+    async fn a_stolen_earlier_session_is_never_sent_on_again() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut stolen, mut bob, mut bob_session) = talking(&handshake, &mailbox).await;
+        alice.publish_keys(KEPT_SESSIONS + 1).await.unwrap();
+        let (alice_key, bob_key) = (alice.identity_key(), bob.identity_key());
+
+        // Someone copied Alice's session, and she started a new one, which Bob accepted.
+        let mut alice_session = alice
+            .initiate(&bob_key, b"new", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        accept_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox).await;
+        // Bob's reply to the copied session, from before.
+        assert!(alice_session.receive().await.unwrap()[0].is_err());
+
+        // The thief writes on the copied session as Alice, and Bob decrypts it while he keeps
+        // it; but he never sends on it, so the thief reads nothing more. Missing Alice, he
+        // retires sessions and starts new ones, which only Alice can accept, until the copied
+        // one drops out.
+        for _ in 0..4 * MAX_DIRECTION_CHANGES {
+            stolen.send(b"it is me").await.unwrap();
+            bob_session.receive().await.unwrap();
+            if bob_session.needs_new_session() {
+                start_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox, b"again").await;
+                accept_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox).await;
+            }
+            bob_session.send(b"for alice").await.unwrap();
+            assert!(stolen.receive().await.unwrap().iter().all(Result::is_err));
+            assert_eq!(
+                contents(alice_session.receive().await.unwrap()),
+                [b"for alice"]
+            );
+        }
+        stolen.send(b"still me").await.unwrap();
+        assert!(bob_session.receive().await.unwrap()[0].is_err());
     }
 
     #[tokio::test]
@@ -888,7 +1264,7 @@ mod test {
     async fn attachments_go_in_chunks() {
         let handshake = HandshakeServer::new(MemoryStore::default());
         let attachments = AttachmentServer::new(MemoryStore::default());
-        let mut alice = Client::new(InProcessHandshake(&handshake));
+        let alice = Client::new(InProcessHandshake(&handshake));
         // Two full chunks and a bit.
         let file: Vec<u8> = (0..2 * attachment::CHUNK_SIZE + 10)
             .map(|i| i as u8)

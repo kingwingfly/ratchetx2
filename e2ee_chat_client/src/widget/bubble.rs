@@ -10,7 +10,7 @@ use ratatui_image::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::message::{File, Message, MessageContent, MessageState};
+use crate::message::{File, Kind, Message, MessageState};
 
 pub struct Bubble<'a> {
     pub picker: &'a Picker,
@@ -54,7 +54,7 @@ impl StatefulWidget for Bubble<'_> {
         let inner = block.inner(chunk);
         block.render(chunk, buf);
         match &self.message.content {
-            MessageContent::Text(text) => {
+            Kind::Text(text) => {
                 let mut lines = text
                     .lines()
                     .map(|line| Line::default().spans([Span::raw(line)]))
@@ -70,13 +70,17 @@ impl StatefulWidget for Bubble<'_> {
                 };
                 p.render(inner, buf);
             }
-            MessageContent::File(File { name, data, .. }) => {
+            // Greetings are dropped as they arrive, but would show as one.
+            Kind::Hello(hello) => {
+                Paragraph::new(format!("👋 {}", hello.name)).render(inner, buf);
+            }
+            Kind::File(File { name, data, .. }) => {
                 file_card(name, data.len() as u64).render(inner, buf);
             }
-            MessageContent::Attachment(pointer) => {
+            Kind::Attachment(pointer) => {
                 file_card(&pointer.name, pointer.size).render(inner, buf);
             }
-            MessageContent::Image(bytes) => {
+            Kind::Image(bytes) => {
                 if let Some(image) = state.get_or_insert_mut(Sha256::digest(bytes).to_vec(), || {
                     load_from_memory(bytes).ok().map(|image| {
                         let mut image = self.picker.new_resize_protocol(image);

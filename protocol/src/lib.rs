@@ -8,6 +8,7 @@
 pub mod attachment;
 #[cfg(feature = "connect")]
 pub mod connect;
+pub mod content;
 pub mod error;
 pub mod handshake;
 pub mod mailbox;

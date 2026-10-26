@@ -30,7 +30,7 @@ use wasm_bindgen_futures::JsFuture;
 use zeroize::Zeroizing;
 
 use crate::{
-    content::{AttachmentPointer, Content, Hello, WireContent, image_type},
+    content::{self, AttachmentPointer, Content, Hello, Kind, image_type},
     notify::{Event, Subscription},
     state::{
         Attachment, Body, ContactView, Delivery, Dialog, Link, Me, MessageView, Opening, Phase,
@@ -120,7 +120,7 @@ pub struct Engine {
 /// What was sent, waiting its turn to go: a message, or a file, which is read, or starts
 /// uploading, first.
 pub enum Sending {
-    Content(PublicKey, Content),
+    Content(PublicKey, Kind),
     File(PublicKey, web_sys::File),
 }
 
@@ -133,6 +133,12 @@ struct Inner {
     state: AppState,
     client: Client<Connect>,
     contacts: Vec<Contact>,
+    /// History records that a save failed to write after what they record could not be undone:
+    /// initial messages, which the server deleted once taken, and the greeting of a chat started.
+    /// Each save writes them too, until one succeeds, so that the history has no gap.
+    unsaved: Vec<(PublicKey, (String, HistoryEntry))>,
+    /// Whether a save wrote such records, whose chats then show.
+    saved_late: bool,
 }
 
 struct Contact {
@@ -239,7 +245,7 @@ impl Engine {
             .await
             .map_err(|e| format!("Cannot read {name}: {}", js_error(e)))?;
         let data = js_sys::Uint8Array::new(&buffer).to_vec();
-        self.send(peer, Content::from_file(name, file.type_(), data))
+        self.send(peer, content::from_file(name, file.type_(), data))
             .await
     }
 
@@ -297,6 +303,8 @@ impl Engine {
             },
             client,
             contacts: vec![],
+            unsaved: vec![],
+            saved_late: false,
         })
         .await;
         Ok(())
@@ -334,6 +342,8 @@ impl Engine {
             state,
             client,
             contacts,
+            unsaved: vec![],
+            saved_late: false,
         })
         .await;
         Ok(())
@@ -488,46 +498,64 @@ impl Engine {
         self.wake();
     }
 
-    /// One round: push what waits, take initial messages, publish prekeys when due, and receive.
-    /// Returns whether anything happened.
+    /// One round: save what an earlier save failed to, push what waits, take initial messages,
+    /// publish prekeys when due, and receive. Returns whether anything happened.
     async fn sync(&self) -> bool {
-        // A push or a publish that keeps failing, e.g. a large file timing out over a slow link,
-        // must not keep the round from receiving: its error is kept, and the round goes on.
+        // A step that keeps failing, e.g. a large file timing out over a slow link, a take of
+        // initial messages the server refuses, or one chat's queue that cannot be fetched, must
+        // not keep the round from the other steps and chats: its error is kept, and the round
+        // goes on.
         let mut failure = None;
-        let result = async {
-            let mut active = false;
-            for peer in self.peers().await {
-                match self.flush(&peer).await {
-                    Ok(pushed) => active |= pushed,
-                    Err(e) => {
-                        failure.get_or_insert(e);
-                    }
+        let mut active = false;
+        if let Err(e) = self.save_late().await {
+            failure.get_or_insert(e);
+        }
+        for peer in self.peers().await {
+            match self.flush(&peer).await {
+                Ok(pushed) => active |= pushed,
+                Err(e) => {
+                    failure.get_or_insert(e);
                 }
             }
-            active |= self.take_initial_messages().await?;
-            if let Err(e) = self.publish(false).await {
+        }
+        match self.take_initial_messages().await {
+            Ok(taken) => active |= taken,
+            Err(e) => {
                 failure.get_or_insert(e);
             }
-            for peer in self.peers().await {
-                active |= self.receive(&peer).await?;
-            }
-            Ok::<_, String>(active)
         }
-        .await;
-        match (result, failure) {
-            (Ok(active), None) => {
-                self.ui.link.set(Link::Synced(now()));
-                active
-            }
-            (Ok(active), Some(e)) => {
-                self.ui.link.set(Link::Offline(e));
-                active
-            }
-            (Err(e), _) => {
-                self.ui.link.set(Link::Offline(e));
-                false
+        if let Err(e) = self.publish(false).await {
+            failure.get_or_insert(e);
+        }
+        for peer in self.peers().await {
+            match self.receive(&peer).await {
+                Ok(received) => active |= received,
+                Err(e) => {
+                    failure.get_or_insert(e);
+                }
             }
         }
+        match failure {
+            None => self.ui.link.set(Link::Synced(now())),
+            Some(e) => self.ui.link.set(Link::Offline(e)),
+        }
+        active
+    }
+
+    /// Save the history records an earlier save failed to write, see `Inner::unsaved`, unless
+    /// another save did, and show their chats.
+    async fn save_late(&self) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return Ok(());
+        };
+        if !inner.unsaved.is_empty() {
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
+        if std::mem::take(&mut inner.saved_late) {
+            self.ui.contacts.set(inner.views());
+        }
+        Ok(())
     }
 
     async fn peers(&self) -> Vec<PublicKey> {
@@ -578,7 +606,7 @@ impl Engine {
 
     /// Take the initial messages waiting, and accept each at once, while its prekeys are kept. One
     /// whose first message does not decrypt is not from whom it claims, and is dropped. A new
-    /// peer's becomes a request; a known peer's session takes over the chat, keeping the old one.
+    /// peer's becomes a request; a known peer's session joins the chat, see `Session::keep`.
     async fn take_initial_messages(&self) -> Result<bool, String> {
         let mut guard = self.inner.lock().await;
         let Some(inner) = guard.as_mut() else {
@@ -593,6 +621,7 @@ impl Engine {
             return Ok(false);
         }
         let (mut records, mut views) = (vec![], vec![]);
+        let mut peers = vec![];
         for initial_message in &initial_messages {
             let peer = initial_message.x3dh.identity_key;
             let (session, first) =
@@ -619,7 +648,7 @@ impl Engine {
                 .position(|contact| contact.peer == peer)
             {
                 // The peer started again, or both started at once. The old session is kept
-                // for the messages sent on it.
+                // only to decrypt the messages sent on it, see `Session::keep`.
                 Some(index) => {
                     let contact = &mut inner.contacts[index];
                     let older = std::mem::replace(&mut contact.session, session);
@@ -649,11 +678,16 @@ impl Engine {
             let open = self.ui.open.get_untracked() == Some(peer);
             let (index, entry) = contact.add_received(&first, open && !document().hidden());
             records.push((history_key(&peer, index), entry.clone()));
+            peers.push(peer);
             if open {
                 views.push(contact.message(index, entry));
             }
         }
-        inner.save(&records).await.map_err(|e| describe(&e))?;
+        if let Err(e) = inner.save(&records).await {
+            // The server deleted them, and their sessions are accepted: they show once saved.
+            inner.unsaved.extend(peers.into_iter().zip(records));
+            return Err(describe(&e));
+        }
         self.ui.messages.update(|messages| messages.extend(views));
         self.ui.contacts.set(inner.views());
         Ok(true)
@@ -754,7 +788,7 @@ impl Engine {
 
     /// Encrypt `content` for `peer`, save it, and push it. What the user sends goes through
     /// [`Engine::queue`], to go in order.
-    async fn send(&self, peer: PublicKey, content: Content) -> Result<(), String> {
+    async fn send(&self, peer: PublicKey, content: Kind) -> Result<(), String> {
         {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
@@ -762,6 +796,10 @@ impl Engine {
             if contact.state.request {
                 return Err("accept the request first".into());
             }
+            if contact.session.needs_new_session() {
+                inner.start_again(&peer).await?;
+            }
+            let contact = inner.contact(&peer).ok_or("no such chat")?;
             // If saving fails, the message is forgotten, ratchet step and all: it never left.
             let snapshot = contact.snapshot();
             let message = contact
@@ -778,8 +816,8 @@ impl Engine {
             let entry = HistoryEntry {
                 outgoing: true,
                 at: now(),
-                content: Some(WireContent {
-                    content: Some(content),
+                content: Some(Content {
+                    kind: Some(content),
                 }),
             };
             let view = contact.message(index, entry.clone());
@@ -862,7 +900,7 @@ impl Engine {
             mime: pending.mime.clone(),
         };
         // Sent first, then kept: going wrong in between sends it twice, not never.
-        self.send(*peer, Content::Attachment(pointer)).await?;
+        self.send(*peer, Kind::Attachment(pointer)).await?;
         pending.announced = true;
         self.save_upload(peer, &pending).await?;
         Ok(pending)
@@ -1220,7 +1258,9 @@ impl Engine {
             guard.as_ref().ok_or("locked")?.server.clone()
         };
         let attachments = Fetch::client(&server);
-        let mut data = Vec::with_capacity(pointer.size as usize);
+        // It grows as its chunks decrypt, not to the size the peer claims, which nothing backs
+        // until they do.
+        let mut data = vec![];
         for index in 0..chunks {
             if !self.opening(id) {
                 return Ok(None);
@@ -1357,7 +1397,7 @@ impl Engine {
         }
         // The greeting is the session's first message, which shows the peer that the initial
         // message is this client's, and lets the peer write back.
-        let hello = Content::Hello(Hello {
+        let hello = Kind::Hello(Hello {
             name: inner.state.name.clone(),
         });
         let session = inner
@@ -1373,9 +1413,7 @@ impl Engine {
         let entry = HistoryEntry {
             outgoing: true,
             at: now(),
-            content: Some(WireContent {
-                content: Some(hello),
-            }),
+            content: Some(Content { kind: Some(hello) }),
         };
         inner.contacts.push(Contact {
             peer,
@@ -1388,10 +1426,12 @@ impl Engine {
                 ..ContactState::default()
             },
         });
-        inner
-            .save(&[(history_key(&peer, 0), entry)])
-            .await
-            .map_err(|e| describe(&e))?;
+        let record = (history_key(&peer, 0), entry);
+        if let Err(e) = inner.save(std::slice::from_ref(&record)).await {
+            // The peer has the initial message already, so the chat stays: it shows once saved.
+            inner.unsaved.push((peer, record));
+            return Err(describe(&e));
+        }
         self.ui.contacts.set(inner.views());
         self.wake();
         Ok(peer)
@@ -1514,6 +1554,7 @@ impl Engine {
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.peer != peer));
         inner.contacts.retain(|contact| contact.peer != peer);
+        inner.unsaved.retain(|(unsaved, _)| *unsaved != peer);
         if self.ui.open.get_untracked() == Some(peer) {
             self.ui.open.set(None);
             self.ui.messages.set(vec![]);
@@ -1551,11 +1592,41 @@ impl Inner {
         }
     }
 
-    /// Save the state, and `entries` with it.
+    /// Save the state, and `entries` with it, and the records left [unsaved](Self::unsaved).
     // TODO: every save encrypts the whole state, outboxes included, whose messages may be files
     // of up to 1 MiB; keep each waiting message in a record of its own.
-    async fn save(&self, entries: &[(String, HistoryEntry)]) -> crate::vault::Result<()> {
-        self.vault.save(&self.app_state(), entries).await
+    async fn save(&mut self, entries: &[(String, HistoryEntry)]) -> crate::vault::Result<()> {
+        if self.unsaved.is_empty() {
+            return self.vault.save(&self.app_state(), entries).await;
+        }
+        let all: Vec<_> = self
+            .unsaved
+            .iter()
+            .map(|(_, record)| record.clone())
+            .chain(entries.iter().cloned())
+            .collect();
+        self.vault.save(&self.app_state(), &all).await?;
+        self.unsaved.clear();
+        self.saved_late = true;
+        Ok(())
+    }
+
+    /// Start a new session with `peer`, whose chat has none to send on, as the two kept missing
+    /// each other (see `Session::needs_new_session`), greeting the peer in its first message as
+    /// a new chat does; and save it.
+    async fn start_again(&mut self, peer: &PublicKey) -> Result<(), String> {
+        let hello = Kind::Hello(Hello {
+            name: self.state.name.clone(),
+        });
+        let started = self
+            .client
+            .initiate(peer, &hello.to_bytes(), Fetch::client(&self.server))
+            .await
+            .map_err(|e| describe(&e))?;
+        let contact = self.contact(peer).ok_or("no such chat")?;
+        let older = std::mem::replace(&mut contact.session, started);
+        contact.session.keep(older).map_err(|e| describe(&e))?;
+        self.save(&[]).await.map_err(|e| describe(&e))
     }
 
     fn contact(&mut self, peer: &PublicKey) -> Option<&mut Contact> {
@@ -1633,9 +1704,9 @@ impl Contact {
     /// Add the content `bytes`, received, to the history, counting it as unread unless the chat
     /// is `open`. Returns the entry and its index.
     fn add_received(&mut self, bytes: &[u8], open: bool) -> (u64, HistoryEntry) {
-        let content = Content::from_bytes(bytes);
+        let content = Kind::from_bytes(bytes);
         match &content {
-            Some(Content::Hello(hello)) => self.state.hello_name = hello.name.clone(),
+            Some(Kind::Hello(hello)) => self.state.hello_name = hello.name.clone(),
             _ if !open => self.state.unread += 1,
             _ => {}
         }
@@ -1645,7 +1716,7 @@ impl Contact {
         let entry = HistoryEntry {
             outgoing: false,
             at: now(),
-            content: Some(WireContent { content }),
+            content: Some(Content { kind: content }),
         };
         (index, entry)
     }
@@ -1667,9 +1738,9 @@ impl Contact {
 
     /// History entry `index`, as shown.
     fn message(&self, index: u64, entry: HistoryEntry) -> MessageView {
-        let body = match entry.content.and_then(|content| content.content) {
-            Some(Content::Text(text)) => Body::Text(text),
-            Some(Content::Image(data)) => {
+        let body = match entry.content.and_then(|content| content.kind) {
+            Some(Kind::Text(text)) => Body::Text(text),
+            Some(Kind::Image(data)) => {
                 // The TUI client sends any image, e.g. BMP, which only downloads here.
                 let mime = image_type(&data);
                 Body::File(Attachment {
@@ -1683,13 +1754,13 @@ impl Contact {
                     data: Arc::new(data),
                 })
             }
-            Some(Content::File(file)) => Body::File(Attachment {
+            Some(Kind::File(file)) => Body::File(Attachment {
                 name: file.name,
                 mime: file.mime,
                 data: Arc::new(file.data),
             }),
-            Some(Content::Hello(hello)) => Body::Hello(hello.name),
-            Some(Content::Attachment(pointer)) => Body::Remote(RemoteFile {
+            Some(Kind::Hello(hello)) => Body::Hello(hello.name),
+            Some(Kind::Attachment(pointer)) => Body::Remote(RemoteFile {
                 peer: self.peer,
                 pointer,
             }),
@@ -1803,7 +1874,7 @@ mod tests {
         assert!(checked_name(&"😀".repeat(NAME_MAX)).is_ok());
         assert!(checked_name(&"a".repeat(NAME_MAX + 1)).is_err());
         // The longest greeting is far below the 4 KiB a first message may take.
-        let greeting = Content::Hello(Hello {
+        let greeting = Kind::Hello(Hello {
             name: "😀".repeat(NAME_MAX),
         });
         assert!(greeting.to_bytes().len() < 512);
