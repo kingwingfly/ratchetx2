@@ -1,5 +1,5 @@
--- The handshake and mailbox stores. Keys are 32-byte BLOBs, timestamps milliseconds since the
--- Unix epoch.
+-- The handshake, mailbox and attachment stores. Keys are 32-byte BLOBs, timestamps milliseconds
+-- since the Unix epoch.
 
 -- Each identity's published bundle.
 CREATE TABLE bundles (
@@ -58,8 +58,21 @@ CREATE TABLE messages (
     object TEXT,
     -- The content's length, wherever it is.
     size INTEGER NOT NULL,
+    -- The initial message its sender sent with it, while its session was unanswered.
+    initial_message BLOB,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (sender, recipient, sequence),
     CHECK ((content IS NULL) != (object IS NULL))
 ) WITHOUT ROWID;
 CREATE INDEX messages_by_age ON messages (created_at);
+
+-- Attachments: their chunks are R2 objects named attachments/<id>/<index>, uploaded with the
+-- token whose SHA-256 is kept here.
+CREATE TABLE attachments (
+    id BLOB PRIMARY KEY,
+    uploader BLOB NOT NULL,
+    chunks INTEGER NOT NULL,
+    token_hash BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+) WITHOUT ROWID;
+CREATE INDEX attachments_by_age ON attachments (created_at);
