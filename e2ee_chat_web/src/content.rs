@@ -1,7 +1,9 @@
 //! What a message carries, encrypted: `protocol::content`, which the TUI client reads too, and
 //! which drops the kinds it does not know.
 
-pub use session::protocol::content::{AttachmentPointer, Content, File, Hello, Kind};
+pub use session::protocol::content::{
+    AttachmentPointer, Content, Deleted, Events, File, Hello, Kind, place, stamp,
+};
 
 /// The content of a file someone chose to send: an image the TUI client can show goes as a
 /// [`Kind::Image`], anything else as a [`Kind::File`].

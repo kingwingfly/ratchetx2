@@ -106,8 +106,15 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
 
     assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
     for i in 1..=3 {
+        let initial_message = (i == 2).then(|| Bytes::from_static(b"initial"));
         let sequence = store
-            .append(&alice, &bob, Bytes::from(vec![i]), Bytes::from(vec![i, i]))
+            .append(
+                &alice,
+                &bob,
+                Bytes::from(vec![i]),
+                Bytes::from(vec![i, i]),
+                initial_message,
+            )
             .await
             .unwrap();
         assert_eq!(sequence, u64::from(i));
@@ -119,6 +126,7 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
             &alice,
             Bytes::from_static(b"h"),
             Bytes::from_static(b"c"),
+            None,
         )
         .await
         .unwrap();
@@ -135,6 +143,7 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
             sequence: 2,
             header: Bytes::from(vec![2]),
             content: Bytes::from(vec![2, 2]),
+            initial_message: Some(Bytes::from_static(b"initial")),
         }
     );
     let page = store.read(&alice, &bob, 1, 1).await.unwrap();

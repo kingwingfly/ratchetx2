@@ -66,6 +66,30 @@ pub fn clock(millis: u64) -> String {
     }
 }
 
+/// The month of a time, as the reader's language writes it, e.g. "October 2026".
+pub fn month(millis: u64) -> String {
+    local_date(millis, &[("month", "long"), ("year", "numeric")])
+}
+
+/// The day of a time, as the reader's language writes it, e.g. "27 Oct".
+pub fn day(millis: u64) -> String {
+    local_date(millis, &[("day", "numeric"), ("month", "short")])
+}
+
+/// The date of a time with the fields `fields` of `Intl.DateTimeFormat`, in the reader's
+/// language.
+fn local_date(millis: u64, fields: &[(&str, &str)]) -> String {
+    let date = js_sys::Date::new(&(millis as f64).into());
+    let options = js_sys::Object::new();
+    for (field, value) in fields {
+        let _ = js_sys::Reflect::set(&options, &(*field).into(), &(*value).into());
+    }
+    let language = web_sys::window()
+        .and_then(|window| window.navigator().language())
+        .unwrap_or_else(|| "en".to_string());
+    date.to_locale_date_string(&language, &options).into()
+}
+
 /// A size in bytes, for people.
 pub fn size(bytes: usize) -> String {
     match bytes {

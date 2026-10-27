@@ -22,14 +22,14 @@ impl StatefulWidget for Bubble<'_> {
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {
         let chunk = match self.message.state {
-            MessageState::Sent => {
+            MessageState::Sent | MessageState::Read | MessageState::Downloaded => {
                 let chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(40), Constraint::Fill(1)])
                     .split(area);
                 chunks[1]
             }
-            MessageState::Received => {
+            MessageState::Received { .. } => {
                 let chunks = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Fill(1), Constraint::Percentage(40)])
@@ -48,9 +48,18 @@ impl StatefulWidget for Bubble<'_> {
                 chunks[1]
             }
         };
+        // How far it got, as Telegram shows it: one tick once the server has it, two once the
+        // peer read it, and three once it downloaded its attachment.
+        let status = match self.message.state {
+            MessageState::Sent => "✓",
+            MessageState::Read => "✓✓",
+            MessageState::Downloaded => "✓✓✓",
+            MessageState::Received { .. } | MessageState::Error(_) => "",
+        };
         let block = Block::bordered()
             .padding(Padding::horizontal(2))
-            .border_style(Style::default().fg(Color::Gray));
+            .border_style(Style::default().fg(Color::Gray))
+            .title_bottom(Line::raw(status).right_aligned());
         let inner = block.inner(chunk);
         block.render(chunk, buf);
         match &self.message.content {
@@ -64,15 +73,17 @@ impl StatefulWidget for Bubble<'_> {
                 }
                 let mut p = Paragraph::new(lines).wrap(Wrap::default());
                 p = match self.message.state {
-                    MessageState::Sent => p.left_aligned(),
-                    MessageState::Received => p.left_aligned(),
                     MessageState::Error(_) => p.centered(),
+                    _ => p.left_aligned(),
                 };
                 p.render(inner, buf);
             }
             // Greetings are dropped as they arrive, but would show as one.
             Kind::Hello(hello) => {
                 Paragraph::new(format!("👋 {}", hello.name)).render(inner, buf);
+            }
+            Kind::Deleted(_) => {
+                Paragraph::new("The peer deleted this chat").render(inner, buf);
             }
             Kind::File(File { name, data, .. }) => {
                 file_card(name, data.len() as u64).render(inner, buf);

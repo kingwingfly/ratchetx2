@@ -3,6 +3,7 @@ syntax = "proto3";
 // The mailbox service: one queue of encrypted messages per sender and recipient.
 package mailbox.v1;
 
+import "handshake.proto";
 import "party.proto";
 
 // Append a message to the queue from `sender` to `recipient`.
@@ -13,6 +14,10 @@ message PushRequest {
   bytes recipient = 2;
   // The message.
   party.v1.EncryptedMessage message = 3;
+  // The initial message of the session the message is on, which the sender sends with each
+  // message while the recipient has not answered that session, so that the recipient can
+  // accept it from here if the one in its inbox was lost.
+  handshake.v1.InitialMessage initial_message = 4;
 }
 
 // Reply to `PushRequest`.
@@ -43,6 +48,8 @@ message FetchResponse {
 message Envelope {
   // Position in the queue.
   uint64 sequence = 1;
+  // The initial message of the message's session, if its sender sent one with it.
+  handshake.v1.InitialMessage initial_message = 4;
   // The message.
   party.v1.EncryptedMessage message = 2;
 }

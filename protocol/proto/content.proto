@@ -4,8 +4,14 @@ syntax = "proto3";
 // and TUI clients both read it, and drop the kinds they do not show.
 package content.v1;
 
-// A message's content.
+// A message's content: something to show, events of messages the other way, or both.
 message Content {
+  // The message's Lamport clock: one more than the highest clock of the chat's messages, both
+  // ways, that its sender had sent or received when it went. A sender's clocks only go up, so
+  // a message is named by its clock, which events do; and both sides show the chat by clock,
+  // then by sender, the one with the lower identity key first, so alike. 0 for a message that
+  // has no place in the chat, as one of events only.
+  uint64 clock = 7;
   oneof kind {
     // Text.
     string text = 1;
@@ -18,7 +24,23 @@ message Content {
     Hello hello = 4;
     // A file too large for its message, uploaded encrypted as an attachment.
     AttachmentPointer attachment = 5;
+    // The sender deleted the chat, and its session with it: the recipient's next message
+    // starts a new session, which comes to the sender as a new chat.
+    Deleted deleted = 6;
   }
+  // What the sender did with the recipient's messages since it last told.
+  Events events = 8;
+}
+
+// What the recipient of messages did with them, which it tells their sender, naming each by its
+// clock: as many as there are, in one message. The session authenticates them as the peer's, as
+// it does every message, without a signature, so that they stay deniable. Each moves a message
+// from sent on, and none back, so one told twice, or late, changes nothing.
+message Events {
+  // Messages read: shown to the recipient.
+  repeated uint64 read = 1;
+  // Attachments downloaded whole.
+  repeated uint64 downloaded = 2;
 }
 
 // A file.
@@ -50,3 +72,7 @@ message AttachmentPointer {
   // Its MIME type, as the sender gave it; only a hint.
   string mime = 5;
 }
+
+// That the sender deleted the chat. Its recipient sends again, on a new session, what the sender
+// never read.
+message Deleted {}

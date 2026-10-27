@@ -7,7 +7,7 @@ Both take any client of the [protocol](../protocol) traits, so the same flow run
 
 Anyone can send an initial message claiming to be anyone, but only the real sender can have encrypted its first message, as X3DH's keys take the sender's identity key: [`Client::accept`] fails unless it decrypts, and then uses up nothing, so a forged initial message changes nothing. Nothing is signed, so neither peer can prove to others that they talked.
 
-When a known peer starts a new session, or this client does, [`Session::keep`] keeps the old one with it, only to decrypt the messages sent on it: as in Signal's session management (Tahini), an earlier session never becomes the one sent on again, so whoever stole its keys cannot draw the chat back to it once the ratchet has locked them out. Of two sessions the peers start at once, both pick the one with the higher ID. If the peers still miss each other, e.g. as an initial message was lost, the session is retired after a few turns, and the next message goes on a new one ([`Session::needs_new_session`]).
+When a known peer starts a new session, or this client does, [`Session::keep`] keeps the old one with it, only to decrypt the messages sent on it: as in Signal's session management (Tahini), an earlier session never becomes the one sent on again, so whoever stole its keys cannot draw the chat back to it once the ratchet has locked them out. Of two sessions the peers start at once, both pick the one with the higher ID. If the peers still miss each other, e.g. as an initial message was lost, the session is retired after a few turns, and the next message goes on a new one ([`Session::needs_new_session`], [`Client::start_again`]); so does it when the client [retires](Session::retire) it, e.g. as the peer deleted the chat. As an initial message reaches the server before its session's messages, but a client takes initial messages and receives in turn, [`Session::receive`] stops at a message that does not decrypt, and goes on past it once the initial messages are taken ([`Session::skip_stalled`]). Until the peer answers a session this client started, each message goes with its initial message, as Signal's clients do, which the peer accepts from there if the one in its inbox was lost ([`Received::initial_messages`]); where receiving stops, those of the rest of the page are offered too. [`Received::earlier`] tells a message that came on an earlier session, e.g. one the peer sent before deleting the chat and starting it again.
 
 Files too large for a message go as attachments ([`attachment`]): [`Client::start_upload`] starts one under a new key, its chunks are encrypted and uploaded, and a message carries the attachment's ID and key, so that its recipients download and decrypt the chunks.
 
@@ -62,8 +62,8 @@ alice_session.send(b"How are you?").await?;
 let initial_messages = bob.take_initial_messages().await?;
 let (mut bob_session, hi) = bob.accept(&alice.identity_key(), &initial_messages[0], server)?;
 println!("{}", String::from_utf8_lossy(&hi));
-for content in bob_session.receive().await? {
-    println!("{}", String::from_utf8_lossy(&content?));
+for received in bob_session.receive().await? {
+    println!("{}", String::from_utf8_lossy(&received.content?));
 }
 bob_session.send(b"Hi Alice").await?;
 # Ok(())

@@ -6,22 +6,25 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map, hash_map},
     rc::Rc,
     sync::Arc,
 };
 
+use bytes::Bytes;
 use futures::{
+    channel::oneshot,
     future::{Either, select},
     lock::Mutex,
 };
 use leptos::{prelude::*, task::spawn_local};
 use session::{
-    Client, ClientState, ErrorKind, PublicKey, Session, SessionState,
+    Client, ClientState, ErrorKind, InitialMessage, PublicKey, Session, SessionState,
     attachment::{self, CHUNK_SIZE, Upload},
     proto,
     protocol::{
         attachment::DEFAULT_MAX_CHUNKS,
+        mailbox::{LocalMailbox, PushRequest},
         notify::{self, Notification},
     },
 };
@@ -30,15 +33,20 @@ use wasm_bindgen_futures::JsFuture;
 use zeroize::Zeroizing;
 
 use crate::{
-    content::{self, AttachmentPointer, Content, Hello, Kind, image_type},
+    content::{self, AttachmentPointer, Content, Deleted, Events, Hello, Kind, stamp},
+    glue::{self, MediaRequest},
     notify::{Event, Subscription},
+    preview::{self, Sort},
     state::{
-        Attachment, Body, ContactView, Delivery, Dialog, Link, Me, MessageView, Opening, Phase,
-        RemoteFile, Ui, UploadState, UploadView,
+        Attachment, Body, ContactView, Delivery, Dialog, FileView, Link, LocalFile, Me,
+        MessageView, Opening, Phase, RemoteFile, Step, Ui, UploadState, UploadView, order,
     },
-    transport::{Connect, Fetch},
-    util::{describe, js_error, key_from_text, now, short, size, sleep},
-    vault::{AppState, ContactState, HistoryEntry, Outgoing, PendingUpload, Vault, history_key},
+    transport::{Connect, Fetch, Progress},
+    util::{describe, hex, js_error, key_from_text, now, short, size, sleep},
+    vault::{
+        AppState, Awaiting, ContactState, Farewell, HistoryEntry, Outgoing, OutgoingRecord,
+        PendingUpload, Vault, history_key, outbox_key,
+    },
 };
 
 /// One-time prekeys in each publish.
@@ -49,6 +57,9 @@ const REPUBLISH_USED: u32 = 10;
 const REPUBLISH_AGE: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Files up to this many bytes go in their message; larger ones go as attachments.
 pub const INLINE_FILE_MAX: usize = 1 << 20;
+/// Attachments up to this many bytes that are images, videos or audio show in the chat, fetched
+/// as they are about to show; larger ones show as files, fetched once opened.
+pub const MEDIA_INLINE_MAX: u64 = 8 << 20;
 /// The largest file to send: as many chunks as the server takes, unless it says otherwise.
 pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_CHUNKS as usize * CHUNK_SIZE;
 /// The most characters in this client's name. It goes in the greeting, the first message of each
@@ -73,8 +84,8 @@ const STALLED: i32 = 60_000;
 /// to the second.
 const RETRY_MIN: i32 = 1_000;
 const RETRY_MAX: i32 = 30_000;
-/// The history entries shown when a chat opens.
-// TODO: these come with their files, up to 1 MiB each; load files when shown instead.
+/// The history entries shown when a chat opens, without their files, which load when shown;
+/// and read at a time to list a chat's files.
 const HISTORY_SHOWN: u64 = 500;
 /// Milliseconds between syncs: right after something happened, at most while idle, and while
 /// the user is away, when the client has no notifications. Workers bill per request, so idle
@@ -95,6 +106,21 @@ const POLL_LIVE: i32 = 300_000;
 /// Milliseconds before subscribing again after the socket closed, doubling up to the second.
 const RESUBSCRIBE_MIN: i32 = 1_000;
 const RESUBSCRIBE_MAX: i32 = 60_000;
+/// Decrypted chunks the streams keep, all of them together, as a player asks for one more than
+/// once, e.g. as it seeks: beyond, the oldest go, so that however many players show, as in a file
+/// browser of videos, they hold little plaintext.
+const CHUNKS_DECRYPTED_KEPT: usize = 4;
+/// Most clocks a chat keeps in each list of messages waiting for an event, either way: beyond,
+/// the oldest are dropped, so that a chat left alone cannot grow the state, which each save
+/// writes whole.
+const EVENTS_KEPT: usize = 1_000;
+
+/// Keep the last [`EVENTS_KEPT`] of `list`.
+fn keep_last<T>(list: &mut Vec<T>) {
+    if list.len() > EVENTS_KEPT {
+        list.drain(..list.len() - EVENTS_KEPT);
+    }
+}
 
 pub struct Engine {
     ui: Ui,
@@ -115,6 +141,53 @@ pub struct Engine {
     draining: Cell<bool>,
     /// Since when the page has been hidden or out of focus, if it is.
     away_since: Cell<Option<u64>>,
+    /// The attachments playing as they are fetched, by the tokens of their URLs.
+    streams: RefCell<HashMap<String, Stream>>,
+    /// The chunks the streams decrypted last, by attachment and index, oldest first, which every
+    /// stream of an attachment shares.
+    decrypted: RefCell<VecDeque<(ChunkOf, Rc<Vec<u8>>)>>,
+    /// The chunks the streams are fetching, by attachment and index, with what waits for each,
+    /// woken once it is done: a chunk asked for again meanwhile, as players ask for overlapping
+    /// ranges, a preview and the viewer show one file, or the tags of audio are read from its
+    /// first, is fetched once.
+    loading: RefCell<HashMap<ChunkOf, Vec<oneshot::Sender<()>>>>,
+}
+
+/// A chunk of an attachment: its ID and the chunk's index.
+type ChunkOf = ([u8; 16], u32);
+
+/// An attachment playing as it is fetched, through the service worker, see [`Engine::stream`].
+struct Stream {
+    fetching: Rc<Fetching>,
+    /// Its MIME type, as its first chunk tells once it is here, or as its sender gave it.
+    mime: String,
+    /// The clock of the peer's message it came in, to tell the peer once it is all here; 0 for
+    /// this client's own.
+    clock: u64,
+}
+
+/// What fetching an attachment's chunks takes, see [`Engine::chunk`].
+struct Fetching {
+    /// The chat it is in.
+    peer: PublicKey,
+    id: [u8; 16],
+    key: Zeroizing<[u8; attachment::KEY_LENGTH]>,
+    name: String,
+    size: u64,
+    chunks: u32,
+    /// How far this client's own upload of it got, if it is unfinished, its file gone with the
+    /// page: what the server lacks only comes once the file is chosen again.
+    unfinished: Option<u32>,
+    attachments: Connect,
+}
+
+/// Who waits for an attachment.
+#[derive(Clone, Copy)]
+enum Waiter<'a> {
+    /// The viewer, until it closes or goes on to another file.
+    Viewer,
+    /// The chat, showing it in place, while this says it does.
+    Chat(&'a dyn Fn() -> bool),
 }
 
 /// What was sent, waiting its turn to go: a message, or a file, which is read, or starts
@@ -137,8 +210,8 @@ struct Inner {
     /// initial messages, which the server deleted once taken, and the greeting of a chat started.
     /// Each save writes them too, until one succeeds, so that the history has no gap.
     unsaved: Vec<(PublicKey, (String, HistoryEntry))>,
-    /// Whether a save wrote such records, whose chats then show.
-    saved_late: bool,
+    /// The chats whose records left unsaved a save wrote, which then show them.
+    saved_late: Vec<PublicKey>,
 }
 
 struct Contact {
@@ -160,6 +233,9 @@ impl Engine {
             sending: RefCell::default(),
             draining: Cell::new(false),
             away_since: Cell::new(None),
+            streams: RefCell::default(),
+            decrypted: RefCell::default(),
+            loading: RefCell::default(),
         })
     }
 
@@ -256,6 +332,7 @@ impl Engine {
 
     /// Find out whether to create or unlock the vault.
     pub async fn start(&self) {
+        glue::register_media_worker();
         // Two tabs on one vault would fork the sessions' ratchets.
         if !crate::glue::take_lock("e2ee-chat").await {
             self.ui.phase.set(Phase::Elsewhere);
@@ -304,7 +381,7 @@ impl Engine {
             client,
             contacts: vec![],
             unsaved: vec![],
-            saved_late: false,
+            saved_late: vec![],
         })
         .await;
         Ok(())
@@ -343,7 +420,7 @@ impl Engine {
             client,
             contacts,
             unsaved: vec![],
-            saved_late: false,
+            saved_late: vec![],
         })
         .await;
         Ok(())
@@ -371,6 +448,11 @@ impl Engine {
         }
         self.clone().run();
         self.clone().listen();
+        let engine = self.clone();
+        glue::serve_media(move |request| {
+            let engine = engine.clone();
+            spawn_local(async move { engine.serve_media(request).await });
+        });
     }
 
     /// Sync until the page goes.
@@ -475,7 +557,12 @@ impl Engine {
         let fetched = match notification.event {
             Some(notify::Event::MessageFrom(sender)) => {
                 match PublicKey::try_from(sender.as_ref()) {
-                    Ok(peer) => self.receive(&peer).await.map(drop),
+                    // Then what it moved on goes, e.g. events to tell, or messages to send
+                    // again, as the peer deleted the chat.
+                    Ok(peer) => match self.receive(&peer).await {
+                        Ok(_) => self.flush(&peer).await.map(drop),
+                        Err(e) => Err(e),
+                    },
                     Err(_) => return,
                 }
             }
@@ -498,38 +585,50 @@ impl Engine {
         self.wake();
     }
 
-    /// One round: save what an earlier save failed to, push what waits, take initial messages,
-    /// publish prekeys when due, and receive. Returns whether anything happened.
+    /// One round: save what an earlier save failed to, tell peers of chats deleted here, take
+    /// initial messages, publish prekeys when due, receive, and push what waits. Returns whether
+    /// anything happened.
     async fn sync(&self) -> bool {
         // A step that keeps failing, e.g. a large file timing out over a slow link, a take of
         // initial messages the server refuses, or one chat's queue that cannot be fetched, must
         // not keep the round from the other steps and chats: its error is kept, and the round
-        // goes on.
+        // goes on. Receiving goes before pushing, so that what waits since the user was offline
+        // goes on a new session if the peer deleted the chat meanwhile.
         let mut failure = None;
         let mut active = false;
         if let Err(e) = self.save_late().await {
             failure.get_or_insert(e);
         }
-        for peer in self.peers().await {
-            match self.flush(&peer).await {
-                Ok(pushed) => active |= pushed,
-                Err(e) => {
-                    failure.get_or_insert(e);
-                }
-            }
+        if let Err(e) = self.say_farewells().await {
+            failure.get_or_insert(e);
         }
-        match self.take_initial_messages().await {
-            Ok(taken) => active |= taken,
+        let reached = match self.take_initial_messages().await {
+            Ok(taken) => {
+                active |= taken;
+                true
+            }
             Err(e) => {
                 failure.get_or_insert(e);
+                false
             }
-        }
-        if let Err(e) = self.publish(false).await {
+        };
+        // Not while the server does not answer signed requests: each publish that fails keeps
+        // its new one-time prekeys, as the server may have them, see `Client::publish_keys`, so
+        // retrying every round while offline would grow the state, which each save writes whole.
+        if reached && let Err(e) = self.publish(false).await {
             failure.get_or_insert(e);
         }
         for peer in self.peers().await {
             match self.receive(&peer).await {
                 Ok(received) => active |= received,
+                Err(e) => {
+                    failure.get_or_insert(e);
+                }
+            }
+        }
+        for peer in self.peers().await {
+            match self.flush(&peer).await {
+                Ok(pushed) => active |= pushed,
                 Err(e) => {
                     failure.get_or_insert(e);
                 }
@@ -552,8 +651,51 @@ impl Engine {
         if !inner.unsaved.is_empty() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
-        if std::mem::take(&mut inner.saved_late) {
+        let late = std::mem::take(&mut inner.saved_late);
+        if !late.is_empty() {
             self.ui.contacts.set(inner.views());
+            // The open chat shows them in their places.
+            if let Some(open) = self.ui.open.get_untracked()
+                && late.contains(&open)
+            {
+                self.show_history(inner, &open).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Push the messages telling peers that their chats were deleted here, see
+    /// [`delete`](Self::delete).
+    async fn say_farewells(&self) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return Ok(());
+        };
+        while let Some(farewell) = inner.state.farewells.first().cloned() {
+            let request = PushRequest {
+                sender: Bytes::copy_from_slice(&inner.client.identity_key()),
+                recipient: farewell.peer.into(),
+                message: farewell.message,
+                initial_message: None,
+            };
+            match Fetch::client(&inner.server)
+                .push(request)
+                .await
+                .map_err(session::Error::from)
+            {
+                Ok(_) => {}
+                // Refused for good, e.g. as the peer's inbox is full: it must not hold up the
+                // others, nor keep the sync failing.
+                Err(e) if matches!(e.kind(), ErrorKind::LimitExceeded | ErrorKind::Protocol) => {
+                    self.ui.log(format!(
+                        "could not tell a deleted chat's peer of it: {}",
+                        describe(&e)
+                    ));
+                }
+                Err(e) => return Err(describe(&e)),
+            }
+            inner.state.farewells.remove(0);
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
         Ok(())
     }
@@ -566,26 +708,97 @@ impl Engine {
             .collect()
     }
 
-    /// Push the messages waiting for `peer`, in order. Returns whether any went.
+    /// Push the messages waiting for `peer`, in order, each encrypted as its turn comes, then
+    /// the events to tell the peer. Returns whether any went.
     async fn flush(&self, peer: &PublicKey) -> Result<bool, String> {
+        // With messages waiting and no session to send on, the peer may have started one, e.g.
+        // having deleted the chat and started it again: taken first, it is sent on, rather than
+        // another started, which the peer might set aside. If taking fails, one starts.
+        let waits = {
+            let guard = self.inner.lock().await;
+            guard.as_ref().is_some_and(|inner| {
+                inner.contacts.iter().any(|contact| {
+                    contact.peer == *peer
+                        && contact.session.needs_new_session()
+                        && !contact.state.outbox.is_empty()
+                })
+            })
+        };
+        if waits {
+            let _ = self.take_initial_messages().await;
+        }
         let mut guard = self.inner.lock().await;
         let Some(inner) = guard.as_mut() else {
             return Ok(false);
         };
+        // Encrypted on a session retired since, as a push failed, e.g. retired as taking initial
+        // messages joined one, which `receive` would only see after a page: put back to go on a
+        // new one, as the peer may never have had that one.
+        if needs_new_session(inner, peer)
+            && let Some(contact) = inner.contact(peer)
+            && contact.state.outbox.iter().any(|outgoing| outgoing.sealed)
+        {
+            let snapshot = contact.snapshot();
+            let mut entries = BTreeMap::new();
+            let saved = match inner.requeue(peer, false, &mut entries).await {
+                Ok(requeued) => inner
+                    .save_with(&[], &requeued)
+                    .await
+                    .map_err(|e| describe(&e)),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = saved {
+                inner.roll_back(peer, snapshot)?;
+                return Err(e);
+            }
+        }
         let mut changed = false;
         let mut result = Ok(());
+        // What happened to the messages, by their history entries, with their places, and the
+        // records gone with them.
+        let (mut steps, mut gone) = (vec![], vec![]);
         while let Some(contact) = inner.contact(peer)
             && let Some(outgoing) = contact.state.outbox.first().cloned()
         {
+            if !outgoing.sealed {
+                // Encrypted now that it goes, so that its place is after what came so far; the
+                // ones after it wait their turn.
+                match inner.seal_next(peer).await {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        self.ui
+                            .notify(format!("messages could not be sent: {reason}"));
+                        if self.ui.open.get_untracked() == Some(*peer) {
+                            self.show_history(inner, peer).await;
+                        }
+                        changed = true;
+                    }
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+                continue;
+            }
+            let record = match inner.vault.outgoing(peer, outgoing.history_index).await {
+                Ok(record) => record,
+                Err(e) => {
+                    result = Err(describe(&e));
+                    break;
+                }
+            };
+            let Some(contact) = inner.contact(peer) else {
+                break;
+            };
             match contact
                 .session
-                .push(outgoing.message.unwrap_or_default())
+                .push(record.message.unwrap_or_default())
                 .await
             {
-                Ok(()) => {}
+                Ok(()) => steps.push((outgoing.history_index, Step::Pushed, outgoing.clock)),
                 // Too large for the server: it never will go.
                 Err(e) if e.kind() == ErrorKind::LimitExceeded => {
-                    contact.state.failed.push(outgoing.history_index);
+                    steps.push((outgoing.history_index, Step::Refused, 0));
                     self.ui
                         .notify(format!("a message could not be sent: {}", describe(&e)));
                 }
@@ -595,13 +808,88 @@ impl Engine {
                 }
             }
             contact.state.outbox.remove(0);
+            gone.push((outbox_key(peer, outgoing.history_index), None));
             changed = true;
         }
-        if changed {
-            inner.save(&[]).await.map_err(|e| describe(&e))?;
-            self.show_deliveries(inner, peer);
+        if !gone.is_empty() {
+            let mut entries = vec![];
+            for (index, step, clock) in steps {
+                let mut entry = match inner.vault.entry(peer, index).await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        result = Err(describe(&e));
+                        continue;
+                    }
+                };
+                entry.set_delivery(entry.delivery().after(step));
+                // Pushed, it has its place, and waits for the peer to read it.
+                if step == Step::Pushed {
+                    entry.place = clock;
+                    let content = entry.content.get_or_insert_default();
+                    content.clock = clock;
+                    let attachment = matches!(content.kind, Some(Kind::Attachment(_)));
+                    if let Some(contact) = inner.contact(peer) {
+                        contact.state.awaiting.push(Awaiting {
+                            place: clock,
+                            history_index: index,
+                            read: false,
+                            attachment,
+                        });
+                        keep_last(&mut contact.state.awaiting);
+                    }
+                }
+                entries.push((index, entry));
+            }
+            inner
+                .save_with(&records(peer, &entries), &gone)
+                .await
+                .map_err(|e| describe(&e))?;
+            self.show_changes(inner, peer, &entries);
+        }
+        if result.is_ok() {
+            match self.push_events(inner, peer).await {
+                Ok(told) => changed |= told,
+                Err(e) => result = Err(e),
+            }
         }
         result.map(|()| changed)
+    }
+
+    /// Tell `peer` what this client did with its messages, all in one message, once what waits
+    /// for it went: on the session, never starting one for it, and never in a request, whose
+    /// sender learns nothing until it is accepted. Encrypted, saved, then pushed, so that no key
+    /// of the ratchet is used twice. Once it went, the events are forgotten, which the next save
+    /// keeps; if none does, they are told again, which changes nothing. Returns whether any went.
+    async fn push_events(&self, inner: &mut Inner, peer: &PublicKey) -> Result<bool, String> {
+        let Some(contact) = inner.contact(peer) else {
+            return Ok(false);
+        };
+        let events = match &contact.state.events {
+            Some(events)
+                if !events.is_empty()
+                    && !contact.state.request
+                    && contact.state.outbox.is_empty()
+                    && !contact.session.needs_new_session() =>
+            {
+                events.to_bytes()
+            }
+            _ => return Ok(false),
+        };
+        let snapshot = contact.snapshot();
+        let message = contact.session.encrypt(&events).map_err(|e| describe(&e))?;
+        if let Err(e) = inner.save(&[]).await {
+            inner.roll_back(peer, snapshot)?;
+            return Err(describe(&e));
+        }
+        let contact = inner.contact(peer).ok_or("no such chat")?;
+        contact
+            .session
+            .push(message)
+            .await
+            .map_err(|e| describe(&e))?;
+        contact.state.events = None;
+        Ok(true)
     }
 
     /// Take the initial messages waiting, and accept each at once, while its prekeys are kept. One
@@ -676,7 +964,8 @@ impl Engine {
                 }
             };
             let open = self.ui.open.get_untracked() == Some(peer);
-            let (index, entry) = contact.add_received(&first, open && !document().hidden());
+            let (index, entry) =
+                contact.add_received(Content::from_bytes(&first), open && !document().hidden());
             records.push((history_key(&peer, index), entry.clone()));
             peers.push(peer);
             if open {
@@ -688,7 +977,9 @@ impl Engine {
             inner.unsaved.extend(peers.into_iter().zip(records));
             return Err(describe(&e));
         }
-        self.ui.messages.update(|messages| messages.extend(views));
+        if let Some(open) = self.ui.open.get_untracked() {
+            self.show_new(inner, &open, views);
+        }
         self.ui.contacts.set(inner.views());
         Ok(true)
     }
@@ -706,15 +997,11 @@ impl Engine {
         if !due {
             return Ok(());
         }
-        // Publishing makes a new generation of prekeys, which deletes older ones; if the server
-        // never got it, the client goes back, so the published prekeys stay usable.
-        // TODO: if the server stored the bundle and only its reply was lost, going back loses
-        // the private keys of the published prekeys, and initial messages fail until the next
-        // publish; publish the same bundle again instead, which needs `session` to resend it.
-        let before = proto::ClientState::from(inner.client.state());
+        // Saved, failed or not: if it failed, the server may still have the prekeys, its reply
+        // being lost, and the next publish sends the same signed prekey again, see
+        // `Client::publish_keys`.
         if let Err(e) = inner.client.publish_keys(ONE_TIME_PREKEYS).await {
-            let before = ClientState::try_from(&before).map_err(|e| describe(&e))?;
-            inner.client = Client::restore(Fetch::client(&inner.server), before);
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
             return Err(describe(&e));
         }
         inner.state.published_at = now();
@@ -745,9 +1032,21 @@ impl Engine {
                 return Ok(received);
             }
             let (mut entries, mut undecryptable) = (vec![], 0);
-            for result in page {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
+            // Where receiving stopped, with the initial messages that came with the rest of the
+            // page.
+            let mut stalled = None;
+            let mut deleted = false;
+            // What the peer told of this client's messages, by their history entries.
+            let mut steps = vec![];
+            for message in page {
+                let content = match message.content {
+                    Ok(content) => content,
+                    // At a message that may be on a session whose initial message is waiting,
+                    // the page's last.
+                    Err(e) if e.kind() == ErrorKind::Stalled => {
+                        stalled = Some(message.initial_messages);
+                        continue;
+                    }
                     Err(e) if e.kind() == ErrorKind::DuplicateMessage => continue,
                     // Anyone can push to a queue, and an earlier session's messages stay in it.
                     Err(_) => {
@@ -755,7 +1054,23 @@ impl Engine {
                         continue;
                     }
                 };
-                entries.push(contact.add_received(&bytes, open));
+                let mut content = Content::from_bytes(&content);
+                if let Some(events) = content.events.take() {
+                    steps.extend(contact.told(&events));
+                    if content.kind.is_none() {
+                        continue;
+                    }
+                }
+                // The peer deleted the chat, and its sessions: the next message goes on a new
+                // one. Unless it said so on an earlier session: then it started the chat again
+                // since, on the active one, which is the chat now.
+                if matches!(content.kind, Some(Kind::Deleted(_))) {
+                    if !message.earlier {
+                        contact.session.retire();
+                    }
+                    deleted = true;
+                }
+                entries.push(contact.add_received(content, open));
             }
             if undecryptable > 0 {
                 let label = contact.view().label();
@@ -764,11 +1079,31 @@ impl Engine {
                      ones of an earlier session"
                 ));
             }
-            let records: Vec<_> = entries
-                .iter()
-                .map(|(index, entry)| (history_key(peer, *index), entry.clone()))
+            // The entries of this client's messages that the peer's events moved on; then, if
+            // the session is retired, as the peer deleted the chat or the two kept missing each
+            // other, what was encrypted on it, and what the peer never read if it deleted the
+            // chat, waits for a new one.
+            let mut changed = BTreeMap::new();
+            let moved = match inner.step(peer, &mut changed, steps).await {
+                Ok(()) if deleted || needs_new_session(inner, peer) => {
+                    inner.requeue(peer, deleted, &mut changed).await
+                }
+                Ok(()) => Ok(vec![]),
+                Err(e) => Err(describe(&e)),
+            };
+            let requeued = match moved {
+                Ok(requeued) => requeued,
+                Err(e) => {
+                    inner.roll_back(peer, snapshot)?;
+                    return Err(e);
+                }
+            };
+            let changed: Vec<_> = changed.into_iter().collect();
+            let records: Vec<_> = records(peer, &entries)
+                .into_iter()
+                .chain(records(peer, &changed))
                 .collect();
-            if let Err(e) = inner.save(&records).await {
+            if let Err(e) = inner.save_with(&records, &requeued).await {
                 inner.roll_back(peer, snapshot)?;
                 return Err(describe(&e));
             }
@@ -780,14 +1115,31 @@ impl Engine {
                     .into_iter()
                     .map(|(index, entry)| contact.message(index, entry))
                     .collect();
-                self.ui.messages.update(|messages| messages.extend(views));
+                self.show_changes(inner, peer, &changed);
+                self.show_new(inner, peer, views);
             }
             self.ui.contacts.set(inner.views());
+            if let Some(initial_messages) = stalled {
+                // Its initial message, which went first, may have come since they were last
+                // taken, or have been lost, and come with the page: once they are taken, and
+                // those are accepted, receiving goes on, past what still does not decrypt.
+                drop(guard);
+                self.take_initial_messages().await?;
+                let mut guard = self.inner.lock().await;
+                if let Some(inner) = guard.as_mut() {
+                    for initial_message in &initial_messages {
+                        inner.join(peer, initial_message).await?;
+                    }
+                    if let Some(contact) = inner.contact(peer) {
+                        contact.session.skip_stalled();
+                    }
+                }
+            }
         }
     }
 
-    /// Encrypt `content` for `peer`, save it, and push it. What the user sends goes through
-    /// [`Engine::queue`], to go in order.
+    /// Save `content` for `peer`, then push it, encrypted as its turn comes. What the user sends
+    /// goes through [`Engine::queue`], to go in order.
     async fn send(&self, peer: PublicKey, content: Kind) -> Result<(), String> {
         {
             let mut guard = self.inner.lock().await;
@@ -796,38 +1148,43 @@ impl Engine {
             if contact.state.request {
                 return Err("accept the request first".into());
             }
-            if contact.session.needs_new_session() {
-                inner.start_again(&peer).await?;
-            }
-            let contact = inner.contact(&peer).ok_or("no such chat")?;
-            // If saving fails, the message is forgotten, ratchet step and all: it never left.
+            // If saving fails, the message is forgotten: it never left.
             let snapshot = contact.snapshot();
-            let message = contact
-                .session
-                .encrypt(&content.to_bytes())
-                .map_err(|e| describe(&e))?;
+            // Encrypted as it goes, once its place in the chat is known, see `flush`.
+            let record = OutgoingRecord {
+                message: None,
+                content: content.to_bytes(),
+            };
             let index = contact.state.history_len;
             contact.state.history_len += 1;
             contact.state.last_activity = now();
             contact.state.outbox.push(Outgoing {
-                message: Some(message),
                 history_index: index,
+                sealed: false,
+                clock: 0,
             });
             let entry = HistoryEntry {
                 outgoing: true,
                 at: now(),
                 content: Some(Content {
                     kind: Some(content),
+                    ..Content::default()
                 }),
+                delivery: Delivery::Pending.into(),
+                ..HistoryEntry::default()
             };
             let view = contact.message(index, entry.clone());
-            if let Err(e) = inner.save(&[(history_key(&peer, index), entry)]).await {
+            let saved = inner
+                .save_with(
+                    &[(history_key(&peer, index), entry)],
+                    &[(outbox_key(&peer, index), Some(record))],
+                )
+                .await;
+            if let Err(e) = saved {
                 inner.roll_back(&peer, snapshot)?;
                 return Err(describe(&e));
             }
-            if self.ui.open.get_untracked() == Some(peer) {
-                self.ui.messages.update(|messages| messages.push(view));
-            }
+            self.show_new(inner, &peer, vec![view]);
             self.ui.contacts.set(inner.views());
         }
         // Saved, so it goes in a later sync if not now.
@@ -904,6 +1261,19 @@ impl Engine {
         pending.announced = true;
         self.save_upload(peer, &pending).await?;
         Ok(pending)
+    }
+
+    /// The bytes of the file of the history entry `index` of the chat with `peer`, which are
+    /// kept apart from it.
+    pub async fn file(&self, peer: PublicKey, index: u64) -> Result<Arc<Vec<u8>>, String> {
+        let guard = self.inner.lock().await;
+        let inner = guard.as_ref().ok_or("locked")?;
+        inner
+            .vault
+            .file(&peer, index)
+            .await
+            .map(Arc::new)
+            .map_err(|e| describe(&e))
     }
 
     /// Whether the file of the upload `id` is still here, so that it can go on without the file
@@ -1083,11 +1453,27 @@ impl Engine {
             let guard = self.inner.lock().await;
             guard.as_ref().ok_or("locked")?.server.clone()
         };
-        let attachments = Fetch::client(&server);
+        // Each chunk shows how far it got as it goes: the bytes before it, and its share of what
+        // its request sent.
+        let before = Rc::new(Cell::new(0));
+        let progress: Progress = {
+            let (ui, before, id, size) = (self.ui, before.clone(), *upload.id(), pending.size);
+            Rc::new(move |sent, total| {
+                let chunk = (size - before.get()).min(CHUNK_SIZE as u64);
+                let done = before.get() + chunk * sent / total.max(1);
+                ui.uploads.update(|uploads| {
+                    if let Some(upload) = uploads.iter_mut().find(|upload| upload.id == id) {
+                        upload.done = done;
+                    }
+                });
+            })
+        };
+        let attachments = Fetch::reporting(&server, progress);
         for index in pending.uploaded..upload.chunks() {
             if self.cancelled.borrow().contains(upload.id()) {
                 return Ok(());
             }
+            before.set((u64::from(index) * CHUNK_SIZE as u64).min(pending.size));
             self.show_upload(peer, pending, UploadState::Running);
             let plaintext = read_chunk(file, index, pending.size).await?;
             // Kept before the chunk is encrypted: from then on, the file must not change there.
@@ -1165,8 +1551,8 @@ impl Engine {
             peer: *peer,
             id: pending.id.as_slice().try_into().unwrap_or_default(),
             name: pending.name.clone(),
-            uploaded: pending.uploaded,
-            chunks: attachment::chunk_count(pending.size) as u32,
+            done: (u64::from(pending.uploaded) * CHUNK_SIZE as u64).min(pending.size),
+            size: pending.size,
             state,
         };
         self.ui.uploads.update(|uploads| {
@@ -1179,11 +1565,13 @@ impl Engine {
 
     /// Open the attachment `pointer`, in the chat with `peer`, in the viewer, from the chunks
     /// kept here, or else from the server, keeping them from then on. The viewer shows how far
-    /// it got meanwhile, and closing it stops it.
+    /// it got meanwhile, and closing it stops it. Once one of the peer's, sent in its message
+    /// at `clock`, is downloaded whole, the peer is told.
     pub async fn open_attachment(
         &self,
         peer: PublicKey,
         pointer: AttachmentPointer,
+        clock: u64,
     ) -> Result<(), String> {
         let Ok(id) = <[u8; 16]>::try_from(pointer.id.as_slice()) else {
             return Err("the attachment is malformed".to_string());
@@ -1195,7 +1583,10 @@ impl Engine {
             done: 0,
             waiting: false,
         }));
-        let opened = self.fetch_attachment(peer, &id, pointer).await;
+        let opened = self
+            .fetch_attachment(peer, &id, pointer, Waiter::Viewer)
+            .await;
+        let opened = self.told_downloaded(peer, clock, opened).await;
         // Unless the viewer closed, or went on to another file, meanwhile.
         if !self.opening(&id) {
             return Ok(());
@@ -1214,6 +1605,60 @@ impl Engine {
         }
     }
 
+    /// The attachment `pointer`, in the chat with `peer`, for the chat to show in place, as small
+    /// media, as long as `shows` says it does: from the chunks kept here, or else from the
+    /// server, as [`open_attachment`](Self::open_attachment) has it, and the peer is told alike;
+    /// none if it stopped showing first.
+    pub async fn media(
+        &self,
+        peer: PublicKey,
+        pointer: AttachmentPointer,
+        clock: u64,
+        shows: &dyn Fn() -> bool,
+    ) -> Result<Option<Attachment>, String> {
+        let Ok(id) = <[u8; 16]>::try_from(pointer.id.as_slice()) else {
+            return Err("the attachment is malformed".to_string());
+        };
+        let fetched = self
+            .fetch_attachment(peer, &id, pointer, Waiter::Chat(shows))
+            .await;
+        self.told_downloaded(peer, clock, fetched).await
+    }
+
+    /// The attachment `fetched`, once the peer is told it is downloaded, if it is the peer's,
+    /// sent in its message at `clock`, and came from the server now.
+    async fn told_downloaded(
+        &self,
+        peer: PublicKey,
+        clock: u64,
+        fetched: Result<Option<(Attachment, bool)>, String>,
+    ) -> Result<Option<Attachment>, String> {
+        let Some((attachment, from_server)) = fetched? else {
+            return Ok(None);
+        };
+        if from_server
+            && clock > 0
+            && let Err(e) = self.downloaded(peer, clock).await
+        {
+            self.ui.link.set(Link::Offline(e));
+        }
+        Ok(Some(attachment))
+    }
+
+    /// Tell `peer` that its attachment, sent in its message at `clock`, is downloaded.
+    async fn downloaded(&self, peer: PublicKey, clock: u64) -> Result<(), String> {
+        {
+            let mut guard = self.inner.lock().await;
+            let inner = guard.as_mut().ok_or("locked")?;
+            let contact = inner.contact(&peer).ok_or("no such chat")?;
+            let events = contact.state.events.get_or_insert_default();
+            events.downloaded.push(clock);
+            keep_last(&mut events.downloaded);
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
+        self.flush(&peer).await.map(drop)
+    }
+
     /// Whether the viewer still waits for the attachment `id`.
     fn opening(&self, id: &[u8; 16]) -> bool {
         self.ui
@@ -1230,15 +1675,276 @@ impl Engine {
         });
     }
 
-    /// The file of the attachment `pointer`, whose ID is `id`, in the chat with `peer`; none if
-    /// the viewer stopped waiting for it.
+    /// Whether `waiter` still waits for the attachment `id`.
+    fn waits(&self, waiter: Waiter<'_>, id: &[u8; 16]) -> bool {
+        match waiter {
+            Waiter::Viewer => self.opening(id),
+            Waiter::Chat(shows) => shows(),
+        }
+    }
+
+    /// The file of the attachment `pointer`, whose ID is `id`, in the chat with `peer`, and
+    /// whether any of it came from the server, as it was not all downloaded before; none if
+    /// `waiter` stopped waiting for it. The viewer shows how far it got.
     async fn fetch_attachment(
         &self,
         peer: PublicKey,
         id: &[u8; 16],
         pointer: AttachmentPointer,
-    ) -> Result<Option<Attachment>, String> {
+        waiter: Waiter<'_>,
+    ) -> Result<Option<(Attachment, bool)>, String> {
+        // The sender's own, while on the page that chose it: from its file, as the server may
+        // not have it all yet.
+        let file = self.files.borrow().get(id).cloned();
+        if let Some(file) = file {
+            let buffer = JsFuture::from(file.array_buffer())
+                .await
+                .map_err(|e| format!("Cannot read {}: {}", pointer.name, js_error(e)))?;
+            let attachment = Attachment {
+                name: pointer.name,
+                mime: pointer.mime,
+                data: Arc::new(js_sys::Uint8Array::new(&buffer).to_vec()),
+            };
+            return Ok(Some((attachment, false)));
+        }
+        let fetching = self.fetching(peer, &pointer).await?;
+        // It grows as its chunks decrypt, not to the size the peer claims, which nothing backs
+        // until they do.
+        let (mut data, mut fetched) = (vec![], false);
+        for index in 0..fetching.chunks {
+            let Some((plaintext, from_server)) = self.chunk(&fetching, index, waiter).await? else {
+                return Ok(None);
+            };
+            fetched |= from_server;
+            data.extend(plaintext);
+            if let Waiter::Viewer = waiter {
+                self.opened(id, data.len() as u64, false);
+            }
+        }
+        if data.len() as u64 != pointer.size {
+            return Err(format!("{} is not the size it should be", pointer.name));
+        }
+        let attachment = Attachment {
+            name: pointer.name,
+            mime: pointer.mime,
+            data: Arc::new(data),
+        };
+        Ok(Some((attachment, fetched)))
+    }
+
+    /// A URL that plays the attachment `pointer`, in the chat with `peer`, as it is fetched,
+    /// through the service worker, see `media-worker.js`: a chunk at a time, as the player asks
+    /// for it, so that it plays, and seeks, while it downloads. The peer is told once it is all
+    /// here, as when opened, if it is the peer's, sent in its message at `clock`. None if no
+    /// service worker controls the page, which then fetches it whole, or if it is malformed. It
+    /// plays until [`end_stream`](Self::end_stream).
+    pub async fn stream(
+        &self,
+        peer: PublicKey,
+        pointer: &AttachmentPointer,
+        clock: u64,
+    ) -> Option<String> {
+        if !glue::streaming() {
+            return None;
+        }
+        let fetching = self.fetching(peer, pointer).await.ok()?;
+        let mut token = [0; 16];
+        getrandom::fill(&mut token).ok()?;
+        let token = hex(&token);
+        let stream = Stream {
+            fetching: Rc::new(fetching),
+            mime: stream_mime(&pointer.mime),
+            clock,
+        };
+        self.streams.borrow_mut().insert(token.clone(), stream);
+        Some(format!("/media/{token}"))
+    }
+
+    /// End the stream at `url`, as its player went.
+    pub fn end_stream(&self, url: &str) {
+        if let Some(token) = url.strip_prefix("/media/") {
+            self.streams.borrow_mut().remove(token);
+        }
+    }
+
+    /// The first chunk of the stream at `url`, e.g. to read the tags of audio from.
+    pub async fn stream_head(&self, url: &str) -> Option<Rc<Vec<u8>>> {
+        let token = url.strip_prefix("/media/")?;
+        self.stream_chunk(token, 0).await.ok().flatten()
+    }
+
+    /// Answer the service worker's `request` for a stream's bytes.
+    async fn serve_media(&self, request: MediaRequest) {
+        match self
+            .media_range(&request.token, request.start, request.end)
+            .await
+        {
+            Ok((size, mime, bytes)) => request.reply(Ok((size, &mime, &bytes))),
+            Err(status) => request.reply(Err(status)),
+        }
+    }
+
+    /// The bytes of the stream `token` from `start`, to `end` at most, as far as the chunk they
+    /// start in goes, with its size and MIME type; or the HTTP status that says why not.
+    async fn media_range(
+        &self,
+        token: &str,
+        start: u64,
+        end: Option<u64>,
+    ) -> Result<(u64, String, Vec<u8>), u16> {
+        const GONE: u16 = 404;
+        const OUT_OF_RANGE: u16 = 416;
+        let size = self
+            .streams
+            .borrow()
+            .get(token)
+            .map(|stream| stream.fetching.size)
+            .ok_or(GONE)?;
+        if start >= size || end.is_some_and(|end| end < start) {
+            return Err(OUT_OF_RANGE);
+        }
+        let index = u32::try_from(start / CHUNK_SIZE as u64).map_err(|_| OUT_OF_RANGE)?;
+        let chunk = match self.stream_chunk(token, index).await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => return Err(GONE),
+            // E.g. its sender cancelled it.
+            Err(_) => return Err(502),
+        };
+        let from = start - u64::from(index) * CHUNK_SIZE as u64;
+        let to = end.map_or(u64::MAX, |end| {
+            from.saturating_add(end - start).saturating_add(1)
+        });
+        let bytes = chunk
+            .get(from as usize..(to.min(chunk.len() as u64)) as usize)
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or(OUT_OF_RANGE)?
+            .to_vec();
+        let mime = self
+            .streams
+            .borrow()
+            .get(token)
+            .map(|stream| stream.mime.clone())
+            .ok_or(GONE)?;
+        Ok((size, mime, bytes))
+    }
+
+    /// Chunk `index` of the stream `token`, decrypted: one decrypted lately, or from this
+    /// client's own file, while on the page that chose it, or else as [`chunk`](Self::chunk)
+    /// has it. Once all its chunks are here, as one came from the server now, the peer is told.
+    /// None if the stream ended.
+    async fn stream_chunk(&self, token: &str, index: u32) -> Result<Option<Rc<Vec<u8>>>, String> {
+        let (fetching, clock) = loop {
+            let Some((fetching, clock)) = self
+                .streams
+                .borrow()
+                .get(token)
+                .map(|stream| (stream.fetching.clone(), stream.clock))
+            else {
+                return Ok(None);
+            };
+            let chunk_of = (fetching.id, index);
+            if let Some(chunk) = self.decrypted_chunk(&chunk_of) {
+                return Ok(Some(chunk));
+            }
+            let waiting = match self.loading.borrow_mut().entry(chunk_of) {
+                hash_map::Entry::Occupied(mut waiters) => {
+                    let (done, waiting) = oneshot::channel();
+                    waiters.get_mut().push(done);
+                    waiting
+                }
+                hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(vec![]);
+                    break (fetching, clock);
+                }
+            };
+            // Then among those decrypted, unless fetching it failed, or stopped as its stream
+            // ended: then fetched here.
+            let _ = waiting.await;
+        };
+        let loaded = self.load_stream_chunk(token, index, &fetching).await;
+        // Among those decrypted, if it came: its waiters wake as their senders go.
+        self.loading.borrow_mut().remove(&(fetching.id, index));
+        let Some((chunk, fetched)) = loaded? else {
+            return Ok(None);
+        };
+        if fetched
+            && clock > 0
+            && self.all_kept(&fetching).await
+            && let Err(e) = self.downloaded(fetching.peer, clock).await
+        {
+            self.ui.link.set(Link::Offline(e));
+        }
+        Ok(Some(chunk))
+    }
+
+    /// The chunk `chunk_of`, if the streams decrypted it lately, which keeps it longer.
+    fn decrypted_chunk(&self, chunk_of: &ChunkOf) -> Option<Rc<Vec<u8>>> {
+        let mut decrypted = self.decrypted.borrow_mut();
+        let at = decrypted.iter().position(|(of, _)| of == chunk_of)?;
+        let kept = decrypted.remove(at)?;
+        let chunk = kept.1.clone();
+        decrypted.push_back(kept);
+        Some(chunk)
+    }
+
+    /// Chunk `index` of the stream `token`, which fetches `fetching`, as
+    /// [`stream_chunk`](Self::stream_chunk) has it, kept among those decrypted, and whether it
+    /// came from the server.
+    async fn load_stream_chunk(
+        &self,
+        token: &str,
+        index: u32,
+        fetching: &Fetching,
+    ) -> Result<Option<(Rc<Vec<u8>>, bool)>, String> {
+        let file = self.files.borrow().get(&fetching.id).cloned();
+        let (plaintext, fetched) = match file {
+            Some(file) => (read_chunk(&file, index, fetching.size).await?, false),
+            None => {
+                let plays = || self.streams.borrow().contains_key(token);
+                match self.chunk(fetching, index, Waiter::Chat(&plays)).await? {
+                    Some(chunk) => chunk,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let chunk = Rc::new(plaintext);
+        let mut decrypted = self.decrypted.borrow_mut();
+        decrypted.push_back(((fetching.id, index), chunk.clone()));
+        if decrypted.len() > CHUNKS_DECRYPTED_KEPT {
+            decrypted.pop_front();
+        }
+        // Served from the page's origin: only ever as video or audio.
+        if index == 0
+            && let Some(stream) = self.streams.borrow_mut().get_mut(token)
+            && let Some(mime) = preview::media_mime(&fetching.name, &stream.mime, &chunk)
+                .filter(|mime| mime.starts_with("video/") || mime.starts_with("audio/"))
+        {
+            stream.mime = mime.to_string();
+        }
+        Ok(Some((chunk, fetched)))
+    }
+
+    /// Whether all the chunks of the attachment `fetching` fetches are kept here.
+    async fn all_kept(&self, fetching: &Fetching) -> bool {
+        let guard = self.inner.lock().await;
+        let Some(inner) = guard.as_ref() else {
+            return false;
+        };
+        inner
+            .vault
+            .chunks_kept(&fetching.peer, &fetching.id)
+            .await
+            .is_ok_and(|kept| kept >= fetching.chunks)
+    }
+
+    /// What fetching the attachment `pointer`, in the chat with `peer`, takes.
+    async fn fetching(
+        &self,
+        peer: PublicKey,
+        pointer: &AttachmentPointer,
+    ) -> Result<Fetching, String> {
         let malformed = || "the attachment is malformed".to_string();
+        let id = <[u8; 16]>::try_from(pointer.id.as_slice()).map_err(|_| malformed())?;
         let key = Zeroizing::new(
             <[u8; attachment::KEY_LENGTH]>::try_from(pointer.key.as_slice())
                 .map_err(|_| malformed())?,
@@ -1253,50 +1959,77 @@ impl Engine {
         }
         let chunks =
             u32::try_from(attachment::chunk_count(pointer.size)).map_err(|_| malformed())?;
-        let server = {
-            let guard = self.inner.lock().await;
-            guard.as_ref().ok_or("locked")?.server.clone()
+        let guard = self.inner.lock().await;
+        let inner = guard.as_ref().ok_or("locked")?;
+        let unfinished = inner
+            .vault
+            .upload(&peer, &id)
+            .await
+            .map_err(|e| describe(&e))?
+            .map(|pending| pending.uploaded);
+        Ok(Fetching {
+            peer,
+            id,
+            key,
+            name: pointer.name.clone(),
+            size: pointer.size,
+            chunks,
+            unfinished,
+            attachments: Fetch::client(&inner.server),
+        })
+    }
+
+    /// Chunk `index` of the attachment `fetching` fetches, decrypted: kept here, or else fetched
+    /// from the server, waiting for it while it is uploaded, and kept from then on; and whether
+    /// it came from the server. None if `waiter` stopped waiting for it.
+    async fn chunk(
+        &self,
+        fetching: &Fetching,
+        index: u32,
+        waiter: Waiter<'_>,
+    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+        if !self.waits(waiter, &fetching.id) {
+            return Ok(None);
+        }
+        let (chunk, kept) = match self.kept_chunk(&fetching.peer, &fetching.id, index).await? {
+            Some(chunk) => (chunk, true),
+            None if fetching
+                .unfinished
+                .is_some_and(|uploaded| index >= uploaded) =>
+            {
+                return Err(format!(
+                    "{} is not all uploaded: choose the file again to go on",
+                    fetching.name
+                ));
+            }
+            None => match self
+                .await_chunk(
+                    &fetching.attachments,
+                    &fetching.name,
+                    &fetching.id,
+                    index,
+                    waiter,
+                )
+                .await?
+            {
+                Some(chunk) => (chunk, false),
+                None => return Ok(None),
+            },
         };
-        let attachments = Fetch::client(&server);
-        // It grows as its chunks decrypt, not to the size the peer claims, which nothing backs
-        // until they do.
-        let mut data = vec![];
-        for index in 0..chunks {
-            if !self.opening(id) {
-                return Ok(None);
-            }
-            let (chunk, kept) = match self.kept_chunk(&peer, id, index).await? {
-                Some(chunk) => (chunk, true),
-                None => match self
-                    .await_chunk(&attachments, &pointer.name, id, index)
-                    .await?
-                {
-                    Some(chunk) => (chunk, false),
-                    None => return Ok(None),
-                },
-            };
-            let plaintext = attachment::decrypt_chunk(&key, index, index + 1 == chunks, &chunk)
-                .map_err(|_| format!("{} does not decrypt", pointer.name))?;
-            // Kept only once it decrypts, so that a chunk that does not is fetched again next
-            // time rather than kept for good.
-            if !kept {
-                self.keep_chunk(&peer, id, index, &chunk).await?;
-            }
-            data.extend(plaintext);
-            self.opened(id, data.len() as u64, false);
+        let last = index + 1 == fetching.chunks;
+        let plaintext = attachment::decrypt_chunk(&fetching.key, index, last, &chunk)
+            .map_err(|_| format!("{} does not decrypt", fetching.name))?;
+        // Kept only once it decrypts, so that a chunk that does not is fetched again next time
+        // rather than kept for good.
+        if !kept {
+            self.keep_chunk(&fetching.peer, &fetching.id, index, &chunk)
+                .await?;
         }
-        if data.len() as u64 != pointer.size {
-            return Err(format!("{} is not the size it should be", pointer.name));
-        }
-        Ok(Some(Attachment {
-            name: pointer.name,
-            mime: pointer.mime,
-            data: Arc::new(data),
-        }))
+        Ok(Some((plaintext, !kept)))
     }
 
     /// Chunk `index` of the attachment `id`, named `name`, from the server, waiting for it while
-    /// it is uploaded, unless no chunk comes for [`STALLED`] milliseconds; none if the viewer
+    /// it is uploaded, unless no chunk comes for [`STALLED`] milliseconds; none if `waiter`
     /// stopped waiting for it meanwhile.
     async fn await_chunk(
         &self,
@@ -1304,10 +2037,11 @@ impl Engine {
         name: &str,
         id: &[u8; 16],
         index: u32,
+        waiter: Waiter<'_>,
     ) -> Result<Option<Vec<u8>>, String> {
         let (mut waited, mut wait) = (0, POLL_CHUNK_MIN);
         loop {
-            if !self.opening(id) {
+            if !self.waits(waiter, id) {
                 return Ok(None);
             }
             match attachment::download_chunk(attachments, id, index).await {
@@ -1395,14 +2129,13 @@ impl Engine {
             self.ui.contacts.set(inner.views());
             return Ok(peer);
         }
-        // The greeting is the session's first message, which shows the peer that the initial
-        // message is this client's, and lets the peer write back.
-        let hello = Kind::Hello(Hello {
-            name: inner.state.name.clone(),
-        });
+        let hello = inner.greeting();
+        // The chat's first message, at its first place.
+        let mut greeting = hello.to_bytes();
+        stamp(&mut greeting, 1);
         let session = inner
             .client
-            .initiate(&peer, &hello.to_bytes(), Fetch::client(&inner.server))
+            .initiate(&peer, &greeting, Fetch::client(&inner.server))
             .await
             .map_err(|e| match e.kind() {
                 session::ErrorKind::NotFound => {
@@ -1410,10 +2143,23 @@ impl Engine {
                 }
                 _ => describe(&e),
             })?;
+        // Telling the peer that the chat was deleted here, if that has not gone yet, goes no
+        // more: this session replaces the deleted one there anyway.
+        inner
+            .state
+            .farewells
+            .retain(|farewell| farewell.peer != peer.as_slice());
         let entry = HistoryEntry {
             outgoing: true,
             at: now(),
-            content: Some(Content { kind: Some(hello) }),
+            content: Some(Content {
+                clock: 1,
+                kind: Some(hello),
+                events: None,
+            }),
+            delivery: Delivery::Sent.into(),
+            place: 1,
+            ..HistoryEntry::default()
         };
         inner.contacts.push(Contact {
             peer,
@@ -1423,6 +2169,7 @@ impl Engine {
                 name,
                 history_len: 1,
                 last_activity: now(),
+                clock: 1,
                 ..ContactState::default()
             },
         });
@@ -1448,17 +2195,36 @@ impl Engine {
             self.ui.messages.set(vec![]);
             return;
         };
-        let Some(contact) = inner.contacts.iter().find(|contact| contact.peer == peer) else {
+        self.show_history(inner, &peer).await;
+        let Some(contact) = inner.contact(&peer) else {
+            return;
+        };
+        let read = contact.read_all();
+        self.ui.open.set(Some(peer));
+        if read && let Err(e) = inner.save(&[]).await {
+            self.ui.notify(describe(&e));
+        }
+        self.ui.contacts.set(inner.views());
+        drop(guard);
+        // The peer learns what was read.
+        if read && let Err(e) = self.flush(&peer).await {
+            self.ui.link.set(Link::Offline(e));
+        }
+    }
+
+    /// Show the last [`HISTORY_SHOWN`] entries of the history of the chat with `peer`.
+    async fn show_history(&self, inner: &mut Inner, peer: &PublicKey) {
+        let Some(contact) = inner.contacts.iter().find(|contact| contact.peer == *peer) else {
             return;
         };
         let history = inner
             .vault
-            .history(&peer, contact.state.history_len, HISTORY_SHOWN)
+            .history(peer, contact.state.history_len, HISTORY_SHOWN)
             .await;
-        let Some(contact) = inner.contact(&peer) else {
+        let Some(contact) = inner.contact(peer) else {
             return;
         };
-        let messages = match history {
+        let mut messages: Vec<_> = match history {
             Ok(history) => history
                 .into_iter()
                 .map(|(index, entry)| contact.message(index, entry))
@@ -1468,18 +2234,70 @@ impl Engine {
                 vec![]
             }
         };
-        let was_unread = contact.state.unread > 0;
-        contact.state.unread = 0;
+        order(&mut messages, &inner.client.identity_key(), peer);
         self.ui.messages.set(messages);
-        self.ui.open.set(Some(peer));
-        if was_unread && let Err(e) = inner.save(&[]).await {
-            self.ui.notify(describe(&e));
+    }
+
+    /// The files of the chat with `peer`, newest first, as its file browser lists them: those its
+    /// messages carry, and its attachments. The whole history is read, a page at a time, without
+    /// the files' bytes, each page under the lock of its own, so that syncing and sending go on
+    /// meanwhile.
+    pub async fn files(&self, peer: PublicKey) -> Result<Vec<FileView>, String> {
+        let mut files = vec![];
+        let mut end = u64::MAX;
+        loop {
+            let guard = self.inner.lock().await;
+            let inner = guard.as_ref().ok_or("locked")?;
+            let contact = inner
+                .contacts
+                .iter()
+                .find(|contact| contact.peer == peer)
+                .ok_or("no such chat")?;
+            // Not past its end, as the chat may have been deleted and started again meanwhile.
+            end = end.min(contact.state.history_len);
+            if end == 0 {
+                break;
+            }
+            let page = inner
+                .vault
+                .history(&peer, end, HISTORY_SHOWN)
+                .await
+                .map_err(|e| describe(&e))?;
+            for (index, entry) in page.into_iter().rev() {
+                // Sorted by content as it came, if it came with its bytes; else by its name and
+                // type, as an attachment.
+                let sort = entry.sort();
+                let message = contact.message(index, entry);
+                let (name, mime, size) = match &message.body {
+                    Body::File(file) => (file.name.clone(), file.mime.clone(), file.size),
+                    Body::Remote(remote) => (
+                        remote.pointer.name.clone(),
+                        remote.pointer.mime.clone(),
+                        remote.pointer.size,
+                    ),
+                    _ => continue,
+                };
+                files.push(FileView {
+                    index,
+                    at: message.at,
+                    outgoing: message.outgoing,
+                    sort: match sort {
+                        Sort::Unknown => preview::sort(&name, &mime, &[]),
+                        sort => sort,
+                    },
+                    name,
+                    size,
+                    body: message.body,
+                });
+            }
+            end = end.saturating_sub(HISTORY_SHOWN);
         }
-        self.ui.contacts.set(inner.views());
+        Ok(files)
     }
 
     /// Count the messages of the chat with `peer` as read, e.g. back on the page with the chat
-    /// open: they show already, as [`receive`](Self::receive) adds them to the open chat.
+    /// open: they show already, as [`receive`](Self::receive) adds them to the open chat. The
+    /// peer learns it.
     pub async fn mark_read(&self, peer: PublicKey) {
         let mut guard = self.inner.lock().await;
         let Some(inner) = guard.as_mut() else {
@@ -1488,14 +2306,17 @@ impl Engine {
         let Some(contact) = inner.contact(&peer) else {
             return;
         };
-        if contact.state.unread == 0 {
+        if !contact.read_all() {
             return;
         }
-        contact.state.unread = 0;
         if let Err(e) = inner.save(&[]).await {
             self.ui.notify(describe(&e));
         }
         self.ui.contacts.set(inner.views());
+        drop(guard);
+        if let Err(e) = self.flush(&peer).await {
+            self.ui.link.set(Link::Offline(e));
+        }
     }
 
     /// Accept the request of `peer`, naming the peer `name`.
@@ -1504,7 +2325,10 @@ impl Engine {
             contact.state.request = false;
             contact.state.name = name.trim().to_string();
         })
-        .await
+        .await?;
+        // The peer learns what was read of the request.
+        self.wake();
+        Ok(())
     }
 
     pub async fn rename(&self, peer: PublicKey, name: String) -> Result<(), String> {
@@ -1529,14 +2353,53 @@ impl Engine {
     pub async fn delete(&self, peer: PublicKey) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        // Forgotten in the vault first, so that if that fails, the chat stays whole.
+        // The peer is told, on the session as it is now, so that its next message starts a new
+        // one, which comes here as a new chat; see `say_farewells`. If forgetting fails, the
+        // session goes back to this, as the farewell never goes.
+        let snapshot = inner.contact(&peer).map(|contact| contact.snapshot());
+        // Not for a request, which a stranger may have sent: they learn nothing of it. What
+        // was read and not told yet goes first, so that the peer sends again only what was not.
+        let mut farewell = vec![];
+        if let Some(contact) = inner.contact(&peer)
+            && !contact.state.request
+        {
+            let mut deleted = Kind::Deleted(Deleted {}).to_bytes();
+            contact.state.clock = contact.state.clock.saturating_add(1);
+            stamp(&mut deleted, contact.state.clock);
+            let events = contact
+                .state
+                .events
+                .take()
+                .filter(|events| !events.is_empty());
+            for content in events
+                .map(|events| events.to_bytes())
+                .into_iter()
+                .chain([deleted])
+            {
+                if let Ok(message) = contact.session.encrypt(&content) {
+                    farewell.push(Farewell {
+                        peer: peer.to_vec(),
+                        message: Some(message),
+                    });
+                }
+            }
+        }
+        // Forgotten in the vault first, so that if that fails, the chat stays whole; with the
+        // records of other chats left unsaved, as with each save.
         let mut state = inner.app_state();
         state.contacts.retain(|contact| contact.peer != peer);
-        inner
-            .vault
-            .forget(&state, &peer)
-            .await
-            .map_err(|e| describe(&e))?;
+        state.farewells.extend(farewell.clone());
+        let unsaved = inner
+            .unsaved
+            .iter()
+            .filter(|(unsaved, _)| *unsaved != peer)
+            .map(|(_, record)| record);
+        if let Err(e) = inner.vault.forget(&state, &peer, unsaved).await {
+            if let Some(snapshot) = snapshot {
+                inner.roll_back(&peer, snapshot)?;
+            }
+            return Err(describe(&e));
+        }
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
         // chat, which `may_keep` now tells them is gone. What the server has expires.
         let uploads: Vec<[u8; 16]> = self.ui.uploads.with_untracked(|uploads| {
@@ -1554,7 +2417,16 @@ impl Engine {
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.peer != peer));
         inner.contacts.retain(|contact| contact.peer != peer);
-        inner.unsaved.retain(|(unsaved, _)| *unsaved != peer);
+        // The other chats' records left unsaved were saved with it, and show at the next sync.
+        inner.saved_late.extend(
+            inner
+                .unsaved
+                .drain(..)
+                .map(|(unsaved, _)| unsaved)
+                .filter(|unsaved| *unsaved != peer),
+        );
+        inner.state.farewells.extend(farewell);
+        self.wake();
         if self.ui.open.get_untracked() == Some(peer) {
             self.ui.open.set(None);
             self.ui.messages.set(vec![]);
@@ -1593,40 +2465,272 @@ impl Inner {
     }
 
     /// Save the state, and `entries` with it, and the records left [unsaved](Self::unsaved).
-    // TODO: every save encrypts the whole state, outboxes included, whose messages may be files
-    // of up to 1 MiB; keep each waiting message in a record of its own.
     async fn save(&mut self, entries: &[(String, HistoryEntry)]) -> crate::vault::Result<()> {
-        if self.unsaved.is_empty() {
-            return self.vault.save(&self.app_state(), entries).await;
-        }
-        let all: Vec<_> = self
-            .unsaved
-            .iter()
-            .map(|(_, record)| record.clone())
-            .chain(entries.iter().cloned())
-            .collect();
-        self.vault.save(&self.app_state(), &all).await?;
-        self.unsaved.clear();
-        self.saved_late = true;
+        self.save_with(entries, &[]).await
+    }
+
+    /// Save as [`save`](Self::save) does, and `outgoing`, the records of messages waiting to be
+    /// pushed, or none for one that went.
+    async fn save_with(
+        &mut self,
+        entries: &[(String, HistoryEntry)],
+        outgoing: &[(String, Option<OutgoingRecord>)],
+    ) -> crate::vault::Result<()> {
+        let unsaved = self.unsaved.iter().map(|(_, record)| record);
+        self.vault
+            .save(&self.app_state(), unsaved.chain(entries), outgoing)
+            .await?;
+        self.saved_late
+            .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
         Ok(())
     }
 
-    /// Start a new session with `peer`, whose chat has none to send on, as the two kept missing
-    /// each other (see `Session::needs_new_session`), greeting the peer in its first message as
-    /// a new chat does; and save it.
-    async fn start_again(&mut self, peer: &PublicKey) -> Result<(), String> {
-        let hello = Kind::Hello(Hello {
-            name: self.state.name.clone(),
-        });
-        let started = self
-            .client
-            .initiate(peer, &hello.to_bytes(), Fetch::client(&self.server))
+    /// Encrypt the next message waiting to `peer`, now that it goes, at the next place in the
+    /// chat, after what came so far: on the session, or on a new one if there is none to send
+    /// on, as the two kept missing each other or the peer deleted the chat. Saved before it
+    /// goes, so that no key of the ratchet is used twice. One encrypted while the server cannot
+    /// be reached keeps its place, after what had come then. If no session can ever start, as
+    /// the peer has no keys on the server, or bad ones, the messages waiting fail for good:
+    /// returns why.
+    async fn seal_next(&mut self, peer: &PublicKey) -> Result<Option<String>, String> {
+        let greeting = self.greeting();
+        let contact = self
+            .contacts
+            .iter_mut()
+            .find(|contact| contact.peer == *peer)
+            .ok_or("no such chat")?;
+        if contact.session.needs_new_session() {
+            let snapshot = contact.snapshot();
+            contact.state.clock = contact.state.clock.saturating_add(1);
+            let mut hello = greeting.to_bytes();
+            stamp(&mut hello, contact.state.clock);
+            match self.client.start_again(&mut contact.session, &hello).await {
+                // Its initial message went: kept at once.
+                Ok(()) => self.save(&[]).await.map_err(|e| describe(&e))?,
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
+                    self.roll_back(peer, snapshot)?;
+                    return self.fail_waiting(peer, describe(&e)).await.map(Some);
+                }
+                Err(e) => {
+                    self.roll_back(peer, snapshot)?;
+                    return Err(describe(&e));
+                }
+            }
+        }
+        let contact = self.contact(peer).ok_or("no such chat")?;
+        let Some(next) = contact
+            .state
+            .outbox
+            .iter()
+            .position(|outgoing| !outgoing.sealed)
+        else {
+            return Ok(None);
+        };
+        let index = contact.state.outbox[next].history_index;
+        let mut content = self
+            .vault
+            .outgoing(peer, index)
+            .await
+            .map_err(|e| describe(&e))?
+            .content;
+        let contact = self.contact(peer).ok_or("no such chat")?;
+        let snapshot = contact.snapshot();
+        let clock = contact.state.clock.saturating_add(1);
+        stamp(&mut content, clock);
+        let message = contact
+            .session
+            .encrypt(&content)
+            .map_err(|e| describe(&e))?;
+        contact.state.clock = clock;
+        let outgoing = &mut contact.state.outbox[next];
+        (outgoing.sealed, outgoing.clock) = (true, clock);
+        let record = OutgoingRecord {
+            message: Some(message),
+            content: vec![],
+        };
+        if let Err(e) = self
+            .save_with(&[], &[(outbox_key(peer, index), Some(record))])
+            .await
+        {
+            self.roll_back(peer, snapshot)?;
+            return Err(describe(&e));
+        }
+        Ok(None)
+    }
+
+    /// Fail the messages waiting to `peer`, as they cannot go, for `reason`, which it returns.
+    async fn fail_waiting(&mut self, peer: &PublicKey, reason: String) -> Result<String, String> {
+        let contact = self.contact(peer).ok_or("no such chat")?;
+        let waiting: Vec<_> = contact
+            .state
+            .outbox
+            .iter()
+            .filter(|outgoing| !outgoing.sealed)
+            .map(|outgoing| outgoing.history_index)
+            .collect();
+        contact.state.outbox.retain(|outgoing| outgoing.sealed);
+        let mut entries = BTreeMap::new();
+        let steps = waiting.iter().map(|index| (*index, Step::Refused));
+        self.step(peer, &mut entries, steps)
             .await
             .map_err(|e| describe(&e))?;
+        let gone: Vec<_> = waiting
+            .iter()
+            .map(|index| (outbox_key(peer, *index), None))
+            .collect();
+        let entries: Vec<_> = entries.into_iter().collect();
+        self.save_with(&records(peer, &entries), &gone)
+            .await
+            .map_err(|e| describe(&e))?;
+        Ok(reason)
+    }
+
+    /// Move the history entries of the chat with `peer` on by `steps`, each read from the vault
+    /// into `entries`, unless there already.
+    async fn step(
+        &self,
+        peer: &PublicKey,
+        entries: &mut BTreeMap<u64, HistoryEntry>,
+        steps: impl IntoIterator<Item = (u64, Step)>,
+    ) -> crate::vault::Result<()> {
+        for (index, step) in steps {
+            let entry = match entries.entry(index) {
+                btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                btree_map::Entry::Vacant(vacant) => match self.vault.entry(peer, index).await? {
+                    Some(entry) => vacant.insert(entry),
+                    None => continue,
+                },
+            };
+            entry.set_delivery(entry.delivery().after(step));
+            // Waiting again, it has no place until it goes.
+            if entry.delivery() == Delivery::Pending {
+                entry.place = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// Put back to wait to be encrypted again, see [`seal_next`](Self::seal_next), what was
+    /// encrypted for `peer` on the session if it was retired since, to go on a new one; and, if
+    /// the peer `deleted` the chat, what it never read, as it pushed that already, to go on the
+    /// new one, or on the active one if the peer started it again already. Their entries move
+    /// on in `entries`. What the peer was to be told of its messages before goes no more then:
+    /// it has no chat to tell of. Their contents come from the history. Returns the records to
+    /// save with the state.
+    async fn requeue(
+        &mut self,
+        peer: &PublicKey,
+        deleted: bool,
+        entries: &mut BTreeMap<u64, HistoryEntry>,
+    ) -> Result<Vec<(String, Option<OutgoingRecord>)>, String> {
         let contact = self.contact(peer).ok_or("no such chat")?;
-        let older = std::mem::replace(&mut contact.session, started);
+        let mut again: Vec<_> = if deleted {
+            let unread = contact
+                .state
+                .awaiting
+                .iter()
+                .filter(|awaiting| !awaiting.read)
+                .map(|awaiting| awaiting.history_index)
+                .collect();
+            contact.state.awaiting.clear();
+            contact.state.events = None;
+            contact.state.unseen.clear();
+            unread
+        } else {
+            vec![]
+        };
+        again.sort_unstable();
+        // On the active session, what is encrypted goes as it is.
+        let retired = contact.session.needs_new_session();
+        let sealed: Vec<_> = contact
+            .state
+            .outbox
+            .iter()
+            .filter(|outgoing| retired && outgoing.sealed)
+            .map(|outgoing| outgoing.history_index)
+            .collect();
+        for outgoing in &mut contact.state.outbox {
+            if sealed.contains(&outgoing.history_index) {
+                (outgoing.sealed, outgoing.clock) = (false, 0);
+            }
+        }
+        // The ones pushed already go first, in the order they went.
+        let pushed: Vec<_> = again
+            .iter()
+            .map(|history_index| Outgoing {
+                history_index: *history_index,
+                sealed: false,
+                clock: 0,
+            })
+            .collect();
+        contact.state.outbox.splice(0..0, pushed);
+        let steps = again.iter().map(|index| (*index, Step::Resent));
+        self.step(peer, entries, steps)
+            .await
+            .map_err(|e| describe(&e))?;
+        let mut records = vec![];
+        for index in again.iter().chain(&sealed) {
+            let entry = match entries.get(index) {
+                Some(entry) => Some(entry.clone()),
+                None => self
+                    .vault
+                    .entry(peer, *index)
+                    .await
+                    .map_err(|e| describe(&e))?,
+            };
+            let content = match entry {
+                Some(entry) => self
+                    .vault
+                    .content(peer, *index, &entry)
+                    .await
+                    .map_err(|e| describe(&e))?,
+                None => None,
+            };
+            let record = OutgoingRecord {
+                message: None,
+                content: content.map(|kind| kind.to_bytes()).unwrap_or_default(),
+            };
+            records.push((outbox_key(peer, *index), Some(record)));
+        }
+        Ok(records)
+    }
+
+    /// Accept `initial_message`, of the peer of the chat with `peer`, which came with one of its
+    /// messages rather than through the inbox, where it was lost: its session joins the chat,
+    /// see `Session::keep`, and its greeting shows. One accepted already, or not from the peer,
+    /// changes nothing.
+    async fn join(
+        &mut self,
+        peer: &PublicKey,
+        initial_message: &InitialMessage,
+    ) -> Result<(), String> {
+        let mailbox = Fetch::client(&self.server);
+        let Ok((session, first)) = self.client.accept(peer, initial_message, mailbox) else {
+            return Ok(());
+        };
+        if initial_message.x3dh.one_time_prekey.is_some() {
+            self.state.used_one_time_prekeys += 1;
+        }
+        let contact = self.contact(peer).ok_or("no such chat")?;
+        let older = std::mem::replace(&mut contact.session, session);
         contact.session.keep(older).map_err(|e| describe(&e))?;
-        self.save(&[]).await.map_err(|e| describe(&e))
+        let (index, entry) = contact.add_received(Content::from_bytes(&first), false);
+        let record = (history_key(peer, index), entry);
+        if let Err(e) = self.save(std::slice::from_ref(&record)).await {
+            // Accepted, it cannot be again: it shows once saved.
+            self.unsaved.push((*peer, record));
+            return Err(describe(&e));
+        }
+        self.saved_late.push(*peer);
+        Ok(())
+    }
+
+    /// The greeting a session this client starts begins with: its first message, which shows
+    /// the peer that the initial message is this client's, and lets the peer write back.
+    fn greeting(&self) -> Kind {
+        Kind::Hello(Hello {
+            name: self.state.name.clone(),
+        })
     }
 
     fn contact(&mut self, peer: &PublicKey) -> Option<&mut Contact> {
@@ -1668,20 +2772,59 @@ impl Inner {
 }
 
 impl Engine {
-    /// Update the delivery of the messages to `peer` on screen.
-    fn show_deliveries(&self, inner: &mut Inner, peer: &PublicKey) {
-        if self.ui.open.get_untracked() != Some(*peer) {
+    /// Show `views`, new in the chat with `peer`, if it is on screen, in its order.
+    fn show_new(&self, inner: &Inner, peer: &PublicKey, views: Vec<MessageView>) {
+        if self.ui.open.get_untracked() != Some(*peer) || views.is_empty() {
             return;
         }
-        let Some(contact) = inner.contact(peer) else {
-            return;
-        };
+        let me = inner.client.identity_key();
         self.ui.messages.update(|messages| {
-            for message in messages.iter_mut().filter(|message| message.outgoing) {
-                message.delivery = contact.delivery(message.index);
-            }
+            messages.extend(views);
+            order(messages, &me, peer);
         });
     }
+
+    /// Show the history entries of the chat with `peer` that changed, `entries`, if it is on
+    /// screen: how far each got, and its place, in the chat's order.
+    fn show_changes(&self, inner: &Inner, peer: &PublicKey, entries: &[(u64, HistoryEntry)]) {
+        if self.ui.open.get_untracked() != Some(*peer) || entries.is_empty() {
+            return;
+        }
+        let me = inner.client.identity_key();
+        self.ui.messages.update(|messages| {
+            for (index, entry) in entries {
+                if let Some(message) = messages.iter_mut().find(|message| message.index == *index) {
+                    message.place = entry.place;
+                    if entry.outgoing {
+                        message.delivery = entry.delivery();
+                    }
+                }
+            }
+            order(messages, &me, peer);
+        });
+    }
+}
+
+/// The records of `entries` of the chat with `peer`.
+fn records(peer: &PublicKey, entries: &[(u64, HistoryEntry)]) -> Vec<(String, HistoryEntry)> {
+    entries
+        .iter()
+        .map(|(index, entry)| (history_key(peer, *index), entry.clone()))
+        .collect()
+}
+
+/// Whether the chat with `peer` has no session to send on.
+fn needs_new_session(inner: &Inner, peer: &PublicKey) -> bool {
+    inner
+        .contacts
+        .iter()
+        .any(|contact| contact.peer == *peer && contact.session.needs_new_session())
+}
+
+/// The place in the chat of the peer's message whose clock is `clock`, as the chat is `state`,
+/// see [`content::place`].
+fn place_of(clock: u64, state: &ContactState) -> u64 {
+    content::place(clock, state.peer_last.max(state.read_by_peer), state.clock)
 }
 
 impl Contact {
@@ -1701,14 +2844,27 @@ impl Contact {
         }
     }
 
-    /// Add the content `bytes`, received, to the history, counting it as unread unless the chat
-    /// is `open`. Returns the entry and its index.
-    fn add_received(&mut self, bytes: &[u8], open: bool) -> (u64, HistoryEntry) {
-        let content = Kind::from_bytes(bytes);
-        match &content {
+    /// Add `content`, received, to the history, at its place in the chat, counting it as unread
+    /// unless the chat is `open`: then it is read, which the peer is told. Returns the entry and
+    /// its index.
+    fn add_received(&mut self, content: Content, open: bool) -> (u64, HistoryEntry) {
+        let place = place_of(content.clock, &self.state);
+        self.state.clock = self.state.clock.max(place);
+        self.state.peer_last = place;
+        match &content.kind {
             Some(Kind::Hello(hello)) => self.state.hello_name = hello.name.clone(),
             _ if !open => self.state.unread += 1,
             _ => {}
+        }
+        // A message to read, which the peer waits to hear of, by its clock.
+        let readable = content.kind.as_ref().is_some_and(Kind::is_readable);
+        if readable && content.clock > 0 {
+            if open {
+                self.tell_read(content.clock);
+            } else {
+                self.state.unseen.push(content.clock);
+                keep_last(&mut self.state.unseen);
+            }
         }
         let index = self.state.history_len;
         self.state.history_len += 1;
@@ -1716,67 +2872,156 @@ impl Contact {
         let entry = HistoryEntry {
             outgoing: false,
             at: now(),
-            content: Some(Content { kind: content }),
+            content: Some(content),
+            place,
+            ..HistoryEntry::default()
         };
         (index, entry)
     }
 
-    fn delivery(&self, index: u64) -> Delivery {
-        if self.state.failed.contains(&index) {
-            Delivery::Failed
-        } else if self
-            .state
-            .outbox
-            .iter()
-            .any(|outgoing| outgoing.history_index == index)
-        {
-            Delivery::Pending
-        } else {
-            Delivery::Sent
+    /// Tell the peer that its message at `clock` was read.
+    fn tell_read(&mut self, clock: u64) {
+        let events = self.state.events.get_or_insert_default();
+        events.read.push(clock);
+        keep_last(&mut events.read);
+    }
+
+    /// Count the chat's messages as read, as it is on screen; the peer is told of those it was
+    /// not told of. Returns whether that changed anything.
+    fn read_all(&mut self) -> bool {
+        let unseen = std::mem::take(&mut self.state.unseen);
+        let changed = self.state.unread > 0 || !unseen.is_empty();
+        self.state.unread = 0;
+        for clock in unseen {
+            self.tell_read(clock);
         }
+        changed
+    }
+
+    /// Take what the peer told of this client's messages: those it names that wait for it move
+    /// on, and are forgotten once they wait for nothing more. Returns their steps, by history
+    /// entry.
+    fn told(&mut self, events: &Events) -> Vec<(u64, Step)> {
+        let mut steps = vec![];
+        for (clocks, step) in [
+            (&events.read, Step::Read),
+            (&events.downloaded, Step::Downloaded),
+        ] {
+            for clock in clocks {
+                let Some(at) = self
+                    .state
+                    .awaiting
+                    .iter()
+                    .position(|awaiting| awaiting.place == *clock)
+                else {
+                    continue;
+                };
+                // Read, or downloaded, which it opened to: what the peer writes next goes after.
+                self.state.read_by_peer = self.state.read_by_peer.max(*clock);
+                let awaiting = &mut self.state.awaiting[at];
+                steps.push((awaiting.history_index, step));
+                if step == Step::Read && awaiting.attachment {
+                    awaiting.read = true;
+                } else {
+                    self.state.awaiting.remove(at);
+                }
+            }
+        }
+        steps
     }
 
     /// History entry `index`, as shown.
-    fn message(&self, index: u64, entry: HistoryEntry) -> MessageView {
-        let body = match entry.content.and_then(|content| content.kind) {
+    fn message(&self, index: u64, mut entry: HistoryEntry) -> MessageView {
+        // The clock the peer sent an attachment's message at, to tell it once downloaded.
+        let clock = match &entry.content {
+            Some(content) if !entry.outgoing => content.clock,
+            _ => 0,
+        };
+        // Moved out, as a file just sent or received comes with its bytes, up to 1 MiB.
+        let kind = entry.content.take().and_then(|content| content.kind);
+        // A file read from the history comes without its bytes, which a record of their own
+        // keeps, as its size notes; one just sent or received, or an empty one, with them.
+        let kept_apart = entry.file > 0;
+        let file = |name: String, mime: String, data: Vec<u8>| {
+            let media = if kept_apart {
+                (!entry.media.is_empty()).then(|| entry.media.clone())
+            } else {
+                preview::media_mime(&name, &mime, &data).map(str::to_string)
+            };
+            Body::File(LocalFile {
+                peer: self.peer,
+                index,
+                size: if kept_apart {
+                    entry.file
+                } else {
+                    data.len() as u64
+                },
+                media,
+                data: (!kept_apart).then(|| Attachment {
+                    name: name.clone(),
+                    mime: mime.clone(),
+                    data: Arc::new(data),
+                }),
+                name,
+                mime,
+            })
+        };
+        let body = match kind {
             Some(Kind::Text(text)) => Body::Text(text),
             Some(Kind::Image(data)) => {
-                // The TUI client sends any image, e.g. BMP, which only downloads here.
-                let mime = image_type(&data);
-                Body::File(Attachment {
-                    name: mime
-                        .and_then(|mime| mime.strip_prefix("image/"))
+                // The TUI client sends any image, e.g. BMP; typed as the history notes it, see
+                // `HistoryEntry::without_file`.
+                let mime = if kept_apart {
+                    (!entry.media.is_empty()).then_some(entry.media.as_str())
+                } else {
+                    preview::media_mime("image", "", &data)
+                };
+                file(
+                    mime.and_then(|mime| mime.strip_prefix("image/"))
                         .map_or_else(
                             || "image".to_string(),
                             |extension| format!("image.{extension}"),
                         ),
-                    mime: mime.unwrap_or("application/octet-stream").to_string(),
-                    data: Arc::new(data),
-                })
+                    mime.unwrap_or("application/octet-stream").to_string(),
+                    data,
+                )
             }
-            Some(Kind::File(file)) => Body::File(Attachment {
-                name: file.name,
-                mime: file.mime,
-                data: Arc::new(file.data),
-            }),
+            Some(Kind::File(content)) => file(content.name, content.mime, content.data),
             Some(Kind::Hello(hello)) => Body::Hello(hello.name),
+            Some(Kind::Deleted(_)) => Body::Deleted,
             Some(Kind::Attachment(pointer)) => Body::Remote(RemoteFile {
                 peer: self.peer,
                 pointer,
+                clock,
             }),
             None => Body::Unknown,
         };
         MessageView {
             index,
+            place: entry.place,
             outgoing: entry.outgoing,
             at: entry.at,
             body,
             delivery: if entry.outgoing {
-                self.delivery(index)
+                entry.delivery()
             } else {
                 Delivery::Received
             },
         }
+    }
+}
+
+/// The MIME type a stream is served as until its first bytes tell, from the page's origin: the
+/// type its sender gave, if it is a plain video or audio type, else none in particular.
+fn stream_mime(mime: &str) -> String {
+    let mime = mime.to_lowercase();
+    let plain = mime
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"/+-.".contains(&byte));
+    if plain && (mime.starts_with("video/") || mime.starts_with("audio/")) {
+        mime
+    } else {
+        "application/octet-stream".to_string()
     }
 }
 
@@ -1878,5 +3123,26 @@ mod tests {
             name: "😀".repeat(NAME_MAX),
         });
         assert!(greeting.to_bytes().len() < 512);
+    }
+
+    #[test]
+    fn a_peer_cannot_place_a_message_before_what_it_saw() {
+        let state = ContactState {
+            clock: 9,
+            peer_last: 5,
+            read_by_peer: 7,
+            ..ContactState::default()
+        };
+        // An honest peer's clock is past both.
+        assert_eq!(place_of(8, &state), 8);
+        // Backdated, it goes after the peer's last message, and the one it read.
+        assert_eq!(place_of(2, &state), 8);
+        // Without a clock, where it came.
+        assert_eq!(place_of(0, &state), 10);
+        // Nor far past the chat's highest place, where it would pin the chat's clock.
+        assert_eq!(
+            place_of(u64::MAX, &state),
+            9 + session::protocol::content::MAX_AHEAD
+        );
     }
 }

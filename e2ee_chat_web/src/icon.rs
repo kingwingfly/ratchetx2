@@ -34,6 +34,18 @@ pub enum Icon {
     /// A presentation board, and a page of text.
     Slides,
     Document,
+    /// A chat's files.
+    Folder,
+    /// Two notes: audio.
+    Music,
+    /// How far a message got, as Telegram shows it: one tick, sent, and two, read, as wide as
+    /// one; three, its attachment downloaded; a clock, waiting to be sent; and a mark, that it
+    /// could not be.
+    Sent,
+    Read,
+    Downloaded,
+    Pending,
+    Failed,
 }
 
 impl Icon {
@@ -69,6 +81,28 @@ impl Icon {
                 "M12 7.5v.01",
             ],
             Self::Close => &["M6 6l12 12", "M18 6 6 18"],
+            Self::Sent => &["M6.5 6.5l3 3L16 3"],
+            // The second tick's foot goes behind the first.
+            Self::Read => &["M1.5 6.5l3 3L11 3", "M7.8 7.8l1.7 1.7L16 3"],
+            Self::Downloaded => &[
+                "M1.5 6.5l3 3L11 3",
+                "M7.8 7.8l1.7 1.7L16 3",
+                "M12.8 7.8l1.7 1.7L21 3",
+            ],
+            Self::Pending => &["M12 3a9 9 0 1 1 0 18 9 9 0 0 1 0-18z", "M12 7v5l3 2"],
+            Self::Failed => &[
+                "M12 3a9 9 0 1 1 0 18 9 9 0 0 1 0-18z",
+                "M12 7.5v5.5",
+                "M12 16.5v.01",
+            ],
+            Self::Folder => {
+                &["M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"]
+            }
+            Self::Music => &[
+                "M9 18V5l12-2v13",
+                "M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
+                "M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
+            ],
             Self::Back => &["M19 12H5", "M11 6l-6 6 6 6"],
             Self::Download => &["M12 4v11", "M7 10l5 5 5-5", "M5 20h14"],
             Self::Copy => &[
@@ -109,10 +143,21 @@ impl Icon {
     }
 }
 
+impl Icon {
+    /// What its paths are drawn in: the ticks are wider than tall.
+    fn view_box(self) -> &'static str {
+        match self {
+            Self::Sent | Self::Read => "0 0 18 12",
+            Self::Downloaded => "0 0 23 12",
+            _ => "0 0 24 24",
+        }
+    }
+}
+
 /// The icon `icon`, for a button that names it in its `title` and `aria-label`.
 pub fn icon(icon: Icon) -> impl IntoView {
     view! {
-        <svg class="glyph" viewBox="0 0 24 24" aria-hidden="true">
+        <svg class="glyph" viewBox=icon.view_box() aria-hidden="true">
             {icon.paths().iter().map(|path| view! { <path d=*path /> }).collect_view()}
         </svg>
     }

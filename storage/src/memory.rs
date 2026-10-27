@@ -92,6 +92,7 @@ impl MailboxStore for MemoryStore {
         recipient: &PublicKey,
         header: Bytes,
         content: Bytes,
+        initial_message: Option<Bytes>,
     ) -> Result<u64> {
         let mut inner = self.inner.lock();
         let queue = inner.queues.entry((*sender, *recipient)).or_default();
@@ -102,6 +103,7 @@ impl MailboxStore for MemoryStore {
             sequence,
             header,
             content,
+            initial_message,
         });
         Ok(sequence)
     }

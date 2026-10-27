@@ -37,6 +37,12 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/handshake.v1.rs"));
 }
 
+/// The messages by the path the other packages' generated code names them with,
+/// `handshake::v1`, e.g. the mailbox's, which carries initial messages.
+pub(crate) mod v1 {
+    pub use super::proto::*;
+}
+
 pub use proto::*;
 #[cfg(feature = "server")]
 pub use server::{HandshakeLimits, HandshakeServer};

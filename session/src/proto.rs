@@ -14,6 +14,7 @@ impl fmt::Debug for ClientState {
         f.debug_struct("ClientState")
             .field("prekeys", &self.prekeys)
             .field("last_timestamp", &self.last_timestamp)
+            .field("publishing", &self.publishing)
             .finish_non_exhaustive()
     }
 }
@@ -25,12 +26,15 @@ impl fmt::Debug for SessionState {
             .field("party", &self.party)
             .field("id", &self.id)
             .field("known_by_peer", &self.known_by_peer)
+            .field("initial_message", &self.initial_message.len())
             .field("others", &self.others)
             .field("me", &self.me)
             .field("peer", &self.peer)
             .field("cursor", &self.cursor)
             .field("last", &self.last)
             .field("direction_changes", &self.direction_changes)
+            .field("stalled_through", &self.stalled_through)
+            .field("skip_through", &self.skip_through)
             .finish()
     }
 }

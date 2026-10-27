@@ -14,7 +14,7 @@ bon = "3.10"
 bytes = "1"
 getrandom = "0.4"
 party = { path = "../party", default-features = false }
-prost = { version = "0.14", optional = true }
+prost = "0.14"
 protocol = { path = "../protocol", default-features = false }
 ratchetx2 = { path = "../ratchetx2", version = "0.4" }
 rkyv = { version = "0.8", optional = true }
@@ -47,7 +47,6 @@ serde = ["dep:serde", "party/serde", "x3dh/serde", "xeddsa/serde"]
 rkyv = ["dep:rkyv", "party/rkyv", "x3dh/rkyv", "xeddsa/rkyv"]
 # The states as protobuf messages too, from proto/session.proto.
 prost = [
-    "dep:prost",
     "dep:prost-build",
     "party/prost",
     "x3dh/prost",

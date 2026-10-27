@@ -9,6 +9,8 @@
     <link data-trunk rel="css" href="style.css" />
     <link data-trunk rel="rust" data-bin="e2ee_chat_web" data-wasm-opt="z" />
     <link data-trunk rel="copy-file" href="init.js" />
+    <!-- The service worker that streams media, which must be at the root to serve the page. -->
+    <link data-trunk rel="copy-file" href="media-worker.js" />
     <link data-trunk rel="copy-file" href="_headers" />
     <!-- The previews' workers, which the page starts when a preview first needs one. -->
     <link data-trunk rel="rust" data-type="worker" href="../e2ee_chat_preview/Cargo.toml" data-bin="preview_pdf" data-cargo-features="pdf,worker" data-loader-shim data-wasm-opt="z" />

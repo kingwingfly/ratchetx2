@@ -32,6 +32,141 @@ const OFFICE: [&str; 13] = [
     "key",
 ];
 
+/// Documents by their extension, which may be archives by content, as office documents are.
+const DOCUMENTS: [&str; 17] = [
+    "pdf", "txt", "text", "md", "markdown", "rtf", "epub", "csv", "tsv", "vcf", "vcard", "ics",
+    "ical", "log", "tex", "djvu", "xps",
+];
+
+/// Archives by their extension, for an attachment, whose content is not here.
+const ARCHIVES: [&str; 12] = [
+    "zip", "tar", "gz", "tgz", "bz2", "xz", "zst", "7z", "rar", "jar", "apk", "dmg",
+];
+
+/// Media by their extension, for an attachment, whose content is not here.
+const IMAGES: [&str; 13] = [
+    "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico", "svg", "heic", "heif", "tif", "tiff",
+];
+const VIDEOS: [&str; 8] = ["mp4", "m4v", "mov", "webm", "mkv", "avi", "ogv", "3gp"];
+const AUDIO: [&str; 9] = [
+    "mp3", "m4a", "aac", "ogg", "oga", "opus", "flac", "wav", "weba",
+];
+
+/// What sort of file it is, which a chat's file browser groups it by. Kept in the history as a
+/// number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, prost::Enumeration)]
+#[repr(i32)]
+pub enum Sort {
+    /// Not known yet, as it was not sorted when it came.
+    Unknown = 0,
+    Image = 1,
+    Video = 2,
+    Audio = 3,
+    /// PDF, office documents, text, and other documents to read.
+    Document = 4,
+    /// Source code and data in a language, e.g. Rust or JSON.
+    Code = 5,
+    Archive = 6,
+    Other = 7,
+}
+
+/// The sort of `data`, the file `name` of the MIME type `mime` by its sender: by its content
+/// first, for the formats with a signature known here, as the sender's name and type are only
+/// hints; then by its name, then by its type. `data` is empty if its bytes are not here, as for
+/// an attachment.
+pub fn sort(name: &str, mime: &str, data: &[u8]) -> Sort {
+    let lower = name.to_lowercase();
+    let extension = lower
+        .rsplit_once('.')
+        .map_or("", |(_, extension)| extension);
+    let mime = mime.to_lowercase();
+    if let Some(media) = media_mime(&lower, &mime, data) {
+        return media_sort(media);
+    }
+    if data.starts_with(b"%PDF-") {
+        return Sort::Document;
+    }
+    // Before archives by content, as office documents are ZIP archives.
+    if OFFICE.contains(&extension) || DOCUMENTS.contains(&extension) {
+        return Sort::Document;
+    }
+    let archive = matches!(
+        data,
+        [b'P', b'K', 3, 4, ..]
+            | [b'P', b'K', 5, 6, ..]
+            | [0x1F, 0x8B, ..]
+            | [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, ..]
+            | [b'R', b'a', b'r', b'!', 0x1A, 0x07, ..]
+            | [0xFD, b'7', b'z', b'X', b'Z', 0, ..]
+            | [b'B', b'Z', b'h', ..]
+            | [0x28, 0xB5, 0x2F, 0xFD, ..]
+    ) || data.get(257..262) == Some(b"ustar");
+    if archive || ARCHIVES.contains(&extension) {
+        return Sort::Archive;
+    }
+    if IMAGES.contains(&extension) {
+        return Sort::Image;
+    }
+    if VIDEOS.contains(&extension) {
+        return Sort::Video;
+    }
+    if AUDIO.contains(&extension) {
+        return Sort::Audio;
+    }
+    if language::of_file(&lower).is_some() {
+        return Sort::Code;
+    }
+    match mime.split_once('/') {
+        Some(("image", _)) => return Sort::Image,
+        Some(("video", _)) => return Sort::Video,
+        Some(("audio", _)) => return Sort::Audio,
+        Some(("text", _)) => return Sort::Document,
+        _ if mime == "application/pdf" => return Sort::Document,
+        _ if mime.contains("zip") || mime.contains("compressed") || mime.ends_with("x-tar") => {
+            return Sort::Archive;
+        }
+        _ => {}
+    }
+    // Any other text is a document, as its sender wrote it.
+    let text = !data.is_empty() && std::str::from_utf8(data).is_ok_and(|text| !text.contains('\0'));
+    if text { Sort::Document } else { Sort::Other }
+}
+
+/// The sort of media of the MIME type `mime`.
+fn media_sort(mime: &str) -> Sort {
+    match mime.split_once('/') {
+        Some(("image", _)) => Sort::Image,
+        Some(("video", _)) => Sort::Video,
+        _ => Sort::Audio,
+    }
+}
+
+/// The MIME type of `data`, the file `name` of the MIME type `mime` by its sender, if it is an
+/// image, a video or audio the browser shows: by its first bytes, or, for media without a
+/// signature known here, by the type its sender gave, as [`kind`] has it.
+pub fn media_mime(name: &str, mime: &str, data: &[u8]) -> Option<&'static str> {
+    match sniff_media(&name.to_lowercase(), data) {
+        Some(Kind::Image(mime) | Kind::Video(mime) | Kind::Audio(mime)) => Some(mime),
+        // Media no browser here shows, as HEIF images.
+        Some(_) => None,
+        None => match hinted_media(mime) {
+            Some(Kind::Video(mime) | Kind::Audio(mime)) => Some(mime),
+            _ => None,
+        },
+    }
+}
+
+/// Media without a signature known here, as the sender's browser named them.
+fn hinted_media(mime: &str) -> Option<Kind> {
+    Some(match mime.to_lowercase().as_str() {
+        "video/mp4" => Kind::Video("video/mp4"),
+        "video/webm" => Kind::Video("video/webm"),
+        "audio/mpeg" => Kind::Audio("audio/mpeg"),
+        "audio/aac" => Kind::Audio("audio/aac"),
+        _ => return None,
+    })
+}
+
 /// What a file shows as.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Kind {
@@ -109,16 +244,8 @@ pub fn kind(name: &str, mime: &str, data: &[u8]) -> Kind {
     if OFFICE.contains(&extension) {
         return Kind::None;
     }
-    if let Some(kind) = sniff(&lower, data) {
+    if let Some(kind) = sniff(&lower, data).or_else(|| hinted_media(mime)) {
         return kind;
-    }
-    // Media without a signature known here, as the sender's browser named it.
-    match mime.to_lowercase().as_str() {
-        "video/mp4" => return Kind::Video("video/mp4"),
-        "video/webm" => return Kind::Video("video/webm"),
-        "audio/mpeg" => return Kind::Audio("audio/mpeg"),
-        "audio/aac" => return Kind::Audio("audio/aac"),
-        _ => {}
     }
     let Ok(text) = std::str::from_utf8(data) else {
         return Kind::None;
@@ -196,6 +323,21 @@ fn sniff(name: &str, data: &[u8]) -> Option<Kind> {
     if data.starts_with(b"%PDF-") {
         return Some(Kind::Pdf);
     }
+    if let Some(media) = sniff_media(name, data) {
+        return Some(media);
+    }
+    Some(match data {
+        [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] => Kind::Archive(zip(data)?),
+        [0x1F, 0x8B, ..] => Kind::Archive(tar(GzDecoder::new(data), UNPACKED_MAX)?),
+        // Already as large as it gets, and listed as fast as it is read.
+        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(tar(data, u64::MAX)?),
+        _ => return None,
+    })
+}
+
+/// The kind of the media file `name`, lowercase, by its first bytes, if it is media: an image,
+/// a video or audio, or [`Kind::None`] for media no browser here shows.
+fn sniff_media(name: &str, data: &[u8]) -> Option<Kind> {
     if let Some(mime) = image_mime(name, data) {
         return Some(Kind::Image(mime));
     }
@@ -235,10 +377,6 @@ fn sniff(name: &str, data: &[u8]) -> Option<Kind> {
         [0xFF, second, ..] if second & 0xE0 == 0xE0 && second & 0x06 != 0 => {
             Kind::Audio("audio/mpeg")
         }
-        [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] => Kind::Archive(zip(data)?),
-        [0x1F, 0x8B, ..] => Kind::Archive(tar(GzDecoder::new(data), UNPACKED_MAX)?),
-        // Already as large as it gets, and listed as fast as it is read.
-        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(tar(data, u64::MAX)?),
         _ => return None,
     })
 }
@@ -639,6 +777,31 @@ mod test {
     use std::io::Write;
 
     use super::*;
+
+    #[test]
+    fn files_sort_by_content_then_name_then_type() {
+        // By content, whatever the name.
+        assert_eq!(sort("notes.txt", "", b"\x89PNG\r\n\x1a\n...."), Sort::Image);
+        assert_eq!(sort("photo", "", b"\x89PNG\r\n\x1a\n...."), Sort::Image);
+        assert_eq!(sort("clip", "", b"\x1aE\xdf\xa3....webm"), Sort::Video);
+        assert_eq!(sort("x.bin", "", b"%PDF-1.7\n..."), Sort::Document);
+        assert_eq!(sort("backup", "", b"7z\xbc\xaf\x27\x1c...."), Sort::Archive);
+        // An office document is a ZIP archive.
+        assert_eq!(sort("report.docx", "", b"PK\x03\x04...."), Sort::Document);
+        // By name, as an attachment's content is not here.
+        assert_eq!(sort("main.rs", "", b""), Sort::Code);
+        assert_eq!(sort("README.md", "", b""), Sort::Document);
+        assert_eq!(sort("song.FLAC", "", b""), Sort::Audio);
+        assert_eq!(sort("site.tar.gz", "", b""), Sort::Archive);
+        // Then by the type its sender gave, then as text or not.
+        assert_eq!(sort("clip", "video/mp4", b""), Sort::Video);
+        assert_eq!(sort("letter", "", b"Dear Bob"), Sort::Document);
+        assert_eq!(
+            sort("blob", "application/octet-stream", b"\0\x01"),
+            Sort::Other
+        );
+        assert_eq!(sort("blob", "", b""), Sort::Other);
+    }
 
     #[test]
     fn kinds_come_from_contents_first() {

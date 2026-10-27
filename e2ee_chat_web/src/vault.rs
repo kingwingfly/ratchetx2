@@ -4,7 +4,10 @@
 //! The database `e2ee-chat` has one object store of records by name:
 //! - `vault`: the [`VaultHeader`], in the clear: the salt and the parameters of the KDF.
 //! - `state`: the [`AppState`]: the identity, the prekeys, the contacts and their sessions.
-//! - `history/<peer in hex>/<index>`: one [`HistoryEntry`] of a chat.
+//! - `history/<peer in hex>/<index>`: one [`HistoryEntry`] of a chat, without the bytes of its
+//!   file, if any, which are in `file/<peer in hex>/<index>`, a [`FileRecord`], read when shown.
+//! - `outbox/<peer in hex>/<index>`: a message of a chat, the history entry `index`, waiting to
+//!   be pushed: an [`OutgoingRecord`]. The state only lists them, so that saving it stays small.
 //! - `attachment/<peer in hex>/<id in hex>/<index>`: a chunk of an attachment in a chat, as the
 //!   server has it: encrypted under the attachment's key, which only the history holds.
 //! - `upload/<peer in hex>/<id in hex>`: an [`PendingUpload`], until it is done.
@@ -28,7 +31,9 @@ use wasm_bindgen::JsValue;
 use zeroize::Zeroizing;
 
 use crate::{
-    content::Content,
+    content::{Content, Events, Kind},
+    preview::{self, Sort},
+    state::Delivery,
     util::{from_hex, hex},
 };
 
@@ -97,6 +102,9 @@ pub struct AppState {
     /// One-time prekeys used since then.
     #[prost(uint32, tag = "6")]
     pub used_one_time_prekeys: u32,
+    /// The messages telling peers that this client deleted their chats, to push.
+    #[prost(message, repeated, tag = "7")]
+    pub farewells: Vec<Farewell>,
 }
 
 /// A peer, and the session with it.
@@ -111,12 +119,9 @@ pub struct ContactState {
     pub request: bool,
     #[prost(message, optional, tag = "4")]
     pub session: Option<session::proto::SessionState>,
-    /// Messages encrypted but not pushed yet, in order.
+    /// Messages not pushed yet, in order.
     #[prost(message, repeated, tag = "5")]
     pub outbox: Vec<Outgoing>,
-    /// The history entries of messages that could not be pushed, for good.
-    #[prost(uint64, repeated, tag = "6")]
-    pub failed: Vec<u64>,
     #[prost(uint32, tag = "7")]
     pub unread: u32,
     /// Number of entries in the history.
@@ -128,6 +133,43 @@ pub struct ContactState {
     /// The name the peer gave in its greeting.
     #[prost(string, tag = "10")]
     pub hello_name: String,
+    /// The chat's Lamport clock: the highest place of its messages, both ways, so far.
+    #[prost(uint64, tag = "11")]
+    pub clock: u64,
+    /// The place of the peer's last message, which the next one goes after.
+    #[prost(uint64, tag = "12")]
+    pub peer_last: u64,
+    /// The highest place of this client's messages that the peer says it read, which the peer's
+    /// next message goes after.
+    #[prost(uint64, tag = "13")]
+    pub read_by_peer: u64,
+    /// This client's messages pushed whose last event has not come, oldest first.
+    #[prost(message, repeated, tag = "14")]
+    pub awaiting: Vec<Awaiting>,
+    /// The clocks of the peer's messages that came while the chat was not on screen, which are
+    /// read once it is.
+    #[prost(uint64, repeated, tag = "15")]
+    pub unseen: Vec<u64>,
+    /// What to tell the peer it did with its messages, once it can be.
+    #[prost(message, optional, tag = "16")]
+    pub events: Option<Events>,
+}
+
+/// A message this client pushed, waiting for the peer to read it, or to download its attachment.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Awaiting {
+    /// Its place, which events name it by.
+    #[prost(uint64, tag = "1")]
+    pub place: u64,
+    /// Its entry in the history.
+    #[prost(uint64, tag = "2")]
+    pub history_index: u64,
+    /// Whether the peer read it already, its attachment waiting to be downloaded.
+    #[prost(bool, tag = "3")]
+    pub read: bool,
+    /// Whether it is an attachment, which waits for both.
+    #[prost(bool, tag = "4")]
+    pub attachment: bool,
 }
 
 /// An attachment being uploaded, kept so that the upload can go on after the page goes, with
@@ -175,14 +217,57 @@ impl fmt::Debug for PendingUpload {
     }
 }
 
-/// A message encrypted but not pushed yet.
+/// A message not pushed yet, whose [`OutgoingRecord`] is kept apart.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Outgoing {
-    #[prost(message, optional, tag = "1")]
-    pub message: Option<party::EncryptedMessage>,
     /// Its entry in the history.
     #[prost(uint64, tag = "2")]
     pub history_index: u64,
+    /// Whether it is encrypted, as it goes next; otherwise it waits for the ones before it to
+    /// go, or for a session to send on.
+    #[prost(bool, tag = "4")]
+    pub sealed: bool,
+    /// Its place, given as it was encrypted.
+    #[prost(uint64, tag = "5")]
+    pub clock: u64,
+}
+
+/// What a message not pushed yet is: its content, encrypted just before it goes, once its place
+/// in the chat is known.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct OutgoingRecord {
+    /// The message, once encrypted.
+    #[prost(message, optional, tag = "1")]
+    pub message: Option<party::EncryptedMessage>,
+    /// Its content, until it is encrypted.
+    #[prost(bytes = "vec", tag = "3")]
+    pub content: Vec<u8>,
+}
+
+/// The bytes of a file in the history.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct FileRecord {
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: Vec<u8>,
+}
+
+/// The name of the [`OutgoingRecord`] of the history entry `index` of the chat with `peer`.
+pub fn outbox_key(peer: &PublicKey, index: u64) -> String {
+    format!("outbox/{}/{index:020}", hex(peer))
+}
+
+/// The name of the [`FileRecord`] of the history entry `index` of the chat with `peer`.
+fn file_key(peer: &PublicKey, index: u64) -> String {
+    format!("file/{}/{index:020}", hex(peer))
+}
+
+/// A message telling a peer that this client deleted the chat, not pushed yet.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Farewell {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer: Vec<u8>,
+    #[prost(message, optional, tag = "2")]
+    pub message: Option<party::EncryptedMessage>,
 }
 
 /// A message sent or received.
@@ -193,8 +278,58 @@ pub struct HistoryEntry {
     /// When it was sent or received.
     #[prost(uint64, tag = "2")]
     pub at: u64,
+    /// Its content, with the clock its sender gave it.
     #[prost(message, optional, tag = "3")]
     pub content: Option<Content>,
+    /// How far it got, if it is this client's.
+    #[prost(enumeration = "Delivery", tag = "4")]
+    pub delivery: i32,
+    /// Its place in the chat, which it shows by: its clock, unless the peer gave one that would
+    /// put it before the peer's earlier messages; 0 for this client's until it is pushed.
+    #[prost(uint64, tag = "5")]
+    pub place: u64,
+    /// The size of its file, if its content is one, whose bytes are in a record of their own.
+    #[prost(uint64, tag = "6")]
+    pub file: u64,
+    /// The MIME type of its file, if it is an image, a video or audio, by its first bytes:
+    /// the chat shows it in place. Empty otherwise.
+    #[prost(string, tag = "7")]
+    pub media: String,
+    /// The sort of its file, by its content, which the chat's file browser groups it by.
+    #[prost(enumeration = "Sort", tag = "8")]
+    pub sort: i32,
+}
+
+impl HistoryEntry {
+    /// The entry without the bytes of its file, if any, which it notes, and the bytes. One read
+    /// back from the history has none, and notes its file already.
+    fn without_file(&self) -> (Self, Option<Vec<u8>>) {
+        let mut entry = self.clone();
+        let data = match entry
+            .content
+            .as_mut()
+            .and_then(|content| content.kind.as_mut())
+        {
+            // Typed as the chat shows it when it comes, e.g. a BMP of the TUI client's.
+            Some(Kind::File(file)) if !file.data.is_empty() => {
+                entry.media = preview::media_mime(&file.name, &file.mime, &file.data)
+                    .unwrap_or_default()
+                    .to_string();
+                entry.sort = preview::sort(&file.name, &file.mime, &file.data).into();
+                std::mem::take(&mut file.data)
+            }
+            Some(Kind::Image(data)) if !data.is_empty() => {
+                entry.media = preview::media_mime("image", "", data)
+                    .unwrap_or_default()
+                    .to_string();
+                entry.sort = preview::sort("image", "", data).into();
+                std::mem::take(data)
+            }
+            _ => return (entry, None),
+        };
+        entry.file = data.len() as u64;
+        (entry, Some(data))
+    }
 }
 
 /// The name of a history entry's record.
@@ -314,17 +449,117 @@ impl Vault {
         Ok((vault, state))
     }
 
-    /// Save `state` and `entries` together, or neither.
-    pub async fn save(&self, state: &AppState, entries: &[(String, HistoryEntry)]) -> Result<()> {
+    /// Save `state`, `entries`, each file of theirs in a record of its own, and `outgoing`,
+    /// the records of messages waiting to be pushed, or none for one that went, together, or
+    /// none of them.
+    pub async fn save<'a>(
+        &self,
+        state: &AppState,
+        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
+        outgoing: &[(String, Option<OutgoingRecord>)],
+    ) -> Result<()> {
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
         let store = transaction.object_store(STORE)?;
         store.put(&bytes(&self.seal(STATE, state)), Some(&STATE.into()))?;
-        for (key, entry) in entries {
-            store.put(&bytes(&self.seal(key, entry)), Some(&key.as_str().into()))?;
+        self.put_entries(&store, entries)?;
+        for (key, record) in outgoing {
+            match record {
+                Some(record) => {
+                    store.put(&bytes(&self.seal(key, record)), Some(&key.as_str().into()))?;
+                }
+                None => {
+                    store.delete(JsValue::from_str(key))?;
+                }
+            }
         }
         commit(transaction).await
+    }
+
+    /// Put `entries` in `store`, each file of theirs in a record of its own.
+    fn put_entries<'a>(
+        &self,
+        store: &idb::ObjectStore,
+        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
+    ) -> Result<()> {
+        for (key, entry) in entries {
+            let (entry, data) = entry.without_file();
+            if let Some(data) = data {
+                let name = key.replacen("history/", "file/", 1);
+                let record = FileRecord { data };
+                store.put(
+                    &bytes(&self.seal(&name, &record)),
+                    Some(&name.as_str().into()),
+                )?;
+            }
+            store.put(&bytes(&self.seal(key, &entry)), Some(&key.as_str().into()))?;
+        }
+        Ok(())
+    }
+
+    /// The bytes of the file of the history entry `index` of the chat with `peer`.
+    pub async fn file(&self, peer: &PublicKey, index: u64) -> Result<Vec<u8>> {
+        let name = file_key(peer, index);
+        let sealed = get(&self.database, &name)
+            .await?
+            .ok_or_else(|| Error::Corrupt(format!("{name} is missing")))?;
+        let record = self
+            .open(&name, &sealed)
+            .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
+        FileRecord::decode(record.as_slice())
+            .map(|record| record.data)
+            .map_err(|e| Error::Corrupt(e.to_string()))
+    }
+
+    /// The content of the history entry `index` of the chat with `peer`, `entry` as read from
+    /// the history, with its file, if any.
+    pub async fn content(
+        &self,
+        peer: &PublicKey,
+        index: u64,
+        entry: &HistoryEntry,
+    ) -> Result<Option<Kind>> {
+        let mut kind = entry
+            .content
+            .as_ref()
+            .and_then(|content| content.kind.clone());
+        if entry.file > 0 {
+            let data = self.file(peer, index).await?;
+            match kind.as_mut() {
+                Some(Kind::File(file)) => file.data = data,
+                Some(Kind::Image(image)) => *image = data,
+                _ => {}
+            }
+        }
+        Ok(kind)
+    }
+
+    /// The history entry `index` of the chat with `peer`, without its file, if any.
+    pub async fn entry(&self, peer: &PublicKey, index: u64) -> Result<Option<HistoryEntry>> {
+        let name = history_key(peer, index);
+        let Some(sealed) = get(&self.database, &name).await? else {
+            return Ok(None);
+        };
+        let entry = self
+            .open(&name, &sealed)
+            .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
+        HistoryEntry::decode(entry.as_slice())
+            .map(Some)
+            .map_err(|e| Error::Corrupt(e.to_string()))
+    }
+
+    /// The record of the message waiting to be pushed that is the history entry `index` of the
+    /// chat with `peer`.
+    pub async fn outgoing(&self, peer: &PublicKey, index: u64) -> Result<OutgoingRecord> {
+        let name = outbox_key(peer, index);
+        let sealed = get(&self.database, &name)
+            .await?
+            .ok_or_else(|| Error::Corrupt(format!("{name} is missing")))?;
+        let record = self
+            .open(&name, &sealed)
+            .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
+        OutgoingRecord::decode(record.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))
     }
 
     /// The history of the chat with `peer`, oldest first, at most the last `limit` entries.
@@ -388,6 +623,19 @@ impl Vault {
     /// Chunk `index` of the attachment `id`, in the chat with `peer`, if kept.
     pub async fn chunk(&self, peer: &PublicKey, id: &[u8], index: u32) -> Result<Option<Vec<u8>>> {
         get(&self.database, &chunk_key(peer, id, index)).await
+    }
+
+    /// How many chunks of the attachment `id`, in the chat with `peer`, are kept.
+    pub async fn chunks_kept(&self, peer: &PublicKey, id: &[u8]) -> Result<u32> {
+        let range = prefix_range(&format!("attachment/{}/{}/", hex(peer), hex(id)))?;
+        let transaction = self
+            .database
+            .transaction(&[STORE], TransactionMode::ReadOnly)?;
+        let count = transaction
+            .object_store(STORE)?
+            .count(Some(range.into()))?
+            .await?;
+        Ok(count)
     }
 
     /// Keep `upload`, in the chat with `peer`, replacing what was kept of it.
@@ -460,19 +708,24 @@ impl Vault {
             .collect()
     }
 
-    /// Save `state`, without the history, attachments and uploads of the chat with `peer`.
-    pub async fn forget(&self, state: &AppState, peer: &PublicKey) -> Result<()> {
-        let range = history_range(peer, 0, u64::MAX)?;
-        let attachments = prefix_range(&format!("attachment/{}/", hex(peer)))?;
-        let uploads = prefix_range(&format!("upload/{}/", hex(peer)))?;
+    /// Save `state`, without the history, files, outbox, attachments and uploads of the chat
+    /// with `peer`, and `entries` of other chats with it.
+    pub async fn forget<'a>(
+        &self,
+        state: &AppState,
+        peer: &PublicKey,
+        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
+    ) -> Result<()> {
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
         let store = transaction.object_store(STORE)?;
-        store.delete(range)?;
-        store.delete(attachments)?;
-        store.delete(uploads)?;
+        store.delete(history_range(peer, 0, u64::MAX)?)?;
+        for prefix in ["file", "outbox", "attachment", "upload"] {
+            store.delete(prefix_range(&format!("{prefix}/{}/", hex(peer)))?)?;
+        }
         store.put(&bytes(&self.seal(STATE, state)), Some(&STATE.into()))?;
+        self.put_entries(&store, entries)?;
         commit(transaction).await
     }
 

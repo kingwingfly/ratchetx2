@@ -7,6 +7,7 @@ use session::PublicKey;
 
 use crate::{
     content::AttachmentPointer,
+    preview::Sort,
     util::{now, short},
 };
 
@@ -66,30 +67,91 @@ impl ContactView {
 pub struct MessageView {
     /// Its entry in the history.
     pub index: u64,
+    /// Its place in the chat, its Lamport clock, which both sides show it by; 0 if it has none
+    /// yet, as it waits to be pushed.
+    pub place: u64,
     pub outgoing: bool,
     pub at: u64,
     pub body: Body,
     pub delivery: Delivery,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Put `messages`, of the chat between `me` and `peer`, in its order, the same on both sides: by
+/// place, then by sender, the one with the lower identity key first. One with no place yet, as
+/// it waits to be pushed, goes last, in the order it was sent.
+pub fn order(messages: &mut [MessageView], me: &PublicKey, peer: &PublicKey) {
+    let mine_first = me < peer;
+    messages.sort_by_key(|message| {
+        (
+            message.place == 0,
+            message.place,
+            message.outgoing != mine_first,
+            message.index,
+        )
+    });
+}
+
+/// How far a message got: one received, or one this client sent, which goes from pending on,
+/// one [`Step`] at a time. Kept in the history as a number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, prost::Enumeration)]
+#[repr(i32)]
 pub enum Delivery {
-    Received,
-    /// Encrypted, and waiting to be pushed.
-    Pending,
-    Sent,
+    Received = 0,
+    /// Waiting to be pushed: it has no place in the chat yet.
+    Pending = 1,
+    /// The server has it: one tick.
+    Sent = 2,
+    /// The peer read it: two ticks.
+    Read = 3,
+    /// The peer downloaded its attachment whole, having read it.
+    Downloaded = 4,
     /// It could not be pushed, e.g. it is too large.
-    Failed,
+    Failed = 5,
+}
+
+/// What happens to a message this client sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The server took it.
+    Pushed,
+    /// The server refused it for good, or there is no session to send it on.
+    Refused,
+    /// The peer says it read it, ...
+    Read,
+    /// ... or downloaded its attachment.
+    Downloaded,
+    /// The peer deleted the chat without reading it: it goes again, on a new session.
+    Resent,
+}
+
+impl Delivery {
+    /// The delivery after `step`. What the peer tells only moves a message on, so a step told
+    /// twice, or late, changes nothing; only the peer deleting the chat unread moves it back,
+    /// to go again.
+    pub fn after(self, step: Step) -> Self {
+        match (self, step) {
+            (Self::Pending, Step::Pushed) => Self::Sent,
+            (Self::Pending, Step::Refused) => Self::Failed,
+            // Pushed already, though its reply was lost.
+            (Self::Pending | Self::Sent, Step::Read) => Self::Read,
+            (Self::Pending | Self::Sent | Self::Read, Step::Downloaded) => Self::Downloaded,
+            (Self::Sent, Step::Resent) => Self::Pending,
+            (delivery, _) => delivery,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     Text(String),
-    File(Attachment),
+    /// A file sent in its message, whose bytes are kept apart, read when shown.
+    File(LocalFile),
     /// A file sent as an attachment, which opening fetches unless it is kept here already.
     Remote(RemoteFile),
     /// A greeting, which starts a session; the name the sender goes by.
     Hello(String),
+    /// The peer deleted the chat.
+    Deleted,
     /// A kind of message this client cannot show.
     Unknown,
 }
@@ -100,9 +162,9 @@ pub struct UploadView {
     pub peer: PublicKey,
     pub id: [u8; 16],
     pub name: String,
-    /// Chunks the server has, of `chunks`.
-    pub uploaded: u32,
-    pub chunks: u32,
+    /// Bytes of the file the server has, or that are on their way, of `size`.
+    pub done: u64,
+    pub size: u64,
     pub state: UploadState,
 }
 
@@ -120,6 +182,9 @@ pub enum UploadState {
 pub struct RemoteFile {
     pub peer: PublicKey,
     pub pointer: AttachmentPointer,
+    /// The clock of the message the peer sent it in, to tell the peer once it is downloaded;
+    /// 0 for this client's own.
+    pub clock: u64,
 }
 
 /// An attachment being opened: fetched, unless kept here, and decrypted, a chunk at a time.
@@ -132,6 +197,23 @@ pub struct Opening {
     pub done: u64,
     /// Whether it waits for its sender to upload the rest.
     pub waiting: bool,
+}
+
+/// A file of a chat's history, which [`Engine::file`](crate::engine::Engine::file) reads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalFile {
+    pub peer: PublicKey,
+    /// Its entry in the history.
+    pub index: u64,
+    pub name: String,
+    /// The MIME type the sender gave; only a hint.
+    pub mime: String,
+    pub size: u64,
+    /// The MIME type its first bytes show, if it is an image, a video or audio, which shows in
+    /// place.
+    pub media: Option<String>,
+    /// Its bytes, if they are here already, as it was just sent or received.
+    pub data: Option<Attachment>,
 }
 
 /// A file sent or received.
@@ -173,6 +255,23 @@ pub enum Dialog {
     Identity,
     /// A contact's name, key and safety number; for a request, accept or delete it.
     Contact(PublicKey),
+    /// The files of the chat with a peer.
+    Files(PublicKey),
+}
+
+/// A file of a chat, as its file browser lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileView {
+    /// Its message's entry in the history.
+    pub index: u64,
+    /// When it was sent or received.
+    pub at: u64,
+    pub outgoing: bool,
+    pub name: String,
+    pub size: u64,
+    pub sort: Sort,
+    /// What opens it: a [`Body::File`] or a [`Body::Remote`].
+    pub body: Body,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -200,8 +299,19 @@ pub struct Ui {
     pub dialog: RwSignal<Option<Dialog>>,
     /// The file in the viewer, ...
     pub viewer: RwSignal<Option<Attachment>>,
-    /// ... or the attachment it waits for, until it is opened.
+    /// ... or the attachment it waits for, until it is opened, ...
     pub opening: RwSignal<Option<Opening>>,
+    /// ... or the video or audio attachment playing in it as it is fetched.
+    pub streaming: RwSignal<Option<Streamed>>,
+}
+
+/// A video or audio attachment playing as it is fetched, from the URL of its stream, see
+/// [`Engine::stream`](crate::engine::Engine::stream).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Streamed {
+    pub url: String,
+    pub remote: RemoteFile,
+    pub video: bool,
 }
 
 impl Ui {
@@ -222,6 +332,7 @@ impl Ui {
             dialog: RwSignal::new(None),
             viewer: RwSignal::new(None),
             opening: RwSignal::new(None),
+            streaming: RwSignal::new(None),
         }
     }
 
@@ -256,5 +367,76 @@ impl Ui {
     pub fn contact(&self, peer: &PublicKey) -> Option<ContactView> {
         self.contacts
             .with(|contacts| contacts.iter().find(|c| c.peer == *peer).cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deliveries_only_move_on() {
+        use Delivery::*;
+        let steps = |steps: &[Step]| {
+            steps
+                .iter()
+                .fold(Pending, |delivery, step| delivery.after(*step))
+        };
+        assert_eq!(steps(&[Step::Pushed]), Sent);
+        assert_eq!(steps(&[Step::Pushed, Step::Read]), Read);
+        assert_eq!(
+            steps(&[Step::Pushed, Step::Read, Step::Downloaded]),
+            Downloaded
+        );
+        // Told late, or twice.
+        assert_eq!(
+            steps(&[Step::Pushed, Step::Downloaded, Step::Read]),
+            Downloaded
+        );
+        assert_eq!(steps(&[Step::Pushed, Step::Read, Step::Pushed]), Read);
+        // Read, though its push seemed to fail.
+        assert_eq!(steps(&[Step::Read, Step::Pushed]), Read);
+        assert_eq!(steps(&[Step::Refused]), Failed);
+        // Unread when the peer deleted the chat, it goes again; read, it stays.
+        assert_eq!(steps(&[Step::Pushed, Step::Resent]), Pending);
+        assert_eq!(steps(&[Step::Pushed, Step::Read, Step::Resent]), Read);
+        assert_eq!(Received.after(Step::Read), Received);
+    }
+
+    #[test]
+    fn both_sides_show_one_order() {
+        let (alice, bob) = ([1; 32], [2; 32]);
+        let view = |index, place, outgoing, delivery| MessageView {
+            index,
+            place,
+            outgoing,
+            at: 0,
+            body: Body::Unknown,
+            delivery,
+        };
+        // Alice's: hers at 1 and 2, written at once with Bob's at 2, and one waiting.
+        let mut alice_sees = vec![
+            view(0, 1, true, Delivery::Sent),
+            view(1, 0, true, Delivery::Pending),
+            view(2, 2, true, Delivery::Read),
+            view(3, 2, false, Delivery::Received),
+            view(4, 3, false, Delivery::Received),
+        ];
+        order(&mut alice_sees, &alice, &bob);
+        let places: Vec<_> = alice_sees.iter().map(|m| (m.place, m.outgoing)).collect();
+        assert_eq!(
+            places,
+            [(1, true), (2, true), (2, false), (3, false), (0, true)]
+        );
+        // Bob's, which came in another order: at 2, Alice's goes first, as her key is lower.
+        let mut bob_sees = vec![
+            view(0, 2, true, Delivery::Sent),
+            view(1, 1, false, Delivery::Received),
+            view(2, 3, true, Delivery::Sent),
+            view(3, 2, false, Delivery::Received),
+        ];
+        order(&mut bob_sees, &bob, &alice);
+        let places: Vec<_> = bob_sees.iter().map(|m| (m.place, m.outgoing)).collect();
+        assert_eq!(places, [(1, false), (2, false), (2, true), (3, true)]);
     }
 }

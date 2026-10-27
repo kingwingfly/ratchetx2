@@ -17,16 +17,18 @@ use web_sys::{
 
 use crate::{
     content,
-    engine::{Engine, MAX_FILE_SIZE, NAME_MAX, Sending, invitation, origin, same_server},
+    engine::{
+        Engine, MAX_FILE_SIZE, MEDIA_INLINE_MAX, NAME_MAX, Sending, invitation, origin, same_server,
+    },
     glue::copy,
     icon::{Icon, icon},
-    preview::{self, DiffLine, Kind},
+    preview::{self, DiffLine, Kind, Sort},
     search::Search,
     state::{
-        Attachment, Body, ContactView, Delivery, Dialog, Link, Me, MessageView, Phase, RemoteFile,
-        Ui, UploadState, UploadView,
+        Attachment, Body, ContactView, Delivery, Dialog, FileView, Link, LocalFile, Me,
+        MessageView, Phase, RemoteFile, Streamed, Ui, UploadState, UploadView,
     },
-    util::{clock, js_error, key_to_text, key_to_url, short, size, sleep},
+    util::{clock, day, js_error, key_to_text, key_to_url, month, short, size, sleep},
     workers,
 };
 
@@ -370,6 +372,14 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
                 </div>
                 <button
                     class="btn icon"
+                    title="Files of this chat"
+                    aria-label="Files of this chat"
+                    on:click=move |_| ui.dialog.set(Some(Dialog::Files(peer)))
+                >
+                    {icon(Icon::Folder)}
+                </button>
+                <button
+                    class="btn icon"
                     title="About this chat"
                     aria-label="About this chat"
                     on:click=move |_| ui.dialog.set(Some(Dialog::Contact(peer)))
@@ -408,19 +418,44 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
     }
 }
 
+/// Pixels from the bottom of a chat within which it still follows the latest message.
+const FOLLOW_SLACK: i32 = 40;
+
 #[component]
 fn Messages(label: Signal<String>) -> impl IntoView {
     let ui = ui();
     let list = NodeRef::<html::Div>::new();
-    // Follow the latest message.
+    // Follow the latest message while at the bottom, so that what changes, as a sync goes,
+    // does not move the history away from the user reading it; and on sending one.
+    let follow = StoredValue::new(true);
+    let newest = StoredValue::new(None::<u64>);
     Effect::new(move || {
-        ui.messages.track();
+        let sent = ui.messages.with(|messages| {
+            let last = messages.iter().max_by_key(|message| message.index)?;
+            let new = newest.get_value().is_some_and(|newest| last.index > newest);
+            newest.set_value(Some(last.index));
+            Some(new && last.outgoing)
+        });
+        if sent == Some(true) {
+            follow.set_value(true);
+        }
         if let Some(list) = list.get() {
-            request_animation_frame(move || list.set_scroll_top(list.scroll_height()));
+            // Unless the chat went meanwhile.
+            request_animation_frame(move || {
+                if follow.try_get_value() == Some(true) {
+                    list.set_scroll_top(list.scroll_height());
+                }
+            });
         }
     });
+    let scrolled = move |_| {
+        if let Some(list) = list.try_get_untracked().flatten() {
+            let below = list.scroll_height() - list.scroll_top() - list.client_height();
+            follow.try_set_value(below < FOLLOW_SLACK);
+        }
+    };
     view! {
-        <div class="messages" node_ref=list aria-live="polite">
+        <div class="messages" node_ref=list aria-live="polite" on:scroll=scrolled>
             <For
                 each=move || ui.messages.get()
                 key=|message| (message.index, message.delivery)
@@ -433,66 +468,17 @@ fn Messages(label: Signal<String>) -> impl IntoView {
 /// A message, as a bubble, an image, a file or a note.
 /// The notes name the peer by `label`, which changes once a request is accepted.
 fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
-    let ui = ui();
     let time = clock(message.at);
     let content = match message.body {
         Body::Text(text) => view! { <div class="bubble">{text}</div> }.into_any(),
-        Body::File(attachment) => {
-            match preview::image_mime(&attachment.name, &attachment.data)
-                .and_then(|mime| image_url(&attachment.data, mime))
-            {
-                Some(url) => {
-                    let (name, title) = (attachment.name.clone(), attachment.name.clone());
-                    let thumbnail = url.clone();
-                    on_cleanup(move || {
-                        let _ = Url::revoke_object_url(&thumbnail);
-                    });
-                    view! {
-                        <button
-                            class="thumb"
-                            title=title
-                            on:click=move |_| ui.viewer.set(Some(attachment.clone()))
-                        >
-                            <img src=url alt=name />
-                        </button>
-                    }
-                    .into_any()
-                }
-                None => {
-                    let extension = extension(&attachment.name);
-                    let name = attachment.name.clone();
-                    let length = size(attachment.data.len());
-                    view! {
-                        <button
-                            class="file-card"
-                            on:click=move |_| ui.viewer.set(Some(attachment.clone()))
-                        >
-                            <span class="file-icon">{extension}</span>
-                            <span>
-                                <strong>{name}</strong>
-                                <span>{length}</span>
-                            </span>
-                        </button>
-                    }
-                    .into_any()
-                }
-            }
-        }
-        Body::Remote(remote) => {
-            let extension = extension(&remote.pointer.name);
-            let name = remote.pointer.name.clone();
-            let length = size(remote.pointer.size as usize);
-            view! {
-                <button class="file-card" on:click=move |_| open_attachment(remote.clone())>
-                    <span class="file-icon">{extension}</span>
-                    <span>
-                        <strong>{name}</strong>
-                        <span>{length}</span>
-                    </span>
-                </button>
-            }
-            .into_any()
-        }
+        // Small media shows in place, other files as cards.
+        Body::File(_) | Body::Remote(_) => match inline_media(&message.body) {
+            Some((source, sort)) => view! { <InlineMedia source sort /> }.into_any(),
+            None => match Source::of(&message.body) {
+                Some(source) => file_card(source),
+                None => ().into_any(),
+            },
+        },
         Body::Hello(name) => {
             let note = move || match (message.outgoing, name.is_empty()) {
                 (true, _) => format!("You started this chat · {time}"),
@@ -501,6 +487,10 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
                     format!("{} started this chat, as “{name}” · {time}", label.get())
                 }
             };
+            return view! { <div class="note">{note}</div> }.into_any();
+        }
+        Body::Deleted => {
+            let note = move || format!("{} deleted this chat · {time}", label.get());
             return view! { <div class="note">{note}</div> }.into_any();
         }
         Body::Unknown => {
@@ -513,16 +503,38 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
             return view! { <div class="note">{note}</div> }.into_any();
         }
     };
-    let meta = match message.delivery {
-        Delivery::Pending => format!("{time} · sending"),
-        Delivery::Failed => format!("{time} · not sent"),
-        Delivery::Sent | Delivery::Received => time.clone(),
+    // How far it got, right of its time, as Telegram shows it: a clock while it waits, one tick
+    // once the server has it, two once the peer read it, and three once it downloaded its
+    // attachment; what that says, for its tooltip and screen readers; and whether the peer read
+    // it.
+    let status = match message.delivery {
+        Delivery::Received => None,
+        Delivery::Pending => Some((Icon::Pending, "waiting to be sent", false)),
+        Delivery::Failed => Some((Icon::Failed, "could not be sent", false)),
+        Delivery::Sent => Some((Icon::Sent, "sent", false)),
+        Delivery::Read => Some((Icon::Read, "read", true)),
+        Delivery::Downloaded => Some((Icon::Downloaded, "read and downloaded", true)),
     };
     view! {
         <div class="message" class:me=message.outgoing>
             {content}
             <span class="meta" class:failed=message.delivery == Delivery::Failed>
-                {meta}
+                {time}
+                {status
+                    .map(|(shown, title, read)| {
+                        view! {
+                            <span
+                                class="status"
+                                class:read=read
+                                class:downloaded=shown == Icon::Downloaded
+                                title=title
+                                role="img"
+                                aria-label=title
+                            >
+                                {icon(shown)}
+                            </span>
+                        }
+                    })}
             </span>
         </div>
     }
@@ -550,7 +562,7 @@ fn Uploads(peer: PublicKey) -> impl IntoView {
 }
 
 fn upload_row(upload: UploadView) -> impl IntoView {
-    let percent = upload.uploaded * 100 / upload.chunks.max(1);
+    let percent = upload.done * 100 / upload.size.max(1);
     let (status, paused) = match &upload.state {
         UploadState::Running => (format!("uploading · {percent}%"), false),
         UploadState::Retrying => (format!("{percent}% · waiting for the server"), false),
@@ -629,10 +641,59 @@ fn extension(name: &str) -> String {
 fn open_attachment(remote: RemoteFile) {
     let (ui, engine) = (ui(), engine());
     spawn_local(async move {
-        if let Err(e) = engine.open_attachment(remote.peer, remote.pointer).await {
+        // A video or audio plays as it is fetched, if a service worker can stream it.
+        let sort = preview::sort(&remote.pointer.name, &remote.pointer.mime, &[]);
+        if matches!(sort, Sort::Video | Sort::Audio)
+            && let Some(url) = engine
+                .stream(remote.peer, &remote.pointer, remote.clock)
+                .await
+        {
+            ui.viewer.set(None);
+            ui.opening.set(None);
+            let video = sort == Sort::Video;
+            ui.streaming.set(Some(Streamed { url, remote, video }));
+            return;
+        }
+        if let Err(e) = engine
+            .open_attachment(remote.peer, remote.pointer, remote.clock)
+            .await
+        {
             ui.notify(e);
         }
     });
+}
+
+/// How long a stream let go of still answers what its players asked for before they stopped.
+const STREAM_GRACE: Duration = Duration::from_secs(10);
+
+/// Let go of `url`, a blob URL or a stream's, as what showed it went. A stream's players on the
+/// page stop asking for it first, and what they asked for already is still answered for
+/// [`STREAM_GRACE`], so that none fails.
+fn release(url: &str) {
+    if url.starts_with("/media/") {
+        stop_players(url);
+        let url = url.to_string();
+        set_timeout(move || engine().end_stream(&url), STREAM_GRACE);
+    } else {
+        let _ = Url::revoke_object_url(url);
+    }
+}
+
+/// Stop the players of the stream at `url` on the page, which cancels what they asked for.
+fn stop_players(url: &str) {
+    let selector = format!("video[src^=\"{url}\"], audio[src^=\"{url}\"]");
+    let Ok(players) = document().query_selector_all(&selector) else {
+        return;
+    };
+    for index in 0..players.length() {
+        if let Some(player) = players
+            .item(index)
+            .and_then(|player| player.dyn_into::<web_sys::HtmlMediaElement>().ok())
+        {
+            let _ = player.remove_attribute("src");
+            player.load();
+        }
+    }
 }
 
 #[component]
@@ -693,6 +754,456 @@ fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
             </button>
             <FilePicker />
         </div>
+    }
+}
+
+/// Show `file`, of a chat's history, in the viewer, its bytes read unless they are here.
+fn show_file(file: LocalFile) {
+    let ui = ui();
+    match file.data {
+        Some(attachment) => ui.viewer.set(Some(attachment)),
+        None => act(async move {
+            let data = engine().file(file.peer, file.index).await?;
+            ui.viewer.set(Some(Attachment {
+                name: file.name,
+                mime: file.mime,
+                data,
+            }));
+            Ok(())
+        }),
+    }
+}
+
+/// Where a file of a chat's history is: in the vault, or here already, or an attachment.
+#[derive(Debug, Clone, PartialEq)]
+enum Source {
+    Local(LocalFile),
+    Remote(RemoteFile),
+}
+
+impl Source {
+    /// The file `body` is, if any.
+    fn of(body: &Body) -> Option<Self> {
+        match body {
+            Body::File(file) => Some(Self::Local(file.clone())),
+            Body::Remote(remote) => Some(Self::Remote(remote.clone())),
+            _ => None,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Local(file) => &file.name,
+            Self::Remote(remote) => &remote.pointer.name,
+        }
+    }
+
+    fn size(&self) -> u64 {
+        match self {
+            Self::Local(file) => file.size,
+            Self::Remote(remote) => remote.pointer.size,
+        }
+    }
+
+    /// Show it in the viewer.
+    fn open(&self) {
+        match self {
+            Self::Local(file) => show_file(file.clone()),
+            Self::Remote(remote) => open_attachment(remote.clone()),
+        }
+    }
+
+    /// Its bytes: read from the vault, or, an attachment's, fetched as long as `shows` says it
+    /// shows; none if it stopped showing first.
+    async fn read(&self, shows: &dyn Fn() -> bool) -> Result<Option<Attachment>, String> {
+        match self {
+            Self::Local(file) => match &file.data {
+                Some(attachment) => Ok(Some(attachment.clone())),
+                None => Ok(Some(Attachment {
+                    name: file.name.clone(),
+                    mime: file.mime.clone(),
+                    data: engine().file(file.peer, file.index).await?,
+                })),
+            },
+            Self::Remote(remote) => {
+                engine()
+                    .media(remote.peer, remote.pointer.clone(), remote.clock, shows)
+                    .await
+            }
+        }
+    }
+}
+
+/// The file `body` is, and its sort, if it is media small enough to show in place: one that came
+/// in its message, as its bytes show, or an attachment up to [`MEDIA_INLINE_MAX`] bytes, as the
+/// type its sender gave and its name say, until its bytes are fetched.
+fn inline_media(body: &Body) -> Option<(Source, Sort)> {
+    let sort = match body {
+        Body::File(file) => match file.media.as_deref()?.split_once('/')? {
+            ("image", _) => Sort::Image,
+            ("video", _) => Sort::Video,
+            _ => Sort::Audio,
+        },
+        Body::Remote(remote) if remote.pointer.size <= MEDIA_INLINE_MAX => {
+            let pointer = &remote.pointer;
+            match preview::sort(&pointer.name, &pointer.mime, &[]) {
+                sort @ (Sort::Image | Sort::Video | Sort::Audio) => sort,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some((Source::of(body)?, sort))
+}
+
+/// A file of a chat's history, as a card of its extension, name and size, which opens it in the
+/// viewer.
+fn file_card(source: Source) -> AnyView {
+    let extension = extension(source.name());
+    let name = source.name().to_string();
+    let length = size(source.size() as usize);
+    view! {
+        <button class="file-card" on:click=move |_| source.open()>
+            <span class="file-icon">{extension}</span>
+            <span>
+                <strong>{name}</strong>
+                <span>{length}</span>
+            </span>
+        </button>
+    }
+    .into_any()
+}
+
+/// Small media of a chat's history, `source`, shown in place as `sort` says it is: an image, or
+/// a video or audio with its controls, which never plays by itself. Its bytes are read, or an
+/// attachment's fetched, once it is about to show, so that a long history does not read them
+/// all; an attachment's video or audio plays as it is fetched, if a service worker can stream
+/// it. One that cannot be read, or whose bytes are no media after all, shows as a file.
+#[component]
+fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
+    let ui = ui();
+    let node = NodeRef::<html::Div>::new();
+    // Its URL and MIME type, once read, and what the viewer shows of it.
+    let shown = RwSignal::new(None::<(String, &'static str)>);
+    let read = StoredValue::new(None::<Attachment>);
+    let failed = RwSignal::new(false);
+    // Gone with the media, e.g. as the chat closed or the message's delivery changed: a read
+    // that ends after shows nothing, and a URL made then is let go at once.
+    let here = StoredValue::new(());
+    let play = move |url: String, mime: &'static str| {
+        if let Some(Some((url, _))) = shown.try_set(Some((url, mime))) {
+            release(&url);
+        }
+    };
+    let show = move |attachment: Attachment| {
+        let data = &attachment.data;
+        let Some(mime) = preview::media_mime(&attachment.name, &attachment.mime, data) else {
+            failed.try_set(true);
+            return;
+        };
+        let url = if mime.starts_with("image/") {
+            image_url(data, mime)
+        } else {
+            blob_url(data, mime)
+        };
+        let Some(url) = url else {
+            failed.try_set(true);
+            return;
+        };
+        play(url, mime);
+        read.try_set_value(Some(attachment));
+    };
+    let load = {
+        let source = source.clone();
+        move || {
+            let source = source.clone();
+            spawn_local(async move {
+                if let Source::Remote(remote) = &source
+                    && sort != Sort::Image
+                    && let Some(url) = engine()
+                        .stream(remote.peer, &remote.pointer, remote.clock)
+                        .await
+                {
+                    play(
+                        url,
+                        if sort == Sort::Video {
+                            "video/"
+                        } else {
+                            "audio/"
+                        },
+                    );
+                    return;
+                }
+                let shows = move || here.try_get_value().is_some();
+                match source.read(&shows).await {
+                    Ok(Some(attachment)) => show(attachment),
+                    Ok(None) => {}
+                    Err(_) => {
+                        failed.try_set(true);
+                    }
+                }
+            });
+        }
+    };
+    match &source {
+        Source::Local(LocalFile { data: Some(_), .. }) => load(),
+        _ => when_shown(node, load),
+    }
+    on_cleanup(move || {
+        if let Some(Some((url, _))) = shown.try_get_untracked() {
+            release(&url);
+        }
+    });
+    let name = source.name().to_string();
+    let caption = format!("{} · {}", source.name(), size(source.size() as usize));
+    // What it read shows at once; a stream's opens as any attachment does.
+    let opened = StoredValue::new(source.clone());
+    let open = move |_| match read.get_value() {
+        Some(attachment) => ui.viewer.set(Some(attachment)),
+        None => opened.with_value(Source::open),
+    };
+    // One that turns out not to play, e.g. as it is no video after all, shows as a file.
+    let unplayable = move |_| failed.set(true);
+    view! {
+        <div class="inline-media" node_ref=node>
+            {move || {
+                if failed.get() {
+                    return file_card(source.clone());
+                }
+                match (shown.get(), sort) {
+                    (Some((url, mime)), _) if mime.starts_with("image/") => {
+                        view! {
+                            <button class="thumb" title=name.clone() on:click=open>
+                                <img src=url alt=name.clone() />
+                            </button>
+                        }
+                            .into_any()
+                    }
+                    (Some((url, mime)), _) if mime.starts_with("video/") => {
+                        view! {
+                            <div class="clip">
+                                <video
+                                    src=url
+                                    controls
+                                    preload="metadata"
+                                    playsinline
+                                    on:error=unplayable
+                                ></video>
+                                <button class="clip-name" on:click=open>
+                                    {caption.clone()}
+                                </button>
+                            </div>
+                        }
+                            .into_any()
+                    }
+                    (Some((url, _)), _) => {
+                        view! {
+                            <div class="clip audio">
+                                <audio
+                                    src=url
+                                    controls
+                                    preload="metadata"
+                                    on:error=unplayable
+                                ></audio>
+                                <button class="clip-name" on:click=open>
+                                    {caption.clone()}
+                                </button>
+                            </div>
+                        }
+                            .into_any()
+                    }
+                    // Holding its place, so that it shows as it scrolls in.
+                    (None, Sort::Image) => {
+                        view! { <button class="thumb" title=name.clone()></button> }.into_any()
+                    }
+                    (None, Sort::Video) => {
+                        view! { <div class="clip waiting">{caption.clone()}</div> }.into_any()
+                    }
+                    (None, _) => {
+                        view! { <div class="clip audio waiting">{caption.clone()}</div> }
+                            .into_any()
+                    }
+                }
+            }}
+        </div>
+    }
+}
+
+/// Run `action` once `node` is about to show, as it scrolls into view, so that a long chat or
+/// list does not run it for all; not at all if `node` goes first.
+fn when_shown(node: NodeRef<html::Div>, action: impl Fn() + Clone + 'static) {
+    // What watches it, and what that calls, until it goes.
+    let watching = StoredValue::new_local(
+        None::<(
+            IntersectionObserver,
+            Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
+        )>,
+    );
+    Effect::new(move || {
+        let Some(element) = node.get() else {
+            return;
+        };
+        let action = action.clone();
+        let seen = Closure::<dyn FnMut(js_sys::Array, IntersectionObserver)>::new(
+            move |entries: js_sys::Array, observer: IntersectionObserver| {
+                let seen = entries.iter().any(|entry| {
+                    entry
+                        .unchecked_into::<IntersectionObserverEntry>()
+                        .is_intersecting()
+                });
+                if seen {
+                    observer.disconnect();
+                    action();
+                }
+            },
+        );
+        let Ok(observer) = IntersectionObserver::new(seen.as_ref().unchecked_ref()) else {
+            return;
+        };
+        observer.observe(&element);
+        watching.set_value(Some((observer, seen)));
+    });
+    on_cleanup(move || {
+        if let Some(Some((observer, _))) = watching.try_update_value(Option::take) {
+            observer.disconnect();
+        }
+    });
+}
+
+/// What a preview of media shows, once read: an image or a video, by a blob URL of this origin,
+/// or a video's stream, or an image's `data:` URL, as an SVG's or an audio file's cover.
+#[derive(Debug, Clone, PartialEq)]
+enum Preview {
+    Image(String),
+    Video(String),
+}
+
+/// A preview of media of a chat's history, of the sort `sort`, for the file browser: an image as
+/// itself, a video as its first frames, under its length, and audio as its cover, if its tags
+/// have one. `source` is read, or fetched, once it is about to show, as small media in the
+/// chat; with none, as it is too large to fetch for this, or if it cannot be read, a glyph of
+/// its sort shows.
+#[component]
+fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
+    let node = NodeRef::<html::Div>::new();
+    let preview = RwSignal::new(None::<Preview>);
+    let length = RwSignal::new(None::<String>);
+    // Gone with the preview: a read that ends after shows nothing, and a URL made then is let
+    // go at once.
+    let here = StoredValue::new(());
+    let show = move |made: Preview| {
+        if let Some(Some(Preview::Image(url) | Preview::Video(url))) = preview.try_set(Some(made)) {
+            release(&url);
+        }
+    };
+    if let Some(source) = source {
+        when_shown(node, move || {
+            let source = source.clone();
+            spawn_local(async move {
+                // An attachment's video or audio streams, if it can, as far as its preview
+                // needs: its first frames, or its tags.
+                if let Source::Remote(remote) = &source
+                    && sort != Sort::Image
+                    && let Some(url) = engine()
+                        .stream(remote.peer, &remote.pointer, remote.clock)
+                        .await
+                {
+                    if sort == Sort::Video {
+                        show(Preview::Video(url));
+                        return;
+                    }
+                    let head = engine().stream_head(&url).await;
+                    engine().end_stream(&url);
+                    if let Some(head) = head
+                        && let Some(made) = cover(&head).await
+                    {
+                        show(made);
+                    }
+                    return;
+                }
+                let shows = move || here.try_get_value().is_some();
+                let Ok(Some(attachment)) = source.read(&shows).await else {
+                    return;
+                };
+                let data = &attachment.data;
+                let made = match preview::media_mime(&attachment.name, &attachment.mime, data) {
+                    Some(mime) if mime.starts_with("image/") => {
+                        image_url(data, mime).map(Preview::Image)
+                    }
+                    Some(mime) if mime.starts_with("video/") => {
+                        blob_url(data, mime).map(Preview::Video)
+                    }
+                    Some(_) => cover(data).await,
+                    None => None,
+                };
+                if let Some(made) = made {
+                    show(made);
+                }
+            });
+        });
+    }
+    on_cleanup(move || {
+        if let Some(Some(Preview::Image(url) | Preview::Video(url))) = preview.try_get_untracked() {
+            release(&url);
+        }
+    });
+    // Its length, once the video knows it.
+    let measured = move |event: ev::Event| {
+        let seconds = event_target::<web_sys::HtmlMediaElement>(&event).duration();
+        if seconds.is_finite() {
+            length.set(Some(duration(seconds)));
+        }
+    };
+    let glyph = match sort {
+        Sort::Video => Icon::Resume,
+        Sort::Audio => Icon::Music,
+        _ => Icon::Document,
+    };
+    view! {
+        <div class="preview" node_ref=node>
+            {move || match preview.get() {
+                Some(Preview::Image(url)) => view! { <img src=url alt="" /> }.into_any(),
+                // Still, at its first frames: a fragment that has it show them, and no controls.
+                Some(Preview::Video(url)) => {
+                    view! {
+                        <video
+                            src=format!("{url}#t=0.1")
+                            muted
+                            preload="metadata"
+                            playsinline
+                            on:loadedmetadata=measured
+                        ></video>
+                    }
+                        .into_any()
+                }
+                None => icon(glyph).into_any(),
+            }}
+            {(sort == Sort::Video)
+                .then(|| {
+                    view! { <span class="badge">{icon(Icon::Resume)} {move || length.get()}</span> }
+                })}
+        </div>
+    }
+}
+
+/// The cover of the audio `data`, as its tags have it, if they do: a `data:` URL, which needs no
+/// letting go, of an image, as the worker made sure.
+async fn cover(data: &[u8]) -> Option<Preview> {
+    let (mime, cover) = workers::audio_tags(data).await.ok()??.cover?;
+    Some(Preview::Image(format!(
+        "data:{mime};base64,{}",
+        BASE64_STANDARD.encode(cover)
+    )))
+}
+
+/// A length of time, as `m:ss`, or `h:mm:ss` from an hour.
+fn duration(seconds: f64) -> String {
+    let seconds = seconds.round() as u64;
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
     }
 }
 
@@ -864,6 +1375,7 @@ fn VaultDialog() -> impl IntoView {
     view! {
         <dialog
             class="modal"
+            class:wide=move || matches!(ui.dialog.get(), Some(Dialog::Files(_)))
             node_ref=dialog
             on:cancel=on_cancel
             on:close=move |_| ui.dialog.set(None)
@@ -879,6 +1391,9 @@ fn VaultDialog() -> impl IntoView {
                 (Phase::Unlocked, Some(Dialog::Identity)) => view! { <Identity /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Contact(peer))) => {
                     view! { <ContactInfo peer /> }.into_any()
+                }
+                (Phase::Unlocked, Some(Dialog::Files(peer))) => {
+                    view! { <FileBrowser peer /> }.into_any()
                 }
                 _ => ().into_any(),
             }}
@@ -1309,6 +1824,213 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     .into_any()
 }
 
+/// The shelves of a chat's file browser, each holding files of some sorts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shelf {
+    All,
+    Media,
+    Documents,
+    Code,
+    Archives,
+    Other,
+}
+
+impl Shelf {
+    const ALL: [Self; 6] = [
+        Self::All,
+        Self::Media,
+        Self::Documents,
+        Self::Code,
+        Self::Archives,
+        Self::Other,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Media => "Media",
+            Self::Documents => "Documents",
+            Self::Code => "Code",
+            Self::Archives => "Archives",
+            Self::Other => "Other",
+        }
+    }
+
+    fn holds(self, sort: Sort) -> bool {
+        match self {
+            Self::All => true,
+            Self::Media => matches!(sort, Sort::Image | Sort::Video | Sort::Audio),
+            Self::Documents => sort == Sort::Document,
+            Self::Code => sort == Sort::Code,
+            Self::Archives => sort == Sort::Archive,
+            Self::Other => matches!(sort, Sort::Other | Sort::Unknown),
+        }
+    }
+}
+
+/// The files of the chat with `peer`, on shelves by their sort, which their contents tell as
+/// well as their names, and by month, newest first. Media shows as a grid, images as thumbnails;
+/// the rest as a list. Each opens in the viewer.
+#[component]
+fn FileBrowser(peer: PublicKey) -> impl IntoView {
+    let ui = ui();
+    let label = ui
+        .contact(&peer)
+        .map(|contact| contact.label())
+        .unwrap_or_default();
+    let files = RwSignal::new(None::<Result<Vec<FileView>, String>>);
+    spawn_local(async move {
+        let listed = engine().files(peer).await;
+        files.try_set(Some(listed));
+    });
+    let shelf = RwSignal::new(Shelf::All);
+    let count = move |of: Shelf| {
+        files.with(|files| match files {
+            Some(Ok(files)) => files.iter().filter(|file| of.holds(file.sort)).count(),
+            _ => 0,
+        })
+    };
+    let shelves = move || {
+        Shelf::ALL
+            .into_iter()
+            .filter(|of| *of == Shelf::All || count(*of) > 0)
+            .map(|of| {
+                view! {
+                    <button
+                        type="button"
+                        class="btn small toggle"
+                        class:on=move || shelf.get() == of
+                        on:click=move |_| shelf.set(of)
+                    >
+                        {format!("{} {}", of.label(), count(of))}
+                    </button>
+                }
+            })
+            .collect_view()
+    };
+    let from = label.clone();
+    let months = move || {
+        let shelf = shelf.get();
+        let listed = files.get()?;
+        let files = match listed {
+            Ok(files) => files,
+            Err(e) => return Some(view! { <p class="error">{e}</p> }.into_any()),
+        };
+        // Newest first, so that a month's files come together.
+        let mut months: Vec<(String, Vec<FileView>)> = vec![];
+        for file in files.into_iter().filter(|file| shelf.holds(file.sort)) {
+            let month = month(file.at);
+            match months.last_mut() {
+                Some((last, files)) if *last == month => files.push(file),
+                _ => months.push((month, vec![file])),
+            }
+        }
+        if months.is_empty() {
+            return Some(view! { <p class="empty">"No files here yet."</p> }.into_any());
+        }
+        let from = from.clone();
+        Some(
+            months
+                .into_iter()
+                .map(|(month, files)| {
+                    let files = if shelf == Shelf::Media {
+                        let tiles = files.into_iter().map(file_tile).collect_view();
+                        view! { <div class="file-grid">{tiles}</div> }.into_any()
+                    } else {
+                        let from = from.clone();
+                        let rows = files
+                            .into_iter()
+                            .map(|file| file_row(file, &from))
+                            .collect_view();
+                        view! { <div class="file-list">{rows}</div> }.into_any()
+                    };
+                    view! {
+                        <section>
+                            <h3>{month}</h3>
+                            {files}
+                        </section>
+                    }
+                })
+                .collect_view()
+                .into_any(),
+        )
+    };
+    view! {
+        <div class="files">
+            <h2>"Files"</h2>
+            <p>
+                {format!(
+                    "What you and {label} sent each other, newest first, sorted by what they are."
+                )}
+            </p>
+            <div class="shelves">{shelves}</div>
+            <div class="file-months">
+                {move || months().unwrap_or_else(|| view! { <p class="empty">"Reading the chat…"</p> }.into_any())}
+            </div>
+            <div class="actions">
+                <button type="button" class="btn" on:click=move |_| close_dialog()>
+                    "Close"
+                </button>
+            </div>
+        </div>
+    }
+}
+
+/// `file` as a tile of the file browser's grid of media: its preview, which for audio, which may
+/// have no cover, goes with its name. It opens in the viewer.
+fn file_tile(file: FileView) -> AnyView {
+    let Some(source) = Source::of(&file.body) else {
+        return ().into_any();
+    };
+    let shown = inline_media(&file.body).map(|(source, _)| source);
+    let title = file.name.clone();
+    view! {
+        <button class="tile" title=title on:click=move |_| source.open()>
+            <MediaThumb source=shown sort=file.sort />
+            {(file.sort == Sort::Audio).then(|| view! { <span class="tile-name">{file.name}</span> })}
+        </button>
+    }
+    .into_any()
+}
+
+/// `file` as a row of the file browser's list: its extension, name, size and day, and who sent
+/// it, the peer being `from`.
+fn file_row(file: FileView, from: &str) -> AnyView {
+    let Some(source) = Source::of(&file.body) else {
+        return ().into_any();
+    };
+    let sender = if file.outgoing {
+        "sent by you".to_string()
+    } else {
+        format!("from {from}")
+    };
+    let details = format!("{} · {} · {sender}", size(file.size as usize), day(file.at));
+    // Media shows its preview, the rest its extension.
+    let mark = match file.sort {
+        sort @ (Sort::Image | Sort::Video | Sort::Audio) => {
+            let shown = inline_media(&file.body).map(|(source, _)| source);
+            view! {
+                <span class="row-preview">
+                    <MediaThumb source=shown sort />
+                </span>
+            }
+            .into_any()
+        }
+        _ => view! { <span class="file-icon">{extension(&file.name)}</span> }.into_any(),
+    };
+    let title = file.name.clone();
+    view! {
+        <button class="file-row" title=title on:click=move |_| source.open()>
+            {mark}
+            <span>
+                <strong>{file.name}</strong>
+                <span>{details}</span>
+            </span>
+        </button>
+    }
+    .into_any()
+}
+
 /// A blob URL of this origin for `data`, typed `mime`.
 fn blob_url(data: &[u8], mime: &str) -> Option<String> {
     let parts = js_sys::Array::of1(&Uint8Array::from(data));
@@ -1345,11 +2067,35 @@ fn Viewer() -> impl IntoView {
     let shown_content = NodeRef::<html::Div>::new();
     let searchable = RwSignal::new(false);
     let close = move || {
+        // Its player stops before it goes.
+        if let Some(streamed) = ui.streaming.get_untracked() {
+            stop_players(&streamed.url);
+        }
         ui.viewer.set(None);
         ui.opening.set(None);
+        ui.streaming.set(None);
     };
+    // A stream plays until the viewer shows something else, or closes.
     Effect::new(move || {
-        let open = ui.viewer.with(Option::is_some) || waiting.get();
+        let other = ui.viewer.with(Option::is_some) || ui.opening.with(Option::is_some);
+        if other && ui.streaming.with_untracked(Option::is_some) {
+            ui.streaming.set(None);
+        }
+    });
+    Effect::new(move |played: Option<Option<String>>| {
+        let playing = ui
+            .streaming
+            .with(|streamed| streamed.as_ref().map(|streamed| streamed.url.clone()));
+        if let Some(Some(played)) = played
+            && playing.as_ref() != Some(&played)
+        {
+            release(&played);
+        }
+        playing
+    });
+    Effect::new(move || {
+        let open =
+            ui.viewer.with(Option::is_some) || waiting.get() || ui.streaming.with(Option::is_some);
         if let Some(dialog) = dialog.get() {
             if open && !dialog.open() {
                 let _ = dialog.show_modal();
@@ -1365,6 +2111,9 @@ fn Viewer() -> impl IntoView {
         }
         let Some(attachment) = ui.viewer.get() else {
             searchable.set(false);
+            if let Some(streamed) = ui.streaming.get() {
+                return Some(streamed_view(streamed));
+            }
             return waiting.get().then(opening_view);
         };
         let kind = preview::kind(&attachment.name, &attachment.mime, &attachment.data);
@@ -1381,52 +2130,48 @@ fn Viewer() -> impl IntoView {
             shown_url.set_value(url.clone().filter(|url| url.starts_with("blob:")));
             url
         };
-        Some(
-            match kind {
-                Kind::Image(mime) => match shown(image_url(&attachment.data, mime)) {
-                    Some(url) => view! {
-                        <div class="media">
-                            <img src=url alt=attachment.name.clone() />
-                        </div>
-                    }
-                    .into_any(),
-                    None => no_preview(),
-                },
-                Kind::Video(mime) => match shown(blob_url(&attachment.data, mime)) {
-                    Some(url) => view! {
-                        <div class="media">
-                            <video src=url controls></video>
-                        </div>
-                    }
-                    .into_any(),
-                    None => no_preview(),
-                },
-                Kind::Audio(mime) => match shown(blob_url(&attachment.data, mime)) {
-                    Some(url) => {
-                        view! { <AudioView url name=attachment.name.clone() data=attachment.data.clone() /> }
-                            .into_any()
-                    }
-                    None => no_preview(),
-                },
-                Kind::Pdf => view! { <PdfView data=attachment.data.clone() /> }.into_any(),
-                Kind::Markdown { html, source } => {
-                    view! { <MarkdownView html source /> }.into_any()
-                }
-                Kind::Code { text, language } => view! {
-                    <Enhanced>
-                        <pre class="code">
-                            <code data-lang=language>{text}</code>
-                        </pre>
-                    </Enhanced>
+        Some(match kind {
+            Kind::Image(mime) => match shown(image_url(&attachment.data, mime)) {
+                Some(url) => view! {
+                    <div class="media">
+                        <img src=url alt=attachment.name.clone() />
+                    </div>
                 }
                 .into_any(),
-                Kind::Table(table) => table_view(table),
-                Kind::Archive(listing) => archive_view(listing),
-                Kind::Cards(cards) => cards_view(cards),
-                Kind::Diff(lines) => diff_view(lines),
-                Kind::None => no_preview(),
+                None => no_preview(),
             },
-        )
+            Kind::Video(mime) => match shown(blob_url(&attachment.data, mime)) {
+                Some(url) => view! {
+                    <div class="media">
+                        <video src=url controls></video>
+                    </div>
+                }
+                .into_any(),
+                None => no_preview(),
+            },
+            Kind::Audio(mime) => match shown(blob_url(&attachment.data, mime)) {
+                Some(url) => view! {
+                    <AudioView url name=attachment.name.clone() data=attachment.data.clone() />
+                }
+                .into_any(),
+                None => no_preview(),
+            },
+            Kind::Pdf => view! { <PdfView data=attachment.data.clone() /> }.into_any(),
+            Kind::Markdown { html, source } => view! { <MarkdownView html source /> }.into_any(),
+            Kind::Code { text, language } => view! {
+                <Enhanced>
+                    <pre class="code">
+                        <code data-lang=language>{text}</code>
+                    </pre>
+                </Enhanced>
+            }
+            .into_any(),
+            Kind::Table(table) => table_view(table),
+            Kind::Archive(listing) => archive_view(listing),
+            Kind::Cards(cards) => cards_view(cards),
+            Kind::Diff(lines) => diff_view(lines),
+            Kind::None => no_preview(),
+        })
     };
     let title = move || {
         ui.viewer
@@ -1434,6 +2179,14 @@ fn Viewer() -> impl IntoView {
                 attachment
                     .as_ref()
                     .map(|a| format!("{} · {}", a.name, size(a.data.len())))
+            })
+            .or_else(|| {
+                ui.streaming.with(|streamed| {
+                    streamed.as_ref().map(|streamed| {
+                        let pointer = &streamed.remote.pointer;
+                        format!("{} · {}", pointer.name, size(pointer.size as usize))
+                    })
+                })
             })
             .or_else(|| {
                 ui.opening.with(|opening| {
@@ -1452,7 +2205,9 @@ fn Viewer() -> impl IntoView {
                     <Show when=move || searchable.get()>
                         <Search content=shown_content />
                     </Show>
-                    <Show when=move || ui.viewer.with(Option::is_some)>
+                    <Show when=move || {
+                        ui.viewer.with(Option::is_some) || ui.streaming.with(Option::is_some)
+                    }>
                         <button
                             class="btn icon small"
                             title="Download"
@@ -1460,6 +2215,8 @@ fn Viewer() -> impl IntoView {
                             on:click=move |_| {
                                 if let Some(attachment) = ui.viewer.get_untracked() {
                                     download(&attachment);
+                                } else if let Some(streamed) = ui.streaming.get_untracked() {
+                                    download_whole(streamed.remote);
                                 }
                             }
                         >
@@ -1482,13 +2239,80 @@ fn Viewer() -> impl IntoView {
     }
 }
 
+/// A video or audio attachment playing as it is fetched, see [`Streamed`]. One that turns out
+/// not to play, e.g. as its name said video but no browser plays it, is fetched whole, to show
+/// as its bytes say, as one that does not stream.
+fn streamed_view(streamed: Streamed) -> AnyView {
+    let unplayable = {
+        let (url, remote) = (streamed.url.clone(), streamed.remote.clone());
+        move |_: ev::ErrorEvent| {
+            // Unless the viewer went on meanwhile.
+            let shown = ui()
+                .streaming
+                .with_untracked(|shown| shown.as_ref().is_some_and(|shown| shown.url == url));
+            if shown {
+                let remote = remote.clone();
+                act(async move {
+                    engine()
+                        .open_attachment(remote.peer, remote.pointer, remote.clock)
+                        .await
+                });
+            }
+        }
+    };
+    if streamed.video {
+        view! {
+            <div class="media">
+                <video src=streamed.url controls on:error=unplayable></video>
+            </div>
+        }
+        .into_any()
+    } else {
+        let name = streamed.remote.pointer.name;
+        let on_error = UnsyncCallback::new(unplayable);
+        view! { <AudioView url=streamed.url name on_error /> }.into_any()
+    }
+}
+
+/// Download the attachment `remote` whole, as a stream plays only what it needs of it.
+fn download_whole(remote: RemoteFile) {
+    let ui = ui();
+    act(async move {
+        ui.notify(format!("Downloading {}…", remote.pointer.name));
+        let fetched = engine()
+            .media(remote.peer, remote.pointer, remote.clock, &|| true)
+            .await?;
+        if let Some(attachment) = fetched {
+            download(&attachment);
+        }
+        Ok(())
+    });
+}
+
 /// Audio, named `name`, playing from `url` at once, and, once a worker read them from `data`,
-/// what its tags say of it, if anything: its cover, title, artist, album and year.
+/// what its tags say of it, if anything: its cover, title, artist, album and year. Without
+/// `data`, as it plays as it is fetched, its tags are read from the start of its stream, where
+/// they are in most files.
 #[component]
-fn AudioView(url: String, name: String, data: Arc<Vec<u8>>) -> impl IntoView {
+fn AudioView(
+    url: String,
+    name: String,
+    #[prop(optional)] data: Option<Arc<Vec<u8>>>,
+    /// What to do if it does not play.
+    #[prop(optional)]
+    on_error: Option<UnsyncCallback<ev::ErrorEvent>>,
+) -> impl IntoView {
     let tags = RwSignal::new(None::<preview::Tags>);
+    let stream = url.clone();
     spawn_local(async move {
-        if let Ok(Some(found)) = workers::audio_tags(&data).await {
+        let found = match data {
+            Some(data) => workers::audio_tags(&data).await,
+            None => match engine().stream_head(&stream).await {
+                Some(head) => workers::audio_tags(&head).await,
+                None => Ok(None),
+            },
+        };
+        if let Ok(Some(found)) = found {
             tags.try_set(Some(found));
         }
     });
@@ -1516,7 +2340,15 @@ fn AudioView(url: String, name: String, data: Arc<Vec<u8>>) -> impl IntoView {
         <div class="media">
             <div class="track">
                 {shown}
-                <audio src=url controls></audio>
+                <audio
+                    src=url
+                    controls
+                    on:error=move |event| {
+                        if let Some(on_error) = on_error {
+                            on_error.run(event);
+                        }
+                    }
+                ></audio>
             </div>
         </div>
     }

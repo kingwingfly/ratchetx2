@@ -66,20 +66,17 @@ impl Store {
     /// Delete the attachments created before `before`, in pages, their chunks first, so that a
     /// failure leaves rows, which the next run picks up, rather than chunks no row names; and
     /// again once the rows are gone, as in [`delete_attachment`](Self::delete_attachment), for a
-    /// chunk put meanwhile, which found its row still there.
+    /// chunk put meanwhile, which found its row still there. The rows go by their IDs, so that
+    /// only those whose chunks went do, though an upload cancelled meanwhile changes the page.
     async fn expire_attachments(&self, before: u64) -> Result<usize> {
-        const PAGE: &str =
-            "SELECT id FROM attachments WHERE created_at < ?1 ORDER BY created_at, id LIMIT 100";
         let before = integer(before);
         let mut deleted = 0;
         loop {
             let rows: Vec<AttachmentRow> = rows(
                 &self
                     .prepare(
-                        &format!(
-                            "SELECT id, uploader, chunks, token_hash FROM attachments \
-                             WHERE id IN ({PAGE})"
-                        ),
+                        "SELECT id, uploader, chunks, token_hash FROM attachments \
+                         WHERE created_at < ?1 ORDER BY created_at, id LIMIT 100",
                         std::slice::from_ref(&before),
                     )?
                     .all()
@@ -91,16 +88,23 @@ impl Store {
                 .map(AttachmentRow::stored)
                 .collect::<Result<Vec<_>>>()?;
             self.delete_chunks(&attachments).await?;
-            self.prepare(
-                &format!("DELETE FROM attachments WHERE id IN ({PAGE})"),
-                std::slice::from_ref(&before),
-            )?
-            .run()
-            .await
-            .map_err(unavailable)?;
+            let ids: Vec<String> = attachments
+                .iter()
+                .map(|attachment| hex(&attachment.id))
+                .collect();
+            let result = self
+                .prepare(
+                    "DELETE FROM attachments WHERE id IN (SELECT unhex(value) FROM json_each(?1))",
+                    &[json_array(&ids).into()],
+                )?
+                .run()
+                .await
+                .map_err(unavailable)?;
             self.delete_chunks(&attachments).await?;
-            deleted += rows.len();
-            if rows.len() < 100 {
+            // None deleted would select the same page again, forever: the next run tries.
+            let changed = changes(&result)?;
+            deleted += changed;
+            if rows.len() < 100 || changed == 0 {
                 return Ok(deleted);
             }
         }
@@ -119,19 +123,16 @@ impl Store {
         .map_err(unavailable)?;
         // In pages, so each statement and R2 call stays small. The R2 objects go first: a row
         // whose object is gone reads as empty content and goes in the next run, while an object
-        // whose row is gone would stay forever. The order makes both statements pick the same
-        // rows.
-        const PAGE: &str = "SELECT sender, recipient, sequence FROM messages WHERE created_at < ?1 \
-                            ORDER BY created_at, sender, recipient, sequence LIMIT 1000";
+        // whose row is gone would stay forever. The rows go by their keys, so that only those
+        // whose objects went do.
         let mut deleted = 0;
         loop {
-            let rows: Vec<ObjectRow> = rows(
+            let rows: Vec<ExpiredRow> = rows(
                 &self
                     .prepare(
-                        &format!(
-                            "SELECT object FROM messages \
-                             WHERE (sender, recipient, sequence) IN ({PAGE})"
-                        ),
+                        "SELECT sender, recipient, sequence, object FROM messages \
+                         WHERE created_at < ?1 \
+                         ORDER BY created_at, sender, recipient, sequence LIMIT 1000",
                         std::slice::from_ref(&before),
                     )?
                     .all()
@@ -148,15 +149,32 @@ impl Store {
                     .await
                     .map_err(unavailable)?;
             }
-            self.prepare(
-                &format!("DELETE FROM messages WHERE (sender, recipient, sequence) IN ({PAGE})"),
-                std::slice::from_ref(&before),
-            )?
-            .run()
-            .await
-            .map_err(unavailable)?;
-            deleted += rows.len();
-            if rows.len() < 1000 {
+            // Each key as a JSON array of the sender and recipient in hex, and the sequence.
+            let keys: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    format!(
+                        "[\"{}\",\"{}\",{}]",
+                        hex(&row.sender),
+                        hex(&row.recipient),
+                        row.sequence
+                    )
+                })
+                .collect();
+            let result = self
+                .prepare(
+                    "DELETE FROM messages WHERE (sender, recipient, sequence) IN \
+                     (SELECT unhex(value ->> 0), unhex(value ->> 1), value ->> 2 \
+                     FROM json_each(?1))",
+                    &[format!("[{}]", keys.join(",")).into()],
+                )?
+                .run()
+                .await
+                .map_err(unavailable)?;
+            // None deleted would select the same page again, forever: the next run tries.
+            let changed = changes(&result)?;
+            deleted += changed;
+            if rows.len() < 1000 || changed == 0 {
                 return Ok(deleted);
             }
         }
@@ -332,6 +350,7 @@ impl LocalMailboxStore for Store {
         recipient: &PublicKey,
         header: Bytes,
         content: Bytes,
+        initial_message: Option<Bytes>,
     ) -> Result<u64> {
         let object = (content.len() > INLINE_CONTENT_MAX).then(|| {
             format!(
@@ -349,9 +368,9 @@ impl LocalMailboxStore for Store {
                 &queue,
             )?,
             self.prepare(
-                "INSERT INTO messages \
-                 (sender, recipient, sequence, header, content, object, size, created_at) \
-                 SELECT ?1, ?2, last_sequence, ?3, ?4, ?5, ?6, ?7 FROM queues \
+                "INSERT INTO messages (sender, recipient, sequence, header, content, object, size, \
+                 initial_message, created_at) \
+                 SELECT ?1, ?2, last_sequence, ?3, ?4, ?5, ?6, ?7, ?8 FROM queues \
                  WHERE sender = ?1 AND recipient = ?2 RETURNING sequence",
                 &[
                     queue[0].clone(),
@@ -363,6 +382,7 @@ impl LocalMailboxStore for Store {
                     },
                     object.as_deref().map_or(JsValue::NULL, JsValue::from_str),
                     integer(content.len() as u64),
+                    initial_message.as_deref().map_or(JsValue::NULL, blob),
                     integer(Date::now().as_millis()),
                 ],
             )?,
@@ -406,13 +426,16 @@ impl LocalMailboxStore for Store {
             &self
                 .prepare(
                     "WITH page AS ( \
-                         SELECT sequence, size + length(header) AS bytes FROM messages \
+                         SELECT sequence, \
+                         size + length(header) + coalesce(length(initial_message), 0) AS bytes \
+                         FROM messages \
                          WHERE sender = ?1 AND recipient = ?2 AND sequence > ?3 \
                          ORDER BY sequence LIMIT ?4 \
                      ), sums AS ( \
                          SELECT sequence, sum(bytes) OVER (ORDER BY sequence) AS total FROM page \
                      ) \
-                     SELECT m.sequence, m.header, m.content, m.object FROM sums \
+                     SELECT m.sequence, m.header, m.content, m.object, \
+                     m.initial_message FROM sums \
                      JOIN messages AS m \
                      ON m.sender = ?1 AND m.recipient = ?2 AND m.sequence = sums.sequence \
                      WHERE sums.total <= ?5 OR sums.sequence = (SELECT min(sequence) FROM page) \
@@ -441,6 +464,7 @@ impl LocalMailboxStore for Store {
                 sequence: row.sequence,
                 header: Bytes::from(row.header),
                 content,
+                initial_message: row.initial_message.map(Bytes::from),
             })
         }))
         .await
@@ -622,6 +646,8 @@ struct MessageRow {
     #[serde(with = "serde_bytes")]
     content: Option<Vec<u8>>,
     object: Option<String>,
+    #[serde(with = "serde_bytes")]
+    initial_message: Option<Vec<u8>>,
 }
 
 #[derive(Deserialize)]
@@ -647,7 +673,12 @@ impl AttachmentRow {
 }
 
 #[derive(Deserialize)]
-struct ObjectRow {
+struct ExpiredRow {
+    #[serde(with = "serde_bytes")]
+    sender: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    recipient: Vec<u8>,
+    sequence: u64,
     object: Option<String>,
 }
 

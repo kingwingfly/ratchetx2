@@ -17,6 +17,7 @@ use bon::Builder;
 use bytes::Bytes;
 pub use error::{Error, ErrorKind, Result};
 use party::{EncryptedMessage, Party};
+use prost::Message as _;
 pub use protocol;
 use protocol::{
     attachment::{LocalAttachments, StartUploadRequest},
@@ -24,7 +25,7 @@ use protocol::{
         self, FetchBundleRequest, LocalHandshake, PublishRequest, SendInitialMessageRequest,
         TakeInitialMessagesRequest,
     },
-    mailbox::{FetchRequest, LocalMailbox, PushRequest},
+    mailbox::{Envelope, FetchRequest, LocalMailbox, PushRequest},
     notify::SubscribeRequest,
 };
 use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
@@ -43,6 +44,36 @@ pub struct InitialMessage {
     /// The session's first message, which only the owner of that identity key can have
     /// encrypted.
     pub first_message: EncryptedMessage,
+}
+
+impl TryFrom<&handshake::InitialMessage> for InitialMessage {
+    type Error = Error;
+
+    /// Fails with [`ErrorKind::InvalidInitialMessage`] if it is malformed, or has no first
+    /// message.
+    fn try_from(message: &handshake::InitialMessage) -> Result<Self> {
+        let malformed = || Error::from(ErrorKind::InvalidInitialMessage);
+        Ok(Self {
+            x3dh: x3dh::InitialMessage::try_from(message).map_err(|_| malformed())?,
+            first_message: message.first_message.clone().ok_or_else(malformed)?,
+        })
+    }
+}
+
+/// A message received, see [`Session::receive`].
+#[derive(Debug)]
+pub struct Received {
+    /// Its content, or why there is none.
+    pub content: Result<Vec<u8>>,
+    /// Whether it decrypted on an earlier session [kept](Session::keep), rather than the active
+    /// one: the peer sent it before the session that replaced it, e.g. before deleting the chat
+    /// and starting it again.
+    pub earlier: bool,
+    /// The initial message of its session, which its sender sends with each message while this
+    /// client has not answered that session. For the message receiving [stalled](ErrorKind::Stalled)
+    /// at, those that came with the rest of its page too, any of which may be the session it,
+    /// or one after it, is on: accepting them with [`Client::accept`] may let them decrypt.
+    pub initial_messages: Vec<InitialMessage>,
 }
 
 /// Number of earlier sessions with its peer that a [`Session`] keeps, only to decrypt the
@@ -90,6 +121,9 @@ pub struct ClientState {
     identity: XEdDSAPrivateKey,
     prekeys: LocalPrekeys,
     last_timestamp: u64,
+    /// Whether the last publish of the prekeys may have failed, though the server may have
+    /// them, its reply being lost, see [`Client::publish_keys`].
+    publishing: bool,
 }
 
 impl ClientState {
@@ -98,6 +132,7 @@ impl ClientState {
             identity,
             prekeys: LocalPrekeys::new(),
             last_timestamp: 0,
+            publishing: false,
         }
     }
 }
@@ -109,6 +144,7 @@ impl From<&ClientState> for proto::ClientState {
             identity: state.identity.to_bytes().to_vec(),
             prekeys: Some((&state.prekeys).into()),
             last_timestamp: state.last_timestamp,
+            publishing: state.publishing,
         }
     }
 }
@@ -131,6 +167,7 @@ impl TryFrom<&proto::ClientState> for ClientState {
                 .transpose()?
                 .unwrap_or_default(),
             last_timestamp: state.last_timestamp,
+            publishing: state.publishing,
         })
     }
 }
@@ -169,15 +206,25 @@ impl<H: LocalHandshake> Client<H> {
     ///
     /// Only the last [`x3dh::KEPT_GENERATIONS`] generations of prekeys are kept, so take the
     /// initial messages waiting before publishing again; later, the ones using deleted prekeys
-    /// cannot be accepted.
+    /// cannot be accepted. If publishing fails, the server may still have the prekeys, its reply
+    /// being lost: the next publish sends the same signed prekey again, with new one-time
+    /// prekeys, rather than a new generation, which would delete the private keys of prekeys
+    /// the server hands out. Save the state after this, failed or not.
     pub async fn publish_keys(&mut self, one_time_count: usize) -> Result<()> {
-        let published = self
-            .state
-            .prekeys
-            .generate(&self.state.identity, one_time_count);
+        let published = if self.state.publishing {
+            self.state
+                .prekeys
+                .extend(&self.state.identity, one_time_count)
+        } else {
+            self.state
+                .prekeys
+                .generate(&self.state.identity, one_time_count)
+        };
+        self.state.publishing = true;
         let timestamp = self.next_timestamp();
         let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
         self.handshake.publish(request).await?;
+        self.state.publishing = false;
         Ok(())
     }
 
@@ -206,13 +253,14 @@ impl<H: LocalHandshake> Client<H> {
         )?;
         let mut party = Party::new(ratchet, agreement.associated_data);
         let first_message = party.encrypt(content)?;
+        let initial_message = handshake::InitialMessage {
+            first_message: Some(first_message),
+            ..handshake::InitialMessage::from(&message)
+        };
         self.handshake
             .send_initial_message(SendInitialMessageRequest {
                 recipient: Bytes::copy_from_slice(peer),
-                message: Some(handshake::InitialMessage {
-                    first_message: Some(first_message),
-                    ..handshake::InitialMessage::from(&message)
-                }),
+                message: Some(initial_message.clone()),
             })
             .await?;
         Ok(Session::new(
@@ -221,10 +269,34 @@ impl<H: LocalHandshake> Client<H> {
                 party,
                 id: message.ephemeral_key,
                 known_by_peer: false,
+                initial_message: initial_message.encode_to_vec(),
             },
             self.identity_key,
             *peer,
         ))
+    }
+
+    /// Start a new session with `session`'s peer, whose first message is `content`, and keep
+    /// `session`, the chat so far, with it, see [`Session::keep`]: as when it has none to send
+    /// on ([`Session::needs_new_session`]).
+    ///
+    /// Fails with [`ErrorKind::UnexpectedPeer`] if `session` is another identity's, before
+    /// anything is sent or changed.
+    pub async fn start_again<M: Clone>(
+        &mut self,
+        session: &mut Session<M>,
+        content: &[u8],
+    ) -> Result<()> {
+        // Checked first, as `keep` would only fail once the initial message went and `session`
+        // was replaced.
+        if session.state.me != self.identity_key {
+            return Err(ErrorKind::UnexpectedPeer.into());
+        }
+        let started = self
+            .initiate(&session.state.peer, content, session.mailbox.clone())
+            .await?;
+        let older = mem::replace(session, started);
+        session.keep(older)
     }
 
     /// Take the initial messages waiting in this client's inbox.
@@ -240,12 +312,7 @@ impl<H: LocalHandshake> Client<H> {
         Ok(response
             .messages
             .iter()
-            .filter_map(|message| {
-                Some(InitialMessage {
-                    x3dh: x3dh::InitialMessage::try_from(message).ok()?,
-                    first_message: message.first_message.clone()?,
-                })
-            })
+            .filter_map(|message| InitialMessage::try_from(message).ok())
             .collect())
     }
 
@@ -280,6 +347,7 @@ impl<H: LocalHandshake> Client<H> {
             party,
             id: initial_message.x3dh.ephemeral_key,
             known_by_peer: true,
+            initial_message: vec![],
         };
         Ok((
             Session::new(mailbox, active, self.identity_key, *peer),
@@ -371,6 +439,11 @@ pub struct SessionState {
     /// session and receiving on an earlier one, see [`Session::keep`].
     last: LastAction,
     direction_changes: u32,
+    /// The last sequence number of the page in which receiving stopped at a message that did not
+    /// decrypt, and up to which messages that do not decrypt are skipped, see
+    /// [`Session::receive`].
+    stalled_through: u64,
+    skip_through: u64,
 }
 
 /// The session a [`SessionState`] sends on.
@@ -387,6 +460,10 @@ struct Active {
     id: PublicKey,
     /// Whether the peer is known to have it: it started it, or a message on it decrypted.
     known_by_peer: bool,
+    /// The initial message, encoded, that started it, which this client did: each message
+    /// goes with it until the peer is known to have the session, in case the one in its inbox
+    /// was lost. Empty once known.
+    initial_message: Vec<u8>,
 }
 
 /// What was done last on a [`SessionState`].
@@ -448,6 +525,11 @@ impl From<&SessionState> for proto::SessionState {
                 .active
                 .as_ref()
                 .is_some_and(|active| active.known_by_peer),
+            initial_message: state
+                .active
+                .as_ref()
+                .map(|active| active.initial_message.clone())
+                .unwrap_or_default(),
             others: state.others.iter().map(Into::into).collect(),
             me: state.me.to_vec(),
             peer: state.peer.to_vec(),
@@ -460,6 +542,8 @@ impl From<&SessionState> for proto::SessionState {
             }
             .into(),
             direction_changes: state.direction_changes,
+            stalled_through: state.stalled_through,
+            skip_through: state.skip_through,
         }
     }
 }
@@ -481,6 +565,7 @@ impl TryFrom<&proto::SessionState> for SessionState {
                 party: Party::try_from(party)?,
                 id: key(&state.id)?,
                 known_by_peer: state.known_by_peer,
+                initial_message: state.initial_message.clone(),
             }),
             None => None,
         };
@@ -503,6 +588,8 @@ impl TryFrom<&proto::SessionState> for SessionState {
             cursor: state.cursor,
             last,
             direction_changes: state.direction_changes,
+            stalled_through: state.stalled_through,
+            skip_through: state.skip_through,
         })
     }
 }
@@ -526,6 +613,8 @@ impl<M> Session<M> {
                 cursor: 0,
                 last,
                 direction_changes: 0,
+                stalled_through: 0,
+                skip_through: 0,
             },
         )
     }
@@ -546,11 +635,34 @@ impl<M> Session<M> {
         &self.state.peer
     }
 
-    /// Whether this session has none to send on, as the peers kept missing each other, see
-    /// [`Session::keep`]: start a new one with [`Client::initiate`] and keep this one with it,
-    /// before sending.
+    /// This client's identity key.
+    pub fn me(&self) -> &PublicKey {
+        &self.state.me
+    }
+
+    /// Whether this session has none to send on, as the peers kept missing each other (see
+    /// [`Session::keep`]) or it was [retired](Session::retire): start a new one with
+    /// [`Client::start_again`] before sending.
     pub fn needs_new_session(&self) -> bool {
         self.state.active.is_none()
+    }
+
+    /// Go on past the messages that receiving stopped at, as they did not decrypt, once the
+    /// initial messages waiting are taken and accepted: those of that page that still do not
+    /// decrypt never will, and are skipped, see [`Session::receive`].
+    pub fn skip_stalled(&mut self) {
+        self.state.skip_through = self.state.skip_through.max(self.state.stalled_through);
+    }
+
+    /// Retire the active session, e.g. as the peer deleted the chat, so it no longer has it:
+    /// messages on it still decrypt, but none go on it; the next goes on a new one, see
+    /// [`Session::needs_new_session`].
+    pub fn retire(&mut self) {
+        if let Some(active) = self.state.active.take() {
+            self.state.archive(active.party);
+        }
+        self.state.last = LastAction::None;
+        self.state.direction_changes = 0;
     }
 
     /// Keep `older`, the chat with the same peer so far, with this session, which the peer or
@@ -577,6 +689,8 @@ impl<M> Session<M> {
         let new = mem::replace(&mut self.state, older.state);
         let state = &mut self.state;
         state.cursor = state.cursor.max(new.cursor);
+        state.stalled_through = state.stalled_through.max(new.stalled_through);
+        state.skip_through = state.skip_through.max(new.skip_through);
         for party in new.others.into_iter().rev() {
             state.archive(party);
         }
@@ -608,31 +722,38 @@ impl<M> Session<M> {
     }
 
     /// Decrypt `message` with the active party, or else with an earlier one, which only counts
-    /// towards retiring the active one, see [`Session::keep`].
-    fn decrypt(&mut self, message: &EncryptedMessage) -> Result<Vec<u8>> {
+    /// towards retiring the active one, see [`Session::keep`]; and tell which.
+    fn decrypt(&mut self, message: &EncryptedMessage) -> Result<(Vec<u8>, bool)> {
         let state = &mut self.state;
         let mut error = None;
         if let Some(active) = &mut state.active {
             match active.party.decrypt(message) {
                 Ok(content) => {
                     active.known_by_peer = true;
+                    active.initial_message = vec![];
                     state.last = LastAction::ReceivedActive;
-                    return Ok(content);
+                    return Ok((content, false));
                 }
                 Err(e) => error = Some(e),
             }
         }
-        let decrypted = state
-            .others
-            .iter_mut()
-            .find_map(|party| party.decrypt(message).ok());
-        match (decrypted, error) {
-            (Some(content), _) => {
-                state.received_earlier();
-                Ok(content)
+        // A message an earlier session received already is told apart, as a duplicate.
+        let mut duplicate = None;
+        for earlier in &mut state.others {
+            match earlier.decrypt(message) {
+                Ok(content) => {
+                    state.received_earlier();
+                    return Ok((content, true));
+                }
+                Err(e) if e.kind() == party::error::ErrorKind::DuplicateMessage => {
+                    duplicate = Some(e);
+                }
+                Err(_) => {}
             }
-            (None, Some(error)) => Err(error.into()),
-            (None, None) => Err(ErrorKind::Undecryptable.into()),
+        }
+        match duplicate.or(error) {
+            Some(error) => Err(error.into()),
+            None => Err(ErrorKind::Undecryptable.into()),
         }
     }
 }
@@ -661,13 +782,24 @@ impl<M: LocalMailbox> Session<M> {
         Ok(message)
     }
 
-    /// Push an encrypted message to the peer; it can be pushed again if this fails.
+    /// Push an encrypted message to the peer; it can be pushed again if this fails. While the
+    /// peer is not known to have the active session, the initial message that started it goes
+    /// with it, in case the one in the peer's inbox was lost.
     pub async fn push(&mut self, message: EncryptedMessage) -> Result<()> {
+        let initial_message = self
+            .state
+            .active
+            .as_ref()
+            .filter(|active| !active.initial_message.is_empty())
+            .and_then(|active| {
+                handshake::InitialMessage::decode(active.initial_message.as_slice()).ok()
+            });
         self.mailbox
             .push(PushRequest {
                 sender: Bytes::copy_from_slice(&self.state.me),
                 recipient: Bytes::copy_from_slice(&self.state.peer),
                 message: Some(message),
+                initial_message,
             })
             .await?;
         Ok(())
@@ -676,10 +808,15 @@ impl<M: LocalMailbox> Session<M> {
     /// Fetch the next page of the peer's messages and decrypt them: one result per message, in
     /// order. Returns an empty page once there are no new messages.
     ///
-    /// A message is tried on the earlier sessions [kept](Session::keep) too. One that fails to decrypt
-    /// is still consumed, so it cannot block the ones after it.
+    /// A message is tried on the earlier sessions [kept](Session::keep) too. One that does not
+    /// decrypt may be on a session whose initial message is waiting, as it reached the server
+    /// first, but came after the initial messages were last taken: receiving stops there, the
+    /// page ending with an [`ErrorKind::Stalled`] error, and leaves it for later. Take and accept
+    /// the initial messages, then [`skip_stalled`](Session::skip_stalled) and receive again: what
+    /// of that page still does not decrypt never will, and is skipped, so that it cannot block
+    /// the messages after it.
     /// Cancel-safe: if the future is dropped, no message is consumed.
-    pub async fn receive(&mut self) -> Result<Vec<Result<Vec<u8>>>> {
+    pub async fn receive(&mut self) -> Result<Vec<Received>> {
         let response = self
             .mailbox
             .fetch(FetchRequest {
@@ -689,12 +826,53 @@ impl<M: LocalMailbox> Session<M> {
                 limit: 0,
             })
             .await?;
+        let last = response
+            .messages
+            .last()
+            .map_or(0, |envelope| envelope.sequence);
+        let attached = |envelope: &Envelope| {
+            envelope
+                .initial_message
+                .as_ref()
+                .and_then(|initial_message| InitialMessage::try_from(initial_message).ok())
+        };
         let mut received = Vec::with_capacity(response.messages.len());
-        for envelope in response.messages {
-            self.state.cursor = self.state.cursor.max(envelope.sequence);
-            received.push(match envelope.message {
-                Some(message) => self.decrypt(&message),
+        let mut envelopes = response.messages.into_iter();
+        while let Some(envelope) = envelopes.next() {
+            let decrypted = match &envelope.message {
+                Some(message) => self.decrypt(message),
                 None => Err(ErrorKind::InvalidMessage.into()),
+            };
+            let mut initial_messages: Vec<_> = attached(&envelope).into_iter().collect();
+            let stalls = decrypted
+                .as_ref()
+                .is_err_and(|e| e.kind() != ErrorKind::DuplicateMessage)
+                && envelope.sequence > self.state.skip_through;
+            if stalls {
+                self.state.stalled_through = last;
+                // What still does not decrypt once they are accepted is skipped, the rest of
+                // the page with it: so each of its sessions is offered now.
+                for initial_message in envelopes
+                    .by_ref()
+                    .filter_map(|envelope| attached(&envelope))
+                {
+                    if !initial_messages.contains(&initial_message) {
+                        initial_messages.push(initial_message);
+                    }
+                }
+                received.push(Received {
+                    content: Err(ErrorKind::Stalled.into()),
+                    earlier: false,
+                    initial_messages,
+                });
+                return Ok(received);
+            }
+            self.state.cursor = self.state.cursor.max(envelope.sequence);
+            let earlier = decrypted.as_ref().is_ok_and(|(_, earlier)| *earlier);
+            received.push(Received {
+                content: decrypted.map(|(content, _)| content),
+                earlier,
+                initial_messages,
             });
         }
         Ok(received)
@@ -703,6 +881,7 @@ impl<M: LocalMailbox> Session<M> {
 
 #[cfg(test)]
 mod test {
+    use core::cell::Cell;
     use protocol::{
         attachment::AttachmentServer,
         handshake::{
@@ -711,6 +890,7 @@ mod test {
         },
         mailbox::{FetchResponse, MailboxServer, PushResponse},
     };
+
     use storage::MemoryStore;
 
     use super::*;
@@ -747,7 +927,7 @@ mod test {
     }
 
     /// Lets several sessions share one in-process mailbox server.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct InProcessMailbox<'a>(&'a MailboxServer<MemoryStore>);
 
     impl LocalMailbox for InProcessMailbox<'_> {
@@ -771,11 +951,27 @@ mod test {
         T::try_from(&P::decode(saved.as_slice()).unwrap()).unwrap()
     }
 
-    fn contents(received: Vec<Result<Vec<u8>>>) -> Vec<Vec<u8>> {
+    fn contents(received: Vec<Received>) -> Vec<Vec<u8>> {
         received
             .into_iter()
-            .map(|content| content.unwrap())
+            .map(|received| received.content.unwrap())
             .collect()
+    }
+
+    /// Receive as a client does once it has taken the initial messages: past what receiving
+    /// stalls at, which then never decrypts.
+    async fn receive_all<M: LocalMailbox>(session: &mut Session<M>) -> Vec<Received> {
+        let mut received = session.receive().await.unwrap();
+        if let Some(Received {
+            content: Err(e), ..
+        }) = received.last()
+            && e.kind() == ErrorKind::Stalled
+        {
+            received.pop();
+            session.skip_stalled();
+            received.extend(session.receive().await.unwrap());
+        }
+        received
     }
 
     #[tokio::test]
@@ -804,14 +1000,14 @@ mod test {
         assert_eq!(first, b"hi");
 
         assert_eq!(
-            contents(bob_session.receive().await.unwrap()),
+            contents(receive_all(&mut bob_session).await),
             [b"bob".to_vec()]
         );
-        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert!(receive_all(&mut bob_session).await.is_empty());
 
         bob_session.send(b"hello").await.unwrap();
         assert_eq!(
-            contents(alice_session.receive().await.unwrap()),
+            contents(receive_all(&mut alice_session).await),
             [b"hello".to_vec()]
         );
 
@@ -820,7 +1016,7 @@ mod test {
         alice_session.send(b"early").await.unwrap();
         alice_session.push(late).await.unwrap();
         assert_eq!(
-            contents(bob_session.receive().await.unwrap()),
+            contents(receive_all(&mut bob_session).await),
             [b"early".to_vec(), b"late".to_vec()]
         );
     }
@@ -852,7 +1048,7 @@ mod test {
             .unwrap();
         assert_eq!(first, b"hi");
         bob_session.send(b"hello").await.unwrap();
-        assert_eq!(contents(alice_session.receive().await.unwrap()), [b"hello"]);
+        assert_eq!(contents(receive_all(&mut alice_session).await), [b"hello"]);
         (alice, alice_session, bob, bob_session)
     }
 
@@ -904,14 +1100,14 @@ mod test {
 
         alice_again.send(b"on the new one").await.unwrap();
         assert_eq!(
-            contents(bob_session.receive().await.unwrap()),
+            contents(receive_all(&mut bob_session).await),
             [b"on the new one"]
         );
         bob_session.send(b"me too").await.unwrap();
-        let received = alice_again.receive().await.unwrap();
+        let received = receive_all(&mut alice_again).await;
         // Her new session reads her queue from the start, where his reply to the old one is.
-        assert!(received[0].is_err());
-        assert_eq!(received[1].as_ref().unwrap(), b"me too");
+        assert!(received[0].content.is_err());
+        assert_eq!(received[1].content.as_ref().unwrap(), b"me too");
     }
 
     #[tokio::test]
@@ -946,12 +1142,12 @@ mod test {
         );
 
         // Her earlier message still decrypts, but does not bring the old session back.
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"old"]);
+        assert_eq!(contents(receive_all(&mut bob_session).await), [b"old"]);
         bob_session.send(b"on the new one").await.unwrap();
-        let received = alice_again.receive().await.unwrap();
-        assert!(received[0].is_err());
-        assert_eq!(received[1].as_ref().unwrap(), b"on the new one");
-        assert!(alice_session.receive().await.unwrap()[0].is_err());
+        let received = receive_all(&mut alice_again).await;
+        assert!(received[0].content.is_err());
+        assert_eq!(received[1].content.as_ref().unwrap(), b"on the new one");
+        assert!(receive_all(&mut alice_session).await[0].content.is_err());
     }
 
     /// Whether `a` and `b` send on one session.
@@ -978,22 +1174,6 @@ mod test {
         first
     }
 
-    /// Start a new session from `client` to `peer`, keeping `session`, the chat so far.
-    async fn start_keeping<'a>(
-        client: &mut Client<InProcessHandshake<'a>>,
-        peer: &PublicKey,
-        session: &mut Session<InProcessMailbox<'a>>,
-        mailbox: &'a MailboxServer<MemoryStore>,
-        first: &[u8],
-    ) {
-        let started = client
-            .initiate(peer, first, InProcessMailbox(mailbox))
-            .await
-            .unwrap();
-        let older = mem::replace(session, started);
-        session.keep(older).unwrap();
-    }
-
     #[tokio::test]
     async fn a_session_the_peer_never_gets_is_retired_for_a_new_one() {
         let handshake = HandshakeServer::new(MemoryStore::default());
@@ -1003,8 +1183,7 @@ mod test {
 
         // Bob starts again, but Alice loses his initial message, and writes on the old session.
         alice.publish_keys(1).await.unwrap();
-        let alice_key = alice.identity_key();
-        start_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox, b"lost").await;
+        bob.start_again(&mut bob_session, b"lost").await.unwrap();
         assert_eq!(alice.take_initial_messages().await.unwrap().len(), 1);
 
         // Bob reads her on the old session, which never becomes active again, and she cannot
@@ -1013,14 +1192,14 @@ mod test {
         loop {
             alice_session.send(b"still here").await.unwrap();
             assert_eq!(
-                contents(bob_session.receive().await.unwrap()),
+                contents(receive_all(&mut bob_session).await),
                 [b"still here"]
             );
             if bob_session.needs_new_session() {
                 break;
             }
             bob_session.send(b"lost too").await.unwrap();
-            assert!(alice_session.receive().await.unwrap()[0].is_err());
+            assert!(receive_all(&mut alice_session).await[0].content.is_err());
             turns += 1;
         }
         assert!(turns <= MAX_DIRECTION_CHANGES);
@@ -1030,7 +1209,7 @@ mod test {
         );
 
         // He starts a new one, which Alice gets this time, and they talk on it.
-        start_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox, b"again").await;
+        bob.start_again(&mut bob_session, b"again").await.unwrap();
         let first = accept_keeping(
             &mut alice,
             &bob.identity_key(),
@@ -1042,11 +1221,11 @@ mod test {
         assert!(on_one_session(&alice_session, &bob_session));
         bob_session.send(b"hello again").await.unwrap();
         assert_eq!(
-            contents(alice_session.receive().await.unwrap()),
+            contents(receive_all(&mut alice_session).await),
             [b"hello again"]
         );
         alice_session.send(b"hi").await.unwrap();
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"hi"]);
+        assert_eq!(contents(receive_all(&mut bob_session).await), [b"hi"]);
     }
 
     #[tokio::test]
@@ -1088,7 +1267,7 @@ mod test {
             .await;
             assert_eq!(first, b"hi alice");
             if answered_first {
-                assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b0"]);
+                assert_eq!(contents(receive_all(&mut alice_session).await), [b"b0"]);
             }
 
             // The session with the higher ID won on both sides, and whatever each sends, at once
@@ -1096,12 +1275,12 @@ mod test {
             assert!(on_one_session(&alice_session, &bob_session));
             alice_session.send(b"a1").await.unwrap();
             bob_session.send(b"b1").await.unwrap();
-            assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b1"]);
-            assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a1"]);
+            assert_eq!(contents(receive_all(&mut alice_session).await), [b"b1"]);
+            assert_eq!(contents(receive_all(&mut bob_session).await), [b"a1"]);
             alice_session.send(b"a2").await.unwrap();
-            assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a2"]);
+            assert_eq!(contents(receive_all(&mut bob_session).await), [b"a2"]);
             bob_session.send(b"b2").await.unwrap();
-            assert_eq!(contents(alice_session.receive().await.unwrap()), [b"b2"]);
+            assert_eq!(contents(receive_all(&mut alice_session).await), [b"b2"]);
             assert!(on_one_session(&alice_session, &bob_session));
         }
     }
@@ -1141,25 +1320,28 @@ mod test {
         while !on_one_session(&alice_session, &bob_session) {
             assert!(lost <= MAX_DIRECTION_CHANGES, "they never settle");
             if alice_session.needs_new_session() {
-                start_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox, b"again").await;
+                alice
+                    .start_again(&mut alice_session, b"again")
+                    .await
+                    .unwrap();
                 let first = accept_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox).await;
                 assert_eq!(first, b"again");
                 continue;
             }
             alice_session.send(b"from alice").await.unwrap();
-            assert!(bob_session.receive().await.unwrap()[0].is_err());
+            assert!(receive_all(&mut bob_session).await[0].content.is_err());
             lost += 1;
             bob_session.send(b"from bob").await.unwrap();
             assert_eq!(
-                contents(alice_session.receive().await.unwrap()),
+                contents(receive_all(&mut alice_session).await),
                 [b"from bob"]
             );
         }
         alice_session.send(b"on one").await.unwrap();
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"on one"]);
+        assert_eq!(contents(receive_all(&mut bob_session).await), [b"on one"]);
         bob_session.send(b"at last").await.unwrap();
         assert_eq!(
-            contents(alice_session.receive().await.unwrap()),
+            contents(receive_all(&mut alice_session).await),
             [b"at last"]
         );
     }
@@ -1182,13 +1364,301 @@ mod test {
         let first =
             accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
         assert_eq!(first, b"again");
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"late"]);
+        assert_eq!(contents(receive_all(&mut bob_session).await), [b"late"]);
         bob_session.send(b"on the new one").await.unwrap();
         // The new session reads the queue from its start, where the reply to the old one is.
-        let received = alice_session.receive().await.unwrap();
-        assert!(received[0].is_err());
-        assert_eq!(received[1].as_ref().unwrap(), b"on the new one");
+        let received = receive_all(&mut alice_session).await;
+        assert!(received[0].content.is_err());
+        assert_eq!(received[1].content.as_ref().unwrap(), b"on the new one");
         assert!(on_one_session(&alice_session, &bob_session));
+    }
+
+    #[tokio::test]
+    async fn a_chat_the_peer_deleted_starts_again_from_a_retired_session() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, mut bob, bob_session) =
+            talking(&handshake, &mailbox).await;
+        alice.publish_keys(1).await.unwrap();
+
+        // Bob deletes the chat, as he tells Alice, who retires her session: what came on it still
+        // decrypts, but she sends nothing on it.
+        drop(bob_session);
+        alice_session.retire();
+        assert!(alice_session.needs_new_session());
+        assert_eq!(
+            alice_session.encrypt(b"no").unwrap_err().kind(),
+            ErrorKind::NoSession
+        );
+
+        // Her next message goes on a new session, which comes to Bob as a new chat.
+        alice
+            .start_again(&mut alice_session, b"again")
+            .await
+            .unwrap();
+        alice_session.send(b"still there?").await.unwrap();
+        let initial_messages = bob.take_initial_messages().await.unwrap();
+        let (mut bob_session, first) = bob
+            .accept(
+                &alice.identity_key(),
+                &initial_messages[0],
+                InProcessMailbox(&mailbox),
+            )
+            .unwrap();
+        assert_eq!(first, b"again");
+        // His new chat reads Alice's queue from its start, where her first message is.
+        let received = receive_all(&mut bob_session).await;
+        assert_eq!(
+            received.last().unwrap().content.as_ref().unwrap(),
+            b"still there?"
+        );
+        bob_session.send(b"yes").await.unwrap();
+        assert_eq!(contents(receive_all(&mut alice_session).await), [b"yes"]);
+        assert!(on_one_session(&alice_session, &bob_session));
+    }
+
+    #[tokio::test]
+    async fn a_message_on_a_session_not_taken_yet_waits_for_it() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, mut bob, mut bob_session) =
+            talking(&handshake, &mailbox).await;
+
+        // Alice starts again and writes on the new session, which Bob receives before he takes
+        // its initial message: receiving stops there, however often, and loses nothing.
+        alice
+            .start_again(&mut alice_session, b"once more")
+            .await
+            .unwrap();
+        alice_session.send(b"new").await.unwrap();
+        for _ in 0..2 {
+            let received = bob_session.receive().await.unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(
+                received[0].content.as_ref().unwrap_err().kind(),
+                ErrorKind::Stalled
+            );
+        }
+        let first =
+            accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
+        assert_eq!(first, b"once more");
+        bob_session.skip_stalled();
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"new"]);
+
+        // What anyone pushes that never decrypts stops receiving once, then is skipped.
+        alice_session
+            .push(EncryptedMessage::default())
+            .await
+            .unwrap();
+        alice_session.send(b"after").await.unwrap();
+        let received = bob_session.receive().await.unwrap();
+        assert_eq!(
+            received[0].content.as_ref().unwrap_err().kind(),
+            ErrorKind::Stalled
+        );
+        bob_session.skip_stalled();
+        let received = bob_session.receive().await.unwrap();
+        assert!(received[0].content.is_err());
+        assert_eq!(received[1].content.as_ref().unwrap(), b"after");
+    }
+
+    #[tokio::test]
+    async fn a_lost_initial_message_comes_with_the_messages_after_it() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, mut bob, mut bob_session) =
+            talking(&handshake, &mailbox).await;
+
+        // Alice starts again, and Bob loses her initial message.
+        alice
+            .start_again(&mut alice_session, b"once more")
+            .await
+            .unwrap();
+        assert_eq!(bob.take_initial_messages().await.unwrap().len(), 1);
+        alice_session.send(b"new").await.unwrap();
+
+        // Her message carries it: accepted from there, it decrypts, and the next ones go
+        // without it, once Bob answers.
+        let received = bob_session.receive().await.unwrap();
+        let stalled = received.last().unwrap();
+        assert_eq!(
+            stalled.content.as_ref().unwrap_err().kind(),
+            ErrorKind::Stalled
+        );
+        let initial_message = stalled.initial_messages[0].clone();
+        let (session, first) = bob
+            .accept(
+                &alice.identity_key(),
+                &initial_message,
+                InProcessMailbox(&mailbox),
+            )
+            .unwrap();
+        assert_eq!(first, b"once more");
+        let older = mem::replace(&mut bob_session, session);
+        bob_session.keep(older).unwrap();
+        bob_session.skip_stalled();
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"new"]);
+        bob_session.send(b"got it").await.unwrap();
+        assert_eq!(contents(receive_all(&mut alice_session).await), [b"got it"]);
+        alice_session.send(b"plain").await.unwrap();
+        let received = bob_session.receive().await.unwrap();
+        assert!(received[0].initial_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_lost_initial_message_behind_junk_is_offered_too() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, mut bob, mut bob_session) =
+            talking(&handshake, &mailbox).await;
+
+        // Junk, which never decrypts, then Alice starts again, and Bob loses her initial
+        // message.
+        alice_session
+            .push(EncryptedMessage::default())
+            .await
+            .unwrap();
+        alice
+            .start_again(&mut alice_session, b"once more")
+            .await
+            .unwrap();
+        assert_eq!(bob.take_initial_messages().await.unwrap().len(), 1);
+        alice_session.send(b"new").await.unwrap();
+
+        // Receiving stops at the junk, offering the initial message that came after it, so
+        // that skipping the page does not skip her message.
+        let received = bob_session.receive().await.unwrap();
+        let stalled = received.last().unwrap();
+        assert_eq!(
+            stalled.content.as_ref().unwrap_err().kind(),
+            ErrorKind::Stalled
+        );
+        assert_eq!(stalled.initial_messages.len(), 1);
+        let (session, _) = bob
+            .accept(
+                &alice.identity_key(),
+                &stalled.initial_messages[0],
+                InProcessMailbox(&mailbox),
+            )
+            .unwrap();
+        let older = mem::replace(&mut bob_session, session);
+        bob_session.keep(older).unwrap();
+        bob_session.skip_stalled();
+        let received = bob_session.receive().await.unwrap();
+        assert!(received[0].content.is_err());
+        assert_eq!(received[1].content.as_ref().unwrap(), b"new");
+    }
+
+    #[tokio::test]
+    async fn a_message_on_an_earlier_session_shows_so() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, mut bob, mut bob_session) =
+            talking(&handshake, &mailbox).await;
+
+        // Sent before Alice started again, which Bob took first.
+        alice_session.send(b"old").await.unwrap();
+        alice
+            .start_again(&mut alice_session, b"again")
+            .await
+            .unwrap();
+        accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
+        alice_session.send(b"new").await.unwrap();
+        let received = receive_all(&mut bob_session).await;
+        let earlier: Vec<_> = received
+            .iter()
+            .map(|received| (received.content.as_deref().unwrap(), received.earlier))
+            .collect();
+        assert_eq!(earlier, [(&b"old"[..], true), (&b"new"[..], false)]);
+    }
+
+    /// Publishes, then fails once, as if the server's reply were lost.
+    #[derive(Debug)]
+    struct LosingReply<'a>(&'a HandshakeServer<MemoryStore>, Cell<bool>);
+
+    impl LocalHandshake for LosingReply<'_> {
+        async fn publish(&self, request: PublishRequest) -> protocol::Result<PublishResponse> {
+            let response = self.0.publish(request).await?;
+            if self.1.replace(false) {
+                return Err(protocol::ErrorKind::Connect.into());
+            }
+            Ok(response)
+        }
+
+        async fn fetch_bundle(
+            &self,
+            request: FetchBundleRequest,
+        ) -> protocol::Result<FetchBundleResponse> {
+            self.0.fetch_bundle(request).await
+        }
+
+        async fn send_initial_message(
+            &self,
+            request: SendInitialMessageRequest,
+        ) -> protocol::Result<SendInitialMessageResponse> {
+            self.0.send_initial_message(request).await
+        }
+
+        async fn take_initial_messages(
+            &self,
+            request: TakeInitialMessagesRequest,
+        ) -> protocol::Result<TakeInitialMessagesResponse> {
+            self.0.take_initial_messages(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn prekeys_published_without_a_reply_stay_usable() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let mut alice = Client::new(InProcessHandshake(&handshake));
+        let mut bob = Client::new(LosingReply(&handshake, Cell::new(true)));
+
+        // The server has Bob's prekeys, but he never heard so; Alice uses them meanwhile.
+        assert!(bob.publish_keys(1).await.is_err());
+        let mut alice_session = alice
+            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        // Bob publishes again, and many times more, before he takes her initial message: it
+        // still is accepted, as publishing again did not start a new generation.
+        bob.publish_keys(1).await.unwrap();
+        bob.publish_keys(1).await.unwrap();
+        let initial_messages = bob.take_initial_messages().await.unwrap();
+        let (_bob_session, first) = bob
+            .accept(
+                &alice.identity_key(),
+                &initial_messages[0],
+                InProcessMailbox(&mailbox),
+            )
+            .unwrap();
+        assert_eq!(first, b"hi");
+        alice_session.send(b"there").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_of_an_earlier_session_pushed_twice_is_a_duplicate() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut earlier, mut bob, mut bob_session) =
+            talking(&handshake, &mailbox).await;
+
+        // Alice pushes a message twice, as a push whose answer was lost goes again, and starts
+        // a new session, which Bob takes before the message.
+        let message = earlier.encrypt(b"twice").unwrap();
+        earlier.push(message.clone()).await.unwrap();
+        earlier.push(message).await.unwrap();
+        alice
+            .initiate(&bob.identity_key(), b"again", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
+        let received = receive_all(&mut bob_session).await;
+        assert_eq!(received[0].content.as_ref().unwrap(), b"twice");
+        assert_eq!(
+            received[1].content.as_ref().unwrap_err().kind(),
+            ErrorKind::DuplicateMessage
+        );
     }
 
     #[tokio::test]
@@ -1206,7 +1676,7 @@ mod test {
             .unwrap();
         accept_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox).await;
         // Bob's reply to the copied session, from before.
-        assert!(alice_session.receive().await.unwrap()[0].is_err());
+        assert!(receive_all(&mut alice_session).await[0].content.is_err());
 
         // The thief writes on the copied session as Alice, and Bob decrypts it while he keeps
         // it; but he never sends on it, so the thief reads nothing more. Missing Alice, he
@@ -1214,20 +1684,25 @@ mod test {
         // one drops out.
         for _ in 0..4 * MAX_DIRECTION_CHANGES {
             stolen.send(b"it is me").await.unwrap();
-            bob_session.receive().await.unwrap();
+            receive_all(&mut bob_session).await;
             if bob_session.needs_new_session() {
-                start_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox, b"again").await;
+                bob.start_again(&mut bob_session, b"again").await.unwrap();
                 accept_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox).await;
             }
             bob_session.send(b"for alice").await.unwrap();
-            assert!(stolen.receive().await.unwrap().iter().all(Result::is_err));
+            assert!(
+                receive_all(&mut stolen)
+                    .await
+                    .iter()
+                    .all(|received| received.content.is_err())
+            );
             assert_eq!(
-                contents(alice_session.receive().await.unwrap()),
+                contents(receive_all(&mut alice_session).await),
                 [b"for alice"]
             );
         }
         stolen.send(b"still me").await.unwrap();
-        assert!(bob_session.receive().await.unwrap()[0].is_err());
+        assert!(receive_all(&mut bob_session).await[0].content.is_err());
     }
 
     #[tokio::test]
@@ -1396,17 +1871,17 @@ mod test {
             restored::<_, proto::SessionState>(bob_session.state()),
         );
         assert_eq!(
-            contents(bob_session.receive().await.unwrap()),
+            contents(receive_all(&mut bob_session).await),
             [b"there".to_vec()]
         );
         let mut bob_session = Session::restore(
             InProcessMailbox(&mailbox),
             restored::<_, proto::SessionState>(bob_session.state()),
         );
-        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert!(receive_all(&mut bob_session).await.is_empty());
         bob_session.send(b"hello").await.unwrap();
         assert_eq!(
-            contents(alice_session.receive().await.unwrap()),
+            contents(receive_all(&mut alice_session).await),
             [b"hello".to_vec()]
         );
     }

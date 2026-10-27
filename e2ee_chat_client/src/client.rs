@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{Stderr, Write},
     path::PathBuf,
@@ -16,22 +17,26 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use parking_lot::RwLock;
 use ratatui::{Terminal, prelude::*};
 use session::{
-    ErrorKind, Session,
+    ErrorKind, InitialMessage, Session,
     attachment::{self, KEY_LENGTH},
     protocol::attachment::ID_LENGTH,
 };
+use tokio::sync::Mutex as AsyncMutex;
 use tui_textarea::TextArea;
 
 use crate::{
-    message::{self, AttachmentPointer, Kind, Message, MessageState, greeting},
+    message::{
+        AttachmentPointer, Chat, Content, Events, Kind, Message, MessageState, greeting, stamp,
+    },
     navi::Navigation,
     save,
     screen::Screen,
     transport::{Connect, Http},
     widget::{
-        app::{App, AppState, PublicKey},
+        app::{App, AppState, PublicKey, SharedSession},
         connecting::Connecting,
         hint::Hint,
         pop_up::PopUp,
@@ -100,34 +105,118 @@ impl Client {
 
         let sessions = state.sessions.clone();
         let conversations = state.conversations.clone();
+        let (client, initial_messages, http) = (
+            state.client.clone(),
+            state.initial_messages.clone(),
+            state.http.clone(),
+        );
         tokio::spawn(async move {
             let mut sync = true;
             loop {
                 tokio::select! {
                     _ = async {
-                        let sessions: Vec<_> = sessions
+                        // A known contact's new session joins its chat first, see `take`; if
+                        // taking fails, what does not decrypt meanwhile waits, see below.
+                        let _ = take(&client, &sessions, &conversations, &initial_messages, &http)
+                            .await;
+                        let chats: Vec<_> = sessions
                             .read()
                             .iter()
                             .map(|(key, session)| (*key, session.clone()))
                             .collect();
-                        for (key, session) in sessions {
+                        for (key, session) in chats {
                             // Lock the session for one page at a time, so sending to this peer
                             // waits for one fetch at most.
                             loop {
-                                let page = session.lock().await.receive().await;
+                                let (page, mine_first, deleted) = {
+                                    let mut session = session.lock().await;
+                                    // Each content decoded once, as it may be an image.
+                                    let page = session.receive().await.map(|page| {
+                                        page.into_iter()
+                                            .map(|received| {
+                                                let content = received
+                                                    .content
+                                                    .map(|content| Content::from_bytes(&content));
+                                                (content, received.earlier, received.initial_messages)
+                                            })
+                                            .collect::<Vec<_>>()
+                                    });
+                                    // The peer deleted the chat, and its sessions: the next
+                                    // message goes on a new one. Under the same lock, so that no
+                                    // session joined meanwhile is retired. Unless it said so on
+                                    // an earlier session: then it started the chat again since,
+                                    // on the active one.
+                                    let deletions: Vec<_> = page
+                                        .iter()
+                                        .flatten()
+                                        .filter(|(content, ..)| {
+                                            matches!(
+                                                content,
+                                                Ok(Content {
+                                                    kind: Some(Kind::Deleted(_)),
+                                                    ..
+                                                })
+                                            )
+                                        })
+                                        .map(|(_, earlier, _)| *earlier)
+                                        .collect();
+                                    if deletions.contains(&false) {
+                                        session.retire();
+                                    }
+                                    let deleted = !deletions.is_empty();
+                                    (page, session.me() < session.peer(), deleted)
+                                };
                                 let Ok(page) = page else { break };
                                 if page.is_empty() {
                                     break;
                                 }
-                                for message in page.into_iter().filter_map(|m| m.ok()) {
-                                    if let Some(content) = message::shown(&message) {
-                                        conversations.write().entry(key).or_default().push(
-                                            Message {
-                                                content,
-                                                state: MessageState::Received,
-                                            },
-                                        );
+                                // Where it stopped, with the initial messages that came with the
+                                // rest of the page.
+                                let stalled = page
+                                    .last()
+                                    .filter(|(content, ..)| {
+                                        content
+                                            .as_ref()
+                                            .is_err_and(|e| e.kind() == ErrorKind::Stalled)
+                                    })
+                                    .map(|(.., initial_messages)| initial_messages.clone());
+                                for (content, ..) in page {
+                                    if let Ok(content) = content {
+                                        conversations
+                                            .write()
+                                            .entry(key)
+                                            .or_default()
+                                            .receive(content, mine_first);
                                     }
+                                }
+                                // What the peer never read goes again, on a new session, or on
+                                // the one it started again.
+                                if deleted {
+                                    resend(&client, &session, &conversations, &key).await;
+                                }
+                                // Stopped at a message that may be on a session whose initial
+                                // message came since they were taken, or with the page, as the
+                                // one in the inbox was lost: once they are taken, and those are
+                                // accepted, receiving goes on, past what still does not decrypt.
+                                if let Some(offered) = stalled {
+                                    if take(
+                                        &client,
+                                        &sessions,
+                                        &conversations,
+                                        &initial_messages,
+                                        &http,
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                    for initial_message in &offered {
+                                        let chats = &conversations;
+                                        join(&client, &session, chats, initial_message, &http)
+                                            .await;
+                                    }
+                                    session.lock().await.skip_stalled();
                                 }
                             }
                         }
@@ -141,6 +230,7 @@ impl Client {
             self.terminal.draw(|f| {
                 f.render_stateful_widget(App {}, f.area(), &mut state);
             })?;
+            tell_read(&state).await;
             match &state.screen {
                 Screen::Quit => {
                     if matches!(
@@ -171,15 +261,23 @@ impl Client {
                 Screen::Settings => match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Char('p') => {
-                            state.screen = match state.client.publish_keys(ONE_TIME_PREKEYS).await {
+                            state.screen = match state
+                                .client
+                                .lock()
+                                .await
+                                .publish_keys(ONE_TIME_PREKEYS)
+                                .await
+                            {
                                 Ok(_) => Screen::Hint("Keys published".to_string()),
                                 Err(err) => Screen::Hint(describe(err)),
                             };
                         }
                         KeyCode::Char('r') => {
-                            state.client = session::Client::new(state.http.connect());
+                            let client = session::Client::new(state.http.connect());
+                            state.identity_key = client.identity_key();
+                            *state.client.lock().await = client;
                             // They were sent to the old identity, whose prekeys are gone.
-                            state.initial_messages.clear();
+                            state.initial_messages.write().clear();
                             state.screen = Screen::Hint(
                                 "New identity created, publish its keys to be reachable"
                                     .to_string(),
@@ -204,12 +302,17 @@ impl Client {
                             state.current_activated_textarea = 0;
                             state.screen = Screen::HandleInitMsg;
                         }
-                        KeyCode::Char('l') => match state.client.take_initial_messages().await {
-                            // Taken initial messages are gone from the server, so keep them
-                            // until accepted.
-                            Ok(initial_messages) => {
-                                state.initial_messages.extend(initial_messages);
-                                state.screen = if state.initial_messages.is_empty() {
+                        KeyCode::Char('l') => match take(
+                            &state.client,
+                            &state.sessions,
+                            &state.conversations,
+                            &state.initial_messages,
+                            &state.http,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                state.screen = if state.initial_messages.read().is_empty() {
                                     Screen::Hint("No init message.".to_string())
                                 } else {
                                     state.current_selected_initial_message = 0;
@@ -251,44 +354,52 @@ impl Client {
                                 // The greeting, the session's first message, shows the peer
                                 // that the initial message is this client's, and lets the peer
                                 // write back.
-                                Screen::PushInitMsg => state
-                                    .client
-                                    .initiate(&identity_key, &greeting(), mailbox)
-                                    .await
-                                    .map_err(describe),
-                                // The newest one from this key: a peer who started again
-                                // only keeps the session of the last.
-                                Screen::HandleInitMsg => match state
-                                    .initial_messages
-                                    .iter()
-                                    .rposition(|i| i.x3dh.identity_key == identity_key)
-                                {
-                                    // Accepting fails for good, e.g. as the first message does
-                                    // not decrypt, or not at all, so remove it.
-                                    Some(index) => match state.client.accept(
-                                        &identity_key,
-                                        &state.initial_messages.remove(index),
-                                        mailbox,
-                                    ) {
-                                        Ok((session, first)) => {
-                                            if let Some(content) = message::shown(&first) {
+                                Screen::PushInitMsg => {
+                                    let clock = state
+                                        .conversations
+                                        .write()
+                                        .entry(identity_key)
+                                        .or_default()
+                                        .tick();
+                                    state
+                                        .client
+                                        .lock()
+                                        .await
+                                        .initiate(&identity_key, &greeting(clock), mailbox)
+                                        .await
+                                        .map_err(describe)
+                                }
+                                Screen::HandleInitMsg => {
+                                    match newest_waiting(&state.initial_messages, &identity_key) {
+                                        // Accepting fails for good, e.g. as the first message does
+                                        // not decrypt, or not at all, so it is removed.
+                                        Some(initial_message) => match state
+                                            .client
+                                            .lock()
+                                            .await
+                                            .accept(&identity_key, &initial_message, mailbox)
+                                        {
+                                            Ok((session, first)) => {
+                                                let mine_first = state.identity_key < identity_key;
                                                 state
                                                     .conversations
                                                     .write()
                                                     .entry(identity_key)
                                                     .or_default()
-                                                    .push(Message {
-                                                        content,
-                                                        state: MessageState::Received,
-                                                    });
+                                                    .receive(
+                                                        Content::from_bytes(&first),
+                                                        mine_first,
+                                                    );
+                                                Ok(session)
                                             }
-                                            Ok(session)
+                                            Err(e) => Err(describe(e)),
+                                        },
+                                        None => {
+                                            Err("No init message from this key, list them first"
+                                                .to_string())
                                         }
-                                        Err(e) => Err(describe(e)),
-                                    },
-                                    None => Err("No init message from this key, list them first"
-                                        .to_string()),
-                                },
+                                    }
+                                }
                                 _ => unreachable!(),
                             };
                             match session {
@@ -341,12 +452,13 @@ impl Client {
                         KeyCode::Esc => state.screen = Screen::Main,
                         KeyCode::Tab | KeyCode::Down => {
                             state.current_selected_initial_message += 1;
-                            state.current_selected_initial_message %= state.initial_messages.len();
+                            state.current_selected_initial_message %=
+                                state.initial_messages.read().len();
                         }
                         KeyCode::BackTab | KeyCode::Up => {
-                            state.current_selected_initial_message +=
-                                state.initial_messages.len() - 1;
-                            state.current_selected_initial_message %= state.initial_messages.len();
+                            let waiting = state.initial_messages.read().len();
+                            state.current_selected_initial_message += waiting - 1;
+                            state.current_selected_initial_message %= waiting;
                         }
                         KeyCode::Enter => {
                             state.textareas = vec![
@@ -355,7 +467,7 @@ impl Client {
                                     "Public IndentityKey (Alice)".to_string(),
                                     TextArea::new(vec![
                                         BASE64_STANDARD.encode(
-                                            state.initial_messages
+                                            state.initial_messages.read()
                                                 [state.current_selected_initial_message]
                                                 .x3dh
                                                 .identity_key,
@@ -410,7 +522,13 @@ impl Client {
                             if let Some(len) = state
                                 .contacts
                                 .get(state.current_activated_contact)
-                                .and_then(|c| state.conversations.read().get(&c.1).map(|m| m.len()))
+                                .and_then(|c| {
+                                    state
+                                        .conversations
+                                        .read()
+                                        .get(&c.1)
+                                        .map(|chat| chat.messages.len())
+                                })
                             {
                                 state.current_activated_message = len.saturating_sub(1);
                             }
@@ -422,7 +540,13 @@ impl Client {
                             if let Some(len) = state
                                 .contacts
                                 .get(state.current_activated_contact)
-                                .and_then(|c| state.conversations.read().get(&c.1).map(|m| m.len()))
+                                .and_then(|c| {
+                                    state
+                                        .conversations
+                                        .read()
+                                        .get(&c.1)
+                                        .map(|chat| chat.messages.len())
+                                })
                             {
                                 state.current_activated_message = len.saturating_sub(1);
                             }
@@ -438,7 +562,13 @@ impl Client {
                             if let Some(len) = state
                                 .contacts
                                 .get(state.current_activated_contact)
-                                .and_then(|c| state.conversations.read().get(&c.1).map(|m| m.len()))
+                                .and_then(|c| {
+                                    state
+                                        .conversations
+                                        .read()
+                                        .get(&c.1)
+                                        .map(|chat| chat.messages.len())
+                                })
                             {
                                 state.current_activated_message = (len.saturating_sub(1))
                                     .min(state.current_activated_message + 1);
@@ -488,21 +618,28 @@ impl Client {
     }
 
     /// Save the selected message's file or image in the downloads directory. An attachment is
-    /// downloaded now, and only now, chunk by chunk, showing how far it got. Returns where it
-    /// went.
+    /// downloaded now, and only now, chunk by chunk, showing how far it got; then, if it is the
+    /// peer's, the peer is told. Returns where it went.
     async fn save(&mut self, state: &AppState) -> Result<PathBuf> {
+        let &(_, key) = state
+            .contacts
+            .get(state.current_activated_contact)
+            .context("No chat open")?;
         let content = {
-            let &(_, key) = state
-                .contacts
-                .get(state.current_activated_contact)
-                .context("No chat open")?;
             let conversations = state.conversations.read();
             let message = conversations
                 .get(&key)
-                .and_then(|messages| messages.get(state.current_activated_message))
+                .and_then(|chat| chat.messages.get(state.current_activated_message))
                 .context("No message selected")?;
+            // The clock the peer named it by, to tell it once downloaded.
+            let clock = match message.state {
+                MessageState::Received { .. } => message.clock,
+                _ => 0,
+            };
             match &message.content {
-                Kind::Text(_) | Kind::Hello(_) => bail!("Only files and images can be saved"),
+                Kind::Text(_) | Kind::Hello(_) | Kind::Deleted(_) => {
+                    bail!("Only files and images can be saved")
+                }
                 Kind::Image(data) => {
                     let extension = image::guess_format(data)
                         .ok()
@@ -511,13 +648,27 @@ impl Client {
                     Ok((format!("image.{extension}"), data.clone()))
                 }
                 Kind::File(file) => Ok((file.name.clone(), file.data.clone())),
-                Kind::Attachment(pointer) => Err(pointer.clone()),
+                Kind::Attachment(pointer) => Err((pointer.clone(), clock)),
             }
         };
         match content {
             Ok((name, data)) => save::bytes(&state.downloads, &name, &data)
                 .with_context(|| format!("Cannot save {name}")),
-            Err(pointer) => self.download(state, &pointer).await,
+            Err((pointer, clock)) => {
+                let path = self.download(state, &pointer).await?;
+                // A statement of its own, so the map's lock is released before the `await`.
+                let session = state.sessions.read().get(&key).cloned();
+                if clock > 0
+                    && let Some(session) = session
+                {
+                    let events = Events {
+                        read: vec![],
+                        downloaded: vec![clock],
+                    };
+                    tell(&session, &state.conversations, &key, events).await;
+                }
+                Ok(path)
+            }
         }
     }
 
@@ -624,47 +775,202 @@ impl Client {
         let Some(session) = state.sessions.read().get(&key).cloned() else {
             return false;
         };
-        let sent = send_on(
-            &mut state.client,
-            &state.http,
-            &mut *session.lock().await,
-            &key,
-            &content.to_bytes(),
-        )
-        .await;
-        let message = Message {
-            state: match sent {
-                Ok(()) => MessageState::Sent,
-                Err(e) => MessageState::Error(describe(e)),
-            },
-            content,
+        // The client first, then the session, as `take` locks them.
+        let mut client = state.client.lock().await;
+        let chats = &state.conversations;
+        let sent = send_on(&mut client, &mut *session.lock().await, chats, &content).await;
+        drop(client);
+        let (state_of, place) = match sent {
+            Ok(clock) => (MessageState::Sent, clock),
+            Err(e) => (MessageState::Error(describe(e)), 0),
         };
-        state
-            .conversations
-            .write()
-            .entry(key)
-            .or_default()
-            .push(message);
-        state.current_activated_message = state.conversations.read()[&key].len().saturating_sub(1);
+        let message = Message {
+            state: state_of,
+            content,
+            place,
+            clock: place,
+        };
+        let mine_first = state.identity_key < key;
+        let mut conversations = state.conversations.write();
+        let chat = conversations.entry(key).or_default();
+        chat.insert(message, mine_first);
+        state.current_activated_message = chat.messages.len().saturating_sub(1);
         true
     }
 }
 
-/// Send `content` to `peer` on `session`; if it has none to send on, as the two kept missing
-/// each other, a new session starts first, greeting the peer, and the content goes on it.
+/// Send `content` on `session`, at the next place of its chat in `chats`; if it has none to send
+/// on, as the two kept missing each other or the peer deleted the chat, a new session starts
+/// first, greeting the peer, and the content goes on it. Returns its place.
 async fn send_on(
     client: &mut session::Client<Connect>,
-    http: &Http,
     session: &mut Session<Connect>,
-    peer: &PublicKey,
-    content: &[u8],
-) -> session::Result<()> {
+    chats: &RwLock<HashMap<PublicKey, Chat>>,
+    content: &Kind,
+) -> session::Result<u64> {
+    let peer = *session.peer();
+    let tick = || chats.write().entry(peer).or_default().tick();
     if session.needs_new_session() {
-        let started = client.initiate(peer, &greeting(), http.connect()).await?;
-        let older = std::mem::replace(session, started);
-        session.keep(older)?;
+        client.start_again(session, &greeting(tick())).await?;
     }
-    session.send(content).await
+    let clock = tick();
+    let mut bytes = content.to_bytes();
+    stamp(&mut bytes, clock);
+    session.send(&bytes).await?;
+    Ok(clock)
+}
+
+/// Send again, on a new session, this client's messages to `peer` that the peer never read, as
+/// it deleted the chat: each at a new place, as in a new chat.
+async fn resend(
+    client: &AsyncMutex<session::Client<Connect>>,
+    session: &SharedSession,
+    chats: &RwLock<HashMap<PublicKey, Chat>>,
+    peer: &PublicKey,
+) {
+    let unread: Vec<_> = {
+        let mut chats = chats.write();
+        let Some(chat) = chats.get_mut(peer) else {
+            return;
+        };
+        let (unread, others) = std::mem::take(&mut chat.messages)
+            .into_iter()
+            .partition(|message| matches!(message.state, MessageState::Sent));
+        chat.messages = others;
+        unread
+    };
+    // The client first, then the session, as `take` locks them.
+    let mut client = client.lock().await;
+    let mut session = session.lock().await;
+    let mine_first = session.me() < session.peer();
+    for mut message in unread {
+        let sent = send_on(&mut client, &mut session, chats, &message.content).await;
+        (message.state, message.place) = match sent {
+            Ok(clock) => (MessageState::Sent, clock),
+            Err(e) => (MessageState::Error(describe(e)), 0),
+        };
+        message.clock = message.place;
+        chats
+            .write()
+            .entry(*peer)
+            .or_default()
+            .insert(message, mine_first);
+    }
+}
+
+/// Tell the peer of the open chat which of its messages are read, as they show now.
+async fn tell_read(state: &AppState) {
+    let Some(&(_, key)) = state.contacts.get(state.current_activated_contact) else {
+        return;
+    };
+    let Some(session) = state.sessions.read().get(&key).cloned() else {
+        return;
+    };
+    let read = match state.conversations.write().get_mut(&key) {
+        Some(chat) => chat.read(),
+        None => return,
+    };
+    if !read.is_empty() {
+        let events = Events {
+            read,
+            downloaded: vec![],
+        };
+        tell(&session, &state.conversations, &key, events).await;
+    }
+}
+
+/// Tell `events` of the chat in `chats` with `peer` on `session`, in one message, never starting
+/// a new session for them. Reads that cannot go are told again later.
+async fn tell(
+    session: &SharedSession,
+    chats: &RwLock<HashMap<PublicKey, Chat>>,
+    peer: &PublicKey,
+    events: Events,
+) {
+    let mut session = session.lock().await;
+    let told = !session.needs_new_session() && session.send(&events.to_bytes()).await.is_ok();
+    if !told && let Some(chat) = chats.write().get_mut(peer) {
+        chat.untold(&events.read);
+    }
+}
+
+/// The newest of the initial messages from `peer` that wait, taken from them: a peer who
+/// started again only keeps the session of the last.
+fn newest_waiting(
+    waiting: &RwLock<Vec<InitialMessage>>,
+    peer: &PublicKey,
+) -> Option<InitialMessage> {
+    let mut waiting = waiting.write();
+    let index = waiting
+        .iter()
+        .rposition(|initial_message| initial_message.x3dh.identity_key == *peer)?;
+    Some(waiting.remove(index))
+}
+
+/// Accept `initial_message`, of the peer of `session`, which came with one of its messages
+/// rather than through the inbox, where it was lost: its session joins `session`, the chat so
+/// far, and its greeting moves the chat's clock in `chats`. One accepted already, or not from
+/// the peer, changes nothing.
+async fn join(
+    client: &AsyncMutex<session::Client<Connect>>,
+    session: &SharedSession,
+    chats: &RwLock<HashMap<PublicKey, Chat>>,
+    initial_message: &InitialMessage,
+    http: &Http,
+) {
+    // The client first, then the session, as `take` locks them.
+    let mut client = client.lock().await;
+    let mut session = session.lock().await;
+    let peer = *session.peer();
+    if let Ok((accepted, greeting)) = client.accept(&peer, initial_message, http.connect()) {
+        let older = std::mem::replace(&mut *session, accepted);
+        let _ = session.keep(older);
+        let mine_first = session.me() < session.peer();
+        chats
+            .write()
+            .entry(peer)
+            .or_default()
+            .receive(Content::from_bytes(&greeting), mine_first);
+    }
+}
+
+/// Take the initial messages waiting. A known contact's session joins its chat at once, as the
+/// messages on it only decrypt once it has, and receiving would skip them for good; so nothing
+/// is received until this succeeds. Its greeting moves the chat's clock in `chats`. A new peer's
+/// waits for the user to accept it.
+async fn take(
+    client: &AsyncMutex<session::Client<Connect>>,
+    sessions: &RwLock<HashMap<PublicKey, SharedSession>>,
+    chats: &RwLock<HashMap<PublicKey, Chat>>,
+    waiting: &RwLock<Vec<InitialMessage>>,
+    http: &Http,
+) -> session::Result<()> {
+    let mut client = client.lock().await;
+    // The server deleted them all: one that cannot join its chat must not lose the others.
+    let mut failure = None;
+    for initial_message in client.take_initial_messages().await? {
+        let peer = initial_message.x3dh.identity_key;
+        let known = sessions.read().get(&peer).cloned();
+        let Some(known) = known else {
+            waiting.write().push(initial_message);
+            continue;
+        };
+        // One whose first message does not decrypt is not from whom it claims: dropped.
+        if let Ok((session, greeting)) = client.accept(&peer, &initial_message, http.connect()) {
+            let mut known = known.lock().await;
+            let older = std::mem::replace(&mut *known, session);
+            if let Err(e) = known.keep(older) {
+                failure.get_or_insert(e);
+            }
+            let mine_first = known.me() < known.peer();
+            chats
+                .write()
+                .entry(peer)
+                .or_default()
+                .receive(Content::from_bytes(&greeting), mine_first);
+        }
+    }
+    failure.map_or(Ok(()), Err)
 }
 
 /// An error and its sources, e.g. "server error: status: Unavailable, ...", since an error's

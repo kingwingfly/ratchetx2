@@ -14,6 +14,9 @@ message ClientState {
   x3dh.v1.LocalPrekeys prekeys = 2;
   // Milliseconds since the Unix epoch of the last signed request.
   uint64 last_timestamp = 3;
+  // Whether the last publish of the prekeys may have failed, though the server may have them:
+  // the next publishes the same signed prekey again, with new one-time prekeys.
+  bool publishing = 4;
 }
 
 // A session's state.
@@ -26,6 +29,10 @@ message SessionState {
   // Whether the peer is known to have the active session: it started it, or a message on it
   // decrypted.
   bool known_by_peer = 7;
+  // The initial message (`handshake.v1.InitialMessage`, encoded) that started the active
+  // session, which this client did, sent with each message until the peer is known to have
+  // it; empty once it is.
+  bytes initial_message = 12;
   // The parties of earlier sessions with the peer, latest first, which only decrypt: messages
   // that `party` cannot decrypt are tried on them.
   repeated party.v1.Party others = 5;
@@ -40,6 +47,12 @@ message SessionState {
   // How many times the peers turned between sending on the active session and receiving on an
   // earlier one; past a few, the active session is retired.
   uint32 direction_changes = 9;
+  // The last sequence number of the page in which receiving stopped at a message that did not
+  // decrypt, which may be on a session whose initial message is waiting.
+  uint64 stalled_through = 10;
+  // Up to this sequence number, messages that do not decrypt are skipped: the initial messages
+  // were taken since.
+  uint64 skip_through = 11;
 }
 
 // What was done last on a session.

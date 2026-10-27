@@ -84,6 +84,9 @@ pub struct StoredMessage {
     pub header: Bytes,
     /// The encrypted content.
     pub content: Bytes,
+    /// The initial message, encoded, of the session the message is on, which its sender sends
+    /// with it while the recipient has not answered that session.
+    pub initial_message: Option<Bytes>,
 }
 
 /// Storage for the handshake server. Every method is atomic.
@@ -116,13 +119,15 @@ pub trait LocalHandshakeStore {
 /// Storage for the mailbox server. Every method is atomic.
 #[trait_variant::make(MailboxStore: Send)]
 pub trait LocalMailboxStore {
-    /// Append a message to the queue from `sender` to `recipient`; returns its sequence number.
+    /// Append a message to the queue from `sender` to `recipient`, with the initial message of
+    /// its session if any; returns its sequence number.
     async fn append(
         &self,
         sender: &PublicKey,
         recipient: &PublicKey,
         header: Bytes,
         content: Bytes,
+        initial_message: Option<Bytes>,
     ) -> Result<u64>;
     /// The messages of the queue from `sender` to `recipient` after sequence number `after`,
     /// in order, at most `limit`.

@@ -31,7 +31,7 @@ use super::{
     setting::{Setting, SettingState},
 };
 use crate::{
-    message::Message,
+    message::Chat,
     navi::{Navigation, Navigator},
     screen::Screen,
     transport::{Connect, Http},
@@ -40,7 +40,10 @@ use crate::{
 pub type SharedSession = Arc<AsyncMutex<Session<Connect>>>;
 
 pub struct AppState {
-    pub client: Client<Connect>,
+    /// Shared with the task that receives, which takes the initial messages first.
+    pub client: Arc<AsyncMutex<Client<Connect>>>,
+    /// The client's identity key.
+    pub identity_key: PublicKey,
     /// The server, for new handshake and mailbox clients.
     pub http: Http,
     /// Where saved files go.
@@ -51,15 +54,17 @@ pub struct AppState {
     /// Only locked to look sessions up, never across an `await`.
     pub sessions: Arc<RwLock<HashMap<PublicKey, SharedSession>>>,
     pub current_activated_contact: usize,
-    pub conversations: Arc<RwLock<HashMap<PublicKey, Vec<Message>>>>,
+    /// Only locked to read or change a chat, never across an `await`.
+    pub conversations: Arc<RwLock<HashMap<PublicKey, Chat>>>,
     pub current_activated_message: usize,
 
     pub navi: Navigator,
     pub chat_textarea: TextArea<'static>,
     pub textareas: Vec<(String, TextArea<'static>)>,
     pub current_activated_textarea: usize,
-    /// Initial messages taken from the server but not accepted yet.
-    pub initial_messages: Vec<InitialMessage>,
+    /// New peers' initial messages, taken from the server but not accepted yet; shared with
+    /// the task that receives, which takes them.
+    pub initial_messages: Arc<RwLock<Vec<InitialMessage>>>,
     pub current_selected_initial_message: usize,
     pub screen: Screen,
 
@@ -89,7 +94,8 @@ impl AppState {
             return Err(anyhow::Error::new(e).context(format!("cannot reach {server_addr}")));
         }
         Ok(Self {
-            client,
+            identity_key: client.identity_key(),
+            client: Arc::new(AsyncMutex::new(client)),
             http,
             downloads,
             contacts: vec![],
@@ -101,7 +107,7 @@ impl AppState {
             chat_textarea: text_area,
             textareas: vec![],
             current_activated_textarea: 0,
-            initial_messages: vec![],
+            initial_messages: Default::default(),
             current_selected_initial_message: 0,
             screen: Screen::default(),
             explore_state: Default::default(),
@@ -168,13 +174,13 @@ impl StatefulWidget for App {
         conversation_block.render(chunks[0], buf);
         {
             let conversations_r = state.conversations.read();
-            if let Some(messages) = state
+            if let Some(chat) = state
                 .contacts
                 .get(state.current_activated_contact)
                 .and_then(|c| conversations_r.get(&c.1))
             {
                 Conversation {
-                    messages,
+                    messages: &chat.messages,
                     current: state.current_activated_message,
                     picker: &state.picker,
                 }
@@ -197,7 +203,7 @@ impl StatefulWidget for App {
                 buf,
                 &mut SettingState {
                     server_addr: state.http.server().to_string(),
-                    public_identity_key: state.client.identity_key(),
+                    public_identity_key: state.identity_key,
                 },
             ),
             Screen::Quit => PopUp { inner: Quit {} }.render(area, buf),
@@ -217,9 +223,16 @@ impl StatefulWidget for App {
             }
             Screen::ListInitMsg => {
                 PopUpStateful {
-                    inner: List::new(state.initial_messages.iter().map(|initial_message| {
-                        BASE64_STANDARD.encode(initial_message.x3dh.identity_key)
-                    }))
+                    inner: List::new(
+                        state
+                            .initial_messages
+                            .read()
+                            .iter()
+                            .map(|initial_message| {
+                                BASE64_STANDARD.encode(initial_message.x3dh.identity_key)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
                     .highlight_style(Style::default().green())
                     .block(Block::bordered().padding(Padding::proportional(2))),
                 }

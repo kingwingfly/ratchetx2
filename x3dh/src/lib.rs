@@ -215,6 +215,32 @@ impl LocalPrekeys {
         Self::default()
     }
 
+    /// Add `one_time_count` one-time prekeys to the last generation, to publish with its signed
+    /// prekey, signed again by `identity`: for when publishing it may have failed, though the
+    /// server may have it, so that a new generation does not delete private keys of prekeys the
+    /// server hands out. Generates a generation if there is none.
+    pub fn extend(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        one_time_count: usize,
+    ) -> PublishedPrekeys {
+        let Some(generation) = self.generations.back_mut() else {
+            return self.generate(identity, one_time_count);
+        };
+        let one_time_prekeys = (0..one_time_count)
+            .map(|_| {
+                let (public_key, secret) = generate_key_pair();
+                generation.one_time.insert(public_key, secret);
+                public_key
+            })
+            .collect();
+        PublishedPrekeys {
+            signed_prekey: generation.signed_prekey,
+            signed_prekey_signature: identity.sign(generation.signed_prekey),
+            one_time_prekeys,
+        }
+    }
+
     /// Generate a signed prekey, signed by `identity`, and `one_time_count` one-time prekeys, as
     /// a new generation.
     ///
@@ -514,6 +540,30 @@ mod test {
                 alice_agreement.associated_data,
                 bob_agreement.associated_data
             );
+        }
+    }
+
+    #[test]
+    fn extending_keeps_the_prekeys_handed_out() {
+        let alice = XEdDSAPrivateKey::generate();
+        let (bob, mut prekeys, first) = bob_setup(1);
+        let (alice_key, bob_key) = (public_key(&alice), public_key(&bob));
+        // Published again, as the reply to the first publish was lost: the same signed prekey,
+        // and new one-time prekeys; one handed out before still works.
+        let again = prekeys.extend(&bob, 1);
+        assert_eq!(again.signed_prekey, first.signed_prekey);
+        assert_ne!(
+            again.one_time_prekeys.first().copied(),
+            first.one_time_prekey
+        );
+        let second = PrekeyBundle {
+            signed_prekey: again.signed_prekey,
+            signed_prekey_signature: again.signed_prekey_signature,
+            one_time_prekey: again.one_time_prekeys.first().copied(),
+        };
+        for bundle in [first, second] {
+            let (message, _) = bundle.initiate(&alice, &bob_key).unwrap();
+            prekeys.accept(&bob, &alice_key, &message).unwrap();
         }
     }
 

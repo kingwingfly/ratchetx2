@@ -116,6 +116,11 @@ pub enum ErrorKind {
     /// A received message cannot be decrypted.
     #[error("cannot decrypt the message")]
     Undecryptable,
+    /// Receiving stopped at a message that does not decrypt, which may be on a session whose
+    /// initial message is waiting: take the initial messages, then receive again, see
+    /// [`Session::receive`](crate::Session::receive).
+    #[error("receiving stopped at a message that does not decrypt yet")]
+    Stalled,
     /// A received message was received already.
     #[error("duplicate message")]
     DuplicateMessage,

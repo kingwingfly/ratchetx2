@@ -23,11 +23,13 @@ pub trait LocalMailbox {
 #[cfg(feature = "server")]
 mod server {
     use bon::Builder;
+    use bytes::Bytes;
     use party::EncryptedMessage;
+    use prost::Message as _;
     use storage::LocalMailboxStore;
 
     use super::*;
-    use crate::{error::ErrorKind, fixed};
+    use crate::{error::ErrorKind, fixed, handshake::InitialMessage};
 
     /// Limits of a [`MailboxServer`].
     #[derive(Debug, Clone, Copy)]
@@ -78,12 +80,24 @@ mod server {
         async fn push(&self, request: PushRequest) -> Result<PushResponse> {
             let (sender, recipient) = (fixed(&request.sender)?, fixed(&request.recipient)?);
             let message = request.message.ok_or(ErrorKind::Malformed)?;
-            if message.header.len() + message.content.len() > self.limits.max_message_size {
+            let initial_message = request
+                .initial_message
+                .map(|initial_message| Bytes::from(initial_message.encode_to_vec()));
+            let size = message.header.len()
+                + message.content.len()
+                + initial_message.as_ref().map_or(0, Bytes::len);
+            if size > self.limits.max_message_size {
                 return Err(ErrorKind::LimitExceeded.into());
             }
             let sequence = self
                 .store
-                .append(&sender, &recipient, message.header, message.content)
+                .append(
+                    &sender,
+                    &recipient,
+                    message.header,
+                    message.content,
+                    initial_message,
+                )
                 .await?;
             Ok(PushResponse { sequence })
         }
@@ -110,6 +124,10 @@ mod server {
                         header: stored.header,
                         content: stored.content,
                     }),
+                    // As stored from a push, which decoded it.
+                    initial_message: stored
+                        .initial_message
+                        .and_then(|bytes| InitialMessage::decode(bytes).ok()),
                 };
                 size += prost::encoding::message::encoded_len(1, &envelope);
                 if !messages.is_empty() && size > self.limits.max_message_size {
@@ -139,7 +157,27 @@ mod server {
                     header: Bytes::from_static(b"header"),
                     content: Bytes::from_static(content),
                 }),
+                initial_message: None,
             }
+        }
+
+        #[tokio::test]
+        async fn messages_keep_their_initial_message() {
+            let server = MailboxServer::new(MemoryStore::default());
+            let initial_message = InitialMessage {
+                identity_key: Bytes::from_static(&ALICE),
+                ..InitialMessage::default()
+            };
+            let pushed = server
+                .push(PushRequest {
+                    initial_message: Some(initial_message.clone()),
+                    ..push(b"a")
+                })
+                .await
+                .unwrap();
+            assert_eq!(pushed.sequence, 1);
+            let messages = server.fetch(fetch(0, 0)).await.unwrap().messages;
+            assert_eq!(messages[0].initial_message, Some(initial_message));
         }
 
         fn fetch(after: u64, limit: u32) -> FetchRequest {

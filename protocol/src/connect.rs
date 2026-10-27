@@ -473,6 +473,7 @@ mod test {
             sender: Bytes::from_static(&[1; 32]),
             recipient: Bytes::from_static(&[2; 32]),
             message: Some(message.clone()),
+            initial_message: None,
         };
         assert_eq!(client.push(request).await.unwrap().sequence, 1);
         let request = FetchRequest {
