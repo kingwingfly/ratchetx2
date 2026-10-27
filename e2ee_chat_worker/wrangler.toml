@@ -13,7 +13,7 @@ watch_dir = ["src", "../e2ee_chat_web/src", "../e2ee_chat_web/index.html", "../e
 [assets]
 directory = "../e2ee_chat_web/dist"
 
-# Prekeys, initial messages and message queues. Create it with
+# Prekeys, initial messages, message queues and attachments. Create it with
 # `npx wrangler d1 create e2ee-chat` and put its id here.
 [[d1_databases]]
 binding = "DB"
@@ -21,7 +21,8 @@ database_name = "e2ee-chat"
 database_id = "00000000-0000-0000-0000-000000000000"
 migrations_dir = "migrations"
 
-# Message contents over 64 KiB. Create it with `npx wrangler r2 bucket create e2ee-chat`.
+# Message contents over 64 KiB and attachments' chunks. Create it with
+# `npx wrangler r2 bucket create e2ee-chat`.
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "e2ee-chat"
@@ -36,7 +37,7 @@ class_name = "Notifier"
 tag = "v1"
 new_sqlite_classes = ["Notifier"]
 
-# Daily, delete the messages and initial messages older than RETENTION_DAYS.
+# Daily, delete the messages, initial messages and attachments older than RETENTION_DAYS.
 [triggers]
 crons = ["0 4 * * *"]
 
