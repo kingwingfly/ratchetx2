@@ -42,11 +42,15 @@ new_sqlite_classes = ["Notifier"]
 [triggers]
 crons = ["0 4 * * *"]
 
-# The secrets PASSWORD, which clients sign in with to store files, and AUTH_KEY, which signs
-# their sign-ins' cookies, are set with `npx wrangler secret put`, or in .dev.vars for
-# `wrangler dev`; see the README.
 [vars]
 RETENTION_DAYS = "30"
 FILE_RETENTION_DAYS = "90"
 # How long a sign-in lasts.
 SESSION_DAYS = "30"
+
+# The secrets PASSWORD, which clients sign in with, as every write takes it, and AUTH_KEY, which
+# signs their sign-ins' cookies: set with `npx wrangler secret put`, or in .dev.vars for
+# `wrangler dev`, which warns if one is missing; see the README. Without both, nobody can use the
+# server.
+[secrets]
+required = ["PASSWORD", "AUTH_KEY"]
