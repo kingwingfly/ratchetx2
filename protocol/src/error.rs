@@ -73,6 +73,10 @@ pub enum ErrorKind {
     /// Too many one-time prekeys, initial messages or chunks, or a message or chunk too large.
     #[error("limit exceeded")]
     LimitExceeded,
+    /// The server stores this only for clients signed in to it, e.g. with its password: a large
+    /// message, or an attachment, which cost it storage.
+    #[error("sign-in required")]
+    SignInRequired,
     /// The server's storage failed.
     #[error("storage error")]
     Storage,

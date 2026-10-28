@@ -1,6 +1,8 @@
 syntax = "proto3";
 
-// The mailbox service: one queue of encrypted messages per sender and recipient.
+// The mailbox service: one queue of encrypted messages per sender and recipient. A message goes
+// once its recipient has it, which it proves with the message's delivery token: a secret only
+// the two peers can compute, whose SHA-256 the push gives the server.
 package mailbox.v1;
 
 import "handshake.proto";
@@ -18,6 +20,9 @@ message PushRequest {
   // message while the recipient has not answered that session, so that the recipient can
   // accept it from here if the one in its inbox was lost.
   handshake.v1.InitialMessage initial_message = 4;
+  // SHA-256 of the message's delivery token (32 bytes), which its recipient gives back once it
+  // has the message, so that the server deletes it; empty for a message that only expires.
+  bytes delivery_hash = 5;
 }
 
 // Reply to `PushRequest`.
@@ -36,6 +41,9 @@ message FetchRequest {
   uint64 after = 3;
   // At most this many messages; 0 for the server's maximum.
   uint32 limit = 4;
+  // The delivery tokens (16 bytes each) of messages of the queue that the recipient has, kept
+  // where it keeps its messages: the server deletes them first. At most 1000.
+  repeated bytes delivered = 5;
 }
 
 // The fetched messages, in order.
@@ -50,7 +58,8 @@ message Envelope {
   uint64 sequence = 1;
   // The initial message of the message's session, if its sender sent one with it.
   handshake.v1.InitialMessage initial_message = 4;
-  // The message.
+  // The message; none if its content expired before it was fetched, e.g. as the server's
+  // storage deletes old objects, which the recipient goes past.
   party.v1.EncryptedMessage message = 2;
 }
 
@@ -58,6 +67,6 @@ message Envelope {
 service MailboxService {
   // Append a message to a queue.
   rpc Push(PushRequest) returns (PushResponse);
-  // Read messages from a queue.
+  // Read messages from a queue, deleting those the recipient has.
   rpc Fetch(FetchRequest) returns (FetchResponse);
 }

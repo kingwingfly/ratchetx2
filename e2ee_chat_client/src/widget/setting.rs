@@ -10,6 +10,8 @@ pub struct Setting {}
 pub struct SettingState {
     pub server_addr: String,
     pub public_identity_key: PublicKey,
+    /// Whether this client signed in to the server, which storing files there takes.
+    pub signed_in: bool,
 }
 
 impl StatefulWidget for Setting {
@@ -47,6 +49,14 @@ impl StatefulWidget for Setting {
                         Cell::from("Public Identity Key"),
                         Cell::from(BASE64_STANDARD.encode(state.public_identity_key).as_str()),
                     ]),
+                    Row::new([
+                        Cell::from("Files"),
+                        Cell::from(if state.signed_in {
+                            "signed in: the server keeps them"
+                        } else {
+                            "sign in for the server to keep them"
+                        }),
+                    ]),
                 ]),
             chunks[0],
             buf,
@@ -62,7 +72,9 @@ impl StatefulWidget for Setting {
                 Span::raw("H").underlined(),
                 Span::raw("andle/"),
                 Span::raw("L").underlined(),
-                Span::raw("ist Initial Messages"),
+                Span::raw("ist Initial Messages | Sign "),
+                Span::raw("I").underlined(),
+                Span::raw("n"),
             ])
             .centered()
             .gray()

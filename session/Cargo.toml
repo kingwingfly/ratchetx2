@@ -13,6 +13,8 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 bon = "3.10"
 bytes = "1"
 getrandom = "0.4"
+hkdf = "0.13"
+hmac = "0.13"
 party = { path = "../party", default-features = false }
 prost = "0.14"
 protocol = { path = "../protocol", default-features = false }

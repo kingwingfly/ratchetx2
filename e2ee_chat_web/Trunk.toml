@@ -23,3 +23,7 @@ backend = "http://127.0.0.1:8787/attachment.v1.AttachmentService/"
 [[proxy]]
 backend = "ws://127.0.0.1:8787/notifications"
 ws = true
+
+# Signing in, whose cookie the browser then keeps for this page, as it would for the Worker's.
+[[proxy]]
+backend = "http://127.0.0.1:8787/auth"

@@ -21,8 +21,17 @@ pub struct MemoryStore {
 struct Inner {
     bundles: HashMap<PublicKey, (Bundle, VecDeque<PublicKey>)>,
     inboxes: HashMap<PublicKey, Inbox>,
-    queues: HashMap<(PublicKey, PublicKey), Vec<StoredMessage>>,
+    queues: HashMap<(PublicKey, PublicKey), Vec<Queued>>,
+    /// The last sequence number of each queue, which goes on once its messages are deleted.
+    last_sequences: HashMap<(PublicKey, PublicKey), u64>,
     attachments: HashMap<AttachmentId, (StoredAttachment, HashMap<u32, Bytes>)>,
+}
+
+/// A message of a queue, with SHA-256 of its delivery token, if any.
+#[derive(Debug)]
+struct Queued {
+    message: StoredMessage,
+    delivery_hash: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Default)]
@@ -93,19 +102,49 @@ impl MailboxStore for MemoryStore {
         header: Bytes,
         content: Bytes,
         initial_message: Option<Bytes>,
+        delivery_hash: Option<[u8; 32]>,
     ) -> Result<u64> {
         let mut inner = self.inner.lock();
-        let queue = inner.queues.entry((*sender, *recipient)).or_default();
-        let sequence = queue.last().map_or(1, |last| last.sequence + 1);
-        queue.push(StoredMessage {
+        let last = inner
+            .last_sequences
+            .entry((*sender, *recipient))
+            .or_default();
+        *last += 1;
+        let sequence = *last;
+        let message = StoredMessage {
             sender: *sender,
             recipient: *recipient,
             sequence,
             header,
-            content,
+            content: Some(content),
             initial_message,
-        });
+        };
+        inner
+            .queues
+            .entry((*sender, *recipient))
+            .or_default()
+            .push(Queued {
+                message,
+                delivery_hash,
+            });
         Ok(sequence)
+    }
+
+    async fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if let Some(queue) = inner.queues.get_mut(&(*sender, *recipient)) {
+            queue.retain(|queued| {
+                !queued
+                    .delivery_hash
+                    .is_some_and(|hash| hashes.contains(&hash))
+            });
+        }
+        Ok(())
     }
 
     async fn read(
@@ -119,12 +158,13 @@ impl MailboxStore for MemoryStore {
         let Some(queue) = inner.queues.get(&(*sender, *recipient)) else {
             return Ok(vec![]);
         };
-        // Sequence numbers increase by 1, so the messages after `after`, at most `limit`, are
-        // the ones numbered up to `after + limit`.
-        let last = after.saturating_add(limit.into());
-        let start = queue.partition_point(|message| message.sequence <= after);
-        let end = queue.partition_point(|message| message.sequence <= last);
-        Ok(queue[start..end].to_vec())
+        // In order, with gaps where messages were delivered or expired.
+        let start = queue.partition_point(|queued| queued.message.sequence <= after);
+        Ok(queue[start..]
+            .iter()
+            .take(limit as usize)
+            .map(|queued| queued.message.clone())
+            .collect())
     }
 }
 
@@ -150,8 +190,9 @@ impl AttachmentStore for MemoryStore {
 
     async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
         let mut inner = self.inner.lock();
-        let (_, chunks) = inner.attachments.get_mut(id).ok_or(ErrorKind::Other)?;
-        chunks.insert(index, data);
+        let (attachment, chunks) = inner.attachments.get_mut(id).ok_or(ErrorKind::Other)?;
+        chunks.entry(index).or_insert(data);
+        attachment.uploaded |= crate::uploaded_bit(index);
         Ok(())
     }
 

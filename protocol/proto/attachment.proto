@@ -22,11 +22,16 @@ message StartUploadRequest {
 message StartUploadResponse {
   // Its random ID (16 bytes), which downloading it takes.
   bytes id = 1;
-  // The random token (16 bytes) that uploading its chunks takes; keep it to the uploader.
+  // The random token (16 bytes) that uploading its chunks and cancelling the upload take; keep
+  // it to the uploader, which may keep it after the upload to delete the attachment later.
   bytes upload_token = 2;
+  // When the server deletes the attachment, in milliseconds since the Unix epoch, after which
+  // the token is no use; 0 if it does not say.
+  uint64 expires = 3;
 }
 
-// Upload, or upload again, a chunk of an attachment.
+// Upload a chunk of an attachment. Uploading it again, e.g. as the reply was lost, keeps the
+// first copy.
 message PutChunkRequest {
   // The attachment's ID.
   bytes id = 1;
@@ -51,7 +56,8 @@ message GetChunkRequest {
 
 // A chunk of an attachment, or that it is not uploaded yet: the attachment is there, as it is
 // downloaded while uploaded, but not this chunk. An attachment that is gone, expired or cancelled,
-// is a `not_found` error.
+// is a `not_found` error, and so is a chunk that was uploaded and is gone, as the server's
+// storage deleted it once old.
 message GetChunkResponse {
   // The chunk, as uploaded; empty unless `uploaded`.
   bytes data = 1;
@@ -59,7 +65,7 @@ message GetChunkResponse {
   bool uploaded = 2;
 }
 
-// Cancel an upload: the attachment and its chunks go.
+// Cancel an upload, done or not: the attachment and its chunks go.
 message CancelUploadRequest {
   // The attachment's ID.
   bytes id = 1;
@@ -74,10 +80,10 @@ message CancelUploadResponse {}
 service AttachmentService {
   // Start uploading an attachment.
   rpc StartUpload(StartUploadRequest) returns (StartUploadResponse);
-  // Upload a chunk.
+  // Upload a chunk, once.
   rpc PutChunk(PutChunkRequest) returns (PutChunkResponse);
   // Download a chunk.
   rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
-  // Cancel an upload.
+  // Cancel an upload, or delete an attachment uploaded.
   rpc CancelUpload(CancelUploadRequest) returns (CancelUploadResponse);
 }

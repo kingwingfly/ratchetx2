@@ -35,6 +35,16 @@ impl fmt::Debug for SessionState {
             .field("direction_changes", &self.direction_changes)
             .field("stalled_through", &self.stalled_through)
             .field("skip_through", &self.skip_through)
-            .finish()
+            .field("delivered", &self.delivered.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for EarlierSession {
+    /// Shows no keys.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EarlierSession")
+            .field("party", &self.party)
+            .finish_non_exhaustive()
     }
 }

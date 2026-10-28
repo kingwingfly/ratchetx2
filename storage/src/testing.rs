@@ -114,6 +114,7 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
                 Bytes::from(vec![i]),
                 Bytes::from(vec![i, i]),
                 initial_message,
+                Some([i; 32]),
             )
             .await
             .unwrap();
@@ -127,6 +128,7 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
             Bytes::from_static(b"h"),
             Bytes::from_static(b"c"),
             None,
+            Some([1; 32]),
         )
         .await
         .unwrap();
@@ -142,7 +144,7 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
             recipient: bob,
             sequence: 2,
             header: Bytes::from(vec![2]),
-            content: Bytes::from(vec![2, 2]),
+            content: Some(Bytes::from(vec![2, 2])),
             initial_message: Some(Bytes::from_static(b"initial")),
         }
     );
@@ -158,6 +160,41 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
             .is_empty()
     );
     assert_eq!(store.read(&bob, &alice, 0, 10).await.unwrap().len(), 1);
+
+    // Delivered, the first two go, of their queue only; a hash naming none changes nothing.
+    store
+        .delete_delivered(&alice, &bob, &[[1; 32], [2; 32], [9; 32]])
+        .await
+        .unwrap();
+    let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
+    let sequences: Vec<_> = messages.iter().map(|m| m.sequence).collect();
+    assert_eq!(sequences, [3]);
+    assert_eq!(store.read(&bob, &alice, 0, 10).await.unwrap().len(), 1);
+    // Numbers go on, and a page reads past the gap.
+    for i in 4..=6 {
+        let sequence = store
+            .append(
+                &alice,
+                &bob,
+                Bytes::from(vec![i]),
+                Bytes::from(vec![i]),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(sequence, u64::from(i));
+    }
+    store
+        .delete_delivered(&alice, &bob, &[[3; 32]])
+        .await
+        .unwrap();
+    let page = store.read(&alice, &bob, 0, 2).await.unwrap();
+    let sequences: Vec<_> = page.iter().map(|m| m.sequence).collect();
+    assert_eq!(sequences, [4, 5]);
+    // A message without a delivery hash stays.
+    store.delete_delivered(&alice, &bob, &[]).await.unwrap();
+    assert_eq!(store.read(&alice, &bob, 3, 10).await.unwrap().len(), 3);
 }
 
 /// Conformance suite for [`LocalAttachmentStore`].
@@ -167,6 +204,7 @@ pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
         uploader: [2; 32],
         chunks: 2,
         token_hash: [3; 32],
+        uploaded: 0,
     };
     assert_eq!(store.attachment(&attachment.id).await.unwrap(), None);
     assert!(store.add_attachment(attachment.clone()).await.unwrap());
@@ -190,19 +228,23 @@ pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
         .put_chunk(&attachment.id, 0, Bytes::from_static(b"first"))
         .await
         .unwrap();
-    // Putting a chunk again replaces it.
+    // Putting a chunk again keeps the first copy.
     store
         .put_chunk(&attachment.id, 0, Bytes::from_static(b"first again"))
         .await
         .unwrap();
     assert_eq!(
         store.chunk(&attachment.id, 0).await.unwrap(),
-        Some(Bytes::from_static(b"first again"))
+        Some(Bytes::from_static(b"first"))
     );
     assert_eq!(
         store.chunk(&attachment.id, 1).await.unwrap(),
         Some(Bytes::from_static(b"second"))
     );
+    // Both are noted as uploaded, whatever order they came in.
+    let uploaded = store.attachment(&attachment.id).await.unwrap().unwrap();
+    assert!(uploaded.was_uploaded(0) && uploaded.was_uploaded(1));
+    assert!(!uploaded.was_uploaded(2));
     assert_eq!(store.chunk(&[9; 16], 0).await.unwrap(), None);
 
     // Deleted, it is gone with its chunks, and deleting it again does nothing.

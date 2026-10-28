@@ -1,16 +1,25 @@
 //! The Connect calls, over the browser's `XMLHttpRequest`, which, unlike `fetch`, tells how far
 //! a request's body got.
 
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+};
 
 use futures::{
     channel::oneshot,
     future::{Either, select},
 };
 use js_sys::{ArrayBuffer, Uint8Array};
-use session::protocol::{
-    self, Error, ErrorKind,
-    connect::{CONTENT_TYPE, ConnectClient, LocalPost, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER},
+use session::{
+    ServerClock,
+    protocol::{
+        self, Error, ErrorKind,
+        connect::{
+            CONTENT_TYPE, ConnectClient, LocalPost, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+        },
+    },
 };
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{ProgressEvent, XmlHttpRequest, XmlHttpRequestResponseType, XmlHttpRequestUpload};
@@ -28,6 +37,44 @@ const STALL_CHECK: i32 = 1_000;
 
 /// Told how far the body of a request got: bytes sent, of how many.
 pub type Progress = Rc<dyn Fn(u64, u64)>;
+
+thread_local! {
+    /// The clocks of the servers called, by address, kept to their time by their responses.
+    static CLOCKS: RefCell<HashMap<String, ServerClock>> = RefCell::default();
+    /// Told when a server refuses a call for the sign-in, whichever call it was.
+    static REFUSED: RefCell<Option<Rc<dyn Fn()>>> = RefCell::default();
+}
+
+/// Tell `refused` whenever a server refuses a call as this browser is not signed in to it.
+pub fn on_sign_in_required(refused: impl Fn() + 'static) {
+    REFUSED.with_borrow_mut(|hook| *hook = Some(Rc::new(refused)));
+}
+
+/// Whether `status` and `body` are the server's own refusal of a call for the sign-in.
+fn asks_sign_in(status: u16, body: &[u8]) -> bool {
+    status == 403
+        && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|error| {
+            error.get("code").and_then(serde_json::Value::as_str) == Some("permission_denied")
+        })
+}
+
+/// The clock of `server`, as its responses tell it, which signs the requests whose time it
+/// checks: this device's may be off.
+pub fn clock(server: &str) -> ServerClock {
+    CLOCKS.with_borrow_mut(|clocks| {
+        clocks
+            .entry(server.trim_end_matches('/').to_string())
+            .or_default()
+            .clone()
+    })
+}
+
+/// Learn the time of `server` from the `Date` of `request`'s response, if it tells it.
+fn observe(server: &str, request: &XmlHttpRequest) {
+    if let Ok(Some(date)) = request.get_response_header("date") {
+        clock(server).observe_date(&date);
+    }
+}
 
 /// Posts to a server.
 #[derive(Clone)]
@@ -110,7 +157,7 @@ impl LocalPost for Fetch {
         // Declared after the closures, so that it goes first.
         let _handlers = Handlers {
             request: &request,
-            upload: &upload,
+            upload: Some(&upload),
         };
         request.set_onprogress(Some(progress.as_ref().unchecked_ref()));
         upload.set_onprogress(Some(sent.as_ref().unchecked_ref()));
@@ -132,9 +179,16 @@ impl LocalPost for Fetch {
             }
         };
         ended.map_err(|reason| Error::new(ErrorKind::Connect, reason))?;
+        observe(&self.server, &request);
         let status = request.status().map_err(failed)?;
         let body: ArrayBuffer = request.response().map_err(failed)?.unchecked_into();
-        Ok((status, Uint8Array::new(&body).to_vec()))
+        let body = Uint8Array::new(&body).to_vec();
+        if asks_sign_in(status, &body)
+            && let Some(refused) = REFUSED.with_borrow(Clone::clone)
+        {
+            refused();
+        }
+        Ok((status, body))
     }
 }
 
@@ -142,18 +196,70 @@ impl LocalPost for Fetch {
 /// request stopped if it has not ended, as when nothing moved, or the call was dropped.
 struct Handlers<'a> {
     request: &'a XmlHttpRequest,
-    upload: &'a XmlHttpRequestUpload,
+    /// The request's upload, if its progress is handled.
+    upload: Option<&'a XmlHttpRequestUpload>,
 }
 
 impl Drop for Handlers<'_> {
     fn drop(&mut self) {
         self.request.set_onprogress(None);
-        self.upload.set_onprogress(None);
+        if let Some(upload) = self.upload {
+            upload.set_onprogress(None);
+        }
         self.request.set_onload(None);
         self.request.set_onerror(None);
+        self.request.set_ontimeout(None);
         if self.request.ready_state() != XmlHttpRequest::DONE {
             // It only fires events, whose handlers are gone.
             let _ = self.request.abort();
         }
     }
+}
+
+/// How long a call outside Connect may take, in milliseconds.
+const CALL_TIMEOUT: u32 = 30_000;
+
+/// Call `path` of `server` outside Connect, e.g. to sign in: `method`, with `body` if any.
+/// Returns the server's status and text. Cookies come and go as with the page's own calls.
+pub async fn call(
+    server: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(u16, String), String> {
+    let request = XmlHttpRequest::new().map_err(js_error)?;
+    request
+        .open(method, &format!("{}{path}", server.trim_end_matches('/')))
+        .map_err(js_error)?;
+    request.set_timeout(CALL_TIMEOUT);
+    let (ended, end) = oneshot::channel();
+    let ended = Rc::new(Cell::new(Some(ended)));
+    let ends = |answered: bool| {
+        let ended = ended.clone();
+        Closure::<dyn FnMut()>::new(move || {
+            if let Some(ended) = ended.take() {
+                let _ = ended.send(answered);
+            }
+        })
+    };
+    let (load, error, timeout) = (ends(true), ends(false), ends(false));
+    // Declared after the closures, so that it goes first, also if this call is dropped.
+    let _handlers = Handlers {
+        request: &request,
+        upload: None,
+    };
+    request.set_onload(Some(load.as_ref().unchecked_ref()));
+    request.set_onerror(Some(error.as_ref().unchecked_ref()));
+    request.set_ontimeout(Some(timeout.as_ref().unchecked_ref()));
+    request.send_with_opt_str(body).map_err(js_error)?;
+    if !end.await.unwrap_or(false) {
+        return Err("the server cannot be reached".to_string());
+    }
+    observe(server, &request);
+    let status = request.status().map_err(js_error)?;
+    let text = request
+        .response_text()
+        .map_err(js_error)?
+        .unwrap_or_default();
+    Ok((status, text))
 }

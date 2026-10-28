@@ -8,7 +8,12 @@
 //! timestamp (u64, little-endian), and the server takes it only within
 //! [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of its own clock. It returns a random upload
 //! token, which uploading the chunks and cancelling the upload take, and a random ID, which
-//! downloading them takes.
+//! downloading them takes. Nothing names whom it is for: the recipients may download it as
+//! often as they like, until it expires or its uploader deletes it.
+//!
+//! A chunk is uploaded once: uploading it again, e.g. as the reply to its upload was lost, keeps
+//! the first copy, so that the upload token, which the uploader may keep to cancel the upload
+//! later, never changes what was downloaded.
 //!
 //! An attachment can be downloaded while it is uploaded: a chunk not uploaded yet is a
 //! [`GetChunkResponse`] that says so, while an attachment that is gone, expired or cancelled,
@@ -43,11 +48,11 @@ pub const TOKEN_LENGTH: usize = 16;
 pub trait LocalAttachments {
     /// Start uploading an attachment; see [`StartUploadRequest::sign`].
     async fn start_upload(&self, request: StartUploadRequest) -> Result<StartUploadResponse>;
-    /// Upload a chunk, or upload it again.
+    /// Upload a chunk; uploading it again keeps the first copy.
     async fn put_chunk(&self, request: PutChunkRequest) -> Result<PutChunkResponse>;
     /// Download a chunk, or learn that it is not uploaded yet.
     async fn get_chunk(&self, request: GetChunkRequest) -> Result<GetChunkResponse>;
-    /// Cancel an upload: the attachment and its chunks go.
+    /// Cancel an upload, done or not: the attachment and its chunks go.
     async fn cancel_upload(&self, request: CancelUploadRequest) -> Result<CancelUploadResponse>;
 }
 
@@ -101,12 +106,16 @@ mod server {
     pub struct AttachmentLimits {
         /// Most chunks of an attachment, so it is at most this many times [`MAX_CHUNK_SIZE`].
         pub max_chunks: u32,
+        /// How long the store keeps an attachment from its upload's start, if it says, which
+        /// the uploader learns, as its upload token is no use after.
+        pub retention: Option<core::time::Duration>,
     }
 
     impl Default for AttachmentLimits {
         fn default() -> Self {
             Self {
                 max_chunks: DEFAULT_MAX_CHUNKS,
+                retention: None,
             }
         }
     }
@@ -171,19 +180,25 @@ mod server {
                 uploader,
                 chunks: request.chunks,
                 token_hash: Sha256::digest(token).into(),
+                uploaded: 0,
             };
             let id = attachment.id;
             // 128 random bits do not collide, but a store that says so is believed.
             if !self.store.add_attachment(attachment).await? {
                 return Err(ErrorKind::Server.into());
             }
+            let expires = self.limits.retention.map_or(0, |retention| {
+                now.saturating_add(u64::try_from(retention.as_millis()).unwrap_or(u64::MAX))
+            });
             Ok(StartUploadResponse {
                 id: Bytes::copy_from_slice(&id),
                 upload_token: Bytes::copy_from_slice(&token),
+                expires,
             })
         }
 
-        /// Store a chunk, if the upload token is the attachment's.
+        /// Store a chunk, if the upload token is the attachment's and the chunk is not stored
+        /// already: one uploaded again keeps its first copy.
         async fn put_chunk(&self, request: PutChunkRequest) -> Result<PutChunkResponse> {
             if request.data.len() > MAX_CHUNK_SIZE {
                 return Err(ErrorKind::LimitExceeded.into());
@@ -192,27 +207,32 @@ mod server {
             if request.index >= attachment.chunks {
                 return Err(ErrorKind::Malformed.into());
             }
+            // Noted as uploaded, it stays as it is, though it expired since; the store keeps the
+            // first copy of the others, beyond what is noted.
+            if attachment.was_uploaded(request.index) {
+                return Ok(PutChunkResponse {});
+            }
             self.store
                 .put_chunk(&attachment.id, request.index, request.data)
                 .await?;
             Ok(PutChunkResponse {})
         }
 
-        /// A chunk, as uploaded, or that it is not uploaded yet.
+        /// A chunk, as uploaded, or that it is not uploaded yet. One uploaded and gone since,
+        /// as the store's lifecycle rules deleted it, is not found: it expired.
         async fn get_chunk(&self, request: GetChunkRequest) -> Result<GetChunkResponse> {
             let attachment = self.attachment(&request.id).await?;
             if request.index >= attachment.chunks {
                 return Err(ErrorKind::Malformed.into());
             }
-            Ok(
-                match self.store.chunk(&attachment.id, request.index).await? {
-                    Some(data) => GetChunkResponse {
-                        data,
-                        uploaded: true,
-                    },
-                    None => GetChunkResponse::default(),
-                },
-            )
+            match self.store.chunk(&attachment.id, request.index).await? {
+                Some(data) => Ok(GetChunkResponse {
+                    data,
+                    uploaded: true,
+                }),
+                None if attachment.was_uploaded(request.index) => Err(ErrorKind::NotFound.into()),
+                None => Ok(GetChunkResponse::default()),
+            }
         }
 
         /// Delete the attachment, if the upload token is its.
@@ -249,7 +269,10 @@ mod server {
         #[tokio::test]
         async fn upload_and_download() {
             let server = AttachmentServer::builder(MemoryStore::default())
-                .limits(AttachmentLimits { max_chunks: 2 })
+                .limits(AttachmentLimits {
+                    max_chunks: 2,
+                    retention: Some(core::time::Duration::from_secs(60)),
+                })
                 .build();
             let alice = XEdDSAPrivateKey::generate();
             // Too many chunks, or none.
@@ -261,6 +284,8 @@ mod server {
                 .start_upload(StartUploadRequest::sign(&alice, 2, now()))
                 .await
                 .unwrap();
+            // It says when it expires, a minute on.
+            assert!(started.expires.abs_diff(now() + 60_000) < 1000);
             let put = |index, upload_token: &Bytes, data: Vec<u8>| PutChunkRequest {
                 id: started.id.clone(),
                 upload_token: upload_token.clone(),
@@ -291,6 +316,12 @@ mod server {
             let second = server.get_chunk(get(1)).await.unwrap();
             assert!(second.uploaded);
             assert_eq!(second.data, &b"second"[..]);
+            // Uploaded again, even with its upload token, it stays as it was downloaded.
+            server
+                .put_chunk(put(1, &started.upload_token, b"changed".to_vec()))
+                .await
+                .unwrap();
+            assert_eq!(server.get_chunk(get(1)).await.unwrap().data, &b"second"[..]);
             // Not uploaded yet, or never: no such chunk.
             assert!(!server.get_chunk(get(0)).await.unwrap().uploaded);
             assert_eq!(

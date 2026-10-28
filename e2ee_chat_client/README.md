@@ -19,3 +19,5 @@ Options:
 For a local Worker, run `npx wrangler dev` in `e2ee_chat_worker`, then `e2ee_chat_client http://localhost:8787`.
 
 Its identity and sessions live in memory only, until it quits.
+
+The server is only for those signed in to it: sign in from the settings (Tab, then `i`) with the server's password, which the server's owner gives out, then publish your keys (`p`). The sign-in lasts until the client quits.

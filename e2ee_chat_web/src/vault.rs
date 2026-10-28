@@ -10,7 +10,8 @@
 //!   be pushed: an [`OutgoingRecord`]. The state only lists them, so that saving it stays small.
 //! - `attachment/<peer in hex>/<id in hex>/<index>`: a chunk of an attachment in a chat, as the
 //!   server has it: encrypted under the attachment's key, which only the history holds.
-//! - `upload/<peer in hex>/<id in hex>`: an [`PendingUpload`], until it is done.
+//! - `upload/<peer in hex>/<id in hex>`: a [`PendingUpload`], an attachment this client uploads
+//!   or uploaded, with its upload token, which can delete it from the server.
 //!
 //! But for the header and the chunks, each record is `nonce ‖ AES-256-GCM(key, record)`, with the
 //! record's name as associated data so that one record cannot pass for another. The key is
@@ -26,7 +27,7 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use idb::{Database, DatabaseEvent, Factory, KeyRange, ObjectStoreParams, TransactionMode};
 use js_sys::Uint8Array;
 use prost::Message;
-use session::PublicKey;
+use session::{PublicKey, Sealed, protocol::mailbox::PushRequest};
 use wasm_bindgen::JsValue;
 use zeroize::Zeroizing;
 
@@ -173,7 +174,12 @@ pub struct Awaiting {
 }
 
 /// An attachment being uploaded, kept so that the upload can go on after the page goes, with
-/// the file chosen again: from `uploaded`, once the file still has the hash it had.
+/// the file chosen again: from `uploaded`, once the file still has the hash it had. Once done, it
+/// stays, so that its upload token can delete it from the server.
+///
+/// One whose upload has not started, as the server keeps files only for those signed in to it,
+/// has no token yet, and is kept under an ID of this client's: its message waits in the chat, at
+/// `history_index`, for the upload to start, which then keeps it under the server's ID.
 #[derive(Clone, PartialEq, prost::Message)]
 #[prost(skip_debug)]
 pub struct PendingUpload {
@@ -204,6 +210,29 @@ pub struct PendingUpload {
     /// The attachment was sent to the chat, which downloads it as it is uploaded.
     #[prost(bool, tag = "10")]
     pub announced: bool,
+    /// The upload is done.
+    #[prost(bool, tag = "11")]
+    pub done: bool,
+    /// The history entry of its message, while its upload has not started.
+    #[prost(uint64, tag = "12")]
+    pub history_index: u64,
+    /// When the server deletes it, in milliseconds since the Unix epoch, as it said as the
+    /// upload started; 0 if it did not.
+    #[prost(uint64, tag = "13")]
+    pub expires: u64,
+}
+
+impl PendingUpload {
+    /// Whether its upload started, so that the server has it, under its ID.
+    pub fn started(&self) -> bool {
+        !self.token.is_empty()
+    }
+
+    /// Whether it is done and the server deleted it by `now`, the server's time, so that its
+    /// token is no use, and it need not be kept.
+    pub fn expired(&self, now: u64) -> bool {
+        self.done && self.expires != 0 && self.expires <= now
+    }
 }
 
 impl fmt::Debug for PendingUpload {
@@ -230,6 +259,11 @@ pub struct Outgoing {
     /// Its place, given as it was encrypted.
     #[prost(uint64, tag = "5")]
     pub clock: u64,
+    /// It is an attachment whose upload has not started, as the server keeps files only for
+    /// those signed in to it: it waits, and the ones after it with it, until it starts and the
+    /// message has the attachment.
+    #[prost(bool, tag = "6")]
+    pub awaits_upload: bool,
 }
 
 /// What a message not pushed yet is: its content, encrypted just before it goes, once its place
@@ -242,6 +276,29 @@ pub struct OutgoingRecord {
     /// Its content, until it is encrypted.
     #[prost(bytes = "vec", tag = "3")]
     pub content: Vec<u8>,
+    /// SHA-256 of its delivery token, once encrypted, under the key of the session it was
+    /// encrypted on, see `session::Sealed`.
+    #[prost(bytes = "vec", tag = "4")]
+    pub delivery_hash: Vec<u8>,
+}
+
+impl OutgoingRecord {
+    /// The record of `sealed`, encrypted.
+    pub fn sealed(sealed: Sealed) -> Self {
+        Self {
+            message: Some(sealed.message),
+            content: vec![],
+            delivery_hash: sealed.delivery_hash.map(Vec::from).unwrap_or_default(),
+        }
+    }
+
+    /// The message to push, once encrypted.
+    pub fn to_push(&self) -> Sealed {
+        Sealed {
+            message: self.message.clone().unwrap_or_default(),
+            delivery_hash: self.delivery_hash.as_slice().try_into().ok(),
+        }
+    }
 }
 
 /// The bytes of a file in the history.
@@ -261,13 +318,12 @@ fn file_key(peer: &PublicKey, index: u64) -> String {
     format!("file/{}/{index:020}", hex(peer))
 }
 
-/// A message telling a peer that this client deleted the chat, not pushed yet.
+/// A message telling a peer that this client deleted the chat, not pushed yet: its push, made
+/// while the chat's session was there.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Farewell {
-    #[prost(bytes = "vec", tag = "1")]
-    pub peer: Vec<u8>,
-    #[prost(message, optional, tag = "2")]
-    pub message: Option<party::EncryptedMessage>,
+    #[prost(message, optional, tag = "1")]
+    pub push: Option<PushRequest>,
 }
 
 /// A message sent or received.
@@ -651,7 +707,8 @@ impl Vault {
         commit(transaction).await
     }
 
-    /// Forget the upload `id`, in the chat with `peer`, once done or cancelled.
+    /// Forget the upload `id`, in the chat with `peer`, once cancelled, or its attachment
+    /// deleted from the server.
     pub async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> Result<()> {
         let transaction = self
             .database
@@ -662,7 +719,7 @@ impl Vault {
         commit(transaction).await
     }
 
-    /// The upload `id`, in the chat with `peer`, if not done yet.
+    /// The upload `id`, in the chat with `peer`, if kept.
     pub async fn upload(&self, peer: &PublicKey, id: &[u8]) -> Result<Option<PendingUpload>> {
         let name = upload_key(peer, id);
         let Some(sealed) = get(&self.database, &name).await? else {
@@ -676,9 +733,16 @@ impl Vault {
             .map_err(|e| Error::Corrupt(e.to_string()))
     }
 
-    /// The uploads not done yet, with the peers of their chats.
-    pub async fn uploads(&self) -> Result<Vec<(PublicKey, PendingUpload)>> {
-        let range = prefix_range("upload/")?;
+    /// The uploads kept, done or not, with the peers of their chats: those of the chat with
+    /// `peer` only, if given.
+    pub async fn uploads(
+        &self,
+        peer: Option<&PublicKey>,
+    ) -> Result<Vec<(PublicKey, PendingUpload)>> {
+        let range = match peer {
+            Some(peer) => prefix_range(&format!("upload/{}/", hex(peer)))?,
+            None => prefix_range("upload/")?,
+        };
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadOnly)?;

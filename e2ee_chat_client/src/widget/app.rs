@@ -204,6 +204,7 @@ impl StatefulWidget for App {
                 &mut SettingState {
                     server_addr: state.http.server().to_string(),
                     public_identity_key: state.identity_key,
+                    signed_in: state.http.signed_in(),
                 },
             ),
             Screen::Quit => PopUp { inner: Quit {} }.render(area, buf),
@@ -213,7 +214,7 @@ impl StatefulWidget for App {
                 },
             }
             .render(area, buf),
-            Screen::PushInitMsg | Screen::HandleInitMsg => {
+            Screen::PushInitMsg | Screen::HandleInitMsg | Screen::SignIn => {
                 PopUpStateful {
                     inner: Form {
                         fields: &state.textareas,

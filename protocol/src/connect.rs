@@ -228,11 +228,22 @@ impl<P: LocalPost> ConnectClient<P> {
         if status == 200 {
             return T::decode(body.as_slice()).map_err(|e| Error::new(ErrorKind::Malformed, e));
         }
-        // Without a valid error body, the status tells the code.
-        let error = serde_json::from_slice::<CallError>(&body).unwrap_or_else(|_| CallError {
-            code: Code::from_status(status).name().to_string(),
-            message: format!("HTTP status {status}"),
-        });
+        let error = match serde_json::from_slice::<CallError>(&body) {
+            Ok(error) => error,
+            // Without a valid error body, the status tells the code. A sign-in is asked for only
+            // by the server's own error, as a 403 without one comes from something in front of
+            // it, e.g. a firewall's rule, which signing in does not get past.
+            Err(_) => {
+                let code = match Code::from_status(status) {
+                    Code::PermissionDenied => Code::Unknown,
+                    code => code,
+                };
+                CallError {
+                    code: code.name().to_string(),
+                    message: format!("HTTP status {status}"),
+                }
+            }
+        };
         let kind = Code::from_name(&error.code).map_or(ErrorKind::Server, ErrorKind::from);
         Err(Error::new(kind, error))
     }
@@ -392,6 +403,7 @@ impl From<ErrorKind> for Code {
             ErrorKind::StaleTimestamp => Self::FailedPrecondition,
             ErrorKind::NotFound => Self::NotFound,
             ErrorKind::LimitExceeded => Self::ResourceExhausted,
+            ErrorKind::SignInRequired => Self::PermissionDenied,
             ErrorKind::Storage => Self::Unavailable,
             _ => Self::Internal,
         }
@@ -406,6 +418,7 @@ impl From<Code> for ErrorKind {
             Code::FailedPrecondition => Self::StaleTimestamp,
             Code::NotFound => Self::NotFound,
             Code::ResourceExhausted => Self::LimitExceeded,
+            Code::PermissionDenied => Self::SignInRequired,
             _ => Self::Server,
         }
     }
@@ -474,6 +487,7 @@ mod test {
             recipient: Bytes::from_static(&[2; 32]),
             message: Some(message.clone()),
             initial_message: None,
+            delivery_hash: Bytes::new(),
         };
         assert_eq!(client.push(request).await.unwrap().sequence, 1);
         let request = FetchRequest {
@@ -481,10 +495,36 @@ mod test {
             recipient: Bytes::from_static(&[2; 32]),
             after: 0,
             limit: 0,
+            delivered: vec![],
         };
         let messages = client.fetch(request).await.unwrap().messages;
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message, Some(message));
+    }
+
+    /// Answers every call with `status` and `body`, as something in front of a server may.
+    struct Answering(u16, &'static [u8]);
+
+    impl LocalPost for Answering {
+        async fn post(&self, _path: &str, _body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+            Ok((self.0, self.1.to_vec()))
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_servers_own_refusal_asks_to_sign_in() {
+        let request = || PushRequest::default();
+        let refused = br#"{"code":"permission_denied","message":"sign in"}"#;
+        for (status, body, kind) in [
+            (403, &refused[..], ErrorKind::SignInRequired),
+            // A firewall's page, or none.
+            (403, b"<html>blocked</html>", ErrorKind::Server),
+            (403, b"", ErrorKind::Server),
+            (429, b"", ErrorKind::Server),
+        ] {
+            let client = ConnectClient::new(Answering(status, body));
+            assert_eq!(client.push(request()).await.unwrap_err().kind(), kind);
+        }
     }
 
     #[tokio::test]

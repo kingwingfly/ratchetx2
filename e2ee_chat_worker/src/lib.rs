@@ -1,15 +1,18 @@
 //! The E2EE chat server as a Cloudflare Worker: the handshake and mailbox services over the
 //! Connect protocol, stored in D1 and R2, and notifications over WebSockets. See the README.
 
+mod auth;
 mod notifier;
 mod store;
+
+use std::time::Duration;
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use prost::{Message, bytes::Bytes};
 use protocol::{
     ErrorKind,
-    attachment::AttachmentServer,
+    attachment::{AttachmentLimits, AttachmentServer},
     connect::{self, PROTOCOL_VERSION_HEADER, Procedure},
     fixed,
     handshake::{HandshakeServer, SendInitialMessageRequest},
@@ -29,8 +32,12 @@ const NOTIFICATIONS_PATH: &str = "/notifications";
 /// The binding of the notifiers' Durable Object namespace.
 const NOTIFIER: &str = "NOTIFIER";
 
-/// How long messages and initial messages are kept, unless the `RETENTION_DAYS` variable says.
+/// How long messages never delivered and initial messages never taken are kept, unless the
+/// `RETENTION_DAYS` variable says.
 const DEFAULT_RETENTION_DAYS: u64 = 30;
+/// How long attachments are kept, unless the `FILE_RETENTION_DAYS` variable says: longer than
+/// messages, as recipients may download them again, e.g. on a new device.
+const DEFAULT_FILE_RETENTION_DAYS: u64 = 90;
 /// The largest request body: the largest message, 4 MiB - 64 KiB, with room for the rest of a
 /// push.
 const MAX_BODY: usize = 4 << 20;
@@ -50,6 +57,9 @@ async fn fetch(request: Request, env: Env, context: Context) -> Result<Response>
     if request.path() == NOTIFICATIONS_PATH {
         return subscribe(request, &env).await;
     }
+    if request.path() == "/auth" || request.path().starts_with("/auth/") {
+        return dated(auth::handle(request, &env).await?);
+    }
     let Some(procedure) = Procedure::from_path(&request.path()) else {
         return Response::error("not found", 404);
     };
@@ -63,13 +73,15 @@ async fn fetch(request: Request, env: Env, context: Context) -> Result<Response>
             Response::error("method not allowed", 405)?.with_headers(headers)
         }
     };
-    // Any page may call: nothing here rests on cookies or the origin, as requests that need
-    // authority are signed.
-    response.with_cors(
+    // Any page may call: requests that need authority are signed; and the sign-in for what costs
+    // storage is a cookie kept to this host's pages, which no other page's calls carry.
+    dated(response)?.with_cors(
         &Cors::new()
             .with_origins(["*"])
             .with_methods([Method::Post, Method::Options])
             .with_allowed_headers(["content-type", PROTOCOL_VERSION_HEADER])
+            // The server's time, which clients sign the requests whose time it checks with.
+            .with_exposed_headers(["date"])
             .with_max_age(86400),
     )
 }
@@ -82,14 +94,25 @@ async fn call(
 ) -> Result<Response> {
     let content_type = request.headers().get("content-type")?;
     let limits = MailboxLimits::default();
-    let response = match read_body(&mut request).await? {
+    let response = match read_body(&mut request, MAX_BODY).await? {
         Some(body) => {
             // Shared, so that `notify` decodes the call again without copying its message.
             let body = Bytes::from(body);
+            if writes(procedure) && auth::signed_in(&request, env).is_none() {
+                let message = "sign in to this server to use it";
+                return respond(connect::error(ErrorKind::SignInRequired, message));
+            }
             let store = Store::new(env, limits.max_message_size)?;
             let handshake = HandshakeServer::new(store.clone());
             let mailbox = MailboxServer::builder(store.clone()).limits(limits).build();
-            let attachments = AttachmentServer::new(store);
+            // Uploaders learn how long it keeps their files, after which their tokens are no use.
+            let retention = days(env, "FILE_RETENTION_DAYS", DEFAULT_FILE_RETENTION_DAYS);
+            let attachments = AttachmentServer::builder(store)
+                .limits(AttachmentLimits {
+                    retention: Some(Duration::from_secs(retention.saturating_mul(24 * 60 * 60))),
+                    ..AttachmentLimits::default()
+                })
+                .build();
             let response = connect::handle(
                 &handshake,
                 &mailbox,
@@ -108,11 +131,41 @@ async fn call(
         }
         None => connect::error(ErrorKind::LimitExceeded, "request too large"),
     };
+    respond(response)
+}
+
+/// `response`, with the server's time in its `Date`, which clients sign the requests whose time
+/// the server checks with, as their clocks may be off. Set here, as not every runtime sets it.
+fn dated(mut response: Response) -> Result<Response> {
+    let now = worker::js_sys::Date::new_0().to_utc_string();
+    response.headers_mut().set("date", &String::from(now))?;
+    Ok(response)
+}
+
+/// The HTTP response of a Connect call's `response`.
+fn respond(response: connect::Response) -> Result<Response> {
     let headers = Headers::new();
     headers.set("content-type", response.content_type)?;
     Ok(Response::from_bytes(response.body)?
         .with_status(response.status)
         .with_headers(headers))
+}
+
+/// Whether calls to `procedure` write, so that only clients signed in may make them: publishing
+/// keys, taking one of a bundle's one-time prekeys, starting a chat, sending a message, and
+/// starting an upload, which hands out the token its chunks go with. As the server's password is
+/// what keeps it for those who have it, whose keys anyone can make, each write needs it, however
+/// small. Reading, taking one's own inbox, downloading, and what an upload's token authorizes
+/// stay open.
+fn writes(procedure: Procedure) -> bool {
+    matches!(
+        procedure,
+        Procedure::Publish
+            | Procedure::FetchBundle
+            | Procedure::SendInitialMessage
+            | Procedure::Push
+            | Procedure::StartUpload
+    )
 }
 
 /// Hand a WebSocket asking for an identity's notifications to its notifier, once its
@@ -194,9 +247,9 @@ fn notifier(env: &Env, identity_key: &PublicKey) -> Result<Stub> {
         .get_stub()
 }
 
-/// The body of `request`; `None` once it grows past [`MAX_BODY`], which stops reading it, so a
+/// The body of `request`; `None` once it grows past `limit` bytes, which stops reading it, so a
 /// large body never sits in memory.
-async fn read_body(request: &mut Request) -> Result<Option<Vec<u8>>> {
+pub(crate) async fn read_body(request: &mut Request, limit: usize) -> Result<Option<Vec<u8>>> {
     if request.inner().body().is_none() {
         return Ok(Some(vec![]));
     }
@@ -204,7 +257,7 @@ async fn read_body(request: &mut Request) -> Result<Option<Vec<u8>>> {
     let mut body = vec![];
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
-        if body.len() + chunk.len() > MAX_BODY {
+        if body.len() + chunk.len() > limit {
             return Ok(None);
         }
         body.extend(chunk);
@@ -212,25 +265,33 @@ async fn read_body(request: &mut Request) -> Result<Option<Vec<u8>>> {
     Ok(Some(body))
 }
 
-/// Deletes the messages and initial messages older than the retention, as the protocol has no
-/// way to acknowledge them.
-#[event(scheduled)]
-async fn scheduled(_event: ScheduledEvent, env: Env, _context: ScheduleContext) {
-    let retention_days = env
-        .var("RETENTION_DAYS")
+/// The days the variable `name` says, `default` unless it says a number.
+pub(crate) fn days(env: &Env, name: &str, default: u64) -> u64 {
+    env.var(name)
         .ok()
         .and_then(|days| days.to_string().parse().ok())
-        .unwrap_or(DEFAULT_RETENTION_DAYS);
-    let before = Date::now()
-        .as_millis()
-        // Saturating, so that a huge RETENTION_DAYS keeps everything rather than wrapping
-        // around to a recent time and deleting what is new.
-        .saturating_sub(retention_days.saturating_mul(24 * 60 * 60 * 1000));
+        .unwrap_or(default)
+}
+
+/// Deletes the messages never delivered, initial messages never taken and attachments older than
+/// their retentions.
+#[event(scheduled)]
+async fn scheduled(_event: ScheduledEvent, env: Env, _context: ScheduleContext) {
+    // What was created before the retention of the variable `name`, `default` days unless it says.
+    let before = |name: &str, default: u64| {
+        Date::now()
+            .as_millis()
+            // Saturating, so that a huge retention keeps everything rather than wrapping around
+            // to a recent time and deleting what is new.
+            .saturating_sub(days(&env, name, default).saturating_mul(24 * 60 * 60 * 1000))
+    };
+    let messages_before = before("RETENTION_DAYS", DEFAULT_RETENTION_DAYS);
+    let files_before = before("FILE_RETENTION_DAYS", DEFAULT_FILE_RETENTION_DAYS);
     let store = match Store::new(&env, 0) {
         Ok(store) => store,
         Err(e) => return console_error!("cannot reach the storage: {e}"),
     };
-    match store.expire(before).await {
+    match store.expire(messages_before, files_before).await {
         Ok((messages, attachments)) => {
             console_log!("expired {messages} messages and {attachments} attachments")
         }

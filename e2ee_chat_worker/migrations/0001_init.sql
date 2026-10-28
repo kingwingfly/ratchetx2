@@ -48,7 +48,8 @@ CREATE TABLE queues (
     PRIMARY KEY (sender, recipient)
 ) WITHOUT ROWID;
 
--- The messages of each queue. A large content is in R2, named by `object`, instead of `content`.
+-- The messages of each queue, until their recipient has them. A large content is in R2, named by
+-- `object`, instead of `content`.
 CREATE TABLE messages (
     sender BLOB NOT NULL,
     recipient BLOB NOT NULL,
@@ -60,6 +61,9 @@ CREATE TABLE messages (
     size INTEGER NOT NULL,
     -- The initial message its sender sent with it, while its session was unanswered.
     initial_message BLOB,
+    -- SHA-256 of its delivery token, which its recipient gives back once it has it, deleting
+    -- it; none for one that only expires.
+    delivery_hash BLOB,
     created_at INTEGER NOT NULL,
     PRIMARY KEY (sender, recipient, sequence),
     CHECK ((content IS NULL) != (object IS NULL))
@@ -73,6 +77,9 @@ CREATE TABLE attachments (
     uploader BLOB NOT NULL,
     chunks INTEGER NOT NULL,
     token_hash BLOB NOT NULL,
+    -- The chunks put so far, chunk i as bit i: one put and gone from R2 since, as the bucket's
+    -- lifecycle rules deleted it, expired, rather than is still to come.
+    uploaded INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 ) WITHOUT ROWID;
 CREATE INDEX attachments_by_age ON attachments (created_at);

@@ -19,6 +19,14 @@ message ClientState {
   bool publishing = 4;
 }
 
+// An earlier session, which only decrypts.
+message EarlierSession {
+  // Its double-ratchet party.
+  party.v1.Party party = 1;
+  // Its delivery key (32 bytes).
+  bytes delivery_key = 2;
+}
+
 // A session's state.
 message SessionState {
   // The double-ratchet party of the active session, which messages are sent on; none once it
@@ -33,9 +41,15 @@ message SessionState {
   // session, which this client did, sent with each message until the peer is known to have
   // it; empty once it is.
   bytes initial_message = 12;
-  // The parties of earlier sessions with the peer, latest first, which only decrypt: messages
-  // that `party` cannot decrypt are tried on them.
-  repeated party.v1.Party others = 5;
+  // The active session's delivery key (32 bytes), from X3DH's shared secret, which both peers
+  // have: each message's delivery token is HMAC-SHA256 of its header under it.
+  bytes delivery_key = 13;
+  // Earlier sessions with the peer, latest first, which only decrypt: messages that `party`
+  // cannot decrypt are tried on them.
+  repeated EarlierSession others = 5;
+  // The delivery tokens of the messages received and not told to the server yet, which the
+  // next fetch tells it, so that it deletes them.
+  repeated bytes delivered = 14;
   // This client's identity key (32 bytes).
   bytes me = 2;
   // The peer's identity key (32 bytes).

@@ -69,6 +69,31 @@ pub struct StoredAttachment {
     /// SHA-256 of the upload token, which only the uploader knows and which writing a chunk
     /// takes.
     pub token_hash: [u8; 32],
+    /// The chunks put so far, chunk `i` as bit `i`, for the first [`UPLOADED_NOTED`]. One noted
+    /// here that is not stored was put, and expired since, e.g. as the storage's lifecycle rules
+    /// deleted it.
+    pub uploaded: u64,
+}
+
+/// How many of an attachment's chunks [`StoredAttachment::uploaded`] notes: as many bits as a
+/// JavaScript number holds exactly, as some stores take integers as those.
+pub const UPLOADED_NOTED: u32 = 53;
+
+impl StoredAttachment {
+    /// Whether chunk `index` was put, as far as [`uploaded`](Self::uploaded) notes.
+    pub fn was_uploaded(&self, index: u32) -> bool {
+        self.uploaded & uploaded_bit(index) != 0
+    }
+}
+
+/// The bit of chunk `index` in [`StoredAttachment::uploaded`]; none from chunk
+/// [`UPLOADED_NOTED`] on.
+pub fn uploaded_bit(index: u32) -> u64 {
+    if index < UPLOADED_NOTED {
+        1 << index
+    } else {
+        0
+    }
 }
 
 /// A message in the queue from `sender` to `recipient`.
@@ -82,8 +107,9 @@ pub struct StoredMessage {
     pub sequence: u64,
     /// The encrypted header.
     pub header: Bytes,
-    /// The encrypted content.
-    pub content: Bytes,
+    /// The encrypted content; none if it expired before it was read, e.g. as the storage's
+    /// lifecycle rules deleted it.
+    pub content: Option<Bytes>,
     /// The initial message, encoded, of the session the message is on, which its sender sends
     /// with it while the recipient has not answered that session.
     pub initial_message: Option<Bytes>,
@@ -120,7 +146,8 @@ pub trait LocalHandshakeStore {
 #[trait_variant::make(MailboxStore: Send)]
 pub trait LocalMailboxStore {
     /// Append a message to the queue from `sender` to `recipient`, with the initial message of
-    /// its session if any; returns its sequence number.
+    /// its session if any, and SHA-256 of its delivery token if any; returns its sequence number,
+    /// which goes on from the queue's last, even once its messages are deleted.
     async fn append(
         &self,
         sender: &PublicKey,
@@ -128,7 +155,16 @@ pub trait LocalMailboxStore {
         header: Bytes,
         content: Bytes,
         initial_message: Option<Bytes>,
+        delivery_hash: Option<[u8; 32]>,
     ) -> Result<u64>;
+    /// Delete the messages of the queue from `sender` to `recipient` whose delivery tokens'
+    /// SHA-256 are among `hashes`, as their recipient has them.
+    async fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> Result<()>;
     /// The messages of the queue from `sender` to `recipient` after sequence number `after`,
     /// in order, at most `limit`.
     async fn read(
@@ -143,13 +179,14 @@ pub trait LocalMailboxStore {
 /// Storage for the attachment server. Every method is atomic.
 #[trait_variant::make(AttachmentStore: Send)]
 pub trait LocalAttachmentStore {
-    /// Add `attachment`, with no chunks yet, unless its ID is taken. Returns whether it was
-    /// added.
+    /// Add `attachment`, with no chunks yet, none uploaded, unless its ID is taken. Returns
+    /// whether it was added.
     async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool>;
     /// The attachment `id`, if any.
     async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>>;
-    /// Store chunk `index` of the attachment `id`, which was added, replacing it if stored
-    /// already.
+    /// Store chunk `index` of the attachment `id`, which was added, unless it is stored already,
+    /// as a chunk is uploaded once, and note it in the attachment's
+    /// [`uploaded`](StoredAttachment::uploaded).
     async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()>;
     /// Chunk `index` of the attachment `id`, if stored.
     async fn chunk(&self, id: &AttachmentId, index: u32) -> Result<Option<Bytes>>;

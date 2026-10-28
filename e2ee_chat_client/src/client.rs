@@ -302,6 +302,13 @@ impl Client {
                             state.current_activated_textarea = 0;
                             state.screen = Screen::HandleInitMsg;
                         }
+                        KeyCode::Char('i') => {
+                            let mut password = TextArea::default();
+                            password.set_mask_char('•');
+                            state.textareas = vec![("Server Password".to_string(), password)];
+                            state.current_activated_textarea = 0;
+                            state.screen = Screen::SignIn;
+                        }
                         KeyCode::Char('l') => match take(
                             &state.client,
                             &state.sessions,
@@ -443,6 +450,26 @@ impl Client {
                             state.textareas[state.current_activated_textarea]
                                 .1
                                 .input(key);
+                        }
+                    },
+                    _ => {}
+                },
+                Screen::SignIn => match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Esc => state.screen = Screen::Main,
+                        KeyCode::Enter => {
+                            let password = state.textareas[0].1.lines().join("\n");
+                            state.textareas = vec![];
+                            state.screen =
+                                Screen::Hint(match state.http.sign_in(&password).await {
+                                    Ok(()) => {
+                                        "Signed in: publish your keys (p), then chat".to_string()
+                                    }
+                                    Err(e) => format!("{e:#}"),
+                                });
+                        }
+                        _ => {
+                            state.textareas[0].1.input(key);
                         }
                     },
                     _ => {}
@@ -782,6 +809,10 @@ impl Client {
         drop(client);
         let (state_of, place) = match sent {
             Ok(clock) => (MessageState::Sent, clock),
+            Err(e) if e.kind() == ErrorKind::SignInRequired => (
+                MessageState::Error(format!("{SIGN_IN_FIRST}, and send it again")),
+                0,
+            ),
             Err(e) => (MessageState::Error(describe(e)), 0),
         };
         let message = Message {
@@ -976,8 +1007,15 @@ async fn take(
 /// An error and its sources, e.g. "server error: status: Unavailable, ...", since an error's
 /// kind alone rarely says what to do.
 fn describe(error: session::Error) -> String {
+    if error.kind() == ErrorKind::SignInRequired {
+        return SIGN_IN_FIRST.to_string();
+    }
     format!("{:#}", anyhow::Error::new(error))
 }
+
+/// What a call the server refused for the sign-in tells.
+const SIGN_IN_FIRST: &str =
+    "The server is only for those signed in to it: sign in from the settings (Tab, then i)";
 
 impl Drop for Client {
     fn drop(&mut self) {

@@ -39,6 +39,7 @@ impl From<protocol::Error> for Error {
         let kind = match error.kind() {
             Kind::NotFound => ErrorKind::NotFound,
             Kind::LimitExceeded => ErrorKind::LimitExceeded,
+            Kind::SignInRequired => ErrorKind::SignInRequired,
             Kind::Malformed | Kind::InvalidSignature | Kind::StaleTimestamp => ErrorKind::Protocol,
             _ => ErrorKind::Server,
         };
@@ -92,6 +93,10 @@ pub enum ErrorKind {
     /// The peer's inbox is full, or a message or an attachment is too large.
     #[error("limit exceeded")]
     LimitExceeded,
+    /// The server stores this only for clients signed in to it, e.g. with its password: a large
+    /// message, or an attachment.
+    #[error("sign-in required")]
+    SignInRequired,
     /// The server rejected a request, or sent a malformed reply.
     #[error("protocol error")]
     Protocol,

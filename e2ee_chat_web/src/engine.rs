@@ -11,7 +11,6 @@ use std::{
     sync::Arc,
 };
 
-use bytes::Bytes;
 use futures::{
     channel::oneshot,
     future::{Either, select},
@@ -24,7 +23,7 @@ use session::{
     proto,
     protocol::{
         attachment::DEFAULT_MAX_CHUNKS,
-        mailbox::{LocalMailbox, PushRequest},
+        mailbox::LocalMailbox,
         notify::{self, Notification},
     },
 };
@@ -39,9 +38,9 @@ use crate::{
     preview::{self, Sort},
     state::{
         Attachment, Body, ContactView, Delivery, Dialog, FileView, Link, LocalFile, Me,
-        MessageView, Opening, Phase, RemoteFile, Step, Ui, UploadState, UploadView, order,
+        MessageView, Opening, Phase, RemoteFile, SignIn, Step, Ui, UploadState, UploadView, order,
     },
-    transport::{Connect, Fetch, Progress},
+    transport::{self, Connect, Fetch, Progress},
     util::{describe, hex, js_error, key_from_text, now, short, size, sleep},
     vault::{
         AppState, Awaiting, ContactState, Farewell, HistoryEntry, Outgoing, OutgoingRecord,
@@ -49,6 +48,12 @@ use crate::{
     },
 };
 
+/// Why an attachment's upload has not started.
+const WAITS_SIGN_IN: &str = "waits for you to sign in to the server";
+/// Why what takes a sign-in never goes from a page that is not the server's own, which cannot
+/// sign in to it.
+const NOT_SIGNED_IN_HERE: &str =
+    "the server keeps it only for those signed in to it, and only its own page can sign in";
 /// One-time prekeys in each publish.
 const ONE_TIME_PREKEYS: usize = 20;
 /// Publish new prekeys once this many one-time prekeys are used...
@@ -151,6 +156,16 @@ pub struct Engine {
     /// ranges, a preview and the viewer show one file, or the tags of audio are read from its
     /// first, is fetched once.
     loading: RefCell<HashMap<ChunkOf, Vec<oneshot::Sender<()>>>>,
+    /// The chats whose next message waits for this browser to sign in to the server, which
+    /// keeps a message that large only for those who do. It goes once it signs in; until then,
+    /// the chat's messages stay in its outbox, in order. An attachment waits so too, by its
+    /// message's [`awaits_upload`](Outgoing::awaits_upload).
+    waits_sign_in: RefCell<HashSet<PublicKey>>,
+    /// Whether the uploads that expired on the server were forgotten, once a page.
+    pruned: Cell<bool>,
+    /// Whether the user put off signing in, so that what the server refuses meanwhile, as it
+    /// syncs, does not ask again; what the user sends does.
+    declined_sign_in: Cell<bool>,
 }
 
 /// A chunk of an attachment: its ID and the chunk's index.
@@ -223,7 +238,7 @@ struct Contact {
 
 impl Engine {
     pub fn new(ui: Ui) -> Rc<Self> {
-        Rc::new(Self {
+        let engine = Rc::new(Self {
             ui,
             inner: Mutex::new(None),
             wake: Cell::new(false),
@@ -236,7 +251,18 @@ impl Engine {
             streams: RefCell::default(),
             decrypted: RefCell::default(),
             loading: RefCell::default(),
-        })
+            waits_sign_in: RefCell::default(),
+            pruned: Cell::default(),
+            declined_sign_in: Cell::default(),
+        });
+        // Whatever the server refuses for the sign-in, the user is asked to sign in.
+        let weak = Rc::downgrade(&engine);
+        transport::on_sign_in_required(move || {
+            if let Some(engine) = weak.upgrade() {
+                engine.refused_for_sign_in();
+            }
+        });
+        engine
     }
 
     /// Whether the user is here: the page shown and in focus, or hidden for less than
@@ -330,6 +356,84 @@ impl Engine {
         self.ui
     }
 
+    /// Who this browser is signed in to the server as, if anyone, which storing files there
+    /// takes.
+    pub async fn signed_in(&self) -> Result<Option<SignIn>, String> {
+        let server = self.server().await?;
+        let (status, answer) = transport::call(&server, "GET", "/auth", None).await?;
+        if status != 200 {
+            return Err(format!("the server answered {status}"));
+        }
+        Ok(SignIn::from_json(&answer))
+    }
+
+    /// Sign in to the server with its `password`: what waited for it goes then.
+    pub async fn sign_in(self: &Rc<Self>, password: &str) -> Result<SignIn, String> {
+        let server = self.server().await?;
+        // Its cookie is the server's, which only the server's own page keeps and sends; another
+        // origin's calls to it cannot even read its answer.
+        if !same_server(&server, &origin()) {
+            return Err(
+                "This page signs in only to its own server: sign in on the server's own page."
+                    .to_string(),
+            );
+        }
+        let (status, _) =
+            transport::call(&server, "POST", "/auth/password", Some(password)).await?;
+        match status {
+            200 => {}
+            403 => return Err("Wrong password.".to_string()),
+            503 => return Err("This server takes no sign-ins: it has no password set.".to_string()),
+            status => return Err(format!("The server answered {status}.")),
+        }
+        // Unless the browser refused the cookie, e.g. as it blocks the server's cookies.
+        let signed_in = self.signed_in().await?.ok_or(
+            "This browser kept no sign-in for the server: it may block the server's cookies.",
+        )?;
+        self.waits_sign_in.borrow_mut().clear();
+        self.declined_sign_in.set(false);
+        self.start_waiting_uploads().await;
+        self.wake();
+        Ok(signed_in)
+    }
+
+    /// Sign out of the server: files wait for the next sign-in.
+    pub async fn sign_out(&self) -> Result<(), String> {
+        let server = self.server().await?;
+        let (status, _) = transport::call(&server, "POST", "/auth/sign-out", None).await?;
+        match status {
+            200 => Ok(()),
+            status => Err(format!("The server answered {status}.")),
+        }
+    }
+
+    /// Ask the user to sign in to the server, as what was sent waits for it, unless a dialog is
+    /// open.
+    fn ask_sign_in(&self) {
+        if self.ui.dialog.with_untracked(Option::is_none) {
+            self.ui.dialog.set(Some(Dialog::SignIn));
+        }
+    }
+
+    /// The server refused a call, whichever, as this browser is not signed in to it, which every
+    /// write takes: ask, unless the user put it off.
+    fn refused_for_sign_in(&self) {
+        if !self.declined_sign_in.get() {
+            self.ask_sign_in();
+        }
+    }
+
+    /// The user put off signing in: what syncing finds refused does not ask again until then.
+    pub fn decline_sign_in(&self) {
+        self.declined_sign_in.set(true);
+    }
+
+    /// The server's address.
+    async fn server(&self) -> Result<String, String> {
+        let guard = self.inner.lock().await;
+        Ok(guard.as_ref().ok_or("locked")?.server.clone())
+    }
+
     /// Find out whether to create or unlock the vault.
     pub async fn start(&self) {
         glue::register_media_worker();
@@ -361,7 +465,7 @@ impl Engine {
             server
         };
         let address = address(&server);
-        let client = Client::new(Fetch::client(&address));
+        let client = Client::new(Fetch::client(&address)).with_clock(transport::clock(&address));
         let state = AppState {
             client: Some(client.state().into()),
             server,
@@ -395,7 +499,8 @@ impl Engine {
         let client = Client::restore(
             Fetch::client(&address),
             ClientState::try_from(&client).map_err(|e| describe(&e))?,
-        );
+        )
+        .with_clock(transport::clock(&address));
         let contacts = std::mem::take(&mut state.contacts)
             .into_iter()
             .map(|mut contact| {
@@ -430,11 +535,16 @@ impl Engine {
         self.ui.me.set(Some(inner.me()));
         self.ui.contacts.set(inner.views());
         // Uploads the page left: their files are gone with it.
-        match inner.vault.uploads().await {
+        match inner.vault.uploads(None).await {
             Ok(uploads) => {
-                for (peer, pending) in uploads {
-                    let reason = "choose the file again to go on".to_string();
-                    self.show_upload(&peer, &pending, UploadState::Paused(reason));
+                for (peer, pending) in uploads.into_iter().filter(|(_, pending)| !pending.done) {
+                    let reason = if pending.started() {
+                        "choose the file again to go on"
+                    } else {
+                        self.hold(&peer, pending.history_index);
+                        "choose the file again, then sign in to the server"
+                    };
+                    self.show_upload(&peer, &pending, UploadState::Paused(reason.to_string()));
                 }
             }
             Err(e) => self.ui.notify(describe(&e)),
@@ -585,6 +695,29 @@ impl Engine {
         self.wake();
     }
 
+    /// Forget the uploads done that the server deleted, by its time, as their tokens are no use.
+    async fn forget_expired_uploads(&self) {
+        let guard = self.inner.lock().await;
+        let Some(inner) = guard.as_ref() else {
+            return;
+        };
+        let uploads = match inner.vault.uploads(None).await {
+            Ok(uploads) => uploads,
+            Err(e) => {
+                return self
+                    .ui
+                    .log(format!("cannot read the uploads: {}", describe(&e)));
+            }
+        };
+        let now = inner.client.clock().now();
+        for (peer, pending) in uploads.iter().filter(|(_, pending)| pending.expired(now)) {
+            if let Err(e) = inner.vault.forget_upload(peer, &pending.id).await {
+                self.ui
+                    .log(format!("cannot forget an expired upload: {}", describe(&e)));
+            }
+        }
+    }
+
     /// One round: save what an earlier save failed to, tell peers of chats deleted here, take
     /// initial messages, publish prekeys when due, receive, and push what waits. Returns whether
     /// anything happened.
@@ -612,6 +745,11 @@ impl Engine {
                 false
             }
         };
+        // Once a round reached the server, whose answers told its time, the uploads done that it
+        // deleted since go, as their tokens are no use: once a page.
+        if reached && !self.pruned.replace(true) {
+            self.forget_expired_uploads().await;
+        }
         // Not while the server does not answer signed requests: each publish that fails keeps
         // its new one-time prekeys, as the server may have them, see `Client::publish_keys`, so
         // retrying every round while offline would grow the state, which each save writes whole.
@@ -672,14 +810,8 @@ impl Engine {
             return Ok(());
         };
         while let Some(farewell) = inner.state.farewells.first().cloned() {
-            let request = PushRequest {
-                sender: Bytes::copy_from_slice(&inner.client.identity_key()),
-                recipient: farewell.peer.into(),
-                message: farewell.message,
-                initial_message: None,
-            };
             match Fetch::client(&inner.server)
-                .push(request)
+                .push(farewell.push.unwrap_or_default())
                 .await
                 .map_err(session::Error::from)
             {
@@ -711,6 +843,9 @@ impl Engine {
     /// Push the messages waiting for `peer`, in order, each encrypted as its turn comes, then
     /// the events to tell the peer. Returns whether any went.
     async fn flush(&self, peer: &PublicKey) -> Result<bool, String> {
+        if self.waits_sign_in.borrow().contains(peer) {
+            return Ok(false);
+        }
         // With messages waiting and no session to send on, the peer may have started one, e.g.
         // having deleted the chat and started it again: taken first, it is sent on, rather than
         // another started, which the peer might set aside. If taking fails, one starts.
@@ -757,9 +892,17 @@ impl Engine {
         // What happened to the messages, by their history entries, with their places, and the
         // records gone with them.
         let (mut steps, mut gone) = (vec![], vec![]);
+        // Whether this page can sign in to the server, which only its own page can: otherwise a
+        // message that takes it never goes, and must not hold up those after it.
+        let signs_in_here = same_server(&inner.server, &origin());
         while let Some(contact) = inner.contact(peer)
             && let Some(outgoing) = contact.state.outbox.first().cloned()
         {
+            // An attachment whose upload has not started: it, and what was sent after it, wait
+            // for it to start.
+            if outgoing.awaits_upload {
+                break;
+            }
             if !outgoing.sealed {
                 // Encrypted now that it goes, so that its place is after what came so far; the
                 // ones after it wait their turn.
@@ -790,12 +933,25 @@ impl Engine {
             let Some(contact) = inner.contact(peer) else {
                 break;
             };
-            match contact
-                .session
-                .push(record.message.unwrap_or_default())
-                .await
-            {
-                Ok(()) => steps.push((outgoing.history_index, Step::Pushed, outgoing.clock)),
+            match contact.session.push(record.to_push()).await {
+                Ok(()) => {
+                    self.release(peer, outgoing.history_index);
+                    steps.push((outgoing.history_index, Step::Pushed, outgoing.clock));
+                }
+                // Large enough to cost the server storage, which it keeps only for those signed
+                // in to it: it waits, with those after it, until this browser is.
+                Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
+                    self.waits_sign_in.borrow_mut().insert(*peer);
+                    self.hold(peer, outgoing.history_index);
+                    self.ask_sign_in();
+                    break;
+                }
+                // The same, but this page cannot sign in to the server: it never will go.
+                Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                    steps.push((outgoing.history_index, Step::Refused, 0));
+                    self.ui
+                        .notify(format!("a message could not be sent: {NOT_SIGNED_IN_HERE}"));
+                }
                 // Too large for the server: it never will go.
                 Err(e) if e.kind() == ErrorKind::LimitExceeded => {
                     steps.push((outgoing.history_index, Step::Refused, 0));
@@ -1144,46 +1300,7 @@ impl Engine {
         {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
-            let contact = inner.contact(&peer).ok_or("no such chat")?;
-            if contact.state.request {
-                return Err("accept the request first".into());
-            }
-            // If saving fails, the message is forgotten: it never left.
-            let snapshot = contact.snapshot();
-            // Encrypted as it goes, once its place in the chat is known, see `flush`.
-            let record = OutgoingRecord {
-                message: None,
-                content: content.to_bytes(),
-            };
-            let index = contact.state.history_len;
-            contact.state.history_len += 1;
-            contact.state.last_activity = now();
-            contact.state.outbox.push(Outgoing {
-                history_index: index,
-                sealed: false,
-                clock: 0,
-            });
-            let entry = HistoryEntry {
-                outgoing: true,
-                at: now(),
-                content: Some(Content {
-                    kind: Some(content),
-                    ..Content::default()
-                }),
-                delivery: Delivery::Pending.into(),
-                ..HistoryEntry::default()
-            };
-            let view = contact.message(index, entry.clone());
-            let saved = inner
-                .save_with(
-                    &[(history_key(&peer, index), entry)],
-                    &[(outbox_key(&peer, index), Some(record))],
-                )
-                .await;
-            if let Err(e) = saved {
-                inner.roll_back(&peer, snapshot)?;
-                return Err(describe(&e));
-            }
+            let view = inner.add(&peer, content, false).await?;
             self.show_new(inner, &peer, vec![view]);
             self.ui.contacts.set(inner.views());
         }
@@ -1205,19 +1322,38 @@ impl Engine {
         file: web_sys::File,
     ) -> Result<(), String> {
         let size = file.size() as u64;
-        let upload = {
+        let (started, signs_in_here) = {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
-            inner
+            let started = inner
                 .client
                 .start_upload(&Fetch::client(&inner.server), size)
-                .await
-                .map_err(|e| describe(&e))?
+                .await;
+            (started, same_server(&inner.server, &origin()))
+        };
+        let upload = match started {
+            Ok(upload) => upload,
+            // The server keeps attachments only for those signed in to it: its message takes its
+            // place in the chat, and waits, with what is sent after it, until this browser is.
+            Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
+                self.wait_for_sign_in(peer, file).await?;
+                self.ask_sign_in();
+                return Ok(());
+            }
+            // This page cannot sign in to the server, so the file never would go.
+            Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                return Err(format!(
+                    "{} could not be sent: {NOT_SIGNED_IN_HERE}",
+                    file.name()
+                ));
+            }
+            Err(e) => return Err(describe(&e)),
         };
         let pending = PendingUpload {
             id: upload.id().to_vec(),
             token: upload.token().to_vec(),
             key: upload.key().to_vec(),
+            expires: upload.expires().unwrap_or_default(),
             name: file.name(),
             mime: file.type_(),
             size,
@@ -1225,12 +1361,251 @@ impl Engine {
             encrypted: 0,
             prefix_hash: Sha256::digest([]).to_vec(),
             announced: false,
+            done: false,
+            history_index: 0,
         };
         self.save_upload(&peer, &pending).await?;
         self.files.borrow_mut().insert(*upload.id(), file.clone());
         let pending = self.announce(&peer, pending).await?;
         // A new upload, which nothing else runs.
         self.running.borrow_mut().insert(*upload.id());
+        let engine = self.clone();
+        spawn_local(async move {
+            if let Err(e) = engine.run_upload(peer, pending, file, Sha256::new()).await {
+                engine.ui.notify(e);
+            }
+        });
+        Ok(())
+    }
+
+    /// Keep `file`, to `peer`, until this browser signs in to the server, which takes no
+    /// attachment before: its message takes its place in the chat at once, waiting, and what is
+    /// sent after it waits for it, see `flush`. Its upload, kept under an ID of this client's,
+    /// starts once signed in, see [`start_waiting`](Self::start_waiting); after the page goes,
+    /// once the file is chosen again.
+    async fn wait_for_sign_in(&self, peer: PublicKey, file: web_sys::File) -> Result<(), String> {
+        let mut id = [0; 16];
+        getrandom::fill(&mut id).map_err(|e| e.to_string())?;
+        let mut guard = self.inner.lock().await;
+        let inner = guard.as_mut().ok_or("locked")?;
+        let contact = inner.contact(&peer).ok_or("no such chat")?;
+        let waiting = PendingUpload {
+            id: id.to_vec(),
+            name: file.name(),
+            mime: file.type_(),
+            size: file.size() as u64,
+            announced: true,
+            history_index: contact.state.history_len,
+            ..PendingUpload::default()
+        };
+        // Kept first, so that no message waits for an upload that is not kept.
+        inner
+            .vault
+            .save_upload(&peer, &waiting)
+            .await
+            .map_err(|e| describe(&e))?;
+        let pointer = AttachmentPointer {
+            id: vec![],
+            key: vec![],
+            size: waiting.size,
+            name: waiting.name.clone(),
+            mime: waiting.mime.clone(),
+        };
+        let view = match inner.add(&peer, Kind::Attachment(pointer), true).await {
+            Ok(view) => view,
+            Err(e) => {
+                let _ = inner.vault.forget_upload(&peer, &id).await;
+                return Err(e);
+            }
+        };
+        self.show_new(inner, &peer, vec![view]);
+        self.ui.contacts.set(inner.views());
+        drop(guard);
+        self.files.borrow_mut().insert(id, file);
+        self.show_upload(
+            &peer,
+            &waiting,
+            UploadState::Paused(WAITS_SIGN_IN.to_string()),
+        );
+        self.hold(&peer, waiting.history_index);
+        Ok(())
+    }
+
+    /// Start the uploads that waited for this browser to sign in, whose files are still here.
+    async fn start_waiting_uploads(self: &Rc<Self>) {
+        let waiting = {
+            let guard = self.inner.lock().await;
+            let Some(inner) = guard.as_ref() else {
+                return;
+            };
+            match inner.vault.uploads(None).await {
+                Ok(uploads) => uploads,
+                Err(e) => return self.ui.notify(describe(&e)),
+            }
+        };
+        for (peer, pending) in waiting.into_iter().filter(|(_, p)| !p.started()) {
+            let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
+                continue;
+            };
+            let Some(file) = self.files.borrow().get(&id).cloned() else {
+                continue;
+            };
+            if let Err(e) = self.start_waiting(peer, id, file).await {
+                self.ui.notify(e);
+            }
+        }
+    }
+
+    /// Start the upload `waiting`, to `peer`, of `file`, which waited for this browser to sign
+    /// in: its message, which kept its place in the chat, gets the attachment and goes, with
+    /// what waited for it, and the upload runs. Refused again, it waits again.
+    async fn start_waiting(
+        self: &Rc<Self>,
+        peer: PublicKey,
+        waiting: [u8; 16],
+        file: web_sys::File,
+    ) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        let inner = guard.as_mut().ok_or("locked")?;
+        let Some(kept) = inner
+            .vault
+            .upload(&peer, &waiting)
+            .await
+            .map_err(|e| describe(&e))?
+            .filter(|pending| !pending.started())
+        else {
+            return Ok(());
+        };
+        // Its message still waits for it, unless this record outlived its start, as forgetting
+        // it failed: that message has its attachment, and a second upload must not replace it.
+        let awaited = inner.contact(&peer).is_some_and(|contact| {
+            contact.state.outbox.iter().any(|outgoing| {
+                outgoing.history_index == kept.history_index && outgoing.awaits_upload
+            })
+        });
+        if !awaited {
+            self.ui
+                .uploads
+                .update(|uploads| uploads.retain(|upload| upload.id != waiting));
+            return inner
+                .vault
+                .forget_upload(&peer, &waiting)
+                .await
+                .map_err(|e| describe(&e));
+        }
+        let started = inner
+            .client
+            .start_upload(&Fetch::client(&inner.server), kept.size)
+            .await;
+        let upload = match started {
+            Ok(upload) => upload,
+            Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                drop(guard);
+                self.files.borrow_mut().insert(waiting, file);
+                self.show_upload(&peer, &kept, UploadState::Paused(WAITS_SIGN_IN.to_string()));
+                self.ask_sign_in();
+                return Ok(());
+            }
+            Err(e) => return Err(describe(&e)),
+        };
+        // Cancelled meanwhile: the server forgets it too, and cancelling fails its message.
+        if self.cancelled.borrow().contains(&waiting) {
+            let _ = upload.cancel(&Fetch::client(&inner.server)).await;
+            return Ok(());
+        }
+        let pointer = AttachmentPointer {
+            id: upload.id().to_vec(),
+            key: upload.key().to_vec(),
+            size: kept.size,
+            name: kept.name.clone(),
+            mime: kept.mime.clone(),
+        };
+        let pending = PendingUpload {
+            id: upload.id().to_vec(),
+            token: upload.token().to_vec(),
+            key: upload.key().to_vec(),
+            prefix_hash: Sha256::digest([]).to_vec(),
+            history_index: 0,
+            expires: upload.expires().unwrap_or_default(),
+            ..kept
+        };
+        // Kept under the server's ID first: if the message is not saved after, the upload is
+        // there to cancel, rather than a message with nothing to download.
+        inner
+            .vault
+            .save_upload(&peer, &pending)
+            .await
+            .map_err(|e| describe(&e))?;
+        let mut entry = inner
+            .vault
+            .entry(&peer, kept.history_index)
+            .await
+            .map_err(|e| describe(&e))?
+            .ok_or("its message is gone")?;
+        let content = Kind::Attachment(pointer);
+        let record = OutgoingRecord {
+            message: None,
+            content: content.to_bytes(),
+            delivery_hash: vec![],
+        };
+        entry.content = Some(Content {
+            kind: Some(content),
+            ..entry.content.unwrap_or_default()
+        });
+        let contact = inner.contact(&peer).ok_or("no such chat")?;
+        let snapshot = contact.snapshot();
+        for outgoing in &mut contact.state.outbox {
+            if outgoing.history_index == kept.history_index {
+                outgoing.awaits_upload = false;
+            }
+        }
+        let changed = [(kept.history_index, entry)];
+        let saved = inner
+            .save_with(
+                &records(&peer, &changed),
+                &[(outbox_key(&peer, kept.history_index), Some(record))],
+            )
+            .await;
+        if let Err(e) = saved {
+            inner.roll_back(&peer, snapshot)?;
+            let _ = inner.vault.forget_upload(&peer, upload.id()).await;
+            return Err(describe(&e));
+        }
+        // Its message has the attachment now: a record left behind is forgotten when found.
+        if let Err(e) = inner.vault.forget_upload(&peer, &waiting).await {
+            self.ui.log(format!(
+                "could not forget the wait of {}: {}",
+                pending.name,
+                describe(&e)
+            ));
+        }
+        self.show_changes(inner, &peer, &changed);
+        // Cancelled while it started, which found nothing left to cancel: it goes no further,
+        // and its message fails, as cancelling it before would have done.
+        if self.cancelled.borrow().contains(&waiting) {
+            let _ = upload.cancel(&Fetch::client(&inner.server)).await;
+            let _ = inner.vault.forget_upload(&peer, upload.id()).await;
+            self.fail_waiting(inner, &peer, kept.history_index).await?;
+            drop(guard);
+            if let Err(e) = self.flush(&peer).await {
+                self.ui.link.set(Link::Offline(e));
+            }
+            return Ok(());
+        }
+        drop(guard);
+        // Under the server's ID from now on.
+        self.files.borrow_mut().remove(&waiting);
+        self.files.borrow_mut().insert(*upload.id(), file.clone());
+        self.ui
+            .uploads
+            .update(|uploads| uploads.retain(|upload| upload.id != waiting));
+        self.running.borrow_mut().remove(&waiting);
+        self.running.borrow_mut().insert(*upload.id());
+        self.release(&peer, kept.history_index);
+        if let Err(e) = self.flush(&peer).await {
+            self.ui.link.set(Link::Offline(e));
+        }
+        self.wake();
         let engine = self.clone();
         spawn_local(async move {
             if let Err(e) = engine.run_upload(peer, pending, file, Sha256::new()).await {
@@ -1286,11 +1661,28 @@ impl Engine {
     /// with the file still here. The file must begin as it did, as far as it may have been
     /// encrypted.
     pub async fn resume_upload(
-        &self,
+        self: &Rc<Self>,
         peer: PublicKey,
         id: [u8; 16],
         file: Option<web_sys::File>,
     ) -> Result<(), String> {
+        // One that waited for a sign-in starts, its message in its place.
+        let waits = {
+            let guard = self.inner.lock().await;
+            let inner = guard.as_ref().ok_or("locked")?;
+            inner
+                .vault
+                .upload(&peer, &id)
+                .await
+                .map_err(|e| describe(&e))?
+                .is_some_and(|pending| !pending.started())
+        };
+        if waits {
+            let file = file
+                .or_else(|| self.files.borrow().get(&id).cloned())
+                .ok_or("choose the file again")?;
+            return self.start_waiting(peer, id, file).await;
+        }
         // Running from here on, so that resuming it again meanwhile, e.g. clicked again while
         // the file is checked, neither checks the file twice nor sends the attachment twice.
         if self.cancelled.borrow().contains(&id) || !self.running.borrow_mut().insert(id) {
@@ -1305,6 +1697,7 @@ impl Engine {
                     .upload(&peer, &id)
                     .await
                     .map_err(|e| describe(&e))?
+                    .filter(|pending| !pending.done)
                     .ok_or("that upload is gone")?
             };
             let file = file
@@ -1348,13 +1741,29 @@ impl Engine {
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != id));
-        let guard = self.inner.lock().await;
-        let inner = guard.as_ref().ok_or("locked")?;
+        let mut guard = self.inner.lock().await;
+        let inner = guard.as_mut().ok_or("locked")?;
         let pending = inner
             .vault
             .upload(&peer, &id)
             .await
             .map_err(|e| describe(&e))?;
+        // One that waited for a sign-in never went: its message fails, and what waited for it
+        // goes.
+        if let Some(waiting) = pending.as_ref().filter(|pending| !pending.started()) {
+            self.fail_waiting(inner, &peer, waiting.history_index)
+                .await?;
+            inner
+                .vault
+                .forget_upload(&peer, &id)
+                .await
+                .map_err(|e| describe(&e))?;
+            drop(guard);
+            if let Err(e) = self.flush(&peer).await {
+                self.ui.link.set(Link::Offline(e));
+            }
+            return Ok(());
+        }
         if let Some(pending) = &pending
             && let Err(e) = upload_of(pending)?
                 .cancel(&Fetch::client(&inner.server))
@@ -1371,6 +1780,113 @@ impl Engine {
             .forget_upload(&peer, &id)
             .await
             .map_err(|e| describe(&e))
+    }
+
+    /// Cancel the message at `index`, to `peer`, held until this browser signs in to the server:
+    /// it fails, and what waited for it goes, unless it too needs the sign-in. One whose
+    /// attachment's upload has not started goes with its upload.
+    pub async fn cancel_held(&self, peer: PublicKey, index: u64) -> Result<(), String> {
+        let waiting = {
+            let guard = self.inner.lock().await;
+            let inner = guard.as_ref().ok_or("locked")?;
+            let uploads = inner
+                .vault
+                .uploads(Some(&peer))
+                .await
+                .map_err(|e| describe(&e))?;
+            uploads.into_iter().find_map(|(_, pending)| {
+                (!pending.started() && pending.history_index == index)
+                    .then(|| <[u8; 16]>::try_from(pending.id.as_slice()).ok())
+                    .flatten()
+            })
+        };
+        if let Some(id) = waiting {
+            return self.cancel_upload(peer, id).await;
+        }
+        {
+            let mut guard = self.inner.lock().await;
+            let inner = guard.as_mut().ok_or("locked")?;
+            // Gone meanwhile, e.g. pushed as the sign-in came.
+            let waits = inner.contact(&peer).is_some_and(|contact| {
+                contact
+                    .state
+                    .outbox
+                    .iter()
+                    .any(|outgoing| outgoing.history_index == index)
+            });
+            if !waits {
+                self.release(&peer, index);
+                return Ok(());
+            }
+            self.fail_waiting(inner, &peer, index).await?;
+        }
+        self.waits_sign_in.borrow_mut().remove(&peer);
+        if let Err(e) = self.flush(&peer).await {
+            self.ui.link.set(Link::Offline(e));
+        }
+        self.wake();
+        Ok(())
+    }
+
+    /// Show the message at `index`, to `peer`, as held until this browser signs in.
+    fn hold(&self, peer: &PublicKey, index: u64) {
+        self.ui.held.update(|held| {
+            held.insert((*peer, index));
+        });
+    }
+
+    /// Show the message at `index`, to `peer`, as no longer held.
+    fn release(&self, peer: &PublicKey, index: u64) {
+        if self
+            .ui
+            .held
+            .with_untracked(|held| held.contains(&(*peer, index)))
+        {
+            self.ui.held.update(|held| {
+                held.remove(&(*peer, index));
+            });
+        }
+    }
+
+    /// Fail the message at `index`, to `peer`, which never went, as it was cancelled: it leaves
+    /// the outbox, so that what was sent after it goes.
+    async fn fail_waiting(
+        &self,
+        inner: &mut Inner,
+        peer: &PublicKey,
+        index: u64,
+    ) -> Result<(), String> {
+        let contact = inner.contact(peer).ok_or("no such chat")?;
+        let snapshot = contact.snapshot();
+        contact
+            .state
+            .outbox
+            .retain(|outgoing| outgoing.history_index != index);
+        let mut entries = BTreeMap::new();
+        let failed = match inner
+            .step(peer, &mut entries, [(index, Step::Refused)])
+            .await
+        {
+            Ok(()) => {
+                let changed: Vec<_> = entries.into_iter().collect();
+                inner
+                    .save_with(&records(peer, &changed), &[(outbox_key(peer, index), None)])
+                    .await
+                    .map(|()| changed)
+            }
+            Err(e) => Err(e),
+        };
+        match failed {
+            Ok(changed) => {
+                self.release(peer, index);
+                self.show_changes(inner, peer, &changed);
+                Ok(())
+            }
+            Err(e) => {
+                inner.roll_back(peer, snapshot)?;
+                Err(describe(&e))
+            }
+        }
     }
 
     /// The hash of `file` as far as `pending` may have encrypted it, once it is what it was then.
@@ -1430,8 +1946,35 @@ impl Engine {
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != id));
+        // Kept with its upload token, which can delete it from the server later; without the
+        // file's hash, which only going on with the upload needed.
+        pending.done = true;
+        pending.prefix_hash.clear();
+        self.save_upload(&peer, &pending).await
+    }
+
+    /// Delete the attachment `id`, which this client uploaded for `peer`, from the server, with
+    /// the upload token kept of it: the peer can no longer download it, though what it
+    /// downloaded stays, and so does this client's copy.
+    pub async fn delete_attachment(&self, peer: PublicKey, id: [u8; 16]) -> Result<(), String> {
         let guard = self.inner.lock().await;
         let inner = guard.as_ref().ok_or("locked")?;
+        let pending = inner
+            .vault
+            .upload(&peer, &id)
+            .await
+            .map_err(|e| describe(&e))?
+            .filter(|pending| pending.done)
+            .ok_or("this browser cannot delete that file from the server")?;
+        match upload_of(&pending)?
+            .cancel(&Fetch::client(&inner.server))
+            .await
+        {
+            // Gone already, e.g. expired, as it should be.
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(describe(&e)),
+        }
         inner
             .vault
             .forget_upload(&peer, &id)
@@ -1573,6 +2116,13 @@ impl Engine {
         pointer: AttachmentPointer,
         clock: u64,
     ) -> Result<(), String> {
+        // A message of this client's whose upload waits for it to sign in.
+        if pointer.id.is_empty() {
+            return Err(format!(
+                "{} goes once you sign in to the server.",
+                pointer.name
+            ));
+        }
         let Ok(id) = <[u8; 16]>::try_from(pointer.id.as_slice()) else {
             return Err("the attachment is malformed".to_string());
         };
@@ -2145,10 +2695,12 @@ impl Engine {
             })?;
         // Telling the peer that the chat was deleted here, if that has not gone yet, goes no
         // more: this session replaces the deleted one there anyway.
-        inner
-            .state
-            .farewells
-            .retain(|farewell| farewell.peer != peer.as_slice());
+        inner.state.farewells.retain(|farewell| {
+            farewell
+                .push
+                .as_ref()
+                .is_none_or(|push| push.recipient != peer.as_slice())
+        });
         let entry = HistoryEntry {
             outgoing: true,
             at: now(),
@@ -2244,6 +2796,23 @@ impl Engine {
     /// meanwhile.
     pub async fn files(&self, peer: PublicKey) -> Result<Vec<FileView>, String> {
         let mut files = vec![];
+        // The attachments this client uploaded whose upload tokens it kept, which can delete them.
+        let deletable: HashSet<Vec<u8>> = {
+            let guard = self.inner.lock().await;
+            let inner = guard.as_ref().ok_or("locked")?;
+            let uploads = inner
+                .vault
+                .uploads(Some(&peer))
+                .await
+                .map_err(|e| describe(&e))?;
+            // Not those the server deleted already, which go by the next unlock.
+            let now = inner.client.clock().now();
+            uploads
+                .into_iter()
+                .filter(|(_, pending)| pending.done && !pending.expired(now))
+                .map(|(_, pending)| pending.id)
+                .collect()
+        };
         let mut end = u64::MAX;
         loop {
             let guard = self.inner.lock().await;
@@ -2277,10 +2846,17 @@ impl Engine {
                     ),
                     _ => continue,
                 };
+                let deletable = match &message.body {
+                    Body::Remote(remote) => {
+                        message.outgoing && deletable.contains(&remote.pointer.id)
+                    }
+                    _ => false,
+                };
                 files.push(FileView {
                     index,
                     at: message.at,
                     outgoing: message.outgoing,
+                    deletable,
                     sort: match sort {
                         Sort::Unknown => preview::sort(&name, &mime, &[]),
                         sort => sort,
@@ -2349,7 +2925,8 @@ impl Engine {
         Ok(())
     }
 
-    /// Delete the chat with `peer` and its history.
+    /// Delete the chat with `peer` and its history. The server knows nothing of it: what it keeps
+    /// of the chat goes as it is delivered, or expires.
     pub async fn delete(&self, peer: PublicKey) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
@@ -2357,8 +2934,8 @@ impl Engine {
         // one, which comes here as a new chat; see `say_farewells`. If forgetting fails, the
         // session goes back to this, as the farewell never goes.
         let snapshot = inner.contact(&peer).map(|contact| contact.snapshot());
-        // Not for a request, which a stranger may have sent: they learn nothing of it. What
-        // was read and not told yet goes first, so that the peer sends again only what was not.
+        // Not for a request, which a stranger may have sent: they learn nothing of it. What was
+        // read and not told yet goes first, so that the peer sends again only what was not.
         let mut farewell = vec![];
         if let Some(contact) = inner.contact(&peer)
             && !contact.state.request
@@ -2378,8 +2955,7 @@ impl Engine {
             {
                 if let Ok(message) = contact.session.encrypt(&content) {
                     farewell.push(Farewell {
-                        peer: peer.to_vec(),
-                        message: Some(message),
+                        push: Some(contact.session.push_request(message)),
                     });
                 }
             }
@@ -2416,6 +2992,9 @@ impl Engine {
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.peer != peer));
+        // Nor does what waited for a sign-in, which would otherwise hold up a chat started
+        // again with the peer, or go to it.
+        self.waits_sign_in.borrow_mut().remove(&peer);
         inner.contacts.retain(|contact| contact.peer != peer);
         // The other chats' records left unsaved were saved with it, and show at the next sync.
         inner.saved_late.extend(
@@ -2448,6 +3027,60 @@ impl Engine {
 }
 
 impl Inner {
+    /// Add `content` to the chat with `peer`, to be pushed in its turn, see `flush`: one that
+    /// `awaits_upload` waits, with those after it, for its attachment's upload to start. Saved,
+    /// or else forgotten; returns how it shows.
+    async fn add(
+        &mut self,
+        peer: &PublicKey,
+        content: Kind,
+        awaits_upload: bool,
+    ) -> Result<MessageView, String> {
+        let contact = self.contact(peer).ok_or("no such chat")?;
+        if contact.state.request {
+            return Err("accept the request first".into());
+        }
+        // If saving fails, the message is forgotten: it never left.
+        let snapshot = contact.snapshot();
+        // Encrypted as it goes, once its place in the chat is known, see `flush`.
+        let record = OutgoingRecord {
+            message: None,
+            content: content.to_bytes(),
+            delivery_hash: vec![],
+        };
+        let index = contact.state.history_len;
+        contact.state.history_len += 1;
+        contact.state.last_activity = now();
+        contact.state.outbox.push(Outgoing {
+            history_index: index,
+            sealed: false,
+            clock: 0,
+            awaits_upload,
+        });
+        let entry = HistoryEntry {
+            outgoing: true,
+            at: now(),
+            content: Some(Content {
+                kind: Some(content),
+                ..Content::default()
+            }),
+            delivery: Delivery::Pending.into(),
+            ..HistoryEntry::default()
+        };
+        let view = contact.message(index, entry.clone());
+        let saved = self
+            .save_with(
+                &[(history_key(peer, index), entry)],
+                &[(outbox_key(peer, index), Some(record))],
+            )
+            .await;
+        if let Err(e) = saved {
+            self.roll_back(peer, snapshot)?;
+            return Err(describe(&e));
+        }
+        Ok(view)
+    }
+
     /// What the vault keeps.
     fn app_state(&self) -> AppState {
         AppState {
@@ -2537,17 +3170,14 @@ impl Inner {
         let snapshot = contact.snapshot();
         let clock = contact.state.clock.saturating_add(1);
         stamp(&mut content, clock);
-        let message = contact
+        let sealed = contact
             .session
             .encrypt(&content)
             .map_err(|e| describe(&e))?;
         contact.state.clock = clock;
         let outgoing = &mut contact.state.outbox[next];
         (outgoing.sealed, outgoing.clock) = (true, clock);
-        let record = OutgoingRecord {
-            message: Some(message),
-            content: vec![],
-        };
+        let record = OutgoingRecord::sealed(sealed);
         if let Err(e) = self
             .save_with(&[], &[(outbox_key(peer, index), Some(record))])
             .await
@@ -2661,6 +3291,7 @@ impl Inner {
                 history_index: *history_index,
                 sealed: false,
                 clock: 0,
+                awaits_upload: false,
             })
             .collect();
         contact.state.outbox.splice(0..0, pushed);
@@ -2689,6 +3320,7 @@ impl Inner {
             let record = OutgoingRecord {
                 message: None,
                 content: content.map(|kind| kind.to_bytes()).unwrap_or_default(),
+                delivery_hash: vec![],
             };
             records.push((outbox_key(peer, *index), Some(record)));
         }

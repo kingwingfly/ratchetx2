@@ -58,6 +58,8 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .btn.icon { justify-content: center; width: 36px; height: 36px; padding: 0; }
 .btn.icon.small { width: 30px; height: 30px; }
 .btn.icon.done { color: var(--accent); border-color: var(--accent-line); }
+/* A button that reads as a link, within text. */
+.link { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 /* The sync button: its arrows, which turn while it syncs, in red while the server cannot be
    reached. */
 .sync { color: var(--muted); }
@@ -198,6 +200,12 @@ dialog::backdrop { background: #020706d9; backdrop-filter: blur(4px); }
 .file-months h3 { position: sticky; top: 0; z-index: 1; margin: 0 0 8px; padding: 2px 0; background: #101714; color: var(--muted); font-size: 12px; font-weight: 550; letter-spacing: .04em; text-transform: uppercase; }
 .file-months .empty { margin: 12px 0; }
 .file-list { display: flex; flex-direction: column; gap: 4px; }
+.file-entry { display: flex; align-items: center; gap: 10px; }
+.file-entry .file-row { flex: 1; min-width: 0; }
+.delete-remote { flex: none; font-size: 12px; }
+.delete-remote.asked { color: var(--danger); }
+.cancel-held { margin-right: 6px; font-size: 11px; }
+.delete-remote:disabled { color: var(--muted); text-decoration: none; cursor: default; }
 .file-row { display: flex; align-items: center; gap: 12px; padding: 8px 10px; border: 1px solid transparent; border-radius: 10px; background: none; text-align: left; cursor: pointer; }
 .file-row:hover { border-color: var(--line); background: var(--raised); }
 .file-row .file-icon { flex: none; width: 46px; overflow: hidden; text-align: center; text-overflow: ellipsis; }

@@ -15,7 +15,7 @@ use storage::{
     LocalMailboxStore, PublicKey, Result, StoredAttachment, StoredInitialMessage, StoredMessage,
 };
 use worker::{
-    Bucket, D1Database, D1PreparedStatement, D1Result, Date, Env, console_error,
+    Bucket, Conditional, D1Database, D1PreparedStatement, D1Result, Date, Env, console_error,
     js_sys::Uint8Array, wasm_bindgen::JsValue,
 };
 
@@ -55,11 +55,12 @@ impl Store {
         self.db.batch(statements).await.map_err(unavailable)
     }
 
-    /// Delete the messages, initial messages and attachments created before `before`, and their
-    /// R2 objects. Returns how many messages and attachments were deleted.
-    pub async fn expire(&self, before: u64) -> Result<(usize, usize)> {
-        let messages = self.expire_messages(before).await?;
-        let attachments = self.expire_attachments(before).await?;
+    /// Delete the messages and initial messages created before `messages_before`, and the
+    /// attachments created before `files_before`, with their R2 objects. Returns how many
+    /// messages and attachments were deleted.
+    pub async fn expire(&self, messages_before: u64, files_before: u64) -> Result<(usize, usize)> {
+        let messages = self.expire_messages(messages_before).await?;
+        let attachments = self.expire_attachments(files_before).await?;
         Ok((messages, attachments))
     }
 
@@ -75,7 +76,7 @@ impl Store {
             let rows: Vec<AttachmentRow> = rows(
                 &self
                     .prepare(
-                        "SELECT id, uploader, chunks, token_hash FROM attachments \
+                        "SELECT id, uploader, chunks, token_hash, uploaded FROM attachments \
                          WHERE created_at < ?1 ORDER BY created_at, id LIMIT 100",
                         std::slice::from_ref(&before),
                     )?
@@ -122,8 +123,9 @@ impl Store {
         .await
         .map_err(unavailable)?;
         // In pages, so each statement and R2 call stays small. The R2 objects go first: a row
-        // whose object is gone reads as empty content and goes in the next run, while an object
-        // whose row is gone would stay forever. The rows go by their keys, so that only those
+        // whose object is gone reads as a message whose content expired, which its recipient
+        // goes past, and goes in the next run, while an object whose row is gone would stay until
+        // the bucket's lifecycle rules delete it. The rows go by their keys, so that only those
         // whose objects went do.
         let mut deleted = 0;
         loop {
@@ -351,6 +353,7 @@ impl LocalMailboxStore for Store {
         header: Bytes,
         content: Bytes,
         initial_message: Option<Bytes>,
+        delivery_hash: Option<[u8; 32]>,
     ) -> Result<u64> {
         let object = (content.len() > INLINE_CONTENT_MAX).then(|| {
             format!(
@@ -361,7 +364,8 @@ impl LocalMailboxStore for Store {
             )
         });
         let queue = [blob(sender), blob(recipient)];
-        let statements = vec![
+        let statements =
+            vec![
             self.prepare(
                 "INSERT INTO queues (sender, recipient, last_sequence) VALUES (?1, ?2, 1) \
                  ON CONFLICT (sender, recipient) DO UPDATE SET last_sequence = last_sequence + 1",
@@ -369,8 +373,8 @@ impl LocalMailboxStore for Store {
             )?,
             self.prepare(
                 "INSERT INTO messages (sender, recipient, sequence, header, content, object, size, \
-                 initial_message, created_at) \
-                 SELECT ?1, ?2, last_sequence, ?3, ?4, ?5, ?6, ?7, ?8 FROM queues \
+                 initial_message, delivery_hash, created_at) \
+                 SELECT ?1, ?2, last_sequence, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM queues \
                  WHERE sender = ?1 AND recipient = ?2 RETURNING sequence",
                 &[
                     queue[0].clone(),
@@ -383,6 +387,7 @@ impl LocalMailboxStore for Store {
                     object.as_deref().map_or(JsValue::NULL, JsValue::from_str),
                     integer(content.len() as u64),
                     initial_message.as_deref().map_or(JsValue::NULL, blob),
+                    delivery_hash.as_ref().map_or(JsValue::NULL, |hash| blob(hash)),
                     integer(Date::now().as_millis()),
                 ],
             )?,
@@ -454,7 +459,7 @@ impl LocalMailboxStore for Store {
         )?;
         try_join_all(rows.into_iter().map(|row| async move {
             let content = match (row.content, &row.object) {
-                (Some(content), _) => Bytes::from(content),
+                (Some(content), _) => Some(Bytes::from(content)),
                 (None, Some(object)) => self.object(object).await?,
                 (None, None) => return Err(Error::new(ErrorKind::Corrupt, "no content")),
             };
@@ -468,6 +473,51 @@ impl LocalMailboxStore for Store {
             })
         }))
         .await
+    }
+
+    /// The R2 objects of the messages go first, as in [`expire`](Store::expire). If R2 fails,
+    /// it is logged, and only the rows without objects go: the others expire, rather than leave
+    /// objects no row names, and the fetch this is part of still reads.
+    async fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let hashes: Vec<String> = hashes.iter().map(|hash| hex(hash)).collect();
+        let values = [blob(sender), blob(recipient), json_array(&hashes).into()];
+        const DELIVERED: &str = "sender = ?1 AND recipient = ?2 \
+            AND delivery_hash IN (SELECT unhex(value) FROM json_each(?3))";
+        let objects: Vec<ObjectRow> = rows(
+            &self
+                .prepare(
+                    &format!(
+                        "SELECT object FROM messages WHERE {DELIVERED} AND object IS NOT NULL"
+                    ),
+                    &values,
+                )?
+                .all()
+                .await
+                .map_err(unavailable)?,
+        )?;
+        let objects: Vec<_> = objects.into_iter().filter_map(|row| row.object).collect();
+        // Any number of them: a hash may name more messages than tokens were given, as a sender
+        // may push one again, or many times.
+        let rows = match self.delete_objects(&objects).await {
+            Ok(()) => format!("DELETE FROM messages WHERE {DELIVERED}"),
+            Err(e) => {
+                console_error!("cannot delete the objects of delivered messages: {e}");
+                format!("DELETE FROM messages WHERE {DELIVERED} AND object IS NULL")
+            }
+        };
+        self.prepare(&rows, &values)?
+            .run()
+            .await
+            .map_err(unavailable)?;
+        Ok(())
     }
 }
 
@@ -494,7 +544,7 @@ impl LocalAttachmentStore for Store {
     async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>> {
         let result = self
             .prepare(
-                "SELECT id, uploader, chunks, token_hash FROM attachments WHERE id = ?1",
+                "SELECT id, uploader, chunks, token_hash, uploaded FROM attachments WHERE id = ?1",
                 &[blob(id)],
             )?
             .all()
@@ -506,17 +556,33 @@ impl LocalAttachmentStore for Store {
             .transpose()
     }
 
-    /// The row is looked at again once the chunk is in R2: if the attachment was deleted
-    /// meanwhile, e.g. cancelled while the chunk was on its way, the chunk goes too, as no row
-    /// would name it for expiry to delete.
+    /// A chunk in R2 already stays, as a chunk is uploaded once: R2 puts it only if there is
+    /// none, in one step, so that of two puts at once, the second changes nothing. The row notes
+    /// the chunk once it is in R2, in one statement, which also tells whether the attachment was
+    /// deleted meanwhile, e.g. cancelled while the chunk was on its way: then the chunk goes too,
+    /// as no row would name it for expiry to delete.
     async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
         let object = chunk_object(id, index);
+        let absent = Conditional {
+            etag_does_not_match: Some("*".to_string()),
+            ..Conditional::default()
+        };
+        // None if one was there already, which stays.
         self.bucket
             .put(&object, data.to_vec())
+            .only_if(absent)
             .execute()
             .await
             .map_err(unavailable)?;
-        if self.attachment(id).await?.is_none() {
+        let noted = self
+            .prepare(
+                "UPDATE attachments SET uploaded = uploaded | ?2 WHERE id = ?1",
+                &[blob(id), integer(storage::uploaded_bit(index))],
+            )?
+            .run()
+            .await
+            .map_err(unavailable)?;
+        if changes(&noted)? == 0 {
             self.bucket.delete(&object).await.map_err(unavailable)?;
             return Err(Error::new(ErrorKind::Other, "the attachment was deleted"));
         }
@@ -557,7 +623,7 @@ impl LocalAttachmentStore for Store {
 }
 
 impl Store {
-    /// Delete the R2 objects of the chunks of `attachments`, 1000 at once, as R2 takes them.
+    /// Delete the R2 objects of the chunks of `attachments`.
     async fn delete_chunks(&self, attachments: &[StoredAttachment]) -> Result<()> {
         let objects: Vec<_> = attachments
             .iter()
@@ -565,11 +631,13 @@ impl Store {
                 (0..attachment.chunks).map(|index| chunk_object(&attachment.id, index))
             })
             .collect();
+        self.delete_objects(&objects).await.map_err(unavailable)
+    }
+
+    /// Delete the R2 `objects`, 1000 at once, as R2 takes them, stopping at the first failure.
+    async fn delete_objects(&self, objects: &[String]) -> worker::Result<()> {
         for objects in objects.chunks(1000) {
-            self.bucket
-                .delete_multiple(objects.to_vec())
-                .await
-                .map_err(unavailable)?;
+            self.bucket.delete_multiple(objects.to_vec()).await?;
         }
         Ok(())
     }
@@ -581,9 +649,9 @@ fn chunk_object(id: &[u8], index: u32) -> String {
 }
 
 impl Store {
-    /// The content in R2 under `object`. A missing object reads as empty content, which fails to
-    /// decrypt, so that it cannot block the messages after it.
-    async fn object(&self, object: &str) -> Result<Bytes> {
+    /// The content in R2 under `object`; none if it expired, as the bucket's lifecycle rules
+    /// deleted it before its message was read, which the recipient goes past.
+    async fn object(&self, object: &str) -> Result<Option<Bytes>> {
         let Some(object) = self
             .bucket
             .get(object)
@@ -591,13 +659,12 @@ impl Store {
             .await
             .map_err(unavailable)?
         else {
-            console_error!("the R2 object {object} of a message is missing");
-            return Ok(Bytes::new());
+            return Ok(None);
         };
         let body = object
             .body()
             .ok_or_else(|| Error::new(ErrorKind::Corrupt, "an R2 object without a body"))?;
-        Ok(Bytes::from(body.bytes().await.map_err(unavailable)?))
+        Ok(Some(Bytes::from(body.bytes().await.map_err(unavailable)?)))
     }
 }
 
@@ -651,6 +718,11 @@ struct MessageRow {
 }
 
 #[derive(Deserialize)]
+struct ObjectRow {
+    object: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct AttachmentRow {
     #[serde(with = "serde_bytes")]
     id: Vec<u8>,
@@ -659,6 +731,8 @@ struct AttachmentRow {
     chunks: u32,
     #[serde(with = "serde_bytes")]
     token_hash: Vec<u8>,
+    /// A bitmask, which SQLite keeps as a signed integer.
+    uploaded: i64,
 }
 
 impl AttachmentRow {
@@ -668,6 +742,7 @@ impl AttachmentRow {
             uploader: fixed(&self.uploader)?,
             chunks: self.chunks,
             token_hash: fixed(&self.token_hash)?,
+            uploaded: self.uploaded as u64,
         })
     }
 }

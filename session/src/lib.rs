@@ -6,6 +6,7 @@
 )]
 
 pub mod attachment;
+mod clock;
 pub mod error;
 #[cfg(feature = "prost")]
 pub mod proto;
@@ -15,7 +16,10 @@ use core::mem;
 
 use bon::Builder;
 use bytes::Bytes;
+pub use clock::ServerClock;
 pub use error::{Error, ErrorKind, Result};
+use hkdf::Hkdf;
+use hmac::{Hmac, KeyInit, Mac};
 use party::{EncryptedMessage, Party};
 use prost::Message as _;
 pub use protocol;
@@ -25,11 +29,14 @@ use protocol::{
         self, FetchBundleRequest, LocalHandshake, PublishRequest, SendInitialMessageRequest,
         TakeInitialMessagesRequest,
     },
-    mailbox::{Envelope, FetchRequest, LocalMailbox, PushRequest},
+    mailbox::{
+        DELIVERY_TOKEN_LENGTH, Envelope, FetchRequest, LocalMailbox, MAX_DELIVERED, PushRequest,
+    },
     notify::SubscribeRequest,
 };
 use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 pub use safety::safety_number;
+use sha2::{Digest, Sha256};
 pub use x3dh::PublicKey;
 use x3dh::{LocalPrekeys, PrekeyBundle};
 use xeddsa::XEdDSAPrivateKey;
@@ -103,6 +110,9 @@ pub struct Client<H> {
     state: ClientState,
     #[builder(skip = state.identity.compute_public_key().to_bytes())]
     identity_key: PublicKey,
+    /// The server's clock, which signs the requests whose time it checks.
+    #[builder(default)]
+    clock: ServerClock,
 }
 
 /// What a [`Client`] keeps besides its transport: the identity key, the prekeys and the last
@@ -180,6 +190,7 @@ impl<H> Client<H> {
             handshake,
             state,
             identity_key,
+            clock: ServerClock::default(),
         }
     }
 
@@ -187,6 +198,19 @@ impl<H> Client<H> {
     /// publishing and accepting, so save it after those.
     pub fn state(&self) -> &ClientState {
         &self.state
+    }
+
+    /// This client, signing the requests whose time the server checks with `clock`, which the
+    /// transport keeps to the server's time, e.g. from the `Date` of its responses.
+    pub fn with_clock(mut self, clock: ServerClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// The server's clock, as this client sees it, which signs the requests whose time the
+    /// server checks.
+    pub fn clock(&self) -> &ServerClock {
+        &self.clock
     }
 }
 
@@ -270,6 +294,7 @@ impl<H: LocalHandshake> Client<H> {
                 id: message.ephemeral_key,
                 known_by_peer: false,
                 initial_message: initial_message.encode_to_vec(),
+                delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
             },
             self.identity_key,
             *peer,
@@ -348,6 +373,7 @@ impl<H: LocalHandshake> Client<H> {
             id: initial_message.x3dh.ephemeral_key,
             known_by_peer: true,
             initial_message: vec![],
+            delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
         };
         Ok((
             Session::new(mailbox, active, self.identity_key, *peer),
@@ -358,7 +384,8 @@ impl<H: LocalHandshake> Client<H> {
     /// Start uploading an attachment of `size` bytes: a new key, and the service's ID and upload
     /// token for it. Then [encrypt](attachment::Upload::encrypt) and
     /// [put](attachment::Upload::put) each chunk, and send the ID and key to the recipients in a
-    /// message.
+    /// message. The upload token may be kept after, to [cancel](attachment::Upload::cancel) it
+    /// later, deleting the attachment.
     ///
     /// Fails with [`ErrorKind::LimitExceeded`] if the service takes no attachment that large.
     pub async fn start_upload(
@@ -368,23 +395,25 @@ impl<H: LocalHandshake> Client<H> {
     ) -> Result<attachment::Upload> {
         let chunks = u32::try_from(attachment::chunk_count(size))
             .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
-        // The server takes it within a few minutes of its clock, so it is signed with this
-        // device's, not the strictly increasing timestamp, which may have run ahead of it.
-        let request = StartUploadRequest::sign(&self.state.identity, chunks, now());
-        let response = attachments.start_upload(request).await?;
+        // The server takes it within a few minutes of its clock, so it is signed with the
+        // server's, not the strictly increasing timestamp, which may have run ahead of it.
+        let sign = || StartUploadRequest::sign(&self.state.identity, chunks, self.clock.now());
+        let response = again_if_stale(|| attachments.start_upload(sign())).await?;
         Ok(attachment::Upload {
             id: protocol::fixed(&response.id)?,
             token: protocol::fixed(&response.upload_token)?,
             key: attachment::generate_key(),
             chunks,
+            expires: (response.expires != 0).then_some(response.expires),
         })
     }
 
     /// A subscription to this client's notifications, signed by its identity key, for a server
-    /// that sends them; see `protocol::notify`. It is good for a few minutes.
+    /// that sends them; see `protocol::notify`. It is good for a few minutes of the server's
+    /// [clock](Self::clock).
     pub fn subscription(&self) -> SubscribeRequest {
         // Within a few minutes of the server's clock, like an upload's start.
-        SubscribeRequest::sign(&self.state.identity, now())
+        SubscribeRequest::sign(&self.state.identity, self.clock.now())
     }
 
     /// Milliseconds since the Unix epoch, strictly increasing, as the server requires of
@@ -400,6 +429,29 @@ fn now() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
+}
+
+/// The response to the call `call` makes, signed with the server's clock: made again once if the
+/// server refused its time, as the refusal may have told the clock the server's.
+async fn again_if_stale<T, F: Future<Output = protocol::Result<T>>>(
+    call: impl Fn() -> F,
+) -> protocol::Result<T> {
+    match call().await {
+        Err(e) if e.kind() == protocol::ErrorKind::StaleTimestamp => call().await,
+        response => response,
+    }
+}
+
+/// A message encrypted for the peer by [`Session::encrypt`], to [push](Session::push) now or
+/// later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sealed {
+    /// The message.
+    pub message: EncryptedMessage,
+    /// SHA-256 of its delivery token, under the key of the session it was encrypted on, which
+    /// the token the peer gives back once it has the message matches, so that the server deletes
+    /// it; none for one that only expires.
+    pub delivery_hash: Option<[u8; 32]>,
 }
 
 /// A session with one peer: encrypts with a [`Party`] and exchanges messages through a mailbox.
@@ -418,8 +470,7 @@ pub struct Session<M> {
 ///
 /// Save it to [`restore`](Session::restore) the session later: serialize it with the `serde` or
 /// `rkyv` feature, or with `prost` convert it to a `proto::SessionState`. It holds the session's
-/// keys, so keep it secret.
-#[derive(Debug)]
+/// keys, so keep it secret; its `Debug` shows none of them, nor the delivery tokens.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "rkyv",
@@ -428,9 +479,8 @@ pub struct Session<M> {
 pub struct SessionState {
     /// The session messages are sent on; none once retired, until a new one starts.
     active: Option<Active>,
-    /// The parties of earlier sessions with the peer, latest first, which only decrypt, see
-    /// [`Session::keep`].
-    others: Vec<Party>,
+    /// Earlier sessions with the peer, latest first, which only decrypt, see [`Session::keep`].
+    others: Vec<Earlier>,
     me: PublicKey,
     peer: PublicKey,
     /// Sequence number of the last fetched message.
@@ -444,6 +494,26 @@ pub struct SessionState {
     /// [`Session::receive`].
     stalled_through: u64,
     skip_through: u64,
+    /// The delivery tokens of the messages received and not told to the server yet, which the
+    /// next fetch tells it, see [`Session::receive`].
+    delivered: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
+}
+
+impl core::fmt::Debug for SessionState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SessionState")
+            .field("active", &self.active)
+            .field("others", &self.others)
+            .field("me", &self.me)
+            .field("peer", &self.peer)
+            .field("cursor", &self.cursor)
+            .field("last", &self.last)
+            .field("direction_changes", &self.direction_changes)
+            .field("stalled_through", &self.stalled_through)
+            .field("skip_through", &self.skip_through)
+            .field("delivered", &self.delivered.len())
+            .finish()
+    }
 }
 
 /// The session a [`SessionState`] sends on.
@@ -464,6 +534,68 @@ struct Active {
     /// goes with it until the peer is known to have the session, in case the one in its inbox
     /// was lost. Empty once known.
     initial_message: Vec<u8>,
+    delivery_key: DeliveryKey,
+}
+
+/// An earlier session of a [`SessionState`], which only decrypts.
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+struct Earlier {
+    party: Party,
+    delivery_key: DeliveryKey,
+}
+
+impl From<Active> for Earlier {
+    fn from(active: Active) -> Self {
+        Self {
+            party: active.party,
+            delivery_key: active.delivery_key,
+        }
+    }
+}
+
+/// A session's delivery key, from X3DH's shared secret, which both peers have. A message's
+/// delivery token is HMAC-SHA256 of its encrypted header under it, truncated: only the two peers
+/// can compute it, so the recipient, giving it back to the server once it has the message,
+/// proves that it does, and the server, which has its SHA-256 from the push, deletes the
+/// message. Its `Debug` shows nothing of it.
+#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+struct DeliveryKey([u8; 32]);
+
+impl DeliveryKey {
+    /// The delivery key of a session whose X3DH shared secret is `secret`.
+    fn derive(secret: &[u8]) -> Self {
+        let mut key = [0; 32];
+        Hkdf::<Sha256>::new(None, secret)
+            .expand(b"session.v1/delivery", &mut key)
+            .expect("32 bytes are a valid HKDF-SHA256 output length");
+        Self(key)
+    }
+
+    /// The delivery token of `message`, a message of this session.
+    fn token(&self, message: &EncryptedMessage) -> [u8; DELIVERY_TOKEN_LENGTH] {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC takes any key");
+        mac.update(&message.header);
+        let tag = mac.finalize().into_bytes();
+        let mut token = [0; DELIVERY_TOKEN_LENGTH];
+        token.copy_from_slice(&tag[..DELIVERY_TOKEN_LENGTH]);
+        token
+    }
+}
+
+impl core::fmt::Debug for DeliveryKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DeliveryKey(..)")
+    }
 }
 
 /// What was done last on a [`SessionState`].
@@ -486,10 +618,10 @@ impl SessionState {
         &self.peer
     }
 
-    /// Keep `party` of an earlier session, only to decrypt, dropping the oldest beyond
+    /// Keep `earlier`, an earlier session, only to decrypt, dropping the oldest beyond
     /// [`KEPT_SESSIONS`].
-    fn archive(&mut self, party: Party) {
-        self.others.insert(0, party);
+    fn archive(&mut self, earlier: Earlier) {
+        self.others.insert(0, earlier);
         self.others.truncate(KEPT_SESSIONS);
     }
 
@@ -504,7 +636,7 @@ impl SessionState {
         self.last = LastAction::ReceivedEarlier;
         if self.direction_changes > MAX_DIRECTION_CHANGES {
             if let Some(active) = self.active.take() {
-                self.archive(active.party);
+                self.archive(active.into());
             }
             self.direction_changes = 0;
         }
@@ -530,7 +662,20 @@ impl From<&SessionState> for proto::SessionState {
                 .as_ref()
                 .map(|active| active.initial_message.clone())
                 .unwrap_or_default(),
-            others: state.others.iter().map(Into::into).collect(),
+            delivery_key: state
+                .active
+                .as_ref()
+                .map(|active| active.delivery_key.0.to_vec())
+                .unwrap_or_default(),
+            others: state
+                .others
+                .iter()
+                .map(|earlier| proto::EarlierSession {
+                    party: Some((&earlier.party).into()),
+                    delivery_key: earlier.delivery_key.0.to_vec(),
+                })
+                .collect(),
+            delivered: state.delivered.iter().map(|token| token.to_vec()).collect(),
             me: state.me.to_vec(),
             peer: state.peer.to_vec(),
             cursor: state.cursor,
@@ -560,12 +705,21 @@ impl TryFrom<&proto::SessionState> for SessionState {
                 .map_err(|_| ErrorKind::MalformedState.into())
         }
 
+        /// A delivery key, which must be 32 bytes.
+        fn delivery_key(bytes: &[u8]) -> Result<DeliveryKey> {
+            bytes
+                .try_into()
+                .map(DeliveryKey)
+                .map_err(|_| ErrorKind::MalformedState.into())
+        }
+
         let active = match &state.party {
             Some(party) => Some(Active {
                 party: Party::try_from(party)?,
                 id: key(&state.id)?,
                 known_by_peer: state.known_by_peer,
                 initial_message: state.initial_message.clone(),
+                delivery_key: delivery_key(&state.delivery_key)?,
             }),
             None => None,
         };
@@ -581,8 +735,24 @@ impl TryFrom<&proto::SessionState> for SessionState {
             others: state
                 .others
                 .iter()
-                .map(Party::try_from)
-                .collect::<core::result::Result<_, _>>()?,
+                .map(|earlier| {
+                    let party = earlier.party.as_ref().ok_or(ErrorKind::MalformedState)?;
+                    Ok(Earlier {
+                        party: Party::try_from(party)?,
+                        delivery_key: delivery_key(&earlier.delivery_key)?,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            delivered: state
+                .delivered
+                .iter()
+                .map(|token| {
+                    token
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| ErrorKind::MalformedState.into())
+                })
+                .collect::<Result<_>>()?,
             me: key(&state.me)?,
             peer: key(&state.peer)?,
             cursor: state.cursor,
@@ -615,6 +785,7 @@ impl<M> Session<M> {
                 direction_changes: 0,
                 stalled_through: 0,
                 skip_through: 0,
+                delivered: vec![],
             },
         )
     }
@@ -625,7 +796,8 @@ impl<M> Session<M> {
     }
 
     /// What to save to [`restore`](Session::restore) this session later. It changes with every
-    /// message encrypted or received, so save it after each, before showing what was received.
+    /// message encrypted or received, so save it after each, before showing what was received,
+    /// and before receiving again: the next fetch tells the server to delete what was received.
     pub fn state(&self) -> &SessionState {
         &self.state
     }
@@ -659,7 +831,7 @@ impl<M> Session<M> {
     /// [`Session::needs_new_session`].
     pub fn retire(&mut self) {
         if let Some(active) = self.state.active.take() {
-            self.state.archive(active.party);
+            self.state.archive(active.into());
         }
         self.state.last = LastAction::None;
         self.state.direction_changes = 0;
@@ -691,8 +863,9 @@ impl<M> Session<M> {
         state.cursor = state.cursor.max(new.cursor);
         state.stalled_through = state.stalled_through.max(new.stalled_through);
         state.skip_through = state.skip_through.max(new.skip_through);
-        for party in new.others.into_iter().rev() {
-            state.archive(party);
+        state.delivered.extend(new.delivered);
+        for earlier in new.others.into_iter().rev() {
+            state.archive(earlier);
         }
         if let Some(active) = new.active {
             // One this client started is not known by the peer yet.
@@ -704,7 +877,7 @@ impl<M> Session<M> {
                     .is_none_or(|current| current.known_by_peer || active.id > current.id);
             if takes_over {
                 if let Some(current) = state.active.replace(active) {
-                    state.archive(current.party);
+                    state.archive(current.into());
                 }
                 state.last = if started_here {
                     LastAction::None
@@ -714,7 +887,7 @@ impl<M> Session<M> {
                 state.direction_changes = 0;
             } else {
                 // Its first message decrypted, on what is now an earlier session.
-                state.archive(active.party);
+                state.archive(active.into());
                 state.received_earlier();
             }
         }
@@ -722,30 +895,45 @@ impl<M> Session<M> {
     }
 
     /// Decrypt `message` with the active party, or else with an earlier one, which only counts
-    /// towards retiring the active one, see [`Session::keep`]; and tell which.
-    fn decrypt(&mut self, message: &EncryptedMessage) -> Result<(Vec<u8>, bool)> {
+    /// towards retiring the active one, see [`Session::keep`]; and tell which, and the message's
+    /// delivery token.
+    fn decrypt(
+        &mut self,
+        message: &EncryptedMessage,
+    ) -> Result<(Vec<u8>, bool, [u8; DELIVERY_TOKEN_LENGTH])> {
         let state = &mut self.state;
         let mut error = None;
+        // A message a session received already is told apart, as a duplicate: one pushed again,
+        // e.g. as the reply to its push was lost, which the server deletes too, though it may
+        // have deleted the first already, as the peer gives its token.
+        let mut duplicate = None;
         if let Some(active) = &mut state.active {
             match active.party.decrypt(message) {
                 Ok(content) => {
                     active.known_by_peer = true;
                     active.initial_message = vec![];
                     state.last = LastAction::ReceivedActive;
-                    return Ok((content, false));
+                    return Ok((content, false, active.delivery_key.token(message)));
+                }
+                Err(e) if e.kind() == party::error::ErrorKind::DuplicateMessage => {
+                    state.delivered.push(active.delivery_key.token(message));
+                    duplicate = Some(e);
                 }
                 Err(e) => error = Some(e),
             }
         }
-        // A message an earlier session received already is told apart, as a duplicate.
-        let mut duplicate = None;
         for earlier in &mut state.others {
-            match earlier.decrypt(message) {
+            if duplicate.is_some() {
+                break;
+            }
+            match earlier.party.decrypt(message) {
                 Ok(content) => {
+                    let token = earlier.delivery_key.token(message);
                     state.received_earlier();
-                    return Ok((content, true));
+                    return Ok((content, true, token));
                 }
                 Err(e) if e.kind() == party::error::ErrorKind::DuplicateMessage => {
+                    state.delivered.push(earlier.delivery_key.token(message));
                     duplicate = Some(e);
                 }
                 Err(_) => {}
@@ -768,24 +956,37 @@ impl<M: LocalMailbox> Session<M> {
         self.push(message).await
     }
 
-    /// Encrypt `content` for the peer, on the active session.
+    /// Encrypt `content` for the peer, on the active session, with SHA-256 of the message's
+    /// delivery token under that session's key, so that it is deleted once the peer has it,
+    /// though it is pushed after another session became active.
     ///
     /// Fails with [`ErrorKind::NoSession`] if it has none, see [`Session::needs_new_session`].
-    pub fn encrypt(&mut self, content: &[u8]) -> Result<EncryptedMessage> {
+    pub fn encrypt(&mut self, content: &[u8]) -> Result<Sealed> {
         let state = &mut self.state;
         let active = state.active.as_mut().ok_or(ErrorKind::NoSession)?;
         let message = active.party.encrypt(content)?;
+        let delivery_hash = Sha256::digest(active.delivery_key.token(&message)).into();
         if state.last == LastAction::ReceivedEarlier {
             state.direction_changes += 1;
         }
         state.last = LastAction::Sent;
-        Ok(message)
+        Ok(Sealed {
+            message,
+            delivery_hash: Some(delivery_hash),
+        })
     }
 
-    /// Push an encrypted message to the peer; it can be pushed again if this fails. While the
+    /// Push a message encrypted for the peer; it can be pushed again if this fails. While the
     /// peer is not known to have the active session, the initial message that started it goes
     /// with it, in case the one in the peer's inbox was lost.
-    pub async fn push(&mut self, message: EncryptedMessage) -> Result<()> {
+    pub async fn push(&mut self, sealed: Sealed) -> Result<()> {
+        self.mailbox.push(self.push_request(sealed)).await?;
+        Ok(())
+    }
+
+    /// The request [`push`](Session::push) makes for `sealed`, to push later, e.g. once this
+    /// session is gone, as when telling the peer that the chat was deleted.
+    pub fn push_request(&self, sealed: Sealed) -> PushRequest {
         let initial_message = self
             .state
             .active
@@ -794,15 +995,15 @@ impl<M: LocalMailbox> Session<M> {
             .and_then(|active| {
                 handshake::InitialMessage::decode(active.initial_message.as_slice()).ok()
             });
-        self.mailbox
-            .push(PushRequest {
-                sender: Bytes::copy_from_slice(&self.state.me),
-                recipient: Bytes::copy_from_slice(&self.state.peer),
-                message: Some(message),
-                initial_message,
-            })
-            .await?;
-        Ok(())
+        PushRequest {
+            sender: Bytes::copy_from_slice(&self.state.me),
+            recipient: Bytes::copy_from_slice(&self.state.peer),
+            message: Some(sealed.message),
+            initial_message,
+            delivery_hash: sealed
+                .delivery_hash
+                .map_or_else(Bytes::new, |hash| Bytes::copy_from_slice(&hash)),
+        }
     }
 
     /// Fetch the next page of the peer's messages and decrypt them: one result per message, in
@@ -814,9 +1015,36 @@ impl<M: LocalMailbox> Session<M> {
     /// page ending with an [`ErrorKind::Stalled`] error, and leaves it for later. Take and accept
     /// the initial messages, then [`skip_stalled`](Session::skip_stalled) and receive again: what
     /// of that page still does not decrypt never will, and is skipped, so that it cannot block
-    /// the messages after it.
-    /// Cancel-safe: if the future is dropped, no message is consumed.
+    /// the messages after it. A message whose content expired on the server before it was
+    /// fetched is gone past, as one lost: a page of only those is not the end, and the next one
+    /// is fetched.
+    ///
+    /// The fetch tells the server which messages the last receive got, with their delivery
+    /// tokens, so that it deletes them: save the [state](Session::state) after each receive,
+    /// before the next, as the messages are on the server until then.
+    ///
+    /// Cancel-safe: if the future is dropped, no message is consumed, but those whose contents
+    /// expired.
     pub async fn receive(&mut self) -> Result<Vec<Received>> {
+        loop {
+            let cursor = self.state.cursor;
+            match self.receive_page().await? {
+                None => return Ok(vec![]),
+                // Their contents all expired; unless the page went nowhere, as a server that
+                // sends it again would have it, which must not hold this here forever.
+                Some(received) if received.is_empty() && self.state.cursor > cursor => {}
+                Some(received) => return Ok(received),
+            }
+        }
+    }
+
+    /// One page of [`receive`](Session::receive), none once the server has no new message.
+    async fn receive_page(&mut self) -> Result<Option<Vec<Received>>> {
+        let told = self.state.delivered.len().min(MAX_DELIVERED);
+        let delivered = self.state.delivered[..told]
+            .iter()
+            .map(|token| Bytes::copy_from_slice(token))
+            .collect();
         let response = self
             .mailbox
             .fetch(FetchRequest {
@@ -824,8 +1052,13 @@ impl<M: LocalMailbox> Session<M> {
                 recipient: Bytes::copy_from_slice(&self.state.me),
                 after: self.state.cursor,
                 limit: 0,
+                delivered,
             })
             .await?;
+        self.state.delivered.drain(..told);
+        if response.messages.is_empty() {
+            return Ok(None);
+        }
         let last = response
             .messages
             .last()
@@ -837,13 +1070,29 @@ impl<M: LocalMailbox> Session<M> {
                 .and_then(|initial_message| InitialMessage::try_from(initial_message).ok())
         };
         let mut received = Vec::with_capacity(response.messages.len());
+        // The initial messages that came with messages whose contents expired, offered with the
+        // next message of the page, so that receiving stalled there may still accept them.
+        let mut carried: Vec<InitialMessage> = vec![];
         let mut envelopes = response.messages.into_iter();
         while let Some(envelope) = envelopes.next() {
-            let decrypted = match &envelope.message {
-                Some(message) => self.decrypt(message),
-                None => Err(ErrorKind::InvalidMessage.into()),
+            // Its content expired on the server before it was fetched: gone past, as the
+            // ratchet goes past a message lost.
+            let Some(message) = &envelope.message else {
+                self.state.cursor = self.state.cursor.max(envelope.sequence);
+                if let Some(initial_message) = attached(&envelope)
+                    && !carried.contains(&initial_message)
+                {
+                    carried.push(initial_message);
+                }
+                continue;
             };
-            let mut initial_messages: Vec<_> = attached(&envelope).into_iter().collect();
+            let decrypted = self.decrypt(message);
+            let mut initial_messages = mem::take(&mut carried);
+            if let Some(initial_message) = attached(&envelope)
+                && !initial_messages.contains(&initial_message)
+            {
+                initial_messages.push(initial_message);
+            }
             let stalls = decrypted
                 .as_ref()
                 .is_err_and(|e| e.kind() != ErrorKind::DuplicateMessage)
@@ -865,17 +1114,20 @@ impl<M: LocalMailbox> Session<M> {
                     earlier: false,
                     initial_messages,
                 });
-                return Ok(received);
+                return Ok(Some(received));
             }
             self.state.cursor = self.state.cursor.max(envelope.sequence);
-            let earlier = decrypted.as_ref().is_ok_and(|(_, earlier)| *earlier);
+            let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
+            if let Ok((_, _, token)) = &decrypted {
+                self.state.delivered.push(*token);
+            }
             received.push(Received {
-                content: decrypted.map(|(content, _)| content),
+                content: decrypted.map(|(content, ..)| content),
                 earlier,
                 initial_messages,
             });
         }
-        Ok(received)
+        Ok(Some(received))
     }
 }
 
@@ -883,12 +1135,15 @@ impl<M: LocalMailbox> Session<M> {
 mod test {
     use core::cell::Cell;
     use protocol::{
-        attachment::AttachmentServer,
+        attachment::{
+            AttachmentServer, CancelUploadRequest, CancelUploadResponse, GetChunkRequest,
+            GetChunkResponse, PutChunkRequest, PutChunkResponse, StartUploadResponse,
+        },
         handshake::{
             FetchBundleResponse, HandshakeServer, PublishResponse, SendInitialMessageResponse,
             TakeInitialMessagesResponse,
         },
-        mailbox::{FetchResponse, MailboxServer, PushResponse},
+        mailbox::{FetchResponse, MailboxLimits, MailboxServer, PushResponse},
     };
 
     use storage::MemoryStore;
@@ -938,6 +1193,189 @@ mod test {
         async fn fetch(&self, request: FetchRequest) -> protocol::Result<FetchResponse> {
             self.0.fetch(request).await
         }
+    }
+
+    /// A mailbox whose message `expired`, a sequence number, comes without its content, as the
+    /// server's storage deleted it.
+    struct Expiring<'a>(&'a MailboxServer<MemoryStore>, u64);
+
+    impl LocalMailbox for Expiring<'_> {
+        async fn push(&self, request: PushRequest) -> protocol::Result<PushResponse> {
+            self.0.push(request).await
+        }
+
+        async fn fetch(&self, request: FetchRequest) -> protocol::Result<FetchResponse> {
+            let mut response = self.0.fetch(request).await?;
+            for envelope in &mut response.messages {
+                if envelope.sequence == self.1 {
+                    envelope.message = None;
+                }
+            }
+            Ok(response)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_message_expired_on_the_server_is_gone_past() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (_alice, mut alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
+        for content in [b"a", b"b", b"c"] {
+            alice_session.send(content).await.unwrap();
+        }
+        // "b", the second of Alice's queue after her greeting, which went with her initial
+        // message, comes without its content.
+        let mut bob_session = Session::restore(Expiring(&mailbox, 2), bob_session.state);
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a", b"c"]);
+        assert!(bob_session.receive().await.unwrap().is_empty());
+    }
+
+    /// A mailbox that answers every fetch with the same expired message, as a faulty server may.
+    struct Repeating(Cell<usize>);
+
+    impl LocalMailbox for Repeating {
+        async fn push(&self, _request: PushRequest) -> protocol::Result<PushResponse> {
+            Ok(PushResponse::default())
+        }
+
+        async fn fetch(&self, _request: FetchRequest) -> protocol::Result<FetchResponse> {
+            self.0.set(self.0.get() + 1);
+            Ok(FetchResponse {
+                messages: vec![Envelope::default()],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_page_that_goes_nowhere_is_the_end() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (_alice, _alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
+        let mut bob_session = Session::restore(Repeating(Cell::new(0)), bob_session.state);
+        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert_eq!(bob_session.mailbox.0.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_page_of_expired_messages_is_not_the_end() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        // A message a page, so that the first page holds only the one expired.
+        let limits = MailboxLimits {
+            max_fetch: 1,
+            ..MailboxLimits::default()
+        };
+        let mailbox = MailboxServer::builder(MemoryStore::default())
+            .limits(limits)
+            .build();
+        let (_alice, mut alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
+        for content in [b"a", b"b"] {
+            alice_session.send(content).await.unwrap();
+        }
+        let mut bob_session = Session::restore(Expiring(&mailbox, 1), bob_session.state);
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"b"]);
+        assert!(bob_session.receive().await.unwrap().is_empty());
+    }
+
+    /// The messages on the server from `sender` to `recipient`.
+    async fn queued(
+        mailbox: &MailboxServer<MemoryStore>,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+    ) -> usize {
+        let request = FetchRequest {
+            sender: Bytes::copy_from_slice(sender),
+            recipient: Bytes::copy_from_slice(recipient),
+            after: 0,
+            limit: 0,
+            delivered: vec![],
+        };
+        mailbox.fetch(request).await.unwrap().messages.len()
+    }
+
+    #[tokio::test]
+    async fn delivered_messages_leave_the_server() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (alice, mut alice_session, bob, mut bob_session) = talking(&handshake, &mailbox).await;
+        let (alice, bob) = (alice.identity_key(), bob.identity_key());
+        // Alice received Bob's "hello", and has not fetched since: it is still there.
+        assert_eq!(queued(&mailbox, &bob, &alice).await, 1);
+        assert!(alice_session.receive().await.unwrap().is_empty());
+        assert_eq!(queued(&mailbox, &bob, &alice).await, 0);
+
+        for content in [b"a", b"b"] {
+            alice_session.send(content).await.unwrap();
+        }
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a", b"b"]);
+        // Until Bob fetches again, having saved what he received, they stay; through a saved
+        // state too.
+        assert_eq!(queued(&mailbox, &alice, &bob).await, 2);
+        #[cfg(feature = "prost")]
+        let mut bob_session = Session::restore(
+            InProcessMailbox(&mailbox),
+            restored::<SessionState, proto::SessionState>(&bob_session.state),
+        );
+        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
+
+        // One that decrypts only on an earlier session goes too.
+        alice_session.send(b"late").await.unwrap();
+        bob_session.retire();
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"late"]);
+        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_message_pushed_after_the_session_changed_goes_once_delivered() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, mut bob, bob_session) =
+            talking(&handshake, &mailbox).await;
+        let (alice_key, bob_key) = (alice.identity_key(), bob.identity_key());
+        // Alice encrypts while offline; meanwhile Bob starts the chat again, and Alice takes his
+        // session, which becomes the one she sends on, before her message goes.
+        let waiting = alice_session.encrypt(b"waiting").unwrap();
+        alice.publish_keys(3).await.unwrap();
+        let mut bob_session = {
+            let mut again = bob
+                .initiate(&alice_key, b"again", InProcessMailbox(&mailbox))
+                .await
+                .unwrap();
+            again.keep(bob_session).unwrap();
+            again
+        };
+        let first = accept_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox).await;
+        assert_eq!(first, b"again");
+        alice_session.push(waiting).await.unwrap();
+        // Bob reads it on the earlier session; its token, under that session's key, deletes it.
+        assert_eq!(contents(receive_all(&mut bob_session).await), [b"waiting"]);
+        assert_eq!(queued(&mailbox, &alice_key, &bob_key).await, 1);
+        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert_eq!(queued(&mailbox, &alice_key, &bob_key).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_copy_pushed_after_the_first_was_delivered_goes_too() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (alice, mut alice_session, bob, mut bob_session) = talking(&handshake, &mailbox).await;
+        let (alice, bob) = (alice.identity_key(), bob.identity_key());
+        let sealed = alice_session.encrypt(b"twice").unwrap();
+        alice_session.push(sealed.clone()).await.unwrap();
+        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"twice"]);
+        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
+        // Pushed again, as the reply to the first push was lost, after Bob had it: a duplicate,
+        // which goes too.
+        alice_session.push(sealed).await.unwrap();
+        let received = bob_session.receive().await.unwrap();
+        assert_eq!(
+            received[0].content.as_ref().unwrap_err().kind(),
+            ErrorKind::DuplicateMessage
+        );
+        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
     }
 
     /// `state` saved as a protobuf message, and read back.
@@ -1447,7 +1885,10 @@ mod test {
 
         // What anyone pushes that never decrypts stops receiving once, then is skipped.
         alice_session
-            .push(EncryptedMessage::default())
+            .push(Sealed {
+                message: EncryptedMessage::default(),
+                delivery_hash: None,
+            })
             .await
             .unwrap();
         alice_session.send(b"after").await.unwrap();
@@ -1515,7 +1956,10 @@ mod test {
         // Junk, which never decrypts, then Alice starts again, and Bob loses her initial
         // message.
         alice_session
-            .push(EncryptedMessage::default())
+            .push(Sealed {
+                message: EncryptedMessage::default(),
+                delivery_hash: None,
+            })
             .await
             .unwrap();
         alice
@@ -1733,6 +2177,52 @@ mod test {
             bob_session.keep(session).unwrap_err().kind(),
             ErrorKind::UnexpectedPeer
         );
+    }
+
+    /// An attachment service whose responses tell `clock` the server's time, as HTTP's `Date`
+    /// does.
+    struct Dated<'a>(&'a AttachmentServer<MemoryStore>, ServerClock);
+
+    impl LocalAttachments for Dated<'_> {
+        async fn start_upload(
+            &self,
+            request: StartUploadRequest,
+        ) -> protocol::Result<StartUploadResponse> {
+            let response = self.0.start_upload(request).await;
+            self.1.observe(now());
+            response
+        }
+
+        async fn put_chunk(&self, request: PutChunkRequest) -> protocol::Result<PutChunkResponse> {
+            self.0.put_chunk(request).await
+        }
+
+        async fn get_chunk(&self, request: GetChunkRequest) -> protocol::Result<GetChunkResponse> {
+            self.0.get_chunk(request).await
+        }
+
+        async fn cancel_upload(
+            &self,
+            request: CancelUploadRequest,
+        ) -> protocol::Result<CancelUploadResponse> {
+            self.0.cancel_upload(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn signed_requests_go_by_the_servers_clock() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let attachments = AttachmentServer::new(MemoryStore::default());
+        let alice = Client::new(InProcessHandshake(&handshake));
+        // As if this device's clock were ten minutes behind the server's: refused.
+        alice.clock().observe(now() - 10 * 60 * 1000);
+        let error = alice.start_upload(&attachments, 1).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Protocol);
+        // Over a transport that learns the server's time from its responses, the refusal tells
+        // it, and the request goes again.
+        let dated = Dated(&attachments, alice.clock().clone());
+        alice.start_upload(&dated, 1).await.unwrap();
+        assert!(alice.clock().now().abs_diff(now()) < 1000);
     }
 
     #[tokio::test]

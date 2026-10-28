@@ -37,9 +37,16 @@ class_name = "Notifier"
 tag = "v1"
 new_sqlite_classes = ["Notifier"]
 
-# Daily, delete the messages, initial messages and attachments older than RETENTION_DAYS.
+# Daily, delete the messages never delivered and initial messages never taken older than
+# RETENTION_DAYS, and attachments older than FILE_RETENTION_DAYS.
 [triggers]
 crons = ["0 4 * * *"]
 
+# The secrets PASSWORD, which clients sign in with to store files, and AUTH_KEY, which signs
+# their sign-ins' cookies, are set with `npx wrangler secret put`, or in .dev.vars for
+# `wrangler dev`; see the README.
 [vars]
 RETENTION_DAYS = "30"
+FILE_RETENTION_DAYS = "90"
+# How long a sign-in lasts.
+SESSION_DAYS = "30"

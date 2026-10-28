@@ -99,6 +99,7 @@ pub struct Upload {
     pub(crate) token: [u8; TOKEN_LENGTH],
     pub(crate) key: Key,
     pub(crate) chunks: u32,
+    pub(crate) expires: Option<u64>,
 }
 
 impl Upload {
@@ -110,7 +111,14 @@ impl Upload {
             token,
             key,
             chunks,
+            expires: None,
         }
+    }
+
+    /// When the server deletes the attachment, in milliseconds since the Unix epoch, after which
+    /// the [token](Self::token) is no use, if it said as the upload started.
+    pub fn expires(&self) -> Option<u64> {
+        self.expires
     }
 
     /// The attachment's ID, which downloading it takes.

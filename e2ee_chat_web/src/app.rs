@@ -26,7 +26,7 @@ use crate::{
     search::Search,
     state::{
         Attachment, Body, ContactView, Delivery, Dialog, FileView, Link, LocalFile, Me,
-        MessageView, Phase, RemoteFile, Streamed, Ui, UploadState, UploadView,
+        MessageView, Phase, RemoteFile, SignIn, Streamed, Ui, UploadState, UploadView,
     },
     util::{clock, day, js_error, key_to_text, key_to_url, month, short, size, sleep},
     workers,
@@ -515,10 +515,30 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
         Delivery::Read => Some((Icon::Read, "read", true)),
         Delivery::Downloaded => Some((Icon::Downloaded, "read and downloaded", true)),
     };
+    // Held until this browser signs in to the server, which keeps it only for those who do: it
+    // can be cancelled, which lets what was sent after it go.
+    let index = message.index;
+    let held = message.outgoing.then_some(move || {
+        let ui = ui();
+        let peer = ui.open.get()?;
+        ui.held.with(|held| held.contains(&(peer, index))).then(|| {
+            view! {
+                <button
+                    type="button"
+                    class="link cancel-held"
+                    title="Do not send it, so that what was sent after it goes"
+                    on:click=move |_| act(async move { engine().cancel_held(peer, index).await })
+                >
+                    "Cancel"
+                </button>
+            }
+        })
+    });
     view! {
         <div class="message" class:me=message.outgoing>
             {content}
             <span class="meta" class:failed=message.delivery == Delivery::Failed>
+                {held}
                 {time}
                 {status
                     .map(|(shown, title, read)| {
@@ -844,7 +864,10 @@ fn inline_media(body: &Body) -> Option<(Source, Sort)> {
             ("video", _) => Sort::Video,
             _ => Sort::Audio,
         },
-        Body::Remote(remote) if remote.pointer.size <= MEDIA_INLINE_MAX => {
+        // Not one whose upload waits to start, which has nothing to fetch yet.
+        Body::Remote(remote)
+            if remote.pointer.size <= MEDIA_INLINE_MAX && !remote.pointer.id.is_empty() =>
+        {
             let pointer = &remote.pointer;
             match preview::sort(&pointer.name, &pointer.mime, &[]) {
                 sort @ (Sort::Image | Sort::Video | Sort::Audio) => sort,
@@ -1395,10 +1418,71 @@ fn VaultDialog() -> impl IntoView {
                 (Phase::Unlocked, Some(Dialog::Files(peer))) => {
                     view! { <FileBrowser peer /> }.into_any()
                 }
+                (Phase::Unlocked, Some(Dialog::SignIn)) => view! { <SignInDialog /> }.into_any(),
                 _ => ().into_any(),
             }}
             <Toast />
         </dialog>
+    }
+}
+
+/// Sign in to the server with its password, which storing files there takes, as they cost it
+/// storage: what waited for it goes then.
+#[component]
+fn SignInDialog() -> impl IntoView {
+    let password = RwSignal::new(String::new());
+    let progress = Progress::new();
+    let submit = move |event: ev::SubmitEvent| {
+        event.prevent_default();
+        let engine = engine();
+        progress.start("Signing in…");
+        spawn_local(async move {
+            match engine.sign_in(&password.get_untracked()).await {
+                Ok(signed_in) => {
+                    engine.ui().dialog.set(None);
+                    engine.ui().notify(format!(
+                        "Signed in until {}: your files go now.",
+                        day(signed_in.expires)
+                    ));
+                }
+                Err(e) => progress.fail(e),
+            }
+        });
+    };
+    view! {
+        <form on:submit=submit>
+            <h2>"Sign in to this server"</h2>
+            <p>
+                "This server is only for those signed in to it, as all that goes through it "
+                "costs it storage. Enter the password its owner gave you; this browser stays "
+                "signed in for a while. What you sent waits until then, unless you cancel it in "
+                "its chat."
+            </p>
+            <label for="server-password">"The server's password"</label>
+            <input
+                id="server-password"
+                type="password"
+                autocomplete="current-password"
+                required
+                bind:value=password
+            />
+            {progress.view()}
+            <div class="actions">
+                <button
+                    type="button"
+                    class="btn"
+                    on:click=move |_| {
+                        engine().decline_sign_in();
+                        close_dialog();
+                    }
+                >
+                    "Not now"
+                </button>
+                <button type="submit" class="btn primary" disabled=move || progress.working.get()>
+                    "Sign in"
+                </button>
+            </div>
+        </form>
     }
 }
 
@@ -1703,6 +1787,54 @@ fn Identity() -> impl IntoView {
             Ok(())
         });
     };
+    // Whether the server keeps this browser's files, as it is signed in to it.
+    let signed_in = RwSignal::new(None::<Result<Option<SignIn>, String>>);
+    spawn_local(async move {
+        signed_in.try_set(Some(engine().signed_in().await));
+    });
+    let sign_out = move |_| {
+        let engine = engine();
+        act(async move {
+            engine.sign_out().await?;
+            signed_in.try_set(Some(Ok(None)));
+            engine
+                .ui()
+                .notify("Signed out: files wait for the next sign-in.");
+            Ok(())
+        });
+    };
+    let files = move || match signed_in.get() {
+        None => view! { <p class="hint">"Asking the server…"</p> }.into_any(),
+        Some(Ok(Some(signed_in))) => view! {
+            <p class="hint">
+                {format!(
+                    "Signed in to the server until {}.",
+                    day(signed_in.expires),
+                )}
+                " "
+                <button type="button" class="link" on:click=sign_out>
+                    "Sign out"
+                </button>
+            </p>
+        }
+        .into_any(),
+        Some(Ok(None)) => view! {
+            <p class="hint">
+                "The server is only for those signed in to it: until then, nothing goes. "
+                <button
+                    type="button"
+                    class="link"
+                    on:click=move |_| ui.dialog.set(Some(Dialog::SignIn))
+                >
+                    "Sign in"
+                </button>
+            </p>
+        }
+        .into_any(),
+        Some(Err(e)) => {
+            view! { <p class="hint">{format!("Cannot ask the server: {e}")}</p> }.into_any()
+        }
+    };
     view! {
         <form on:submit=submit>
             <h2>"Your identity"</h2>
@@ -1716,6 +1848,8 @@ fn Identity() -> impl IntoView {
             <Copyable text=invitation_link(&me) what="your invitation link" />
             <label for="my-name">"Your name, which new chats see"</label>
             <input id="my-name" autocomplete="nickname" maxlength=NAME_MAX bind:value=name />
+            <label>"Server"</label>
+            {files}
             <div class="actions">
                 <button
                     type="button"
@@ -2019,16 +2153,85 @@ fn file_row(file: FileView, from: &str) -> AnyView {
         _ => view! { <span class="file-icon">{extension(&file.name)}</span> }.into_any(),
     };
     let title = file.name.clone();
+    // An attachment this client uploaded, which it can delete from the server.
+    let delete = match &file.body {
+        Body::Remote(remote) if file.deletable => {
+            <[u8; 16]>::try_from(remote.pointer.id.as_slice())
+                .ok()
+                .map(|id| view! { <DeleteFromServer peer=remote.peer id name=file.name.clone() /> })
+        }
+        _ => None,
+    };
     view! {
-        <button class="file-row" title=title on:click=move |_| source.open()>
-            {mark}
-            <span>
-                <strong>{file.name}</strong>
-                <span>{details}</span>
-            </span>
-        </button>
+        <div class="file-entry">
+            <button class="file-row" title=title on:click=move |_| source.open()>
+                {mark}
+                <span>
+                    <strong>{file.name}</strong>
+                    <span>{details}</span>
+                </span>
+            </button>
+            {delete}
+        </div>
     }
     .into_any()
+}
+
+/// Deletes the attachment `id`, named `name`, which this client uploaded for `peer`, from the
+/// server, once asked twice: the peer can no longer download it, though what it downloaded
+/// stays, and so does this client's copy.
+#[component]
+fn DeleteFromServer(peer: PublicKey, id: [u8; 16], name: String) -> impl IntoView {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Step {
+        Offered,
+        Asked,
+        Deleting,
+        Deleted,
+    }
+    let step = RwSignal::new(Step::Offered);
+    let label = ui()
+        .contact(&peer)
+        .map(|contact| contact.label())
+        .unwrap_or_default();
+    let title = format!("{label} can no longer download it; what they downloaded stays");
+    let click = move |_| match step.get_untracked() {
+        Step::Offered => step.set(Step::Asked),
+        Step::Asked => {
+            step.set(Step::Deleting);
+            let name = name.clone();
+            spawn_local(async move {
+                match engine().delete_attachment(peer, id).await {
+                    Ok(()) => {
+                        step.try_set(Step::Deleted);
+                        ui().notify(format!("{name} is deleted from the server"));
+                    }
+                    Err(e) => {
+                        step.try_set(Step::Offered);
+                        ui().notify(e);
+                    }
+                }
+            });
+        }
+        Step::Deleting | Step::Deleted => {}
+    };
+    view! {
+        <button
+            type="button"
+            class="link delete-remote"
+            class:asked=move || step.get() == Step::Asked
+            title=title
+            disabled=move || matches!(step.get(), Step::Deleting | Step::Deleted)
+            on:click=click
+        >
+            {move || match step.get() {
+                Step::Offered => "Delete from server",
+                Step::Asked => "Delete it for them?",
+                Step::Deleting => "Deleting…",
+                Step::Deleted => "Deleted from server",
+            }}
+        </button>
+    }
 }
 
 /// A blob URL of this origin for `data`, typed `mime`.

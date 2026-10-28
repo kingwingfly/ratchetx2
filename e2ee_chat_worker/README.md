@@ -3,8 +3,11 @@ The E2EE chat server as a [Cloudflare Worker](https://developers.cloudflare.com/
 - The handshake, mailbox and attachment services (the [protocol](../protocol) crate's servers) over the [Connect protocol](https://connectrpc.com/docs/protocol): `POST /handshake.v1.HandshakeService/<Method>`, `POST /mailbox.v1.MailboxService/<Method>` and `POST /attachment.v1.AttachmentService/<Method>`, with protobuf bodies. Any page may call them (CORS); requests that read or change an identity's data are signed by it.
 - **D1** keeps the prekey bundles, one-time prekeys, initial messages, message queues and attachments (`migrations/`; apply new ones before running a new build). **R2** keeps message contents over 64 KiB, so rows stay small, and attachments' chunks, under `attachments/<id>/<index>`.
 - **Notifications** over WebSockets: a client opens `/notifications?request=<SubscribeRequest>`, a subscription signed by its identity key, as unpadded base64url protobuf (`protocol::notify`). The socket goes to a **Durable Object** for that identity key, which keeps it with the hibernation API, so an idle socket costs no duration, and answers the client's `ping`s, one a minute, with `pong` without waking. A web client keeps its socket open only while its user is on the page; one that died without closing, as its device slept, goes without pings, and the object closes it when it next wakes, to notify. After each pushed message or initial message, the Worker tells the recipient's object, which sends a `Notification` frame on its sockets, once the response has gone.
+- **Sign-in**: the server is only for those signed in to it. Every call that writes needs it: publishing keys, fetching a bundle, which takes one of its one-time prekeys, starting a chat, pushing a message, and starting an upload; others are refused with `permission_denied`. Anyone can make identity keys, so limits per key would stop nobody; the password is what keeps the server to those who have it. Fetching messages, taking one's own inbox, downloading, notifications, and what an upload's token authorizes stay open. A client signs in once, `POST /auth/password` with the server's password, the `PASSWORD` secret, as its body, and gets a cookie, `__Host-e2ee-chat`, which its calls carry until it expires after `SESSION_DAYS` (30). The cookie is signed with HMAC-SHA256 under another secret, `AUTH_KEY`, so that a cookie cannot help guess the password offline; it names who signed in, `password` for now, so that later sign-ins, e.g. with a blockchain account by SIWE, SIWS or SIWX (CAIP-122), can sign the same cookies, and storage bought could be counted against them. It is `HttpOnly`, `Secure` and `SameSite=Strict`: the page's scripts cannot read it, and no other site's requests carry it, so no other page can store files as the user. `GET /auth` says who a request is signed in as, as JSON, `{}` for nobody, and `POST /auth/sign-out` signs out. Both posts are refused when the browser says they come from another site (`Sec-Fetch-Site`), so that no other page's form signs its visitor in or out; a development proxy such as `trunk serve` is the page's own origin, so its calls pass. A wrong password is answered after a second. As the cookie is the server's own, a web client signs in only on its own server's page.
 - Every store operation is one D1 statement or batch, so it is atomic, as the [storage](../storage) traits require; `--features conformance` runs their conformance suites against D1 and R2.
-- Daily, a cron trigger deletes messages, initial messages and attachments older than `RETENTION_DAYS` (30), with their R2 objects, since the protocol has no acknowledgements.
+- **Delivery**: a message goes once its recipient has it. Its push carries SHA-256 of its delivery token, which only the two peers can compute, and the recipient's next fetch, once it saved what it received, gives the tokens back: the Worker deletes those messages, with their R2 objects. Attachments stay, as recipients may download them again, until they expire or their uploader deletes one with the upload token it kept; a chunk is put once, R2 writing it only if it has none, so the token cannot change what was downloaded, even with two puts at once. If R2 fails to delete what was delivered, the fetch still reads, and those messages expire. Deleting a chat tells the server nothing.
+- Daily, a cron trigger deletes, with their R2 objects, the messages never delivered and initial messages never taken older than `RETENTION_DAYS` (30), and attachments older than `FILE_RETENTION_DAYS` (90). The bucket's [lifecycle rules](https://developers.cloudflare.com/r2/buckets/object-lifecycles/) may delete objects sooner: a message whose content is gone comes without it, and its recipient goes past it, as past a message lost; an attachment notes each chunk put, so one gone since is not found, rather than waited for as one still to be uploaded.
+- Its responses carry its time in `Date`, exposed to other origins too, which clients sign the requests whose time it checks with (an upload's start, a subscription), as a device's clock may be off; the Worker sets it, as `wrangler dev` does not.
 - The web client's files are served before the Worker runs, with the security headers of `e2ee_chat_web/_headers`.
 
 The server only sees encrypted messages and public keys, but it does see who sends to whom, when, and how much.
@@ -16,9 +19,12 @@ Needs the `wasm32-unknown-unknown` target, [trunk](https://trunkrs.dev) and [wor
 ```sh
 cd e2ee_chat_worker
 npm install
+printf 'PASSWORD="%s"\nAUTH_KEY="%s"\n' "a password" "$(openssl rand -base64 32)" > .dev.vars
 npx wrangler d1 migrations apply e2ee-chat --local
 npx wrangler dev
 ```
+
+`.dev.vars` holds the secrets for `wrangler dev`; git ignores it.
 
 `wrangler dev` builds the web client, with its previews' workers, and the Worker, and serves both, with local D1 and R2, on <http://localhost:8787>. Open it in two browser profiles to chat with yourself. To work on the web client with hot reload, run `trunk serve` in `e2ee_chat_web` too: it proxies the Connect calls to `wrangler dev`.
 
@@ -28,11 +34,15 @@ npx wrangler dev
 npx wrangler login
 npx wrangler d1 create e2ee-chat          # put its database_id in wrangler.toml
 npx wrangler r2 bucket create e2ee-chat
+npx wrangler r2 bucket lifecycle add e2ee-chat messages messages/ --expire-days 30
+npx wrangler r2 bucket lifecycle add e2ee-chat attachments attachments/ --expire-days 90
+npx wrangler secret put PASSWORD          # what users sign in with, to store files
+openssl rand -base64 32 | npx wrangler secret put AUTH_KEY
 npx wrangler d1 migrations apply e2ee-chat --remote
 npx wrangler deploy
 ```
 
-**Before a public deployment, add a password** to the expensive operations: starting uploads and uploading chunks (R2 storage), pushing messages and sending initial messages. Today anyone who can reach the Worker can use them, and storage, requests and Durable Object calls are billed. This is not built yet. A password shared by the server's users, which the clients send with those calls, identifies nobody and signs nothing, so it does not weaken deniability.
+Without both secrets, nobody can sign in, so nobody can use the server. The lifecycle rules delete objects that outlive their rows, as with a run of the cron that failed; keep their days at least `RETENTION_DAYS` for `messages/` and `FILE_RETENTION_DAYS` for `attachments/`, and longer than an upload takes, as a chunk expires from when it was put. Changing `AUTH_KEY` signs everyone out. The password is shared by the server's users and identifies nobody: it signs nothing the peers send, so deniability stays. The password is shared, and identifies nobody, so it cannot limit one user's share: put [rate limiting rules](https://developers.cloudflare.com/waf/rate-limiting-rules/) in front of a public deployment, by IP, on `/auth/password` too. Limits per user need users that cannot be made at will, e.g. invited or paying ones.
 
 # Limits
 

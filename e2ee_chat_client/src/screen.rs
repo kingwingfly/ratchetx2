@@ -11,6 +11,8 @@ pub enum Screen {
     HandleInitMsg,
     ListInitMsg,
     SelectFile,
+    /// Sign in to the server, which storing files there takes.
+    SignIn,
 }
 
 impl fmt::Display for Screen {
@@ -24,6 +26,7 @@ impl fmt::Display for Screen {
             Screen::HandleInitMsg => write!(f, "HandleInitMsg"),
             Screen::ListInitMsg => write!(f, "ListInitMsg"),
             Screen::SelectFile => write!(f, "SelectFile"),
+            Screen::SignIn => write!(f, "SignIn"),
         }
     }
 }

@@ -1,6 +1,6 @@
 //! What the page shows: plain data in signals, which the engine keeps up to date.
 
-use std::{fmt, sync::Arc, time::Duration};
+use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use leptos::prelude::*;
 use session::PublicKey;
@@ -257,6 +257,28 @@ pub enum Dialog {
     Contact(PublicKey),
     /// The files of the chat with a peer.
     Files(PublicKey),
+    /// Sign in to the server, which keeps files only for those who do.
+    SignIn,
+}
+
+/// Who this browser is signed in to its server as, which storing files there takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignIn {
+    /// Who: `password`, for the server's password.
+    pub subject: String,
+    /// When it expires, in milliseconds since the Unix epoch.
+    pub expires: u64,
+}
+
+impl SignIn {
+    /// The sign-in the server's answer `json` names, if any.
+    pub fn from_json(json: &str) -> Option<Self> {
+        let answer: serde_json::Value = serde_json::from_str(json).ok()?;
+        Some(Self {
+            subject: answer.get("subject")?.as_str()?.to_string(),
+            expires: answer.get("expires")?.as_u64()?,
+        })
+    }
 }
 
 /// A file of a chat, as its file browser lists it.
@@ -267,6 +289,9 @@ pub struct FileView {
     /// When it was sent or received.
     pub at: u64,
     pub outgoing: bool,
+    /// Whether this client can delete it from the server, as an attachment it uploaded whose
+    /// upload token it kept.
+    pub deletable: bool,
     pub name: String,
     pub size: u64,
     pub sort: Sort,
@@ -286,6 +311,9 @@ pub struct Ui {
     pub away: RwSignal<bool>,
     /// The attachments being uploaded, or paused.
     pub uploads: RwSignal<Vec<UploadView>>,
+    /// The messages held until this browser signs in to the server, by chat and history entry,
+    /// which can be cancelled.
+    pub held: RwSignal<HashSet<(PublicKey, u64)>>,
     pub me: RwSignal<Option<Me>>,
     pub contacts: RwSignal<Vec<ContactView>>,
     /// The chat on screen, if any.
@@ -323,6 +351,7 @@ impl Ui {
             live: RwSignal::new(false),
             away: RwSignal::new(false),
             uploads: RwSignal::new(vec![]),
+            held: RwSignal::new(HashSet::new()),
             me: RwSignal::new(None),
             contacts: RwSignal::new(vec![]),
             open: RwSignal::new(None),
