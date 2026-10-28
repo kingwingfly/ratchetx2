@@ -1,35 +1,33 @@
-//! The handshake, mailbox and attachment stores over D1, with large message contents and
-//! attachments' chunks in R2.
+//! The handshake, mailbox and attachment stores over the Worker's Durable Objects, with large
+//! message contents and attachments' chunks in R2.
 //!
-//! The tables are in `migrations/`. Every method is one D1 statement or one batch, which D1 runs
-//! as a transaction, so each is atomic as the storage traits require. Where a batch depends on a
-//! condition, such as a newer timestamp, every statement checks it against the rows as they were,
-//! before the statement that changes them, which comes last.
-
-use std::rc::Rc;
+//! Each store method is one call of one object, which serves it whole, so it is atomic, as the
+//! storage traits require: an identity's object for its keys, its inbox and the queues of
+//! messages to it, and an attachment's object for it. What goes to R2 goes from here, around
+//! those calls: a large content before its message is appended, and the objects of delivered
+//! messages before they are deleted, so that a failure leaves rows, which expire, rather than
+//! objects no row names.
 
 use futures_util::future::try_join_all;
-use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use storage::{
     AttachmentId, Bundle, Bytes, Error, ErrorKind, LocalAttachmentStore, LocalHandshakeStore,
     LocalMailboxStore, PublicKey, Result, StoredAttachment, StoredInitialMessage, StoredMessage,
 };
-use worker::{
-    Bucket, Conditional, D1Database, D1PreparedStatement, D1Result, Date, Env, console_error,
-    js_sys::Uint8Array, wasm_bindgen::JsValue,
+use worker::{Bucket, Conditional, Env, console_error};
+
+use crate::objects::{
+    self, AttachmentCall, AttachmentRow, Content, IdentityCall, InitialMessage, StoredRow,
+    TakenBundle,
 };
 
-/// Contents larger than this go to R2; smaller ones stay in their D1 row.
+/// Contents larger than this go to R2; smaller ones stay in their object's row.
 pub const INLINE_CONTENT_MAX: usize = 64 << 10;
 
-/// JavaScript's largest exact integer, as D1 takes integers as JavaScript numbers.
-const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
-
-/// The stores over the D1 database `DB` and the R2 bucket `BUCKET`. Its clones share the
-/// bindings.
+/// The stores over `env`'s objects and its R2 bucket.
 #[derive(Clone)]
 pub struct Store {
-    db: Rc<D1Database>,
+    env: Env,
     bucket: Bucket,
     /// Most bytes, headers and contents, one read returns, unless its first message alone is
     /// larger.
@@ -41,614 +39,32 @@ impl Store {
     /// unless the first message alone is larger.
     pub fn new(env: &Env, max_read_size: usize) -> worker::Result<Self> {
         Ok(Self {
-            db: Rc::new(env.d1("DB")?),
-            bucket: env.bucket("BUCKET")?,
+            env: env.clone(),
+            bucket: env.bucket(crate::BUCKET)?,
             max_read_size,
         })
     }
 
-    fn prepare(&self, query: &str, values: &[JsValue]) -> Result<D1PreparedStatement> {
-        self.db.prepare(query).bind(values).map_err(unavailable)
-    }
-
-    async fn batch(&self, statements: Vec<D1PreparedStatement>) -> Result<Vec<D1Result>> {
-        self.db.batch(statements).await.map_err(unavailable)
-    }
-
-    /// Delete the messages and initial messages created before `messages_before`, and the
-    /// attachments created before `files_before`, with their R2 objects. Returns how many
-    /// messages and attachments were deleted.
-    pub async fn expire(&self, messages_before: u64, files_before: u64) -> Result<(usize, usize)> {
-        let messages = self.expire_messages(messages_before).await?;
-        let attachments = self.expire_attachments(files_before).await?;
-        Ok((messages, attachments))
-    }
-
-    /// Delete the attachments created before `before`, in pages, their chunks first, so that a
-    /// failure leaves rows, which the next run picks up, rather than chunks no row names; and
-    /// again once the rows are gone, as in [`delete_attachment`](Self::delete_attachment), for a
-    /// chunk put meanwhile, which found its row still there. The rows go by their IDs, so that
-    /// only those whose chunks went do, though an upload cancelled meanwhile changes the page.
-    async fn expire_attachments(&self, before: u64) -> Result<usize> {
-        let before = integer(before);
-        let mut deleted = 0;
-        loop {
-            let rows: Vec<AttachmentRow> = rows(
-                &self
-                    .prepare(
-                        "SELECT id, uploader, chunks, token_hash, uploaded FROM attachments \
-                         WHERE created_at < ?1 ORDER BY created_at, id LIMIT 100",
-                        std::slice::from_ref(&before),
-                    )?
-                    .all()
-                    .await
-                    .map_err(unavailable)?,
-            )?;
-            let attachments = rows
-                .iter()
-                .map(AttachmentRow::stored)
-                .collect::<Result<Vec<_>>>()?;
-            self.delete_chunks(&attachments).await?;
-            let ids: Vec<String> = attachments
-                .iter()
-                .map(|attachment| hex(&attachment.id))
-                .collect();
-            let result = self
-                .prepare(
-                    "DELETE FROM attachments WHERE id IN (SELECT unhex(value) FROM json_each(?1))",
-                    &[json_array(&ids).into()],
-                )?
-                .run()
-                .await
-                .map_err(unavailable)?;
-            self.delete_chunks(&attachments).await?;
-            // None deleted would select the same page again, forever: the next run tries.
-            let changed = changes(&result)?;
-            deleted += changed;
-            if rows.len() < 100 || changed == 0 {
-                return Ok(deleted);
-            }
-        }
-    }
-
-    /// Delete the messages and initial messages created before `before`, and the messages' R2
-    /// objects. Returns how many messages were deleted.
-    async fn expire_messages(&self, before: u64) -> Result<usize> {
-        let before = integer(before);
-        self.prepare(
-            "DELETE FROM initial_messages WHERE created_at < ?1",
-            std::slice::from_ref(&before),
-        )?
-        .run()
-        .await
-        .map_err(unavailable)?;
-        // In pages, so each statement and R2 call stays small. The R2 objects go first: a row
-        // whose object is gone reads as a message whose content expired, which its recipient
-        // goes past, and goes in the next run, while an object whose row is gone would stay until
-        // the bucket's lifecycle rules delete it. The rows go by their keys, so that only those
-        // whose objects went do.
-        let mut deleted = 0;
-        loop {
-            let rows: Vec<ExpiredRow> = rows(
-                &self
-                    .prepare(
-                        "SELECT sender, recipient, sequence, object FROM messages \
-                         WHERE created_at < ?1 \
-                         ORDER BY created_at, sender, recipient, sequence LIMIT 1000",
-                        std::slice::from_ref(&before),
-                    )?
-                    .all()
-                    .await
-                    .map_err(unavailable)?,
-            )?;
-            let objects: Vec<_> = rows
-                .iter()
-                .filter_map(|row| row.object.as_deref())
-                .collect();
-            if !objects.is_empty() {
-                self.bucket
-                    .delete_multiple(objects)
-                    .await
-                    .map_err(unavailable)?;
-            }
-            // Each key as a JSON array of the sender and recipient in hex, and the sequence.
-            let keys: Vec<_> = rows
-                .iter()
-                .map(|row| {
-                    format!(
-                        "[\"{}\",\"{}\",{}]",
-                        hex(&row.sender),
-                        hex(&row.recipient),
-                        row.sequence
-                    )
-                })
-                .collect();
-            let result = self
-                .prepare(
-                    "DELETE FROM messages WHERE (sender, recipient, sequence) IN \
-                     (SELECT unhex(value ->> 0), unhex(value ->> 1), value ->> 2 \
-                     FROM json_each(?1))",
-                    &[format!("[{}]", keys.join(",")).into()],
-                )?
-                .run()
-                .await
-                .map_err(unavailable)?;
-            // None deleted would select the same page again, forever: the next run tries.
-            let changed = changes(&result)?;
-            deleted += changed;
-            if rows.len() < 1000 || changed == 0 {
-                return Ok(deleted);
-            }
-        }
-    }
-}
-
-impl LocalHandshakeStore for Store {
-    async fn publish(&self, bundle: Bundle, one_time_prekeys: Vec<PublicKey>) -> Result<bool> {
-        let identity_key = blob(&bundle.identity_key);
-        let timestamp = integer(bundle.timestamp);
-        // The prekeys as a JSON array of hex strings, inserted by one statement.
-        let one_time_prekeys: Vec<String> = one_time_prekeys.iter().map(|key| hex(key)).collect();
-        let one_time_prekeys = json_array(&one_time_prekeys);
-        // Only if the stored bundle, if any, is older.
-        const OLDER: &str =
-            "NOT EXISTS (SELECT 1 FROM bundles WHERE identity_key = ?1 AND timestamp >= ?2)";
-        let results = self
-            .batch(vec![
-                self.prepare(
-                    &format!("DELETE FROM one_time_prekeys WHERE identity_key = ?1 AND {OLDER}"),
-                    &[identity_key.clone(), timestamp.clone()],
-                )?,
-                self.prepare(
-                    &format!(
-                        "INSERT INTO one_time_prekeys (identity_key, position, prekey) \
-                         SELECT ?1, key, unhex(value) FROM json_each(?3) WHERE {OLDER}"
-                    ),
-                    &[
-                        identity_key.clone(),
-                        timestamp.clone(),
-                        one_time_prekeys.into(),
-                    ],
-                )?,
-                self.prepare(
-                    "INSERT INTO bundles \
-                     (identity_key, signed_prekey, signed_prekey_signature, timestamp) \
-                     VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT (identity_key) DO UPDATE SET \
-                     signed_prekey = excluded.signed_prekey, \
-                     signed_prekey_signature = excluded.signed_prekey_signature, \
-                     timestamp = excluded.timestamp \
-                     WHERE excluded.timestamp > bundles.timestamp",
-                    &[
-                        identity_key,
-                        blob(&bundle.signed_prekey),
-                        blob(&bundle.signed_prekey_signature),
-                        timestamp,
-                    ],
-                )?,
-            ])
-            .await?;
-        Ok(changes(&results[2])? > 0)
-    }
-
-    async fn take_bundle(
+    /// Make `call` of the object of `identity_key`.
+    async fn identity<T: DeserializeOwned>(
         &self,
-        identity_key: &PublicKey,
-    ) -> Result<Option<(Bundle, Option<PublicKey>)>> {
-        let key = blob(identity_key);
-        let results = self
-            .batch(vec![
-                self.prepare(
-                    "DELETE FROM one_time_prekeys WHERE identity_key = ?1 AND position = \
-                     (SELECT min(position) FROM one_time_prekeys WHERE identity_key = ?1) \
-                     RETURNING prekey",
-                    std::slice::from_ref(&key),
-                )?,
-                self.prepare(
-                    "SELECT signed_prekey, signed_prekey_signature, timestamp FROM bundles \
-                     WHERE identity_key = ?1",
-                    &[key],
-                )?,
-            ])
-            .await?;
-        let Some(bundle) = rows::<BundleRow>(&results[1])?.pop() else {
-            return Ok(None);
-        };
-        let one_time_prekey = rows::<PrekeyRow>(&results[0])?
-            .pop()
-            .map(|row| fixed(&row.prekey))
-            .transpose()?;
-        let bundle = Bundle {
-            identity_key: *identity_key,
-            signed_prekey: fixed(&bundle.signed_prekey)?,
-            signed_prekey_signature: fixed(&bundle.signed_prekey_signature)?,
-            timestamp: bundle.timestamp,
-        };
-        Ok(Some((bundle, one_time_prekey)))
+        identity_key: &[u8],
+        call: &IdentityCall,
+    ) -> Result<T> {
+        let stub = objects::identity(&self.env, identity_key).map_err(unavailable)?;
+        objects::call(&stub, call).await.map_err(unavailable)
     }
 
-    async fn add_initial_message(
+    /// Make `call` of the object of the attachment `id`.
+    async fn attachment_call<T: DeserializeOwned>(
         &self,
-        initial_message: StoredInitialMessage,
-        limit: usize,
-    ) -> Result<bool> {
-        let result = self
-            .prepare(
-                "INSERT INTO initial_messages \
-                 (recipient, sender, ephemeral_key, signed_prekey, one_time_prekey, header, \
-                 content, created_at) \
-                 SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8 \
-                 WHERE (SELECT count(*) FROM initial_messages WHERE recipient = ?1) < ?9",
-                &[
-                    blob(&initial_message.recipient),
-                    blob(&initial_message.sender),
-                    blob(&initial_message.ephemeral_key),
-                    blob(&initial_message.signed_prekey),
-                    initial_message
-                        .one_time_prekey
-                        .as_ref()
-                        .map_or(JsValue::NULL, |key| blob(key)),
-                    blob(&initial_message.header),
-                    blob(&initial_message.content),
-                    integer(Date::now().as_millis()),
-                    integer(limit as u64),
-                ],
-            )?
-            .run()
-            .await
-            .map_err(unavailable)?;
-        Ok(changes(&result)? > 0)
+        id: &AttachmentId,
+        call: &AttachmentCall,
+    ) -> Result<T> {
+        let stub = objects::attachment(&self.env, id).map_err(unavailable)?;
+        objects::call(&stub, call).await.map_err(unavailable)
     }
 
-    async fn take_initial_messages(
-        &self,
-        recipient: &PublicKey,
-        timestamp: u64,
-    ) -> Result<Option<Vec<StoredInitialMessage>>> {
-        let values = [blob(recipient), integer(timestamp)];
-        let results = self
-            .batch(vec![
-                self.prepare(
-                    "DELETE FROM initial_messages WHERE recipient = ?1 AND NOT EXISTS \
-                     (SELECT 1 FROM inboxes WHERE recipient = ?1 AND last_take >= ?2) \
-                     RETURNING id, sender, ephemeral_key, signed_prekey, one_time_prekey, header, \
-                     content",
-                    &values,
-                )?,
-                self.prepare(
-                    "INSERT INTO inboxes (recipient, last_take) VALUES (?1, ?2) \
-                     ON CONFLICT (recipient) DO UPDATE SET last_take = excluded.last_take \
-                     WHERE excluded.last_take > inboxes.last_take",
-                    &values,
-                )?,
-            ])
-            .await?;
-        if changes(&results[1])? == 0 {
-            return Ok(None);
-        }
-        let mut rows = rows::<InitialMessageRow>(&results[0])?;
-        rows.sort_by_key(|row| row.id);
-        rows.into_iter()
-            .map(|row| {
-                Ok(StoredInitialMessage {
-                    sender: fixed(&row.sender)?,
-                    recipient: *recipient,
-                    ephemeral_key: fixed(&row.ephemeral_key)?,
-                    signed_prekey: fixed(&row.signed_prekey)?,
-                    one_time_prekey: row.one_time_prekey.as_deref().map(fixed).transpose()?,
-                    header: Bytes::from(row.header),
-                    content: Bytes::from(row.content),
-                })
-            })
-            .collect::<Result<_>>()
-            .map(Some)
-    }
-}
-
-impl LocalMailboxStore for Store {
-    async fn append(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        header: Bytes,
-        content: Bytes,
-        initial_message: Option<Bytes>,
-        delivery_hash: Option<[u8; 32]>,
-    ) -> Result<u64> {
-        let object = (content.len() > INLINE_CONTENT_MAX).then(|| {
-            format!(
-                "messages/{}/{}/{}",
-                hex(sender),
-                hex(recipient),
-                random_id()
-            )
-        });
-        let queue = [blob(sender), blob(recipient)];
-        let statements =
-            vec![
-            self.prepare(
-                "INSERT INTO queues (sender, recipient, last_sequence) VALUES (?1, ?2, 1) \
-                 ON CONFLICT (sender, recipient) DO UPDATE SET last_sequence = last_sequence + 1",
-                &queue,
-            )?,
-            self.prepare(
-                "INSERT INTO messages (sender, recipient, sequence, header, content, object, size, \
-                 initial_message, delivery_hash, created_at) \
-                 SELECT ?1, ?2, last_sequence, ?3, ?4, ?5, ?6, ?7, ?8, ?9 FROM queues \
-                 WHERE sender = ?1 AND recipient = ?2 RETURNING sequence",
-                &[
-                    queue[0].clone(),
-                    queue[1].clone(),
-                    blob(&header),
-                    match object {
-                        Some(_) => JsValue::NULL,
-                        None => blob(&content),
-                    },
-                    object.as_deref().map_or(JsValue::NULL, JsValue::from_str),
-                    integer(content.len() as u64),
-                    initial_message.as_deref().map_or(JsValue::NULL, blob),
-                    delivery_hash.as_ref().map_or(JsValue::NULL, |hash| blob(hash)),
-                    integer(Date::now().as_millis()),
-                ],
-            )?,
-        ];
-        if let Some(object) = &object {
-            self.bucket
-                .put(object, content.to_vec())
-                .execute()
-                .await
-                .map_err(unavailable)?;
-        }
-        let results = match self.batch(statements).await {
-            Ok(results) => results,
-            Err(error) => {
-                if let Some(object) = object
-                    && let Err(e) = self.bucket.delete(object).await
-                {
-                    console_error!("cannot delete the object of a message not appended: {e}");
-                }
-                return Err(error);
-            }
-        };
-        let row = rows::<SequenceRow>(&results[1])?
-            .pop()
-            .ok_or_else(|| Error::new(ErrorKind::Corrupt, "no sequence number returned"))?;
-        Ok(row.sequence)
-    }
-
-    async fn read(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        after: u64,
-        limit: u32,
-    ) -> Result<Vec<StoredMessage>> {
-        // Only the messages that fit in the size, headers included as the mailbox counts them,
-        // leave D1, so a page fits in the Worker's memory: their bytes are summed from the
-        // lengths, without reading the blobs; the first message always comes, so that fetching
-        // progresses.
-        let rows: Vec<MessageRow> = rows(
-            &self
-                .prepare(
-                    "WITH page AS ( \
-                         SELECT sequence, \
-                         size + length(header) + coalesce(length(initial_message), 0) AS bytes \
-                         FROM messages \
-                         WHERE sender = ?1 AND recipient = ?2 AND sequence > ?3 \
-                         ORDER BY sequence LIMIT ?4 \
-                     ), sums AS ( \
-                         SELECT sequence, sum(bytes) OVER (ORDER BY sequence) AS total FROM page \
-                     ) \
-                     SELECT m.sequence, m.header, m.content, m.object, \
-                     m.initial_message FROM sums \
-                     JOIN messages AS m \
-                     ON m.sender = ?1 AND m.recipient = ?2 AND m.sequence = sums.sequence \
-                     WHERE sums.total <= ?5 OR sums.sequence = (SELECT min(sequence) FROM page) \
-                     ORDER BY m.sequence",
-                    &[
-                        blob(sender),
-                        blob(recipient),
-                        integer(after),
-                        integer(limit.into()),
-                        integer(self.max_read_size as u64),
-                    ],
-                )?
-                .all()
-                .await
-                .map_err(unavailable)?,
-        )?;
-        try_join_all(rows.into_iter().map(|row| async move {
-            let content = match (row.content, &row.object) {
-                (Some(content), _) => Some(Bytes::from(content)),
-                (None, Some(object)) => self.object(object).await?,
-                (None, None) => return Err(Error::new(ErrorKind::Corrupt, "no content")),
-            };
-            Ok(StoredMessage {
-                sender: *sender,
-                recipient: *recipient,
-                sequence: row.sequence,
-                header: Bytes::from(row.header),
-                content,
-                initial_message: row.initial_message.map(Bytes::from),
-            })
-        }))
-        .await
-    }
-
-    /// The R2 objects of the messages go first, as in [`expire`](Store::expire). If R2 fails,
-    /// it is logged, and only the rows without objects go: the others expire, rather than leave
-    /// objects no row names, and the fetch this is part of still reads.
-    async fn delete_delivered(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        hashes: &[[u8; 32]],
-    ) -> Result<()> {
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        let hashes: Vec<String> = hashes.iter().map(|hash| hex(hash)).collect();
-        let values = [blob(sender), blob(recipient), json_array(&hashes).into()];
-        const DELIVERED: &str = "sender = ?1 AND recipient = ?2 \
-            AND delivery_hash IN (SELECT unhex(value) FROM json_each(?3))";
-        let objects: Vec<ObjectRow> = rows(
-            &self
-                .prepare(
-                    &format!(
-                        "SELECT object FROM messages WHERE {DELIVERED} AND object IS NOT NULL"
-                    ),
-                    &values,
-                )?
-                .all()
-                .await
-                .map_err(unavailable)?,
-        )?;
-        let objects: Vec<_> = objects.into_iter().filter_map(|row| row.object).collect();
-        // Any number of them: a hash may name more messages than tokens were given, as a sender
-        // may push one again, or many times.
-        let rows = match self.delete_objects(&objects).await {
-            Ok(()) => format!("DELETE FROM messages WHERE {DELIVERED}"),
-            Err(e) => {
-                console_error!("cannot delete the objects of delivered messages: {e}");
-                format!("DELETE FROM messages WHERE {DELIVERED} AND object IS NULL")
-            }
-        };
-        self.prepare(&rows, &values)?
-            .run()
-            .await
-            .map_err(unavailable)?;
-        Ok(())
-    }
-}
-
-impl LocalAttachmentStore for Store {
-    async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool> {
-        let result = self
-            .prepare(
-                "INSERT INTO attachments (id, uploader, chunks, token_hash, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (id) DO NOTHING",
-                &[
-                    blob(&attachment.id),
-                    blob(&attachment.uploader),
-                    integer(attachment.chunks.into()),
-                    blob(&attachment.token_hash),
-                    integer(Date::now().as_millis()),
-                ],
-            )?
-            .run()
-            .await
-            .map_err(unavailable)?;
-        Ok(changes(&result)? > 0)
-    }
-
-    async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>> {
-        let result = self
-            .prepare(
-                "SELECT id, uploader, chunks, token_hash, uploaded FROM attachments WHERE id = ?1",
-                &[blob(id)],
-            )?
-            .all()
-            .await
-            .map_err(unavailable)?;
-        rows::<AttachmentRow>(&result)?
-            .first()
-            .map(AttachmentRow::stored)
-            .transpose()
-    }
-
-    /// A chunk in R2 already stays, as a chunk is uploaded once: R2 puts it only if there is
-    /// none, in one step, so that of two puts at once, the second changes nothing. The row notes
-    /// the chunk once it is in R2, in one statement, which also tells whether the attachment was
-    /// deleted meanwhile, e.g. cancelled while the chunk was on its way: then the chunk goes too,
-    /// as no row would name it for expiry to delete.
-    async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
-        let object = chunk_object(id, index);
-        let absent = Conditional {
-            etag_does_not_match: Some("*".to_string()),
-            ..Conditional::default()
-        };
-        // None if one was there already, which stays.
-        self.bucket
-            .put(&object, data.to_vec())
-            .only_if(absent)
-            .execute()
-            .await
-            .map_err(unavailable)?;
-        let noted = self
-            .prepare(
-                "UPDATE attachments SET uploaded = uploaded | ?2 WHERE id = ?1",
-                &[blob(id), integer(storage::uploaded_bit(index))],
-            )?
-            .run()
-            .await
-            .map_err(unavailable)?;
-        if changes(&noted)? == 0 {
-            self.bucket.delete(&object).await.map_err(unavailable)?;
-            return Err(Error::new(ErrorKind::Other, "the attachment was deleted"));
-        }
-        Ok(())
-    }
-
-    /// The chunks go first, so that a failure leaves the row, which expires, rather than chunks
-    /// no row names; and again once the row is gone, as a chunk put meanwhile, which found the
-    /// row still there, would stay.
-    async fn delete_attachment(&self, id: &AttachmentId) -> Result<()> {
-        let Some(attachment) = self.attachment(id).await? else {
-            return Ok(());
-        };
-        let attachment = std::slice::from_ref(&attachment);
-        self.delete_chunks(attachment).await?;
-        self.prepare("DELETE FROM attachments WHERE id = ?1", &[blob(id)])?
-            .run()
-            .await
-            .map_err(unavailable)?;
-        self.delete_chunks(attachment).await
-    }
-
-    async fn chunk(&self, id: &AttachmentId, index: u32) -> Result<Option<Bytes>> {
-        let Some(object) = self
-            .bucket
-            .get(chunk_object(id, index))
-            .execute()
-            .await
-            .map_err(unavailable)?
-        else {
-            return Ok(None);
-        };
-        let body = object
-            .body()
-            .ok_or_else(|| Error::new(ErrorKind::Corrupt, "an R2 object without a body"))?;
-        Ok(Some(Bytes::from(body.bytes().await.map_err(unavailable)?)))
-    }
-}
-
-impl Store {
-    /// Delete the R2 objects of the chunks of `attachments`.
-    async fn delete_chunks(&self, attachments: &[StoredAttachment]) -> Result<()> {
-        let objects: Vec<_> = attachments
-            .iter()
-            .flat_map(|attachment| {
-                (0..attachment.chunks).map(|index| chunk_object(&attachment.id, index))
-            })
-            .collect();
-        self.delete_objects(&objects).await.map_err(unavailable)
-    }
-
-    /// Delete the R2 `objects`, 1000 at once, as R2 takes them, stopping at the first failure.
-    async fn delete_objects(&self, objects: &[String]) -> worker::Result<()> {
-        for objects in objects.chunks(1000) {
-            self.bucket.delete_multiple(objects.to_vec()).await?;
-        }
-        Ok(())
-    }
-}
-
-/// The R2 object of chunk `index` of the attachment `id`.
-fn chunk_object(id: &[u8], index: u32) -> String {
-    format!("attachments/{}/{index}", hex(id))
-}
-
-impl Store {
     /// The content in R2 under `object`; none if it expired, as the bucket's lifecycle rules
     /// deleted it before its message was read, which the recipient goes past.
     async fn object(&self, object: &str) -> Result<Option<Bytes>> {
@@ -668,104 +84,270 @@ impl Store {
     }
 }
 
-#[derive(Deserialize)]
-struct BundleRow {
-    #[serde(with = "serde_bytes")]
-    signed_prekey: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    signed_prekey_signature: Vec<u8>,
-    timestamp: u64,
-}
+impl LocalHandshakeStore for Store {
+    async fn publish(&self, bundle: Bundle, one_time_prekeys: Vec<PublicKey>) -> Result<bool> {
+        let call = IdentityCall::Publish {
+            signed_prekey: bundle.signed_prekey.to_vec(),
+            signature: bundle.signed_prekey_signature.to_vec(),
+            timestamp: bundle.timestamp,
+            one_time_prekeys: one_time_prekeys.iter().map(|key| key.to_vec()).collect(),
+        };
+        self.identity(&bundle.identity_key, &call).await
+    }
 
-#[derive(Deserialize)]
-struct PrekeyRow {
-    #[serde(with = "serde_bytes")]
-    prekey: Vec<u8>,
-}
+    async fn take_bundle(
+        &self,
+        identity_key: &PublicKey,
+    ) -> Result<Option<(Bundle, Option<PublicKey>)>> {
+        let taken: Option<TakenBundle> = self
+            .identity(identity_key, &IdentityCall::TakeBundle)
+            .await?;
+        let Some(taken) = taken else {
+            return Ok(None);
+        };
+        let bundle = Bundle {
+            identity_key: *identity_key,
+            signed_prekey: fixed(&taken.signed_prekey)?,
+            signed_prekey_signature: fixed(&taken.signature)?,
+            timestamp: taken.timestamp,
+        };
+        let one_time_prekey = taken.one_time_prekey.as_deref().map(fixed).transpose()?;
+        Ok(Some((bundle, one_time_prekey)))
+    }
 
-#[derive(Deserialize)]
-struct InitialMessageRow {
-    id: u64,
-    #[serde(with = "serde_bytes")]
-    sender: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    ephemeral_key: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    signed_prekey: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    one_time_prekey: Option<Vec<u8>>,
-    #[serde(with = "serde_bytes")]
-    header: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    content: Vec<u8>,
-}
+    async fn add_initial_message(
+        &self,
+        initial_message: StoredInitialMessage,
+        limit: usize,
+    ) -> Result<bool> {
+        let call = IdentityCall::AddInitialMessage {
+            message: InitialMessage {
+                sender: initial_message.sender.to_vec(),
+                ephemeral_key: initial_message.ephemeral_key.to_vec(),
+                signed_prekey: initial_message.signed_prekey.to_vec(),
+                one_time_prekey: initial_message.one_time_prekey.map(|key| key.to_vec()),
+                header: initial_message.header.to_vec(),
+                content: initial_message.content.to_vec(),
+            },
+            limit: limit as u64,
+        };
+        self.identity(&initial_message.recipient, &call).await
+    }
 
-#[derive(Deserialize)]
-struct SequenceRow {
-    sequence: u64,
-}
-
-#[derive(Deserialize)]
-struct MessageRow {
-    sequence: u64,
-    #[serde(with = "serde_bytes")]
-    header: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    content: Option<Vec<u8>>,
-    object: Option<String>,
-    #[serde(with = "serde_bytes")]
-    initial_message: Option<Vec<u8>>,
-}
-
-#[derive(Deserialize)]
-struct ObjectRow {
-    object: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct AttachmentRow {
-    #[serde(with = "serde_bytes")]
-    id: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    uploader: Vec<u8>,
-    chunks: u32,
-    #[serde(with = "serde_bytes")]
-    token_hash: Vec<u8>,
-    /// A bitmask, which SQLite keeps as a signed integer.
-    uploaded: i64,
-}
-
-impl AttachmentRow {
-    fn stored(&self) -> Result<StoredAttachment> {
-        Ok(StoredAttachment {
-            id: fixed(&self.id)?,
-            uploader: fixed(&self.uploader)?,
-            chunks: self.chunks,
-            token_hash: fixed(&self.token_hash)?,
-            uploaded: self.uploaded as u64,
-        })
+    async fn take_initial_messages(
+        &self,
+        recipient: &PublicKey,
+        timestamp: u64,
+    ) -> Result<Option<Vec<StoredInitialMessage>>> {
+        let taken: Option<Vec<InitialMessage>> = self
+            .identity(recipient, &IdentityCall::TakeInitialMessages { timestamp })
+            .await?;
+        let Some(taken) = taken else {
+            return Ok(None);
+        };
+        taken
+            .into_iter()
+            .map(|message| {
+                Ok(StoredInitialMessage {
+                    sender: fixed(&message.sender)?,
+                    recipient: *recipient,
+                    ephemeral_key: fixed(&message.ephemeral_key)?,
+                    signed_prekey: fixed(&message.signed_prekey)?,
+                    one_time_prekey: message.one_time_prekey.as_deref().map(fixed).transpose()?,
+                    header: Bytes::from(message.header),
+                    content: Bytes::from(message.content),
+                })
+            })
+            .collect::<Result<_>>()
+            .map(Some)
     }
 }
 
-#[derive(Deserialize)]
-struct ExpiredRow {
-    #[serde(with = "serde_bytes")]
-    sender: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    recipient: Vec<u8>,
-    sequence: u64,
-    object: Option<String>,
+impl LocalMailboxStore for Store {
+    /// A content too large for its row goes to R2 first, and goes again if the message is not
+    /// appended.
+    async fn append(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        header: Bytes,
+        content: Bytes,
+        initial_message: Option<Bytes>,
+        delivery_hash: Option<[u8; 32]>,
+    ) -> Result<u64> {
+        let size = content.len() as u64;
+        let content = if content.len() > INLINE_CONTENT_MAX {
+            let object = format!(
+                "messages/{}/{}/{}",
+                hex(sender),
+                hex(recipient),
+                random_id()
+            );
+            self.bucket
+                .put(&object, content.to_vec())
+                .execute()
+                .await
+                .map_err(unavailable)?;
+            Content::Object(object)
+        } else {
+            Content::Inline(content.to_vec())
+        };
+        let call = IdentityCall::Append {
+            sender: sender.to_vec(),
+            header: header.to_vec(),
+            content: content.clone(),
+            size,
+            initial_message: initial_message.map(|bytes| bytes.to_vec()),
+            delivery_hash: delivery_hash.map(Vec::from),
+        };
+        let appended = self.identity(recipient, &call).await;
+        if appended.is_err()
+            && let Content::Object(object) = content
+            && let Err(e) = self.bucket.delete(object).await
+        {
+            console_error!("cannot delete the object of a message not appended: {e}");
+        }
+        appended
+    }
+
+    async fn read(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredMessage>> {
+        let call = IdentityCall::Read {
+            sender: sender.to_vec(),
+            after,
+            limit,
+            max_size: self.max_read_size as u64,
+        };
+        let rows: Vec<StoredRow> = self.identity(recipient, &call).await?;
+        try_join_all(rows.into_iter().map(|row| async move {
+            let content = match row.content {
+                Content::Inline(content) => Some(Bytes::from(content)),
+                Content::Object(object) => self.object(&object).await?,
+            };
+            Ok(StoredMessage {
+                sender: *sender,
+                recipient: *recipient,
+                sequence: row.sequence,
+                header: Bytes::from(row.header),
+                content,
+                initial_message: row.initial_message.map(Bytes::from),
+            })
+        }))
+        .await
+    }
+
+    /// Their R2 objects go first. If R2 fails, it is logged, and only the messages without
+    /// objects go: the others expire, rather than leave objects no row names, and the fetch this
+    /// is part of still reads.
+    async fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> Result<()> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let hashes: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.to_vec()).collect();
+        let call = IdentityCall::DeliveredObjects {
+            sender: sender.to_vec(),
+            hashes: hashes.clone(),
+        };
+        let objects: Vec<String> = self.identity(recipient, &call).await?;
+        let inline_only = match delete_objects(&self.bucket, objects).await {
+            Ok(()) => false,
+            Err(e) => {
+                console_error!("cannot delete the objects of delivered messages: {e}");
+                true
+            }
+        };
+        let call = IdentityCall::DeleteDelivered {
+            sender: sender.to_vec(),
+            hashes,
+            inline_only,
+        };
+        self.identity(recipient, &call).await
+    }
 }
 
-/// Bind bytes as a BLOB.
-fn blob(bytes: &[u8]) -> JsValue {
-    Uint8Array::from(bytes).buffer().into()
+impl LocalAttachmentStore for Store {
+    async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool> {
+        let call = AttachmentCall::Add {
+            id: attachment.id.to_vec(),
+            uploader: attachment.uploader.to_vec(),
+            chunks: attachment.chunks,
+            token_hash: attachment.token_hash.to_vec(),
+        };
+        self.attachment_call(&attachment.id, &call).await
+    }
+
+    async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>> {
+        let row: Option<AttachmentRow> = self.attachment_call(id, &AttachmentCall::Get).await?;
+        row.map(|row| {
+            Ok(StoredAttachment {
+                id: fixed(&row.id)?,
+                uploader: fixed(&row.uploader)?,
+                chunks: row.chunks,
+                token_hash: fixed(&row.token_hash)?,
+                uploaded: row.uploaded,
+            })
+        })
+        .transpose()
+    }
+
+    /// A chunk in R2 already stays, as a chunk is uploaded once: R2 puts it only if there is
+    /// none, in one step, so that of two puts at once, the second changes nothing. The object
+    /// notes it once it is in R2, which also tells whether the attachment was deleted meanwhile,
+    /// e.g. cancelled while the chunk was on its way: then the chunk goes too, as nothing would
+    /// name it for deleting.
+    async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
+        let object = chunk_object(id, index);
+        let absent = Conditional {
+            etag_does_not_match: Some("*".to_string()),
+            ..Conditional::default()
+        };
+        // None if one was there already, which stays.
+        self.bucket
+            .put(&object, data.to_vec())
+            .only_if(absent)
+            .execute()
+            .await
+            .map_err(unavailable)?;
+        let noted: bool = self
+            .attachment_call(id, &AttachmentCall::Note { index })
+            .await?;
+        if !noted {
+            self.bucket.delete(&object).await.map_err(unavailable)?;
+            return Err(Error::new(ErrorKind::Other, "the attachment was deleted"));
+        }
+        Ok(())
+    }
+
+    async fn chunk(&self, id: &AttachmentId, index: u32) -> Result<Option<Bytes>> {
+        self.object(&chunk_object(id, index)).await
+    }
+
+    async fn delete_attachment(&self, id: &AttachmentId) -> Result<()> {
+        self.attachment_call(id, &AttachmentCall::Delete).await
+    }
 }
 
-/// Bind an integer, as a JavaScript number. Beyond 2^53, where a number is no longer exact, the
-/// integer is clamped: only absurd timestamps get there, which compare as equal and so as stale.
-fn integer(value: u64) -> JsValue {
-    JsValue::from_f64(value.min(MAX_SAFE_INTEGER) as f64)
+/// The R2 object of chunk `index` of the attachment `id`.
+pub(crate) fn chunk_object(id: &[u8], index: u32) -> String {
+    format!("attachments/{}/{index}", hex(id))
+}
+
+/// Delete the R2 `objects`, 1000 at once, as R2 takes them.
+pub(crate) async fn delete_objects(bucket: &Bucket, objects: Vec<String>) -> worker::Result<()> {
+    for objects in objects.chunks(1000) {
+        bucket.delete_multiple(objects.to_vec()).await?;
+    }
+    Ok(())
 }
 
 /// Lowercase hex.
@@ -773,34 +355,11 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// A JSON array of hex strings, which need no escaping.
-fn json_array(strings: &[String]) -> String {
-    let quoted: Vec<_> = strings
-        .iter()
-        .map(|string| format!("\"{string}\""))
-        .collect();
-    format!("[{}]", quoted.join(","))
-}
-
 /// A random name, for an R2 object.
 fn random_id() -> String {
     let mut bytes = [0; 16];
     getrandom::fill(&mut bytes).expect("crypto.getRandomValues is available in Workers");
     hex(&bytes)
-}
-
-/// The rows of a result.
-fn rows<T: for<'de> Deserialize<'de>>(result: &D1Result) -> Result<Vec<T>> {
-    result.results().map_err(|e| {
-        console_error!("unexpected rows: {e}");
-        Error::new(ErrorKind::Corrupt, e.to_string())
-    })
-}
-
-/// How many rows a statement changed.
-fn changes(result: &D1Result) -> Result<usize> {
-    let meta = result.meta().map_err(unavailable)?;
-    Ok(meta.and_then(|meta| meta.changes).unwrap_or(0))
 }
 
 /// A stored key or signature of `N` bytes.
@@ -812,7 +371,7 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     })
 }
 
-/// A failed D1 or R2 call, logged, since clients only learn that the storage failed.
+/// A failed object or R2 call, logged, since clients only learn that the storage failed.
 fn unavailable(error: worker::Error) -> Error {
     console_error!("storage failed: {error}");
     Error::new(ErrorKind::Unavailable, error.to_string())

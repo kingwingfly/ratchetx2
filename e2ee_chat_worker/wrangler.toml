@@ -13,35 +13,29 @@ watch_dir = ["src", "../e2ee_chat_web/src", "../e2ee_chat_web/index.html", "../e
 [assets]
 directory = "../e2ee_chat_web/dist"
 
-# Prekeys, initial messages, message queues and attachments. Create it with
-# `npx wrangler d1 create e2ee-chat` and put its id here.
-[[d1_databases]]
-binding = "DB"
-database_name = "e2ee-chat"
-database_id = "00000000-0000-0000-0000-000000000000"
-migrations_dir = "migrations"
-
 # Message contents over 64 KiB and attachments' chunks. Create it with
 # `npx wrangler r2 bucket create e2ee-chat`.
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "e2ee-chat"
 
-# A notifier per identity key, holding its client's WebSockets; SQLite-backed, as the Free plan
-# requires, though it stores nothing.
+# The server's state, in SQLite-backed Durable Objects, as the Free plan requires: an object per
+# identity key, keeping its prekeys, its inbox, the messages to it and its client's WebSockets;
+# and an object per attachment. Each deletes what expires with an alarm.
 [[durable_objects.bindings]]
-name = "NOTIFIER"
-class_name = "Notifier"
+name = "IDENTITIES"
+class_name = "Identity"
+
+[[durable_objects.bindings]]
+name = "ATTACHMENTS"
+class_name = "Attachment"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["Notifier"]
+new_sqlite_classes = ["Identity", "Attachment"]
 
-# Daily, delete the messages never delivered and initial messages never taken older than
-# RETENTION_DAYS, and attachments older than FILE_RETENTION_DAYS.
-[triggers]
-crons = ["0 4 * * *"]
-
+# How long, in days, the messages never delivered and the initial messages never taken are kept,
+# and attachments: the objects' alarms delete them then.
 [vars]
 RETENTION_DAYS = "30"
 FILE_RETENTION_DAYS = "90"

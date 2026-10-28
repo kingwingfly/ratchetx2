@@ -94,7 +94,7 @@ const RETRY_MAX: i32 = 30_000;
 const HISTORY_SHOWN: u64 = 500;
 /// Milliseconds between syncs: right after something happened, at most while idle, and while
 /// the user is away, when the client has no notifications. Workers bill per request, so idle
-/// pages back off, and pages left alone all but stop: the Worker and its notifiers then scale to
+/// pages back off, and pages left alone all but stop: the Worker and its Durable Objects then scale to
 /// nothing.
 const POLL_FAST: i32 = 3_000;
 const POLL_SLOW: i32 = 30_000;
@@ -267,7 +267,7 @@ impl Engine {
 
     /// Whether the user is here: the page shown and in focus, or hidden for less than
     /// [`HIDDEN_GRACE`], or out of focus for less than [`UNFOCUSED_GRACE`]. Notifications are
-    /// for then only, as a WebSocket open keeps a notifier on the server.
+    /// for then only, as a WebSocket open is held on the server.
     fn present(&self) -> bool {
         let document = document();
         let grace = if document.hidden() {

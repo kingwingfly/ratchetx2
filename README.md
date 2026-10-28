@@ -2,7 +2,7 @@
 
 ![screenshot](image/screenshot.png)
 
-- **[E2EE chat Worker](e2ee_chat_worker/README.md)**: the chat server as a Cloudflare Worker, over Connect, storing in D1 and R2, and serving the web client
+- **[E2EE chat Worker](e2ee_chat_worker/README.md)**: the chat server as a Cloudflare Worker, over Connect, storing in Durable Objects and R2, and serving the web client
 - **[E2EE chat web client](e2ee_chat_web/README.md)**: the web client, in Leptos: keys and sessions stay in the browser, in a vault sealed by a passphrase
 - **[E2EE chat client](e2ee_chat_client/README.md)**: TUI chat client, support image; it talks to the Worker, and with the web client
 

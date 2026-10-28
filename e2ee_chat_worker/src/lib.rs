@@ -1,8 +1,9 @@
-//! The E2EE chat server as a Cloudflare Worker: the handshake and mailbox services over the
-//! Connect protocol, stored in D1 and R2, and notifications over WebSockets. See the README.
+//! The E2EE chat server as a Cloudflare Worker: the handshake, mailbox and attachment services
+//! over the Connect protocol, kept in Durable Objects and R2, and notifications over WebSockets.
+//! See the README.
 
 mod auth;
-mod notifier;
+mod objects;
 mod store;
 
 use std::time::Duration;
@@ -14,37 +15,27 @@ use protocol::{
     ErrorKind,
     attachment::{AttachmentLimits, AttachmentServer},
     connect::{self, PROTOCOL_VERSION_HEADER, Procedure},
-    fixed,
-    handshake::{HandshakeServer, SendInitialMessageRequest},
-    mailbox::{MailboxLimits, MailboxServer, PushRequest},
-    notify::{Notification, SubscribeRequest},
+    handshake::HandshakeServer,
+    mailbox::{MailboxLimits, MailboxServer},
+    notify::SubscribeRequest,
 };
-use storage::PublicKey;
-use worker::{
-    Context, Cors, Date, Env, Headers, Method, Request, RequestInit, Response, Result,
-    ScheduleContext, ScheduledEvent, Stub, console_error, console_log, event, js_sys::Uint8Array,
-};
+use worker::{Context, Cors, Date, Env, Headers, Method, Request, Response, Result, event};
 
+pub use crate::objects::{Attachment, Identity};
 use crate::store::Store;
+pub(crate) use crate::store::hex;
 
 /// Where a client opens the WebSocket of its notifications.
 const NOTIFICATIONS_PATH: &str = "/notifications";
-/// The binding of the notifiers' Durable Object namespace.
-const NOTIFIER: &str = "NOTIFIER";
-
-/// How long messages never delivered and initial messages never taken are kept, unless the
-/// `RETENTION_DAYS` variable says.
-const DEFAULT_RETENTION_DAYS: u64 = 30;
-/// How long attachments are kept, unless the `FILE_RETENTION_DAYS` variable says: longer than
-/// messages, as recipients may download them again, e.g. on a new device.
-const DEFAULT_FILE_RETENTION_DAYS: u64 = 90;
+/// The binding of the R2 bucket.
+pub(crate) const BUCKET: &str = "BUCKET";
 /// The largest request body: the largest message, 4 MiB - 64 KiB, with room for the rest of a
 /// push.
 const MAX_BODY: usize = 4 << 20;
 
 /// Answers the Connect calls; the web client's files are served before the Worker runs.
 #[event(fetch)]
-async fn fetch(request: Request, env: Env, context: Context) -> Result<Response> {
+async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response> {
     #[cfg(feature = "conformance")]
     if request.path() == "/conformance" && request.method() == Method::Post {
         // A failure panics, which fails the request.
@@ -66,7 +57,7 @@ async fn fetch(request: Request, env: Env, context: Context) -> Result<Response>
     let response = match request.method() {
         // A CORS preflight, which the headers below answer.
         Method::Options => Response::empty()?,
-        Method::Post => call(request, &env, &context, procedure).await?,
+        Method::Post => call(request, &env, procedure).await?,
         _ => {
             let headers = Headers::new();
             headers.set("allow", "POST, OPTIONS")?;
@@ -86,17 +77,11 @@ async fn fetch(request: Request, env: Env, context: Context) -> Result<Response>
     )
 }
 
-async fn call(
-    mut request: Request,
-    env: &Env,
-    context: &Context,
-    procedure: Procedure,
-) -> Result<Response> {
+async fn call(mut request: Request, env: &Env, procedure: Procedure) -> Result<Response> {
     let content_type = request.headers().get("content-type")?;
     let limits = MailboxLimits::default();
     let response = match read_body(&mut request, MAX_BODY).await? {
         Some(body) => {
-            // Shared, so that `notify` decodes the call again without copying its message.
             let body = Bytes::from(body);
             if writes(procedure) && auth::signed_in(&request, env).is_none() {
                 let message = "sign in to this server to use it";
@@ -106,14 +91,18 @@ async fn call(
             let handshake = HandshakeServer::new(store.clone());
             let mailbox = MailboxServer::builder(store.clone()).limits(limits).build();
             // Uploaders learn how long it keeps their files, after which their tokens are no use.
-            let retention = days(env, "FILE_RETENTION_DAYS", DEFAULT_FILE_RETENTION_DAYS);
+            let retention = period(
+                env,
+                "FILE_RETENTION_DAYS",
+                objects::DEFAULT_FILE_RETENTION_DAYS,
+            );
             let attachments = AttachmentServer::builder(store)
                 .limits(AttachmentLimits {
-                    retention: Some(Duration::from_secs(retention.saturating_mul(24 * 60 * 60))),
+                    retention: Some(retention),
                     ..AttachmentLimits::default()
                 })
                 .build();
-            let response = connect::handle(
+            connect::handle(
                 &handshake,
                 &mailbox,
                 &attachments,
@@ -121,13 +110,7 @@ async fn call(
                 content_type.as_deref(),
                 &body,
             )
-            .await;
-            if response.status == 200
-                && let Err(e) = notify(env, context, procedure, body)
-            {
-                console_error!("cannot notify: {e}");
-            }
-            response
+            .await
         }
         None => connect::error(ErrorKind::LimitExceeded, "request too large"),
     };
@@ -168,12 +151,12 @@ fn writes(procedure: Procedure) -> bool {
     )
 }
 
-/// Hand a WebSocket asking for an identity's notifications to its notifier, once its
+/// Hand a WebSocket asking for an identity's notifications to its object, once its
 /// subscription verifies: a `SubscribeRequest` in the `request` query parameter, as protobuf in
 /// unpadded base64url, as a browser's WebSocket cannot send headers.
 async fn subscribe(request: Request, env: &Env) -> Result<Response> {
-    // Only a WebSocket handshake, a GET: the notifier takes a POST as a notification for every
-    // subscriber, which only the Worker may send.
+    // Only a WebSocket handshake, a GET: the identity's object takes a POST as a call, which
+    // only the Worker may make.
     if request.method() != Method::Get {
         let headers = Headers::new();
         headers.set("allow", "GET")?;
@@ -194,57 +177,12 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
     };
     match subscription.verify(Date::now().as_millis()) {
         Ok(identity_key) => {
-            notifier(env, &identity_key)?
+            objects::identity(env, &identity_key)?
                 .fetch_with_request(request)
                 .await
         }
         Err(e) => Response::error(e.to_string(), 403),
     }
-}
-
-/// Tell the recipient of a message or an initial message, the call `body` made, that it arrived,
-/// once the response has gone. Decoding from `Bytes`, the message the call carries is not copied.
-fn notify(
-    env: &Env,
-    context: &Context,
-    procedure: Procedure,
-    body: Bytes,
-) -> core::result::Result<(), String> {
-    let (recipient, notification) = match procedure {
-        Procedure::Push => {
-            let request = PushRequest::decode(body).map_err(|e| e.to_string())?;
-            let sender = fixed(&request.sender).map_err(|e| e.to_string())?;
-            (request.recipient, Notification::message_from(&sender))
-        }
-        Procedure::SendInitialMessage => {
-            let request = SendInitialMessageRequest::decode(body).map_err(|e| e.to_string())?;
-            (request.recipient, Notification::initial_message())
-        }
-        _ => return Ok(()),
-    };
-    let recipient = fixed(&recipient).map_err(|e| e.to_string())?;
-    let notifier = notifier(env, &recipient).map_err(|e| e.to_string())?;
-    let body = Uint8Array::from(notification.encode_to_vec().as_slice());
-    let request = Request::new_with_init(
-        "https://notifier/notify",
-        RequestInit::new()
-            .with_method(Method::Post)
-            .with_body(Some(body.into())),
-    )
-    .map_err(|e| e.to_string())?;
-    context.wait_until(async move {
-        if let Err(e) = notifier.fetch_with_request(request).await {
-            console_error!("cannot notify: {e}");
-        }
-    });
-    Ok(())
-}
-
-/// The notifier of `identity_key`, the Durable Object holding its client's WebSockets.
-fn notifier(env: &Env, identity_key: &PublicKey) -> Result<Stub> {
-    env.durable_object(NOTIFIER)?
-        .id_from_name(&store::hex(identity_key))?
-        .get_stub()
 }
 
 /// The body of `request`; `None` once it grows past `limit` bytes, which stops reading it, so a
@@ -265,37 +203,19 @@ pub(crate) async fn read_body(request: &mut Request, limit: usize) -> Result<Opt
     Ok(Some(body))
 }
 
-/// The days the variable `name` says, `default` unless it says a number.
-pub(crate) fn days(env: &Env, name: &str, default: u64) -> u64 {
-    env.var(name)
+/// How long the variable `name` says, in days, which may be a fraction, e.g. `0.5`; `default`
+/// days unless it says a number that is not negative.
+pub(crate) fn period(env: &Env, name: &str, default: u64) -> Duration {
+    let days = env
+        .var(name)
         .ok()
-        .and_then(|days| days.to_string().parse().ok())
-        .unwrap_or(default)
+        .and_then(|days| days.to_string().parse::<f64>().ok())
+        .filter(|days| days.is_finite() && *days >= 0.0)
+        .unwrap_or(default as f64);
+    Duration::try_from_secs_f64(days * 24.0 * 60.0 * 60.0).unwrap_or(Duration::MAX)
 }
 
-/// Deletes the messages never delivered, initial messages never taken and attachments older than
-/// their retentions.
-#[event(scheduled)]
-async fn scheduled(_event: ScheduledEvent, env: Env, _context: ScheduleContext) {
-    // What was created before the retention of the variable `name`, `default` days unless it says.
-    let before = |name: &str, default: u64| {
-        Date::now()
-            .as_millis()
-            // Saturating, so that a huge retention keeps everything rather than wrapping around
-            // to a recent time and deleting what is new.
-            .saturating_sub(days(&env, name, default).saturating_mul(24 * 60 * 60 * 1000))
-    };
-    let messages_before = before("RETENTION_DAYS", DEFAULT_RETENTION_DAYS);
-    let files_before = before("FILE_RETENTION_DAYS", DEFAULT_FILE_RETENTION_DAYS);
-    let store = match Store::new(&env, 0) {
-        Ok(store) => store,
-        Err(e) => return console_error!("cannot reach the storage: {e}"),
-    };
-    match store.expire(messages_before, files_before).await {
-        Ok((messages, attachments)) => {
-            console_log!("expired {messages} messages and {attachments} attachments")
-        }
-        // The cause is logged where it happened.
-        Err(e) => console_error!("expiring messages failed: {e}"),
-    }
+/// `period` in milliseconds, as the runtime's clock counts.
+pub(crate) fn millis(period: Duration) -> u64 {
+    u64::try_from(period.as_millis()).unwrap_or(u64::MAX)
 }

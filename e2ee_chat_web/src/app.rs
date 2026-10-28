@@ -311,7 +311,7 @@ fn Welcome() -> impl IntoView {
                 <p>
                     "Messages are encrypted here, with X3DH and a double ratchet, before they "
                     "leave the page. The server, a Cloudflare Worker, only relays what it cannot "
-                    "read: prekeys and sealed messages in D1, the large ones in R2."
+                    "read: prekeys and sealed messages in its Durable Objects, the large ones in R2."
                 </p>
                 <div>
                     <div class="section-label">"Your identity key"</div>

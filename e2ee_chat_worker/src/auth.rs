@@ -1,5 +1,5 @@
-//! Signing in, for what costs the server storage: attachments, and messages too large for their
-//! D1 rows, which go to R2. A client signs in once with the server's password, a secret, and gets
+//! Signing in, which every call that writes takes, as the server is only for those who have its
+//! password. A client signs in once with the server's password, a secret, and gets
 //! a cookie, signed with another secret, which it sends with its calls until it expires. The
 //! cookie names who signed in, its subject: `password`, for now; later, e.g. a blockchain account
 //! that signed in with SIWE, SIWS or SIWX (CAIP-122), whose bought storage would be counted
@@ -109,7 +109,7 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
         Delay::from(WRONG_PASSWORD_DELAY).await;
         return Response::error("wrong password", 403);
     }
-    let lasts = crate::days(env, "SESSION_DAYS", DEFAULT_SESSION_DAYS).saturating_mul(24 * 60 * 60);
+    let lasts = crate::period(env, "SESSION_DAYS", DEFAULT_SESSION_DAYS).as_secs();
     let claims = Claims {
         subject: "password".to_string(),
         expires: Date::now()
