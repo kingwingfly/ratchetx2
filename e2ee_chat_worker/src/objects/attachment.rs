@@ -20,9 +20,10 @@ const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS attachment (
     only INTEGER PRIMARY KEY CHECK (only = 0),
     id BLOB NOT NULL,
-    uploader BLOB NOT NULL,
     chunks INTEGER NOT NULL,
+    -- SHA-256 of its upload token, and of its delete token.
     token_hash BLOB NOT NULL,
+    delete_hash BLOB NOT NULL,
     -- The chunks put so far, chunk i as bit i: one put and gone from R2 since, as the bucket's
     -- lifecycle rules deleted it, expired, rather than is still to come.
     uploaded INTEGER NOT NULL DEFAULT 0,
@@ -51,11 +52,11 @@ impl DurableObject for Attachment {
         match call {
             AttachmentCall::Add {
                 id,
-                uploader,
                 chunks,
                 token_hash,
+                delete_hash,
             } => {
-                let added = self.add(&id, &uploader, chunks, &token_hash);
+                let added = self.add(&id, chunks, &token_hash, &delete_hash);
                 if matches!(added, Ok(true)) {
                     let retention = crate::period(
                         &self.env,
@@ -90,15 +91,15 @@ impl Attachment {
         self.state.storage().sql()
     }
 
-    fn add(&self, id: &[u8], uploader: &[u8], chunks: u32, token_hash: &[u8]) -> Result<bool> {
+    fn add(&self, id: &[u8], chunks: u32, token_hash: &[u8], delete_hash: &[u8]) -> Result<bool> {
         let added = self.sql().exec(
-            "INSERT INTO attachment (only, id, uploader, chunks, token_hash, created_at) \
+            "INSERT INTO attachment (only, id, chunks, token_hash, delete_hash, created_at) \
              VALUES (0, ?, ?, ?, ?, ?) ON CONFLICT (only) DO NOTHING",
             vec![
                 blob(id),
-                blob(uploader),
                 integer(chunks.into()),
                 blob(token_hash),
+                blob(delete_hash),
                 integer(Date::now().as_millis()),
             ],
         )?;
@@ -109,15 +110,15 @@ impl Attachment {
         let rows: Vec<Row> = self
             .sql()
             .exec(
-                "SELECT id, uploader, chunks, token_hash, uploaded FROM attachment",
+                "SELECT id, chunks, token_hash, delete_hash, uploaded FROM attachment",
                 None,
             )?
             .to_array()?;
         Ok(rows.into_iter().next().map(|row| AttachmentRow {
             id: row.id,
-            uploader: row.uploader,
             chunks: row.chunks,
             token_hash: row.token_hash,
+            delete_hash: row.delete_hash,
             uploaded: row.uploaded as u64,
         }))
     }
@@ -154,11 +155,11 @@ impl Attachment {
 struct Row {
     #[serde(with = "serde_bytes")]
     id: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    uploader: Vec<u8>,
     chunks: u32,
     #[serde(with = "serde_bytes")]
     token_hash: Vec<u8>,
+    #[serde(with = "serde_bytes")]
+    delete_hash: Vec<u8>,
     /// A bitmask, which SQLite keeps as a signed integer.
     uploaded: i64,
 }

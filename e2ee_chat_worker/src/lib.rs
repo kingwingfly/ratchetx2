@@ -138,7 +138,7 @@ fn respond(response: connect::Response) -> Result<Response> {
 /// keys, taking one of a bundle's one-time prekeys, starting a chat, sending a message, and
 /// starting an upload, which hands out the token its chunks go with. As the server's password is
 /// what keeps it for those who have it, whose keys anyone can make, each write needs it, however
-/// small. Reading, taking one's own inbox, downloading, and what an upload's token authorizes
+/// small. Reading, taking one's own inbox, downloading, and what an attachment's tokens authorize
 /// stay open.
 fn writes(procedure: Procedure) -> bool {
     matches!(

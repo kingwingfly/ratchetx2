@@ -279,9 +279,9 @@ impl LocalAttachmentStore for Store {
     async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool> {
         let call = AttachmentCall::Add {
             id: attachment.id.to_vec(),
-            uploader: attachment.uploader.to_vec(),
             chunks: attachment.chunks,
             token_hash: attachment.token_hash.to_vec(),
+            delete_hash: attachment.delete_hash.to_vec(),
         };
         self.attachment_call(&attachment.id, &call).await
     }
@@ -291,9 +291,9 @@ impl LocalAttachmentStore for Store {
         row.map(|row| {
             Ok(StoredAttachment {
                 id: fixed(&row.id)?,
-                uploader: fixed(&row.uploader)?,
                 chunks: row.chunks,
                 token_hash: fixed(&row.token_hash)?,
+                delete_hash: fixed(&row.delete_hash)?,
                 uploaded: row.uploaded,
             })
         })

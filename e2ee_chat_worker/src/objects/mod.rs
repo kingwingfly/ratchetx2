@@ -131,9 +131,9 @@ pub enum AttachmentCall {
     /// Keep the attachment `id`, unless kept already, until it expires. Answers whether it did.
     Add {
         id: Vec<u8>,
-        uploader: Vec<u8>,
         chunks: u32,
         token_hash: Vec<u8>,
+        delete_hash: Vec<u8>,
     },
     /// The attachment, if kept. Answers an `Option<AttachmentRow>`.
     Get,
@@ -147,9 +147,9 @@ pub enum AttachmentCall {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttachmentRow {
     pub id: Vec<u8>,
-    pub uploader: Vec<u8>,
     pub chunks: u32,
     pub token_hash: Vec<u8>,
+    pub delete_hash: Vec<u8>,
     /// The chunks put, chunk `i` as bit `i`; see `storage::StoredAttachment::uploaded`.
     pub uploaded: u64,
 }

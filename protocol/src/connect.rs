@@ -18,7 +18,7 @@ use prost::Message;
 
 use crate::{
     attachment::{
-        CancelUploadRequest, CancelUploadResponse, GetChunkRequest, GetChunkResponse,
+        DeleteAttachmentRequest, DeleteAttachmentResponse, GetChunkRequest, GetChunkResponse,
         LocalAttachments, PutChunkRequest, PutChunkResponse, StartUploadRequest,
         StartUploadResponse,
     },
@@ -61,8 +61,8 @@ pub enum Procedure {
     PutChunk,
     /// [`LocalAttachments::get_chunk`].
     GetChunk,
-    /// [`LocalAttachments::cancel_upload`].
-    CancelUpload,
+    /// [`LocalAttachments::delete_attachment`].
+    DeleteAttachment,
 }
 
 impl Procedure {
@@ -77,7 +77,7 @@ impl Procedure {
         Self::StartUpload,
         Self::PutChunk,
         Self::GetChunk,
-        Self::CancelUpload,
+        Self::DeleteAttachment,
     ];
 
     /// The path of its calls: `/` ‖ the service's full name ‖ `/` ‖ the method's name.
@@ -92,7 +92,7 @@ impl Procedure {
             Self::StartUpload => "/attachment.v1.AttachmentService/StartUpload",
             Self::PutChunk => "/attachment.v1.AttachmentService/PutChunk",
             Self::GetChunk => "/attachment.v1.AttachmentService/GetChunk",
-            Self::CancelUpload => "/attachment.v1.AttachmentService/CancelUpload",
+            Self::DeleteAttachment => "/attachment.v1.AttachmentService/DeleteAttachment",
         }
     }
 
@@ -151,7 +151,9 @@ pub async fn handle(
         Procedure::StartUpload => reply(decode(body).map(|r| attachments.start_upload(r))).await,
         Procedure::PutChunk => reply(decode(body).map(|r| attachments.put_chunk(r))).await,
         Procedure::GetChunk => reply(decode(body).map(|r| attachments.get_chunk(r))).await,
-        Procedure::CancelUpload => reply(decode(body).map(|r| attachments.cancel_upload(r))).await,
+        Procedure::DeleteAttachment => {
+            reply(decode(body).map(|r| attachments.delete_attachment(r))).await
+        }
     };
     match reply {
         Ok(body) => Response {
@@ -296,8 +298,11 @@ impl<P: LocalPost> LocalAttachments for ConnectClient<P> {
         self.call(Procedure::GetChunk, request).await
     }
 
-    async fn cancel_upload(&self, request: CancelUploadRequest) -> Result<CancelUploadResponse> {
-        self.call(Procedure::CancelUpload, request).await
+    async fn delete_attachment(
+        &self,
+        request: DeleteAttachmentRequest,
+    ) -> Result<DeleteAttachmentResponse> {
+        self.call(Procedure::DeleteAttachment, request).await
     }
 }
 

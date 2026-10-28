@@ -161,8 +161,6 @@ pub struct Engine {
     /// the chat's messages stay in its outbox, in order. An attachment waits so too, by its
     /// message's [`awaits_upload`](Outgoing::awaits_upload).
     waits_sign_in: RefCell<HashSet<PublicKey>>,
-    /// Whether the uploads that expired on the server were forgotten, once a page.
-    pruned: Cell<bool>,
     /// Whether the user put off signing in, so that what the server refuses meanwhile, as it
     /// syncs, does not ask again; what the user sends does.
     declined_sign_in: Cell<bool>,
@@ -252,7 +250,6 @@ impl Engine {
             decrypted: RefCell::default(),
             loading: RefCell::default(),
             waits_sign_in: RefCell::default(),
-            pruned: Cell::default(),
             declined_sign_in: Cell::default(),
         });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
@@ -537,7 +534,14 @@ impl Engine {
         // Uploads the page left: their files are gone with it.
         match inner.vault.uploads(None).await {
             Ok(uploads) => {
-                for (peer, pending) in uploads.into_iter().filter(|(_, pending)| !pending.done) {
+                for (peer, pending) in uploads {
+                    // Done, but left behind, as forgetting it failed.
+                    if pending.started()
+                        && u64::from(pending.uploaded) >= attachment::chunk_count(pending.size)
+                    {
+                        let _ = inner.vault.forget_upload(&peer, &pending.id).await;
+                        continue;
+                    }
                     let reason = if pending.started() {
                         "choose the file again to go on"
                     } else {
@@ -695,29 +699,6 @@ impl Engine {
         self.wake();
     }
 
-    /// Forget the uploads done that the server deleted, by its time, as their tokens are no use.
-    async fn forget_expired_uploads(&self) {
-        let guard = self.inner.lock().await;
-        let Some(inner) = guard.as_ref() else {
-            return;
-        };
-        let uploads = match inner.vault.uploads(None).await {
-            Ok(uploads) => uploads,
-            Err(e) => {
-                return self
-                    .ui
-                    .log(format!("cannot read the uploads: {}", describe(&e)));
-            }
-        };
-        let now = inner.client.clock().now();
-        for (peer, pending) in uploads.iter().filter(|(_, pending)| pending.expired(now)) {
-            if let Err(e) = inner.vault.forget_upload(peer, &pending.id).await {
-                self.ui
-                    .log(format!("cannot forget an expired upload: {}", describe(&e)));
-            }
-        }
-    }
-
     /// One round: save what an earlier save failed to, tell peers of chats deleted here, take
     /// initial messages, publish prekeys when due, receive, and push what waits. Returns whether
     /// anything happened.
@@ -745,11 +726,6 @@ impl Engine {
                 false
             }
         };
-        // Once a round reached the server, whose answers told its time, the uploads done that it
-        // deleted since go, as their tokens are no use: once a page.
-        if reached && !self.pruned.replace(true) {
-            self.forget_expired_uploads().await;
-        }
         // Not while the server does not answer signed requests: each publish that fails keeps
         // its new one-time prekeys, as the server may have them, see `Client::publish_keys`, so
         // retrying every round while offline would grow the state, which each save writes whole.
@@ -1361,7 +1337,6 @@ impl Engine {
             encrypted: 0,
             prefix_hash: Sha256::digest([]).to_vec(),
             announced: false,
-            done: false,
             history_index: 0,
         };
         self.save_upload(&peer, &pending).await?;
@@ -1410,6 +1385,7 @@ impl Engine {
             size: waiting.size,
             name: waiting.name.clone(),
             mime: waiting.mime.clone(),
+            expires: 0,
         };
         let view = match inner.add(&peer, Kind::Attachment(pointer), true).await {
             Ok(view) => view,
@@ -1519,6 +1495,7 @@ impl Engine {
             size: kept.size,
             name: kept.name.clone(),
             mime: kept.mime.clone(),
+            expires: upload.expires().unwrap_or_default(),
         };
         let pending = PendingUpload {
             id: upload.id().to_vec(),
@@ -1630,6 +1607,7 @@ impl Engine {
             size: pending.size,
             name: pending.name.clone(),
             mime: pending.mime.clone(),
+            expires: pending.expires,
         };
         // Sent first, then kept: going wrong in between sends it twice, not never.
         self.send(*peer, Kind::Attachment(pointer)).await?;
@@ -1697,7 +1675,6 @@ impl Engine {
                     .upload(&peer, &id)
                     .await
                     .map_err(|e| describe(&e))?
-                    .filter(|pending| !pending.done)
                     .ok_or("that upload is gone")?
             };
             let file = file
@@ -1938,43 +1915,30 @@ impl Engine {
         if self.cancelled.borrow().contains(&id) {
             return Ok(());
         }
-        if let Err(e) = uploaded {
-            self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
-            return Err(e);
+        match uploaded {
+            Ok(true) => {}
+            // Deleted from the server, e.g. by the peer, who did not want it: the rest need not
+            // go up.
+            Ok(false) => {
+                self.drop_upload(&peer, id).await?;
+                return Err(format!(
+                    "{} is no longer on the server, so its upload stopped",
+                    pending.name
+                ));
+            }
+            Err(e) => {
+                self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
+                return Err(e);
+            }
         }
         self.files.borrow_mut().remove(&id);
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != id));
-        // Kept with its upload token, which can delete it from the server later; without the
-        // file's hash, which only going on with the upload needed.
-        pending.done = true;
-        pending.prefix_hash.clear();
-        self.save_upload(&peer, &pending).await
-    }
-
-    /// Delete the attachment `id`, which this client uploaded for `peer`, from the server, with
-    /// the upload token kept of it: the peer can no longer download it, though what it
-    /// downloaded stays, and so does this client's copy.
-    pub async fn delete_attachment(&self, peer: PublicKey, id: [u8; 16]) -> Result<(), String> {
+        // Forgotten, with its upload token, which is no use now: deleting it takes its delete
+        // token, which its key gives.
         let guard = self.inner.lock().await;
         let inner = guard.as_ref().ok_or("locked")?;
-        let pending = inner
-            .vault
-            .upload(&peer, &id)
-            .await
-            .map_err(|e| describe(&e))?
-            .filter(|pending| pending.done)
-            .ok_or("this browser cannot delete that file from the server")?;
-        match upload_of(&pending)?
-            .cancel(&Fetch::client(&inner.server))
-            .await
-        {
-            // Gone already, e.g. expired, as it should be.
-            Ok(()) => {}
-            Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(describe(&e)),
-        }
         inner
             .vault
             .forget_upload(&peer, &id)
@@ -1982,8 +1946,60 @@ impl Engine {
             .map_err(|e| describe(&e))
     }
 
+    /// Stop the upload `id`, in the chat with `peer`, if this client uploads it, for good, as
+    /// the server no longer has it, and forget it.
+    async fn drop_upload(&self, peer: &PublicKey, id: [u8; 16]) -> Result<(), String> {
+        let guard = self.inner.lock().await;
+        let inner = guard.as_ref().ok_or("locked")?;
+        let kept = inner
+            .vault
+            .upload(peer, &id)
+            .await
+            .map_err(|e| describe(&e))?
+            .is_some();
+        if !kept && !self.running.borrow().contains(&id) {
+            return Ok(());
+        }
+        self.cancelled.borrow_mut().insert(id);
+        self.files.borrow_mut().remove(&id);
+        self.ui
+            .uploads
+            .update(|uploads| uploads.retain(|upload| upload.id != id));
+        inner
+            .vault
+            .forget_upload(peer, &id)
+            .await
+            .map_err(|e| describe(&e))
+    }
+
+    /// Delete the attachment `pointer`, in the chat with `peer`, sent or received, from the
+    /// server, with its delete token, which its key gives: neither peer can download it any
+    /// more, though what they downloaded stays. One this client uploads stops; one the peer
+    /// uploads stops too, sparing it the rest.
+    pub async fn delete_attachment(
+        &self,
+        peer: PublicKey,
+        pointer: &AttachmentPointer,
+    ) -> Result<(), String> {
+        let not_there = || format!("{} is not on the server", pointer.name);
+        let id: [u8; 16] = pointer.id.as_slice().try_into().map_err(|_| not_there())?;
+        let key: [u8; 32] = pointer.key.as_slice().try_into().map_err(|_| not_there())?;
+        let server = {
+            let guard = self.inner.lock().await;
+            guard.as_ref().ok_or("locked")?.server.clone()
+        };
+        match attachment::delete(&Fetch::client(&server), &id, &key).await {
+            // Gone already, e.g. expired, or deleted by the peer, as it should be.
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(e) => return Err(describe(&e)),
+        }
+        self.drop_upload(&peer, id).await
+    }
+
     /// Upload the chunks of `pending` from `uploaded` on, reading each from `file` in its turn,
-    /// unless the upload is cancelled.
+    /// unless the upload is cancelled. Returns whether the server still has the attachment: one
+    /// deleted meanwhile, e.g. by the peer, is not found.
     async fn upload_chunks(
         &self,
         peer: &PublicKey,
@@ -1991,7 +2007,7 @@ impl Engine {
         upload: &Upload,
         file: &web_sys::File,
         mut hasher: Sha256,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let server = {
             let guard = self.inner.lock().await;
             guard.as_ref().ok_or("locked")?.server.clone()
@@ -2014,7 +2030,7 @@ impl Engine {
         let attachments = Fetch::reporting(&server, progress);
         for index in pending.uploaded..upload.chunks() {
             if self.cancelled.borrow().contains(upload.id()) {
-                return Ok(());
+                return Ok(true);
             }
             before.set((u64::from(index) * CHUNK_SIZE as u64).min(pending.size));
             self.show_upload(peer, pending, UploadState::Running);
@@ -2028,16 +2044,20 @@ impl Engine {
             pending.uploaded = index;
             self.save_upload(peer, pending).await?;
             let chunk = upload.encrypt(index, &plaintext);
-            self.put_chunk(peer, pending, &attachments, upload, index, &chunk)
-                .await?;
+            if !self
+                .put_chunk(peer, pending, &attachments, upload, index, &chunk)
+                .await?
+            {
+                return Ok(false);
+            }
             self.keep_chunk(peer, upload.id(), index, &chunk).await?;
             pending.uploaded = index + 1;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Upload chunk `index` of `upload`, trying again while the server cannot be reached, unless
-    /// the upload is cancelled meanwhile.
+    /// the upload is cancelled meanwhile. Returns whether the server still has the attachment.
     async fn put_chunk(
         &self,
         peer: &PublicKey,
@@ -2046,17 +2066,18 @@ impl Engine {
         upload: &Upload,
         index: u32,
         chunk: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let mut wait = RETRY_MIN;
         loop {
             match upload.put(attachments, index, chunk).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => return Ok(true),
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
                 Err(e) if e.kind() == ErrorKind::Server => {
                     self.show_upload(peer, pending, UploadState::Retrying);
                     sleep(wait).await;
                     wait = (wait * 2).min(RETRY_MAX);
                     if self.cancelled.borrow().contains(upload.id()) {
-                        return Ok(());
+                        return Ok(true);
                     }
                 }
                 Err(e) => return Err(describe(&e)),
@@ -2796,22 +2817,10 @@ impl Engine {
     /// meanwhile.
     pub async fn files(&self, peer: PublicKey) -> Result<Vec<FileView>, String> {
         let mut files = vec![];
-        // The attachments this client uploaded whose upload tokens it kept, which can delete them.
-        let deletable: HashSet<Vec<u8>> = {
+        // The server's time, by which the attachments it deleted already are not offered.
+        let now = {
             let guard = self.inner.lock().await;
-            let inner = guard.as_ref().ok_or("locked")?;
-            let uploads = inner
-                .vault
-                .uploads(Some(&peer))
-                .await
-                .map_err(|e| describe(&e))?;
-            // Not those the server deleted already, which go by the next unlock.
-            let now = inner.client.clock().now();
-            uploads
-                .into_iter()
-                .filter(|(_, pending)| pending.done && !pending.expired(now))
-                .map(|(_, pending)| pending.id)
-                .collect()
+            guard.as_ref().ok_or("locked")?.client.clock().now()
         };
         let mut end = u64::MAX;
         loop {
@@ -2847,9 +2856,7 @@ impl Engine {
                     _ => continue,
                 };
                 let deletable = match &message.body {
-                    Body::Remote(remote) => {
-                        message.outgoing && deletable.contains(&remote.pointer.id)
-                    }
+                    Body::Remote(remote) => deletable(&remote.pointer, now),
                     _ => false,
                 };
                 files.push(FileView {
@@ -3661,6 +3668,15 @@ fn stream_mime(mime: &str) -> String {
 async fn read_chunk(file: &web_sys::File, index: u32, size: u64) -> Result<Vec<u8>, String> {
     let start = u64::from(index) * CHUNK_SIZE as u64;
     read(file, start, (start + CHUNK_SIZE as u64).min(size)).await
+}
+
+/// Whether either peer can delete the attachment `pointer` from the server, by `now`, the
+/// server's time: it went up, rather than waits for a sign-in, and has not expired, as far as
+/// its message tells.
+fn deletable(pointer: &AttachmentPointer, now: u64) -> bool {
+    pointer.id.len() == 16
+        && pointer.key.len() == 32
+        && (pointer.expires == 0 || pointer.expires > now)
 }
 
 /// The upload of `pending`, to go on with.

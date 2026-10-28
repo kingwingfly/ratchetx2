@@ -71,6 +71,10 @@ message AttachmentPointer {
   string name = 4;
   // Its MIME type, as the sender gave it; only a hint.
   string mime = 5;
+  // When the service deletes it, in milliseconds since the Unix epoch, as it told the sender; 0
+  // if it did not. Until then, either peer may delete it sooner, with its delete token, which
+  // they derive from `key`.
+  uint64 expires = 6;
 }
 
 // That the sender deleted the chat. Its recipient sends again, on a new session, what the sender

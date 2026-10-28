@@ -201,9 +201,9 @@ pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
 pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
     let attachment = StoredAttachment {
         id: [1; 16],
-        uploader: [2; 32],
         chunks: 2,
         token_hash: [3; 32],
+        delete_hash: [5; 32],
         uploaded: 0,
     };
     assert_eq!(store.attachment(&attachment.id).await.unwrap(), None);

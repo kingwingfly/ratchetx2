@@ -10,8 +10,8 @@
 //!   be pushed: an [`OutgoingRecord`]. The state only lists them, so that saving it stays small.
 //! - `attachment/<peer in hex>/<id in hex>/<index>`: a chunk of an attachment in a chat, as the
 //!   server has it: encrypted under the attachment's key, which only the history holds.
-//! - `upload/<peer in hex>/<id in hex>`: a [`PendingUpload`], an attachment this client uploads
-//!   or uploaded, with its upload token, which can delete it from the server.
+//! - `upload/<peer in hex>/<id in hex>`: a [`PendingUpload`], an attachment this client uploads,
+//!   with its upload token, forgotten once the upload is done.
 //!
 //! But for the header and the chunks, each record is `nonce ‖ AES-256-GCM(key, record)`, with the
 //! record's name as associated data so that one record cannot pass for another. The key is
@@ -175,7 +175,8 @@ pub struct Awaiting {
 
 /// An attachment being uploaded, kept so that the upload can go on after the page goes, with
 /// the file chosen again: from `uploaded`, once the file still has the hash it had. Once done, it
-/// stays, so that its upload token can delete it from the server.
+/// is forgotten, with its upload token, which is no use then: deleting the attachment from the
+/// server takes its delete token, which either peer derives from its key.
 ///
 /// One whose upload has not started, as the server keeps files only for those signed in to it,
 /// has no token yet, and is kept under an ID of this client's: its message waits in the chat, at
@@ -210,14 +211,11 @@ pub struct PendingUpload {
     /// The attachment was sent to the chat, which downloads it as it is uploaded.
     #[prost(bool, tag = "10")]
     pub announced: bool,
-    /// The upload is done.
-    #[prost(bool, tag = "11")]
-    pub done: bool,
     /// The history entry of its message, while its upload has not started.
     #[prost(uint64, tag = "12")]
     pub history_index: u64,
     /// When the server deletes it, in milliseconds since the Unix epoch, as it said as the
-    /// upload started; 0 if it did not.
+    /// upload started, which its message tells the peer; 0 if it did not.
     #[prost(uint64, tag = "13")]
     pub expires: u64,
 }
@@ -226,12 +224,6 @@ impl PendingUpload {
     /// Whether its upload started, so that the server has it, under its ID.
     pub fn started(&self) -> bool {
         !self.token.is_empty()
-    }
-
-    /// Whether it is done and the server deleted it by `now`, the server's time, so that its
-    /// token is no use, and it need not be kept.
-    pub fn expired(&self, now: u64) -> bool {
-        self.done && self.expires != 0 && self.expires <= now
     }
 }
 
@@ -733,7 +725,7 @@ impl Vault {
             .map_err(|e| Error::Corrupt(e.to_string()))
     }
 
-    /// The uploads kept, done or not, with the peers of their chats: those of the chat with
+    /// The uploads kept, those not done, with the peers of their chats: those of the chat with
     /// `peer` only, if given.
     pub async fn uploads(
         &self,

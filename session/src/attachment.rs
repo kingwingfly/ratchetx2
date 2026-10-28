@@ -10,16 +10,23 @@
 //! An attachment can be downloaded while it is uploaded, so its ID and key can go to the
 //! recipients as soon as the upload starts: [`download_chunk`] tells a chunk not uploaded yet
 //! from an attachment that is gone.
+//!
+//! Its upload token, which the service gives the uploader alone, uploads it, and is no use once
+//! it is up. Its delete token, which [`delete_token`] derives from its key, deletes it from the
+//! service, at any time, for the uploader or any recipient alike, with [`delete`]: holding it
+//! shows only that one knew the key, as every peer of the chat does.
 
 use aes_gcm::{
     Aes256Gcm, KeyInit,
     aead::{Aead, AeadCore, Payload, array::typenum::Unsigned},
 };
 use bytes::Bytes;
+use hkdf::Hkdf;
 use protocol::attachment::{
-    CancelUploadRequest, GetChunkRequest, ID_LENGTH, LocalAttachments, MAX_CHUNK_SIZE,
+    DeleteAttachmentRequest, GetChunkRequest, ID_LENGTH, LocalAttachments, MAX_CHUNK_SIZE,
     PutChunkRequest, TOKEN_LENGTH,
 };
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::error::{ErrorKind, Result};
@@ -149,6 +156,9 @@ impl Upload {
 
     /// Upload chunk `index`, as [encrypted](Self::encrypt), or upload it again, e.g. after a
     /// failure.
+    ///
+    /// Fails with [`ErrorKind::NotFound`] once the attachment is gone: expired, or deleted, e.g.
+    /// by a recipient who does not want it, so that the rest need not go up.
     pub async fn put(
         &self,
         attachments: &impl LocalAttachments,
@@ -170,9 +180,9 @@ impl Upload {
     /// find it gone.
     pub async fn cancel(&self, attachments: &impl LocalAttachments) -> Result<()> {
         attachments
-            .cancel_upload(CancelUploadRequest {
+            .delete_attachment(DeleteAttachmentRequest {
                 id: Bytes::copy_from_slice(&self.id),
-                upload_token: Bytes::copy_from_slice(&self.token),
+                token: Bytes::copy_from_slice(&self.token),
             })
             .await?;
         Ok(())
@@ -205,6 +215,41 @@ pub async fn download_chunk(
         })
         .await?;
     Ok(response.uploaded.then(|| response.data.to_vec()))
+}
+
+/// The delete token of the attachment whose key is `key`, which the uploader and its recipients
+/// alike derive: HKDF-SHA256 of the key, with no salt, and `"attachment.v1/delete"` as info.
+pub fn delete_token(key: &[u8; KEY_LENGTH]) -> [u8; TOKEN_LENGTH] {
+    let mut token = [0; TOKEN_LENGTH];
+    Hkdf::<Sha256>::new(None, key)
+        .expand(b"attachment.v1/delete", &mut token)
+        .expect("16 bytes are a valid HKDF-SHA256 output length");
+    token
+}
+
+/// SHA-256 of the delete token of the attachment whose key is `key`, which its upload's start
+/// gives the service.
+pub(crate) fn delete_hash(key: &[u8; KEY_LENGTH]) -> [u8; 32] {
+    Sha256::digest(delete_token(key)).into()
+}
+
+/// Delete the attachment `id`, whose key is `key`, from the service, uploaded or not: it and its
+/// chunks go, and its upload stops. Its uploader or any recipient may: a recipient that does not
+/// want it spares the uploader the rest of the upload.
+///
+/// Fails with [`ErrorKind::NotFound`] if it is gone already: expired, or deleted.
+pub async fn delete(
+    attachments: &impl LocalAttachments,
+    id: &[u8; ID_LENGTH],
+    key: &[u8; KEY_LENGTH],
+) -> Result<()> {
+    attachments
+        .delete_attachment(DeleteAttachmentRequest {
+            id: Bytes::copy_from_slice(id),
+            token: Bytes::copy_from_slice(&delete_token(key)),
+        })
+        .await?;
+    Ok(())
 }
 
 /// A new random key.

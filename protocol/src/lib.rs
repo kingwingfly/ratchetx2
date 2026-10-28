@@ -16,9 +16,9 @@ pub mod notify;
 
 pub use error::{Error, ErrorKind, Result};
 
-/// How far, in milliseconds, the timestamp of a subscription or an upload's start may be from
-/// the server's clock, as a signature would otherwise stay good forever. Clients sign
-/// them with the server's time, as their responses tell it, since a device's clock may be off.
+/// How far, in milliseconds, the timestamp of a subscription may be from the server's clock, as a
+/// signature would otherwise stay good forever. Clients sign them with the server's time, as its
+/// responses tell it, since a device's clock may be off.
 pub const MAX_CLOCK_SKEW: u64 = 5 * 60 * 1000;
 
 /// Read a fixed-size bytes field, such as a 32-byte key.

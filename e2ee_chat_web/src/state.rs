@@ -289,8 +289,8 @@ pub struct FileView {
     /// When it was sent or received.
     pub at: u64,
     pub outgoing: bool,
-    /// Whether this client can delete it from the server, as an attachment it uploaded whose
-    /// upload token it kept.
+    /// Whether it can be deleted from the server, as an attachment there, sent or received,
+    /// which either peer may delete.
     pub deletable: bool,
     pub name: String,
     pub size: u64,

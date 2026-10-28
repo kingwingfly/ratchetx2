@@ -395,14 +395,17 @@ impl<H: LocalHandshake> Client<H> {
     ) -> Result<attachment::Upload> {
         let chunks = u32::try_from(attachment::chunk_count(size))
             .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
-        // The server takes it within a few minutes of its clock, so it is signed with the
-        // server's, not the strictly increasing timestamp, which may have run ahead of it.
-        let sign = || StartUploadRequest::sign(&self.state.identity, chunks, self.clock.now());
-        let response = again_if_stale(|| attachments.start_upload(sign())).await?;
+        let key = attachment::generate_key();
+        let response = attachments
+            .start_upload(StartUploadRequest {
+                chunks,
+                delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
+            })
+            .await?;
         Ok(attachment::Upload {
             id: protocol::fixed(&response.id)?,
             token: protocol::fixed(&response.upload_token)?,
-            key: attachment::generate_key(),
+            key,
             chunks,
             expires: (response.expires != 0).then_some(response.expires),
         })
@@ -412,7 +415,8 @@ impl<H: LocalHandshake> Client<H> {
     /// that sends them; see `protocol::notify`. It is good for a few minutes of the server's
     /// [clock](Self::clock).
     pub fn subscription(&self) -> SubscribeRequest {
-        // Within a few minutes of the server's clock, like an upload's start.
+        // Within a few minutes of the server's clock, not by the strictly increasing timestamp,
+        // which may have run ahead of it.
         SubscribeRequest::sign(&self.state.identity, self.clock.now())
     }
 
@@ -429,17 +433,6 @@ fn now() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
-}
-
-/// The response to the call `call` makes, signed with the server's clock: made again once if the
-/// server refused its time, as the refusal may have told the clock the server's.
-async fn again_if_stale<T, F: Future<Output = protocol::Result<T>>>(
-    call: impl Fn() -> F,
-) -> protocol::Result<T> {
-    match call().await {
-        Err(e) if e.kind() == protocol::ErrorKind::StaleTimestamp => call().await,
-        response => response,
-    }
 }
 
 /// A message encrypted for the peer by [`Session::encrypt`], to [push](Session::push) now or
@@ -1135,10 +1128,7 @@ impl<M: LocalMailbox> Session<M> {
 mod test {
     use core::cell::Cell;
     use protocol::{
-        attachment::{
-            AttachmentServer, CancelUploadRequest, CancelUploadResponse, GetChunkRequest,
-            GetChunkResponse, PutChunkRequest, PutChunkResponse, StartUploadResponse,
-        },
+        attachment::AttachmentServer,
         handshake::{
             FetchBundleResponse, HandshakeServer, PublishResponse, SendInitialMessageResponse,
             TakeInitialMessagesResponse,
@@ -2179,50 +2169,18 @@ mod test {
         );
     }
 
-    /// An attachment service whose responses tell `clock` the server's time, as HTTP's `Date`
-    /// does.
-    struct Dated<'a>(&'a AttachmentServer<MemoryStore>, ServerClock);
-
-    impl LocalAttachments for Dated<'_> {
-        async fn start_upload(
-            &self,
-            request: StartUploadRequest,
-        ) -> protocol::Result<StartUploadResponse> {
-            let response = self.0.start_upload(request).await;
-            self.1.observe(now());
-            response
-        }
-
-        async fn put_chunk(&self, request: PutChunkRequest) -> protocol::Result<PutChunkResponse> {
-            self.0.put_chunk(request).await
-        }
-
-        async fn get_chunk(&self, request: GetChunkRequest) -> protocol::Result<GetChunkResponse> {
-            self.0.get_chunk(request).await
-        }
-
-        async fn cancel_upload(
-            &self,
-            request: CancelUploadRequest,
-        ) -> protocol::Result<CancelUploadResponse> {
-            self.0.cancel_upload(request).await
-        }
-    }
-
-    #[tokio::test]
-    async fn signed_requests_go_by_the_servers_clock() {
+    #[test]
+    fn subscriptions_go_by_the_servers_clock() {
         let handshake = HandshakeServer::new(MemoryStore::default());
-        let attachments = AttachmentServer::new(MemoryStore::default());
         let alice = Client::new(InProcessHandshake(&handshake));
         // As if this device's clock were ten minutes behind the server's: refused.
-        alice.clock().observe(now() - 10 * 60 * 1000);
-        let error = alice.start_upload(&attachments, 1).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Protocol);
-        // Over a transport that learns the server's time from its responses, the refusal tells
-        // it, and the request goes again.
-        let dated = Dated(&attachments, alice.clock().clone());
-        alice.start_upload(&dated, 1).await.unwrap();
-        assert!(alice.clock().now().abs_diff(now()) < 1000);
+        let behind = now() - 10 * 60 * 1000;
+        let error = alice.subscription().verify(behind).unwrap_err();
+        assert_eq!(error.kind(), protocol::ErrorKind::StaleTimestamp);
+        // Once a response told it the server's time, taken.
+        alice.clock().observe(behind);
+        let key = alice.subscription().verify(behind).unwrap();
+        assert_eq!(key, alice.identity_key());
     }
 
     #[tokio::test]
@@ -2297,6 +2255,25 @@ mod test {
         // Cancelled, it is gone for Bob.
         resumed.cancel(&attachments).await.unwrap();
         let error = attachment::download_chunk(&attachments, &id, 0)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+
+        // Bob, who does not want one, deletes it with its key while it is uploaded, which stops
+        // the upload; so may Alice, uploaded or not, once she forgot its upload token.
+        let unwanted = alice
+            .start_upload(&attachments, file.len() as u64)
+            .await
+            .unwrap();
+        let first = unwanted.encrypt(0, &file[..attachment::CHUNK_SIZE]);
+        unwanted.put(&attachments, 0, &first).await.unwrap();
+        attachment::delete(&attachments, unwanted.id(), unwanted.key())
+            .await
+            .unwrap();
+        let second = unwanted.encrypt(1, &file[attachment::CHUNK_SIZE..][..attachment::CHUNK_SIZE]);
+        let error = unwanted.put(&attachments, 1, &second).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        let error = attachment::delete(&attachments, unwanted.id(), unwanted.key())
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);

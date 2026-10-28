@@ -2153,13 +2153,11 @@ fn file_row(file: FileView, from: &str) -> AnyView {
         _ => view! { <span class="file-icon">{extension(&file.name)}</span> }.into_any(),
     };
     let title = file.name.clone();
-    // An attachment this client uploaded, which it can delete from the server.
+    // An attachment on the server, sent or received, which either peer can delete.
     let delete = match &file.body {
-        Body::Remote(remote) if file.deletable => {
-            <[u8; 16]>::try_from(remote.pointer.id.as_slice())
-                .ok()
-                .map(|id| view! { <DeleteFromServer peer=remote.peer id name=file.name.clone() /> })
-        }
+        Body::Remote(remote) if file.deletable => Some(view! {
+            <DeleteFromServer peer=remote.peer pointer=remote.pointer.clone() />
+        }),
         _ => None,
     };
     view! {
@@ -2177,11 +2175,11 @@ fn file_row(file: FileView, from: &str) -> AnyView {
     .into_any()
 }
 
-/// Deletes the attachment `id`, named `name`, which this client uploaded for `peer`, from the
-/// server, once asked twice: the peer can no longer download it, though what it downloaded
-/// stays, and so does this client's copy.
+/// Deletes the attachment `pointer`, in the chat with `peer`, sent or received, from the server,
+/// once asked twice: neither of them can download it any more, though what they downloaded
+/// stays. Its upload, if still going, stops.
 #[component]
-fn DeleteFromServer(peer: PublicKey, id: [u8; 16], name: String) -> impl IntoView {
+fn DeleteFromServer(peer: PublicKey, pointer: content::AttachmentPointer) -> impl IntoView {
     #[derive(Clone, Copy, PartialEq)]
     enum Step {
         Offered,
@@ -2194,17 +2192,19 @@ fn DeleteFromServer(peer: PublicKey, id: [u8; 16], name: String) -> impl IntoVie
         .contact(&peer)
         .map(|contact| contact.label())
         .unwrap_or_default();
-    let title = format!("{label} can no longer download it; what they downloaded stays");
+    let title = format!(
+        "Neither you nor {label} can download it any more; what you downloaded stays"
+    );
     let click = move |_| match step.get_untracked() {
         Step::Offered => step.set(Step::Asked),
         Step::Asked => {
             step.set(Step::Deleting);
-            let name = name.clone();
+            let pointer = pointer.clone();
             spawn_local(async move {
-                match engine().delete_attachment(peer, id).await {
+                match engine().delete_attachment(peer, &pointer).await {
                     Ok(()) => {
                         step.try_set(Step::Deleted);
-                        ui().notify(format!("{name} is deleted from the server"));
+                        ui().notify(format!("{} is deleted from the server", pointer.name));
                     }
                     Err(e) => {
                         step.try_set(Step::Offered);
@@ -2226,7 +2226,7 @@ fn DeleteFromServer(peer: PublicKey, id: [u8; 16], name: String) -> impl IntoVie
         >
             {move || match step.get() {
                 Step::Offered => "Delete from server",
-                Step::Asked => "Delete it for them?",
+                Step::Asked => "Delete it for both of you?",
                 Step::Deleting => "Deleting…",
                 Step::Deleted => "Deleted from server",
             }}

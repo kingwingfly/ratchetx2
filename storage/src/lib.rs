@@ -62,13 +62,13 @@ pub type AttachmentId = [u8; 16];
 pub struct StoredAttachment {
     /// Its random ID.
     pub id: AttachmentId,
-    /// The identity key that started the upload.
-    pub uploader: PublicKey,
     /// Number of chunks.
     pub chunks: u32,
     /// SHA-256 of the upload token, which only the uploader knows and which writing a chunk
     /// takes.
     pub token_hash: [u8; 32],
+    /// SHA-256 of the delete token, which the peers derive from the attachment's key.
+    pub delete_hash: [u8; 32],
     /// The chunks put so far, chunk `i` as bit `i`, for the first [`UPLOADED_NOTED`]. One noted
     /// here that is not stored was put, and expired since, e.g. as the storage's lifecycle rules
     /// deleted it.

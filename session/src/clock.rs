@@ -7,7 +7,7 @@ use std::sync::{
 
 /// A server's clock, as this device sees it from the `Date` of the server's responses.
 ///
-/// The server takes the requests it checks the time of, such as an upload's start, only within
+/// The server takes the requests it checks the time of, such as a subscription, only within
 /// `protocol::MAX_CLOCK_SKEW` of its own clock, as a signature would otherwise stay good
 /// forever. A [`Client`](crate::Client) signs them with this clock, so that a device whose clock
 /// is off, e.g. set by hand, still makes requests that the server takes. Until a response tells

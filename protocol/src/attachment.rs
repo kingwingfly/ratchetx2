@@ -3,27 +3,25 @@
 //! download. A message carries the key and the attachment's ID, so the server only sees
 //! ciphertext.
 //!
-//! Starting an upload is signed like the handshake's requests: the signature covers
-//! `"attachment.v1/start-upload"` ‖ identity key ‖ number of chunks (u32, little-endian) ‖
-//! timestamp (u64, little-endian), and the server takes it only within
-//! [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of its own clock. It returns a random upload
-//! token, which uploading the chunks and cancelling the upload take, and a random ID, which
-//! downloading them takes. Nothing names whom it is for: the recipients may download it as
-//! often as they like, until it expires or its uploader deletes it.
+//! An attachment has two tokens:
+//! - its **upload token**, random, which the server gives the uploader alone as the upload
+//!   starts, uploads its chunks; the uploader forgets it once they are up;
+//! - its **delete token**, which the peers derive from the attachment's key, deletes it, at any
+//!   time, whoever of them does: a recipient that does not want it spares the uploader the rest.
+//!
+//! The upload token deletes it too. The server keeps only their SHA-256, and nothing about an
+//! upload is signed, nor names its uploader: holding the delete token shows only that one knew
+//! the key, which every peer of the chat does. Who may start an upload is up to the server, e.g.
+//! those signed in to it.
 //!
 //! A chunk is uploaded once: uploading it again, e.g. as the reply to its upload was lost, keeps
-//! the first copy, so that the upload token, which the uploader may keep to cancel the upload
-//! later, never changes what was downloaded.
+//! the first copy.
 //!
 //! An attachment can be downloaded while it is uploaded: a chunk not uploaded yet is a
-//! [`GetChunkResponse`] that says so, while an attachment that is gone, expired or cancelled,
+//! [`GetChunkResponse`] that says so, while an attachment that is gone, expired or deleted,
 //! fails with [`ErrorKind::NotFound`](crate::ErrorKind::NotFound).
 
-use bytes::Bytes;
-use x3dh::PublicKey;
-use xeddsa::XEdDSAPrivateKey;
-
-use crate::{error::Result, verify_recent};
+use crate::error::Result;
 
 #[allow(missing_docs)]
 mod proto {
@@ -40,56 +38,23 @@ pub const MAX_CHUNK_SIZE: usize = 2 << 20;
 pub const DEFAULT_MAX_CHUNKS: u32 = 50;
 /// Length of an attachment's ID.
 pub const ID_LENGTH: usize = 16;
-/// Length of an upload token.
+/// Length of an upload or delete token.
 pub const TOKEN_LENGTH: usize = 16;
 
 /// Client side of the attachment service.
 #[trait_variant::make(Attachments: Send)]
 pub trait LocalAttachments {
-    /// Start uploading an attachment; see [`StartUploadRequest::sign`].
+    /// Start uploading an attachment.
     async fn start_upload(&self, request: StartUploadRequest) -> Result<StartUploadResponse>;
     /// Upload a chunk; uploading it again keeps the first copy.
     async fn put_chunk(&self, request: PutChunkRequest) -> Result<PutChunkResponse>;
     /// Download a chunk, or learn that it is not uploaded yet.
     async fn get_chunk(&self, request: GetChunkRequest) -> Result<GetChunkResponse>;
-    /// Cancel an upload, done or not: the attachment and its chunks go.
-    async fn cancel_upload(&self, request: CancelUploadRequest) -> Result<CancelUploadResponse>;
-}
-
-impl StartUploadRequest {
-    /// A request to upload `chunks` chunks as `identity`, signed by it.
-    pub fn sign(identity: &XEdDSAPrivateKey, chunks: u32, timestamp: u64) -> Self {
-        let identity_key = identity.compute_public_key().to_bytes();
-        let signature = identity.sign(start_upload_message(&identity_key, chunks, timestamp));
-        Self {
-            identity_key: Bytes::copy_from_slice(&identity_key),
-            chunks,
-            timestamp,
-            signature: Bytes::copy_from_slice(&signature),
-        }
-    }
-
-    /// The identity key uploading, once the signature by that key verifies and the timestamp is
-    /// within [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of `now`, in milliseconds since the Unix
-    /// epoch.
-    pub fn verify(&self, now: u64) -> Result<PublicKey> {
-        verify_recent(
-            &self.identity_key,
-            &self.signature,
-            self.timestamp,
-            now,
-            |identity_key| start_upload_message(identity_key, self.chunks, self.timestamp),
-        )
-    }
-}
-
-/// The bytes a start-upload request's signature covers.
-fn start_upload_message(identity_key: &PublicKey, chunks: u32, timestamp: u64) -> Vec<u8> {
-    let mut message = b"attachment.v1/start-upload".to_vec();
-    message.extend(identity_key);
-    message.extend(chunks.to_le_bytes());
-    message.extend(timestamp.to_le_bytes());
-    message
+    /// Delete an attachment, uploaded or not, with its upload or delete token.
+    async fn delete_attachment(
+        &self,
+        request: DeleteAttachmentRequest,
+    ) -> Result<DeleteAttachmentResponse>;
 }
 
 #[cfg(feature = "server")]
@@ -97,6 +62,8 @@ mod server {
     use bon::Builder;
     use sha2::{Digest, Sha256};
     use storage::{LocalAttachmentStore, StoredAttachment};
+
+    use bytes::Bytes;
 
     use super::*;
     use crate::{error::ErrorKind, fixed};
@@ -107,7 +74,7 @@ mod server {
         /// Most chunks of an attachment, so it is at most this many times [`MAX_CHUNK_SIZE`].
         pub max_chunks: u32,
         /// How long the store keeps an attachment from its upload's start, if it says, which
-        /// the uploader learns, as its upload token is no use after.
+        /// the uploader learns, and tells the recipients.
         pub retention: Option<core::time::Duration>,
     }
 
@@ -159,15 +126,26 @@ mod server {
             }
             Ok(attachment)
         }
+
+        /// The attachment `id`, if `token` is its upload or delete token.
+        async fn deletable(&self, id: &[u8], token: &[u8]) -> Result<StoredAttachment> {
+            let attachment = self.attachment(id).await?;
+            let hash = <[u8; 32]>::from(Sha256::digest(token));
+            if hash != attachment.token_hash && hash != attachment.delete_hash {
+                return Err(ErrorKind::InvalidSignature.into());
+            }
+            Ok(attachment)
+        }
     }
 
     impl<S: LocalAttachmentStore> LocalAttachments for AttachmentServer<S> {
-        /// Check the request and add the attachment, under a random ID.
+        /// Check the request and add the attachment, under a random ID, with a random upload
+        /// token.
         async fn start_upload(&self, request: StartUploadRequest) -> Result<StartUploadResponse> {
             let now = web_time::SystemTime::now()
                 .duration_since(web_time::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as u64);
-            let uploader = request.verify(now)?;
+            let delete_hash = fixed(&request.delete_hash)?;
             if request.chunks == 0 {
                 return Err(ErrorKind::Malformed.into());
             }
@@ -177,9 +155,9 @@ mod server {
             let token: [u8; TOKEN_LENGTH] = random();
             let attachment = StoredAttachment {
                 id: random(),
-                uploader,
                 chunks: request.chunks,
                 token_hash: Sha256::digest(token).into(),
+                delete_hash,
                 uploaded: 0,
             };
             let id = attachment.id;
@@ -235,14 +213,14 @@ mod server {
             }
         }
 
-        /// Delete the attachment, if the upload token is its.
-        async fn cancel_upload(
+        /// Delete the attachment, if the token is its upload or delete token.
+        async fn delete_attachment(
             &self,
-            request: CancelUploadRequest,
-        ) -> Result<CancelUploadResponse> {
-            let attachment = self.uploading(&request.id, &request.upload_token).await?;
+            request: DeleteAttachmentRequest,
+        ) -> Result<DeleteAttachmentResponse> {
+            let attachment = self.deletable(&request.id, &request.token).await?;
             self.store.delete_attachment(&attachment.id).await?;
-            Ok(CancelUploadResponse {})
+            Ok(DeleteAttachmentResponse {})
         }
     }
 
@@ -274,16 +252,27 @@ mod server {
                     retention: Some(core::time::Duration::from_secs(60)),
                 })
                 .build();
-            let alice = XEdDSAPrivateKey::generate();
-            // Too many chunks, or none.
-            for (chunks, kind) in [(3, ErrorKind::LimitExceeded), (0, ErrorKind::Malformed)] {
-                let request = StartUploadRequest::sign(&alice, chunks, now());
+            // The delete token, which the peers derive from the attachment's key.
+            let delete_token = Bytes::from_static(&[7; TOKEN_LENGTH]);
+            let start = |chunks| StartUploadRequest {
+                chunks,
+                delete_hash: Bytes::from(Sha256::digest(&delete_token).to_vec()),
+            };
+            // Too many chunks, or none, or no delete hash.
+            for (request, kind) in [
+                (start(3), ErrorKind::LimitExceeded),
+                (start(0), ErrorKind::Malformed),
+                (
+                    StartUploadRequest {
+                        chunks: 2,
+                        delete_hash: Bytes::new(),
+                    },
+                    ErrorKind::Malformed,
+                ),
+            ] {
                 assert_eq!(server.start_upload(request).await.unwrap_err().kind(), kind);
             }
-            let started = server
-                .start_upload(StartUploadRequest::sign(&alice, 2, now()))
-                .await
-                .unwrap();
+            let started = server.start_upload(start(2)).await.unwrap();
             // It says when it expires, a minute on.
             assert!(started.expires.abs_diff(now() + 60_000) < 1000);
             let put = |index, upload_token: &Bytes, data: Vec<u8>| PutChunkRequest {
@@ -328,58 +317,51 @@ mod server {
                 server.get_chunk(get(2)).await.unwrap_err().kind(),
                 ErrorKind::Malformed
             );
-
-            // Cancelled, only with the upload token, it is gone.
-            let cancel = |upload_token: &Bytes| CancelUploadRequest {
-                id: started.id.clone(),
-                upload_token: upload_token.clone(),
-            };
+            // The delete token uploads nothing.
             assert_eq!(
                 server
-                    .cancel_upload(cancel(&wrong))
+                    .put_chunk(put(0, &delete_token, b"first".to_vec()))
                     .await
                     .unwrap_err()
                     .kind(),
                 ErrorKind::InvalidSignature
             );
-            server
-                .cancel_upload(cancel(&started.upload_token))
-                .await
-                .unwrap();
+
+            // Deleted with the delete token, before its upload is done, it is gone, and its
+            // upload stops.
+            let delete = |token: &Bytes| DeleteAttachmentRequest {
+                id: started.id.clone(),
+                token: token.clone(),
+            };
+            assert_eq!(
+                server
+                    .delete_attachment(delete(&wrong))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidSignature
+            );
+            server.delete_attachment(delete(&delete_token)).await.unwrap();
             assert_eq!(
                 server.get_chunk(get(1)).await.unwrap_err().kind(),
                 ErrorKind::NotFound
             );
+            assert_eq!(
+                server
+                    .put_chunk(put(0, &started.upload_token, b"first".to_vec()))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::NotFound
+            );
+
+            // The upload token deletes one too.
+            let started = server.start_upload(start(1)).await.unwrap();
+            let delete = DeleteAttachmentRequest {
+                id: started.id.clone(),
+                token: started.upload_token.clone(),
+            };
+            server.delete_attachment(delete).await.unwrap();
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-    use crate::{MAX_CLOCK_SKEW, error::ErrorKind};
-
-    #[test]
-    fn sign_and_verify() {
-        let alice = XEdDSAPrivateKey::generate();
-        let request = StartUploadRequest::sign(&alice, 3, 1_000_000);
-        assert_eq!(
-            request.verify(1_000_000).unwrap(),
-            alice.compute_public_key().to_bytes()
-        );
-        assert_eq!(
-            request
-                .verify(1_000_000 + MAX_CLOCK_SKEW + 1)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::StaleTimestamp
-        );
-        // The number of chunks is signed too.
-        let mut changed = request.clone();
-        changed.chunks = 4;
-        assert_eq!(
-            changed.verify(1_000_000).unwrap_err().kind(),
-            ErrorKind::InvalidSignature
-        );
     }
 }
