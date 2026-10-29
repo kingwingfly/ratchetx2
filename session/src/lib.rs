@@ -233,9 +233,12 @@ impl<H: LocalHandshake> Client<H> {
     /// cannot be accepted. If publishing fails, the server may still have the prekeys, its reply
     /// being lost: the next publish sends the same signed prekey again, with new one-time
     /// prekeys, rather than a new generation, which would delete the private keys of prekeys
-    /// the server hands out. Save the state after this, failed or not.
+    /// the server hands out. One refused for want of a sign-in, which the server keeps none of,
+    /// forgets the one-time prekeys it added to them, so that publishing again while signed out
+    /// does not add up keys. Save the state after this, failed or not.
     pub async fn publish_keys(&mut self, one_time_count: usize) -> Result<()> {
-        let published = if self.state.publishing {
+        let extended = self.state.publishing;
+        let published = if extended {
             self.state
                 .prekeys
                 .extend(&self.state.identity, one_time_count)
@@ -247,9 +250,17 @@ impl<H: LocalHandshake> Client<H> {
         self.state.publishing = true;
         let timestamp = self.next_timestamp();
         let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
-        self.handshake.publish(request).await?;
-        self.state.publishing = false;
-        Ok(())
+        match self.handshake.publish(request).await {
+            Ok(_) => {
+                self.state.publishing = false;
+                Ok(())
+            }
+            Err(e) if extended && e.kind() == protocol::ErrorKind::SignInRequired => {
+                self.state.prekeys.retract(&published.one_time_prekeys);
+                Err(e.into())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Start a session with `peer`, whose first message is `content`: fetch the peer's prekeys,
@@ -2039,6 +2050,78 @@ mod test {
         ) -> protocol::Result<TakeInitialMessagesResponse> {
             self.0.take_initial_messages(request).await
         }
+    }
+
+    /// Refuses publishing while `.1`, as a server does a client not signed in to it.
+    #[derive(Debug)]
+    struct SignedOut<'a>(&'a HandshakeServer<MemoryStore>, Cell<bool>);
+
+    impl LocalHandshake for SignedOut<'_> {
+        async fn publish(&self, request: PublishRequest) -> protocol::Result<PublishResponse> {
+            if self.1.get() {
+                return Err(protocol::ErrorKind::SignInRequired.into());
+            }
+            self.0.publish(request).await
+        }
+
+        async fn fetch_bundle(
+            &self,
+            request: FetchBundleRequest,
+        ) -> protocol::Result<FetchBundleResponse> {
+            self.0.fetch_bundle(request).await
+        }
+
+        async fn send_initial_message(
+            &self,
+            request: SendInitialMessageRequest,
+        ) -> protocol::Result<SendInitialMessageResponse> {
+            self.0.send_initial_message(request).await
+        }
+
+        async fn take_initial_messages(
+            &self,
+            request: TakeInitialMessagesRequest,
+        ) -> protocol::Result<TakeInitialMessagesResponse> {
+            self.0.take_initial_messages(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn publishing_refused_for_the_sign_in_adds_up_no_keys() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let mut alice = Client::new(InProcessHandshake(&handshake));
+        let mut bob = Client::new(SignedOut(&handshake, Cell::new(true)));
+        // The one-time prekeys Bob keeps, as his state shows them.
+        let one_time = |bob: &Client<SignedOut<'_>>| {
+            let state = format!("{:?}", bob.state());
+            let count = state.split("one_time: ").nth(1).unwrap();
+            count[..count.find(|c: char| !c.is_ascii_digit()).unwrap()].to_string()
+        };
+        let error = bob.publish_keys(2).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::SignInRequired);
+        let kept = one_time(&bob);
+        for _ in 0..5 {
+            bob.publish_keys(2).await.unwrap_err();
+        }
+        assert_eq!(one_time(&bob), kept);
+
+        // Signed in, it publishes, and Alice can start a chat with him.
+        bob.handshake.1.set(false);
+        bob.publish_keys(2).await.unwrap();
+        let _alice_session = alice
+            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        let initial_messages = bob.take_initial_messages().await.unwrap();
+        let (_bob_session, first) = bob
+            .accept(
+                &alice.identity_key(),
+                &initial_messages[0],
+                InProcessMailbox(&mailbox),
+            )
+            .unwrap();
+        assert_eq!(first, b"hi");
     }
 
     #[tokio::test]

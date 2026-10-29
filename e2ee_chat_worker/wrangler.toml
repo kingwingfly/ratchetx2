@@ -1,6 +1,8 @@
 name = "e2ee-chat"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
+workers_dev = true
+preview_urls = false
 
 # Builds the web client into ../e2ee_chat_web/dist, then the Worker, passing WORKER_BUILD_ARGS
 # on to cargo, e.g. "--features conformance".

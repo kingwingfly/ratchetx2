@@ -9,8 +9,9 @@ mod identity;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use worker::{
-    Env, Error, Method, ObjectNamespace, Request, RequestInit, Response, Result, SqlStorageValue,
-    Stub, js_sys::Uint8Array,
+    Env, Error, Method, ObjectNamespace, Request, RequestInit, Response, Result, ScheduledTime,
+    SqlStorage, SqlStorageValue, Stub,
+    js_sys::{self, Uint8Array},
 };
 
 pub use attachment::{Attachment, DEFAULT_FILE_RETENTION_DAYS};
@@ -22,6 +23,13 @@ const IDENTITIES: &str = "IDENTITIES";
 const ATTACHMENTS: &str = "ATTACHMENTS";
 /// JavaScript's largest exact integer, as SQLite's integers cross into JavaScript as numbers.
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+/// The latest an alarm may be set for, in milliseconds since the Unix epoch: 2189-01-01, as the
+/// runtime refuses alarms after 2189.
+const LATEST: u64 = 6_911_049_600_000;
+/// How long, in milliseconds, after an alarm that failed, e.g. as R2 could not be reached, the
+/// next tries again: the runtime retries one only for a few minutes, and nothing else would set
+/// it again.
+const RETRY_ALARM: u64 = 60 * 60 * 1000;
 
 /// The object of `identity_key`.
 pub fn identity(env: &Env, identity_key: &[u8]) -> Result<Stub> {
@@ -80,12 +88,12 @@ pub enum IdentityCall {
         sender: Vec<u8>,
         hashes: Vec<Vec<u8>>,
     },
-    /// Delete the messages from `sender` whose delivery hashes are among `hashes`; only those
-    /// without R2 objects if `inline_only`. Answers `()`.
+    /// Delete the messages from `sender` whose delivery hashes are among `hashes`: those without
+    /// R2 objects, and those whose objects are among `objects`, which went. Answers `()`.
     DeleteDelivered {
         sender: Vec<u8>,
         hashes: Vec<Vec<u8>>,
-        inline_only: bool,
+        objects: Vec<String>,
     },
 }
 
@@ -198,4 +206,28 @@ fn integer(value: u64) -> SqlStorageValue {
 /// Bind bytes as a BLOB.
 fn blob(bytes: &[u8]) -> SqlStorageValue {
     SqlStorageValue::Blob(bytes.to_vec())
+}
+
+/// An alarm at `at`, in milliseconds since the Unix epoch, or as late as one may be: a retention
+/// of more days than that keeps everything, rather than fails what it would keep.
+fn alarm_at(at: u64) -> ScheduledTime {
+    ScheduledTime::new(js_sys::Date::new(&(at.min(LATEST) as f64).into()))
+}
+
+/// Whether the object's table `name` is there. Only what keeps something creates its object's
+/// tables, so that a read of an object nothing was kept in, or whose data was deleted, e.g. a
+/// download of an attachment gone, which anyone may try, leaves no storage behind.
+fn has_table(sql: &SqlStorage, name: &str) -> Result<bool> {
+    let found: TablesRow = sql
+        .exec(
+            "SELECT count(*) AS tables FROM sqlite_master WHERE type = 'table' AND name = ?",
+            vec![name.into()],
+        )?
+        .one()?;
+    Ok(found.tables > 0)
+}
+
+#[derive(Deserialize)]
+struct TablesRow {
+    tables: u64,
 }

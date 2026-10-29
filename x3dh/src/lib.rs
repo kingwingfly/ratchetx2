@@ -241,6 +241,17 @@ impl LocalPrekeys {
         }
     }
 
+    /// Forget `one_time_prekeys` of the last generation, which [`extend`](Self::extend) added:
+    /// for when the server refused them, keeping none, so that publishing again, refused each
+    /// time, does not add up keys.
+    pub fn retract(&mut self, one_time_prekeys: &[PublicKey]) {
+        if let Some(generation) = self.generations.back_mut() {
+            for prekey in one_time_prekeys {
+                generation.one_time.remove(prekey);
+            }
+        }
+    }
+
     /// Generate a signed prekey, signed by `identity`, and `one_time_count` one-time prekeys, as
     /// a new generation.
     ///
@@ -523,6 +534,17 @@ mod test {
             one_time_prekey: published.one_time_prekeys.first().copied(),
         };
         (bob, prekeys, bundle)
+    }
+
+    #[test]
+    fn retracted_one_time_prekeys_go() {
+        let (bob, mut prekeys, _) = bob_setup(2);
+        let extended = prekeys.extend(&bob, 3);
+        let one_time = |prekeys: &LocalPrekeys| prekeys.generations.back().unwrap().one_time.len();
+        assert_eq!(one_time(&prekeys), 5);
+        prekeys.retract(&extended.one_time_prekeys);
+        assert_eq!(one_time(&prekeys), 2);
+        assert_eq!(prekeys.generations.len(), 1);
     }
 
     #[test]

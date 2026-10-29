@@ -5,8 +5,7 @@
   "description": "The E2EE chat server and web client on Cloudflare Workers",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "migrate": "wrangler d1 migrations apply e2ee-chat --remote"
+    "deploy": "wrangler deploy"
   },
   "devDependencies": {
     "wrangler": "^4.152.0"

@@ -241,9 +241,9 @@ impl LocalMailboxStore for Store {
         .await
     }
 
-    /// Their R2 objects go first. If R2 fails, it is logged, and only the messages without
-    /// objects go: the others expire, rather than leave objects no row names, and the fetch this
-    /// is part of still reads.
+    /// Their R2 objects go first, then the messages whose objects went, and those without. If
+    /// R2 fails, it is logged, and only the messages without objects go: the others expire,
+    /// rather than leave objects no row names, and the fetch this is part of still reads.
     async fn delete_delivered(
         &self,
         sender: &PublicKey,
@@ -259,17 +259,17 @@ impl LocalMailboxStore for Store {
             hashes: hashes.clone(),
         };
         let objects: Vec<String> = self.identity(recipient, &call).await?;
-        let inline_only = match delete_objects(&self.bucket, objects).await {
-            Ok(()) => false,
+        let objects = match delete_objects(&self.bucket, objects.clone()).await {
+            Ok(()) => objects,
             Err(e) => {
                 console_error!("cannot delete the objects of delivered messages: {e}");
-                true
+                vec![]
             }
         };
         let call = IdentityCall::DeleteDelivered {
             sender: sender.to_vec(),
             hashes,
-            inline_only,
+            objects,
         };
         self.identity(recipient, &call).await
     }
@@ -303,8 +303,8 @@ impl LocalAttachmentStore for Store {
     /// A chunk in R2 already stays, as a chunk is uploaded once: R2 puts it only if there is
     /// none, in one step, so that of two puts at once, the second changes nothing. The object
     /// notes it once it is in R2, which also tells whether the attachment was deleted meanwhile,
-    /// e.g. cancelled while the chunk was on its way: then the chunk goes too, as nothing would
-    /// name it for deleting.
+    /// e.g. by a peer while the chunk was on its way: then the chunk goes too, as deleting the
+    /// attachment may have missed it.
     async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
         let object = chunk_object(id, index);
         let absent = Conditional {

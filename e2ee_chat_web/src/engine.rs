@@ -164,6 +164,9 @@ pub struct Engine {
     /// Whether the user put off signing in, so that what the server refuses meanwhile, as it
     /// syncs, does not ask again; what the user sends does.
     declined_sign_in: Cell<bool>,
+    /// Whether publishing the prekeys was refused for the sign-in: it waits for one, rather than
+    /// tries every round.
+    publish_waits_sign_in: Cell<bool>,
 }
 
 /// A chunk of an attachment: its ID and the chunk's index.
@@ -251,6 +254,7 @@ impl Engine {
             loading: RefCell::default(),
             waits_sign_in: RefCell::default(),
             declined_sign_in: Cell::default(),
+            publish_waits_sign_in: Cell::default(),
         });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
         let weak = Rc::downgrade(&engine);
@@ -361,7 +365,12 @@ impl Engine {
         if status != 200 {
             return Err(format!("the server answered {status}"));
         }
-        Ok(SignIn::from_json(&answer))
+        let signed_in = SignIn::from_json(&answer);
+        // Signed in meanwhile, e.g. on another of the server's pages: publishing goes again.
+        if signed_in.is_some() && self.publish_waits_sign_in.replace(false) {
+            self.wake();
+        }
+        Ok(signed_in)
     }
 
     /// Sign in to the server with its `password`: what waited for it goes then.
@@ -389,6 +398,7 @@ impl Engine {
         )?;
         self.waits_sign_in.borrow_mut().clear();
         self.declined_sign_in.set(false);
+        self.publish_waits_sign_in.set(false);
         self.start_waiting_uploads().await;
         self.wake();
         Ok(signed_in)
@@ -785,6 +795,7 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
+        let signs_in_here = same_server(&inner.server, &origin());
         while let Some(farewell) = inner.state.farewells.first().cloned() {
             match Fetch::client(&inner.server)
                 .push(farewell.push.unwrap_or_default())
@@ -792,9 +803,16 @@ impl Engine {
                 .map_err(session::Error::from)
             {
                 Ok(_) => {}
-                // Refused for good, e.g. as the peer's inbox is full: it must not hold up the
-                // others, nor keep the sync failing.
-                Err(e) if matches!(e.kind(), ErrorKind::LimitExceeded | ErrorKind::Protocol) => {
+                // Pushing takes a sign-in: they wait for it, without failing the round.
+                Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => return Ok(()),
+                // Refused for good, e.g. as the peer's inbox is full, or as this page cannot sign
+                // in to the server: it must not hold up the others, nor keep the sync failing.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::LimitExceeded | ErrorKind::Protocol | ErrorKind::SignInRequired
+                    ) =>
+                {
                     self.ui.log(format!(
                         "could not tell a deleted chat's peer of it: {}",
                         describe(&e)
@@ -979,7 +997,9 @@ impl Engine {
                 .map_err(|e| describe(&e))?;
             self.show_changes(inner, peer, &entries);
         }
-        if result.is_ok() {
+        // Not from a page that cannot sign in to the server, which takes no push from it: each
+        // try would use up a key of the ratchet.
+        if result.is_ok() && signs_in_here {
             match self.push_events(inner, peer).await {
                 Ok(told) => changed |= told,
                 Err(e) => result = Err(e),
@@ -1015,11 +1035,17 @@ impl Engine {
             return Err(describe(&e));
         }
         let contact = inner.contact(peer).ok_or("no such chat")?;
-        contact
-            .session
-            .push(message)
-            .await
-            .map_err(|e| describe(&e))?;
+        match contact.session.push(message).await {
+            Ok(()) => {}
+            // Each try uses up a key of the ratchet, of which the peer skips only so many: the
+            // chat waits for the sign-in, as a message refused for it does, and tries once more
+            // then.
+            Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                self.waits_sign_in.borrow_mut().insert(*peer);
+                return Ok(false);
+            }
+            Err(e) => return Err(describe(&e)),
+        }
         contact.state.events = None;
         Ok(true)
     }
@@ -1126,7 +1152,7 @@ impl Engine {
             || inner.state.published_at == 0
             || inner.state.used_one_time_prekeys >= REPUBLISH_USED
             || now().saturating_sub(inner.state.published_at) > REPUBLISH_AGE;
-        if !due {
+        if !due || (self.publish_waits_sign_in.get() && !now_anyway) {
             return Ok(());
         }
         // Saved, failed or not: if it failed, the server may still have the prekeys, its reply
@@ -1134,8 +1160,17 @@ impl Engine {
         // `Client::publish_keys`.
         if let Err(e) = inner.client.publish_keys(ONE_TIME_PREKEYS).await {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
+            // Refused for the sign-in: it waits for one, without failing the round; asked for,
+            // it says so.
+            if e.kind() == ErrorKind::SignInRequired {
+                self.publish_waits_sign_in.set(true);
+                if !now_anyway {
+                    return Ok(());
+                }
+            }
             return Err(describe(&e));
         }
+        self.publish_waits_sign_in.set(false);
         inner.state.published_at = now();
         inner.state.used_one_time_prekeys = 0;
         inner.save(&[]).await.map_err(|e| describe(&e))?;

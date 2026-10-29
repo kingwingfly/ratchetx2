@@ -1393,6 +1393,12 @@ fn VaultDialog() -> impl IntoView {
         // The vault's dialog stays until the vault opens.
         if ui.phase.get_untracked() != Phase::Unlocked {
             event.prevent_default();
+        } else if ui
+            .dialog
+            .with_untracked(|dialog| matches!(dialog, Some(Dialog::SignIn)))
+        {
+            // Dismissed, e.g. with Escape, the sign-in is put off, as "Not now" puts it off.
+            engine().decline_sign_in();
         }
     };
     view! {

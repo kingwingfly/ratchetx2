@@ -6,12 +6,16 @@
 //! answers their pings. A client keeps one open only while its user is on the page, and closes it
 //! on leaving; one that dies without closing, e.g. as its device sleeps, is closed when the object
 //! next notifies. An alarm deletes what was never delivered, or taken, once `RETENTION_DAYS` old.
+//!
+//! Its tables are created by the first call that keeps something: publishing, an initial message,
+//! a message, or a take of the inbox, signed by the identity, whose timestamp the next take must
+//! pass. Until then, reads, which anyone may make, find nothing, and keep nothing.
 
 use prost::Message as _;
 use protocol::notify::Notification;
 use serde::Deserialize;
 use worker::{
-    Date, DurableObject, Env, Error, Method, Request, Response, Result, ScheduledTime, SqlStorage,
+    Date, DurableObject, Env, Error, Method, Request, Response, Result, SqlStorage,
     SqlStorageValue, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
     WebSocketRequestResponsePair, console_error, durable_object,
     js_sys::{self, Function, Reflect},
@@ -19,7 +23,8 @@ use worker::{
 };
 
 use super::{
-    Content, IdentityCall, InitialMessage, StoredRow, TakenBundle, answer, blob, decode, integer,
+    Content, IdentityCall, InitialMessage, RETRY_ALARM, StoredRow, TakenBundle, alarm_at, answer,
+    blob, decode, has_table, integer,
 };
 
 /// What a client sends to keep its WebSocket open, and the answer, given without waking the
@@ -98,9 +103,6 @@ impl DurableObject for Identity {
             Ok(pair) => state.set_websocket_auto_response(&pair),
             Err(e) => console_error!("cannot answer pings: {e:?}"),
         }
-        if let Err(e) = state.storage().sql().exec(SCHEMA, None) {
-            console_error!("cannot create the tables: {e}");
-        }
         Self { state, env }
     }
 
@@ -124,9 +126,12 @@ impl DurableObject for Identity {
     }
 
     /// What was never delivered, or taken, goes once `RETENTION_DAYS` old, with its R2
-    /// objects: the objects first, so that a failure leaves rows, which the next alarm deletes,
-    /// rather than objects no row names.
+    /// objects: the objects first, so that a failure leaves rows, which the alarm deletes when it
+    /// tries again later, rather than objects no row names.
     async fn alarm(&self) -> Result<Response> {
+        if !self.has_tables()? {
+            return Response::empty();
+        }
         let before = Date::now().as_millis().saturating_sub(self.retention());
         let sql = self.sql();
         let objects: Vec<ObjectRow> = sql
@@ -136,7 +141,16 @@ impl DurableObject for Identity {
             )?
             .to_array()?;
         let objects: Vec<_> = objects.into_iter().filter_map(|row| row.object).collect();
-        crate::store::delete_objects(&self.env.bucket(crate::BUCKET)?, objects).await?;
+        let deleted = match self.env.bucket(crate::BUCKET) {
+            Ok(bucket) => crate::store::delete_objects(&bucket, objects).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = deleted {
+            console_error!("cannot delete the objects of expired messages: {e}");
+            let at = Date::now().as_millis().saturating_add(RETRY_ALARM);
+            self.state.storage().set_alarm(alarm_at(at)).await?;
+            return Response::empty();
+        }
         let sql = self.sql();
         sql.exec(
             "DELETE FROM messages WHERE created_at < ?",
@@ -181,6 +195,17 @@ impl Identity {
         self.state.storage().sql()
     }
 
+    /// Whether its tables are there, see the module's docs.
+    fn has_tables(&self) -> Result<bool> {
+        has_table(&self.sql(), "messages")
+    }
+
+    /// Its tables, for a call that keeps something.
+    fn create_tables(&self) -> Result<()> {
+        self.sql().exec(SCHEMA, None)?;
+        Ok(())
+    }
+
     /// How long what was never delivered is kept, in milliseconds.
     fn retention(&self) -> u64 {
         crate::millis(crate::period(
@@ -190,7 +215,8 @@ impl Identity {
         ))
     }
 
-    /// Serve `call`. Its statements run with no await between them, so that it is atomic.
+    /// Serve `call`. Its statements run with no await between them, but the storage's own, which
+    /// let nothing else in meanwhile, so that it is atomic.
     async fn serve(&self, call: IdentityCall) -> Result<Response> {
         match call {
             IdentityCall::Publish {
@@ -198,17 +224,24 @@ impl Identity {
                 signature,
                 timestamp,
                 one_time_prekeys,
-            } => answer(self.publish(&signed_prekey, &signature, timestamp, &one_time_prekeys)),
+            } => {
+                self.create_tables()?;
+                answer(self.publish(&signed_prekey, &signature, timestamp, &one_time_prekeys))
+            }
             IdentityCall::TakeBundle => answer(self.take_bundle()),
             IdentityCall::AddInitialMessage { message, limit } => {
+                self.create_tables()?;
+                // Before it is kept, so that failing to set it keeps nothing, rather than what
+                // never expires.
+                self.schedule_expiry(false).await?;
                 let added = self.add_initial_message(&message, limit);
                 if matches!(added, Ok(true)) {
-                    self.schedule_expiry(false).await?;
                     self.notify(&Notification::initial_message());
                 }
                 answer(added)
             }
             IdentityCall::TakeInitialMessages { timestamp } => {
+                self.create_tables()?;
                 answer(self.take_initial_messages(timestamp))
             }
             IdentityCall::Append {
@@ -219,6 +252,9 @@ impl Identity {
                 initial_message,
                 delivery_hash,
             } => {
+                self.create_tables()?;
+                // As for an initial message.
+                self.schedule_expiry(false).await?;
                 let appended = self.append(
                     &sender,
                     &header,
@@ -227,11 +263,10 @@ impl Identity {
                     initial_message.as_deref(),
                     delivery_hash.as_deref(),
                 );
-                if appended.is_ok() {
-                    self.schedule_expiry(false).await?;
-                    if let Ok(sender) = <[u8; 32]>::try_from(sender.as_slice()) {
-                        self.notify(&Notification::message_from(&sender));
-                    }
+                if appended.is_ok()
+                    && let Ok(sender) = <[u8; 32]>::try_from(sender.as_slice())
+                {
+                    self.notify(&Notification::message_from(&sender));
                 }
                 answer(appended)
             }
@@ -247,8 +282,8 @@ impl Identity {
             IdentityCall::DeleteDelivered {
                 sender,
                 hashes,
-                inline_only,
-            } => answer(self.delete_delivered(&sender, &hashes, inline_only)),
+                objects,
+            } => answer(self.delete_delivered(&sender, &hashes, &objects)),
         }
     }
 
@@ -282,6 +317,9 @@ impl Identity {
     }
 
     fn take_bundle(&self) -> Result<Option<TakenBundle>> {
+        if !self.has_tables()? {
+            return Ok(None);
+        }
         let sql = self.sql();
         let Some(bundle) = sql
             .exec(
@@ -416,6 +454,9 @@ impl Identity {
     }
 
     fn read(&self, sender: &[u8], after: u64, limit: u32, max_size: u64) -> Result<Vec<StoredRow>> {
+        if !self.has_tables()? {
+            return Ok(vec![]);
+        }
         let rows: Vec<MessageRow> = self
             .sql()
             .exec(
@@ -448,6 +489,9 @@ impl Identity {
     }
 
     fn delivered_objects(&self, sender: &[u8], hashes: &[Vec<u8>]) -> Result<Vec<String>> {
+        if !self.has_tables()? {
+            return Ok(vec![]);
+        }
         let rows: Vec<ObjectRow> = self
             .sql()
             .exec(
@@ -459,24 +503,27 @@ impl Identity {
         Ok(rows.into_iter().filter_map(|row| row.object).collect())
     }
 
-    fn delete_delivered(&self, sender: &[u8], hashes: &[Vec<u8>], inline_only: bool) -> Result<()> {
-        let inline = if inline_only {
-            " AND object IS NULL"
-        } else {
-            ""
-        };
+    /// Delete the delivered messages: those without objects, and those whose objects went, of
+    /// `objects`, which the Worker read before. A copy pushed again since, whose object it did
+    /// not read, stays, and goes once its recipient gives its token again, or expires.
+    fn delete_delivered(&self, sender: &[u8], hashes: &[Vec<u8>], objects: &[String]) -> Result<()> {
+        if !self.has_tables()? {
+            return Ok(());
+        }
+        let objects =
+            serde_json::to_string(objects).map_err(|e| Error::RustError(e.to_string()))?;
         self.sql().exec(
-            &format!(
-                "DELETE FROM messages WHERE sender = ? \
-                 AND delivery_hash IN (SELECT unhex(value) FROM json_each(?)){inline}"
-            ),
-            vec![blob(sender), hashes_json(hashes).into()],
+            "DELETE FROM messages WHERE sender = ? \
+             AND delivery_hash IN (SELECT unhex(value) FROM json_each(?)) \
+             AND (object IS NULL OR object IN (SELECT value FROM json_each(?)))",
+            vec![blob(sender), hashes_json(hashes).into(), objects.into()],
         )?;
         Ok(())
     }
 
-    /// Set the alarm for when the oldest of what is kept expires, if there is any; unless one is
-    /// set already, which it is from the first thing kept on, but if `again`, after an alarm.
+    /// Set the alarm for when the oldest of what is kept expires, unless one is set already,
+    /// which it is from the first thing kept on: before something is kept, it counts as kept
+    /// now. If `again`, after an alarm, for the oldest of what is left, if any.
     async fn schedule_expiry(&self, again: bool) -> Result<()> {
         let storage = self.state.storage();
         if !again && storage.get_alarm().await?.is_some() {
@@ -490,13 +537,14 @@ impl Identity {
                 None,
             )?
             .one()?;
-        if let Some(oldest) = oldest.oldest {
-            let at = oldest.saturating_add(self.retention());
-            storage
-                .set_alarm(ScheduledTime::new(js_sys::Date::new(&(at as f64).into())))
-                .await?;
-        }
-        Ok(())
+        let oldest = match (oldest.oldest, again) {
+            (Some(oldest), _) => oldest,
+            (None, false) => Date::now().as_millis(),
+            (None, true) => return Ok(()),
+        };
+        storage
+            .set_alarm(alarm_at(oldest.saturating_add(self.retention())))
+            .await
     }
 
     /// Tell every subscriber of `notification`.
