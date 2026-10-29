@@ -2198,9 +2198,8 @@ fn DeleteFromServer(peer: PublicKey, pointer: content::AttachmentPointer) -> imp
         .contact(&peer)
         .map(|contact| contact.label())
         .unwrap_or_default();
-    let title = format!(
-        "Neither you nor {label} can download it any more; what you downloaded stays"
-    );
+    let title =
+        format!("Neither you nor {label} can download it any more; what you downloaded stays");
     let click = move |_| match step.get_untracked() {
         Step::Offered => step.set(Step::Asked),
         Step::Asked => {

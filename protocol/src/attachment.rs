@@ -341,7 +341,10 @@ mod server {
                     .kind(),
                 ErrorKind::InvalidSignature
             );
-            server.delete_attachment(delete(&delete_token)).await.unwrap();
+            server
+                .delete_attachment(delete(&delete_token))
+                .await
+                .unwrap();
             assert_eq!(
                 server.get_chunk(get(1)).await.unwrap_err().kind(),
                 ErrorKind::NotFound

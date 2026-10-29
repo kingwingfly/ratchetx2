@@ -154,6 +154,26 @@ pub struct ContactState {
     /// What to tell the peer it did with its messages, once it can be.
     #[prost(message, optional, tag = "16")]
     pub events: Option<Events>,
+    /// Events encrypted for the peer whose push has not gone yet: it goes again as it is, as
+    /// encrypting them again would use up another key of the ratchet, of which the peer skips
+    /// only so many.
+    #[prost(message, optional, tag = "17")]
+    pub sealed_events: Option<SealedEvents>,
+}
+
+/// Events encrypted for the peer, waiting to be pushed, see [`ContactState::sealed_events`].
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SealedEvents {
+    /// The message, encrypted.
+    #[prost(message, optional, tag = "1")]
+    pub record: Option<OutgoingRecord>,
+    /// The ID of the session it was encrypted on: if another is active by the time it goes, it
+    /// is encrypted again on that one, as the peer may never have had this one.
+    #[prost(bytes = "vec", tag = "2")]
+    pub session: Vec<u8>,
+    /// What it tells, which [`ContactState::events`] forgets once it went.
+    #[prost(message, optional, tag = "3")]
+    pub events: Option<Events>,
 }
 
 /// A message this client pushed, waiting for the peer to read it, or to download its attachment.

@@ -92,7 +92,11 @@ impl Attachment {
         if kept.count > 0 {
             return Ok(false);
         }
-        let retention = crate::period(&self.env, "FILE_RETENTION_DAYS", DEFAULT_FILE_RETENTION_DAYS);
+        let retention = crate::period(
+            &self.env,
+            "FILE_RETENTION_DAYS",
+            DEFAULT_FILE_RETENTION_DAYS,
+        );
         let at = Date::now()
             .as_millis()
             .saturating_add(crate::millis(retention));

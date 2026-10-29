@@ -823,6 +823,14 @@ impl<M> Session<M> {
         self.state.active.is_none()
     }
 
+    /// The ID of the session messages are sent on, if any, which both peers have: the X3DH
+    /// ephemeral key of the one who started it. A message [encrypted](Session::encrypt) to push
+    /// later can be told from one of a session that is no longer the active one, e.g. to encrypt
+    /// it again on the new one.
+    pub fn active_id(&self) -> Option<&PublicKey> {
+        self.state.active.as_ref().map(|active| &active.id)
+    }
+
     /// Go on past the messages that receiving stopped at, as they did not decrypt, once the
     /// initial messages waiting are taken and accepted: those of that page that still do not
     /// decrypt never will, and are skipped, see [`Session::receive`].
@@ -2151,6 +2159,24 @@ mod test {
             .unwrap();
         assert_eq!(first, b"hi");
         alice_session.send(b"there").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_active_session_has_an_id_both_peers_share() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
+        let first = *alice_session.active_id().unwrap();
+        assert_eq!(bob_session.active_id(), Some(&first));
+        // Retired, there is none; started again, another.
+        alice_session.retire();
+        assert_eq!(alice_session.active_id(), None);
+        alice
+            .start_again(&mut alice_session, b"again")
+            .await
+            .unwrap();
+        let second = *alice_session.active_id().unwrap();
+        assert_ne!(second, first);
     }
 
     #[tokio::test]

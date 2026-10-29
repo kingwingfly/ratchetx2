@@ -506,7 +506,12 @@ impl Identity {
     /// Delete the delivered messages: those without objects, and those whose objects went, of
     /// `objects`, which the Worker read before. A copy pushed again since, whose object it did
     /// not read, stays, and goes once its recipient gives its token again, or expires.
-    fn delete_delivered(&self, sender: &[u8], hashes: &[Vec<u8>], objects: &[String]) -> Result<()> {
+    fn delete_delivered(
+        &self,
+        sender: &[u8],
+        hashes: &[Vec<u8>],
+        objects: &[String],
+    ) -> Result<()> {
         if !self.has_tables()? {
             return Ok(());
         }

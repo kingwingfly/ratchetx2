@@ -44,7 +44,7 @@ use crate::{
     util::{describe, hex, js_error, key_from_text, now, short, size, sleep},
     vault::{
         AppState, Awaiting, ContactState, Farewell, HistoryEntry, Outgoing, OutgoingRecord,
-        PendingUpload, Vault, history_key, outbox_key,
+        PendingUpload, SealedEvents, Vault, history_key, outbox_key,
     },
 };
 
@@ -1010,43 +1010,81 @@ impl Engine {
 
     /// Tell `peer` what this client did with its messages, all in one message, once what waits
     /// for it went: on the session, never starting one for it, and never in a request, whose
-    /// sender learns nothing until it is accepted. Encrypted, saved, then pushed, so that no key
-    /// of the ratchet is used twice. Once it went, the events are forgotten, which the next save
-    /// keeps; if none does, they are told again, which changes nothing. Returns whether any went.
+    /// sender learns nothing until it is accepted. Encrypted and saved once, then pushed as it is
+    /// until it goes, so that no key of the ratchet is used twice, nor another on each try, e.g.
+    /// while the server cannot be reached: the peer skips only so many. Once it went, what it
+    /// told is forgotten, which the next save keeps; if none does, it goes again, which the peer
+    /// takes as a duplicate. Returns whether any went.
     async fn push_events(&self, inner: &mut Inner, peer: &PublicKey) -> Result<bool, String> {
         let Some(contact) = inner.contact(peer) else {
             return Ok(false);
         };
-        let events = match &contact.state.events {
-            Some(events)
-                if !events.is_empty()
-                    && !contact.state.request
-                    && contact.state.outbox.is_empty()
-                    && !contact.session.needs_new_session() =>
-            {
-                events.to_bytes()
-            }
-            _ => return Ok(false),
-        };
-        let snapshot = contact.snapshot();
-        let message = contact.session.encrypt(&events).map_err(|e| describe(&e))?;
-        if let Err(e) = inner.save(&[]).await {
-            inner.roll_back(peer, snapshot)?;
-            return Err(describe(&e));
+        if contact.state.request
+            || !contact.state.outbox.is_empty()
+            || contact.session.needs_new_session()
+        {
+            return Ok(false);
         }
+        let active = contact.session.active_id().map(|id| id.to_vec());
+        // One encrypted on a session that is no longer the active one, which the peer may never
+        // have had: what it tells, still in the events, is encrypted again on the active one.
+        if contact
+            .state
+            .sealed_events
+            .as_ref()
+            .is_some_and(|sealed| Some(&sealed.session) != active.as_ref())
+        {
+            contact.state.sealed_events = None;
+        }
+        let sealed = match contact.state.sealed_events.clone() {
+            Some(sealed) => sealed,
+            None => {
+                let Some(events) = contact
+                    .state
+                    .events
+                    .clone()
+                    .filter(|events| !events.is_empty())
+                else {
+                    return Ok(false);
+                };
+                let snapshot = contact.snapshot();
+                let message = contact
+                    .session
+                    .encrypt(&events.to_bytes())
+                    .map_err(|e| describe(&e))?;
+                let sealed = SealedEvents {
+                    record: Some(OutgoingRecord::sealed(message)),
+                    session: active.unwrap_or_default(),
+                    events: Some(events),
+                };
+                contact.state.sealed_events = Some(sealed.clone());
+                if let Err(e) = inner.save(&[]).await {
+                    inner.roll_back(peer, snapshot)?;
+                    return Err(describe(&e));
+                }
+                sealed
+            }
+        };
         let contact = inner.contact(peer).ok_or("no such chat")?;
+        let message = sealed.record.unwrap_or_default().to_push();
         match contact.session.push(message).await {
             Ok(()) => {}
-            // Each try uses up a key of the ratchet, of which the peer skips only so many: the
-            // chat waits for the sign-in, as a message refused for it does, and tries once more
-            // then.
+            // The chat waits for the sign-in, as a message refused for it does, rather than
+            // tries every round, and goes once signed in.
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
                 self.waits_sign_in.borrow_mut().insert(*peer);
                 return Ok(false);
             }
             Err(e) => return Err(describe(&e)),
         }
-        contact.state.events = None;
+        // Those told since it was encrypted stay, to go in the next.
+        contact.state.sealed_events = None;
+        if let (Some(events), Some(told)) = (&mut contact.state.events, &sealed.events) {
+            forget_told(events, told);
+        }
+        if contact.state.events.as_ref().is_some_and(Events::is_empty) {
+            contact.state.events = None;
+        }
         Ok(true)
     }
 
@@ -2985,11 +3023,24 @@ impl Engine {
             let mut deleted = Kind::Deleted(Deleted {}).to_bytes();
             contact.state.clock = contact.state.clock.saturating_add(1);
             stamp(&mut deleted, contact.state.clock);
-            let events = contact
-                .state
-                .events
-                .take()
-                .filter(|events| !events.is_empty());
+            let mut events = contact.state.events.take();
+            // Events encrypted already on the active session go as they are, before the rest.
+            let active = contact.session.active_id().map(|id| id.to_vec());
+            if let Some(sealed) = contact.state.sealed_events.take()
+                && Some(&sealed.session) == active.as_ref()
+            {
+                farewell.push(Farewell {
+                    push: Some(
+                        contact
+                            .session
+                            .push_request(sealed.record.unwrap_or_default().to_push()),
+                    ),
+                });
+                if let (Some(events), Some(told)) = (&mut events, &sealed.events) {
+                    forget_told(events, told);
+                }
+            }
+            let events = events.filter(|events| !events.is_empty());
             for content in events
                 .map(|events| events.to_bytes())
                 .into_iter()
@@ -3306,6 +3357,7 @@ impl Inner {
                 .collect();
             contact.state.awaiting.clear();
             contact.state.events = None;
+            contact.state.sealed_events = None;
             contact.state.unseen.clear();
             unread
         } else {
@@ -3703,6 +3755,14 @@ fn stream_mime(mime: &str) -> String {
 async fn read_chunk(file: &web_sys::File, index: u32, size: u64) -> Result<Vec<u8>, String> {
     let start = u64::from(index) * CHUNK_SIZE as u64;
     read(file, start, (start + CHUNK_SIZE as u64).min(size)).await
+}
+
+/// Forget, of `events`, what `told` told the peer already.
+fn forget_told(events: &mut Events, told: &Events) {
+    events.read.retain(|clock| !told.read.contains(clock));
+    events
+        .downloaded
+        .retain(|clock| !told.downloaded.contains(clock));
 }
 
 /// Whether either peer can delete the attachment `pointer` from the server, by `now`, the
