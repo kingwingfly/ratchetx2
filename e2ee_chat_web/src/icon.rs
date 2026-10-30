@@ -38,6 +38,8 @@ pub enum Icon {
     Folder,
     /// Two notes: audio.
     Music,
+    /// A bin: delete.
+    Delete,
     /// How far a message got, as Telegram shows it: one tick, sent, and two, read, as wide as
     /// one; three, its attachment downloaded; a clock, waiting to be sent; and a mark, that it
     /// could not be.
@@ -102,6 +104,13 @@ impl Icon {
                 "M9 18V5l12-2v13",
                 "M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
                 "M21 16a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",
+            ],
+            Self::Delete => &[
+                "M4 7h16",
+                "M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2",
+                "M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12",
+                "M10 11v6",
+                "M14 11v6",
             ],
             Self::Back => &["M19 12H5", "M11 6l-6 6 6 6"],
             Self::Download => &["M12 4v11", "M7 10l5 5 5-5", "M5 20h14"],

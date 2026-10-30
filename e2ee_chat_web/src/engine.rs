@@ -2045,13 +2045,15 @@ impl Engine {
             .map_err(|e| describe(&e))
     }
 
-    /// Delete the attachment `pointer`, in the chat with `peer`, sent or received, from the
-    /// server, with its delete token, which its key gives: neither peer can download it any
-    /// more, though what they downloaded stays. One this client uploads stops; one the peer
-    /// uploads stops too, sparing it the rest.
+    /// Delete the attachment `pointer`, of the history entry `index` of the chat with `peer`,
+    /// sent or received, from the server, with its delete token, which its key gives: neither
+    /// peer can download it any more, though what they downloaded stays. One this client uploads
+    /// stops; one the peer uploads stops too, sparing it the rest. The entry notes it, so that
+    /// it is not offered again.
     pub async fn delete_attachment(
         &self,
         peer: PublicKey,
+        index: u64,
         pointer: &AttachmentPointer,
     ) -> Result<(), String> {
         let not_there = || format!("{} is not on the server", pointer.name);
@@ -2067,7 +2069,34 @@ impl Engine {
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => return Err(describe(&e)),
         }
-        self.drop_upload(&peer, id).await
+        self.drop_upload(&peer, id).await?;
+        self.note_gone(&peer, index, &id).await
+    }
+
+    /// Note in the history entry `index` of the chat with `peer` that its attachment `id` is
+    /// gone from the server, unless the entry is no longer that attachment's message, as the
+    /// chat was deleted, and maybe started again, meanwhile.
+    async fn note_gone(&self, peer: &PublicKey, index: u64, id: &[u8; 16]) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        let inner = guard.as_mut().ok_or("locked")?;
+        let entry = inner
+            .vault
+            .entry(peer, index)
+            .await
+            .map_err(|e| describe(&e))?;
+        let Some(mut entry) = entry.filter(|entry| {
+            matches!(
+                entry.content.as_ref().and_then(|content| content.kind.as_ref()),
+                Some(Kind::Attachment(pointer)) if pointer.id == id
+            )
+        }) else {
+            return Ok(());
+        };
+        entry.gone = true;
+        inner
+            .save(&records(peer, &[(index, entry)]))
+            .await
+            .map_err(|e| describe(&e))
     }
 
     /// Upload the chunks of `pending` from `uploaded` on, reading each from `file` in its turn,
@@ -2918,6 +2947,7 @@ impl Engine {
                 // Sorted by content as it came, if it came with its bytes; else by its name and
                 // type, as an attachment.
                 let sort = entry.sort();
+                let gone = entry.gone;
                 let message = contact.message(index, entry);
                 let (name, mime, size) = match &message.body {
                     Body::File(file) => (file.name.clone(), file.mime.clone(), file.size),
@@ -2928,15 +2958,19 @@ impl Engine {
                     ),
                     _ => continue,
                 };
-                let deletable = match &message.body {
-                    Body::Remote(remote) => deletable(&remote.pointer, now),
-                    _ => false,
+                let (deletable, gone) = match &message.body {
+                    Body::Remote(remote) => {
+                        let gone = gone || expired(&remote.pointer, now);
+                        (!gone && uploaded(&remote.pointer), gone)
+                    }
+                    _ => (false, false),
                 };
                 files.push(FileView {
                     index,
                     at: message.at,
                     outgoing: message.outgoing,
                     deletable,
+                    gone,
                     sort: match sort {
                         Sort::Unknown => preview::sort(&name, &mime, &[]),
                         sort => sort,
@@ -3006,10 +3040,29 @@ impl Engine {
     }
 
     /// Delete the chat with `peer` and its history. The server knows nothing of it: what it keeps
-    /// of the chat goes as it is delivered, or expires.
+    /// of the chat goes as it is delivered, or expires; but for its uploads that went up and
+    /// have not finished, which it deletes, as they never can now.
     pub async fn delete(&self, peer: PublicKey) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
+        // Read before anything changes, as the vault forgets them with the chat: those still
+        // shown, going or paused, as one that just finished leaves the page before the vault.
+        let shown: HashSet<Vec<u8>> = self.ui.uploads.with_untracked(|uploads| {
+            uploads
+                .iter()
+                .filter(|upload| upload.peer == peer)
+                .map(|upload| upload.id.to_vec())
+                .collect()
+        });
+        let unfinished: Vec<(String, Upload)> = inner
+            .vault
+            .uploads(Some(&peer))
+            .await
+            .map_err(|e| describe(&e))?
+            .into_iter()
+            .filter(|(_, pending)| pending.started() && shown.contains(&pending.id))
+            .filter_map(|(_, pending)| Some((pending.name.clone(), upload_of(&pending).ok()?)))
+            .collect();
         // The peer is told, on the session as it is now, so that its next message starts a new
         // one, which comes here as a new chat; see `say_farewells`. If forgetting fails, the
         // session goes back to this, as the farewell never goes.
@@ -3070,7 +3123,7 @@ impl Engine {
             return Err(describe(&e));
         }
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
-        // chat, which `may_keep` now tells them is gone. What the server has expires.
+        // chat, which `may_keep` now tells them is gone.
         let uploads: Vec<[u8; 16]> = self.ui.uploads.with_untracked(|uploads| {
             uploads
                 .iter()
@@ -3104,6 +3157,21 @@ impl Engine {
             self.ui.messages.set(vec![]);
         }
         self.ui.contacts.set(inner.views());
+        // What the server has of the uploads that never can finish now goes, so that the peer
+        // does not wait for the rest; with their upload tokens, which name nobody.
+        if !unfinished.is_empty() {
+            let (ui, attachments) = (self.ui, Fetch::client(&inner.server));
+            spawn_local(async move {
+                for (name, upload) in unfinished {
+                    if let Err(e) = upload.cancel(&attachments).await {
+                        ui.log(format!(
+                            "the server keeps what it has of {name} until it expires: {}",
+                            describe(&e)
+                        ));
+                    }
+                }
+            });
+        }
         Ok(())
     }
 
@@ -3765,13 +3833,16 @@ fn forget_told(events: &mut Events, told: &Events) {
         .retain(|clock| !told.downloaded.contains(clock));
 }
 
-/// Whether either peer can delete the attachment `pointer` from the server, by `now`, the
-/// server's time: it went up, rather than waits for a sign-in, and has not expired, as far as
-/// its message tells.
-fn deletable(pointer: &AttachmentPointer, now: u64) -> bool {
-    pointer.id.len() == 16
-        && pointer.key.len() == 32
-        && (pointer.expires == 0 || pointer.expires > now)
+/// Whether the attachment `pointer` went up, rather than waits for a sign-in, so that either
+/// peer can delete it from the server while it is there.
+fn uploaded(pointer: &AttachmentPointer) -> bool {
+    pointer.id.len() == 16 && pointer.key.len() == 32
+}
+
+/// Whether the attachment `pointer` expired by `now`, the server's time, as far as its message
+/// tells.
+fn expired(pointer: &AttachmentPointer, now: u64) -> bool {
+    pointer.expires != 0 && pointer.expires <= now
 }
 
 /// The upload of `pending`, to go on with.

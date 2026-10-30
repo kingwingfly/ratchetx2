@@ -292,6 +292,9 @@ pub struct FileView {
     /// Whether it can be deleted from the server, as an attachment there, sent or received,
     /// which either peer may delete.
     pub deletable: bool,
+    /// Whether it is an attachment no longer on the server, as this client deleted it, or it
+    /// expired; what is kept here of it still opens.
+    pub gone: bool,
     pub name: String,
     pub size: u64,
     pub sort: Sort,
