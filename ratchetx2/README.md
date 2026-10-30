@@ -2,9 +2,9 @@ A double-ratchet implementation following [Signal](https://signal.org/docs/speci
 
 Pure Rust (no C dependencies), so it also builds for `wasm32-unknown-unknown`.
 
-# E2EE chat app (TUI)
+# E2EE chat app
 
-An E2EE chat server-client TUI app base on this crate is available [here](https://github.com/kingwingfly/ratchetx2). The repository also has unpublished companion crates: `xeddsa` (XEdDSA), `x3dh` (X3DH key agreement), `party` (header encryption over this crate), and `storage`, `protocol` and `session` for the chat itself.
+An E2EE chat built on this crate, a web client and its server as a Cloudflare Worker, is available [here](https://github.com/kingwingfly/ratchetx2). The repository also has unpublished companion crates: `xeddsa` (XEdDSA), `x3dh` (X3DH key agreement), `party` (header encryption over this crate), and `storage`, `protocol` and `session` for the chat itself.
 
 # Compared to others
 

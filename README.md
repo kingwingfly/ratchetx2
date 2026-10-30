@@ -1,10 +1,11 @@
 # About
 
-![screenshot](image/screenshot.png)
+![The web client: a chat with read receipts, a file and an image](image/screenshot.png)
 
 - **[E2EE chat Worker](e2ee_chat_worker/README.md)**: the chat server as a Cloudflare Worker, over Connect, storing in Durable Objects and R2, and serving the web client
 - **[E2EE chat web client](e2ee_chat_web/README.md)**: the web client, in Leptos: keys and sessions stay in the browser, in a vault sealed by a passphrase
-- **[E2EE chat client](e2ee_chat_client/README.md)**: TUI chat client, support image; it talks to the Worker, and with the web client
+
+The TUI chat client, `e2ee_chat_client`, is archived: its last version is at the tag [`archive/e2ee_chat_client`](https://github.com/kingwingfly/ratchetx2/tree/archive/e2ee_chat_client/e2ee_chat_client), where it still talks to the Worker, and with the web client.
 
 Libraries; only `ratchetx2` is published on crates.io:
 
