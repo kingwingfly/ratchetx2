@@ -1,6 +1,6 @@
 //! The page: the chat list beside the open chat, the dialogs, the viewer and the dropzone.
 
-use std::{cell::OnceCell, rc::Rc, sync::Arc, time::Duration};
+use std::{cell::OnceCell, collections::HashSet, rc::Rc, sync::Arc, time::Duration};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use e2ee_chat_preview::language;
@@ -518,21 +518,31 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
     // Held until this browser signs in to the server, which keeps it only for those who do: it
     // can be cancelled, which lets what was sent after it go.
     let index = message.index;
-    let held = message.outgoing.then_some(move || {
-        let ui = ui();
-        let peer = ui.open.get()?;
-        ui.held.with(|held| held.contains(&(peer, index))).then(|| {
-            view! {
-                <button
-                    type="button"
-                    class="link cancel-held"
-                    title="Do not send it, so that what was sent after it goes"
-                    on:click=move |_| act(async move { engine().cancel_held(peer, index).await })
-                >
-                    "Cancel"
-                </button>
-            }
-        })
+    let held = message.outgoing.then(|| {
+        let cancelling = RwSignal::new(false);
+        move || {
+            let ui = ui();
+            let peer = ui.open.get()?;
+            ui.held.with(|held| held.contains(&(peer, index))).then(|| {
+                view! {
+                    <button
+                        type="button"
+                        class="btn icon quiet cancel-held"
+                        title="Cancel it, so that what was sent after it goes"
+                        aria-label="Cancel it"
+                        disabled=move || cancelling.get()
+                        on:click=move |_| {
+                            act_while(
+                                cancelling,
+                                async move { engine().cancel_held(peer, index).await },
+                            )
+                        }
+                    >
+                        {icon(Icon::Close)}
+                    </button>
+                }
+            })
+        }
     });
     view! {
         <div class="message" class:me=message.outgoing>
@@ -1240,6 +1250,20 @@ fn act(action: impl Future<Output = Result<(), String>> + 'static) {
     });
 }
 
+/// Run `action` as [`act`] does, unless `busy` says one runs already, which it says meanwhile:
+/// the buttons it disables, pressed again, start nothing twice.
+fn act_while(busy: RwSignal<bool>, action: impl Future<Output = Result<(), String>> + 'static) {
+    if busy.get_untracked() {
+        return;
+    }
+    busy.set(true);
+    act(async move {
+        let done = action.await;
+        busy.try_set(false);
+        done
+    });
+}
+
 fn open_chat(peer: Option<PublicKey>) {
     let engine = engine();
     spawn_local(async move { engine.open(peer).await });
@@ -1627,10 +1651,14 @@ fn UnlockVault() -> impl IntoView {
         });
     };
     let reset = move |_| {
+        if progress.working.get_untracked() {
+            return;
+        }
         if !confirm_reset.get_untracked() {
             confirm_reset.set(true);
             return;
         }
+        progress.start("Deleting the vault…");
         spawn_local(async move {
             match crate::vault::Vault::destroy().await {
                 Ok(()) => lock(),
@@ -1653,7 +1681,12 @@ fn UnlockVault() -> impl IntoView {
             />
             {progress.view()}
             <div class="actions">
-                <button type="button" class="btn danger" on:click=reset>
+                <button
+                    type="button"
+                    class="btn danger"
+                    disabled=move || progress.working.get()
+                    on:click=reset
+                >
                     {move || {
                         if confirm_reset.get() {
                             "Delete it all, for good?"
@@ -1775,10 +1808,12 @@ fn Identity() -> impl IntoView {
         return ().into_any();
     };
     let name = RwSignal::new(me.name.clone());
+    // Saving, publishing or signing out, which its buttons wait for.
+    let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         let engine = engine();
-        act(async move {
+        act_while(busy, async move {
             engine.set_name(name.get_untracked()).await?;
             engine.ui().dialog.set(None);
             engine.ui().notify("Saved your name.");
@@ -1787,7 +1822,7 @@ fn Identity() -> impl IntoView {
     };
     let publish = move |_| {
         let engine = engine();
-        act(async move {
+        act_while(busy, async move {
             engine.publish(true).await?;
             engine.ui().notify("Published new prekeys.");
             Ok(())
@@ -1800,7 +1835,7 @@ fn Identity() -> impl IntoView {
     });
     let sign_out = move |_| {
         let engine = engine();
-        act(async move {
+        act_while(busy, async move {
             engine.sign_out().await?;
             signed_in.try_set(Some(Ok(None)));
             engine
@@ -1818,7 +1853,12 @@ fn Identity() -> impl IntoView {
                     day(signed_in.expires),
                 )}
                 " "
-                <button type="button" class="link" on:click=sign_out>
+                <button
+                    type="button"
+                    class="link"
+                    disabled=move || busy.get()
+                    on:click=sign_out
+                >
                     "Sign out"
                 </button>
             </p>
@@ -1861,6 +1901,7 @@ fn Identity() -> impl IntoView {
                     type="button"
                     class="btn aside"
                     title="publish a new signed prekey and one-time prekeys"
+                    disabled=move || busy.get()
                     on:click=publish
                 >
                     "New prekeys"
@@ -1868,7 +1909,7 @@ fn Identity() -> impl IntoView {
                 <button type="button" class="btn" on:click=move |_| close_dialog()>
                     "Cancel"
                 </button>
-                <button type="submit" class="btn primary">
+                <button type="submit" class="btn primary" disabled=move || busy.get()>
                     "Save"
                 </button>
             </div>
@@ -1890,10 +1931,12 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         contact.name.clone()
     });
     let confirm_delete = RwSignal::new(false);
+    // Saving, accepting or deleting, which its buttons wait for.
+    let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         let engine = engine();
-        act(async move {
+        act_while(busy, async move {
             if request {
                 engine.accept(peer, name.get_untracked()).await?;
             } else {
@@ -1909,7 +1952,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             return;
         }
         let engine = engine();
-        act(async move {
+        act_while(busy, async move {
             engine.delete(peer).await?;
             engine.ui().dialog.set(None);
             Ok(())
@@ -1945,7 +1988,12 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             <label for="contact-name">"Their name, for you"</label>
             <input id="contact-name" autocomplete="off" bind:value=name />
             <div class="actions">
-                <button type="button" class="btn danger" on:click=delete>
+                <button
+                    type="button"
+                    class="btn danger"
+                    disabled=move || busy.get()
+                    on:click=delete
+                >
                     {move || match (confirm_delete.get(), request) {
                         (false, true) => "Delete request",
                         (false, false) => "Delete chat",
@@ -1955,7 +2003,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                 <button type="button" class="btn" on:click=move |_| close_dialog()>
                     "Cancel"
                 </button>
-                <button class="btn primary" type="submit">
+                <button class="btn primary" type="submit" disabled=move || busy.get()>
                     {if request { "Accept" } else { "Save" }}
                 </button>
             </div>
@@ -2023,6 +2071,9 @@ fn FileBrowser(peer: PublicKey) -> impl IntoView {
         let listed = engine().files(peer).await;
         files.try_set(Some(listed));
     });
+    // What was deleted from the server since, by history entry, which `files` does not say:
+    // listed again, as the shelf changes, it stays deleted.
+    let deleted = RwSignal::new(HashSet::<u64>::new());
     let shelf = RwSignal::new(Shelf::All);
     let count = move |of: Shelf| {
         files.with(|files| match files {
@@ -2080,7 +2131,7 @@ fn FileBrowser(peer: PublicKey) -> impl IntoView {
                         let from = from.clone();
                         let rows = files
                             .into_iter()
-                            .map(|file| file_row(file, &from))
+                            .map(|file| file_row(file, &from, deleted))
                             .collect_view();
                         view! { <div class="file-list">{rows}</div> }.into_any()
                     };
@@ -2134,8 +2185,9 @@ fn file_tile(file: FileView) -> AnyView {
 }
 
 /// `file` as a row of the file browser's list: its extension, name, size and day, and who sent
-/// it, the peer being `from`.
-fn file_row(file: FileView, from: &str) -> AnyView {
+/// it, the peer being `from`; and whether it is on the server, unless gone, as it expired, or it
+/// is among those `deleted` since it was listed.
+fn file_row(file: FileView, from: &str, deleted: RwSignal<HashSet<u64>>) -> AnyView {
     let Some(source) = Source::of(&file.body) else {
         return ().into_any();
     };
@@ -2144,7 +2196,16 @@ fn file_row(file: FileView, from: &str) -> AnyView {
     } else {
         format!("from {from}")
     };
+    let (index, listed_gone) = (file.index, file.gone);
+    let gone = move || listed_gone || deleted.with(|deleted| deleted.contains(&index));
     let details = format!("{} · {} · {sender}", size(file.size as usize), day(file.at));
+    let details = move || {
+        if gone() {
+            format!("{details} · no longer on the server")
+        } else {
+            details.clone()
+        }
+    };
     // Media shows its preview, the rest its extension.
     let mark = match file.sort {
         sort @ (Sort::Image | Sort::Video | Sort::Audio) => {
@@ -2159,11 +2220,16 @@ fn file_row(file: FileView, from: &str) -> AnyView {
         _ => view! { <span class="file-icon">{extension(&file.name)}</span> }.into_any(),
     };
     let title = file.name.clone();
-    // An attachment on the server, sent or received, which either peer can delete.
+    // An attachment on the server, sent or received, which either peer can delete, until it is.
     let delete = match &file.body {
-        Body::Remote(remote) if file.deletable => Some(view! {
-            <DeleteFromServer peer=remote.peer pointer=remote.pointer.clone() />
-        }),
+        Body::Remote(remote) if file.deletable => {
+            let (peer, pointer) = (remote.peer, remote.pointer.clone());
+            Some(move || {
+                (!gone()).then(|| {
+                    view! { <DeleteFromServer peer index pointer=pointer.clone() deleted /> }
+                })
+            })
+        }
         _ => None,
     };
     view! {
@@ -2181,34 +2247,61 @@ fn file_row(file: FileView, from: &str) -> AnyView {
     .into_any()
 }
 
-/// Deletes the attachment `pointer`, in the chat with `peer`, sent or received, from the server,
-/// once asked twice: neither of them can download it any more, though what they downloaded
-/// stays. Its upload, if still going, stops.
+/// How long a button that asks to be pressed again, to be sure, waits for it.
+const ASKED_SHOWN: Duration = Duration::from_secs(6);
+
+/// Deletes the attachment `pointer`, of the history entry `index` of the chat with `peer`, sent
+/// or received, from the server, once pressed twice, which a notice asks for, as the button is
+/// only an icon: neither of them can download it any more, though what they downloaded stays.
+/// Its upload, if still going, stops. Once deleted, it is among `deleted`; the entry keeps it.
 #[component]
-fn DeleteFromServer(peer: PublicKey, pointer: content::AttachmentPointer) -> impl IntoView {
+fn DeleteFromServer(
+    peer: PublicKey,
+    index: u64,
+    pointer: content::AttachmentPointer,
+    deleted: RwSignal<HashSet<u64>>,
+) -> impl IntoView {
     #[derive(Clone, Copy, PartialEq)]
     enum Step {
         Offered,
         Asked,
         Deleting,
-        Deleted,
     }
     let step = RwSignal::new(Step::Offered);
     let label = ui()
         .contact(&peer)
         .map(|contact| contact.label())
         .unwrap_or_default();
-    let title =
-        format!("Neither you nor {label} can download it any more; what you downloaded stays");
+    let what = move || match step.get() {
+        Step::Offered => "Delete from the server".to_string(),
+        Step::Asked => format!("Delete it from the server, for you and {label}?"),
+        Step::Deleting => "Deleting it from the server…".to_string(),
+    };
     let click = move |_| match step.get_untracked() {
-        Step::Offered => step.set(Step::Asked),
+        Step::Offered => {
+            step.set(Step::Asked);
+            ui().notify(format!(
+                "Press again to delete {} from the server: neither of you can download it any \
+                 more; what you downloaded stays.",
+                pointer.name
+            ));
+            // Not pressed again meanwhile, it asks no more.
+            set_timeout(
+                move || {
+                    if step.try_get_untracked() == Some(Step::Asked) {
+                        step.set(Step::Offered);
+                    }
+                },
+                ASKED_SHOWN,
+            );
+        }
         Step::Asked => {
             step.set(Step::Deleting);
             let pointer = pointer.clone();
             spawn_local(async move {
-                match engine().delete_attachment(peer, &pointer).await {
+                match engine().delete_attachment(peer, index, &pointer).await {
                     Ok(()) => {
-                        step.try_set(Step::Deleted);
+                        deleted.try_update(|deleted| deleted.insert(index));
                         ui().notify(format!("{} is deleted from the server", pointer.name));
                     }
                     Err(e) => {
@@ -2218,23 +2311,19 @@ fn DeleteFromServer(peer: PublicKey, pointer: content::AttachmentPointer) -> imp
                 }
             });
         }
-        Step::Deleting | Step::Deleted => {}
+        Step::Deleting => {}
     };
     view! {
         <button
             type="button"
-            class="link delete-remote"
+            class="btn icon small quiet delete-remote"
             class:asked=move || step.get() == Step::Asked
-            title=title
-            disabled=move || matches!(step.get(), Step::Deleting | Step::Deleted)
+            title=what.clone()
+            aria-label=what
+            disabled=move || step.get() == Step::Deleting
             on:click=click
         >
-            {move || match step.get() {
-                Step::Offered => "Delete from server",
-                Step::Asked => "Delete it for both of you?",
-                Step::Deleting => "Deleting…",
-                Step::Deleted => "Deleted from server",
-            }}
+            {icon(Icon::Delete)}
         </button>
     }
 }
@@ -2274,6 +2363,15 @@ fn Viewer() -> impl IntoView {
     // What it shows, and whether that is text, which can be searched.
     let shown_content = NodeRef::<html::Div>::new();
     let searchable = RwSignal::new(false);
+    // The streamed attachments being downloaded whole, by ID, which their Download waits for.
+    let downloading = RwSignal::new(HashSet::<Vec<u8>>::new());
+    let fetching_whole = move || {
+        ui.streaming.with(|streamed| {
+            streamed.as_ref().is_some_and(|streamed| {
+                downloading.with(|downloading| downloading.contains(&streamed.remote.pointer.id))
+            })
+        })
+    };
     let close = move || {
         // Its player stops before it goes.
         if let Some(streamed) = ui.streaming.get_untracked() {
@@ -2420,11 +2518,12 @@ fn Viewer() -> impl IntoView {
                             class="btn icon small"
                             title="Download"
                             aria-label="Download"
+                            disabled=fetching_whole
                             on:click=move |_| {
                                 if let Some(attachment) = ui.viewer.get_untracked() {
                                     download(&attachment);
                                 } else if let Some(streamed) = ui.streaming.get_untracked() {
-                                    download_whole(streamed.remote);
+                                    download_whole(streamed.remote, downloading);
                                 }
                             }
                         >
@@ -2482,15 +2581,26 @@ fn streamed_view(streamed: Streamed) -> AnyView {
     }
 }
 
-/// Download the attachment `remote` whole, as a stream plays only what it needs of it.
-fn download_whole(remote: RemoteFile) {
+/// Download the attachment `remote` whole, as a stream plays only what it needs of it, unless
+/// it is among those `downloading` already, as it is meanwhile.
+fn download_whole(remote: RemoteFile, downloading: RwSignal<HashSet<Vec<u8>>>) {
+    let id = remote.pointer.id.clone();
+    if downloading.with_untracked(|downloading| downloading.contains(&id)) {
+        return;
+    }
+    downloading.update(|downloading| {
+        downloading.insert(id.clone());
+    });
     let ui = ui();
     act(async move {
         ui.notify(format!("Downloading {}…", remote.pointer.name));
         let fetched = engine()
             .media(remote.peer, remote.pointer, remote.clock, &|| true)
-            .await?;
-        if let Some(attachment) = fetched {
+            .await;
+        downloading.update(|downloading| {
+            downloading.remove(&id);
+        });
+        if let Some(attachment) = fetched? {
             download(&attachment);
         }
         Ok(())

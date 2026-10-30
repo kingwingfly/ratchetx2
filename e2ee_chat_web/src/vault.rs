@@ -366,6 +366,10 @@ pub struct HistoryEntry {
     /// The sort of its file, by its content, which the chat's file browser groups it by.
     #[prost(enumeration = "Sort", tag = "8")]
     pub sort: i32,
+    /// Whether its attachment, if its content is one, is gone from the server, as this client
+    /// deleted it, or found it gone when deleting it: the chat's file browser no longer offers to.
+    #[prost(bool, tag = "9")]
+    pub gone: bool,
 }
 
 impl HistoryEntry {

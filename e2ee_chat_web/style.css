@@ -60,6 +60,7 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .btn.icon.done { color: var(--accent); border-color: var(--accent-line); }
 /* A button that reads as a link, within text. */
 .link { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.link:disabled { color: var(--muted); text-decoration: none; cursor: default; }
 /* The sync button: its arrows, which turn while it syncs, in red while the server cannot be
    reached. */
 .sync { color: var(--muted); }
@@ -124,6 +125,9 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .meta .status .glyph path { stroke-width: 1.5px; vector-effect: non-scaling-stroke; }
 .meta .status.downloaded .glyph { width: 20.5px; }
 .meta .status.read { color: var(--accent); }
+/* Cancelling a message held for a sign-in: a cross before its time. */
+.btn.icon.cancel-held { width: 20px; height: 20px; margin-right: 2px; border-radius: 6px; }
+.btn.icon.cancel-held .glyph { width: 12px; height: 12px; }
 .thumb { padding: 0; border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: var(--sunken); cursor: zoom-in; }
 .message.me .thumb { border-color: var(--accent-line); }
 /* Bounded by the viewport rather than the message, whose width depends on the image's. */
@@ -202,10 +206,10 @@ dialog::backdrop { background: #020706d9; backdrop-filter: blur(4px); }
 .file-list { display: flex; flex-direction: column; gap: 4px; }
 .file-entry { display: flex; align-items: center; gap: 10px; }
 .file-entry .file-row { flex: 1; min-width: 0; }
-.delete-remote { flex: none; font-size: 12px; }
-.delete-remote.asked { color: var(--danger); }
-.cancel-held { margin-right: 6px; font-size: 11px; }
-.delete-remote:disabled { color: var(--muted); text-decoration: none; cursor: default; }
+/* Deleting a file from the server, which asks to be pressed again, in red. */
+.delete-remote { flex: none; }
+.btn.delete-remote:hover { color: var(--danger); }
+.btn.delete-remote.asked { color: var(--danger); border-color: var(--danger-line); background: #2b1a17; }
 .file-row { display: flex; align-items: center; gap: 12px; padding: 8px 10px; border: 1px solid transparent; border-radius: 10px; background: none; text-align: left; cursor: pointer; }
 .file-row:hover { border-color: var(--line); background: var(--raised); }
 .file-row .file-icon { flex: none; width: 46px; overflow: hidden; text-align: center; text-overflow: ellipsis; }
