@@ -10,7 +10,7 @@ publish = false
 
 [dependencies]
 bytes = "1"
-parking_lot = { version = "0.12", optional = true }
+parking_lot = { version = "0.13", optional = true }
 thiserror = "2.0"
 trait-variant = "0.1"
 xeddsa = { path = "../xeddsa" }

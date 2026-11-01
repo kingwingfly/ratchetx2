@@ -13,7 +13,7 @@ repository = "https://github.com/kingwingfly/ratchetx2"
 crate-type = ["cdylib"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 hmac = "0.13"
