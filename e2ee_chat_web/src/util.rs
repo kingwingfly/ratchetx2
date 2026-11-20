@@ -70,7 +70,6 @@ fn saturating_f64_to_u64(value: f64) -> u64 {
 /// rollbacks. Uses `performance.now()` on `wasm32` (falling back to a non-decreasing wall clock if
 /// unavailable) and `std::time::Instant` on native targets.
 #[cfg(target_arch = "wasm32")]
-#[allow(dead_code)] // Exposed for Engine::present() monotonic grace-period checks.
 pub fn monotonic_now_ms() -> u64 {
     use std::cell::Cell;
 
@@ -106,7 +105,6 @@ pub fn monotonic_now_ms() -> u64 {
 /// Monotonic milliseconds for elapsed-time checks (grace windows, timeouts), immune to wall-clock
 /// rollbacks.
 #[cfg(not(target_arch = "wasm32"))]
-#[allow(dead_code)] // Exposed for Engine::present() monotonic grace-period checks.
 pub fn monotonic_now_ms() -> u64 {
     use std::{sync::OnceLock, time::Instant};
 

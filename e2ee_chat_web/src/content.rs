@@ -2,7 +2,7 @@
 //! which drops the kinds it does not know.
 
 pub use session::protocol::content::{
-    AttachmentPointer, Content, Deleted, Events, File, Hello, Kind, place, stamp,
+    AttachmentPointer, Content, Deleted, Events, File, Kind, place, stamp,
 };
 
 /// The content of a file someone chose to send: an image the TUI client can show goes as a

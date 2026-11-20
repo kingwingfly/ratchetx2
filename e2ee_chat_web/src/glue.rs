@@ -20,29 +20,50 @@ fn has(navigator: &Navigator, name: &str) -> bool {
     Reflect::get(navigator, &name.into()).is_ok_and(|api| !api.is_undefined())
 }
 
-/// Take the lock `name` for as long as the page lives; `false` if another page holds it, or if
-/// the Web Locks API is unavailable or fails (fail closed to prevent concurrent vault corruption).
-pub async fn take_lock(name: &str) -> bool {
+/// Result of attempting to acquire the exclusive tab lock for the vault.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockStatus {
+    /// Exclusive lock acquired for the lifetime of this page.
+    Acquired,
+    /// Another tab or window already holds the lock.
+    HeldElsewhere,
+    /// Web Locks API is unavailable (e.g. insecure non-HTTPS context or unsupported browser).
+    Unavailable { insecure_context: bool },
+}
+
+/// Whether this page is running in a secure context (HTTPS or localhost).
+fn is_secure_context() -> bool {
+    web_sys::window()
+        .and_then(|w| Reflect::get(&w, &"isSecureContext".into()).ok())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Take the lock `name` for as long as the page lives, failing closed if another tab holds it
+/// or if the Web Locks API is unavailable or fails (preventing concurrent vault corruption).
+pub async fn take_lock(name: &str) -> LockStatus {
+    let insecure_context = !is_secure_context();
+    let unavailable = LockStatus::Unavailable { insecure_context };
     let navigator = navigator();
     let Some(locks) = Reflect::get(&navigator, &"locks".into())
         .ok()
         .filter(|locks| !locks.is_undefined() && !locks.is_null())
     else {
-        return false;
+        return unavailable;
     };
     let Some(request) = Reflect::get(&locks, &"request".into())
         .ok()
         .and_then(|request| request.dyn_into::<Function>().ok())
     else {
-        return false;
+        return unavailable;
     };
     let (taken, told) = oneshot::channel();
     let taken = Rc::new(RefCell::new(Some(taken)));
     let tell = {
         let taken = taken.clone();
-        move |held: bool| {
+        move |status: LockStatus| {
             if let Some(taken) = taken.borrow_mut().take() {
-                let _ = taken.send(held);
+                let _ = taken.send(status);
             }
         }
     };
@@ -50,7 +71,11 @@ pub async fn take_lock(name: &str) -> bool {
         let tell = tell.clone();
         Closure::<dyn FnMut(JsValue) -> Promise>::new(move |lock: JsValue| {
             let held = !lock.is_null() && !lock.is_undefined();
-            tell(held);
+            tell(if held {
+                LockStatus::Acquired
+            } else {
+                LockStatus::HeldElsewhere
+            });
             if held {
                 // Held until the page goes.
                 Promise::new(&mut |_, _| {})
@@ -61,7 +86,7 @@ pub async fn take_lock(name: &str) -> bool {
     };
     let options = Object::new();
     if Reflect::set(&options, &"ifAvailable".into(), &JsValue::TRUE).is_err() {
-        return false;
+        return unavailable;
     }
     let requested = request
         .call3(&locks, &name.into(), &options, granted.as_ref())
@@ -73,12 +98,12 @@ pub async fn take_lock(name: &str) -> bool {
             spawn_local(async move {
                 // Fail closed if the request promise rejects or settles without granting the lock.
                 let _ = JsFuture::from(requested).await;
-                tell(false);
+                tell(unavailable);
             });
         }
-        Err(_) => tell(false),
+        Err(_) => tell(unavailable),
     }
-    told.await.unwrap_or(false)
+    told.await.unwrap_or(unavailable)
 }
 
 /// Copy `text` to the clipboard; `false` if the browser refused.
