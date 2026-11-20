@@ -19,8 +19,9 @@ prost = "0.14"
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = "0.11"
+subtle = { version = "2", default-features = false }
 thiserror = "2.0"
-zeroize = { version = "1.9", features = ["derive"], optional = true }
+zeroize = { version = "1.9", features = ["derive"] }
 
 [build-dependencies]
 prost-build = "0.14"
@@ -36,4 +37,8 @@ protox = ["dep:protox"]
 serde = ["dep:serde", "bytes/serde", "ratchetx2/serde"]
 rkyv = ["dep:rkyv", "rkyv/bytes-1", "ratchetx2/rkyv"]
 # The party's state as protobuf messages too, from proto/party_state.proto.
-prost = ["dep:zeroize", "ratchetx2/prost"]
+prost = ["ratchetx2/prost"]
+# Optional post-quantum KEM ratchet integration.
+ml-kem-1024 = ["ratchetx2/ml-kem-1024"]
+ml-kem-768 = ["ratchetx2/ml-kem-768"]
+pq = ["ml-kem-1024", "ml-kem-768", "ratchetx2/pq"]

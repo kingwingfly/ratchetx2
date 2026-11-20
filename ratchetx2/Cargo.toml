@@ -18,10 +18,12 @@ curve25519-dalek = "5.0"
 getrandom = "0.4"
 hkdf = "0.13"
 hmac = "0.13"
+ml-kem = { version = "0.3", default-features = false, features = ["zeroize"], optional = true }
 prost = { version = "0.14", optional = true }
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 sha2 = "0.11"
+subtle = { version = "2", default-features = false }
 thiserror = "2.0"
 zeroize = { version = "1.9", features = ["derive"] }
 
@@ -38,3 +40,7 @@ serde = ["dep:serde"]
 rkyv = ["dep:rkyv"]
 # The ratchet's state as protobuf messages, from proto/ratchetx2.proto, compiled with protox.
 prost = ["dep:prost", "dep:prost-build", "dep:protox"]
+# Optional post-quantum KEM ratchet suites (pure Rust, wasm32-compatible).
+ml-kem-1024 = ["dep:ml-kem"]
+ml-kem-768 = ["dep:ml-kem"]
+pq = ["ml-kem-1024", "ml-kem-768"]

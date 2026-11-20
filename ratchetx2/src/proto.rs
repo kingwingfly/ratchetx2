@@ -38,6 +38,37 @@ impl fmt::Debug for Chain {
     }
 }
 
+impl fmt::Debug for KemRatchet {
+    /// Shows no keys or seeds.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KemRatchet")
+            .field("suite", &self.suite)
+            .field("pending_offers", &self.pending_offers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for KemPendingOffer {
+    /// Shows no seed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KemPendingOffer").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for KemActiveSendCt {
+    /// Shows no key material.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KemActiveSendCt").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for KemPeerPendingEk {
+    /// Shows no key material.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KemPeerPendingEk").finish_non_exhaustive()
+    }
+}
+
 /// Read a key field, which must be `N` bytes.
 pub(crate) fn key<const N: usize>(bytes: &[u8]) -> Result<[u8; N], MalformedState> {
     bytes.try_into().map_err(|_| MalformedState)

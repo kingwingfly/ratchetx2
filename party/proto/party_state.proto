@@ -20,6 +20,13 @@ message Party {
   uint64 message_number_receiver = 5;
   // The session's associated data.
   bytes associated_data = 6;
+  // Disjoint inclusive ranges of message numbers whose skipped keys were evicted on the
+  // current receiving chain.
+  repeated EvictedRange current_chain_evicted = 7;
+  // Watermark below which missing keys on the current receiving chain are treated as evicted.
+  uint64 current_chain_evicted_below = 8;
+  // Optional post-quantum KEM ratchet state; absent in classical sessions.
+  ratchetx2.v1.KemRatchet kem_ratchet = 9;
 }
 
 // The keys of the messages skipped in one of the peer's chains.
@@ -30,6 +37,10 @@ message SkippedChain {
   repeated MessageKey message_keys = 2;
   // Number of the peer's chains received after this one.
   uint64 age = 3;
+  // Disjoint inclusive ranges of evicted message numbers in this skipped chain.
+  repeated EvictedRange evicted = 4;
+  // Watermark below which missing keys in this skipped chain are treated as evicted.
+  uint64 evicted_below = 5;
 }
 
 // The key of a message skipped over.
@@ -38,4 +49,12 @@ message MessageKey {
   uint64 message_number = 1;
   // The message key (32 bytes).
   bytes key = 2;
+}
+
+// Inclusive range [start, end] of message numbers whose skipped keys were evicted.
+message EvictedRange {
+  // First evicted message number in the range (inclusive).
+  uint64 start = 1;
+  // Last evicted message number in the range (inclusive).
+  uint64 end = 2;
 }

@@ -1,11 +1,14 @@
+use core::fmt;
+
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use subtle::{Choice, ConstantTimeEq};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::key::{ChainKey, HeaderKey, KEY_LENGTH, MessageKey};
 
 /// An established chain: its ChainKey and the HeaderKey of its messages.
-#[derive(Debug, Clone, PartialEq, Zeroize)]
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "rkyv",
@@ -16,7 +19,22 @@ struct Chain {
     header_key: HeaderKey,
 }
 
-#[derive(Debug, Clone, PartialEq, Zeroize, ZeroizeOnDrop)]
+impl fmt::Debug for Chain {
+    /// Shows no keys.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Chain").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Chain {
+    fn eq(&self, other: &Self) -> bool {
+        bool::from(
+            self.chain_key.ct_eq(&other.chain_key) & self.header_key.ct_eq(&other.header_key),
+        )
+    }
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "rkyv",
@@ -26,6 +44,26 @@ pub struct MessageRatchet {
     /// None until a DH-root step sets up this chain.
     chain: Option<Chain>,
     pub next_header_key: HeaderKey,
+}
+
+impl fmt::Debug for MessageRatchet {
+    /// Shows no keys.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageRatchet")
+            .field("has_chain", &self.chain.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for MessageRatchet {
+    fn eq(&self, other: &Self) -> bool {
+        let chain_eq = match (&self.chain, &other.chain) {
+            (Some(a), Some(b)) => Choice::from(u8::from(a == b)),
+            (None, None) => Choice::from(1),
+            _ => Choice::from(0),
+        };
+        bool::from(chain_eq & self.next_header_key.ct_eq(&other.next_header_key))
+    }
 }
 
 impl MessageRatchet {
@@ -52,6 +90,12 @@ impl MessageRatchet {
         }
     }
 
+    /// Whether this message ratchet has an established chain.
+    #[cfg(any(feature = "serde", feature = "prost"))]
+    pub(crate) fn has_chain(&self) -> bool {
+        self.chain.is_some()
+    }
+
     /// HeaderKey of the current chain, if there is one.
     pub fn header_key(&self) -> Option<HeaderKey> {
         self.chain.as_ref().map(|chain| chain.header_key)
@@ -61,8 +105,21 @@ impl MessageRatchet {
     pub fn step(&mut self) -> Option<MessageKey> {
         let chain = self.chain.as_mut()?;
         let message_key = hmac_sha256(&chain.chain_key, &[1]);
-        chain.chain_key = hmac_sha256(&chain.chain_key, &[2]);
+        let next_chain_key = Zeroizing::new(hmac_sha256(&chain.chain_key, &[2]));
+        chain.chain_key.zeroize();
+        chain.chain_key = *next_chain_key;
         Some(message_key)
+    }
+}
+
+#[cfg(feature = "rkyv")]
+impl ArchivedMessageRatchet {
+    pub(crate) fn has_chain(&self) -> bool {
+        self.chain.is_some()
+    }
+
+    pub(crate) fn header_key(&self) -> Option<HeaderKey> {
+        self.chain.as_ref().map(|chain| chain.header_key)
     }
 }
 
