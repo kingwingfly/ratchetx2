@@ -40,6 +40,7 @@ impl From<protocol::Error> for Error {
             Kind::NotFound => ErrorKind::NotFound,
             Kind::LimitExceeded => ErrorKind::LimitExceeded,
             Kind::SignInRequired => ErrorKind::SignInRequired,
+            Kind::Unimplemented => ErrorKind::Unimplemented,
             Kind::Malformed | Kind::InvalidSignature | Kind::StaleTimestamp => ErrorKind::Protocol,
             _ => ErrorKind::Server,
         };
@@ -54,6 +55,7 @@ impl From<x3dh::Error> for Error {
             Kind::InvalidPublicKey | Kind::InvalidSignature => ErrorKind::InvalidKeys,
             Kind::UnexpectedIdentity => ErrorKind::UnexpectedPeer,
             Kind::MalformedState => ErrorKind::MalformedState,
+            Kind::UnsupportedSuite => ErrorKind::UnsupportedSuite,
             _ => ErrorKind::InvalidInitialMessage,
         };
         Self::new(kind, error)
@@ -67,6 +69,7 @@ impl From<party::error::Error> for Error {
             Kind::NoSendingChain => ErrorKind::NoSendingChain,
             Kind::Undecryptable => ErrorKind::Undecryptable,
             Kind::DuplicateMessage => ErrorKind::DuplicateMessage,
+            Kind::EvictedMessage => ErrorKind::EvictedMessage,
             Kind::MalformedState => ErrorKind::MalformedState,
             _ => ErrorKind::InvalidMessage,
         };
@@ -129,12 +132,53 @@ pub enum ErrorKind {
     /// A received message was received already.
     #[error("duplicate message")]
     DuplicateMessage,
+    /// A received message's skipped decryption key was evicted before it arrived; the message is
+    /// permanently lost, though its delivery token has been queued for server acknowledgement.
+    #[error("message skipped key was evicted")]
+    EvictedMessage,
+    /// A message's content expired on the server before it was fetched, leaving only carried
+    /// initial message(s) to surface.
+    #[error("message content expired on the server")]
+    Expired,
     /// A received message is malformed.
     #[error("invalid message")]
     InvalidMessage,
     /// A saved client or session state is malformed.
     #[error("malformed saved state")]
     MalformedState,
+    /// The server does not implement this v2 procedure.
+    #[error("procedure not implemented by server")]
+    Unimplemented,
+    /// A peer-initiated session was rejected because its `session_seq` was stale (rollback).
+    #[error("stale peer-initiated session rejected")]
+    StaleSession,
+    /// An attachment chunk was requested to be encrypted again with different data or below the
+    /// resumed sealed-chunk watermark, which would reuse an AES-GCM nonce.
+    #[error("attachment chunk nonce reuse refused")]
+    NonceReuse,
+    /// Local policy requires post-quantum security (strict PQ mode), refusing classical fallback.
+    #[error("post-quantum security is required")]
+    PqRequired,
+    /// A post-quantum downgrade, manifest replay, audience mismatch, or prekey stripping attack
+    /// was detected.
+    #[error("post-quantum downgrade detected")]
+    DowngradeDetected,
+    /// A peer's signed capability manifest is cryptographically valid and not rolled back, but
+    /// its validity window has expired (or lies beyond clock skew), e.g. the peer has been
+    /// offline past its manifest TTL.
+    #[error("peer capability manifest has expired")]
+    PeerManifestExpired,
+    /// Peer lacks PQ (or published a signed `OFF` manifest) while local PQ is enabled, and no
+    /// classical exception has been approved yet.
+    #[error("classical fallback requires explicit user approval (peer_signed_off={peer_signed_off})")]
+    ClassicalApprovalRequired {
+        /// `true` if the peer published a valid signed `CapabilityManifest` with
+        /// `pq_enabled == false`; `false` if the peer has no manifest (legacy v1 user).
+        peer_signed_off: bool,
+    },
+    /// No mutually supported post-quantum suite is available.
+    #[error("unsupported post-quantum suite")]
+    UnsupportedSuite,
 }
 
 /// Result type with [`Error`].
