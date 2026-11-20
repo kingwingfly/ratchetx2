@@ -43,7 +43,7 @@ impl SubscribeRequest {
             &self.signature,
             self.timestamp,
             now,
-            |identity_key| subscribe_message(identity_key, self.timestamp),
+            |identity_key| Ok(subscribe_message(identity_key, self.timestamp)),
         )
     }
 }

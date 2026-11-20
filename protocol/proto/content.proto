@@ -57,6 +57,16 @@ message File {
 message Hello {
   // The name the sender goes by; empty if it has none.
   string name = 1;
+  // Whether the sender supports post-quantum handshakes (PQXDH).
+  bool pq_capable = 2;
+  // Highest protocol version supported by the sender (0 = legacy v1, 2 = PQXDH v2).
+  uint32 max_version = 3;
+  // Monotonic per-peer session sequence number (0 = legacy client without sequencing).
+  uint64 session_seq = 4;
+  // Offered ML-KEM suites in preference order (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  repeated uint32 offered_suites = 5;
+  // Whether the sender supports continuous post-quantum KEM ratcheting.
+  bool pq_ratchet_capable = 6;
 }
 
 // Where an attachment is, and its key.

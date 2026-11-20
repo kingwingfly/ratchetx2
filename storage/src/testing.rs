@@ -5,8 +5,14 @@
 use bytes::Bytes;
 
 use crate::{
-    Bundle, LocalAttachmentStore, LocalHandshakeStore, LocalMailboxStore, StoredAttachment,
-    StoredInitialMessage, StoredMessage,
+    Bundle, ErrorKind, LocalAttachmentStore, LocalHandshakeStore, LocalMailboxStore,
+    MAX_SAFE_INTEGER, StoredAttachment, StoredInitialMessage, StoredMessage,
+};
+#[cfg(feature = "pq")]
+use crate::{
+    LocalIdempotentMailboxStore, LocalPqHandshakeStore, PqLastResortCommitment, PublishV2Record,
+    PublishV2Status, RefillPrekeysRecord, RefillStatus, StoredCapabilityManifest,
+    StoredInitialMessageV2, StoredPqPrekey,
 };
 
 /// Conformance suite for [`LocalHandshakeStore`].
@@ -97,6 +103,24 @@ pub async fn handshake_store<S: LocalHandshakeStore>(store: &S) {
     assert_eq!(
         store.take_initial_messages(&alice, 1).await.unwrap(),
         Some(vec![])
+    );
+
+    // Timestamps above MAX_SAFE_INTEGER are rejected rather than silently clamped.
+    assert_eq!(
+        store
+            .publish(bundle(MAX_SAFE_INTEGER + 1), vec![])
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        store
+            .take_initial_messages(&bob, MAX_SAFE_INTEGER + 1)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
     );
 }
 
@@ -252,4 +276,401 @@ pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
     assert_eq!(store.attachment(&attachment.id).await.unwrap(), None);
     assert_eq!(store.chunk(&attachment.id, 0).await.unwrap(), None);
     store.delete_attachment(&attachment.id).await.unwrap();
+}
+
+/// Conformance suite for [`LocalPqHandshakeStore`] and its v1/v2 isolation invariants.
+#[cfg(feature = "pq")]
+pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(store: &S) {
+    let (alice, bob, carol) = ([11; 32], [12; 32], [13; 32]);
+    let pq_key = |suite: u8, tag: u8| StoredPqPrekey {
+        suite,
+        id: [tag; 32],
+        encapsulation_key: Bytes::from(vec![tag; if suite == 1 { 1568 } else { 1184 }]),
+        signature: [tag; 64],
+    };
+    let manifest = |seq: u64, generation: u64, pq_enabled: bool, strict_pq: bool| {
+        StoredCapabilityManifest {
+            audience: "chat.example".to_string(),
+            identity_key: bob,
+            manifest_seq: seq,
+            generation,
+            issued_at: 1000 + seq,
+            expires_at: 100_000 + seq,
+            pq_enabled,
+            strict_pq,
+            pq_ratchet_supported: pq_enabled,
+            offered_suites: if pq_enabled { vec![1, 2] } else { vec![] },
+            signed_prekey: [20 + (generation as u8); 32],
+            pq_last_resort: if pq_enabled {
+                vec![
+                    PqLastResortCommitment {
+                        suite: 1,
+                        prekey_id: [0xA1; 32],
+                    },
+                    PqLastResortCommitment {
+                        suite: 2,
+                        prekey_id: [0xA2; 32],
+                    },
+                ]
+            } else {
+                vec![]
+            },
+            signature: [0x55; 64],
+        }
+    };
+
+    // Unknown identity returns None / empty without allocating.
+    assert_eq!(store.get_manifest(&bob).await.unwrap(), None);
+    assert_eq!(store.claim_bundle(&bob, &[1, 2]).await.unwrap(), None);
+    assert!(store.list_initial_messages(&bob, 10).await.unwrap().is_empty());
+    assert_eq!(store.ack_initial_messages(&bob, &[1]).await.unwrap(), 0);
+
+    // Legacy v1-only user falls back cleanly in ClaimBundle (manifest = None).
+    assert!(
+        store
+            .publish(
+                Bundle {
+                    identity_key: carol,
+                    signed_prekey: [30; 32],
+                    signed_prekey_signature: [31; 64],
+                    timestamp: 10,
+                },
+                vec![[32; 32]],
+            )
+            .await
+            .unwrap()
+    );
+    let claimed_v1 = store.claim_bundle(&carol, &[1, 2]).await.unwrap().unwrap();
+    assert_eq!(claimed_v1.manifest, None);
+    assert_eq!(claimed_v1.signed_prekey, [30; 32]);
+    assert_eq!(claimed_v1.signed_prekey_signature, Some([31; 64]));
+    assert_eq!(claimed_v1.one_time_prekey, Some([32; 32]));
+    assert_eq!(claimed_v1.pq_last_resort, None);
+    assert_eq!(claimed_v1.pq_one_time_prekey, None);
+
+    // Duplicate OPK or PQOPK is rejected.
+    let dup = PublishV2Record {
+        manifest: manifest(1, 1, true, false),
+        signed_prekey_signature: Some([0x44; 64]),
+        one_time_prekeys: vec![[40; 32], [40; 32]],
+        pq_last_resort: vec![pq_key(1, 0xA1), pq_key(2, 0xA2)],
+        pq_one_time_prekeys: vec![pq_key(1, 0xB1)],
+        timestamp: 1001,
+    };
+    assert_eq!(
+        store.publish_v2(dup).await.unwrap(),
+        PublishV2Status::DuplicatePrekey
+    );
+
+    // Valid compat v2 publish succeeds and is visible via non-consuming get_manifest.
+    let valid = PublishV2Record {
+        manifest: manifest(1, 1, true, false),
+        signed_prekey_signature: Some([0x44; 64]),
+        one_time_prekeys: vec![[40; 32], [41; 32]],
+        pq_last_resort: vec![pq_key(1, 0xA1), pq_key(2, 0xA2)],
+        pq_one_time_prekeys: vec![pq_key(1, 0xB1), pq_key(2, 0xB2)],
+        timestamp: 1001,
+    };
+    assert_eq!(store.publish_v2(valid).await.unwrap(), PublishV2Status::Stored);
+    assert_eq!(
+        store.get_manifest(&bob).await.unwrap(),
+        Some(manifest(1, 1, true, false))
+    );
+
+    // Stale manifest_seq is rejected.
+    let stale = PublishV2Record {
+        manifest: manifest(1, 2, true, false),
+        signed_prekey_signature: Some([0x44; 64]),
+        one_time_prekeys: vec![],
+        pq_last_resort: vec![pq_key(1, 0xA1), pq_key(2, 0xA2)],
+        pq_one_time_prekeys: vec![],
+        timestamp: 1002,
+    };
+    assert_eq!(
+        store.publish_v2(stale).await.unwrap(),
+        PublishV2Status::StaleSequence
+    );
+
+    // Legacy v1 take_bundle NEVER consumes PQOPKs.
+    let (v1_bundle, v1_opk) = store.take_bundle(&bob).await.unwrap().unwrap();
+    assert_eq!(v1_bundle.signed_prekey, [21; 32]);
+    assert_eq!(v1_opk, Some([40; 32]));
+    let snap = store.pq_snapshot(&bob).await.unwrap();
+    assert_eq!(snap.pq_one_time_counts, vec![(1, 1), (2, 1)]);
+
+    // Legacy v1 publish MUST be refused once a v2 manifest exists, leaving v2 manifest, PQ
+    // prekeys, and the remaining classical OPK pool untouched.
+    assert!(
+        !store
+            .publish(
+                Bundle {
+                    identity_key: bob,
+                    signed_prekey: [99; 32],
+                    signed_prekey_signature: [98; 64],
+                    timestamp: 2000,
+                },
+                vec![[42; 32]],
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        store.get_manifest(&bob).await.unwrap(),
+        Some(manifest(1, 1, true, false))
+    );
+    assert_eq!(
+        store.pq_snapshot(&bob).await.unwrap().pq_one_time_counts,
+        vec![(1, 1), (2, 1)]
+    );
+
+    // Claim ML-KEM-768 (suite 2) pops suite 2 PQOPK and remaining classical OPK [41; 32];
+    // second claim falls back to last-resort.
+    let claim1 = store.claim_bundle(&bob, &[2]).await.unwrap().unwrap();
+    assert_eq!(claim1.one_time_prekey, Some([41; 32]));
+    assert_eq!(claim1.pq_last_resort, Some(pq_key(2, 0xA2)));
+    assert_eq!(claim1.pq_one_time_prekey, Some(pq_key(2, 0xB2)));
+    let claim2 = store.claim_bundle(&bob, &[2]).await.unwrap().unwrap();
+    assert_eq!(claim2.one_time_prekey, None);
+    assert_eq!(claim2.pq_last_resort, Some(pq_key(2, 0xA2)));
+    assert_eq!(claim2.pq_one_time_prekey, None);
+
+    // RefillPrekeys appends to current generation without rotating SPK.
+    assert_eq!(
+        store
+            .refill_prekeys(RefillPrekeysRecord {
+                identity_key: bob,
+                generation: 99,
+                one_time_prekeys: vec![[50; 32]],
+                pq_one_time_prekeys: vec![],
+                max_one_time_prekeys: 10,
+                max_pq_one_time_prekeys: 10,
+                timestamp: 2000,
+            })
+            .await
+            .unwrap(),
+        RefillStatus::StaleGeneration
+    );
+    assert_eq!(
+        store
+            .refill_prekeys(RefillPrekeysRecord {
+                identity_key: bob,
+                generation: 1,
+                one_time_prekeys: vec![[50; 32]],
+                pq_one_time_prekeys: vec![pq_key(2, 0xB3)],
+                max_one_time_prekeys: 10,
+                max_pq_one_time_prekeys: 10,
+                timestamp: 2001,
+            })
+            .await
+            .unwrap(),
+        RefillStatus::Stored {
+            classical_count: 1,
+            pq_counts: vec![(1, 1), (2, 1)],
+        }
+    );
+    // Replaying RefillPrekeys with the same or older timestamp fails even after claiming keys.
+    assert_eq!(
+        store
+            .refill_prekeys(RefillPrekeysRecord {
+                identity_key: bob,
+                generation: 1,
+                one_time_prekeys: vec![[51; 32]],
+                pq_one_time_prekeys: vec![],
+                max_one_time_prekeys: 10,
+                max_pq_one_time_prekeys: 10,
+                timestamp: 2001,
+            })
+            .await
+            .unwrap(),
+        RefillStatus::StaleTimestamp
+    );
+    // Refill rejects duplicate PQOPK ID on a newer timestamp.
+    assert_eq!(
+        store
+            .refill_prekeys(RefillPrekeysRecord {
+                identity_key: bob,
+                generation: 1,
+                one_time_prekeys: vec![],
+                pq_one_time_prekeys: vec![pq_key(2, 0xB3)],
+                max_one_time_prekeys: 10,
+                max_pq_one_time_prekeys: 10,
+                timestamp: 2002,
+            })
+            .await
+            .unwrap(),
+        RefillStatus::DuplicatePrekey
+    );
+
+    // Strict PQ publish clears legacy v1 bundle so v1 take_bundle returns None; replaying an
+    // old or new v1 publish MUST remain refused and must NOT restore v1 bundle or overwrite OPKs.
+    assert_eq!(
+        store
+            .publish_v2(PublishV2Record {
+                manifest: manifest(2, 2, true, true),
+                signed_prekey_signature: None,
+                one_time_prekeys: vec![[60; 32]],
+                pq_last_resort: vec![pq_key(1, 0xA1), pq_key(2, 0xA2)],
+                pq_one_time_prekeys: vec![pq_key(1, 0xB4)],
+                timestamp: 2002,
+            })
+            .await
+            .unwrap(),
+        PublishV2Status::Stored
+    );
+    assert!(
+        !store
+            .publish(
+                Bundle {
+                    identity_key: bob,
+                    signed_prekey: [99; 32],
+                    signed_prekey_signature: [98; 64],
+                    timestamp: 100,
+                },
+                vec![[97; 32]],
+            )
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.take_bundle(&bob).await.unwrap(), None);
+    let strict_claim = store.claim_bundle(&bob, &[1]).await.unwrap().unwrap();
+    assert_eq!(strict_claim.one_time_prekey, Some([60; 32]));
+    assert_eq!(strict_claim.signed_prekey_signature, None);
+    assert_eq!(strict_claim.pq_one_time_prekey, Some(pq_key(1, 0xB4)));
+
+    // Affirmative PQ OFF clears stored PQ prekeys while persisting the signed OFF manifest.
+    assert_eq!(
+        store
+            .publish_v2(PublishV2Record {
+                manifest: manifest(3, 3, false, false),
+                signed_prekey_signature: Some([0x77; 64]),
+                one_time_prekeys: vec![[70; 32]],
+                pq_last_resort: vec![],
+                pq_one_time_prekeys: vec![],
+                timestamp: 2003,
+            })
+            .await
+            .unwrap(),
+        PublishV2Status::Stored
+    );
+    let off_snap = store.pq_snapshot(&bob).await.unwrap();
+    assert!(!off_snap.manifest.as_ref().unwrap().pq_enabled);
+    assert!(off_snap.pq_last_resort_suites.is_empty());
+    assert!(off_snap.pq_one_time_counts.is_empty());
+
+    // Inbox v1/v2 isolation: add 1 classical v1 initial and 1 PQXDH v2 initial.
+    assert!(
+        store
+            .add_initial_message(
+                StoredInitialMessage {
+                    sender: alice,
+                    recipient: bob,
+                    ephemeral_key: [80; 32],
+                    signed_prekey: [23; 32],
+                    one_time_prekey: None,
+                    header: Bytes::from_static(b"v1-h"),
+                    content: Bytes::from_static(b"v1-c"),
+                },
+                10,
+            )
+            .await
+            .unwrap()
+    );
+    let pq_id = store
+        .add_initial_message_v2(
+            StoredInitialMessageV2 {
+                id: 0,
+                version: 2,
+                sender: alice,
+                recipient: bob,
+                ephemeral_key: [81; 32],
+                signed_prekey: [23; 32],
+                one_time_prekey: Some([70; 32]),
+                header: Bytes::from_static(b"v2-h"),
+                content: Bytes::from_static(b"v2-c"),
+                pq_suite: Some(1),
+                pq_last_resort: false,
+                pq_prekey_id: Some([0xB4; 32]),
+                pq_ciphertext: Some(Bytes::from(vec![0xCC; 1568])),
+                manifest_digest: Some([0xDD; 32]),
+            },
+            10,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(pq_id > 0);
+
+    // v2 list returns BOTH v1 and v2 without deleting either.
+    let listed = store.list_initial_messages(&bob, 10).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].version, 1);
+    assert_eq!(listed[1].version, 2);
+    assert_eq!(listed[1].id, pq_id);
+
+    // Legacy v1 take_initial_messages drains ONLY the classical v1 message; v2 PQ survives!
+    let v1_taken = store.take_initial_messages(&bob, 3000).await.unwrap().unwrap();
+    assert_eq!(v1_taken.len(), 1);
+    assert_eq!(v1_taken[0].header, Bytes::from_static(b"v1-h"));
+
+    let remaining = store.list_initial_messages(&bob, 10).await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, pq_id);
+    assert_eq!(remaining[0].version, 2);
+
+    // Ack deletes only the acknowledged ID.
+    assert_eq!(store.ack_initial_messages(&bob, &[pq_id]).await.unwrap(), 1);
+    assert!(store.list_initial_messages(&bob, 10).await.unwrap().is_empty());
+}
+
+/// Conformance suite for [`LocalIdempotentMailboxStore`] sharing state with [`LocalMailboxStore`].
+#[cfg(feature = "pq")]
+pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMailboxStore>(store: &S) {
+    let (alice, bob) = ([21; 32], [22; 32]);
+    let cid = [0x42; 16];
+
+    let seq1 = store
+        .append_idempotent(
+            &alice,
+            &bob,
+            Bytes::from_static(b"h1"),
+            Bytes::from_static(b"c1"),
+            None,
+            Some([1; 32]),
+            Some(cid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq1, 1);
+    // Retrying with the same client_message_id returns the original sequence without duplicating.
+    let seq1_retry = store
+        .append_idempotent(
+            &alice,
+            &bob,
+            Bytes::from_static(b"h1"),
+            Bytes::from_static(b"c1"),
+            None,
+            Some([1; 32]),
+            Some(cid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq1_retry, 1);
+
+    // Shares the same underlying queue with classical v1 append/read.
+    let seq2 = store
+        .append(
+            &alice,
+            &bob,
+            Bytes::from_static(b"h2"),
+            Bytes::from_static(b"c2"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq2, 2);
+    let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].sequence, 1);
+    assert_eq!(messages[1].sequence, 2);
 }

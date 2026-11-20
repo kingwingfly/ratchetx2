@@ -11,11 +11,24 @@ pub use bytes::Bytes;
 
 #[cfg(feature = "memory")]
 pub mod memory;
+#[cfg(feature = "pq")]
+pub mod pq;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
 #[cfg(feature = "memory")]
 pub use memory::MemoryStore;
+#[cfg(feature = "pq")]
+pub use pq::*;
+
+/// JavaScript's largest exact integer (`2^53 - 1`), which SQLite-backed stores (e.g. Cloudflare
+/// Durable Objects) enforce on timestamps, sequences, and IDs to avoid precision loss or clamping.
+pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+/// Maximum messages queued per `(sender, recipient)` mailbox queue.
+pub const MAX_QUEUE_MESSAGES: usize = 2000;
+/// Maximum total bytes (headers, contents, and carried initial messages) per `(sender, recipient)`
+/// mailbox queue: 64 MiB.
+pub const MAX_QUEUE_BYTES: u64 = 64 << 20;
 
 /// An X25519 or XEdDSA public key.
 pub type PublicKey = [u8; xeddsa::PUBLIC_KEY_LENGTH];
@@ -233,6 +246,12 @@ pub enum ErrorKind {
     /// Stored data is malformed.
     #[error("corrupt stored data")]
     Corrupt,
+    /// A per-queue or per-inbox quota was exceeded.
+    #[error("storage limit exceeded")]
+    LimitExceeded,
+    /// An argument violates storage bounds (e.g. an integer exceeding [`MAX_SAFE_INTEGER`]).
+    #[error("invalid storage argument")]
+    InvalidArgument,
     /// Any other error; see its [`source`](std::error::Error::source).
     #[error("storage error")]
     Other,

@@ -74,6 +74,17 @@ impl fmt::Debug for AttachmentPointer {
     }
 }
 
+impl Hello {
+    /// A classical greeting carrying only `name`, with all v2 capability fields defaulted so its
+    /// protobuf encoding is wire-identical to legacy v1 clients.
+    pub fn classical(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ..Self::default()
+        }
+    }
+}
+
 impl Kind {
     /// Same bytes as encoding `Content { kind: Some(self), .. }`, without cloning `self`, which
     /// may be a file of megabytes.
@@ -132,5 +143,32 @@ mod test {
         assert_eq!((content.kind, content.events), (None, Some(events)));
         // A kind of a later version, field 15, is dropped.
         assert_eq!(Kind::from_bytes(&[0x7a, 0]), None);
+    }
+
+    #[test]
+    fn classical_hello_wire_compat_and_v2_fields() {
+        // Default v2 fields serialize identically to legacy v1 Hello(name).
+        let legacy = Hello::classical("alice");
+        assert_eq!(legacy.encode_to_vec(), b"\x0a\x05alice");
+        // Decoded from legacy v1 bytes, v2 capability fields default to false/0/empty.
+        let decoded = Hello::decode(&b"\x0a\x05alice"[..]).unwrap();
+        assert_eq!(decoded, legacy);
+        assert!(!decoded.pq_capable);
+        assert_eq!(decoded.max_version, 0);
+        assert_eq!(decoded.session_seq, 0);
+        assert!(decoded.offered_suites.is_empty());
+        assert!(!decoded.pq_ratchet_capable);
+
+        // V2 capability fields round-trip cleanly.
+        let pq_hello = Hello {
+            name: "bob".into(),
+            pq_capable: true,
+            max_version: 2,
+            session_seq: 7,
+            offered_suites: vec![1, 2],
+            pq_ratchet_capable: true,
+        };
+        let encoded = Kind::Hello(pq_hello.clone()).to_bytes();
+        assert_eq!(Kind::from_bytes(&encoded), Some(Kind::Hello(pq_hello)));
     }
 }

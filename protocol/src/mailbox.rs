@@ -20,6 +20,12 @@ pub use server::{MailboxLimits, MailboxServer};
 pub const DELIVERY_TOKEN_LENGTH: usize = 16;
 /// Most delivery tokens of one fetch.
 pub const MAX_DELIVERED: usize = 1000;
+/// Maximum encrypted header size in bytes (8 KiB: fits encrypted PQ ratchet headers while
+/// preventing Durable Object OOM / queue bricking).
+pub const MAX_HEADER_SIZE: usize = 8 << 10;
+/// Maximum encoded carried initial message size in bytes (8 KiB: fits PQXDH initial messages
+/// while preventing Durable Object OOM / queue bricking).
+pub const MAX_INITIAL_MESSAGE_SIZE: usize = 8 << 10;
 
 /// Client side of the mailbox service.
 #[trait_variant::make(Mailbox: Send)]
@@ -53,6 +59,10 @@ mod server {
         pub max_message_size: usize,
         /// Most messages in one fetch.
         pub max_fetch: u32,
+        /// Largest encrypted header, in bytes.
+        pub max_header_size: usize,
+        /// Largest encoded carried initial message, in bytes.
+        pub max_initial_message_size: usize,
     }
 
     impl Default for MailboxLimits {
@@ -63,6 +73,8 @@ mod server {
                 // response.
                 max_message_size: (4 << 20) - (64 << 10),
                 max_fetch: 100,
+                max_header_size: MAX_HEADER_SIZE,
+                max_initial_message_size: MAX_INITIAL_MESSAGE_SIZE,
             }
         }
     }
@@ -92,9 +104,18 @@ mod server {
         async fn push(&self, request: PushRequest) -> Result<PushResponse> {
             let (sender, recipient) = (fixed(&request.sender)?, fixed(&request.recipient)?);
             let message = request.message.ok_or(ErrorKind::Malformed)?;
+            if message.header.len() > self.limits.max_header_size {
+                return Err(ErrorKind::LimitExceeded.into());
+            }
             let initial_message = request
                 .initial_message
                 .map(|initial_message| Bytes::from(initial_message.encode_to_vec()));
+            if initial_message
+                .as_ref()
+                .is_some_and(|im| im.len() > self.limits.max_initial_message_size)
+            {
+                return Err(ErrorKind::LimitExceeded.into());
+            }
             let size = message.header.len()
                 + message.content.len()
                 + initial_message.as_ref().map_or(0, Bytes::len);
@@ -305,6 +326,48 @@ mod server {
             let messages = server.fetch(fetch(2, 0)).await.unwrap().messages;
             assert_eq!(messages.len(), 1);
             assert_eq!(messages[0].sequence, 3);
+        }
+
+        #[tokio::test]
+        async fn rejects_oversized_header_and_initial_message() {
+            let server = MailboxServer::new(MemoryStore::default());
+            // Exactly 8 KiB header succeeds; 8 KiB + 1 fails.
+            let ok_header = PushRequest {
+                message: Some(EncryptedMessage {
+                    header: Bytes::from(vec![0xAB; MAX_HEADER_SIZE]),
+                    content: Bytes::from_static(b"ok"),
+                }),
+                ..push(b"ok")
+            };
+            server.push(ok_header).await.unwrap();
+            let big_header = PushRequest {
+                message: Some(EncryptedMessage {
+                    header: Bytes::from(vec![0xAB; MAX_HEADER_SIZE + 1]),
+                    content: Bytes::from_static(b"no"),
+                }),
+                ..push(b"no")
+            };
+            assert_eq!(
+                server.push(big_header).await.unwrap_err().kind(),
+                ErrorKind::LimitExceeded
+            );
+
+            // Oversized carried initial message (> 8 KiB) fails.
+            let big_initial = PushRequest {
+                initial_message: Some(InitialMessage {
+                    identity_key: Bytes::from_static(&ALICE),
+                    first_message: Some(EncryptedMessage {
+                        header: Bytes::from(vec![0; 64]),
+                        content: Bytes::from(vec![0; MAX_INITIAL_MESSAGE_SIZE + 1]),
+                    }),
+                    ..InitialMessage::default()
+                }),
+                ..push(b"no")
+            };
+            assert_eq!(
+                server.push(big_initial).await.unwrap_err().kind(),
+                ErrorKind::LimitExceeded
+            );
         }
     }
 }

@@ -1538,6 +1538,7 @@ dependencies = [
  "storage",
  "wasm-bindgen",
  "worker",
+ "xeddsa",
 ]
 
 [[package]]
@@ -3587,6 +3588,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "storage",
+ "subtle",
  "thiserror 2.0.21",
  "tokio",
  "trait-variant",
