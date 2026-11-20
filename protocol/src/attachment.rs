@@ -59,11 +59,10 @@ pub trait LocalAttachments {
 
 #[cfg(feature = "server")]
 mod server {
-    use bon::Builder;
-    use sha2::{Digest, Sha256};
-    use storage::{LocalAttachmentStore, StoredAttachment};
-
     use bytes::Bytes;
+    use sha2::{Digest, Sha256};
+    use storage::{LocalAttachmentStore, StoredAttachment, UPLOADED_NOTED};
+    use subtle::ConstantTimeEq;
 
     use super::*;
     use crate::{error::ErrorKind, fixed};
@@ -72,6 +71,7 @@ mod server {
     #[derive(Debug, Clone, Copy)]
     pub struct AttachmentLimits {
         /// Most chunks of an attachment, so it is at most this many times [`MAX_CHUNK_SIZE`].
+        /// Must be between `1` and [`storage::UPLOADED_NOTED`] (`53`) inclusive.
         pub max_chunks: u32,
         /// How long the store keeps an attachment from its upload's start, if it says, which
         /// the uploader learns, and tells the recipients.
@@ -87,23 +87,61 @@ mod server {
         }
     }
 
+    /// Builder for [`AttachmentServer`], validating limits at construction.
+    #[derive(Debug)]
+    pub struct AttachmentServerBuilder<S> {
+        store: S,
+        limits: AttachmentLimits,
+    }
+
+    impl<S> AttachmentServerBuilder<S> {
+        /// Sets the limits of the server.
+        pub fn limits(mut self, limits: AttachmentLimits) -> Self {
+            self.limits = limits;
+            self
+        }
+
+        /// Builds the [`AttachmentServer`], failing with [`ErrorKind::LimitExceeded`] if
+        /// `limits.max_chunks > storage::UPLOADED_NOTED` (`53`) or [`ErrorKind::Malformed`] if
+        /// `limits.max_chunks == 0`.
+        pub fn build(self) -> Result<AttachmentServer<S>> {
+            if self.limits.max_chunks == 0 {
+                return Err(ErrorKind::Malformed.into());
+            }
+            if self.limits.max_chunks > UPLOADED_NOTED {
+                return Err(ErrorKind::LimitExceeded.into());
+            }
+            Ok(AttachmentServer {
+                store: self.store,
+                limits: self.limits,
+            })
+        }
+    }
+
     /// The attachment server's logic, over any attachment store.
     ///
     /// [`AttachmentServer::new`] gives it the default limits, and [`AttachmentServer::builder`]
-    /// can set them: `AttachmentServer::builder(store).limits(limits).build()`.
-    #[derive(Debug, Builder)]
+    /// can set and validate them: `AttachmentServer::builder(store).limits(limits).build()?`.
+    #[derive(Debug)]
     pub struct AttachmentServer<S> {
-        #[builder(start_fn)]
         store: S,
-        /// The limits; the default ones unless set.
-        #[builder(default)]
         limits: AttachmentLimits,
     }
 
     impl<S> AttachmentServer<S> {
         /// A server over `store`, with the default limits.
         pub fn new(store: S) -> Self {
-            Self::builder(store).build()
+            Self::builder(store)
+                .build()
+                .expect("DEFAULT_MAX_CHUNKS is within storage::UPLOADED_NOTED")
+        }
+
+        /// Starts building a server over `store` with custom [`AttachmentLimits`].
+        pub fn builder(store: S) -> AttachmentServerBuilder<S> {
+            AttachmentServerBuilder {
+                store,
+                limits: AttachmentLimits::default(),
+            }
         }
     }
 
@@ -121,7 +159,8 @@ mod server {
         /// The attachment `id`, if `upload_token` is its upload token.
         async fn uploading(&self, id: &[u8], upload_token: &[u8]) -> Result<StoredAttachment> {
             let attachment = self.attachment(id).await?;
-            if <[u8; 32]>::from(Sha256::digest(upload_token)) != attachment.token_hash {
+            let hash = <[u8; 32]>::from(Sha256::digest(upload_token));
+            if !bool::from(hash.ct_eq(&attachment.token_hash)) {
                 return Err(ErrorKind::InvalidSignature.into());
             }
             Ok(attachment)
@@ -131,7 +170,8 @@ mod server {
         async fn deletable(&self, id: &[u8], token: &[u8]) -> Result<StoredAttachment> {
             let attachment = self.attachment(id).await?;
             let hash = <[u8; 32]>::from(Sha256::digest(token));
-            if hash != attachment.token_hash && hash != attachment.delete_hash {
+            let matches = hash.ct_eq(&attachment.token_hash) | hash.ct_eq(&attachment.delete_hash);
+            if !bool::from(matches) {
                 return Err(ErrorKind::InvalidSignature.into());
             }
             Ok(attachment)
@@ -142,14 +182,12 @@ mod server {
         /// Check the request and add the attachment, under a random ID, with a random upload
         /// token.
         async fn start_upload(&self, request: StartUploadRequest) -> Result<StartUploadResponse> {
-            let now = web_time::SystemTime::now()
-                .duration_since(web_time::UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_millis() as u64);
+            let now = crate::now_millis();
             let delete_hash = fixed(&request.delete_hash)?;
             if request.chunks == 0 {
                 return Err(ErrorKind::Malformed.into());
             }
-            if request.chunks > self.limits.max_chunks {
+            if request.chunks > self.limits.max_chunks.min(UPLOADED_NOTED) {
                 return Err(ErrorKind::LimitExceeded.into());
             }
             let token: [u8; TOKEN_LENGTH] = random();
@@ -251,7 +289,8 @@ mod server {
                     max_chunks: 2,
                     retention: Some(core::time::Duration::from_secs(60)),
                 })
-                .build();
+                .build()
+                .unwrap();
             // The delete token, which the peers derive from the attachment's key.
             let delete_token = Bytes::from_static(&[7; TOKEN_LENGTH]);
             let start = |chunks| StartUploadRequest {
@@ -365,6 +404,41 @@ mod server {
                 token: started.upload_token.clone(),
             };
             server.delete_attachment(delete).await.unwrap();
+        }
+
+        #[test]
+        fn rejects_max_chunks_above_uploaded_noted() {
+            assert!(
+                AttachmentServer::builder(MemoryStore::default())
+                    .limits(AttachmentLimits {
+                        max_chunks: UPLOADED_NOTED,
+                        ..AttachmentLimits::default()
+                    })
+                    .build()
+                    .is_ok()
+            );
+            assert_eq!(
+                AttachmentServer::builder(MemoryStore::default())
+                    .limits(AttachmentLimits {
+                        max_chunks: UPLOADED_NOTED + 1,
+                        ..AttachmentLimits::default()
+                    })
+                    .build()
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::LimitExceeded
+            );
+            assert_eq!(
+                AttachmentServer::builder(MemoryStore::default())
+                    .limits(AttachmentLimits {
+                        max_chunks: 0,
+                        ..AttachmentLimits::default()
+                    })
+                    .build()
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Malformed
+            );
         }
     }
 }

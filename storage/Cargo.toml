@@ -22,5 +22,7 @@ futures = "0.3"
 default = ["memory"]
 # In-memory backend, for tests and development servers.
 memory = ["dep:parking_lot"]
+# Optional post-quantum handshake & idempotent mailbox storage traits (zero ML-KEM deps).
+pq = []
 # Conformance suites every backend should pass.
 testing = []

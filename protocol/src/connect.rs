@@ -30,6 +30,19 @@ use crate::{
     },
     mailbox::{FetchRequest, FetchResponse, LocalMailbox, PushRequest, PushResponse},
 };
+#[cfg(feature = "pq")]
+use crate::{
+    handshake_v2::{
+        AckInitialMessagesRequest, AckInitialMessagesResponse, ClaimBundleRequest,
+        ClaimBundleResponse, GetManifestRequest, GetManifestResponse, GetServerInfoRequest,
+        GetServerInfoResponse, ListInitialMessagesRequest, ListInitialMessagesResponse,
+        LocalHandshakeV2, PublishV2Request, PublishV2Response, RefillPrekeysRequest,
+        RefillPrekeysResponse, SendInitialV2Request, SendInitialV2Response,
+    },
+    mailbox_v2::{
+        FetchSignedRequest, FetchSignedResponse, LocalMailboxV2, PushV2Request, PushV2Response,
+    },
+};
 
 /// The content type of requests and successful responses: binary protobuf.
 pub const CONTENT_TYPE: &str = "application/proto";
@@ -104,6 +117,72 @@ impl Procedure {
     }
 }
 
+/// A v2 procedure: a method of `handshake.v2.HandshakeService` or `mailbox.v2.MailboxService`.
+#[cfg(feature = "pq")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProcedureV2 {
+    /// [`LocalHandshakeV2::get_server_info`].
+    GetServerInfo,
+    /// [`LocalHandshakeV2::publish_v2`].
+    PublishV2,
+    /// [`LocalHandshakeV2::refill_prekeys`].
+    RefillPrekeys,
+    /// [`LocalHandshakeV2::get_manifest`].
+    GetManifest,
+    /// [`LocalHandshakeV2::claim_bundle`].
+    ClaimBundle,
+    /// [`LocalHandshakeV2::send_initial_v2`].
+    SendInitialV2,
+    /// [`LocalHandshakeV2::list_initial_messages`].
+    ListInitialMessages,
+    /// [`LocalHandshakeV2::ack_initial_messages`].
+    AckInitialMessages,
+    /// [`LocalMailboxV2::push_v2`].
+    PushV2,
+    /// [`LocalMailboxV2::fetch_signed`].
+    FetchSigned,
+}
+
+#[cfg(feature = "pq")]
+impl ProcedureV2 {
+    /// Every v2 procedure.
+    pub const ALL: [Self; 10] = [
+        Self::GetServerInfo,
+        Self::PublishV2,
+        Self::RefillPrekeys,
+        Self::GetManifest,
+        Self::ClaimBundle,
+        Self::SendInitialV2,
+        Self::ListInitialMessages,
+        Self::AckInitialMessages,
+        Self::PushV2,
+        Self::FetchSigned,
+    ];
+
+    /// The path of its calls: `/` ‖ the service's full name ‖ `/` ‖ the method's name.
+    pub fn path(self) -> &'static str {
+        match self {
+            Self::GetServerInfo => "/handshake.v2.HandshakeService/GetServerInfo",
+            Self::PublishV2 => "/handshake.v2.HandshakeService/PublishV2",
+            Self::RefillPrekeys => "/handshake.v2.HandshakeService/RefillPrekeys",
+            Self::GetManifest => "/handshake.v2.HandshakeService/GetManifest",
+            Self::ClaimBundle => "/handshake.v2.HandshakeService/ClaimBundle",
+            Self::SendInitialV2 => "/handshake.v2.HandshakeService/SendInitialV2",
+            Self::ListInitialMessages => "/handshake.v2.HandshakeService/ListInitialMessages",
+            Self::AckInitialMessages => "/handshake.v2.HandshakeService/AckInitialMessages",
+            Self::PushV2 => "/mailbox.v2.MailboxService/PushV2",
+            Self::FetchSigned => "/mailbox.v2.MailboxService/FetchSigned",
+        }
+    }
+
+    /// The v2 procedure whose calls go to `path`, if any.
+    pub fn from_path(path: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|procedure| procedure.path() == path)
+    }
+}
+
 /// The HTTP response to a call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
@@ -154,6 +233,56 @@ pub async fn handle(
         Procedure::DeleteAttachment => {
             reply(decode(body).map(|r| attachments.delete_attachment(r))).await
         }
+    };
+    match reply {
+        Ok(body) => Response {
+            status: 200,
+            content_type: CONTENT_TYPE,
+            body,
+        },
+        Err(error) => self::error(error.kind(), &error.to_string()),
+    }
+}
+
+/// Answer a call to a v2 `procedure`, whose request has `content_type` and `body`, with
+/// `handshake` and `mailbox`.
+#[cfg(feature = "pq")]
+pub async fn handle_v2(
+    handshake: &impl LocalHandshakeV2,
+    mailbox: &impl LocalMailboxV2,
+    procedure: ProcedureV2,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> Response {
+    let essence = content_type.and_then(|content_type| content_type.split(';').next());
+    if !essence.is_some_and(|essence| essence.trim().eq_ignore_ascii_case(CONTENT_TYPE)) {
+        return Response {
+            status: 415,
+            content_type: ERROR_CONTENT_TYPE,
+            body: error_body(Code::InvalidArgument, "unsupported content type"),
+        };
+    }
+    let reply = match procedure {
+        ProcedureV2::GetServerInfo => {
+            reply(decode(body).map(|r| handshake.get_server_info(r))).await
+        }
+        ProcedureV2::PublishV2 => reply(decode(body).map(|r| handshake.publish_v2(r))).await,
+        ProcedureV2::RefillPrekeys => {
+            reply(decode(body).map(|r| handshake.refill_prekeys(r))).await
+        }
+        ProcedureV2::GetManifest => reply(decode(body).map(|r| handshake.get_manifest(r))).await,
+        ProcedureV2::ClaimBundle => reply(decode(body).map(|r| handshake.claim_bundle(r))).await,
+        ProcedureV2::SendInitialV2 => {
+            reply(decode(body).map(|r| handshake.send_initial_v2(r))).await
+        }
+        ProcedureV2::ListInitialMessages => {
+            reply(decode(body).map(|r| handshake.list_initial_messages(r))).await
+        }
+        ProcedureV2::AckInitialMessages => {
+            reply(decode(body).map(|r| handshake.ack_initial_messages(r))).await
+        }
+        ProcedureV2::PushV2 => reply(decode(body).map(|r| mailbox.push_v2(r))).await,
+        ProcedureV2::FetchSigned => reply(decode(body).map(|r| mailbox.fetch_signed(r))).await,
     };
     match reply {
         Ok(body) => Response {
@@ -217,16 +346,13 @@ impl<P> ConnectClient<P> {
 }
 
 impl<P: LocalPost> ConnectClient<P> {
-    /// Call `procedure` with `request`.
-    async fn call<T: Message + Default>(
+    /// Call a procedure at `path` with `request`.
+    async fn call_path<T: Message + Default>(
         &self,
-        procedure: Procedure,
+        path: &str,
         request: impl Message,
     ) -> Result<T> {
-        let (status, body) = self
-            .0
-            .post(procedure.path(), request.encode_to_vec())
-            .await?;
+        let (status, body) = self.0.post(path, request.encode_to_vec()).await?;
         if status == 200 {
             return T::decode(body.as_slice()).map_err(|e| Error::new(ErrorKind::Malformed, e));
         }
@@ -248,6 +374,25 @@ impl<P: LocalPost> ConnectClient<P> {
         };
         let kind = Code::from_name(&error.code).map_or(ErrorKind::Server, ErrorKind::from);
         Err(Error::new(kind, error))
+    }
+
+    /// Call `procedure` with `request`.
+    async fn call<T: Message + Default>(
+        &self,
+        procedure: Procedure,
+        request: impl Message,
+    ) -> Result<T> {
+        self.call_path(procedure.path(), request).await
+    }
+
+    /// Call v2 `procedure` with `request`.
+    #[cfg(feature = "pq")]
+    async fn call_v2<T: Message + Default>(
+        &self,
+        procedure: ProcedureV2,
+        request: impl Message,
+    ) -> Result<T> {
+        self.call_path(procedure.path(), request).await
     }
 }
 
@@ -303,6 +448,64 @@ impl<P: LocalPost> LocalAttachments for ConnectClient<P> {
         request: DeleteAttachmentRequest,
     ) -> Result<DeleteAttachmentResponse> {
         self.call(Procedure::DeleteAttachment, request).await
+    }
+}
+
+#[cfg(feature = "pq")]
+impl<P: LocalPost> LocalHandshakeV2 for ConnectClient<P> {
+    async fn get_server_info(
+        &self,
+        request: GetServerInfoRequest,
+    ) -> Result<GetServerInfoResponse> {
+        self.call_v2(ProcedureV2::GetServerInfo, request).await
+    }
+
+    async fn publish_v2(&self, request: PublishV2Request) -> Result<PublishV2Response> {
+        self.call_v2(ProcedureV2::PublishV2, request).await
+    }
+
+    async fn refill_prekeys(&self, request: RefillPrekeysRequest) -> Result<RefillPrekeysResponse> {
+        self.call_v2(ProcedureV2::RefillPrekeys, request).await
+    }
+
+    async fn get_manifest(&self, request: GetManifestRequest) -> Result<GetManifestResponse> {
+        self.call_v2(ProcedureV2::GetManifest, request).await
+    }
+
+    async fn claim_bundle(&self, request: ClaimBundleRequest) -> Result<ClaimBundleResponse> {
+        self.call_v2(ProcedureV2::ClaimBundle, request).await
+    }
+
+    async fn send_initial_v2(
+        &self,
+        request: SendInitialV2Request,
+    ) -> Result<SendInitialV2Response> {
+        self.call_v2(ProcedureV2::SendInitialV2, request).await
+    }
+
+    async fn list_initial_messages(
+        &self,
+        request: ListInitialMessagesRequest,
+    ) -> Result<ListInitialMessagesResponse> {
+        self.call_v2(ProcedureV2::ListInitialMessages, request).await
+    }
+
+    async fn ack_initial_messages(
+        &self,
+        request: AckInitialMessagesRequest,
+    ) -> Result<AckInitialMessagesResponse> {
+        self.call_v2(ProcedureV2::AckInitialMessages, request).await
+    }
+}
+
+#[cfg(feature = "pq")]
+impl<P: LocalPost> LocalMailboxV2 for ConnectClient<P> {
+    async fn push_v2(&self, request: PushV2Request) -> Result<PushV2Response> {
+        self.call_v2(ProcedureV2::PushV2, request).await
+    }
+
+    async fn fetch_signed(&self, request: FetchSignedRequest) -> Result<FetchSignedResponse> {
+        self.call_v2(ProcedureV2::FetchSigned, request).await
     }
 }
 
@@ -410,6 +613,7 @@ impl From<ErrorKind> for Code {
             ErrorKind::LimitExceeded => Self::ResourceExhausted,
             ErrorKind::SignInRequired => Self::PermissionDenied,
             ErrorKind::Storage => Self::Unavailable,
+            ErrorKind::Unimplemented => Self::Unimplemented,
             _ => Self::Internal,
         }
     }
@@ -424,6 +628,7 @@ impl From<Code> for ErrorKind {
             Code::NotFound => Self::NotFound,
             Code::ResourceExhausted => Self::LimitExceeded,
             Code::PermissionDenied => Self::SignInRequired,
+            Code::Unimplemented => Self::Unimplemented,
             _ => Self::Server,
         }
     }
@@ -589,5 +794,286 @@ mod test {
         services.sort();
         paths.sort();
         assert_eq!(services, paths);
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn v2_paths_follow_the_services() {
+        let files = protox::compile(
+            ["proto/handshake_v2.proto", "proto/mailbox_v2.proto"],
+            ["proto", "../party/proto"],
+        )
+        .unwrap();
+        let mut services: Vec<_> = files
+            .file
+            .iter()
+            .flat_map(|file| {
+                file.service.iter().flat_map(move |service| {
+                    service.method.iter().map(move |method| {
+                        format!("/{}.{}/{}", file.package(), service.name(), method.name())
+                    })
+                })
+            })
+            .collect();
+        let mut paths = ProcedureV2::ALL.map(|procedure| procedure.path().to_string());
+        services.sort();
+        paths.sort();
+        assert_eq!(services, paths);
+    }
+
+    #[cfg(feature = "pq")]
+    #[tokio::test]
+    async fn v2_over_connect_roundtrip() {
+        use std::sync::Arc;
+
+        use x3dh::{PqSuite, pq_prekey_id, sign_pq_spk};
+        use xeddsa::XEdDSAPrivateKey;
+
+        use crate::{
+            handshake_v2::{
+                CapabilityManifest, HandshakeV2Server, PqLastResortCommitment, PqPrekey,
+                ServerInfoConfig, sign_manifest,
+            },
+            mailbox_v2::MailboxV2Server,
+        };
+
+        #[derive(Clone)]
+        struct Shared(Arc<MemoryStore>);
+
+        impl storage::LocalPqHandshakeStore for Shared {
+            async fn publish_v2(
+                &self,
+                r: storage::PublishV2Record,
+            ) -> storage::Result<storage::PublishV2Status> {
+                storage::PqHandshakeStore::publish_v2(&*self.0, r).await
+            }
+            async fn refill_prekeys(
+                &self,
+                r: storage::RefillPrekeysRecord,
+            ) -> storage::Result<storage::RefillStatus> {
+                storage::PqHandshakeStore::refill_prekeys(&*self.0, r).await
+            }
+            async fn get_manifest(
+                &self,
+                id: &x3dh::PublicKey,
+            ) -> storage::Result<Option<storage::StoredCapabilityManifest>> {
+                storage::PqHandshakeStore::get_manifest(&*self.0, id).await
+            }
+            async fn claim_bundle(
+                &self,
+                id: &x3dh::PublicKey,
+                suites: &[u8],
+            ) -> storage::Result<Option<storage::ClaimedPqBundle>> {
+                storage::PqHandshakeStore::claim_bundle(&*self.0, id, suites).await
+            }
+            async fn add_initial_message_v2(
+                &self,
+                m: storage::StoredInitialMessageV2,
+                limit: usize,
+            ) -> storage::Result<Option<u64>> {
+                storage::PqHandshakeStore::add_initial_message_v2(&*self.0, m, limit).await
+            }
+            async fn list_initial_messages(
+                &self,
+                id: &x3dh::PublicKey,
+                limit: usize,
+            ) -> storage::Result<Vec<storage::StoredInitialMessageV2>> {
+                storage::PqHandshakeStore::list_initial_messages(&*self.0, id, limit).await
+            }
+            async fn ack_initial_messages(
+                &self,
+                id: &x3dh::PublicKey,
+                ids: &[u64],
+            ) -> storage::Result<usize> {
+                storage::PqHandshakeStore::ack_initial_messages(&*self.0, id, ids).await
+            }
+            async fn pq_snapshot(
+                &self,
+                id: &x3dh::PublicKey,
+            ) -> storage::Result<storage::PqStorageSnapshot> {
+                storage::PqHandshakeStore::pq_snapshot(&*self.0, id).await
+            }
+        }
+
+        impl storage::LocalMailboxStore for Shared {
+            async fn append(
+                &self,
+                s: &x3dh::PublicKey,
+                r: &x3dh::PublicKey,
+                h: Bytes,
+                c: Bytes,
+                i: Option<Bytes>,
+                d: Option<[u8; 32]>,
+            ) -> storage::Result<u64> {
+                storage::MailboxStore::append(&*self.0, s, r, h, c, i, d).await
+            }
+            async fn delete_delivered(
+                &self,
+                s: &x3dh::PublicKey,
+                r: &x3dh::PublicKey,
+                h: &[[u8; 32]],
+            ) -> storage::Result<()> {
+                storage::MailboxStore::delete_delivered(&*self.0, s, r, h).await
+            }
+            async fn read(
+                &self,
+                s: &x3dh::PublicKey,
+                r: &x3dh::PublicKey,
+                a: u64,
+                l: u32,
+            ) -> storage::Result<Vec<storage::StoredMessage>> {
+                storage::MailboxStore::read(&*self.0, s, r, a, l).await
+            }
+        }
+
+        impl storage::LocalIdempotentMailboxStore for Shared {
+            async fn append_idempotent(
+                &self,
+                s: &x3dh::PublicKey,
+                r: &x3dh::PublicKey,
+                h: Bytes,
+                c: Bytes,
+                i: Option<Bytes>,
+                d: Option<[u8; 32]>,
+                cid: Option<[u8; 16]>,
+            ) -> storage::Result<u64> {
+                storage::IdempotentMailboxStore::append_idempotent(&*self.0, s, r, h, c, i, d, cid)
+                    .await
+            }
+        }
+
+        struct InProcessV2 {
+            handshake: HandshakeV2Server<Shared>,
+            mailbox: MailboxV2Server<Shared>,
+        }
+
+        impl LocalPost for InProcessV2 {
+            async fn post(&self, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+                let Some(proc_v2) = ProcedureV2::from_path(path) else {
+                    return Ok((404, b"no such procedure".to_vec()));
+                };
+                let resp = handle_v2(
+                    &self.handshake,
+                    &self.mailbox,
+                    proc_v2,
+                    Some(CONTENT_TYPE),
+                    &body,
+                )
+                .await;
+                Ok((resp.status, resp.body))
+            }
+        }
+
+        let store = Shared(Arc::new(MemoryStore::default()));
+        let client = ConnectClient::new(InProcessV2 {
+            handshake: HandshakeV2Server::new(store.clone(), ServerInfoConfig::new("connect.test")),
+            mailbox: MailboxV2Server::new(store, "connect.test"),
+        });
+
+        let info = client
+            .get_server_info(GetServerInfoRequest {})
+            .await
+            .unwrap();
+        assert!(info.pq_enabled);
+        assert_eq!(info.server_id, "connect.test");
+
+        let bob = XEdDSAPrivateKey::generate();
+        let bob_pk = bob.compute_public_key().to_bytes();
+        let alice = XEdDSAPrivateKey::generate();
+        let alice_pk = alice.compute_public_key().to_bytes();
+        let now = crate::now_millis();
+
+        let ek = vec![0x99; PqSuite::MlKem1024.ek_len()];
+        let id = pq_prekey_id(PqSuite::MlKem1024.as_u8(), &ek);
+        let lr = PqPrekey {
+            suite: 1,
+            prekey_id: Bytes::copy_from_slice(&id),
+            encapsulation_key: Bytes::from(ek),
+            signature: Bytes::copy_from_slice(
+                &sign_pq_spk(&bob, PqSuite::MlKem1024, &[0x99; 1568]).unwrap(),
+            ),
+        };
+        let mut manifest = CapabilityManifest {
+            audience: "connect.test".into(),
+            identity_key: Bytes::new(),
+            manifest_seq: 1,
+            generation: 1,
+            issued_at: now,
+            expires_at: now + 60_000,
+            pq_enabled: true,
+            strict_pq: false,
+            pq_ratchet_supported: true,
+            offered_suites: vec![1],
+            signed_prekey: Bytes::from_static(&[0x11; 32]),
+            pq_last_resort: vec![PqLastResortCommitment {
+                suite: 1,
+                prekey_id: Bytes::copy_from_slice(&id),
+            }],
+            signature: Bytes::new(),
+        };
+        sign_manifest(&bob, &mut manifest).unwrap();
+
+        let pub_req = PublishV2Request::sign(
+            &bob,
+            manifest.clone(),
+            Some(bob.sign([0x11; 32])),
+            &[[0x22; 32]],
+            vec![lr],
+            vec![],
+            now,
+        )
+        .unwrap();
+        client.publish_v2(pub_req).await.unwrap();
+
+        let got = client
+            .get_manifest(GetManifestRequest {
+                identity_key: Bytes::copy_from_slice(&bob_pk),
+            })
+            .await
+            .unwrap();
+        assert_eq!(got.manifest, Some(manifest));
+
+        let claimed = client
+            .claim_bundle(ClaimBundleRequest {
+                identity_key: Bytes::copy_from_slice(&bob_pk),
+                preferred_suites: vec![1],
+            })
+            .await
+            .unwrap();
+        assert!(claimed.pq_last_resort.is_some());
+
+        let pushed = client
+            .push_v2(PushV2Request {
+                sender: Bytes::copy_from_slice(&alice_pk),
+                recipient: Bytes::copy_from_slice(&bob_pk),
+                message: Some(EncryptedMessage {
+                    header: Bytes::from_static(b"hdr"),
+                    content: Bytes::from_static(b"body"),
+                }),
+                initial_message: None,
+                delivery_hash: Bytes::new(),
+                client_message_id: Bytes::from_static(&[7; 16]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(pushed.sequence, 1);
+
+        let fetched = client
+            .fetch_signed(
+                FetchSignedRequest::sign(
+                    &bob,
+                    "connect.test",
+                    &alice_pk,
+                    0,
+                    10,
+                    0,
+                    vec![],
+                    now,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fetched.messages.len(), 1);
     }
 }

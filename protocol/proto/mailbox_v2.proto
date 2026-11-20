@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+// Hardened mailbox service (v2): recipient-signed FetchSigned and idempotent PushV2 sharing the
+// same underlying mailbox queues as mailbox.v1 so classical and upgraded clients interoperate.
+package mailbox.v2;
+
+import "handshake_v2.proto";
+import "party.proto";
+
+// Append a message to the queue from sender to recipient with per-field caps and optional
+// client_message_id deduplication.
+message PushV2Request {
+  // Sender's canonical identity key (32 bytes).
+  bytes sender = 1;
+  // Recipient's canonical identity key (32 bytes).
+  bytes recipient = 2;
+  // Encrypted ratchet message (header <= 8 KiB).
+  party.v1.EncryptedMessage message = 3;
+  // Optional carried initial message (v1 or v2; encoded <= 8 KiB).
+  handshake.v2.InitialMessageV2 initial_message = 4;
+  // SHA-256 of the delivery token (32 bytes), or empty.
+  bytes delivery_hash = 5;
+  // Optional 16-byte client-generated idempotency ID for safe retries.
+  bytes client_message_id = 6;
+}
+
+// Reply to PushV2Request.
+message PushV2Response {
+  // The message's position in the shared queue, starting at 1.
+  uint64 sequence = 1;
+}
+
+// Recipient-signed mailbox fetch sharing the same underlying queue as mailbox.v1.
+message FetchSignedRequest {
+  // Relay audience / server identifier bound into the signature.
+  string audience = 1;
+  // Sender's (peer's) canonical identity key (32 bytes).
+  bytes sender = 2;
+  // Recipient's canonical identity key (32 bytes), who signs this request.
+  bytes recipient = 3;
+  // Fetch messages after this sequence number; 0 for the start of the queue.
+  uint64 after = 4;
+  // At most this many messages; 0 for the server's maximum.
+  uint32 limit = 5;
+  // Maximum response byte budget; 0 for the server's default.
+  uint32 max_size = 6;
+  // Delivery tokens (16 bytes each) of messages to delete before reading.
+  repeated bytes delivered = 7;
+  // Request timestamp in milliseconds since the Unix epoch (within clock skew).
+  uint64 timestamp = 8;
+  // Recipient's XEdDSA signature (64 bytes) over canonical FetchSigned signing input.
+  bytes signature = 9;
+}
+
+// A fetched message envelope in mailbox.v2.
+message EnvelopeV2 {
+  // Position in the shared queue.
+  uint64 sequence = 1;
+  // Encrypted ratchet message; absent if its content expired before it was fetched.
+  party.v1.EncryptedMessage message = 2;
+  // Optional carried initial message (normalized from either v1 or v2).
+  handshake.v2.InitialMessageV2 initial_message = 3;
+}
+
+// Reply to FetchSignedRequest.
+message FetchSignedResponse {
+  // Fetched envelopes, in ascending sequence order.
+  repeated EnvelopeV2 messages = 1;
+}
+
+// The v2 mailbox service.
+service MailboxService {
+  // Append a message to a queue with per-field caps and optional idempotency.
+  rpc PushV2(PushV2Request) returns (PushV2Response);
+  // Read messages from a queue with recipient authentication.
+  rpc FetchSigned(FetchSignedRequest) returns (FetchSignedResponse);
+}

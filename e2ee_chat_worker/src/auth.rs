@@ -4,14 +4,18 @@
 //! cookie names who signed in, its subject: `password`, for now; later, e.g. a blockchain account
 //! that signed in with SIWE, SIWS or SIWX (CAIP-122), whose bought storage would be counted
 //! against it.
+//!
+//! Best-effort brute-force throttling tracks recent failed password attempts per isolate; internet-
+//! facing deployments should additionally configure Cloudflare Rate Limiting rules or a dedicated
+//! Durable Object counter binding for cross-edge enforcement.
 
-use std::time::Duration;
+use std::{cell::RefCell, collections::VecDeque, time::Duration};
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use worker::{Date, Delay, Env, Headers, Method, Request, Response, Result};
+use worker::{Date, Delay, Env, Headers, Method, Request, Response, Result, Url};
 
 /// The cookie: `__Host-` keeps it to this host, over HTTPS, for all its paths.
 const COOKIE: &str = "__Host-e2ee-chat";
@@ -22,10 +26,23 @@ const PASSWORD: &str = "PASSWORD";
 const AUTH_KEY: &str = "AUTH_KEY";
 /// How long a sign-in lasts, unless the `SESSION_DAYS` variable says.
 const DEFAULT_SESSION_DAYS: u64 = 30;
-/// How long a wrong password waits for its answer, which slows guessing it.
-const WRONG_PASSWORD_DELAY: Duration = Duration::from_secs(1);
+/// Base delay after a wrong password, which scales with recent isolate failures.
+const WRONG_PASSWORD_BASE_DELAY_MS: u64 = 1000;
+/// Cap on per-request wrong-password delay.
+const WRONG_PASSWORD_MAX_DELAY_MS: u64 = 5000;
+/// Sliding window for best-effort per-isolate password failure throttling (60 seconds).
+const THROTTLE_WINDOW_MS: u64 = 60_000;
+/// Maximum failed password attempts permitted per isolate within [`THROTTLE_WINDOW_MS`].
+const MAX_FAILURES_PER_WINDOW: usize = 20;
 /// The longest password read.
 const MAX_PASSWORD: usize = 1024;
+
+thread_local! {
+    /// Best-effort per-isolate sliding window of failed password timestamps (in ms).
+    /// Note: Cloudflare Workers isolates are ephemeral and per-colo; combine with Cloudflare
+    /// Rate Limiting rules for global distributed throttling without extra DO bindings.
+    static FAILED_ATTEMPTS: RefCell<VecDeque<u64>> = const { RefCell::new(VecDeque::new()) };
+}
 
 /// What a cookie says of who signed in.
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,15 +92,56 @@ pub async fn handle(request: Request, env: &Env) -> Result<Response> {
     }
 }
 
-/// Whether `request` comes from this server's own page, as its browser's `Sec-Fetch-Site` tells:
-/// `same-origin`, or `none`, as the user's own, e.g. typed. Without the header, as from a client
-/// that is no browser, or an old one, it is taken: forms are what the check is for, and every
-/// browser now sends it. Through a development proxy, e.g. `trunk serve`, the page and its calls
-/// share the proxy's origin, so they pass too.
+/// Whether `request` comes from this server's own page:
+/// 1. If `Sec-Fetch-Site` is present, requires `same-origin` or `none`.
+/// 2. If `Sec-Fetch-Site` is absent, falls back to checking `Origin` (and then `Referer`) against
+///    the request's own scheme, host, and effective port.
+/// 3. Non-browser clients omitting all three headers are allowed.
 fn same_origin(request: &Request) -> Result<bool> {
-    Ok(match request.headers().get("sec-fetch-site")? {
-        Some(site) => matches!(site.as_str(), "same-origin" | "none"),
-        None => true,
+    if let Some(site) = request.headers().get("sec-fetch-site")? {
+        return Ok(matches!(site.as_str(), "same-origin" | "none"));
+    }
+    let req_url = request.url()?;
+    if let Some(origin) = request.headers().get("origin")? {
+        return Ok(url_matches_origin(&origin, &req_url));
+    }
+    if let Some(referer) = request.headers().get("referer")? {
+        return Ok(url_matches_origin(&referer, &req_url));
+    }
+    Ok(true)
+}
+
+/// Returns `true` iff `candidate` parses as a URL with the exact same scheme, host, and effective
+/// port as `target`.
+fn url_matches_origin(candidate: &str, target: &Url) -> bool {
+    let Ok(parsed) = Url::parse(candidate) else {
+        return false;
+    };
+    parsed.scheme() == target.scheme()
+        && parsed.host_str() == target.host_str()
+        && parsed.port_or_known_default() == target.port_or_known_default()
+}
+
+fn recent_failures(now: u64) -> usize {
+    FAILED_ATTEMPTS.with(|cell| {
+        let mut q = cell.borrow_mut();
+        let cutoff = now.saturating_sub(THROTTLE_WINDOW_MS);
+        while q.front().is_some_and(|&ts| ts < cutoff) {
+            q.pop_front();
+        }
+        q.len()
+    })
+}
+
+fn record_failure(now: u64) -> usize {
+    FAILED_ATTEMPTS.with(|cell| {
+        let mut q = cell.borrow_mut();
+        let cutoff = now.saturating_sub(THROTTLE_WINDOW_MS);
+        while q.front().is_some_and(|&ts| ts < cutoff) {
+            q.pop_front();
+        }
+        q.push_back(now);
+        q.len()
     })
 }
 
@@ -95,7 +153,16 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
             503,
         );
     };
+    let now = Date::now().as_millis();
+    if recent_failures(now) >= MAX_FAILURES_PER_WINDOW {
+        return Response::error("too many failed sign-in attempts", 429);
+    }
     let Some(given) = crate::read_body(&mut request, MAX_PASSWORD).await? else {
+        let failures = record_failure(Date::now().as_millis());
+        let delay_ms = WRONG_PASSWORD_BASE_DELAY_MS
+            .saturating_mul(1u64 << (failures.saturating_sub(1).min(3)))
+            .min(WRONG_PASSWORD_MAX_DELAY_MS);
+        Delay::from(Duration::from_millis(delay_ms)).await;
         return Response::error("wrong password", 403);
     };
     // Compared as MACs, in constant time, so that the time it takes tells nothing of it.
@@ -106,7 +173,11 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
         .verify_slice(&expected)
         .is_err()
     {
-        Delay::from(WRONG_PASSWORD_DELAY).await;
+        let failures = record_failure(Date::now().as_millis());
+        let delay_ms = WRONG_PASSWORD_BASE_DELAY_MS
+            .saturating_mul(1u64 << (failures.saturating_sub(1).min(3)))
+            .min(WRONG_PASSWORD_MAX_DELAY_MS);
+        Delay::from(Duration::from_millis(delay_ms)).await;
         return Response::error("wrong password", 403);
     }
     let lasts = crate::period(env, "SESSION_DAYS", DEFAULT_SESSION_DAYS).as_secs();

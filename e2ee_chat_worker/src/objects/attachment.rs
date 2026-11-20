@@ -9,7 +9,8 @@ use worker::{
 };
 
 use super::{
-    AttachmentCall, AttachmentRow, RETRY_ALARM, alarm_at, answer, blob, decode, has_table, integer,
+    AttachmentCall, AttachmentRow, RETRY_ALARM, alarm_at, answer, blob, checked_integer, decode,
+    has_table,
 };
 
 /// How long attachments are kept, unless the `FILE_RETENTION_DAYS` variable says: longer than
@@ -106,10 +107,10 @@ impl Attachment {
              VALUES (0, ?, ?, ?, ?, ?) ON CONFLICT (only) DO NOTHING",
             vec![
                 blob(id),
-                integer(chunks.into()),
+                checked_integer(chunks.into())?,
                 blob(token_hash),
                 blob(delete_hash),
-                integer(Date::now().as_millis()),
+                checked_integer(Date::now().as_millis())?,
             ],
         )?;
         Ok(added.rows_written() > 0)
@@ -147,7 +148,7 @@ impl Attachment {
         }
         let noted = sql.exec(
             "UPDATE attachment SET uploaded = uploaded | ? WHERE deleting = 0",
-            vec![integer(storage::uploaded_bit(index))],
+            vec![checked_integer(storage::uploaded_bit(index))?],
         )?;
         Ok(noted.rows_written() > 0)
     }

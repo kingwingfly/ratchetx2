@@ -43,10 +43,25 @@ impl From<xeddsa::Error> for Error {
     }
 }
 
+impl From<x3dh::Error> for Error {
+    fn from(error: x3dh::Error) -> Self {
+        let kind = match error.kind() {
+            x3dh::ErrorKind::InvalidSignature => ErrorKind::InvalidSignature,
+            _ => ErrorKind::Malformed,
+        };
+        Self::new(kind, error)
+    }
+}
+
 #[cfg(feature = "server")]
 impl From<storage::Error> for Error {
     fn from(error: storage::Error) -> Self {
-        Self::new(ErrorKind::Storage, error)
+        let kind = match error.kind() {
+            storage::ErrorKind::LimitExceeded => ErrorKind::LimitExceeded,
+            storage::ErrorKind::InvalidArgument => ErrorKind::Malformed,
+            _ => ErrorKind::Storage,
+        };
+        Self::new(kind, error)
     }
 }
 
@@ -80,6 +95,9 @@ pub enum ErrorKind {
     /// The server's storage failed.
     #[error("storage error")]
     Storage,
+    /// The server does not implement or has disabled this procedure.
+    #[error("unimplemented")]
+    Unimplemented,
     /// Another server or network failure.
     #[error("server error")]
     Server,

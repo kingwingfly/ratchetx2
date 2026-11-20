@@ -43,6 +43,13 @@ pub(crate) mod v1 {
     pub use super::proto::*;
 }
 
+/// The v2 handshake messages by the path `mailbox.v2`'s generated code names them with,
+/// `handshake::v2`.
+#[cfg(feature = "pq")]
+pub(crate) mod v2 {
+    pub use crate::handshake_v2::proto::*;
+}
+
 pub use proto::*;
 #[cfg(feature = "server")]
 pub use server::{HandshakeLimits, HandshakeServer};
@@ -216,11 +223,16 @@ impl TryFrom<&InitialMessage> for x3dh::InitialMessage {
 
 #[cfg(feature = "server")]
 mod server {
+    use std::collections::HashSet;
+
     use bon::Builder;
     use party::EncryptedMessage;
     use storage::{Bundle, LocalHandshakeStore, StoredInitialMessage};
 
     use super::*;
+    use crate::{
+        check_canonical_key, check_monotonic_timestamp, mailbox::MAX_HEADER_SIZE, now_millis,
+    };
 
     /// Limits of a [`HandshakeServer`].
     #[derive(Debug, Clone, Copy)]
@@ -269,7 +281,16 @@ mod server {
             if request.one_time_prekeys.len() > self.limits.max_one_time_prekeys {
                 return Err(ErrorKind::LimitExceeded.into());
             }
+            check_monotonic_timestamp(request.timestamp, now_millis())?;
             let (identity_key, prekeys) = request.verify()?;
+            check_canonical_key(&prekeys.signed_prekey)?;
+            let mut seen = HashSet::with_capacity(prekeys.one_time_prekeys.len());
+            for opk in &prekeys.one_time_prekeys {
+                check_canonical_key(opk)?;
+                if !seen.insert(*opk) {
+                    return Err(ErrorKind::Malformed.into());
+                }
+            }
             XEdDSAPublicKey::new(&identity_key)?
                 .verify(prekeys.signed_prekey, &prekeys.signed_prekey_signature)?;
             let bundle = Bundle {
@@ -306,15 +327,24 @@ mod server {
         ) -> Result<SendInitialMessageResponse> {
             let message = request.message.as_ref().ok_or(ErrorKind::Malformed)?;
             let first_message = message.first_message.clone().ok_or(ErrorKind::Malformed)?;
-            if first_message.header.len() + first_message.content.len()
-                > self.limits.max_first_message_size
+            if first_message.header.len() > MAX_HEADER_SIZE
+                || first_message.header.len() + first_message.content.len()
+                    > self.limits.max_first_message_size
             {
                 return Err(ErrorKind::LimitExceeded.into());
             }
+            let recipient = fixed(&request.recipient)?;
+            check_canonical_key(&recipient)?;
             let message = x3dh::InitialMessage::try_from(message)?;
+            check_canonical_key(&message.identity_key)?;
+            check_canonical_key(&message.ephemeral_key)?;
+            check_canonical_key(&message.signed_prekey)?;
+            if let Some(opk) = &message.one_time_prekey {
+                check_canonical_key(opk)?;
+            }
             let initial_message = StoredInitialMessage {
                 sender: message.identity_key,
-                recipient: fixed(&request.recipient)?,
+                recipient,
                 ephemeral_key: message.ephemeral_key,
                 signed_prekey: message.signed_prekey,
                 one_time_prekey: message.one_time_prekey,
@@ -336,6 +366,7 @@ mod server {
             &self,
             request: TakeInitialMessagesRequest,
         ) -> Result<TakeInitialMessagesResponse> {
+            check_monotonic_timestamp(request.timestamp, now_millis())?;
             let identity_key = request.verify()?;
             let initial_messages = self
                 .store
@@ -445,6 +476,59 @@ mod server {
             assert_eq!(
                 taken.messages,
                 [request(Some(first_message)).message.unwrap()]
+            );
+        }
+
+        #[tokio::test]
+        async fn rejects_unsafe_and_future_timestamps_and_duplicate_opks() {
+            let server = HandshakeServer::new(MemoryStore::default());
+            let bob = XEdDSAPrivateKey::generate();
+            let prekeys = PublishedPrekeys {
+                signed_prekey: [3; 32],
+                signed_prekey_signature: bob.sign([3; 32]),
+                one_time_prekeys: vec![[4; 32]],
+            };
+            // Timestamp above MAX_SAFE_INTEGER is rejected as Malformed.
+            let over_safe =
+                PublishRequest::sign(&bob, &prekeys, crate::MAX_SAFE_INTEGER + 1).unwrap();
+            assert_eq!(
+                server.publish(over_safe).await.unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
+            // Far-future timestamp beyond MAX_CLOCK_SKEW is rejected as StaleTimestamp.
+            let future = now_millis() + crate::MAX_CLOCK_SKEW + 60_000;
+            let future_pub = PublishRequest::sign(&bob, &prekeys, future).unwrap();
+            assert_eq!(
+                server.publish(future_pub).await.unwrap_err().kind(),
+                ErrorKind::StaleTimestamp
+            );
+            let future_take = TakeInitialMessagesRequest::sign(&bob, future);
+            assert_eq!(
+                server
+                    .take_initial_messages(future_take)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
+            let over_safe_take = TakeInitialMessagesRequest::sign(&bob, crate::MAX_SAFE_INTEGER + 1);
+            assert_eq!(
+                server
+                    .take_initial_messages(over_safe_take)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Malformed
+            );
+            // Duplicate OPKs are rejected.
+            let dup = PublishedPrekeys {
+                one_time_prekeys: vec![[4; 32], [4; 32]],
+                ..prekeys
+            };
+            let dup_req = PublishRequest::sign(&bob, &dup, now_millis()).unwrap();
+            assert_eq!(
+                server.publish(dup_req).await.unwrap_err().kind(),
+                ErrorKind::Malformed
             );
         }
     }

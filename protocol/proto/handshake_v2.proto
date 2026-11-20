@@ -1,0 +1,271 @@
+syntax = "proto3";
+
+// Post-quantum handshake service (v2): signed capability manifests, last-resort PQSPKs,
+// signed one-time PQOPKs, non-rotating prekey refills, atomic bundle claims, and two-phase
+// non-destructive initial-message delivery.
+package handshake.v2;
+
+import "party.proto";
+
+// Commitment to one last-resort post-quantum signed prekey inside a CapabilityManifest.
+message PqLastResortCommitment {
+  // ML-KEM suite identifier (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  uint32 suite = 1;
+  // Deterministic 32-byte prekey identifier: SHA-256("pqxdh.v1/id\0" || suite || ek).
+  bytes prekey_id = 2;
+}
+
+// Identity-signed statement of a user's post-quantum policy, active SPK, and last-resort PQSPKs.
+message CapabilityManifest {
+  // Relay audience / server identifier bound into the signature.
+  string audience = 1;
+  // Owner's canonical XEdDSA identity public key (32 bytes).
+  bytes identity_key = 2;
+  // Strictly increasing manifest sequence number per identity (> 0).
+  uint64 manifest_seq = 3;
+  // Prekey generation identifier.
+  uint64 generation = 4;
+  // Issuance time in milliseconds since the Unix epoch (<= 2^53 - 1).
+  uint64 issued_at = 5;
+  // Expiration time in milliseconds since the Unix epoch (<= 2^53 - 1, > issued_at).
+  uint64 expires_at = 6;
+  // Affirmative post-quantum capability flag: true = ON, false = affirmative OFF.
+  bool pq_enabled = 7;
+  // Strict PQ mode: true = refuse classical v1 bundle fetches and omit raw v1 SPK signature.
+  bool strict_pq = 8;
+  // Whether the owner supports continuous post-quantum KEM ratcheting.
+  bool pq_ratchet_supported = 9;
+  // Offered ML-KEM suites in preference order (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  repeated uint32 offered_suites = 10;
+  // Owner's current classical X25519 signed prekey (32 bytes).
+  bytes signed_prekey = 11;
+  // Commitments to the owner's last-resort PQSPK for every offered suite.
+  repeated PqLastResortCommitment pq_last_resort = 12;
+  // Owner's XEdDSA signature (64 bytes) over the canonical manifest signing input.
+  bytes signature = 13;
+}
+
+// A published post-quantum prekey (either a last-resort PQSPK or a one-time PQOPK).
+message PqPrekey {
+  // ML-KEM suite identifier (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  uint32 suite = 1;
+  // Deterministic 32-byte identifier: SHA-256("pqxdh.v1/id\0" || suite || encapsulation_key).
+  bytes prekey_id = 2;
+  // ML-KEM encapsulation key bytes (1568 B for ML-KEM-1024, 1184 B for ML-KEM-768).
+  bytes encapsulation_key = 3;
+  // Domain-separated XEdDSA signature by the owner's identity key (64 bytes).
+  bytes signature = 4;
+}
+
+// Query the server's runtime capabilities and audience identifier.
+message GetServerInfoRequest {}
+
+// The server's runtime capabilities and audience identifier.
+message GetServerInfoResponse {
+  // Whether PQ handshake routes and storage are enabled at runtime.
+  bool pq_enabled = 1;
+  // Supported ML-KEM suite identifiers (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  repeated uint32 supported_suites = 2;
+  // Whether the server supports PQ ratchet header sizes (<= 8 KiB).
+  bool pq_ratchet_supported = 3;
+  // Canonical server audience identifier bound into signed v2 requests and manifests.
+  string server_id = 4;
+  // Whether legacy v1 handshake/mailbox routes are enabled.
+  bool legacy_v1_enabled = 5;
+  // Whether unsigned legacy v1 mailbox Fetch requests are allowed.
+  bool allow_unsigned_fetch = 6;
+}
+
+// Publish a signed CapabilityManifest along with classical and optional PQ prekeys.
+message PublishV2Request {
+  // Signed capability manifest.
+  CapabilityManifest manifest = 1;
+  // Optional legacy raw XEdDSA signature over manifest.signed_prekey (64 bytes) for v1 compat;
+  // MUST be absent when manifest.strict_pq is true.
+  optional bytes signed_prekey_signature = 2;
+  // Classical X25519 one-time prekeys (32 bytes each, unique).
+  repeated bytes one_time_prekeys = 3;
+  // Last-resort PQSPKs (one per offered suite when manifest.pq_enabled is true; empty when false).
+  repeated PqPrekey pq_last_resort = 4;
+  // One-time PQOPKs (for offered suites when manifest.pq_enabled is true; empty when false).
+  repeated PqPrekey pq_one_time_prekeys = 5;
+  // Request timestamp in milliseconds since the Unix epoch (<= 2^53 - 1, within clock skew).
+  uint64 timestamp = 6;
+  // Owner's XEdDSA signature (64 bytes) over canonical PublishV2 signing input.
+  bytes signature = 7;
+}
+
+// Reply to PublishV2Request.
+message PublishV2Response {}
+
+// Remaining PQOPK count for one suite.
+message SuiteCount {
+  // ML-KEM suite identifier.
+  uint32 suite = 1;
+  // Number of unused PQOPKs currently stored for this suite.
+  uint32 count = 2;
+}
+
+// Append fresh classical OPKs and/or signed PQOPKs to the current generation without rotating SPK.
+message RefillPrekeysRequest {
+  // Relay audience / server identifier.
+  string audience = 1;
+  // Owner's canonical XEdDSA identity public key (32 bytes).
+  bytes identity_key = 2;
+  // Current manifest generation to replenish.
+  uint64 generation = 3;
+  // Fresh classical X25519 one-time prekeys (32 bytes each, unique).
+  repeated bytes one_time_prekeys = 4;
+  // Fresh signed PQOPKs.
+  repeated PqPrekey pq_one_time_prekeys = 5;
+  // Request timestamp in milliseconds since the Unix epoch (within clock skew).
+  uint64 timestamp = 6;
+  // Owner's XEdDSA signature (64 bytes) over canonical RefillPrekeys signing input.
+  bytes signature = 7;
+}
+
+// Reply to RefillPrekeysRequest.
+message RefillPrekeysResponse {
+  // Total unused classical one-time prekeys stored for the current generation.
+  uint32 classical_one_time_count = 1;
+  // Total unused PQOPKs stored per suite for the current generation.
+  repeated SuiteCount pq_one_time_counts = 2;
+}
+
+// Non-consuming read of a peer's signed CapabilityManifest.
+message GetManifestRequest {
+  // Peer's canonical XEdDSA identity public key (32 bytes).
+  bytes identity_key = 1;
+}
+
+// Reply to GetManifestRequest.
+message GetManifestResponse {
+  // Peer's signed capability manifest, if published; absent for v1-only users.
+  CapabilityManifest manifest = 1;
+}
+
+// Atomically claim a peer's bundle (popping at most one classical OPK and one PQOPK).
+message ClaimBundleRequest {
+  // Peer's canonical XEdDSA identity public key (32 bytes).
+  bytes identity_key = 1;
+  // Preferred ML-KEM suites in priority order (e.g. [1, 2]); empty requests classical only.
+  repeated uint32 preferred_suites = 2;
+}
+
+// Reply to ClaimBundleRequest.
+message ClaimBundleResponse {
+  // Peer's signed CapabilityManifest if published; absent when falling back to a legacy v1 user.
+  CapabilityManifest manifest = 1;
+  // Peer's classical X25519 signed prekey (32 bytes).
+  bytes signed_prekey = 2;
+  // Optional legacy raw XEdDSA signature over signed_prekey (64 bytes); absent in strict PQ mode.
+  optional bytes signed_prekey_signature = 3;
+  // Popped classical one-time prekey (32 bytes), if available.
+  optional bytes one_time_prekey = 4;
+  // Matching last-resort PQSPK for the negotiated suite, if PQ was negotiated.
+  PqPrekey pq_last_resort = 5;
+  // Popped one-time PQOPK for the negotiated suite, if available.
+  PqPrekey pq_one_time_prekey = 6;
+}
+
+// An initial message supporting both classical X3DH (version = 1) and PQXDH (version = 2).
+message InitialMessageV2 {
+  // Stable server-assigned inbox ID (0 when sending, positive when listed).
+  uint64 id = 1;
+  // Protocol version: 1 = classical X3DH, 2 = PQXDH.
+  uint32 version = 2;
+  // Sender's canonical identity key (32 bytes).
+  bytes identity_key = 3;
+  // Sender's canonical ephemeral X25519 key (32 bytes).
+  bytes ephemeral_key = 4;
+  // Recipient's classical signed prekey used (32 bytes).
+  bytes signed_prekey = 5;
+  // Recipient's classical one-time prekey used (32 bytes), if any.
+  optional bytes one_time_prekey = 6;
+  // The session's encrypted first message (header + content <= 8 KiB).
+  party.v1.EncryptedMessage first_message = 7;
+  // ML-KEM suite identifier (1 or 2 for version 2; 0 for version 1).
+  uint32 pq_suite = 8;
+  // Whether the recipient's last-resort PQSPK was used (false for PQOPK or version 1).
+  bool pq_last_resort = 9;
+  // Deterministic 32-byte ID of the PQ prekey encapsulated to (empty for version 1).
+  bytes pq_prekey_id = 10;
+  // ML-KEM ciphertext (exact suite ct_len for version 2; empty for version 1).
+  bytes pq_ciphertext = 11;
+  // Optional SHA-256 digest of the recipient's verified CapabilityManifest (32 bytes).
+  bytes manifest_digest = 12;
+}
+
+// Deliver a classical (v1) or PQXDH (v2) initial message into a recipient's inbox.
+message SendInitialV2Request {
+  // Recipient's canonical identity key (32 bytes).
+  bytes recipient = 1;
+  // Initial message payload.
+  InitialMessageV2 message = 2;
+}
+
+// Reply to SendInitialV2Request.
+message SendInitialV2Response {
+  // Stable server-assigned inbox ID.
+  uint64 id = 1;
+}
+
+// Recipient-signed non-destructive listing of pending inbox initial messages (both v1 and v2).
+message ListInitialMessagesRequest {
+  // Relay audience / server identifier.
+  string audience = 1;
+  // Recipient's canonical identity key (32 bytes).
+  bytes identity_key = 2;
+  // Maximum number of messages to return (0 for server default).
+  uint32 limit = 3;
+  // Request timestamp in milliseconds since the Unix epoch (within clock skew).
+  uint64 timestamp = 4;
+  // Recipient's XEdDSA signature (64 bytes) over canonical ListInitialMessages signing input.
+  bytes signature = 5;
+}
+
+// Reply to ListInitialMessagesRequest.
+message ListInitialMessagesResponse {
+  // Pending initial messages (both v1 and v2), oldest first.
+  repeated InitialMessageV2 messages = 1;
+}
+
+// Recipient-signed explicit acknowledgement deleting only the specified inbox message IDs.
+message AckInitialMessagesRequest {
+  // Relay audience / server identifier.
+  string audience = 1;
+  // Recipient's canonical identity key (32 bytes).
+  bytes identity_key = 2;
+  // Stable inbox IDs to delete.
+  repeated uint64 ids = 3;
+  // Request timestamp in milliseconds since the Unix epoch (within clock skew).
+  uint64 timestamp = 4;
+  // Recipient's XEdDSA signature (64 bytes) over canonical AckInitialMessages signing input.
+  bytes signature = 5;
+}
+
+// Reply to AckInitialMessagesRequest.
+message AckInitialMessagesResponse {
+  // Number of initial messages deleted.
+  uint32 deleted = 1;
+}
+
+// The v2 post-quantum handshake service.
+service HandshakeService {
+  // Discover runtime PQ capabilities and server audience.
+  rpc GetServerInfo(GetServerInfoRequest) returns (GetServerInfoResponse);
+  // Publish a signed capability manifest and classical/PQ prekeys.
+  rpc PublishV2(PublishV2Request) returns (PublishV2Response);
+  // Append classical/PQ one-time prekeys to the current generation without rotating SPK.
+  rpc RefillPrekeys(RefillPrekeysRequest) returns (RefillPrekeysResponse);
+  // Non-consuming read of a peer's signed capability manifest.
+  rpc GetManifest(GetManifestRequest) returns (GetManifestResponse);
+  // Atomically claim a peer's prekey bundle (PQ or classical fallback).
+  rpc ClaimBundle(ClaimBundleRequest) returns (ClaimBundleResponse);
+  // Leave a classical (v1) or PQXDH (v2) initial message in a recipient's inbox.
+  rpc SendInitialV2(SendInitialV2Request) returns (SendInitialV2Response);
+  // Non-destructively list pending initial messages (both v1 and v2).
+  rpc ListInitialMessages(ListInitialMessagesRequest) returns (ListInitialMessagesResponse);
+  // Explicitly delete acknowledged initial messages by ID.
+  rpc AckInitialMessages(AckInitialMessagesRequest) returns (AckInitialMessagesResponse);
+}

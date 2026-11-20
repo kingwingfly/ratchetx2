@@ -28,8 +28,12 @@ storage = { path = "../storage", default-features = false }
 # The `#[durable_object]` macro expands to wasm-bindgen code.
 wasm-bindgen = "0.2"
 worker = "0.8"
+xeddsa = { path = "../xeddsa" }
 
 [features]
+default = ["pq"]
+# Optional post-quantum handshake.v2 and mailbox.v2 routes & storage (zero ML-KEM deps).
+pq = ["protocol/pq", "storage/pq"]
 # `POST /conformance` runs the storage conformance suites against the bindings, which must be
 # empty, e.g. a fresh `wrangler dev`. Never deploy it.
 conformance = ["storage/testing"]

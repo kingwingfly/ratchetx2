@@ -3524,6 +3524,7 @@ impl Inner {
     fn greeting(&self) -> Kind {
         Kind::Hello(Hello {
             name: self.state.name.clone(),
+            ..Hello::default()
         })
     }
 
@@ -3935,6 +3936,7 @@ mod tests {
         // The longest greeting is far below the 4 KiB a first message may take.
         let greeting = Kind::Hello(Hello {
             name: "😀".repeat(NAME_MAX),
+            ..Hello::default()
         });
         assert!(greeting.to_bytes().len() < 512);
     }
