@@ -118,20 +118,39 @@ impl Party {
         config: KemRatchetConfig,
     ) -> Self {
         let mut party = Self::new(ratchet, associated_data);
-        party.enable_pq_ratchet_with_config(suite, config);
+        party.kem_ratchet = Some(KemRatchet::with_config(suite, config));
         party
     }
 
     /// Enable post-quantum KEM ratcheting on this party using default cadence.
+    ///
+    /// If the same `suite` is already enabled, this is a no-op so pending KEM offer seeds and
+    /// active ciphertexts are preserved. Returns [`ErrorKind::Crypto`] if a different PQ suite
+    /// is already enabled.
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    pub fn enable_pq_ratchet(&mut self, suite: PqSuite) {
-        self.enable_pq_ratchet_with_config(suite, KemRatchetConfig::default());
+    pub fn enable_pq_ratchet(&mut self, suite: PqSuite) -> Result<()> {
+        self.enable_pq_ratchet_with_config(suite, KemRatchetConfig::default())
     }
 
     /// Enable post-quantum KEM ratcheting on this party with custom rekey cadence.
+    ///
+    /// If the same `suite` is already enabled, this is a no-op so pending KEM offer seeds and
+    /// active ciphertexts are preserved. Returns [`ErrorKind::Crypto`] if a different PQ suite
+    /// is already enabled.
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    pub fn enable_pq_ratchet_with_config(&mut self, suite: PqSuite, config: KemRatchetConfig) {
+    pub fn enable_pq_ratchet_with_config(
+        &mut self,
+        suite: PqSuite,
+        config: KemRatchetConfig,
+    ) -> Result<()> {
+        if let Some(existing) = &self.kem_ratchet {
+            if existing.suite() == suite {
+                return Ok(());
+            }
+            return Err(ErrorKind::Crypto.into());
+        }
         self.kem_ratchet = Some(KemRatchet::with_config(suite, config));
+        Ok(())
     }
 
     /// The configured post-quantum KEM suite, if PQ ratcheting is enabled.
@@ -561,6 +580,9 @@ struct PartyUnchecked {
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     #[serde(default)]
     kem_ratchet: Option<KemRatchet>,
+    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+    #[serde(default)]
+    kem_ratchet: Option<serde::de::IgnoredAny>,
 }
 
 #[cfg(feature = "serde")]
@@ -568,6 +590,11 @@ impl TryFrom<PartyUnchecked> for Party {
     type Error = Error;
 
     fn try_from(raw: PartyUnchecked) -> Result<Self> {
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        if raw.kem_ratchet.is_some() {
+            // Fail closed: never silently drop PQ ratchet state on a non-PQ build.
+            return Err(ErrorKind::MalformedState.into());
+        }
         let party = Self {
             ratchet: raw.ratchet,
             skipped_message_keys: raw.skipped_message_keys,
@@ -1278,6 +1305,37 @@ mod test {
                 serde_json::from_str(&serde_json::to_string(&bob).unwrap()).unwrap();
             val["message_number_receiver"] = serde_json::json!(5);
             assert!(serde_json::from_value::<Party>(val).is_err());
+
+            #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+            {
+                // Non-PQ build MUST fail closed if serde JSON contains a non-null `kem_ratchet`.
+                let mut with_pq: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(&bob).unwrap()).unwrap();
+                with_pq["kem_ratchet"] = serde_json::json!({"suite": "MlKem1024"});
+                assert!(serde_json::from_value::<Party>(with_pq).is_err());
+
+                // Explicit null `kem_ratchet` (a classical party serialized by a PQ build) loads OK.
+                let mut with_null: serde_json::Value =
+                    serde_json::from_str(&serde_json::to_string(&bob).unwrap()).unwrap();
+                with_null["kem_ratchet"] = serde_json::Value::Null;
+                assert!(serde_json::from_value::<Party>(with_null).is_ok());
+            }
+        }
+
+        #[cfg(all(
+            feature = "prost",
+            not(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
+        ))]
+        {
+            // Non-PQ build MUST fail closed if protobuf state contains `kem_ratchet`.
+            let mut with_pq = crate::proto::Party::from(&bob);
+            let mut kem = ratchetx2::proto::KemRatchet::default();
+            kem.suite = 1;
+            with_pq.kem_ratchet = Some(kem);
+            assert_eq!(
+                Party::try_from(&with_pq).unwrap_err().kind(),
+                ErrorKind::MalformedState
+            );
         }
 
         #[cfg(feature = "rkyv")]
@@ -1429,6 +1487,44 @@ mod test {
                     bob.decrypt(&a_cur).unwrap_err().kind(),
                     ErrorKind::DuplicateMessage
                 );
+            }
+        }
+
+        #[test]
+        fn enable_pq_ratchet_is_idempotent_and_rejects_suite_change() {
+            for suite in enabled_suites() {
+                let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::default());
+                // Alice sends A0 carrying an active offer ek_A0; Bob responds with ct_A0.
+                let a0 = alice.encrypt(b"a0").unwrap();
+                assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
+                let b0 = bob.encrypt(b"b0").unwrap();
+                assert_eq!(alice.kem_ratchet.as_ref().unwrap().pending_offer_count(), 1);
+
+                // Re-enabling the same suite MUST be a no-op (preserving pending offer seeds).
+                alice.enable_pq_ratchet(suite).unwrap();
+                alice
+                    .enable_pq_ratchet_with_config(suite, KemRatchetConfig::every_turn())
+                    .unwrap();
+                assert_eq!(alice.kem_ratchet.as_ref().unwrap().pending_offer_count(), 1);
+
+                // Switching to a different PQ suite MUST fail without dropping pending offers.
+                #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                {
+                    let other = match suite {
+                        PqSuite::MlKem1024 => PqSuite::MlKem768,
+                        PqSuite::MlKem768 => PqSuite::MlKem1024,
+                    };
+                    assert_eq!(
+                        alice.enable_pq_ratchet(other).unwrap_err().kind(),
+                        ErrorKind::Crypto
+                    );
+                    assert_eq!(alice.pq_suite(), Some(suite));
+                    assert_eq!(alice.kem_ratchet.as_ref().unwrap().pending_offer_count(), 1);
+                }
+
+                // Bob's in-flight ct_A0 MUST still decapsulate and decrypt cleanly!
+                assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
+                assert_eq!(alice.kem_ratchet.as_ref().unwrap().pending_offer_count(), 0);
             }
         }
 
