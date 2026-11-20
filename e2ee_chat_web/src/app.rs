@@ -2098,6 +2098,11 @@ fn NewChat(
         event.prevent_default();
         start(false);
     };
+    let local_pq_enabled = ui().me.with_untracked(|me| {
+        me.as_ref().is_some_and(|me| {
+            me.pq_config.pq_enabled && !me.pq_config.offered_suites().is_empty()
+        })
+    });
     view! {
         <form on:submit=submit>
             <h2>"New chat"</h2>
@@ -2106,11 +2111,23 @@ fn NewChat(
                 "with your name starts the session."
             </p>
             {pq_pinned.then(|| {
-                view! {
-                    <p class="pq-pin-hint">
-                        <span class="sec-badge pq">"PQ pinned"</span>
-                        " This invitation expects post-quantum encryption and will refuse classical downgrades."
-                    </p>
+                if local_pq_enabled {
+                    view! {
+                        <p class="pq-pin-hint">
+                            <span class="sec-badge pq">"PQ pinned"</span>
+                            " This invitation expects post-quantum encryption and will refuse classical downgrades."
+                        </p>
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <p class="warning">
+                            "This invitation expects post-quantum encryption, but post-quantum \
+                             encryption is disabled or not compiled into this client; starting a \
+                             chat here will use classical encryption only."
+                        </p>
+                    }
+                    .into_any()
                 }
             })}
             <label for="peer-key">"Their identity key"</label>
@@ -2464,8 +2481,10 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     let Some((contact, me)) = ui.contact(&peer).zip(ui.me.get_untracked()) else {
         return ().into_any();
     };
-    let request = contact.request;
-    let name = RwSignal::new(if request {
+    let live_contact = move || ui.contact(&peer);
+    let is_request = move || live_contact().is_some_and(|c| c.request);
+    let is_quarantined = move || live_contact().is_some_and(|c| c.is_quarantined());
+    let name = RwSignal::new(if contact.request {
         contact.hello_name.clone()
     } else {
         contact.name.clone()
@@ -2475,9 +2494,14 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
+        let req = is_request();
+        if req && is_quarantined() {
+            ui.notify("Allow classical encryption or upgrade to PQ before accepting this request.");
+            return;
+        }
         let engine = engine();
         act_while(busy, async move {
-            if request {
+            if req {
                 engine.accept(peer, name.get_untracked()).await?;
             } else {
                 engine.rename(peer, name.get_untracked()).await?;
@@ -2498,7 +2522,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             Ok(())
         });
     };
-    let intro = if request {
+    let intro = if contact.request {
         match contact.hello_name.as_str() {
             "" => format!("{} wants to chat.", short(&peer)),
             hello => format!("{} wants to chat, and goes by “{hello}”.", short(&peer)),
@@ -2506,7 +2530,6 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     } else {
         format!("Your chat with {}.", contact.label())
     };
-    let live_contact = move || ui.contact(&peer);
     let pq_available = move || {
         ui.me.with(|me| {
             me.as_ref().is_some_and(|me| {
@@ -2516,7 +2539,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     };
     view! {
         <form on:submit=submit>
-            <h2>{if request { "Chat request" } else { "Chat" }}</h2>
+            <h2>{move || if is_request() { "Chat request" } else { "Chat" }}</h2>
             <p>
                 {intro}
                 " To be sure it is them, compare the safety number with them in person or over "
@@ -2616,7 +2639,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                     disabled=move || busy.get()
                     on:click=delete
                 >
-                    {move || match (confirm_delete.get(), request) {
+                    {move || match (confirm_delete.get(), is_request()) {
                         (false, true) => "Delete request",
                         (false, false) => "Delete chat",
                         (true, _) => "Delete it and its history?",
@@ -2625,9 +2648,11 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                 <button type="button" class="btn" on:click=move |_| close_dialog()>
                     "Cancel"
                 </button>
-                <button class="btn primary" type="submit" disabled=move || busy.get()>
-                    {if request { "Accept" } else { "Save" }}
-                </button>
+                <Show when=move || !(is_request() && is_quarantined())>
+                    <button class="btn primary" type="submit" disabled=move || busy.get()>
+                        {move || if is_request() { "Accept" } else { "Save" }}
+                    </button>
+                </Show>
             </div>
         </form>
     }

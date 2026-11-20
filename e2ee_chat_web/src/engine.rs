@@ -13,6 +13,8 @@ use std::{
 
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use bytes::Bytes;
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+use prost::Message as _;
 use futures::{
     channel::oneshot,
     future::{Either, select},
@@ -947,24 +949,46 @@ impl Engine {
                 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                 {
                     let client = Fetch::client(&inner.server);
-                    let v2_req = PushV2Request {
-                        sender: push_req.sender.clone(),
-                        recipient: push_req.recipient.clone(),
-                        message: push_req.message.clone(),
-                        initial_message: push_req
-                            .initial_message
-                            .as_ref()
-                            .map(WireInitialMessageV2::from),
-                        delivery_hash: push_req.delivery_hash.clone(),
-                        client_message_id: Bytes::from(farewell.client_message_id.clone()),
+                    let v2_req = if !farewell.push_v2.is_empty() {
+                        PushV2Request::decode(farewell.push_v2.as_slice()).unwrap_or_else(|_| {
+                            PushV2Request {
+                                sender: push_req.sender.clone(),
+                                recipient: push_req.recipient.clone(),
+                                message: push_req.message.clone(),
+                                initial_message: push_req
+                                    .initial_message
+                                    .as_ref()
+                                    .map(WireInitialMessageV2::from),
+                                delivery_hash: push_req.delivery_hash.clone(),
+                                client_message_id: Bytes::from(farewell.client_message_id.clone()),
+                            }
+                        })
+                    } else {
+                        PushV2Request {
+                            sender: push_req.sender.clone(),
+                            recipient: push_req.recipient.clone(),
+                            message: push_req.message.clone(),
+                            initial_message: push_req
+                                .initial_message
+                                .as_ref()
+                                .map(WireInitialMessageV2::from),
+                            delivery_hash: push_req.delivery_hash.clone(),
+                            client_message_id: Bytes::from(farewell.client_message_id.clone()),
+                        }
                     };
                     match client.push_v2(v2_req).await {
                         Ok(_) => Ok(()),
-                        Err(e) if e.kind() == session::protocol::ErrorKind::Unimplemented => client
-                            .push(push_req)
-                            .await
-                            .map(|_| ())
-                            .map_err(session::Error::from),
+                        Err(e) if e.kind() == session::protocol::ErrorKind::Unimplemented => {
+                            if inner.client.pq_config().strict_pq {
+                                Err(ErrorKind::PqRequired.into())
+                            } else {
+                                client
+                                    .push(push_req)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(session::Error::from)
+                            }
+                        }
                         Err(e) => Err(e.into()),
                     }
                 }
@@ -1491,17 +1515,12 @@ impl Engine {
                             match inner.contacts.iter().position(|c| c.peer == peer) {
                                 Some(index) => {
                                     let contact = &mut inner.contacts[index];
-                                    contact.state.quarantined = true;
-                                    contact.state.quarantined_was_pq_pinned = peer_was_pq_pinned;
-                                    contact.state.quarantined_session =
-                                        Some(session.state().into());
-                                    contact.state.quarantined_first_message = first_message;
-                                    contact.state.last_activity = now();
-                                    if peer_was_pq_pinned {
-                                        contact.session.peer_pq_state_mut().downgrade_detected =
-                                            true;
-                                        contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                                    }
+                                    contact.record_quarantined_initial(
+                                        Some(session.state().into()),
+                                        first_message,
+                                        peer_was_pq_pinned,
+                                        now(),
+                                    );
                                 }
                                 None => {
                                     let alert = if peer_was_pq_pinned {
@@ -1516,6 +1535,7 @@ impl Engine {
                                             peer: peer.to_vec(),
                                             request: true,
                                             quarantined: true,
+                                            quarantined_primary: true,
                                             quarantined_was_pq_pinned: peer_was_pq_pinned,
                                             quarantined_first_message: first_message,
                                             security_alert: alert,
@@ -2007,21 +2027,31 @@ impl Engine {
                 self.take_initial_messages().await?;
                 let mut guard = self.inner.lock().await;
                 if let Some(inner) = guard.as_mut() {
+                    let mut joined = false;
                     for initial_message in carried_initials.iter().chain(&initial_messages) {
-                        if inner.join_carried(peer, initial_message).await? {
-                            recommend_upgrade = true;
-                        }
+                        let (added, upgrade) = inner.join_carried(peer, initial_message).await?;
+                        joined |= added;
+                        recommend_upgrade |= upgrade;
                     }
                     if let Some(contact) = inner.contact(peer) {
                         contact.session.skip_stalled();
                     }
+                    if joined && self.ui.open.get_untracked() == Some(*peer) {
+                        inner.saved_late.retain(|p| p != peer);
+                        self.show_history(inner, peer).await;
+                    }
                     self.ui.contacts.set(inner.views());
                 }
             } else if !carried_initials.is_empty() {
+                let mut joined = false;
                 for initial_message in &carried_initials {
-                    if inner.join_carried(peer, initial_message).await? {
-                        recommend_upgrade = true;
-                    }
+                    let (added, upgrade) = inner.join_carried(peer, initial_message).await?;
+                    joined |= added;
+                    recommend_upgrade |= upgrade;
+                }
+                if joined && self.ui.open.get_untracked() == Some(*peer) {
+                    inner.saved_late.retain(|p| p != peer);
+                    self.show_history(inner, peer).await;
                 }
                 self.ui.contacts.set(inner.views());
             }
@@ -3839,13 +3869,17 @@ impl Engine {
         }
     }
 
-    /// Accept the request of `peer`, naming the peer `name`.
+    /// Accept the request of `peer`, naming the peer `name`. Refuses while the contact is
+    /// quarantined pending explicit classical approval or post-quantum upgrade.
     pub async fn accept(&self, peer: PublicKey, name: String) -> Result<(), String> {
-        self.change_contact(peer, |contact| {
-            contact.state.request = false;
-            contact.state.name = name.trim().to_string();
-        })
-        .await?;
+        {
+            let mut guard = self.inner.lock().await;
+            let inner = guard.as_mut().ok_or("locked")?;
+            let contact = inner.contact(&peer).ok_or("no such chat")?;
+            contact.accept_request(&name)?;
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+            self.ui.contacts.set(inner.views());
+        }
         // The peer learns what was read of the request.
         self.wake();
         Ok(())
@@ -3915,11 +3949,7 @@ impl Engine {
                 && Some(&sealed.session) == active.as_ref()
             {
                 let sealed_msg = sealed.record.unwrap_or_default().to_push();
-                let cid = sealed_msg.client_message_id().to_vec();
-                farewell.push(Farewell {
-                    push: Some(contact.session.push_request(sealed_msg)),
-                    client_message_id: cid,
-                });
+                farewell.push(build_farewell(contact, sealed_msg));
                 if let (Some(events), Some(told)) = (&mut events, &sealed.events) {
                     forget_told(events, told);
                 }
@@ -3931,11 +3961,7 @@ impl Engine {
                 .chain([deleted])
             {
                 if let Ok(message) = contact.session.encrypt(&content) {
-                    let cid = message.client_message_id().to_vec();
-                    farewell.push(Farewell {
-                        push: Some(contact.session.push_request(message)),
-                        client_message_id: cid,
-                    });
+                    farewell.push(build_farewell(contact, message));
                 }
             }
         }
@@ -4031,7 +4057,7 @@ impl Engine {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
             let previous = inner.client.pq_config().clone();
-            if previous == config {
+            if previous == config && !inner.state.needs_publish {
                 return Ok(());
             }
             inner
@@ -4071,18 +4097,25 @@ impl Engine {
                 contact.state.security_alert = SECURITY_ALERT_NONE;
             }
             let mut entries = vec![];
+            let mut replaced_session = false;
             if contact.state.quarantined {
                 let first_message = std::mem::take(&mut contact.state.quarantined_first_message);
                 let held_session = contact.state.quarantined_session.take();
                 contact.state.quarantined = false;
+                contact.state.quarantined_primary = false;
                 contact.state.quarantined_was_pq_pinned = false;
                 contact.session.peer_pq_state_mut().downgrade_detected = false;
                 if contact.state.security_alert == SECURITY_ALERT_DOWNGRADE {
                     contact.state.security_alert = SECURITY_ALERT_NONE;
                 }
                 if let Some(proto_session) = held_session {
-                    let restored =
-                        SessionState::try_from(&proto_session).map_err(|e| describe(&e))?;
+                    let restored = match SessionState::try_from(&proto_session) {
+                        Ok(restored) => restored,
+                        Err(e) => {
+                            inner.roll_back(&peer, snapshot)?;
+                            return Err(describe(&e));
+                        }
+                    };
                     let mut incoming = Session::restore(Fetch::client(&server), restored);
                     incoming
                         .peer_pq_state_mut()
@@ -4091,6 +4124,8 @@ impl Engine {
                         inner.roll_back(&peer, snapshot)?;
                         return Err(describe(&e));
                     }
+                    contact.state.sealed_events = None;
+                    replaced_session = true;
                 }
                 if !first_message.is_empty() {
                     let content = Content::from_bytes(&first_message);
@@ -4106,8 +4141,19 @@ impl Engine {
                     entries.push(contact.add_received(content, open));
                 }
             }
+            let requeued = if replaced_session {
+                match inner.requeue_sealed(&peer).await {
+                    Ok(requeued) => requeued,
+                    Err(e) => {
+                        inner.roll_back(&peer, snapshot)?;
+                        return Err(e);
+                    }
+                }
+            } else {
+                vec![]
+            };
             let recs = records(&peer, &entries);
-            if let Err(e) = inner.save(&recs).await {
+            if let Err(e) = inner.save_with(&recs, &requeued).await {
                 inner.roll_back(&peer, snapshot)?;
                 return Err(describe(&e));
             }
@@ -4142,6 +4188,12 @@ impl Engine {
                 return Err("no such chat".to_string());
             };
             let snapshot = inner.contacts[index].snapshot();
+            // Clear any prior classical exception before attempting PQ upgrade so
+            // `prepare_start_again_v2` cannot silently negotiate another classical session.
+            inner.contacts[index]
+                .session
+                .peer_pq_state_mut()
+                .clear_classical_exception();
             let hello = Kind::Hello(
                 inner.contacts[index]
                     .session
@@ -4192,16 +4244,34 @@ impl Engine {
                     return Err(describe(&e));
                 }
             };
-            if let Some(contact) = inner.contact(&peer) {
-                if contact.session.security().is_some_and(|s| s.is_pq) {
-                    contact.clear_quarantine_and_alerts();
-                } else {
-                    contact.state.security_alert = SECURITY_ALERT_NONE;
-                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                }
+            // Verify that the new session actually negotiated post-quantum encryption.
+            let upgraded_is_pq = inner
+                .contact(&peer)
+                .is_some_and(|c| c.session.security().is_some_and(|s| s.is_pq));
+            if !upgraded_is_pq {
+                inner.roll_back(&peer, snapshot)?;
+                self.ui.contacts.set(inner.views());
+                return Err(
+                    "Could not establish a post-quantum session with this peer (peer or server \
+                     does not have post-quantum encryption enabled)."
+                        .to_string(),
+                );
             }
-            // H-2: Persist upgraded session BEFORE transmitting initial message!
-            if let Err(e) = inner.save(&[]).await {
+            if let Some(contact) = inner.contact(&peer) {
+                contact.clear_quarantine_and_alerts();
+                contact.state.sealed_events = None;
+            }
+            // Requeue any outbox messages sealed on the previous session so they re-encrypt
+            // on the new PQ session instead of pushing old-session ciphertexts with the PQ initial.
+            let requeued = match inner.requeue_sealed(&peer).await {
+                Ok(requeued) => requeued,
+                Err(e) => {
+                    inner.roll_back(&peer, snapshot)?;
+                    return Err(e);
+                }
+            };
+            // H-2: Persist upgraded PQ session + requeued outbox BEFORE transmitting initial!
+            if let Err(e) = inner.save_with(&[], &requeued).await {
                 inner.roll_back(&peer, snapshot)?;
                 return Err(describe(&e));
             }
@@ -4669,21 +4739,70 @@ impl Inner {
         Ok(records)
     }
 
+    /// Requeue any already-sealed outbox items for `peer` so they are re-encrypted onto a newly
+    /// established active session (e.g. after `upgrade_to_pq` or approving a replacement session).
+    async fn requeue_sealed(
+        &mut self,
+        peer: &PublicKey,
+    ) -> Result<Vec<(String, Option<OutgoingRecord>)>, String> {
+        let Some(contact) = self.contact(peer) else {
+            return Ok(vec![]);
+        };
+        let sealed: Vec<u64> = contact
+            .state
+            .outbox
+            .iter()
+            .filter(|outgoing| outgoing.sealed)
+            .map(|outgoing| outgoing.history_index)
+            .collect();
+        if sealed.is_empty() {
+            return Ok(vec![]);
+        }
+        for outgoing in &mut contact.state.outbox {
+            if outgoing.sealed {
+                (outgoing.sealed, outgoing.clock) = (false, 0);
+            }
+        }
+        let mut outbox_records = Vec::with_capacity(sealed.len());
+        for index in sealed {
+            let entry = self
+                .vault
+                .entry(peer, index)
+                .await
+                .map_err(|e| describe(&e))?;
+            let content = match entry {
+                Some(entry) => self
+                    .vault
+                    .content(peer, index, &entry)
+                    .await
+                    .map_err(|e| describe(&e))?,
+                None => None,
+            };
+            let record = OutgoingRecord {
+                message: None,
+                content: content.map(|kind| kind.to_bytes()).unwrap_or_default(),
+                delivery_hash: vec![],
+            };
+            outbox_records.push((outbox_key(peer, index), Some(record)));
+        }
+        Ok(outbox_records)
+    }
+
     /// Accept a carried initial message from `peer` (from a mailbox envelope), enforcing PQ
-    /// quarantine, `accept_replacement`, and `check_peer_hello`. Returns `Ok(true)` if an
-    /// automatic PQ upgrade is recommended.
+    /// quarantine, `accept_replacement`, and `check_peer_hello`. Returns `(joined_entry,
+    /// recommend_upgrade)`.
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     async fn join_carried(
         &mut self,
         peer: &PublicKey,
         initial_message: &InitialMessageV2,
-    ) -> Result<bool, String> {
+    ) -> Result<(bool, bool), String> {
         if *peer == self.client.identity_key() {
-            return Ok(false);
+            return Ok((false, false));
         }
         let peer_state = match self.contacts.iter().find(|c| c.peer == *peer) {
             Some(c) => c.session.peer_pq_state().clone(),
-            None => return Ok(false),
+            None => return Ok((false, false)),
         };
         let mailbox = Fetch::client(&self.server);
         let outcome = match self
@@ -4699,7 +4818,7 @@ impl Inner {
                     contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
                     let _ = self.save(&[]).await;
                 }
-                return Ok(false);
+                return Ok((false, false));
             }
         };
         if initial_message.uses_one_time_prekey() {
@@ -4729,7 +4848,7 @@ impl Inner {
                             contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
                             let _ = self.save(&[]).await;
                         }
-                        return Ok(false);
+                        return Ok((false, false));
                     }
                 }
                 let content = Content::from_bytes(&first_message);
@@ -4750,7 +4869,7 @@ impl Inner {
                     return Err(describe(&e));
                 }
                 self.saved_late.push(*peer);
-                Ok(upgrade)
+                Ok((true, upgrade))
             }
             AcceptedInitial::Quarantined {
                 session,
@@ -4758,16 +4877,14 @@ impl Inner {
                 peer_was_pq_pinned,
             } => {
                 let contact = self.contact(peer).ok_or("no such chat")?;
-                contact.state.quarantined = true;
-                contact.state.quarantined_was_pq_pinned = peer_was_pq_pinned;
-                contact.state.quarantined_session = Some(session.state().into());
-                contact.state.quarantined_first_message = first_message;
-                if peer_was_pq_pinned {
-                    contact.session.peer_pq_state_mut().downgrade_detected = true;
-                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                }
+                contact.record_quarantined_initial(
+                    Some(session.state().into()),
+                    first_message,
+                    peer_was_pq_pinned,
+                    now(),
+                );
                 self.save(&[]).await.map_err(|e| describe(&e))?;
-                Ok(false)
+                Ok((false, false))
             }
         }
     }
@@ -4777,20 +4894,20 @@ impl Inner {
         &mut self,
         peer: &PublicKey,
         initial_message: &InitialMessage,
-    ) -> Result<bool, String> {
+    ) -> Result<(bool, bool), String> {
         if *peer == self.client.identity_key() {
-            return Ok(false);
+            return Ok((false, false));
         }
         let mailbox = Fetch::client(&self.server);
         let Ok((session, first)) = self.client.accept(peer, initial_message, mailbox) else {
-            return Ok(false);
+            return Ok((false, false));
         };
         if initial_message.x3dh.one_time_prekey.is_some() {
             self.state.used_one_time_prekeys += 1;
         }
         let contact = self.contact(peer).ok_or("no such chat")?;
         if contact.session.accept_replacement(session).is_err() {
-            return Ok(false);
+            return Ok((false, false));
         }
         let content = Content::from_bytes(&first);
         if let Some(Kind::Hello(ref hello)) = content.kind {
@@ -4804,7 +4921,7 @@ impl Inner {
             return Err(describe(&e));
         }
         self.saved_late.push(*peer);
-        Ok(false)
+        Ok((true, false))
     }
 
     fn contact(&mut self, peer: &PublicKey) -> Option<&mut Contact> {
@@ -4903,18 +5020,110 @@ fn place_of(clock: u64, state: &ContactState) -> u64 {
     content::place(clock, state.peer_last.max(state.read_by_peer), state.clock)
 }
 
+/// Build a persisted [`Farewell`] for `sealed` on `contact`'s active session, preserving any
+/// carried v2/PQXDH initial message in `push_v2` under PQ builds.
+fn build_farewell(contact: &Contact, sealed: session::Sealed) -> Farewell {
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    {
+        let v2 = contact.session.push_v2_request(sealed.clone());
+        let cid = v2.client_message_id.to_vec();
+        let v2_bytes = v2.encode_to_vec();
+        Farewell {
+            push: Some(contact.session.push_request(sealed)),
+            client_message_id: cid,
+            push_v2: v2_bytes,
+        }
+    }
+    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+    {
+        let cid = sealed.client_message_id().to_vec();
+        Farewell {
+            push: Some(contact.session.push_request(sealed)),
+            client_message_id: cid,
+            push_v2: vec![],
+        }
+    }
+}
+
+/// Pure quarantine helper: whether a contact's primary session itself is unapproved/quarantined.
+fn contact_state_is_new_quarantined(state: &ContactState) -> bool {
+    state.quarantined && state.quarantined_primary
+}
+
+/// Pure quarantine helper: record an incoming quarantined classical initial message on an existing
+/// contact without clearing `quarantined_primary` (preventing a 2nd classical initial from
+/// unblocking `receive()`/`flush()`).
+#[cfg_attr(
+    not(any(feature = "ml-kem-1024", feature = "ml-kem-768", test)),
+    allow(dead_code)
+)]
+fn record_quarantined_initial_state(
+    state: &mut ContactState,
+    held_session: Option<proto::SessionState>,
+    first_message: Vec<u8>,
+    peer_was_pq_pinned: bool,
+    at: u64,
+) {
+    state.quarantined = true;
+    state.quarantined_was_pq_pinned |= peer_was_pq_pinned;
+    state.quarantined_session = held_session;
+    state.quarantined_first_message = first_message;
+    state.last_activity = at;
+    if peer_was_pq_pinned {
+        state.security_alert = SECURITY_ALERT_DOWNGRADE;
+    }
+}
+
+/// Pure helper: accept a chat request only when the contact is NOT quarantined.
+fn accept_contact_request_state(state: &mut ContactState, name: &str) -> Result<(), String> {
+    if state.quarantined {
+        return Err(
+            "Allow classical encryption or upgrade to PQ before accepting this request."
+                .to_string(),
+        );
+    }
+    state.request = false;
+    state.name = name.trim().to_string();
+    Ok(())
+}
+
 impl Contact {
     /// Whether this contact is a brand-new inbound quarantined classical chat (not yet approved).
     fn is_new_quarantined(&self) -> bool {
-        self.state.quarantined
-            && self.state.request
-            && self.state.quarantined_session.is_none()
+        contact_state_is_new_quarantined(&self.state)
+    }
+
+    /// Record an inbound quarantined classical initial message on an existing contact.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    fn record_quarantined_initial(
+        &mut self,
+        held_session: Option<proto::SessionState>,
+        first_message: Vec<u8>,
+        peer_was_pq_pinned: bool,
+        at: u64,
+    ) {
+        record_quarantined_initial_state(
+            &mut self.state,
+            held_session,
+            first_message,
+            peer_was_pq_pinned,
+            at,
+        );
+        if peer_was_pq_pinned {
+            self.session.peer_pq_state_mut().downgrade_detected = true;
+        }
+    }
+
+    /// Accept a non-quarantined chat request, refusing while quarantined.
+    fn accept_request(&mut self, name: &str) -> Result<(), String> {
+        accept_contact_request_state(&mut self.state, name)
     }
 
     /// Clear quarantine state and active security prompts after establishing a verified PQ session.
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     fn clear_quarantine_and_alerts(&mut self) {
         self.state.quarantined = false;
+        self.state.quarantined_primary = false;
         self.state.quarantined_was_pq_pinned = false;
         self.state.quarantined_session = None;
         self.state.quarantined_first_message.clear();
@@ -5449,5 +5658,79 @@ mod tests {
         let c_b1: ChunkOf = (peer_b, shared_id, attachment_key_hash(&key_1), 0);
         assert_ne!(c_a1, c_a2);
         assert_ne!(c_a1, c_b1);
+    }
+
+    #[test]
+    fn quarantined_primary_survives_second_initial_and_blocks_accept() {
+        // Brand-new quarantined classical contact created on first initial message.
+        let mut state = ContactState {
+            peer: vec![0x42; 32],
+            request: true,
+            quarantined: true,
+            quarantined_primary: true,
+            quarantined_first_message: b"msg-1".to_vec(),
+            ..ContactState::default()
+        };
+        assert!(contact_state_is_new_quarantined(&state));
+
+        // Zero-click attacker bypass regression: a 2nd classical initial populates
+        // `quarantined_session`, but `quarantined_primary` MUST remain true so `receive()` and
+        // `flush()` stay blocked until explicit approval.
+        record_quarantined_initial_state(
+            &mut state,
+            Some(proto::SessionState::default()),
+            b"msg-2".to_vec(),
+            false,
+            1234,
+        );
+        assert!(state.quarantined_session.is_some());
+        assert!(state.quarantined_primary);
+        assert!(contact_state_is_new_quarantined(&state));
+        assert_eq!(state.quarantined_first_message, b"msg-2");
+
+        // UI / Engine::accept() bypass regression: accepting while quarantined MUST be refused
+        // and leave `request` and `quarantined_primary` intact.
+        assert!(accept_contact_request_state(&mut state, "Mallory").is_err());
+        assert!(state.request);
+        assert!(state.quarantined);
+        assert!(contact_state_is_new_quarantined(&state));
+
+        // Only after explicit approval clears quarantine can `accept` succeed.
+        state.quarantined = false;
+        state.quarantined_primary = false;
+        assert!(!contact_state_is_new_quarantined(&state));
+        assert!(accept_contact_request_state(&mut state, "  Alice  ").is_ok());
+        assert!(!state.request);
+        assert_eq!(state.name, "Alice");
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[test]
+    fn farewell_push_v2_preserves_carried_initial_message_v2() {
+        let pq_initial = WireInitialMessageV2 {
+            id: 0,
+            version: 2,
+            identity_key: Bytes::from(vec![0x11; 32]),
+            pq_suite: PqConfig::default_suite().as_u8() as u32,
+            pq_prekey_id: Bytes::from(vec![0x33; 32]),
+            pq_ciphertext: Bytes::from(vec![0x44; 64]),
+            ..WireInitialMessageV2::default()
+        };
+        let req = PushV2Request {
+            sender: Bytes::from(vec![0x11; 32]),
+            recipient: Bytes::from(vec![0x22; 32]),
+            message: None,
+            initial_message: Some(pq_initial.clone()),
+            delivery_hash: Bytes::new(),
+            client_message_id: Bytes::from(vec![0xAB; 16]),
+        };
+        let farewell = Farewell {
+            push: None,
+            client_message_id: vec![0xAB; 16],
+            push_v2: req.encode_to_vec(),
+        };
+        let decoded = PushV2Request::decode(farewell.push_v2.as_slice()).expect("decode push_v2");
+        assert_eq!(decoded.initial_message, Some(pq_initial));
+        assert_eq!(decoded.client_message_id.as_ref(), &[0xAB; 16]);
     }
 }

@@ -323,6 +323,10 @@ pub struct ContactState {
     /// Active security alert (`SECURITY_ALERT_*`).
     #[prost(uint32, tag = "23")]
     pub security_alert: u32,
+    /// Whether this contact's primary (active) session itself is an unapproved quarantined
+    /// classical session. Cleared only by explicit classical approval or verified PQ upgrade.
+    #[prost(bool, tag = "24")]
+    pub quarantined_primary: bool,
 }
 
 /// Events encrypted for the peer, waiting to be pushed, see [`ContactState::sealed_events`].
@@ -499,6 +503,9 @@ pub struct Farewell {
     /// Optional deterministic 16-byte `client_message_id` for v2 idempotent `PushV2`.
     #[prost(bytes = "vec", tag = "2")]
     pub client_message_id: Vec<u8>,
+    /// Encoded `protocol::mailbox_v2::PushV2Request` preserving v2/PQXDH carried initial messages.
+    #[prost(bytes = "vec", tag = "3")]
+    pub push_v2: Vec<u8>,
 }
 
 /// A message sent or received.
@@ -672,9 +679,16 @@ impl Vault {
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
         let store = transaction.object_store(STORE)?;
-        store.clear()?;
-        store.put(&bytes(&header_bytes), Some(&HEADER.into()))?;
-        store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
+        let write_res: Result<()> = (|| {
+            store.clear()?;
+            store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
+            store.put(&bytes(&header_bytes), Some(&HEADER.into()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = transaction.abort();
+            return Err(e);
+        }
         commit(transaction).await?;
         Ok(vault)
     }
@@ -712,11 +726,13 @@ impl Vault {
             let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
             let store = transaction.object_store(STORE)?;
             // CAS check inside the upgrade transaction: ensure HEADER wasn't changed concurrently.
-            let current = store
-                .get(JsValue::from_str(HEADER))?
-                .await?
-                .map(|v| Uint8Array::new(&v).to_vec())
-                .ok_or_else(|| Error::Corrupt("no vault".into()))?;
+            let current = match store.get(JsValue::from_str(HEADER))?.await? {
+                Some(v) => Uint8Array::new(&v).to_vec(),
+                None => {
+                    let _ = transaction.abort();
+                    return Err(Error::Corrupt("no vault".into()));
+                }
+            };
             if current != header_bytes {
                 let actual = VaultHeader::decode(current.as_slice())
                     .map(|h| h.revision)
@@ -727,8 +743,15 @@ impl Vault {
                     actual,
                 });
             }
-            store.put(&bytes(&v2_header_bytes), Some(&HEADER.into()))?;
-            store.put(&bytes(&v2_sealed_state), Some(&STATE.into()))?;
+            let write_res: Result<()> = (|| {
+                store.put(&bytes(&v2_sealed_state), Some(&STATE.into()))?;
+                store.put(&bytes(&v2_header_bytes), Some(&HEADER.into()))?;
+                Ok(())
+            })();
+            if let Err(e) = write_res {
+                let _ = transaction.abort();
+                return Err(e);
+            }
             commit(transaction).await?;
 
             let vault = Self {
@@ -801,18 +824,25 @@ impl Vault {
         next_header.revision = next_revision;
         let next_header_bytes = next_header.encode_to_vec();
         let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
-        store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
-        store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
-        self.put_entries(&store, entries)?;
-        for (key, record) in outgoing {
-            match record {
-                Some(record) => {
-                    store.put(&bytes(&self.seal(key, record)), Some(&key.as_str().into()))?;
-                }
-                None => {
-                    store.delete(JsValue::from_str(key))?;
+        let write_res: Result<()> = (|| {
+            self.put_entries(&store, entries)?;
+            for (key, record) in outgoing {
+                match record {
+                    Some(record) => {
+                        store.put(&bytes(&self.seal(key, record)), Some(&key.as_str().into()))?;
+                    }
+                    None => {
+                        store.delete(JsValue::from_str(key))?;
+                    }
                 }
             }
+            store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
+            store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = transaction.abort();
+            return Err(e);
         }
         commit(transaction).await?;
         *self.header.borrow_mut() = next_header;
@@ -954,7 +984,10 @@ impl Vault {
         chunk: &[u8],
     ) -> Result<()> {
         let (transaction, store, _) = self.begin_checked_rw_tx().await?;
-        store.put(&bytes(chunk), Some(&chunk_key(peer, id, index).into()))?;
+        if let Err(e) = store.put(&bytes(chunk), Some(&chunk_key(peer, id, index).into())) {
+            let _ = transaction.abort();
+            return Err(e.into());
+        }
         commit(transaction).await
     }
 
@@ -980,7 +1013,10 @@ impl Vault {
     pub async fn save_upload(&self, peer: &PublicKey, upload: &PendingUpload) -> Result<()> {
         let name = upload_key(peer, &upload.id);
         let (transaction, store, _) = self.begin_checked_rw_tx().await?;
-        store.put(&bytes(&self.seal(&name, upload)), Some(&name.as_str().into()))?;
+        if let Err(e) = store.put(&bytes(&self.seal(&name, upload)), Some(&name.as_str().into())) {
+            let _ = transaction.abort();
+            return Err(e.into());
+        }
         commit(transaction).await
     }
 
@@ -988,7 +1024,10 @@ impl Vault {
     /// deleted from the server.
     pub async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> Result<()> {
         let (transaction, store, _) = self.begin_checked_rw_tx().await?;
-        store.delete(JsValue::from_str(&upload_key(peer, id)))?;
+        if let Err(e) = store.delete(JsValue::from_str(&upload_key(peer, id))) {
+            let _ = transaction.abort();
+            return Err(e.into());
+        }
         commit(transaction).await
     }
 
@@ -1061,13 +1100,20 @@ impl Vault {
         next_header.revision = next_revision;
         let next_header_bytes = next_header.encode_to_vec();
         let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
-        store.delete(history_range(peer, 0, u64::MAX)?)?;
-        for prefix in ["file", "outbox", "attachment", "upload"] {
-            store.delete(prefix_range(&format!("{prefix}/{}/", hex(peer)))?)?;
+        let write_res: Result<()> = (|| {
+            store.delete(history_range(peer, 0, u64::MAX)?)?;
+            for prefix in ["file", "outbox", "attachment", "upload"] {
+                store.delete(prefix_range(&format!("{prefix}/{}/", hex(peer)))?)?;
+            }
+            self.put_entries(&store, entries)?;
+            store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
+            store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = transaction.abort();
+            return Err(e);
         }
-        store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
-        store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
-        self.put_entries(&store, entries)?;
         commit(transaction).await?;
         *self.header.borrow_mut() = next_header;
         Ok(())
