@@ -4,7 +4,7 @@ const RKYV: &str =
     r#"#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]"#;
 /// The message format, from `proto/party.proto`.
 const WIRE: [&str; 2] = [".party.v1.EncryptedMessage", ".party.v1.Header"];
-/// The party's state, from `proto/party_state.proto`, with the `prost` feature.
+/// The party's secret-holding state messages, from `proto/party_state.proto`, with `prost`.
 const STATE: [&str; 3] = [
     ".party.v1.Party",
     ".party.v1.SkippedChain",
@@ -36,6 +36,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
             );
         }
+        // `EvictedRange` holds only public u64 counters (and prost derives `Copy` for it),
+        // so derive `Zeroize` without `ZeroizeOnDrop`.
+        config.type_attribute(".party.v1.EvictedRange", "#[derive(::zeroize::Zeroize)]");
         println!("cargo:rerun-if-changed=../ratchetx2/proto");
     }
     #[cfg(feature = "protox")]

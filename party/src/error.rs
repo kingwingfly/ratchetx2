@@ -54,6 +54,9 @@ pub enum ErrorKind {
     /// The message was received already.
     #[error("duplicate message")]
     DuplicateMessage,
+    /// The message's skipped key was evicted before it arrived; it was never decrypted.
+    #[error("message key was evicted")]
+    EvictedMessage,
     /// The message header does not parse, or its counters are out of range.
     #[error("invalid message header")]
     InvalidHeader,

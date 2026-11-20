@@ -19,4 +19,12 @@ message Header {
   uint64 previous_chain_length = 2;
   // Index of this message in the sender's current sending chain.
   uint64 message_number = 3;
+  // Optional post-quantum KEM suite identifier (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  optional uint32 pq_suite = 4;
+  // Optional post-quantum KEM encapsulation key offered for a future ratchet step.
+  optional bytes pq_public_key = 5;
+  // Optional post-quantum KEM ciphertext encapsulated to the peer's offered key.
+  optional bytes pq_ciphertext = 6;
+  // Optional 16-byte identifier of the peer's encapsulation key used for `pq_ciphertext`.
+  optional bytes pq_key_id = 7;
 }

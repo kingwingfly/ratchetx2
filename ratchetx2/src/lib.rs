@@ -9,6 +9,8 @@
 pub mod document;
 pub mod error;
 pub mod key;
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+pub mod pq;
 #[cfg(feature = "prost")]
 pub mod proto;
 pub mod ratchet;

@@ -41,3 +41,53 @@ message Chain {
   // The header key of the chain's messages (32 bytes).
   bytes header_key = 2;
 }
+
+// State of the optional post-quantum KEM ratchet. Holds 64-byte ML-KEM seeds: keep secret.
+message KemRatchet {
+  // PQ KEM suite identifier (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  uint32 suite = 1;
+  // Rekey cadence in messages sent or received (0 = disabled).
+  uint64 rekey_messages = 2;
+  // Rekey cadence in DH turns without a KEM mix (0 = disabled; 1 = every turn).
+  uint64 rekey_turns = 3;
+  // Pending local KEM offers awaiting peer encapsulation, oldest first.
+  repeated KemPendingOffer pending_offers = 4;
+  // ID of the currently advertised local offer (16 bytes), empty if none.
+  bytes active_offer_id = 5;
+  // Active ciphertext retransmitted on the current sending chain, if any.
+  KemActiveSendCt active_send_ct = 6;
+  // Peer encapsulation key queued for our next sending chain, if any.
+  KemPeerPendingEk peer_pending_ek = 7;
+  // Recently encapsulated peer key IDs (each 16 bytes), oldest first.
+  repeated bytes encapsulated_ek_ids = 8;
+  // Messages sent or received since the last KEM ratchet mix.
+  uint64 messages_since_rekey = 9;
+  // DH turns without a KEM mix since the last KEM ratchet mix.
+  uint64 turns_since_rekey = 10;
+  // Whether an initial offer should be sent on the next outbound message.
+  bool initial_offer_needed = 11;
+}
+
+// A pending local KEM offer (seed only, never the expanded decapsulation key).
+message KemPendingOffer {
+  // 16-byte key identifier.
+  bytes id = 1;
+  // 64-byte ML-KEM (d, z) seed.
+  bytes seed = 2;
+}
+
+// The active KEM ciphertext retransmitted on every message of the current sending chain.
+message KemActiveSendCt {
+  // 16-byte identifier of the peer's encapsulation key.
+  bytes ek_id = 1;
+  // ML-KEM ciphertext bytes.
+  bytes ciphertext = 2;
+}
+
+// A peer's offered KEM encapsulation key queued for our next sending chain.
+message KemPeerPendingEk {
+  // 16-byte identifier of the peer's encapsulation key.
+  bytes ek_id = 1;
+  // ML-KEM encapsulation key bytes.
+  bytes encapsulation_key = 2;
+}

@@ -27,6 +27,7 @@ pub mod proto {
                     .field("message_number_sender", &self.message_number_sender)
                     .field("message_number_receiver", &self.message_number_receiver)
                     .field("skipped_chains", &self.skipped_chains.len())
+                    .field("has_kem_ratchet", &self.kem_ratchet.is_some())
                     .finish_non_exhaustive()
             }
         }
@@ -54,3 +55,5 @@ pub mod proto {
 
 pub use party::Party;
 pub use proto::EncryptedMessage;
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+pub use ratchetx2::pq::{KemRatchet, KemRatchetConfig, PqSuite};
