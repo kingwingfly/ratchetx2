@@ -8,6 +8,7 @@
 pub mod attachment;
 mod clock;
 pub mod error;
+pub mod pq;
 #[cfg(feature = "prost")]
 pub mod proto;
 mod safety;
@@ -21,10 +22,12 @@ pub use error::{Error, ErrorKind, Result};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
 use party::{EncryptedMessage, Party};
+pub use pq::*;
 use prost::Message as _;
 pub use protocol;
 use protocol::{
     attachment::{LocalAttachments, StartUploadRequest},
+    content::{Content, Hello, Kind as ContentKind},
     handshake::{
         self, FetchBundleRequest, LocalHandshake, PublishRequest, SendInitialMessageRequest,
         TakeInitialMessagesRequest,
@@ -37,9 +40,16 @@ use protocol::{
 use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 pub use safety::safety_number;
 use sha2::{Digest, Sha256};
-pub use x3dh::PublicKey;
+pub use x3dh::{PqSuite, PublicKey};
 use x3dh::{LocalPrekeys, PrekeyBundle};
 use xeddsa::XEdDSAPrivateKey;
+#[cfg(any(feature = "prost", feature = "serde"))]
+use xeddsa::XEdDSAPublicKey;
+use zeroize::Zeroizing;
+
+/// Upper bound on queued delivery tokens permitted when restoring saved session state.
+#[cfg(any(feature = "prost", feature = "serde"))]
+const MAX_STORED_DELIVERED: usize = 4096;
 
 /// An initial message from a peer who wants to start a session, with the session's first
 /// message; accept it with [`Client::accept`].
@@ -83,6 +93,49 @@ pub struct Received {
     pub initial_messages: Vec<InitialMessage>,
 }
 
+impl Received {
+    /// Whether this entry represents a message whose skipped key was evicted before arrival
+    /// (permanently lost, with its delivery token queued for server acknowledgement).
+    pub fn is_evicted(&self) -> bool {
+        self.content
+            .as_ref()
+            .is_err_and(|e| e.kind() == ErrorKind::EvictedMessage)
+    }
+}
+
+/// A prepared classical prekey publish request from [`Client::prepare_publish`] or
+/// [`Client::prepare_extend_keys`].
+///
+/// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish`], then call
+/// [`Client::commit_publish`] on success or [`Client::rollback_publish_on_refusal`] on
+/// [`ErrorKind::SignInRequired`].
+#[derive(Debug, Clone)]
+pub struct PreparedPublish {
+    /// The signed v1 publish request to transmit.
+    pub request: PublishRequest,
+    extended: bool,
+    one_time_prekeys: Vec<PublicKey>,
+}
+
+/// A prepared classical session initiation from [`Client::prepare_initiate`].
+///
+/// Persist [`session.state()`](Session::state) BEFORE calling [`Client::send_prepared_initiate`].
+#[derive(Debug)]
+pub struct PreparedInitiate<M> {
+    /// The newly established classical session.
+    pub session: Session<M>,
+    /// The signed-out v1 initial message request to transmit after persisting `session`.
+    pub request: SendInitialMessageRequest,
+}
+
+/// Extract a [`Hello`] greeting from decrypted or outgoing content bytes, if present.
+pub(crate) fn extract_hello(content: &[u8]) -> Option<Hello> {
+    match Content::decode(content).ok()?.kind {
+        Some(ContentKind::Hello(hello)) => Some(hello),
+        _ => None,
+    }
+}
+
 /// Number of earlier sessions with its peer that a [`Session`] keeps, only to decrypt the
 /// messages sent on them; see [`Session::keep`].
 pub const KEPT_SESSIONS: usize = 3;
@@ -122,18 +175,28 @@ pub struct Client<H> {
 /// `rkyv` feature, or with `prost` convert it to a `proto::ClientState`. It holds private keys,
 /// so keep it secret.
 #[derive(Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "RawClientState")
+)]
 #[cfg_attr(
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
 pub struct ClientState {
-    identity: XEdDSAPrivateKey,
-    prekeys: LocalPrekeys,
-    last_timestamp: u64,
+    pub(crate) identity: XEdDSAPrivateKey,
+    pub(crate) prekeys: LocalPrekeys,
+    pub(crate) last_timestamp: u64,
     /// Whether the last publish of the prekeys may have failed, though the server may have
     /// them, its reply being lost, see [`Client::publish_keys`].
-    publishing: bool,
+    pub(crate) publishing: bool,
+    /// User post-quantum preferences (PQ enabled by default when compiled).
+    pub(crate) pq_config: PqConfig,
+    /// Strictly increasing `CapabilityManifest.manifest_seq` published via v2.
+    pub(crate) manifest_seq: u64,
+    /// Prekey generation counter published via v2.
+    pub(crate) prekey_generation: u64,
 }
 
 impl ClientState {
@@ -143,7 +206,62 @@ impl ClientState {
             prekeys: LocalPrekeys::new(),
             last_timestamp: 0,
             publishing: false,
+            pq_config: PqConfig::default(),
+            manifest_seq: 0,
+            prekey_generation: 0,
         }
+    }
+
+    /// This client's post-quantum configuration.
+    pub fn pq_config(&self) -> &PqConfig {
+        &self.pq_config
+    }
+
+    #[cfg(any(feature = "prost", feature = "serde"))]
+    fn validate(&self) -> Result<()> {
+        if self.last_timestamp > protocol::MAX_SAFE_INTEGER
+            || self.manifest_seq > protocol::MAX_SAFE_INTEGER
+            || self.prekey_generation > protocol::MAX_SAFE_INTEGER
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        self.pq_config.validate()?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(rename = "ClientState")]
+struct RawClientState {
+    identity: XEdDSAPrivateKey,
+    prekeys: LocalPrekeys,
+    last_timestamp: u64,
+    publishing: bool,
+    #[serde(default)]
+    pq_config: PqConfig,
+    #[serde(default)]
+    manifest_seq: u64,
+    #[serde(default)]
+    prekey_generation: u64,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawClientState> for ClientState {
+    type Error = Error;
+
+    fn try_from(raw: RawClientState) -> Result<Self> {
+        let state = Self {
+            identity: raw.identity,
+            prekeys: raw.prekeys,
+            last_timestamp: raw.last_timestamp,
+            publishing: raw.publishing,
+            pq_config: raw.pq_config,
+            manifest_seq: raw.manifest_seq,
+            prekey_generation: raw.prekey_generation,
+        };
+        state.validate()?;
+        Ok(state)
     }
 }
 
@@ -155,6 +273,12 @@ impl From<&ClientState> for proto::ClientState {
             prekeys: Some((&state.prekeys).into()),
             last_timestamp: state.last_timestamp,
             publishing: state.publishing,
+            pq_disabled: !state.pq_config.pq_enabled,
+            preferred_pq_suite: u32::from(state.pq_config.preferred_suite.as_u8()),
+            pq_ratchet_disabled: !state.pq_config.pq_ratchet_enabled,
+            strict_pq: state.pq_config.strict_pq,
+            manifest_seq: state.manifest_seq,
+            prekey_generation: state.prekey_generation,
         }
     }
 }
@@ -168,7 +292,24 @@ impl TryFrom<&proto::ClientState> for ClientState {
             .ok()
             .and_then(XEdDSAPrivateKey::from_bytes)
             .ok_or(ErrorKind::MalformedState)?;
-        Ok(Self {
+        let preferred_suite = match state.preferred_pq_suite {
+            0 => PqConfig::default_suite(),
+            v => u8::try_from(v)
+                .ok()
+                .and_then(PqSuite::from_u8)
+                .ok_or(ErrorKind::MalformedState)?,
+        };
+        let has_pq = cfg!(any(feature = "ml-kem-1024", feature = "ml-kem-768"));
+        if state.strict_pq && (state.pq_disabled || !has_pq) {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        let pq_config = PqConfig {
+            pq_enabled: has_pq && !state.pq_disabled,
+            preferred_suite,
+            pq_ratchet_enabled: has_pq && !state.pq_ratchet_disabled,
+            strict_pq: state.strict_pq,
+        };
+        let restored = Self {
             identity,
             prekeys: state
                 .prekeys
@@ -178,7 +319,12 @@ impl TryFrom<&proto::ClientState> for ClientState {
                 .unwrap_or_default(),
             last_timestamp: state.last_timestamp,
             publishing: state.publishing,
-        })
+            pq_config,
+            manifest_seq: state.manifest_seq,
+            prekey_generation: state.prekey_generation,
+        };
+        restored.validate()?;
+        Ok(restored)
     }
 }
 
@@ -212,6 +358,139 @@ impl<H> Client<H> {
     pub fn clock(&self) -> &ServerClock {
         &self.clock
     }
+
+    /// Current post-quantum security configuration.
+    pub fn pq_config(&self) -> &PqConfig {
+        &self.state.pq_config
+    }
+
+    /// Update this client's post-quantum configuration, validating suite support and `strict_pq`
+    /// invariants.
+    pub fn set_pq_config(&mut self, config: PqConfig) -> Result<()> {
+        if config.pq_enabled && !config.preferred_suite.is_supported() {
+            return Err(ErrorKind::UnsupportedSuite.into());
+        }
+        config.validate()?;
+        self.state.pq_config = config;
+        Ok(())
+    }
+
+    /// Builder-style helper setting this client's post-quantum configuration.
+    pub fn with_pq_config(mut self, config: PqConfig) -> Result<Self> {
+        self.set_pq_config(config)?;
+        Ok(self)
+    }
+
+    /// Monotonic `CapabilityManifest.manifest_seq` last prepared/published by this client.
+    pub fn manifest_seq(&self) -> u64 {
+        self.state.manifest_seq
+    }
+
+    /// Prekey generation number last prepared/published via v2 by this client.
+    pub fn prekey_generation(&self) -> u64 {
+        self.state.prekey_generation
+    }
+
+    /// Latest local signed prekey, if any generation has been generated.
+    pub fn current_signed_prekey(&self) -> Option<PublicKey> {
+        self.state.prekeys.current_signed_prekey()
+    }
+
+    /// Number of unused classical one-time prekeys in the latest local generation.
+    pub fn current_one_time_count(&self) -> usize {
+        self.state.prekeys.current_one_time_count()
+    }
+
+    /// Number of unused post-quantum one-time prekeys for `suite` in the latest local generation.
+    pub fn current_pq_one_time_count(&self, suite: PqSuite) -> usize {
+        self.state.prekeys.current_pq_one_time_count(suite)
+    }
+
+    /// Build a [`Hello`] greeting reflecting this client's current [`PqConfig`] and `session_seq`.
+    pub fn make_hello(&self, name: impl Into<String>, session_seq: u64) -> Hello {
+        let offered = self.state.pq_config.offered_suites();
+        let pq_capable = self.state.pq_config.pq_enabled && !offered.is_empty();
+        Hello {
+            name: name.into(),
+            pq_capable,
+            max_version: if pq_capable { x3dh::PQXDH_VERSION } else { 1 },
+            session_seq,
+            offered_suites: offered.into_iter().map(|s| u32::from(s.as_u8())).collect(),
+            pq_ratchet_capable: pq_capable && self.state.pq_config.pq_ratchet_enabled,
+        }
+    }
+
+    /// Prepare a classical v1 prekey publish request without sending it over the network yet.
+    ///
+    /// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish`], then call
+    /// [`Client::commit_publish`] on success or [`Client::rollback_publish_on_refusal`] on
+    /// [`ErrorKind::SignInRequired`].
+    pub fn prepare_publish(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
+        let extended = self.state.publishing;
+        let published = if extended {
+            self.state
+                .prekeys
+                .extend(&self.state.identity, one_time_count)
+        } else {
+            self.state
+                .prekeys
+                .generate(&self.state.identity, one_time_count)
+        };
+        self.state.publishing = true;
+        let timestamp = self.next_timestamp()?;
+        let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
+        Ok(PreparedPublish {
+            request,
+            extended,
+            one_time_prekeys: published.one_time_prekeys,
+        })
+    }
+
+    /// Prepare a classical v1 publish that replenishes `one_time_count` one-time prekeys on the
+    /// current generation WITHOUT rotating the signed prekey (generates a generation if none
+    /// exists yet).
+    pub fn prepare_extend_keys(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
+        let had_gen = self.state.prekeys.generation_count() > 0;
+        let published = self
+            .state
+            .prekeys
+            .extend(&self.state.identity, one_time_count);
+        self.state.publishing = true;
+        let timestamp = self.next_timestamp()?;
+        let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
+        Ok(PreparedPublish {
+            request,
+            extended: had_gen,
+            one_time_prekeys: published.one_time_prekeys,
+        })
+    }
+
+    /// Mark a prepared classical publish as confirmed by the server.
+    pub fn commit_publish(&mut self, _prepared: PreparedPublish) {
+        self.state.publishing = false;
+    }
+
+    /// Retract newly added one-time prekeys from a prepared classical publish that was refused
+    /// before storage (e.g. [`ErrorKind::SignInRequired`]).
+    pub fn rollback_publish_on_refusal(&mut self, prepared: PreparedPublish) {
+        if prepared.extended {
+            self.state.prekeys.retract(&prepared.one_time_prekeys);
+        }
+    }
+
+    /// Milliseconds since the Unix epoch by the server's [clock](Self::clock), strictly
+    /// increasing and bounded by `protocol::MAX_SAFE_INTEGER`.
+    pub(crate) fn next_timestamp(&mut self) -> Result<u64> {
+        let next = self
+            .clock
+            .now()
+            .max(self.state.last_timestamp.saturating_add(1));
+        if next > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::Protocol.into());
+        }
+        self.state.last_timestamp = next;
+        Ok(next)
+    }
 }
 
 impl<H: LocalHandshake> Client<H> {
@@ -225,6 +504,12 @@ impl<H: LocalHandshake> Client<H> {
         self.identity_key
     }
 
+    /// Transmit a prepared classical publish request (after persisting [`Client::state`]).
+    pub async fn transmit_publish(&self, prepared: &PreparedPublish) -> Result<()> {
+        self.handshake.publish(prepared.request.clone()).await?;
+        Ok(())
+    }
+
     /// Generate and publish a signed prekey and `one_time_count` one-time prekeys, replacing
     /// the published ones.
     ///
@@ -236,44 +521,50 @@ impl<H: LocalHandshake> Client<H> {
     /// the server hands out. One refused for want of a sign-in, which the server keeps none of,
     /// forgets the one-time prekeys it added to them, so that publishing again while signed out
     /// does not add up keys. Save the state after this, failed or not.
+    ///
+    /// For persist-before-transmit flows, use [`Client::prepare_publish`], persist
+    /// [`Client::state`], then call [`Client::transmit_publish`] and [`Client::commit_publish`].
     pub async fn publish_keys(&mut self, one_time_count: usize) -> Result<()> {
-        let extended = self.state.publishing;
-        let published = if extended {
-            self.state
-                .prekeys
-                .extend(&self.state.identity, one_time_count)
-        } else {
-            self.state
-                .prekeys
-                .generate(&self.state.identity, one_time_count)
-        };
-        self.state.publishing = true;
-        let timestamp = self.next_timestamp();
-        let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
-        match self.handshake.publish(request).await {
-            Ok(_) => {
-                self.state.publishing = false;
+        let prepared = self.prepare_publish(one_time_count)?;
+        match self.transmit_publish(&prepared).await {
+            Ok(()) => {
+                self.commit_publish(prepared);
                 Ok(())
             }
-            Err(e) if extended && e.kind() == protocol::ErrorKind::SignInRequired => {
-                self.state.prekeys.retract(&published.one_time_prekeys);
-                Err(e.into())
+            Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                self.rollback_publish_on_refusal(prepared);
+                Err(e)
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 
-    /// Start a session with `peer`, whose first message is `content`: fetch the peer's prekeys,
-    /// run X3DH, and leave the initial message, with the first message, in the peer's inbox.
-    ///
-    /// The first message shows the peer that the initial message is this client's, and lets the
-    /// peer write back at once. It can be empty.
-    pub async fn initiate<M>(
+    /// Replenish `one_time_count` classical one-time prekeys on the current generation without
+    /// rotating the signed prekey (generates a generation if none exists yet).
+    pub async fn extend_keys(&mut self, one_time_count: usize) -> Result<()> {
+        let prepared = self.prepare_extend_keys(one_time_count)?;
+        match self.transmit_publish(&prepared).await {
+            Ok(()) => {
+                self.commit_publish(prepared);
+                Ok(())
+            }
+            Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                self.rollback_publish_on_refusal(prepared);
+                Err(e)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Prepare starting a classical session with `peer` without sending the initial message yet,
+    /// so the caller can persist [`PreparedInitiate::session`] BEFORE calling
+    /// [`Client::send_prepared_initiate`].
+    pub async fn prepare_initiate<M>(
         &mut self,
         peer: &PublicKey,
         content: &[u8],
         mailbox: M,
-    ) -> Result<Session<M>> {
+    ) -> Result<PreparedInitiate<M>> {
         let response = self
             .handshake
             .fetch_bundle(FetchBundleRequest {
@@ -292,13 +583,11 @@ impl<H: LocalHandshake> Client<H> {
             first_message: Some(first_message),
             ..handshake::InitialMessage::from(&message)
         };
-        self.handshake
-            .send_initial_message(SendInitialMessageRequest {
-                recipient: Bytes::copy_from_slice(peer),
-                message: Some(initial_message.clone()),
-            })
-            .await?;
-        Ok(Session::new(
+        let request = SendInitialMessageRequest {
+            recipient: Bytes::copy_from_slice(peer),
+            message: Some(initial_message.clone()),
+        };
+        let mut session = Session::new(
             mailbox,
             Active {
                 party,
@@ -306,10 +595,62 @@ impl<H: LocalHandshake> Client<H> {
                 known_by_peer: false,
                 initial_message: initial_message.encode_to_vec(),
                 delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
+                security: SessionSecurity::classical(),
+                peer_session_seq: 0,
             },
             self.identity_key,
             *peer,
-        ))
+        );
+        if let Some(hello) = extract_hello(content)
+            && hello.session_seq > 0
+        {
+            session.state.next_session_seq = hello.session_seq.saturating_add(1);
+        }
+        Ok(PreparedInitiate { session, request })
+    }
+
+    /// Transmit a prepared classical initial message request (after persisting `session.state()`).
+    pub async fn send_prepared_initiate(
+        &self,
+        request: &SendInitialMessageRequest,
+    ) -> Result<()> {
+        self.handshake.send_initial_message(request.clone()).await?;
+        Ok(())
+    }
+
+    /// Start a session with `peer`, whose first message is `content`: fetch the peer's prekeys,
+    /// run X3DH, and leave the initial message, with the first message, in the peer's inbox.
+    ///
+    /// The first message shows the peer that the initial message is this client's, and lets the
+    /// peer write back at once. It can be empty.
+    pub async fn initiate<M>(
+        &mut self,
+        peer: &PublicKey,
+        content: &[u8],
+        mailbox: M,
+    ) -> Result<Session<M>> {
+        let prepared = self.prepare_initiate(peer, content, mailbox).await?;
+        self.send_prepared_initiate(&prepared.request).await?;
+        Ok(prepared.session)
+    }
+
+    /// Prepare starting a new classical session with `session`'s peer and merge it into `session`
+    /// via [`Session::keep`], returning the `SendInitialMessageRequest` to transmit AFTER
+    /// persisting `session.state()`.
+    pub async fn prepare_start_again<M: Clone>(
+        &mut self,
+        session: &mut Session<M>,
+        content: &[u8],
+    ) -> Result<SendInitialMessageRequest> {
+        if session.state.me != self.identity_key {
+            return Err(ErrorKind::UnexpectedPeer.into());
+        }
+        let prepared = self
+            .prepare_initiate(&session.state.peer, content, session.mailbox.clone())
+            .await?;
+        let older = mem::replace(session, prepared.session);
+        session.keep(older)?;
+        Ok(prepared.request)
     }
 
     /// Start a new session with `session`'s peer, whose first message is `content`, and keep
@@ -323,16 +664,8 @@ impl<H: LocalHandshake> Client<H> {
         session: &mut Session<M>,
         content: &[u8],
     ) -> Result<()> {
-        // Checked first, as `keep` would only fail once the initial message went and `session`
-        // was replaced.
-        if session.state.me != self.identity_key {
-            return Err(ErrorKind::UnexpectedPeer.into());
-        }
-        let started = self
-            .initiate(&session.state.peer, content, session.mailbox.clone())
-            .await?;
-        let older = mem::replace(session, started);
-        session.keep(older)
+        let request = self.prepare_start_again(session, content).await?;
+        self.send_prepared_initiate(&request).await
     }
 
     /// Take the initial messages waiting in this client's inbox.
@@ -340,7 +673,7 @@ impl<H: LocalHandshake> Client<H> {
     /// The server deletes them, so keep the ones to accept later. Malformed ones, which could
     /// never be accepted, are left out.
     pub async fn take_initial_messages(&mut self) -> Result<Vec<InitialMessage>> {
-        let timestamp = self.next_timestamp();
+        let timestamp = self.next_timestamp()?;
         let request = TakeInitialMessagesRequest::sign(&self.state.identity, timestamp);
         let response = self.handshake.take_initial_messages(request).await?;
         // The server has deleted them already, so one malformed message must not fail the
@@ -379,21 +712,23 @@ impl<H: LocalHandshake> Client<H> {
             .decrypt(&initial_message.first_message)
             .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
         self.state.prekeys.confirm(&initial_message.x3dh)?;
+        let peer_session_seq = extract_hello(&content).map_or(0, |h| h.session_seq);
         let active = Active {
             party,
             id: initial_message.x3dh.ephemeral_key,
             known_by_peer: true,
             initial_message: vec![],
             delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
+            security: SessionSecurity::classical(),
+            peer_session_seq,
         };
-        Ok((
-            Session::new(mailbox, active, self.identity_key, *peer),
-            content,
-        ))
+        let mut session = Session::new(mailbox, active, self.identity_key, *peer);
+        session.state.peer_pq.peer_session_seq = peer_session_seq;
+        Ok((session, content))
     }
 
     /// Start uploading an attachment of `size` bytes: a new key, and the service's ID and upload
-    /// token for it. Then [encrypt](attachment::Upload::encrypt) and
+    /// token for it. Then [encrypt](attachment::Upload::try_encrypt) and
     /// [put](attachment::Upload::put) each chunk, and send the ID and key to the recipients in a
     /// message. The upload token may be kept after, to [cancel](attachment::Upload::cancel) it
     /// later, deleting the attachment.
@@ -413,13 +748,13 @@ impl<H: LocalHandshake> Client<H> {
                 delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
             })
             .await?;
-        Ok(attachment::Upload {
-            id: protocol::fixed(&response.id)?,
-            token: protocol::fixed(&response.upload_token)?,
+        Ok(attachment::Upload::new(
+            protocol::fixed(&response.id)?,
+            Zeroizing::new(protocol::fixed(&response.upload_token)?),
             key,
             chunks,
-            expires: (response.expires != 0).then_some(response.expires),
-        })
+            (response.expires != 0).then_some(response.expires),
+        ))
     }
 
     /// A subscription to this client's notifications, signed by its identity key, for a server
@@ -428,14 +763,10 @@ impl<H: LocalHandshake> Client<H> {
     pub fn subscription(&self) -> SubscribeRequest {
         // Within a few minutes of the server's clock, not by the strictly increasing timestamp,
         // which may have run ahead of it.
-        SubscribeRequest::sign(&self.state.identity, self.clock.now())
-    }
-
-    /// Milliseconds since the Unix epoch, strictly increasing, as the server requires of
-    /// publishing and taking initial messages.
-    fn next_timestamp(&mut self) -> u64 {
-        self.state.last_timestamp = now().max(self.state.last_timestamp + 1);
-        self.state.last_timestamp
+        SubscribeRequest::sign(
+            &self.state.identity,
+            self.clock.now().min(protocol::MAX_SAFE_INTEGER),
+        )
     }
 }
 
@@ -458,6 +789,24 @@ pub struct Sealed {
     pub delivery_hash: Option<[u8; 32]>,
 }
 
+impl Sealed {
+    /// Deterministic 16-byte client idempotency identifier derived from this sealed ciphertext
+    /// (`SHA-256("session.v2/client-message-id\0" || len(header) || header || len(content) || content)[..16]`),
+    /// stable across retries and restarts without leaking plaintext or keys.
+    pub fn client_message_id(&self) -> [u8; 16] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"session.v2/client-message-id\0");
+        hasher.update((self.message.header.len() as u64).to_be_bytes());
+        hasher.update(&self.message.header);
+        hasher.update((self.message.content.len() as u64).to_be_bytes());
+        hasher.update(&self.message.content);
+        let digest = hasher.finalize();
+        let mut id = [0u8; 16];
+        id.copy_from_slice(&digest[..16]);
+        id
+    }
+}
+
 /// A session with one peer: encrypts with a [`Party`] and exchanges messages through a mailbox.
 ///
 /// It may hold earlier sessions with the peer too, which only decrypt, see [`Session::keep`].
@@ -465,8 +814,8 @@ pub struct Sealed {
 /// [`Session::restore`] brings back a session from its saved [`state`](Session::state).
 #[derive(Debug)]
 pub struct Session<M> {
-    mailbox: M,
-    state: SessionState,
+    pub(crate) mailbox: M,
+    pub(crate) state: SessionState,
 }
 
 /// What a [`Session`] keeps besides its transport: the double ratchets, both identity keys and
@@ -475,32 +824,40 @@ pub struct Session<M> {
 /// Save it to [`restore`](Session::restore) the session later: serialize it with the `serde` or
 /// `rkyv` feature, or with `prost` convert it to a `proto::SessionState`. It holds the session's
 /// keys, so keep it secret; its `Debug` shows none of them, nor the delivery tokens.
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "RawSessionState")
+)]
 #[cfg_attr(
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
 pub struct SessionState {
     /// The session messages are sent on; none once retired, until a new one starts.
-    active: Option<Active>,
+    pub(crate) active: Option<Active>,
     /// Earlier sessions with the peer, latest first, which only decrypt, see [`Session::keep`].
-    others: Vec<Earlier>,
-    me: PublicKey,
-    peer: PublicKey,
+    pub(crate) others: Vec<Earlier>,
+    pub(crate) me: PublicKey,
+    pub(crate) peer: PublicKey,
     /// Sequence number of the last fetched message.
-    cursor: u64,
+    pub(crate) cursor: u64,
     /// What was done last, and how many times the peers turned between sending on the active
     /// session and receiving on an earlier one, see [`Session::keep`].
-    last: LastAction,
-    direction_changes: u32,
+    pub(crate) last: LastAction,
+    pub(crate) direction_changes: u32,
     /// The last sequence number of the page in which receiving stopped at a message that did not
     /// decrypt, and up to which messages that do not decrypt are skipped, see
     /// [`Session::receive`].
-    stalled_through: u64,
-    skip_through: u64,
+    pub(crate) stalled_through: u64,
+    pub(crate) skip_through: u64,
     /// The delivery tokens of the messages received and not told to the server yet, which the
     /// next fetch tells it, see [`Session::receive`].
-    delivered: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
+    pub(crate) delivered: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
+    /// Per-peer post-quantum pinning, downgrade-detection, and `peer_session_seq` state.
+    pub(crate) peer_pq: PeerPqState,
+    /// Next outgoing monotonic `Hello.session_seq` for this peer (`0` treated as `1`).
+    pub(crate) next_session_seq: u64,
 }
 
 impl core::fmt::Debug for SessionState {
@@ -516,6 +873,8 @@ impl core::fmt::Debug for SessionState {
             .field("stalled_through", &self.stalled_through)
             .field("skip_through", &self.skip_through)
             .field("delivered", &self.delivered.len())
+            .field("peer_pq", &self.peer_pq)
+            .field("next_session_seq", &self.next_session_seq)
             .finish()
     }
 }
@@ -527,18 +886,24 @@ impl core::fmt::Debug for SessionState {
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
-struct Active {
-    party: Party,
+pub(crate) struct Active {
+    pub(crate) party: Party,
     /// The session's ID, which both peers have: the X3DH ephemeral key of the one who started
     /// it.
-    id: PublicKey,
+    pub(crate) id: PublicKey,
     /// Whether the peer is known to have it: it started it, or a message on it decrypted.
-    known_by_peer: bool,
+    pub(crate) known_by_peer: bool,
     /// The initial message, encoded, that started it, which this client did: each message
     /// goes with it until the peer is known to have the session, in case the one in its inbox
     /// was lost. Empty once known.
-    initial_message: Vec<u8>,
-    delivery_key: DeliveryKey,
+    pub(crate) initial_message: Vec<u8>,
+    pub(crate) delivery_key: DeliveryKey,
+    /// Negotiated cryptographic security metadata of this active session.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) security: SessionSecurity,
+    /// Peer's `Hello.session_seq` that created this session (`0` if locally initiated or legacy).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) peer_session_seq: u64,
 }
 
 /// An earlier session of a [`SessionState`], which only decrypts.
@@ -548,9 +913,9 @@ struct Active {
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
-struct Earlier {
-    party: Party,
-    delivery_key: DeliveryKey,
+pub(crate) struct Earlier {
+    pub(crate) party: Party,
+    pub(crate) delivery_key: DeliveryKey,
 }
 
 impl From<Active> for Earlier {
@@ -573,11 +938,11 @@ impl From<Active> for Earlier {
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
-struct DeliveryKey([u8; 32]);
+pub(crate) struct DeliveryKey(pub(crate) [u8; 32]);
 
 impl DeliveryKey {
     /// The delivery key of a session whose X3DH shared secret is `secret`.
-    fn derive(secret: &[u8]) -> Self {
+    pub(crate) fn derive(secret: &[u8]) -> Self {
         let mut key = [0; 32];
         Hkdf::<Sha256>::new(None, secret)
             .expand(b"session.v1/delivery", &mut key)
@@ -586,7 +951,7 @@ impl DeliveryKey {
     }
 
     /// The delivery token of `message`, a message of this session.
-    fn token(&self, message: &EncryptedMessage) -> [u8; DELIVERY_TOKEN_LENGTH] {
+    pub(crate) fn token(&self, message: &EncryptedMessage) -> [u8; DELIVERY_TOKEN_LENGTH] {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC takes any key");
         mac.update(&message.header);
         let tag = mac.finalize().into_bytes();
@@ -609,7 +974,7 @@ impl core::fmt::Debug for DeliveryKey {
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
 )]
-enum LastAction {
+pub(crate) enum LastAction {
     None,
     Sent,
     ReceivedActive,
@@ -620,6 +985,65 @@ impl SessionState {
     /// The peer's identity key.
     pub fn peer(&self) -> &PublicKey {
         &self.peer
+    }
+
+    /// Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
+    pub fn peer_pq_state(&self) -> &PeerPqState {
+        &self.peer_pq
+    }
+
+    /// Cryptographic security level of the active session, if any.
+    pub fn security(&self) -> Option<SessionSecurity> {
+        self.active.as_ref().map(|active| active.security)
+    }
+
+    /// Validate canonical keys, bounded collections, integer bounds, and PQ metadata invariants.
+    #[cfg(any(feature = "prost", feature = "serde"))]
+    fn validate(&self) -> Result<()> {
+        if !xeddsa::is_canonical_public_key(&self.me)
+            || XEdDSAPublicKey::new(&self.me).is_err()
+            || !xeddsa::is_canonical_public_key(&self.peer)
+            || XEdDSAPublicKey::new(&self.peer).is_err()
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        if self.others.len() > KEPT_SESSIONS || self.delivered.len() > MAX_STORED_DELIVERED {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        if self.cursor > protocol::MAX_SAFE_INTEGER
+            || self.stalled_through > protocol::MAX_SAFE_INTEGER
+            || self.skip_through > protocol::MAX_SAFE_INTEGER
+            || self.next_session_seq > protocol::MAX_SAFE_INTEGER
+            || self.peer_pq.pinned_manifest_seq > protocol::MAX_SAFE_INTEGER
+            || self.peer_pq.peer_session_seq > protocol::MAX_SAFE_INTEGER
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        if let Some(active) = &self.active {
+            if !xeddsa::is_canonical_public_key(&active.id) || active.id == [0u8; 32] {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if active.peer_session_seq > protocol::MAX_SAFE_INTEGER {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if active.security.is_pq {
+                if active.security.suite.is_none() {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+            } else if active.security.suite.is_some() || active.security.pq_ratchet {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if active.security.pq_ratchet != active.party.is_pq_ratchet_active() {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+            if let Some(ratchet_suite) = active.party.pq_suite()
+                && active.security.suite.map(PqSuite::as_u8) != Some(ratchet_suite.id())
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+        }
+        Ok(())
     }
 
     /// Keep `earlier`, an earlier session, only to decrypt, dropping the oldest beyond
@@ -644,6 +1068,125 @@ impl SessionState {
             }
             self.direction_changes = 0;
         }
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(rename = "SessionState")]
+struct RawSessionState {
+    active: Option<Active>,
+    others: Vec<Earlier>,
+    me: PublicKey,
+    peer: PublicKey,
+    cursor: u64,
+    last: LastAction,
+    direction_changes: u32,
+    stalled_through: u64,
+    skip_through: u64,
+    delivered: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
+    #[serde(default)]
+    peer_pq: PeerPqState,
+    #[serde(default)]
+    next_session_seq: u64,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawSessionState> for SessionState {
+    type Error = Error;
+
+    fn try_from(raw: RawSessionState) -> Result<Self> {
+        let state = Self {
+            active: raw.active,
+            others: raw.others,
+            me: raw.me,
+            peer: raw.peer,
+            cursor: raw.cursor,
+            last: raw.last,
+            direction_changes: raw.direction_changes,
+            stalled_through: raw.stalled_through,
+            skip_through: raw.skip_through,
+            delivered: raw.delivered,
+            peer_pq: raw.peer_pq,
+            next_session_seq: raw.next_session_seq,
+        };
+        state.validate()?;
+        Ok(state)
+    }
+}
+
+#[cfg(feature = "prost")]
+impl From<&PeerPqState> for proto::PeerPqState {
+    fn from(state: &PeerPqState) -> Self {
+        Self {
+            pq_pinned: state.pq_pinned,
+            pinned_manifest_seq: state.pinned_manifest_seq,
+            allow_classical_exception: state.allow_classical_exception,
+            downgrade_detected: state.downgrade_detected,
+            peer_pq_capable: state.peer_pq_capable,
+            peer_session_seq: state.peer_session_seq,
+        }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&proto::PeerPqState> for PeerPqState {
+    type Error = Error;
+
+    fn try_from(state: &proto::PeerPqState) -> Result<Self> {
+        if state.pinned_manifest_seq > protocol::MAX_SAFE_INTEGER
+            || state.peer_session_seq > protocol::MAX_SAFE_INTEGER
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        Ok(Self {
+            pq_pinned: state.pq_pinned,
+            pinned_manifest_seq: state.pinned_manifest_seq,
+            allow_classical_exception: state.allow_classical_exception,
+            downgrade_detected: state.downgrade_detected,
+            peer_pq_capable: state.peer_pq_capable,
+            peer_session_seq: state.peer_session_seq,
+        })
+    }
+}
+
+#[cfg(feature = "prost")]
+impl From<&SessionSecurity> for proto::SessionSecurity {
+    fn from(security: &SessionSecurity) -> Self {
+        Self {
+            is_pq: security.is_pq,
+            suite: security.suite.map_or(0, |s| u32::from(s.as_u8())),
+            pq_ratchet: security.pq_ratchet,
+        }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&proto::SessionSecurity> for SessionSecurity {
+    type Error = Error;
+
+    fn try_from(security: &proto::SessionSecurity) -> Result<Self> {
+        let suite = match security.suite {
+            0 => None,
+            v => Some(
+                u8::try_from(v)
+                    .ok()
+                    .and_then(PqSuite::from_u8)
+                    .ok_or(ErrorKind::MalformedState)?,
+            ),
+        };
+        if security.is_pq {
+            if suite.is_none() {
+                return Err(ErrorKind::MalformedState.into());
+            }
+        } else if suite.is_some() || security.pq_ratchet {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        Ok(Self {
+            is_pq: security.is_pq,
+            suite,
+            pq_ratchet: security.pq_ratchet,
+        })
     }
 }
 
@@ -693,6 +1236,13 @@ impl From<&SessionState> for proto::SessionState {
             direction_changes: state.direction_changes,
             stalled_through: state.stalled_through,
             skip_through: state.skip_through,
+            peer_pq: Some((&state.peer_pq).into()),
+            next_session_seq: state.next_session_seq,
+            active_security: state.active.as_ref().map(|active| (&active.security).into()),
+            active_peer_session_seq: state
+                .active
+                .as_ref()
+                .map_or(0, |active| active.peer_session_seq),
         }
     }
 }
@@ -717,15 +1267,72 @@ impl TryFrom<&proto::SessionState> for SessionState {
                 .map_err(|_| ErrorKind::MalformedState.into())
         }
 
+        /// Verify that `party`'s associated data binds the exact `(me, peer)` identity pair.
+        fn check_party_identity_ad(
+            party: &party::proto::Party,
+            me: &PublicKey,
+            peer: &PublicKey,
+            expected_pq: Option<bool>,
+        ) -> Result<()> {
+            let ad = &party.associated_data;
+            let classical_len = 2 * xeddsa::PUBLIC_KEY_LENGTH;
+            let pq_len = x3dh::PQXDH_ASSOCIATED_DATA_LENGTH;
+            match expected_pq {
+                Some(true) if ad.len() != pq_len => return Err(ErrorKind::MalformedState.into()),
+                Some(false) if ad.len() != classical_len => {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+                None if ad.len() != classical_len && ad.len() != pq_len => {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+                _ => {}
+            }
+            let (first, second) = (&ad[..32], &ad[32..64]);
+            if !((first == me && second == peer) || (first == peer && second == me)) {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            Ok(())
+        }
+
+        if state.others.len() > KEPT_SESSIONS || state.delivered.len() > MAX_STORED_DELIVERED {
+            return Err(ErrorKind::MalformedState.into());
+        }
+
+        let me = key(&state.me)?;
+        let peer = key(&state.peer)?;
+
         let active = match &state.party {
-            Some(party) => Some(Active {
-                party: Party::try_from(party)?,
-                id: key(&state.id)?,
-                known_by_peer: state.known_by_peer,
-                initial_message: state.initial_message.clone(),
-                delivery_key: delivery_key(&state.delivery_key)?,
-            }),
-            None => None,
+            Some(proto_party) => {
+                let security = match &state.active_security {
+                    Some(sec) => SessionSecurity::try_from(sec)?,
+                    None => SessionSecurity::classical(),
+                };
+                check_party_identity_ad(proto_party, &me, &peer, Some(security.is_pq))?;
+                Some(Active {
+                    party: Party::try_from(proto_party)?,
+                    id: key(&state.id)?,
+                    known_by_peer: state.known_by_peer,
+                    initial_message: state.initial_message.clone(),
+                    delivery_key: delivery_key(&state.delivery_key)?,
+                    security,
+                    peer_session_seq: state.active_peer_session_seq,
+                })
+            }
+            None => {
+                if !state.id.is_empty()
+                    || !state.delivery_key.is_empty()
+                    || state.known_by_peer
+                    || !state.initial_message.is_empty()
+                    || state.active_peer_session_seq != 0
+                    || state
+                        .active_security
+                        .as_ref()
+                        .is_some_and(|s| s.is_pq || s.suite != 0 || s.pq_ratchet)
+                {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+                None
+            }
         };
         let last = match proto::LastAction::try_from(state.last) {
             Ok(proto::LastAction::None) => LastAction::None,
@@ -734,15 +1341,22 @@ impl TryFrom<&proto::SessionState> for SessionState {
             Ok(proto::LastAction::ReceivedEarlier) => LastAction::ReceivedEarlier,
             Err(_) => return Err(ErrorKind::MalformedState.into()),
         };
-        Ok(Self {
+        let peer_pq = state
+            .peer_pq
+            .as_ref()
+            .map(PeerPqState::try_from)
+            .transpose()?
+            .unwrap_or_default();
+        let restored = Self {
             active,
             others: state
                 .others
                 .iter()
                 .map(|earlier| {
-                    let party = earlier.party.as_ref().ok_or(ErrorKind::MalformedState)?;
+                    let proto_party = earlier.party.as_ref().ok_or(ErrorKind::MalformedState)?;
+                    check_party_identity_ad(proto_party, &me, &peer, None)?;
                     Ok(Earlier {
-                        party: Party::try_from(party)?,
+                        party: Party::try_from(proto_party)?,
                         delivery_key: delivery_key(&earlier.delivery_key)?,
                     })
                 })
@@ -757,20 +1371,24 @@ impl TryFrom<&proto::SessionState> for SessionState {
                         .map_err(|_| ErrorKind::MalformedState.into())
                 })
                 .collect::<Result<_>>()?,
-            me: key(&state.me)?,
-            peer: key(&state.peer)?,
+            me,
+            peer,
             cursor: state.cursor,
             last,
             direction_changes: state.direction_changes,
             stalled_through: state.stalled_through,
             skip_through: state.skip_through,
-        })
+            peer_pq,
+            next_session_seq: state.next_session_seq,
+        };
+        restored.validate()?;
+        Ok(restored)
     }
 }
 
 impl<M> Session<M> {
     /// A session that begins a chat, sending on `active`.
-    fn new(mailbox: M, active: Active, me: PublicKey, peer: PublicKey) -> Self {
+    pub(crate) fn new(mailbox: M, active: Active, me: PublicKey, peer: PublicKey) -> Self {
         let last = if active.known_by_peer {
             // Its first message was received.
             LastAction::ReceivedActive
@@ -790,6 +1408,8 @@ impl<M> Session<M> {
                 stalled_through: 0,
                 skip_through: 0,
                 delivered: vec![],
+                peer_pq: PeerPqState::default(),
+                next_session_seq: 0,
             },
         )
     }
@@ -829,6 +1449,67 @@ impl<M> Session<M> {
     /// it again on the new one.
     pub fn active_id(&self) -> Option<&PublicKey> {
         self.state.active.as_ref().map(|active| &active.id)
+    }
+
+    /// Cryptographic security level of the active session, if any.
+    pub fn security(&self) -> Option<SessionSecurity> {
+        self.state.security()
+    }
+
+    /// Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
+    pub fn peer_pq_state(&self) -> &PeerPqState {
+        &self.state.peer_pq
+    }
+
+    /// Mutable reference to this session's per-peer post-quantum state (e.g. to approve a
+    /// classical exception or inspect/clear downgrade flags).
+    pub fn peer_pq_state_mut(&mut self) -> &mut PeerPqState {
+        &mut self.state.peer_pq
+    }
+
+    /// Pin this peer as post-quantum capable (e.g. when opening a `#chat=...&pq=1` invite link).
+    pub fn pin_peer_pq(&mut self) {
+        self.state.peer_pq.pin_peer_pq();
+    }
+
+    /// Next outgoing monotonic `Hello.session_seq` for this peer (`>= 1`), without advancing it.
+    pub fn next_session_seq(&self) -> u64 {
+        self.state.next_session_seq.max(1)
+    }
+
+    /// Allocate and advance the next monotonic outgoing `Hello.session_seq` (`>= 1`).
+    pub fn allocate_session_seq(&mut self) -> u64 {
+        let seq = self.state.next_session_seq.max(1);
+        self.state.next_session_seq = seq.saturating_add(1);
+        seq
+    }
+
+    /// Highest `Hello.session_seq` observed from this peer (`0` until peer sends a positive one).
+    pub fn peer_session_seq(&self) -> u64 {
+        self.state.peer_pq.peer_session_seq
+    }
+
+    /// Build a [`Hello`] greeting for starting a new session with this peer, automatically
+    /// allocating the next monotonic outgoing `session_seq`.
+    pub fn make_hello(&mut self, name: impl Into<String>, pq_config: &PqConfig) -> Hello {
+        let seq = self.allocate_session_seq();
+        let offered = pq_config.offered_suites();
+        let pq_capable = pq_config.pq_enabled && !offered.is_empty();
+        Hello {
+            name: name.into(),
+            pq_capable,
+            max_version: if pq_capable { x3dh::PQXDH_VERSION } else { 1 },
+            session_seq: seq,
+            offered_suites: offered.into_iter().map(|s| u32::from(s.as_u8())).collect(),
+            pq_ratchet_capable: pq_capable && pq_config.pq_ratchet_enabled,
+        }
+    }
+
+    /// Validate a peer's decrypted [`Hello`] against this session's [`PeerPqState`] and active
+    /// [`SessionSecurity`].
+    pub fn check_peer_hello(&mut self, hello: &Hello, local_pq_enabled: bool) -> HelloCheck {
+        let security = self.security().unwrap_or_default();
+        check_peer_hello(&mut self.state.peer_pq, security, hello, local_pq_enabled)
     }
 
     /// Go on past the messages that receiving stopped at, as they did not decrypt, once the
@@ -871,17 +1552,83 @@ impl<M> Session<M> {
             return Err(ErrorKind::UnexpectedPeer.into());
         }
         let new = mem::replace(&mut self.state, older.state);
+        self.merge_incoming_state(new).map(|_| ())
+    }
+
+    /// Merge an incoming newly accepted or locally initiated session `incoming` into `self`
+    /// without swapping first.
+    ///
+    /// Returns `Ok(true)` if `incoming` became the active session, `Ok(false)` if `incoming` was
+    /// archived as an earlier session (e.g. lost a crossed-start tie-break), or
+    /// `Err(ErrorKind::StaleSession)` / `Err(ErrorKind::DowngradeDetected)` if rejected (leaving
+    /// `self`'s active session intact).
+    pub fn accept_replacement(&mut self, incoming: Session<M>) -> Result<bool> {
+        if incoming.state.me != self.state.me || incoming.state.peer != self.state.peer {
+            return Err(ErrorKind::UnexpectedPeer.into());
+        }
+        self.merge_incoming_state(incoming.state)
+    }
+
+    /// Core session-replacement logic enforcing monotonic `peer_session_seq` anti-rollback,
+    /// crossed-start tie-breaking, and PQ-pin downgrade defense.
+    fn merge_incoming_state(&mut self, new: SessionState) -> Result<bool> {
         let state = &mut self.state;
+        if let Some(active) = &new.active {
+            let started_here = !active.known_by_peer;
+            if !started_here {
+                // Enforce monotonic peer_session_seq once the peer has ever sent a positive one.
+                // `session_seq == 0` is tolerated ONLY while high_water == 0 (legacy TUI compat).
+                let high_water = state.peer_pq.peer_session_seq;
+                let incoming_seq = active.peer_session_seq;
+                if high_water > 0 && (incoming_seq == 0 || incoming_seq <= high_water) {
+                    return Err(ErrorKind::StaleSession.into());
+                }
+                // Defense-in-depth: never let an unapproved classical peer-initiated session
+                // silently overwrite a PQ-pinned session.
+                if !active.security.is_pq
+                    && state.peer_pq.pq_pinned
+                    && !state.peer_pq.allow_classical_exception
+                    && !new.peer_pq.allow_classical_exception
+                {
+                    return Err(ErrorKind::DowngradeDetected.into());
+                }
+            }
+        }
+
         state.cursor = state.cursor.max(new.cursor);
         state.stalled_through = state.stalled_through.max(new.stalled_through);
         state.skip_through = state.skip_through.max(new.skip_through);
+        state.next_session_seq = state.next_session_seq.max(new.next_session_seq);
         state.delivered.extend(new.delivered);
         for earlier in new.others.into_iter().rev() {
             state.archive(earlier);
         }
+
+        // Merge per-peer PQ metadata monotonically.
+        state.peer_pq.pq_pinned |= new.peer_pq.pq_pinned;
+        state.peer_pq.pinned_manifest_seq = state
+            .peer_pq
+            .pinned_manifest_seq
+            .max(new.peer_pq.pinned_manifest_seq);
+        state.peer_pq.peer_pq_capable |= new.peer_pq.peer_pq_capable;
+        state.peer_pq.downgrade_detected |= new.peer_pq.downgrade_detected;
+        state.peer_pq.peer_session_seq = state
+            .peer_pq
+            .peer_session_seq
+            .max(new.peer_pq.peer_session_seq);
+
         if let Some(active) = new.active {
+            if active.security.is_pq {
+                state.peer_pq.allow_classical_exception = false;
+                state.peer_pq.downgrade_detected = false;
+            } else {
+                state.peer_pq.allow_classical_exception |= new.peer_pq.allow_classical_exception;
+            }
             // One this client started is not known by the peer yet.
             let started_here = !active.known_by_peer;
+            if !started_here && active.peer_session_seq > state.peer_pq.peer_session_seq {
+                state.peer_pq.peer_session_seq = active.peer_session_seq;
+            }
             let takes_over = started_here
                 || state
                     .active
@@ -897,19 +1644,21 @@ impl<M> Session<M> {
                     LastAction::ReceivedActive
                 };
                 state.direction_changes = 0;
+                return Ok(true);
             } else {
                 // Its first message decrypted, on what is now an earlier session.
                 state.archive(active.into());
                 state.received_earlier();
+                return Ok(false);
             }
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Decrypt `message` with the active party, or else with an earlier one, which only counts
     /// towards retiring the active one, see [`Session::keep`]; and tell which, and the message's
     /// delivery token.
-    fn decrypt(
+    pub(crate) fn decrypt(
         &mut self,
         message: &EncryptedMessage,
     ) -> Result<(Vec<u8>, bool, [u8; DELIVERY_TOKEN_LENGTH])> {
@@ -919,6 +1668,10 @@ impl<M> Session<M> {
         // e.g. as the reply to its push was lost, which the server deletes too, though it may
         // have deleted the first already, as the peer gives its token.
         let mut duplicate = None;
+        // A message whose skipped key was evicted is also authenticated to a known session:
+        // acknowledge its delivery token so the server deletes it, and surface it distinctly as
+        // `ErrorKind::EvictedMessage` instead of stalling or hiding it as a duplicate.
+        let mut evicted = None;
         if let Some(active) = &mut state.active {
             match active.party.decrypt(message) {
                 Ok(content) => {
@@ -931,11 +1684,15 @@ impl<M> Session<M> {
                     state.delivered.push(active.delivery_key.token(message));
                     duplicate = Some(e);
                 }
+                Err(e) if e.kind() == party::error::ErrorKind::EvictedMessage => {
+                    state.delivered.push(active.delivery_key.token(message));
+                    evicted = Some(e);
+                }
                 Err(e) => error = Some(e),
             }
         }
         for earlier in &mut state.others {
-            if duplicate.is_some() {
+            if duplicate.is_some() || evicted.is_some() {
                 break;
             }
             match earlier.party.decrypt(message) {
@@ -948,10 +1705,14 @@ impl<M> Session<M> {
                     state.delivered.push(earlier.delivery_key.token(message));
                     duplicate = Some(e);
                 }
+                Err(e) if e.kind() == party::error::ErrorKind::EvictedMessage => {
+                    state.delivered.push(earlier.delivery_key.token(message));
+                    evicted = Some(e);
+                }
                 Err(_) => {}
             }
         }
-        match duplicate.or(error) {
+        match duplicate.or(evicted).or(error) {
             Some(error) => Err(error.into()),
             None => Err(ErrorKind::Undecryptable.into()),
         }
@@ -1038,20 +1799,42 @@ impl<M: LocalMailbox> Session<M> {
     /// Cancel-safe: if the future is dropped, no message is consumed, but those whose contents
     /// expired.
     pub async fn receive(&mut self) -> Result<Vec<Received>> {
+        let mut carried: Vec<InitialMessage> = vec![];
         loop {
             let cursor = self.state.cursor;
-            match self.receive_page().await? {
-                None => return Ok(vec![]),
+            match self.receive_page(&mut carried).await? {
+                None => {
+                    if !carried.is_empty() {
+                        return Ok(vec![Received {
+                            content: Err(ErrorKind::Expired.into()),
+                            earlier: false,
+                            initial_messages: carried,
+                        }]);
+                    }
+                    return Ok(vec![]);
+                }
                 // Their contents all expired; unless the page went nowhere, as a server that
                 // sends it again would have it, which must not hold this here forever.
                 Some(received) if received.is_empty() && self.state.cursor > cursor => {}
-                Some(received) => return Ok(received),
+                Some(mut received) => {
+                    if !carried.is_empty() {
+                        received.push(Received {
+                            content: Err(ErrorKind::Expired.into()),
+                            earlier: false,
+                            initial_messages: mem::take(&mut carried),
+                        });
+                    }
+                    return Ok(received);
+                }
             }
         }
     }
 
     /// One page of [`receive`](Session::receive), none once the server has no new message.
-    async fn receive_page(&mut self) -> Result<Option<Vec<Received>>> {
+    async fn receive_page(
+        &mut self,
+        carried: &mut Vec<InitialMessage>,
+    ) -> Result<Option<Vec<Received>>> {
         let told = self.state.delivered.len().min(MAX_DELIVERED);
         let delivered = self.state.delivered[..told]
             .iter()
@@ -1082,13 +1865,11 @@ impl<M: LocalMailbox> Session<M> {
                 .and_then(|initial_message| InitialMessage::try_from(initial_message).ok())
         };
         let mut received = Vec::with_capacity(response.messages.len());
-        // The initial messages that came with messages whose contents expired, offered with the
-        // next message of the page, so that receiving stalled there may still accept them.
-        let mut carried: Vec<InitialMessage> = vec![];
         let mut envelopes = response.messages.into_iter();
         while let Some(envelope) = envelopes.next() {
             // Its content expired on the server before it was fetched: gone past, as the
-            // ratchet goes past a message lost.
+            // ratchet goes past a message lost, while carrying any attached initial message
+            // forward so it is never dropped across expired envelopes or page boundaries.
             let Some(message) = &envelope.message else {
                 self.state.cursor = self.state.cursor.max(envelope.sequence);
                 if let Some(initial_message) = attached(&envelope)
@@ -1099,16 +1880,18 @@ impl<M: LocalMailbox> Session<M> {
                 continue;
             };
             let decrypted = self.decrypt(message);
-            let mut initial_messages = mem::take(&mut carried);
+            let mut initial_messages = mem::take(carried);
             if let Some(initial_message) = attached(&envelope)
                 && !initial_messages.contains(&initial_message)
             {
                 initial_messages.push(initial_message);
             }
-            let stalls = decrypted
-                .as_ref()
-                .is_err_and(|e| e.kind() != ErrorKind::DuplicateMessage)
-                && envelope.sequence > self.state.skip_through;
+            let stalls = decrypted.as_ref().is_err_and(|e| {
+                !matches!(
+                    e.kind(),
+                    ErrorKind::DuplicateMessage | ErrorKind::EvictedMessage
+                )
+            }) && envelope.sequence > self.state.skip_through;
             if stalls {
                 self.state.stalled_through = last;
                 // What still does not decrypt once they are accepted is skipped, the rest of

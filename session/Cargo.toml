@@ -55,3 +55,9 @@ prost = [
 ]
 # Connect clients over any HTTP client, see `protocol::connect`.
 connect = ["protocol/connect"]
+# Optional ML-KEM-1024 post-quantum handshake (PQXDH) and KEM ratchet suite.
+ml-kem-1024 = ["x3dh/ml-kem-1024", "party/ml-kem-1024", "protocol/pq"]
+# Optional ML-KEM-768 post-quantum handshake (PQXDH) and KEM ratchet suite.
+ml-kem-768 = ["x3dh/ml-kem-768", "party/ml-kem-768", "protocol/pq"]
+# All optional post-quantum suites (ML-KEM-1024 and ML-KEM-768).
+pq = ["ml-kem-1024", "ml-kem-768", "x3dh/pq", "party/pq", "protocol/pq"]
