@@ -3,7 +3,7 @@
 use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
 
 use leptos::prelude::*;
-use session::PublicKey;
+use session::{PqConfig, PqSuite, PublicKey, SessionSecurity};
 
 use crate::{
     content::AttachmentPointer,
@@ -20,7 +20,7 @@ pub enum Phase {
     Unlocked,
     /// Another tab has the vault open.
     Elsewhere,
-    /// The browser's storage failed, so whether it holds a vault is unknown; the error.
+    /// The browser's storage or Web Locks failed, so whether it holds a vault is unknown; the error.
     Unavailable(String),
 }
 
@@ -32,12 +32,104 @@ pub enum Link {
     Offline(String),
 }
 
+/// Server post-quantum capability status discovered via `GetServerInfo` with expected-audience check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
+    allow(dead_code)
+)]
+pub enum ServerPqStatus {
+    /// Not queried yet (or classical-only build).
+    Unknown,
+    /// Server verified expected audience and advertises post-quantum routes enabled.
+    Enabled {
+        suites: Vec<PqSuite>,
+        pq_ratchet: bool,
+    },
+    /// Server explicitly reported `pq_enabled = false` or returned `Unimplemented`.
+    Disabled,
+    /// Server's `server_id` did not match the client's locally configured expected audience.
+    AudienceMismatch,
+}
+
 /// This client.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Me {
     pub name: String,
     pub key: PublicKey,
     pub server: String,
+    pub pq_config: PqConfig,
+    pub server_pq: ServerPqStatus,
+}
+
+/// Hashable view of an active session's cryptographic security level.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct SecurityView {
+    pub is_pq: bool,
+    /// Wire suite ID (`1` = ML-KEM-1024, `2` = ML-KEM-768) when `is_pq` is `true`.
+    pub suite: Option<u8>,
+    pub pq_ratchet: bool,
+}
+
+impl SecurityView {
+    pub fn from_session(security: SessionSecurity) -> Self {
+        Self {
+            is_pq: security.is_pq,
+            suite: security.suite.map(PqSuite::as_u8),
+            pq_ratchet: security.pq_ratchet,
+        }
+    }
+
+    pub fn suite_name(self) -> &'static str {
+        match self.suite.and_then(PqSuite::from_u8) {
+            Some(PqSuite::MlKem1024) => "ML-KEM-1024",
+            Some(PqSuite::MlKem768) => "ML-KEM-768",
+            None => "Classical",
+        }
+    }
+
+    /// Short badge label for the chat header (e.g. `PQ · ML-KEM-1024 + Ratchet` or `Classical only`).
+    pub fn badge_label(self) -> String {
+        if !self.is_pq {
+            "Classical only".to_string()
+        } else if self.pq_ratchet {
+            format!("PQ · {} + Ratchet", self.suite_name())
+        } else {
+            format!("PQ · {}", self.suite_name())
+        }
+    }
+
+    /// Detailed description for tooltips and `ContactInfo`.
+    pub fn detail_label(self) -> String {
+        if !self.is_pq {
+            "Classical X3DH + Double Ratchet (not quantum-resistant)".to_string()
+        } else if self.pq_ratchet {
+            format!("Quantum-resistant · {} + PQ Ratchet", self.suite_name())
+        } else {
+            format!("Quantum-resistant · {}", self.suite_name())
+        }
+    }
+}
+
+/// Per-contact security alert displayed as an actionable banner / badge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SecurityAlert {
+    #[default]
+    None,
+    DowngradeDetected,
+    ManifestExpired,
+    PqRequired,
+}
+
+/// Actionable classical-fallback approval prompt for a contact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ClassicalPrompt {
+    #[default]
+    None,
+    /// Outbound initiation or session renewal requires explicit classical approval.
+    Outbound { peer_signed_off: bool },
+    /// Inbound classical initial message is held in quarantine pending explicit approval.
+    InboundQuarantined { peer_was_pq_pinned: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,6 +142,15 @@ pub struct ContactView {
     pub hello_name: String,
     pub unread: u32,
     pub last_activity: u64,
+    /// Active session cryptographic security level.
+    pub security: SecurityView,
+    pub has_active_session: bool,
+    pub pq_pinned: bool,
+    pub peer_pq_capable: bool,
+    pub allow_classical_exception: bool,
+    pub downgrade_detected: bool,
+    pub alert: SecurityAlert,
+    pub classical_prompt: ClassicalPrompt,
 }
 
 impl ContactView {
@@ -60,6 +161,19 @@ impl ContactView {
         } else {
             self.name.clone()
         }
+    }
+
+    /// Whether a downgrade alarm is active for this contact.
+    pub fn has_downgrade(&self) -> bool {
+        self.downgrade_detected || self.alert == SecurityAlert::DowngradeDetected
+    }
+
+    /// Whether an inbound classical initial message is held in quarantine.
+    pub fn is_quarantined(&self) -> bool {
+        matches!(
+            self.classical_prompt,
+            ClassicalPrompt::InboundQuarantined { .. }
+        )
     }
 }
 
@@ -152,6 +266,8 @@ pub enum Body {
     Hello(String),
     /// The peer deleted the chat.
     Deleted,
+    /// A message arrived too late and its skipped ratchet decryption key was evicted.
+    Evicted,
     /// A kind of message this client cannot show.
     Unknown,
 }
@@ -245,15 +361,16 @@ impl PartialEq for Attachment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dialog {
     /// Start a chat, with the key and name filled in, e.g. from an invitation link, which names
-    /// the inviter's server if it is not the page's own.
+    /// the inviter's server if it is not the page's own and whether PQ was pinned (`&pq=1`).
     NewChat {
         key: String,
         name: String,
         server: Option<String>,
+        pq_pinned: bool,
     },
-    /// This client's key and name.
+    /// This client's key, name, and post-quantum security settings.
     Identity,
-    /// A contact's name, key and safety number; for a request, accept or delete it.
+    /// A contact's name, key, security level, and safety number; for a request, accept or delete it.
     Contact(PublicKey),
     /// The files of the chat with a peer.
     Files(PublicKey),
@@ -470,5 +587,35 @@ mod tests {
         order(&mut bob_sees, &bob, &alice);
         let places: Vec<_> = bob_sees.iter().map(|m| (m.place, m.outgoing)).collect();
         assert_eq!(places, [(1, false), (2, false), (2, true), (3, true)]);
+    }
+
+    #[test]
+    fn pq_config_defaults_match_compiled_features() {
+        let cfg = PqConfig::default();
+        let compiled = PqConfig::compiled_suites();
+        #[cfg(feature = "ml-kem-1024")]
+        {
+            assert!(cfg.pq_enabled);
+            assert!(cfg.pq_ratchet_enabled);
+            assert!(!cfg.strict_pq);
+            assert_eq!(cfg.preferred_suite, PqSuite::MlKem1024);
+            assert!(compiled.contains(&PqSuite::MlKem1024));
+        }
+        #[cfg(all(feature = "ml-kem-768", not(feature = "ml-kem-1024")))]
+        {
+            assert!(cfg.pq_enabled);
+            assert!(cfg.pq_ratchet_enabled);
+            assert!(!cfg.strict_pq);
+            assert_eq!(cfg.preferred_suite, PqSuite::MlKem768);
+            assert_eq!(compiled, vec![PqSuite::MlKem768]);
+        }
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        {
+            assert!(!cfg.pq_enabled);
+            assert!(!cfg.pq_ratchet_enabled);
+            assert!(!cfg.strict_pq);
+            assert!(compiled.is_empty());
+            assert!(cfg.offered_suites().is_empty());
+        }
     }
 }

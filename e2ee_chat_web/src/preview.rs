@@ -2109,7 +2109,9 @@ fn is_tag_name_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || matches!(b, b'-' | b':' | b'_')
 }
 
-fn parse_start_tag(input: &str, start: usize) -> Option<(String, Vec<(String, String)>, bool, usize)> {
+type ParsedStartTag = (String, Vec<(String, String)>, bool, usize);
+
+fn parse_start_tag(input: &str, start: usize) -> Option<ParsedStartTag> {
     let bytes = input.as_bytes();
     let mut i = start + 1;
     let name_start = i;
@@ -2354,7 +2356,18 @@ fn emit_sanitized_attrs(out: &mut String, tag: &'static str, attrs: &[(String, S
         let validated: Option<String> = match (tag, name.as_str()) {
             ("a", "href") => {
                 if is_safe_href(&decoded) {
-                    Some(decoded.trim_matches(|c: char| c.is_ascii_whitespace()).to_string())
+                    let trimmed = decoded.trim_matches(|c: char| c.is_ascii_whitespace());
+                    if let Some(fragment) = trimmed.strip_prefix('#') {
+                        if fragment.is_empty() {
+                            Some("#".to_string())
+                        } else if fragment.starts_with("fn-") {
+                            Some(trimmed.to_string())
+                        } else {
+                            Some(format!("#fn-{fragment}"))
+                        }
+                    } else {
+                        Some(trimmed.to_string())
+                    }
                 } else {
                     Some("#".to_string())
                 }
@@ -2396,12 +2409,19 @@ fn emit_sanitized_attrs(out: &mut String, tag: &'static str, attrs: &[(String, S
             ),
             ("div", "class") => filter_allowed_classes(&decoded, &["footnote-definition"]),
             ("div", "id") => {
+                let max_len = if decoded.starts_with("fn-") { 67 } else { 64 };
                 let valid = !decoded.is_empty()
-                    && decoded.len() <= 64
+                    && decoded.len() <= max_len
                     && decoded
                         .bytes()
                         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'));
-                valid.then_some(decoded)
+                valid.then(|| {
+                    if decoded.starts_with("fn-") {
+                        decoded
+                    } else {
+                        format!("fn-{decoded}")
+                    }
+                })
             }
             ("math", "display") => match decoded.as_str() {
                 "inline" | "block" => Some(decoded),
@@ -3388,5 +3408,38 @@ mod test {
             tar(GzDecoder::new(&gz.finish().unwrap()[..]), UNPACKED_MAX),
             None
         );
+    }
+
+    #[test]
+    fn markdown_footnotes_prefix_ids_and_hrefs_preventing_dom_clobbering() {
+        let md = "Attach something[^file-picker].\n\n[^file-picker]: footnote body\n";
+        let html = markdown(md);
+        assert!(
+            !html.contains(r#"id="file-picker""#),
+            "footnote clobbered #file-picker: {html}"
+        );
+        assert!(
+            !html.contains(r##"href="#file-picker""##),
+            "footnote href missing fn- prefix: {html}"
+        );
+        assert!(
+            html.contains(r#"id="fn-file-picker""#),
+            "expected fn- prefixed id: {html}"
+        );
+        assert!(
+            html.contains(r##"href="#fn-file-picker""##),
+            "expected fn- prefixed href: {html}"
+        );
+        // Sanitizer must remain idempotent (re-sanitizing does not double-prefix).
+        assert_eq!(sanitize_html(&html), html);
+
+        // Max-length (64-char) footnote id remains idempotent after fn- prefixing.
+        let long_id = "a".repeat(64);
+        let long_html = sanitize_html(&format!(
+            r##"<div class="footnote-definition" id="{long_id}"><a href="#{long_id}">1</a></div>"##
+        ));
+        assert!(long_html.contains(&format!(r#"id="fn-{long_id}""#)));
+        assert!(long_html.contains(&format!(r##"href="#fn-{long_id}""##)));
+        assert_eq!(sanitize_html(&long_html), long_html);
     }
 }

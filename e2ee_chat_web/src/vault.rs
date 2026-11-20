@@ -1,9 +1,12 @@
-//! The vault: everything the client keeps, in IndexedDB, encrypted with a key derived from the
-//! passphrase.
+//! The vault: everything the client keeps, in IndexedDB (schema v2), encrypted with a key derived
+//! from the passphrase.
 //!
-//! The database `e2ee-chat` has one object store of records by name:
-//! - `vault`: the [`VaultHeader`], in the clear: the salt and the parameters of the KDF.
+//! The database `e2ee-chat` (IndexedDB version 2) has one object store of records by name:
+//! - `vault`: the [`VaultHeader`], in the clear: the salt, Argon2id parameters, schema version,
+//!   and monotonic CAS revision.
 //! - `state`: the [`AppState`]: the identity, the prekeys, the contacts and their sessions.
+//!   In v2, its AES-256-GCM AAD is `b"state/v2\0" || encoded(VaultHeader)` so any tampering with
+//!   header parameters, version, or revision fails decryption.
 //! - `history/<peer in hex>/<index>`: one [`HistoryEntry`] of a chat, without the bytes of its
 //!   file, if any, which are in `file/<peer in hex>/<index>`, a [`FileRecord`], read when shown.
 //! - `outbox/<peer in hex>/<index>`: a message of a chat, the history entry `index`, waiting to
@@ -13,11 +16,10 @@
 //! - `upload/<peer in hex>/<id in hex>`: a [`PendingUpload`], an attachment this client uploads,
 //!   with its upload token, forgotten once the upload is done.
 //!
-//! But for the header and the chunks, each record is `nonce ‖ AES-256-GCM(key, record)`, with the
-//! record's name as associated data so that one record cannot pass for another. The key is
-//! Argon2id of the passphrase.
+//! Every `ReadWrite` transaction enforces monotonic `revision` compare-and-swap (CAS) against the
+//! persisted `VaultHeader` inside the transaction so concurrent tabs cannot fork ratchets.
 
-use std::fmt;
+use std::{cell::RefCell, fmt};
 
 use aes_gcm::{
     AeadCore, Aes256Gcm, KeyInit,
@@ -39,14 +41,59 @@ use crate::{
 };
 
 const DATABASE: &str = "e2ee-chat";
+/// IndexedDB schema version 2 fence: older v1 clients fail closed with `VersionError` instead of
+/// stripping unknown prost PQ fields or offering to wipe via `create()`.
+const DATABASE_VERSION: u32 = 2;
 const STORE: &str = "records";
 const HEADER: &str = "vault";
 const STATE: &str = "state";
 
+/// Legacy v1 vault schema version (v1 headers omitted field 5, so protobuf decodes `0`).
+pub const VAULT_VERSION_V1: u32 = 1;
+/// Hardened v2 vault schema version (header-bound `STATE` AAD + monotonic CAS revision).
+pub const VAULT_VERSION_V2: u32 = 2;
+
+/// Prefix for v2 `STATE` associated data: `b"state/v2\0" || header_bytes`.
+const STATE_V2_AAD_PREFIX: &[u8] = b"state/v2\0";
+
+/// Allowed Argon2id parameter bounds (enforced on untrusted headers BEFORE key derivation).
+pub const ARGON2_MEMORY_MIN: u32 = 16 * 1024;
+pub const ARGON2_MEMORY_MAX: u32 = 256 * 1024;
+/// Default Argon2id memory for NEW vaults: 64 MiB.
+pub const ARGON2_DEFAULT_MEMORY: u32 = 64 * 1024;
+pub const ARGON2_ITERATIONS_MIN: u32 = 1;
+pub const ARGON2_ITERATIONS_MAX: u32 = 10;
+pub const ARGON2_DEFAULT_ITERATIONS: u32 = 2;
+pub const ARGON2_PARALLELISM_MIN: u32 = 1;
+pub const ARGON2_PARALLELISM_MAX: u32 = 4;
+pub const ARGON2_DEFAULT_PARALLELISM: u32 = 1;
+pub const ARGON2_SALT_MIN: usize = 16;
+pub const ARGON2_SALT_MAX: usize = 64;
+
+/// Pending outbound classical approval state stored in [`ContactState::classical_approval_needed`].
+pub const CLASSICAL_APPROVAL_NONE: u32 = 0;
+pub const CLASSICAL_APPROVAL_LEGACY: u32 = 1;
+pub const CLASSICAL_APPROVAL_SIGNED_OFF: u32 = 2;
+
+/// Per-contact security alert state stored in [`ContactState::security_alert`].
+pub const SECURITY_ALERT_NONE: u32 = 0;
+pub const SECURITY_ALERT_DOWNGRADE: u32 = 1;
+pub const SECURITY_ALERT_MANIFEST_EXPIRED: u32 = 2;
+pub const SECURITY_ALERT_PQ_REQUIRED: u32 = 3;
+
 /// AES-GCM nonce length.
 const NONCE_LEN: usize = <Aes256Gcm as AeadCore>::NonceSize::USIZE;
 
-/// The KDF's salt and parameters, in the clear.
+/// Build the v2 `STATE` associated data binding `header_bytes`: `b"state/v2\0" || header_bytes`.
+pub fn state_v2_aad(header_bytes: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(STATE_V2_AAD_PREFIX.len() + header_bytes.len());
+    aad.extend_from_slice(STATE_V2_AAD_PREFIX);
+    aad.extend_from_slice(header_bytes);
+    aad
+}
+
+/// The KDF's salt, parameters, schema version, and monotonic CAS revision, in the clear.
+/// Bound into `STATE` AAD in v2 vaults so tampering is detected upon unlock.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct VaultHeader {
     #[prost(bytes = "vec", tag = "1")]
@@ -58,30 +105,122 @@ pub struct VaultHeader {
     pub iterations: u32,
     #[prost(uint32, tag = "4")]
     pub parallelism: u32,
+    /// Schema version: `0` or `1` for legacy v1 vaults, `2` for hardened v2 vaults.
+    #[prost(uint32, tag = "5")]
+    pub version: u32,
+    /// Monotonic state revision enforced with compare-and-swap inside every RW transaction.
+    #[prost(uint64, tag = "6")]
+    pub revision: u64,
 }
 
 impl VaultHeader {
-    /// A new random salt, and OWASP's recommended Argon2id parameters.
+    /// A new v2 header with a random 16-byte salt and hardened Argon2id parameters (64 MiB).
     fn new() -> Self {
         let mut salt = vec![0; 16];
         getrandom::fill(&mut salt).expect("crypto.getRandomValues");
         Self {
             salt,
-            memory: 19 * 1024,
-            iterations: 2,
-            parallelism: 1,
+            memory: ARGON2_DEFAULT_MEMORY,
+            iterations: ARGON2_DEFAULT_ITERATIONS,
+            parallelism: ARGON2_DEFAULT_PARALLELISM,
+            version: VAULT_VERSION_V2,
+            revision: 1,
         }
     }
 
-    fn derive_key(&self, passphrase: &str) -> Result<Zeroizing<[u8; 32]>> {
+    /// Whether this header represents a legacy v1 vault awaiting atomic v1 -> v2 upgrade.
+    pub fn is_legacy_v1(&self) -> bool {
+        self.version == 0 || self.version == VAULT_VERSION_V1
+    }
+
+    /// Validate untrusted header version, salt length, and Argon2id parameters BEFORE deriving
+    /// any key (prevents DoS via huge memory/iterations or downgrade via tiny parameters).
+    pub fn validate(&self) -> Result<()> {
+        match self.version {
+            0 | VAULT_VERSION_V1 => {}
+            VAULT_VERSION_V2 => {
+                if self.revision == 0 {
+                    return Err(Error::Corrupt(
+                        "v2 vault header has invalid revision 0".into(),
+                    ));
+                }
+            }
+            v => {
+                return Err(Error::Corrupt(format!("unsupported vault version {v}")));
+            }
+        }
+        if !(ARGON2_SALT_MIN..=ARGON2_SALT_MAX).contains(&self.salt.len()) {
+            return Err(Error::Corrupt(format!(
+                "invalid vault salt length {}",
+                self.salt.len()
+            )));
+        }
+        if !(ARGON2_MEMORY_MIN..=ARGON2_MEMORY_MAX).contains(&self.memory) {
+            return Err(Error::Corrupt(format!(
+                "Argon2 memory {} KiB outside allowed range [{}..={}]",
+                self.memory, ARGON2_MEMORY_MIN, ARGON2_MEMORY_MAX
+            )));
+        }
+        if !(ARGON2_ITERATIONS_MIN..=ARGON2_ITERATIONS_MAX).contains(&self.iterations) {
+            return Err(Error::Corrupt(format!(
+                "Argon2 iterations {} outside allowed range [{}..={}]",
+                self.iterations, ARGON2_ITERATIONS_MIN, ARGON2_ITERATIONS_MAX
+            )));
+        }
+        if !(ARGON2_PARALLELISM_MIN..=ARGON2_PARALLELISM_MAX).contains(&self.parallelism) {
+            return Err(Error::Corrupt(format!(
+                "Argon2 parallelism {} outside allowed range [{}..={}]",
+                self.parallelism, ARGON2_PARALLELISM_MIN, ARGON2_PARALLELISM_MAX
+            )));
+        }
+        Ok(())
+    }
+
+    /// Derive the 32-byte vault key from `passphrase` after validating parameters.
+    pub fn derive_key(&self, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+        self.validate()?;
         let params = Params::new(self.memory, self.iterations, self.parallelism, Some(32))
             .map_err(|e| Error::Corrupt(e.to_string()))?;
         let mut key = Zeroizing::new([0; 32]);
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into(passphrase.as_bytes(), &self.salt, key.as_mut_slice())
+            .hash_password_into(passphrase, &self.salt, key.as_mut_slice())
             .map_err(|e| Error::Corrupt(e.to_string()))?;
         Ok(key)
     }
+}
+
+/// Encrypt `plaintext` under `key` with associated data `aad`.
+pub fn seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    let mut nonce = [0; NONCE_LEN];
+    getrandom::fill(&mut nonce).expect("crypto.getRandomValues");
+    let mut sealed = nonce.to_vec();
+    sealed.extend(
+        Aes256Gcm::new(key.into())
+            .encrypt(
+                &nonce.into(),
+                Payload {
+                    msg: plaintext,
+                    aad,
+                },
+            )
+            .expect("AES-GCM encrypts any record that fits in memory"),
+    );
+    sealed
+}
+
+/// Decrypt `sealed` under `key` with associated data `aad`; zeroized on drop.
+pub fn open_bytes(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    let (nonce, ciphertext) = sealed.split_at_checked(NONCE_LEN)?;
+    Aes256Gcm::new(key.into())
+        .decrypt(
+            &<[u8; NONCE_LEN]>::try_from(nonce).ok()?.into(),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .ok()
+        .map(Zeroizing::new)
 }
 
 /// Everything but the chats' histories.
@@ -97,15 +236,21 @@ pub struct AppState {
     pub name: String,
     #[prost(message, repeated, tag = "4")]
     pub contacts: Vec<ContactState>,
-    /// When the prekeys were last published; 0 if never.
+    /// When the signed prekey was last published/rotated; 0 if never.
     #[prost(uint64, tag = "5")]
     pub published_at: u64,
-    /// One-time prekeys used since then.
+    /// Classical one-time prekeys used since last publish or refill.
     #[prost(uint32, tag = "6")]
     pub used_one_time_prekeys: u32,
     /// The messages telling peers that this client deleted their chats, to push.
     #[prost(message, repeated, tag = "7")]
     pub farewells: Vec<Farewell>,
+    /// Post-quantum one-time prekeys used since last publish or refill.
+    #[prost(uint32, tag = "8")]
+    pub used_pq_one_time_prekeys: u32,
+    /// Whether a full manifest/prekey publish is pending (e.g. after toggling PQ config).
+    #[prost(bool, tag = "9")]
+    pub needs_publish: bool,
 }
 
 /// A peer, and the session with it.
@@ -159,6 +304,25 @@ pub struct ContactState {
     /// only so many.
     #[prost(message, optional, tag = "17")]
     pub sealed_events: Option<SealedEvents>,
+    /// Whether an inbound classical initial message is held in quarantine pending explicit approval.
+    #[prost(bool, tag = "18")]
+    pub quarantined: bool,
+    /// Whether the peer was already PQ-pinned when the quarantined classical session arrived.
+    #[prost(bool, tag = "19")]
+    pub quarantined_was_pq_pinned: bool,
+    /// Quarantined inbound classical session for an existing contact (held apart so the active
+    /// session is never overwritten before approval).
+    #[prost(message, optional, tag = "20")]
+    pub quarantined_session: Option<session::proto::SessionState>,
+    /// Held decrypted first message bytes of the quarantined session (not shown or applied until approved).
+    #[prost(bytes = "vec", tag = "21")]
+    pub quarantined_first_message: Vec<u8>,
+    /// Pending outbound classical fallback prompt (`CLASSICAL_APPROVAL_*`).
+    #[prost(uint32, tag = "22")]
+    pub classical_approval_needed: u32,
+    /// Active security alert (`SECURITY_ALERT_*`).
+    #[prost(uint32, tag = "23")]
+    pub security_alert: u32,
 }
 
 /// Events encrypted for the peer, waiting to be pushed, see [`ContactState::sealed_events`].
@@ -197,10 +361,6 @@ pub struct Awaiting {
 /// the file chosen again: from `uploaded`, once the file still has the hash it had. Once done, it
 /// is forgotten, with its upload token, which is no use then: deleting the attachment from the
 /// server takes its delete token, which either peer derives from its key.
-///
-/// One whose upload has not started, as the server keeps files only for those signed in to it,
-/// has no token yet, and is kept under an ID of this client's: its message waits in the chat, at
-/// `history_index`, for the upload to start, which then keeps it under the server's ID.
 #[derive(Clone, PartialEq, prost::Message)]
 #[prost(skip_debug)]
 pub struct PendingUpload {
@@ -336,6 +496,9 @@ fn file_key(peer: &PublicKey, index: u64) -> String {
 pub struct Farewell {
     #[prost(message, optional, tag = "1")]
     pub push: Option<PushRequest>,
+    /// Optional deterministic 16-byte `client_message_id` for v2 idempotent `PushV2`.
+    #[prost(bytes = "vec", tag = "2")]
+    pub client_message_id: Vec<u8>,
 }
 
 /// A message sent or received.
@@ -370,6 +533,9 @@ pub struct HistoryEntry {
     /// deleted it, or found it gone when deleting it: the chat's file browser no longer offers to.
     #[prost(bool, tag = "9")]
     pub gone: bool,
+    /// Whether this entry represents a message whose skipped ratchet key was evicted before arrival.
+    #[prost(bool, tag = "10")]
+    pub evicted: bool,
 }
 
 impl HistoryEntry {
@@ -447,8 +613,10 @@ pub enum Error {
     Storage(String),
     /// The passphrase does not open the vault.
     WrongPassphrase,
-    /// A record does not decode.
+    /// A record does not decode or failed parameter validation.
     Corrupt(String),
+    /// The vault revision changed underneath this tab (concurrent writer detected via CAS).
+    Conflict { expected: u64, actual: u64 },
 }
 
 impl fmt::Display for Error {
@@ -457,6 +625,10 @@ impl fmt::Display for Error {
             Self::Storage(e) => write!(f, "the browser's storage failed: {e}"),
             Self::WrongPassphrase => write!(f, "wrong passphrase"),
             Self::Corrupt(e) => write!(f, "the vault is corrupt: {e}"),
+            Self::Conflict { expected, actual } => write!(
+                f,
+                "the vault was modified elsewhere (expected revision {expected}, found {actual}); reload this page"
+            ),
         }
     }
 }
@@ -475,6 +647,7 @@ pub type Result<T> = core::result::Result<T, Error>;
 pub struct Vault {
     database: Database,
     key: Zeroizing<[u8; 32]>,
+    header: RefCell<VaultHeader>,
 }
 
 impl Vault {
@@ -483,58 +656,153 @@ impl Vault {
         Ok(get(&open().await?, HEADER).await?.is_some())
     }
 
-    /// A new vault holding `state`, under `passphrase`, replacing any other.
-    pub async fn create(passphrase: &str, state: &AppState) -> Result<Self> {
+    /// A new v2 vault holding `state`, under `passphrase`, replacing any other.
+    pub async fn create(passphrase: &[u8], state: &AppState) -> Result<Self> {
         let database = open().await?;
         let header = VaultHeader::new();
         let key = header.derive_key(passphrase)?;
-        let vault = Self { database, key };
+        let header_bytes = header.encode_to_vec();
+        let vault = Self {
+            database,
+            key,
+            header: RefCell::new(header),
+        };
+        let sealed_state = vault.seal_with_aad(&state_v2_aad(&header_bytes), state);
         let transaction = vault
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
         let store = transaction.object_store(STORE)?;
         store.clear()?;
-        store.put(&bytes(&header.encode_to_vec()), Some(&HEADER.into()))?;
-        store.put(&bytes(&vault.seal(STATE, state)), Some(&STATE.into()))?;
+        store.put(&bytes(&header_bytes), Some(&HEADER.into()))?;
+        store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
         commit(transaction).await?;
         Ok(vault)
     }
 
-    /// Open the vault with `passphrase`.
-    pub async fn unlock(passphrase: &str) -> Result<(Self, AppState)> {
+    /// Open the vault with `passphrase`, seamlessly upgrading legacy v1 vaults to v2 atomically
+    /// in a single IndexedDB RW transaction.
+    pub async fn unlock(passphrase: &[u8]) -> Result<(Self, AppState)> {
         let database = open().await?;
-        let header = get(&database, HEADER)
+        let header_bytes = get(&database, HEADER)
             .await?
             .ok_or_else(|| Error::Corrupt("no vault".into()))?;
-        let header =
-            VaultHeader::decode(header.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
-        let vault = Self {
-            database,
-            key: header.derive_key(passphrase)?,
-        };
-        let state = get(&vault.database, STATE)
+        let header = VaultHeader::decode(header_bytes.as_slice())
+            .map_err(|e| Error::Corrupt(e.to_string()))?;
+        // Validate version, salt, and Argon2 parameters BEFORE deriving key.
+        header.validate()?;
+        let key = header.derive_key(passphrase)?;
+        let sealed_state = get(&database, STATE)
             .await?
             .ok_or_else(|| Error::Corrupt("no state".into()))?;
-        let state = vault.open(STATE, &state).ok_or(Error::WrongPassphrase)?;
-        let state =
-            AppState::decode(state.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
-        Ok((vault, state))
+
+        if header.is_legacy_v1() {
+            // Unlock legacy v1 vault with `"state"` AAD, then atomically re-seal as v2.
+            let plain =
+                open_bytes(&key, STATE.as_bytes(), &sealed_state).ok_or(Error::WrongPassphrase)?;
+            let state =
+                AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
+
+            let mut v2_header = header;
+            v2_header.version = VAULT_VERSION_V2;
+            v2_header.revision = 1;
+            let v2_header_bytes = v2_header.encode_to_vec();
+            let v2_sealed_state =
+                seal_bytes(&key, &state_v2_aad(&v2_header_bytes), plain.as_slice());
+
+            let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
+            let store = transaction.object_store(STORE)?;
+            // CAS check inside the upgrade transaction: ensure HEADER wasn't changed concurrently.
+            let current = store
+                .get(JsValue::from_str(HEADER))?
+                .await?
+                .map(|v| Uint8Array::new(&v).to_vec())
+                .ok_or_else(|| Error::Corrupt("no vault".into()))?;
+            if current != header_bytes {
+                let actual = VaultHeader::decode(current.as_slice())
+                    .map(|h| h.revision)
+                    .unwrap_or(0);
+                let _ = transaction.abort();
+                return Err(Error::Conflict {
+                    expected: 0,
+                    actual,
+                });
+            }
+            store.put(&bytes(&v2_header_bytes), Some(&HEADER.into()))?;
+            store.put(&bytes(&v2_sealed_state), Some(&STATE.into()))?;
+            commit(transaction).await?;
+
+            let vault = Self {
+                database,
+                key,
+                header: RefCell::new(v2_header),
+            };
+            Ok((vault, state))
+        } else {
+            let plain = open_bytes(&key, &state_v2_aad(&header_bytes), &sealed_state)
+                .ok_or(Error::WrongPassphrase)?;
+            let state =
+                AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
+            let vault = Self {
+                database,
+                key,
+                header: RefCell::new(header),
+            };
+            Ok((vault, state))
+        }
+    }
+
+    /// Open an IndexedDB RW transaction and enforce monotonic CAS revision BEFORE any writes.
+    async fn begin_checked_rw_tx(
+        &self,
+    ) -> Result<(idb::Transaction, idb::ObjectStore, VaultHeader)> {
+        let transaction = self
+            .database
+            .transaction(&[STORE], TransactionMode::ReadWrite)?;
+        let store = transaction.object_store(STORE)?;
+        let expected = self.header.borrow().revision;
+        let current = match store.get(JsValue::from_str(HEADER))?.await? {
+            Some(v) => Uint8Array::new(&v).to_vec(),
+            None => {
+                let _ = transaction.abort();
+                return Err(Error::Corrupt("vault header missing".into()));
+            }
+        };
+        let decoded = match VaultHeader::decode(current.as_slice()) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                let _ = transaction.abort();
+                return Err(Error::Corrupt(e.to_string()));
+            }
+        };
+        if decoded.version != VAULT_VERSION_V2 || decoded.revision != expected {
+            let _ = transaction.abort();
+            return Err(Error::Conflict {
+                expected,
+                actual: decoded.revision,
+            });
+        }
+        Ok((transaction, store, decoded))
     }
 
     /// Save `state`, `entries`, each file of theirs in a record of its own, and `outgoing`,
     /// the records of messages waiting to be pushed, or none for one that went, together, or
-    /// none of them.
+    /// none of them, enforcing monotonic `revision` CAS inside the transaction.
     pub async fn save<'a>(
         &self,
         state: &AppState,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: &[(String, Option<OutgoingRecord>)],
     ) -> Result<()> {
-        let transaction = self
-            .database
-            .transaction(&[STORE], TransactionMode::ReadWrite)?;
-        let store = transaction.object_store(STORE)?;
-        store.put(&bytes(&self.seal(STATE, state)), Some(&STATE.into()))?;
+        let (transaction, store, mut next_header) = self.begin_checked_rw_tx().await?;
+        let Some(next_revision) = next_header.revision.checked_add(1) else {
+            let _ = transaction.abort();
+            return Err(Error::Corrupt("vault revision overflow".into()));
+        };
+        next_header.revision = next_revision;
+        let next_header_bytes = next_header.encode_to_vec();
+        let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
+        store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
+        store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
         self.put_entries(&store, entries)?;
         for (key, record) in outgoing {
             match record {
@@ -546,7 +814,9 @@ impl Vault {
                 }
             }
         }
-        commit(transaction).await
+        commit(transaction).await?;
+        *self.header.borrow_mut() = next_header;
+        Ok(())
     }
 
     /// Put `entries` in `store`, each file of theirs in a record of its own.
@@ -683,12 +953,8 @@ impl Vault {
         index: u32,
         chunk: &[u8],
     ) -> Result<()> {
-        let transaction = self
-            .database
-            .transaction(&[STORE], TransactionMode::ReadWrite)?;
-        transaction
-            .object_store(STORE)?
-            .put(&bytes(chunk), Some(&chunk_key(peer, id, index).into()))?;
+        let (transaction, store, _) = self.begin_checked_rw_tx().await?;
+        store.put(&bytes(chunk), Some(&chunk_key(peer, id, index).into()))?;
         commit(transaction).await
     }
 
@@ -713,25 +979,16 @@ impl Vault {
     /// Keep `upload`, in the chat with `peer`, replacing what was kept of it.
     pub async fn save_upload(&self, peer: &PublicKey, upload: &PendingUpload) -> Result<()> {
         let name = upload_key(peer, &upload.id);
-        let transaction = self
-            .database
-            .transaction(&[STORE], TransactionMode::ReadWrite)?;
-        transaction.object_store(STORE)?.put(
-            &bytes(&self.seal(&name, upload)),
-            Some(&name.as_str().into()),
-        )?;
+        let (transaction, store, _) = self.begin_checked_rw_tx().await?;
+        store.put(&bytes(&self.seal(&name, upload)), Some(&name.as_str().into()))?;
         commit(transaction).await
     }
 
     /// Forget the upload `id`, in the chat with `peer`, once cancelled, or its attachment
     /// deleted from the server.
     pub async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> Result<()> {
-        let transaction = self
-            .database
-            .transaction(&[STORE], TransactionMode::ReadWrite)?;
-        transaction
-            .object_store(STORE)?
-            .delete(JsValue::from_str(&upload_key(peer, id)))?;
+        let (transaction, store, _) = self.begin_checked_rw_tx().await?;
+        store.delete(JsValue::from_str(&upload_key(peer, id)))?;
         commit(transaction).await
     }
 
@@ -789,24 +1046,31 @@ impl Vault {
     }
 
     /// Save `state`, without the history, files, outbox, attachments and uploads of the chat
-    /// with `peer`, and `entries` of other chats with it.
+    /// with `peer`, and `entries` of other chats with it, enforcing monotonic `revision` CAS.
     pub async fn forget<'a>(
         &self,
         state: &AppState,
         peer: &PublicKey,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
     ) -> Result<()> {
-        let transaction = self
-            .database
-            .transaction(&[STORE], TransactionMode::ReadWrite)?;
-        let store = transaction.object_store(STORE)?;
+        let (transaction, store, mut next_header) = self.begin_checked_rw_tx().await?;
+        let Some(next_revision) = next_header.revision.checked_add(1) else {
+            let _ = transaction.abort();
+            return Err(Error::Corrupt("vault revision overflow".into()));
+        };
+        next_header.revision = next_revision;
+        let next_header_bytes = next_header.encode_to_vec();
+        let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
         store.delete(history_range(peer, 0, u64::MAX)?)?;
         for prefix in ["file", "outbox", "attachment", "upload"] {
             store.delete(prefix_range(&format!("{prefix}/{}/", hex(peer)))?)?;
         }
-        store.put(&bytes(&self.seal(STATE, state)), Some(&STATE.into()))?;
+        store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
+        store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
         self.put_entries(&store, entries)?;
-        commit(transaction).await
+        commit(transaction).await?;
+        *self.header.borrow_mut() = next_header;
+        Ok(())
     }
 
     /// Delete the vault for good.
@@ -818,44 +1082,25 @@ impl Vault {
         commit(transaction).await
     }
 
+    /// `record`, encrypted under explicit `aad`. Its plaintext, which holds keys, is zeroized.
+    fn seal_with_aad(&self, aad: &[u8], record: &impl Message) -> Vec<u8> {
+        let plaintext = Zeroizing::new(record.encode_to_vec());
+        seal_bytes(&self.key, aad, &plaintext)
+    }
+
     /// `record`, encrypted under the name `name`. Its plaintext, which holds keys, is zeroized.
     fn seal(&self, name: &str, record: &impl Message) -> Vec<u8> {
-        let plaintext = Zeroizing::new(record.encode_to_vec());
-        let mut nonce = [0; NONCE_LEN];
-        getrandom::fill(&mut nonce).expect("crypto.getRandomValues");
-        let mut sealed = nonce.to_vec();
-        sealed.extend(
-            Aes256Gcm::new(&(*self.key).into())
-                .encrypt(
-                    &nonce.into(),
-                    Payload {
-                        msg: &plaintext,
-                        aad: name.as_bytes(),
-                    },
-                )
-                .expect("AES-GCM encrypts any record that fits in memory"),
-        );
-        sealed
+        self.seal_with_aad(name.as_bytes(), record)
     }
 
     /// The plaintext of the record `name`, zeroized once dropped; `None` if it does not decrypt.
     fn open(&self, name: &str, sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-        let (nonce, ciphertext) = sealed.split_at_checked(NONCE_LEN)?;
-        Aes256Gcm::new(&(*self.key).into())
-            .decrypt(
-                &<[u8; NONCE_LEN]>::try_from(nonce).ok()?.into(),
-                Payload {
-                    msg: ciphertext,
-                    aad: name.as_bytes(),
-                },
-            )
-            .ok()
-            .map(Zeroizing::new)
+        open_bytes(&self.key, name.as_bytes(), sealed)
     }
 }
 
 async fn open() -> Result<Database> {
-    let mut request = Factory::new()?.open(DATABASE, Some(1))?;
+    let mut request = Factory::new()?.open(DATABASE, Some(DATABASE_VERSION))?;
     request.on_upgrade_needed(|event| {
         if let Ok(database) = event.database()
             && !database.store_names().iter().any(|name| name == STORE)
@@ -886,4 +1131,130 @@ async fn commit(transaction: idb::Transaction) -> Result<()> {
 
 fn bytes(bytes: &[u8]) -> JsValue {
     Uint8Array::from(bytes).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_header_argon2_parameter_bounds_and_defaults() {
+        let new_header = VaultHeader::new();
+        assert_eq!(new_header.version, VAULT_VERSION_V2);
+        assert_eq!(new_header.revision, 1);
+        assert_eq!(new_header.memory, ARGON2_DEFAULT_MEMORY);
+        assert_eq!(new_header.memory, 64 * 1024);
+        assert!(new_header.validate().is_ok());
+
+        // Legacy v1 vault header (19 MiB, version = 0, revision = 0) validates cleanly.
+        let legacy_v1 = VaultHeader {
+            salt: vec![0x42; 16],
+            memory: 19 * 1024,
+            iterations: 2,
+            parallelism: 1,
+            version: 0,
+            revision: 0,
+        };
+        assert!(legacy_v1.is_legacy_v1());
+        assert!(legacy_v1.validate().is_ok());
+
+        // Reject out-of-range Argon2 parameters BEFORE running KDF.
+        for bad in [
+            VaultHeader {
+                memory: ARGON2_MEMORY_MIN - 1,
+                ..new_header.clone()
+            },
+            VaultHeader {
+                memory: ARGON2_MEMORY_MAX + 1,
+                ..new_header.clone()
+            },
+            VaultHeader {
+                iterations: 0,
+                ..new_header.clone()
+            },
+            VaultHeader {
+                iterations: ARGON2_ITERATIONS_MAX + 1,
+                ..new_header.clone()
+            },
+            VaultHeader {
+                parallelism: 0,
+                ..new_header.clone()
+            },
+            VaultHeader {
+                parallelism: ARGON2_PARALLELISM_MAX + 1,
+                ..new_header.clone()
+            },
+            VaultHeader {
+                salt: vec![0u8; 8],
+                ..new_header.clone()
+            },
+            VaultHeader {
+                version: 3,
+                ..new_header.clone()
+            },
+            VaultHeader {
+                version: VAULT_VERSION_V2,
+                revision: 0,
+                ..new_header.clone()
+            },
+        ] {
+            assert!(
+                matches!(bad.validate(), Err(Error::Corrupt(_))),
+                "expected Corrupt for {bad:?}"
+            );
+            assert!(matches!(bad.derive_key(b"passphrase"), Err(Error::Corrupt(_))));
+        }
+    }
+
+    #[test]
+    fn vault_v1_to_v2_header_bound_aad_detects_tampering() {
+        let legacy_header = VaultHeader {
+            salt: vec![0x11; 16],
+            memory: ARGON2_MEMORY_MIN,
+            iterations: 1,
+            parallelism: 1,
+            version: 0,
+            revision: 0,
+        };
+        let key = legacy_header.derive_key(b"correct horse battery staple").unwrap();
+
+        let state = AppState {
+            name: "Alice".to_string(),
+            server: "https://chat.example.com".to_string(),
+            ..AppState::default()
+        };
+        let plain = state.encode_to_vec();
+
+        // Legacy v1 STATE sealed under `"state"` AAD opens cleanly.
+        let v1_sealed = seal_bytes(&key, STATE.as_bytes(), &plain);
+        let opened_v1 = open_bytes(&key, STATE.as_bytes(), &v1_sealed).unwrap();
+        assert_eq!(opened_v1.as_slice(), plain.as_slice());
+
+        // Upgrade to v2: bind encoded v2 VaultHeader bytes into STATE AAD.
+        let mut v2_header = legacy_header;
+        v2_header.version = VAULT_VERSION_V2;
+        v2_header.revision = 1;
+        let v2_header_bytes = v2_header.encode_to_vec();
+        let v2_aad = state_v2_aad(&v2_header_bytes);
+        assert!(v2_aad.starts_with(b"state/v2\0"));
+        let v2_sealed = seal_bytes(&key, &v2_aad, &opened_v1);
+
+        // Opens with matching v2 header bytes, fails with legacy `"state"` AAD.
+        assert!(open_bytes(&key, STATE.as_bytes(), &v2_sealed).is_none());
+        let opened_v2 = open_bytes(&key, &v2_aad, &v2_sealed).unwrap();
+        assert_eq!(AppState::decode(opened_v2.as_slice()).unwrap(), state);
+
+        // Any tampering with VaultHeader (e.g. revision rollback or memory change) fails AAD check!
+        let mut tampered_rev = v2_header.clone();
+        tampered_rev.revision = 2;
+        assert!(
+            open_bytes(&key, &state_v2_aad(&tampered_rev.encode_to_vec()), &v2_sealed).is_none()
+        );
+
+        let mut tampered_mem = v2_header;
+        tampered_mem.memory = ARGON2_DEFAULT_MEMORY;
+        assert!(
+            open_bytes(&key, &state_v2_aad(&tampered_mem.encode_to_vec()), &v2_sealed).is_none()
+        );
+    }
 }

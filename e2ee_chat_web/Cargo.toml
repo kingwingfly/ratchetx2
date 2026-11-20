@@ -9,6 +9,12 @@ license = "MIT"
 authors = ["Louis <836250617@qq.com>"]
 repository = "https://github.com/kingwingfly/ratchetx2"
 
+[features]
+default = ["pq"]
+ml-kem-1024 = ["session/ml-kem-1024", "party/ml-kem-1024"]
+ml-kem-768 = ["session/ml-kem-768", "party/ml-kem-768"]
+pq = ["ml-kem-1024", "ml-kem-768", "session/pq", "party/pq"]
+
 [dependencies]
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
 argon2 = { version = "0.6", default-features = false, features = ["alloc"] }
@@ -58,6 +64,7 @@ web-sys = { version = "0.3", features = [
     "HtmlElement",
     "HtmlInputElement",
     "HtmlMediaElement",
+    "HtmlSelectElement",
     "ImageData",
     "IntersectionObserver",
     "IntersectionObserverEntry",

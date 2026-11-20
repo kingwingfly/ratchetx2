@@ -24,7 +24,7 @@ use session::{
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{ProgressEvent, XmlHttpRequest, XmlHttpRequestResponseType, XmlHttpRequestUpload};
 
-use crate::util::{js_error, now, sleep};
+use crate::util::{js_error, monotonic_now_ms, sleep};
 
 /// The handshake and mailbox client of a server.
 pub type Connect = ConnectClient<Fetch>;
@@ -34,6 +34,10 @@ pub type Connect = ConnectClient<Fetch>;
 const STALL_MILLIS: u64 = 30_000;
 /// Milliseconds between checks of whether a call moves.
 const STALL_CHECK: i32 = 1_000;
+/// Maximum Connect HTTP response body size accepted before decoding (5 MiB, matching server max ~4 MiB + framing).
+pub const MAX_CONNECT_RESPONSE_BYTES: usize = 5 << 20;
+/// Maximum response size for non-Connect auxiliary calls (e.g. `/auth`).
+const MAX_CALL_RESPONSE_BYTES: usize = 64 << 10;
 
 /// Told how far the body of a request got: bytes sent, of how many.
 pub type Progress = Rc<dyn Fn(u64, u64)>;
@@ -56,6 +60,17 @@ fn asks_sign_in(status: u16, body: &[u8]) -> bool {
         && serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|error| {
             error.get("code").and_then(serde_json::Value::as_str) == Some("permission_denied")
         })
+}
+
+/// Check that a Connect response body length does not exceed [`MAX_CONNECT_RESPONSE_BYTES`].
+fn check_response_size(len: u64) -> protocol::Result<()> {
+    if len > MAX_CONNECT_RESPONSE_BYTES as u64 {
+        return Err(Error::new(
+            ErrorKind::LimitExceeded,
+            format!("response exceeds maximum size of {MAX_CONNECT_RESPONSE_BYTES} bytes"),
+        ));
+    }
+    Ok(())
 }
 
 /// The clock of `server`, as its responses tell it, which signs the requests whose time it
@@ -111,6 +126,13 @@ impl Fetch {
     }
 }
 
+#[derive(Clone, Copy)]
+enum XhrOutcome {
+    Loaded,
+    Failed,
+    Oversized,
+}
+
 impl LocalPost for Fetch {
     async fn post(&self, path: &str, body: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
         let failed = |error| Error::new(ErrorKind::Connect, js_error(error));
@@ -126,18 +148,36 @@ impl LocalPost for Fetch {
             .map_err(failed)?;
         request.set_response_type(XmlHttpRequestResponseType::Arraybuffer);
         let upload = request.upload().map_err(failed)?;
-        // When it last moved, and whether it ended with an answer, or failed.
-        let moved = Rc::new(Cell::new(now()));
-        let (ended, mut end) = oneshot::channel();
+        // When it last moved (monotonic), and whether it ended with an answer, failed, or exceeded cap.
+        let moved = Rc::new(Cell::new(monotonic_now_ms()));
+        let (ended, mut end) = oneshot::channel::<XhrOutcome>();
         let ended = Rc::new(Cell::new(Some(ended)));
         let progress = {
             let moved = moved.clone();
-            Closure::<dyn FnMut()>::new(move || moved.set(now()))
+            let ended = ended.clone();
+            let req = request.clone();
+            Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
+                moved.set(monotonic_now_ms());
+                let loaded = event.loaded();
+                let total = if event.length_computable() {
+                    event.total()
+                } else {
+                    0.0
+                };
+                if loaded > MAX_CONNECT_RESPONSE_BYTES as f64
+                    || total > MAX_CONNECT_RESPONSE_BYTES as f64
+                {
+                    let _ = req.abort();
+                    if let Some(ended) = ended.take() {
+                        let _ = ended.send(XhrOutcome::Oversized);
+                    }
+                }
+            })
         };
         let sent = {
             let (moved, progress) = (moved.clone(), self.progress.clone());
             Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
-                moved.set(now());
+                moved.set(monotonic_now_ms());
                 if let Some(progress) = &progress
                     && event.length_computable()
                 {
@@ -145,15 +185,15 @@ impl LocalPost for Fetch {
                 }
             })
         };
-        let ends = |answered: bool| {
+        let ends = |outcome: XhrOutcome| {
             let ended = ended.clone();
             Closure::<dyn FnMut()>::new(move || {
                 if let Some(ended) = ended.take() {
-                    let _ = ended.send(answered);
+                    let _ = ended.send(outcome);
                 }
             })
         };
-        let (load, error) = (ends(true), ends(false));
+        let (load, error) = (ends(XhrOutcome::Loaded), ends(XhrOutcome::Failed));
         // Declared after the closures, so that it goes first.
         let _handlers = Handlers {
             request: &request,
@@ -169,19 +209,44 @@ impl LocalPost for Fetch {
         let ended = loop {
             match select(end, Box::pin(sleep(STALL_CHECK))).await {
                 // Its sender lives as long as the closures.
-                Either::Left((Ok(true), _)) => break Ok(()),
-                Either::Left(_) => break Err("the server cannot be reached".to_string()),
-                // The clock may go back, e.g. set by hand.
-                Either::Right(_) if now().saturating_sub(moved.get()) > STALL_MILLIS => {
-                    break Err(format!("nothing moved for {} s", STALL_MILLIS / 1000));
+                Either::Left((Ok(XhrOutcome::Loaded), _)) => break Ok(()),
+                Either::Left((Ok(XhrOutcome::Oversized), _)) => {
+                    break Err(Error::new(
+                        ErrorKind::LimitExceeded,
+                        format!(
+                            "response exceeds maximum size of {MAX_CONNECT_RESPONSE_BYTES} bytes"
+                        ),
+                    ));
+                }
+                Either::Left(_) => {
+                    break Err(Error::new(ErrorKind::Connect, "the server cannot be reached"));
+                }
+                Either::Right(_)
+                    if monotonic_now_ms().saturating_sub(moved.get()) > STALL_MILLIS =>
+                {
+                    break Err(Error::new(
+                        ErrorKind::Connect,
+                        format!("nothing moved for {} s", STALL_MILLIS / 1000),
+                    ));
                 }
                 Either::Right((_, pending)) => end = pending,
             }
         };
-        ended.map_err(|reason| Error::new(ErrorKind::Connect, reason))?;
+        ended?;
         observe(&self.server, &request);
         let status = request.status().map_err(failed)?;
-        let body: ArrayBuffer = request.response().map_err(failed)?.unchecked_into();
+        // Enforce bounded response size BEFORE copying into Rust memory or decoding.
+        if let Ok(Some(cl)) = request.get_response_header("content-length")
+            && let Ok(parsed) = cl.trim().parse::<u64>()
+        {
+            check_response_size(parsed)?;
+        }
+        let body: ArrayBuffer = request
+            .response()
+            .map_err(failed)?
+            .dyn_into()
+            .map_err(|_| Error::new(ErrorKind::Malformed, "unexpected response buffer type"))?;
+        check_response_size(u64::from(body.byte_length()))?;
         let body = Uint8Array::new(&body).to_vec();
         if asks_sign_in(status, &body)
             && let Some(refused) = REFUSED.with_borrow(Clone::clone)
@@ -261,5 +326,21 @@ pub async fn call(
         .response_text()
         .map_err(js_error)?
         .unwrap_or_default();
+    if text.len() > MAX_CALL_RESPONSE_BYTES {
+        return Err("the server's response was too large".to_string());
+    }
     Ok((status, text))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connect_response_size_cap_is_enforced() {
+        assert!(check_response_size(0).is_ok());
+        assert!(check_response_size(MAX_CONNECT_RESPONSE_BYTES as u64).is_ok());
+        let err = check_response_size(MAX_CONNECT_RESPONSE_BYTES as u64 + 1).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::LimitExceeded);
+    }
 }

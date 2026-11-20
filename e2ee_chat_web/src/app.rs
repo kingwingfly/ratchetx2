@@ -7,28 +7,31 @@ use e2ee_chat_preview::language;
 
 use js_sys::Uint8Array;
 use leptos::{ev, html, prelude::*, task::spawn_local};
-use session::{PublicKey, safety_number};
+use session::{PqConfig, PqSuite, PublicKey, safety_number};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
     Blob, BlobPropertyBag, CanvasRenderingContext2d, FileList, HtmlAnchorElement,
     HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry, IntersectionObserverInit,
     Url,
 };
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     content,
     engine::{
-        Engine, MAX_FILE_SIZE, MEDIA_INLINE_MAX, NAME_MAX, Sending, invitation, origin, same_server,
+        Engine, MAX_FILE_SIZE, MEDIA_INLINE_MAX, NAME_MAX, Sending, StartChatError,
+        build_invitation_link, invitation, origin, same_server,
     },
     glue::copy,
     icon::{Icon, icon},
     preview::{self, DiffLine, Kind, Sort},
     search::Search,
     state::{
-        Attachment, Body, ContactView, Delivery, Dialog, FileView, Link, LocalFile, Me,
-        MessageView, Phase, RemoteFile, SignIn, Streamed, Ui, UploadState, UploadView,
+        Attachment, Body, ClassicalPrompt, ContactView, Delivery, Dialog, FileView, Link,
+        LocalFile, Me, MessageView, Phase, RemoteFile, SecurityAlert, ServerPqStatus, SignIn,
+        Streamed, Ui, UploadState, UploadView,
     },
-    util::{clock, day, js_error, key_to_text, key_to_url, month, short, size, sleep},
+    util::{clock, day, js_error, key_to_text, month, short, size, size_u64, sleep},
     workers,
 };
 
@@ -265,7 +268,11 @@ fn ChatItem(contact: ContactView) -> impl IntoView {
     } else {
         initials(&label)
     };
-    let sub = if contact.request {
+    let sub = if contact.has_downgrade() {
+        "downgrade detected".to_string()
+    } else if contact.is_quarantined() {
+        "classical request (quarantined)".to_string()
+    } else if contact.request {
         "wants to chat".to_string()
     } else {
         short(&peer)
@@ -275,6 +282,7 @@ fn ChatItem(contact: ContactView) -> impl IntoView {
         <button
             class="chat-item"
             class:request=contact.request
+            class:downgrade=contact.has_downgrade()
             class:active=move || ui.open.get() == Some(peer)
             on:click=move |_| open_chat(Some(peer))
         >
@@ -295,12 +303,10 @@ fn ChatItem(contact: ContactView) -> impl IntoView {
 #[component]
 fn Welcome() -> impl IntoView {
     let ui = ui();
-    let me = ui.me.get_untracked();
-    let key = me
-        .as_ref()
-        .map(|me| key_to_text(&me.key))
-        .unwrap_or_default();
-    let link = me.as_ref().map(invitation_link).unwrap_or_default();
+    let key = move || {
+        ui.me
+            .with(|me| me.as_ref().map(|me| key_to_text(&me.key)).unwrap_or_default())
+    };
     view! {
         <section class="pane welcome">
             <div class="welcome-inner">
@@ -309,15 +315,19 @@ fn Welcome() -> impl IntoView {
                     <h1>"Your keys stay in this browser"</h1>
                 </div>
                 <p>
-                    "Messages are encrypted here, with X3DH and a double ratchet, before they "
-                    "leave the page. The server, a Cloudflare Worker, only relays what it cannot "
-                    "read: prekeys and sealed messages in its Durable Objects, the large ones in R2."
+                    "Messages are encrypted here, with PQXDH / X3DH and a double ratchet, before "
+                    "they leave the page. The server, a Cloudflare Worker, only relays what it "
+                    "cannot read: prekeys and sealed messages in its Durable Objects, the large "
+                    "ones in R2."
                 </p>
                 <div>
                     <div class="section-label">"Your identity key"</div>
-                    <Copyable text=key what="your key" />
+                    {move || view! { <Copyable text=key() what="your key" /> }}
                     <div class="section-label">"Your invitation link"</div>
-                    <Copyable text=link what="your invitation link" />
+                    {move || {
+                        let link = ui.me.get().as_ref().map(invitation_link).unwrap_or_default();
+                        view! { <Copyable text=link what="your invitation link" /> }
+                    }}
                     <div class="row">
                         <button class="btn primary" on:click=move |_| new_chat()>
                             {icon(Icon::Compose)}
@@ -348,12 +358,52 @@ fn Welcome() -> impl IntoView {
     }
 }
 
+/// Render a security status badge for `contact` (`detailed` shows the full label in `ContactInfo`).
+fn security_badge(contact: &ContactView, detailed: bool) -> AnyView {
+    let (class, label, title) = if contact.has_downgrade() {
+        (
+            "sec-badge danger",
+            "Downgrade detected".to_string(),
+            "Post-quantum downgrade detected for this chat".to_string(),
+        )
+    } else if contact.security.is_pq {
+        let text = if detailed {
+            contact.security.detail_label()
+        } else {
+            contact.security.badge_label()
+        };
+        ("sec-badge pq", text, contact.security.detail_label())
+    } else {
+        (
+            "sec-badge classical",
+            "Classical only".to_string(),
+            contact.security.detail_label(),
+        )
+    };
+    view! {
+        <span class=class title=title>
+            {label}
+        </span>
+    }
+    .into_any()
+}
+
 #[component]
 fn ChatPane(peer: PublicKey) -> impl IntoView {
     let ui = ui();
     let contact = move || ui.contact(&peer);
     let label = move || contact().map(|contact| contact.label()).unwrap_or_default();
     let request = move || contact().is_some_and(|contact| contact.request);
+    let quarantined = move || contact().is_some_and(|contact| contact.is_quarantined());
+    let composer_disabled = move || request() || quarantined();
+    let pq_available = move || {
+        ui.me.with(|me| {
+            me.as_ref().is_some_and(|me| {
+                me.pq_config.pq_enabled && !me.pq_config.offered_suites().is_empty()
+            })
+        })
+    };
+    let sec_busy = RwSignal::new(false);
     view! {
         <section class="pane">
             <header class="pane-head">
@@ -368,7 +418,10 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
                 <span class="avatar">{move || initials(&label())}</span>
                 <div class="pane-title">
                     <strong>{label}</strong>
-                    <span>{short(&peer)}</span>
+                    <div class="pane-sub">
+                        <span>{short(&peer)}</span>
+                        {move || contact().map(|c| security_badge(&c, false))}
+                    </div>
                 </div>
                 <button
                     class="btn icon"
@@ -395,7 +448,194 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
                     {icon(Icon::Close)}
                 </button>
             </header>
-            <Show when=request>
+            {move || {
+                let c = contact()?;
+                if c.has_downgrade() {
+                    Some(
+                        view! {
+                            <div class="banner danger" role="alert">
+                                <span>
+                                    "Downgrade detected: this peer supports or was pinned for post-quantum encryption, but a classical or tampered handshake was received."
+                                </span>
+                                <div class="banner-actions">
+                                    <Show when=pq_available>
+                                        <button
+                                            type="button"
+                                            class="btn primary small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().upgrade_to_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Upgrade to PQ"
+                                        </button>
+                                    </Show>
+                                    <button
+                                        type="button"
+                                        class="btn small"
+                                        disabled=move || sec_busy.get()
+                                        on:click=move |_| {
+                                            act_while(sec_busy, async move {
+                                                engine().dismiss_downgrade(peer).await
+                                            });
+                                        }
+                                    >
+                                        "Dismiss"
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    )
+                } else {
+                    None
+                }
+            }}
+            {move || {
+                let c = contact()?;
+                match c.classical_prompt {
+                    ClassicalPrompt::InboundQuarantined { peer_was_pq_pinned } => Some(
+                        view! {
+                            <div class="banner warn" role="alert">
+                                <span>
+                                    {if peer_was_pq_pinned {
+                                        "Classical session quarantined: this peer was previously pinned as post-quantum capable. Its incoming message is held until you explicitly allow classical encryption or upgrade to PQ."
+                                    } else {
+                                        "Classical chat request quarantined: this peer initiated without post-quantum encryption. Its message is held until you allow classical encryption."
+                                    }}
+                                </span>
+                                <div class="banner-actions">
+                                    <button
+                                        type="button"
+                                        class="btn small"
+                                        disabled=move || sec_busy.get()
+                                        on:click=move |_| {
+                                            act_while(sec_busy, async move {
+                                                engine().approve_classical(peer).await
+                                            });
+                                        }
+                                    >
+                                        "Allow classical"
+                                    </button>
+                                    <Show when=pq_available>
+                                        <button
+                                            type="button"
+                                            class="btn primary small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().upgrade_to_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Upgrade to PQ"
+                                        </button>
+                                    </Show>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    ),
+                    ClassicalPrompt::Outbound { peer_signed_off } => Some(
+                        view! {
+                            <div class="banner warn" role="alert">
+                                <span>
+                                    {if peer_signed_off {
+                                        "Sending paused: this peer published a signed manifest disabling post-quantum encryption. Allow classical fallback to send?"
+                                    } else {
+                                        "Sending paused: this peer has no post-quantum prekeys on the server. Allow classical encryption for this chat?"
+                                    }}
+                                </span>
+                                <div class="banner-actions">
+                                    <button
+                                        type="button"
+                                        class="btn small"
+                                        disabled=move || sec_busy.get()
+                                        on:click=move |_| {
+                                            act_while(sec_busy, async move {
+                                                engine().approve_classical(peer).await
+                                            });
+                                        }
+                                    >
+                                        "Allow classical"
+                                    </button>
+                                    <button
+                                        type="button"
+                                        class="btn primary small"
+                                        disabled=move || sec_busy.get()
+                                        on:click=move |_| {
+                                            act_while(sec_busy, async move {
+                                                engine().retry_pq(peer).await
+                                            });
+                                        }
+                                    >
+                                        "Retry PQ"
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    ),
+                    ClassicalPrompt::None => None,
+                }
+            }}
+            {move || {
+                let c = contact()?;
+                match c.alert {
+                    SecurityAlert::ManifestExpired => Some(
+                        view! {
+                            <div class="banner warn" role="alert">
+                                <span>
+                                    "Peer's signed post-quantum capability manifest has expired (they may have been offline for a while)."
+                                </span>
+                                <div class="banner-actions">
+                                    <button
+                                        type="button"
+                                        class="btn small"
+                                        disabled=move || sec_busy.get()
+                                        on:click=move |_| {
+                                            act_while(sec_busy, async move {
+                                                engine().retry_pq(peer).await
+                                            });
+                                        }
+                                    >
+                                        "Retry"
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    ),
+                    SecurityAlert::PqRequired => Some(
+                        view! {
+                            <div class="banner warn" role="alert">
+                                <span>
+                                    "Require PQ (strict mode) is enabled, and a post-quantum session could not be established with this peer."
+                                </span>
+                                <div class="banner-actions">
+                                    <button
+                                        type="button"
+                                        class="btn small"
+                                        disabled=move || sec_busy.get()
+                                        on:click=move |_| {
+                                            act_while(sec_busy, async move {
+                                                engine().retry_pq(peer).await
+                                            });
+                                        }
+                                    >
+                                        "Retry"
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    ),
+                    _ => None,
+                }
+            }}
+            <Show when=move || request() && !quarantined()>
                 <div class="banner">
                     <span>
                         {format!(
@@ -413,7 +653,7 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
             </Show>
             <Messages label=Signal::derive(label) />
             <Uploads peer />
-            <Composer peer disabled=Signal::derive(request) />
+            <Composer peer disabled=Signal::derive(composer_disabled) />
         </section>
     }
 }
@@ -492,6 +732,15 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
         Body::Deleted => {
             let note = move || format!("{} deleted this chat · {time}", label.get());
             return view! { <div class="note">{note}</div> }.into_any();
+        }
+        Body::Evicted => {
+            let note = move || {
+                format!(
+                    "A message from {} could not be decrypted (its key expired) · {time}",
+                    label.get()
+                )
+            };
+            return view! { <div class="note evicted">{note}</div> }.into_any();
         }
         Body::Unknown => {
             let note = move || {
@@ -601,7 +850,7 @@ fn upload_row(upload: UploadView) -> impl IntoView {
     let (peer, id) = (upload.peer, upload.id);
     // Without the file, which went with the page that chose it, the file is chosen again.
     let resume = move |_| {
-        if engine().has_file(&id) {
+        if engine().has_file(&peer, &id) {
             act(async move { engine().resume_upload(peer, id, None).await });
         } else {
             choose_file(move |file| {
@@ -894,7 +1143,7 @@ fn inline_media(body: &Body) -> Option<(Source, Sort)> {
 fn file_card(source: Source) -> AnyView {
     let extension = extension(source.name());
     let name = source.name().to_string();
-    let length = size(source.size() as usize);
+    let length = size_u64(source.size());
     view! {
         <button class="file-card" on:click=move |_| source.open()>
             <span class="file-icon">{extension}</span>
@@ -988,7 +1237,7 @@ fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
         }
     });
     let name = source.name().to_string();
-    let caption = format!("{} · {}", source.name(), size(source.size() as usize));
+    let caption = format!("{} · {}", source.name(), size_u64(source.size()));
     // What it read shows at once; a stream's opens as any attachment does.
     let opened = StoredValue::new(source.clone());
     let open = move |_| match read.get_value() {
@@ -1274,6 +1523,7 @@ fn new_chat() {
         key: String::new(),
         name: String::new(),
         server: None,
+        pq_pinned: false,
     }));
 }
 
@@ -1329,20 +1579,10 @@ fn Copyable(text: String, what: &'static str) -> impl IntoView {
     }
 }
 
-/// A link that opens a chat with `me`, with the name filled in, and the server if it is not the
-/// page's own.
+/// A link that opens a chat with `me`, with the name filled in, the server if it is not the
+/// page's own, and `&pq=1` when post-quantum encryption is enabled.
 fn invitation_link(me: &Me) -> String {
-    let mut link = format!("{}/#chat={}", origin(), key_to_url(&me.key));
-    if !me.name.is_empty() {
-        link.push_str(&format!("&name={}", js_sys::encode_uri_component(&me.name)));
-    }
-    if !same_server(&me.server, &origin()) {
-        link.push_str(&format!(
-            "&server={}",
-            js_sys::encode_uri_component(&me.server)
-        ));
-    }
-    link
+    build_invitation_link(&origin(), me)
 }
 
 /// The server an invitation link in the page's address names, to create the vault on.
@@ -1438,9 +1678,15 @@ fn VaultDialog() -> impl IntoView {
                 (Phase::Locked, _) => view! { <UnlockVault /> }.into_any(),
                 (Phase::Elsewhere, _) => view! { <Elsewhere /> }.into_any(),
                 (Phase::Unavailable(error), _) => view! { <Unavailable error /> }.into_any(),
-                (Phase::Unlocked, Some(Dialog::NewChat { key, name, server })) => {
-                    view! { <NewChat key name server /> }.into_any()
-                }
+                (
+                    Phase::Unlocked,
+                    Some(Dialog::NewChat {
+                        key,
+                        name,
+                        server,
+                        pq_pinned,
+                    }),
+                ) => view! { <NewChat key name server pq_pinned /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Identity)) => view! { <Identity /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Contact(peer))) => {
                     view! { <ContactInfo peer /> }.into_any()
@@ -1456,6 +1702,22 @@ fn VaultDialog() -> impl IntoView {
     }
 }
 
+/// Move a secret string out of an `RwSignal<String>` into [`Zeroizing`] while clearing and
+/// zeroizing the signal's buffer immediately.
+fn take_secret(signal: RwSignal<String>) -> Zeroizing<String> {
+    let mut secret = String::new();
+    signal.update(|value| {
+        std::mem::swap(value, &mut secret);
+        value.zeroize();
+    });
+    Zeroizing::new(secret)
+}
+
+/// Zeroize and clear a secret `RwSignal<String>` in place.
+fn clear_secret(signal: RwSignal<String>) {
+    signal.update(|value| value.zeroize());
+}
+
 /// Sign in to the server with its password, which storing files there takes, as they cost it
 /// storage: what waited for it goes then.
 #[component]
@@ -1465,9 +1727,12 @@ fn SignInDialog() -> impl IntoView {
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         let engine = engine();
+        let secret = take_secret(password);
         progress.start("Signing in…");
         spawn_local(async move {
-            match engine.sign_in(&password.get_untracked()).await {
+            let result = engine.sign_in(&secret).await;
+            drop(secret);
+            match result {
                 Ok(signed_in) => {
                     engine.ui().dialog.set(None);
                     engine.ui().notify(format!(
@@ -1560,6 +1825,8 @@ fn CreateVault() -> impl IntoView {
     let name = RwSignal::new(String::new());
     let passphrase = RwSignal::new(String::new());
     let repeat = RwSignal::new(String::new());
+    let pq_compiled = !PqConfig::compiled_suites().is_empty();
+    let pq_enabled = RwSignal::new(pq_compiled);
     let invited = invited_server();
     let server = RwSignal::new(invited.clone().unwrap_or_else(origin));
     let progress = Progress::new();
@@ -1568,20 +1835,22 @@ fn CreateVault() -> impl IntoView {
         if passphrase.with_untracked(|p| p.chars().count()) < 8 {
             return progress.fail("Use a passphrase of 8 characters or more.");
         }
-        if passphrase.get_untracked() != repeat.get_untracked() {
+        let matches = passphrase.with_untracked(|p| repeat.with_untracked(|r| p == r));
+        if !matches {
             return progress.fail("The passphrases differ.");
         }
+        let secret = take_secret(passphrase);
+        clear_secret(repeat);
+        let enable_pq = pq_enabled.get_untracked();
+        let display_name = name.get_untracked();
+        let target_server = server.get_untracked();
         progress.start("Deriving the key…");
         let engine = engine();
         spawn_local(async move {
             // Argon2 blocks the page for a moment; let it show why first.
             sleep(50).await;
             let result = engine
-                .create(
-                    name.get_untracked(),
-                    passphrase.get_untracked(),
-                    server.get_untracked(),
-                )
+                .create(display_name, secret, target_server, enable_pq)
                 .await;
             if let Err(e) = result {
                 progress.fail(e);
@@ -1624,6 +1893,25 @@ fn CreateVault() -> impl IntoView {
                         </p>
                     }
                 })}
+            {pq_compiled.then(|| {
+                view! {
+                    <label class="toggle-row" for="create-pq">
+                        <input
+                            id="create-pq"
+                            type="checkbox"
+                            prop:checked=move || pq_enabled.get()
+                            on:change=move |ev: ev::Event| {
+                                let input: web_sys::HtmlInputElement = event_target(&ev);
+                                pq_enabled.set(input.checked());
+                            }
+                        />
+                        <span>
+                            <strong>"Post-quantum encryption"</strong>
+                            <small>"Enabled by default (PQXDH + PQ Ratchet)."</small>
+                        </span>
+                    </label>
+                }
+            })}
             {progress.view()}
             <div class="actions">
                 <button class="btn primary" type="submit" disabled=move || progress.working.get()>
@@ -1641,11 +1929,12 @@ fn UnlockVault() -> impl IntoView {
     let confirm_reset = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
+        let secret = take_secret(passphrase);
         progress.start("Deriving the key…");
         let engine = engine();
         spawn_local(async move {
             sleep(50).await;
-            if let Err(e) = engine.unlock(passphrase.get_untracked()).await {
+            if let Err(e) = engine.unlock(secret).await {
                 progress.fail(e);
             }
         });
@@ -1741,7 +2030,12 @@ fn Unavailable(error: String) -> impl IntoView {
 }
 
 #[component]
-fn NewChat(key: String, name: String, server: Option<String>) -> impl IntoView {
+fn NewChat(
+    key: String,
+    name: String,
+    server: Option<String>,
+    pq_pinned: bool,
+) -> impl IntoView {
     // An invitation for another server than the vault's: the inviter's keys are not on it.
     let elsewhere = ui().me.get_untracked().and_then(|me| {
         server
@@ -1751,22 +2045,58 @@ fn NewChat(key: String, name: String, server: Option<String>) -> impl IntoView {
     let key = RwSignal::new(key);
     let name = RwSignal::new(name);
     let progress = Progress::new();
-    let submit = move |event: ev::SubmitEvent| {
-        event.prevent_default();
+    let classical_needed = RwSignal::new(None::<bool>);
+    let start = move |allow_classical: bool| {
+        classical_needed.set(None);
         progress.start("Fetching their prekeys…");
         let engine = engine();
         spawn_local(async move {
             match engine
-                .start_chat(&key.get_untracked(), name.get_untracked())
+                .start_chat(
+                    &key.get_untracked(),
+                    name.get_untracked(),
+                    pq_pinned,
+                    allow_classical,
+                )
                 .await
             {
                 Ok(peer) => {
                     engine.ui().dialog.set(None);
                     engine.open(Some(peer)).await;
                 }
-                Err(e) => progress.fail(e),
+                Err(StartChatError::ClassicalApprovalRequired { peer_signed_off }) => {
+                    classical_needed.set(Some(peer_signed_off));
+                    progress.fail(if peer_signed_off {
+                        "This peer signed a manifest disabling post-quantum encryption."
+                    } else {
+                        "This peer has no post-quantum prekeys on the server."
+                    });
+                }
+                Err(StartChatError::DowngradeDetected) => {
+                    progress.fail(
+                        "Downgrade detected: this invitation pinned post-quantum encryption, but \
+                         the server did not provide valid PQ prekeys.",
+                    );
+                }
+                Err(StartChatError::PeerManifestExpired) => {
+                    progress.fail(
+                        "This peer's signed post-quantum capability manifest has expired. Try \
+                         again after they come online.",
+                    );
+                }
+                Err(StartChatError::PqRequired) => {
+                    progress.fail(
+                        "Require PQ (strict mode) is enabled, and a post-quantum session could not \
+                         be established with this peer.",
+                    );
+                }
+                Err(StartChatError::Other(e)) => progress.fail(e),
             }
         });
+    };
+    let submit = move |event: ev::SubmitEvent| {
+        event.prevent_default();
+        start(false);
     };
     view! {
         <form on:submit=submit>
@@ -1775,6 +2105,14 @@ fn NewChat(key: String, name: String, server: Option<String>) -> impl IntoView {
                 "Paste their identity key. Their prekeys come from the server, and a greeting "
                 "with your name starts the session."
             </p>
+            {pq_pinned.then(|| {
+                view! {
+                    <p class="pq-pin-hint">
+                        <span class="sec-badge pq">"PQ pinned"</span>
+                        " This invitation expects post-quantum encryption and will refuse classical downgrades."
+                    </p>
+                }
+            })}
             <label for="peer-key">"Their identity key"</label>
             <input id="peer-key" required autocomplete="off" spellcheck="false" bind:value=key />
             <label for="peer-name">"Their name, for you"</label>
@@ -1788,6 +2126,29 @@ fn NewChat(key: String, name: String, server: Option<String>) -> impl IntoView {
                         </p>
                     }
                 })}
+            {move || {
+                classical_needed.get().map(|peer_signed_off| {
+                    view! {
+                        <div class="classical-box" role="alert">
+                            <p>
+                                {if peer_signed_off {
+                                    "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
+                                } else {
+                                    "No post-quantum prekeys were returned for this peer. Allow a classical (non-PQ) chat?"
+                                }}
+                            </p>
+                            <button
+                                type="button"
+                                class="btn small"
+                                disabled=move || progress.working.get()
+                                on:click=move |_| start(true)
+                            >
+                                "Allow classical"
+                            </button>
+                        </div>
+                    }
+                })
+            }}
             {progress.view()}
             <div class="actions">
                 <button type="button" class="btn" on:click=move |_| close_dialog()>
@@ -1801,6 +2162,48 @@ fn NewChat(key: String, name: String, server: Option<String>) -> impl IntoView {
     }
 }
 
+/// Human-readable label for an ML-KEM suite in the UI.
+fn pq_suite_label(suite: PqSuite) -> &'static str {
+    match suite {
+        PqSuite::MlKem1024 => "ML-KEM-1024 (default, NIST Level 5)",
+        PqSuite::MlKem768 => "ML-KEM-768 (NIST Level 3)",
+    }
+}
+
+/// Short description of the server's advertised PQ support.
+fn server_pq_summary(status: &ServerPqStatus) -> String {
+    match status {
+        ServerPqStatus::Enabled { suites, pq_ratchet } => {
+            let names: Vec<_> = suites
+                .iter()
+                .map(|s| match s {
+                    PqSuite::MlKem1024 => "ML-KEM-1024",
+                    PqSuite::MlKem768 => "ML-KEM-768",
+                })
+                .collect();
+            let list = if names.is_empty() {
+                "enabled".to_string()
+            } else {
+                names.join(", ")
+            };
+            if *pq_ratchet {
+                format!("Server PQ status: enabled ({list}, PQ Ratchet supported).")
+            } else {
+                format!("Server PQ status: enabled ({list}).")
+            }
+        }
+        ServerPqStatus::Disabled => {
+            "Server PQ status: disabled on this server. Classical mode will be used unless Require PQ is enabled."
+                .to_string()
+        }
+        ServerPqStatus::AudienceMismatch => {
+            "Server PQ status: server ID did not match this server's expected audience."
+                .to_string()
+        }
+        ServerPqStatus::Unknown => "Server PQ status: checking…".to_string(),
+    }
+}
+
 #[component]
 fn Identity() -> impl IntoView {
     let ui = ui();
@@ -1808,15 +2211,43 @@ fn Identity() -> impl IntoView {
         return ().into_any();
     };
     let name = RwSignal::new(me.name.clone());
+    let compiled_suites = PqConfig::compiled_suites();
+    let pq_compiled = !compiled_suites.is_empty();
+    let initial_pq = me.pq_config.clone();
+    let pq_enabled = RwSignal::new(pq_compiled && initial_pq.pq_enabled);
+    let preferred_suite = RwSignal::new(if compiled_suites.contains(&initial_pq.preferred_suite) {
+        initial_pq.preferred_suite
+    } else {
+        PqConfig::default_suite()
+    });
+    let pq_ratchet_enabled = RwSignal::new(pq_compiled && initial_pq.pq_ratchet_enabled);
+    let strict_pq = RwSignal::new(pq_compiled && initial_pq.pq_enabled && initial_pq.strict_pq);
     // Saving, publishing or signing out, which its buttons wait for.
     let busy = RwSignal::new(false);
+    let initial_pq_for_submit = initial_pq.clone();
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         let engine = engine();
+        let old_pq = initial_pq_for_submit.clone();
+        let next_pq = PqConfig {
+            pq_enabled: pq_compiled && pq_enabled.get_untracked(),
+            preferred_suite: preferred_suite.get_untracked(),
+            pq_ratchet_enabled: pq_compiled && pq_ratchet_enabled.get_untracked(),
+            strict_pq: pq_compiled && pq_enabled.get_untracked() && strict_pq.get_untracked(),
+        };
+        let next_name = name.get_untracked();
         act_while(busy, async move {
-            engine.set_name(name.get_untracked()).await?;
+            engine.set_name(next_name).await?;
+            let pq_changed = pq_compiled && next_pq != old_pq;
+            if pq_changed {
+                engine.set_pq_config(next_pq).await?;
+            }
             engine.ui().dialog.set(None);
-            engine.ui().notify("Saved your name.");
+            engine.ui().notify(if pq_changed {
+                "Saved settings and published updated prekeys."
+            } else {
+                "Saved your identity settings."
+            });
             Ok(())
         });
     };
@@ -1881,6 +2312,110 @@ fn Identity() -> impl IntoView {
             view! { <p class="hint">{format!("Cannot ask the server: {e}")}</p> }.into_any()
         }
     };
+    let pq_section = if pq_compiled {
+        let suites_for_select = compiled_suites.clone();
+        view! {
+            <div class="pq-settings">
+                <label class="toggle-row" for="pq-enabled">
+                    <input
+                        id="pq-enabled"
+                        type="checkbox"
+                        disabled=move || busy.get()
+                        prop:checked=move || pq_enabled.get()
+                        on:change=move |ev: ev::Event| {
+                            let input: web_sys::HtmlInputElement = event_target(&ev);
+                            let on = input.checked();
+                            pq_enabled.set(on);
+                            if !on {
+                                strict_pq.set(false);
+                            }
+                        }
+                    />
+                    <span>
+                        <strong>"Post-quantum encryption"</strong>
+                        <small>"Publish ML-KEM prekeys and signed capability manifest (ON by default)."</small>
+                    </span>
+                </label>
+                <label for="pq-suite">"Preferred KEM suite"</label>
+                <select
+                    id="pq-suite"
+                    disabled=move || busy.get() || !pq_enabled.get()
+                    prop:value=move || preferred_suite.get().as_u8().to_string()
+                    on:change=move |ev: ev::Event| {
+                        let select: web_sys::HtmlSelectElement = event_target(&ev);
+                        if let Some(suite) = select.value().parse::<u8>().ok().and_then(PqSuite::from_u8) {
+                            preferred_suite.set(suite);
+                        }
+                    }
+                >
+                    {suites_for_select
+                        .into_iter()
+                        .map(|suite| {
+                            let val = suite.as_u8().to_string();
+                            view! {
+                                <option value=val selected=move || preferred_suite.get() == suite>
+                                    {pq_suite_label(suite)}
+                                </option>
+                            }
+                        })
+                        .collect_view()}
+                </select>
+                <label class="toggle-row" for="pq-ratchet">
+                    <input
+                        id="pq-ratchet"
+                        type="checkbox"
+                        disabled=move || busy.get() || !pq_enabled.get()
+                        prop:checked=move || pq_ratchet_enabled.get()
+                        on:change=move |ev: ev::Event| {
+                            let input: web_sys::HtmlInputElement = event_target(&ev);
+                            pq_ratchet_enabled.set(input.checked());
+                        }
+                    />
+                    <span>
+                        <strong>"PQ Ratchet (PQ-PCS)"</strong>
+                        <small>"Periodically re-key sessions with fresh ML-KEM encapsulations."</small>
+                    </span>
+                </label>
+                <label class="toggle-row" for="pq-strict">
+                    <input
+                        id="pq-strict"
+                        type="checkbox"
+                        disabled=move || busy.get() || !pq_enabled.get()
+                        prop:checked=move || strict_pq.get()
+                        on:change=move |ev: ev::Event| {
+                            let input: web_sys::HtmlInputElement = event_target(&ev);
+                            strict_pq.set(input.checked());
+                        }
+                    />
+                    <span>
+                        <strong>"Require PQ (strict mode)"</strong>
+                        <small>"Refuse classical fallback and omit legacy raw SPK signatures."</small>
+                    </span>
+                </label>
+                <p class="hint">
+                    {move || {
+                        ui.me
+                            .with(|me| {
+                                me.as_ref()
+                                    .map(|m| server_pq_summary(&m.server_pq))
+                                    .unwrap_or_default()
+                            })
+                    }}
+                </p>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="pq-settings">
+                <span class="sec-badge classical">"Classical-only build"</span>
+                <p class="hint">
+                    "This client was built without post-quantum cryptography (classical X3DH + Double Ratchet only)."
+                </p>
+            </div>
+        }
+        .into_any()
+    };
     view! {
         <form on:submit=submit>
             <h2>"Your identity"</h2>
@@ -1891,9 +2426,14 @@ fn Identity() -> impl IntoView {
             <label>"Identity key"</label>
             <Copyable text=key_to_text(&me.key) what="your key" />
             <label>"Invitation link"</label>
-            <Copyable text=invitation_link(&me) what="your invitation link" />
+            {move || {
+                let link = ui.me.get().as_ref().map(invitation_link).unwrap_or_default();
+                view! { <Copyable text=link what="your invitation link" /> }
+            }}
             <label for="my-name">"Your name, which new chats see"</label>
             <input id="my-name" autocomplete="nickname" maxlength=NAME_MAX bind:value=name />
+            <label>"Post-quantum security"</label>
+            {pq_section}
             <label>"Server"</label>
             {files}
             <div class="actions">
@@ -1966,6 +2506,14 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     } else {
         format!("Your chat with {}.", contact.label())
     };
+    let live_contact = move || ui.contact(&peer);
+    let pq_available = move || {
+        ui.me.with(|me| {
+            me.as_ref().is_some_and(|me| {
+                me.pq_config.pq_enabled && !me.pq_config.offered_suites().is_empty()
+            })
+        })
+    };
     view! {
         <form on:submit=submit>
             <h2>{if request { "Chat request" } else { "Chat" }}</h2>
@@ -1974,6 +2522,80 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                 " To be sure it is them, compare the safety number with them in person or over "
                 "another channel: it is the same on both sides only if neither key was swapped."
             </p>
+            <label>"Encryption"</label>
+            {move || {
+                live_contact().map(|c| {
+                    let show_allow = c.classical_prompt != ClassicalPrompt::None;
+                    let show_upgrade = pq_available()
+                        && (c.has_downgrade() || c.is_quarantined() || !c.security.is_pq);
+                    let show_dismiss = c.has_downgrade();
+                    view! {
+                        <div class="contact-security">
+                            <div class="contact-security-row">
+                                {security_badge(&c, true)}
+                                {c.pq_pinned.then(|| view! { <span class="sec-meta">"PQ pinned"</span> })}
+                                {c.allow_classical_exception.then(|| {
+                                    view! { <span class="sec-meta">"Classical allowed"</span> }
+                                })}
+                            </div>
+                            {(show_allow || show_upgrade || show_dismiss).then(|| {
+                                view! {
+                                    <div class="banner-actions">
+                                        {show_allow.then(|| {
+                                            view! {
+                                                <button
+                                                    type="button"
+                                                    class="btn small"
+                                                    disabled=move || busy.get()
+                                                    on:click=move |_| {
+                                                        act_while(busy, async move {
+                                                            engine().approve_classical(peer).await
+                                                        });
+                                                    }
+                                                >
+                                                    "Allow classical"
+                                                </button>
+                                            }
+                                        })}
+                                        {show_upgrade.then(|| {
+                                            view! {
+                                                <button
+                                                    type="button"
+                                                    class="btn primary small"
+                                                    disabled=move || busy.get()
+                                                    on:click=move |_| {
+                                                        act_while(busy, async move {
+                                                            engine().upgrade_to_pq(peer).await
+                                                        });
+                                                    }
+                                                >
+                                                    "Upgrade to PQ"
+                                                </button>
+                                            }
+                                        })}
+                                        {show_dismiss.then(|| {
+                                            view! {
+                                                <button
+                                                    type="button"
+                                                    class="btn small"
+                                                    disabled=move || busy.get()
+                                                    on:click=move |_| {
+                                                        act_while(busy, async move {
+                                                            engine().dismiss_downgrade(peer).await
+                                                        });
+                                                    }
+                                                >
+                                                    "Dismiss warning"
+                                                </button>
+                                            }
+                                        })}
+                                    </div>
+                                }
+                            })}
+                        </div>
+                    }
+                })
+            }}
             <label>"Safety number"</label>
             // Twelve groups of five digits, four to a row, as Signal shows them.
             <div class="key safety">
@@ -2198,7 +2820,7 @@ fn file_row(file: FileView, from: &str, deleted: RwSignal<HashSet<u64>>) -> AnyV
     };
     let (index, listed_gone) = (file.index, file.gone);
     let gone = move || listed_gone || deleted.with(|deleted| deleted.contains(&index));
-    let details = format!("{} · {} · {sender}", size(file.size as usize), day(file.at));
+    let details = format!("{} · {} · {sender}", size_u64(file.size), day(file.at));
     let details = move || {
         if gone() {
             format!("{details} · no longer on the server")
@@ -2490,7 +3112,7 @@ fn Viewer() -> impl IntoView {
                 ui.streaming.with(|streamed| {
                     streamed.as_ref().map(|streamed| {
                         let pointer = &streamed.remote.pointer;
-                        format!("{} · {}", pointer.name, size(pointer.size as usize))
+                        format!("{} · {}", pointer.name, size_u64(pointer.size))
                     })
                 })
             })
@@ -2498,7 +3120,7 @@ fn Viewer() -> impl IntoView {
                 ui.opening.with(|opening| {
                     opening
                         .as_ref()
-                        .map(|o| format!("{} · {}", o.name, size(o.size as usize)))
+                        .map(|o| format!("{} · {}", o.name, size_u64(o.size)))
                 })
             })
             .unwrap_or_default()
@@ -2687,11 +3309,7 @@ fn opening_view() -> AnyView {
     let note = move || {
         ui.opening.with(|opening| {
             opening.as_ref().map_or_else(String::new, |opening| {
-                let done = format!(
-                    "{} of {}",
-                    size(opening.done as usize),
-                    size(opening.size as usize)
-                );
+                let done = format!("{} of {}", size_u64(opening.done), size_u64(opening.size));
                 if opening.waiting {
                     format!("{done}, waiting for its sender to upload the rest")
                 } else {
@@ -3193,13 +3811,16 @@ fn archive_view(listing: preview::Listing) -> AnyView {
         .iter()
         .filter(|entry| !entry.directory)
         .count();
-    let total: u64 = listing.entries.iter().map(|entry| entry.size).sum();
+    let total: u64 = listing
+        .entries
+        .iter()
+        .fold(0u64, |acc, entry| acc.saturating_add(entry.size));
     let note = if listing.complete {
-        format!("{files} files, {} unpacked", size(total as usize))
+        format!("{files} files, {} unpacked", size_u64(total))
     } else {
         format!(
             "The first {files} files, {} unpacked; listing the rest would take too long, or it is damaged.",
-            size(total as usize)
+            size_u64(total)
         )
     };
     view! {
@@ -3210,7 +3831,7 @@ fn archive_view(listing: preview::Listing) -> AnyView {
                     .entries
                     .into_iter()
                     .map(|entry| {
-                        let length = if entry.directory { String::new() } else { size(entry.size as usize) };
+                        let length = if entry.directory { String::new() } else { size_u64(entry.size) };
                         view! {
                             <li class:directory=entry.directory>
                                 <span>{entry.path}</span>
@@ -3319,7 +3940,7 @@ fn Dropzone() -> impl IntoView {
         ui.open
             .get_untracked()
             .and_then(|peer| ui.contact(&peer))
-            .is_some_and(|contact| !contact.request)
+            .is_some_and(|contact| !contact.request && !contact.is_quarantined())
     };
     let _ = window_event_listener(ev::dragenter, move |event| {
         if accepts() {
@@ -3351,7 +3972,7 @@ fn Dropzone() -> impl IntoView {
             .and_then(|peer| ui.contact(&peer))
             .map(|contact| contact.label())
             .unwrap_or_default();
-        format!("to {name} · up to {} each", size(MAX_FILE_SIZE))
+        format!("to {name} · up to {} each", size_u64(MAX_FILE_SIZE as u64))
     };
     view! {
         <div class="dropzone" hidden=move || depth.get() == 0>
