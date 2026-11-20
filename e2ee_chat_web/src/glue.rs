@@ -20,21 +20,21 @@ fn has(navigator: &Navigator, name: &str) -> bool {
     Reflect::get(navigator, &name.into()).is_ok_and(|api| !api.is_undefined())
 }
 
-/// Take the lock `name` for as long as the page lives; `false` if another page holds it.
+/// Take the lock `name` for as long as the page lives; `false` if another page holds it, or if
+/// the Web Locks API is unavailable or fails (fail closed to prevent concurrent vault corruption).
 pub async fn take_lock(name: &str) -> bool {
     let navigator = navigator();
-    // Without locks, there is no telling.
     let Some(locks) = Reflect::get(&navigator, &"locks".into())
         .ok()
-        .filter(|locks| !locks.is_undefined())
+        .filter(|locks| !locks.is_undefined() && !locks.is_null())
     else {
-        return true;
+        return false;
     };
     let Some(request) = Reflect::get(&locks, &"request".into())
         .ok()
         .and_then(|request| request.dyn_into::<Function>().ok())
     else {
-        return true;
+        return false;
     };
     let (taken, told) = oneshot::channel();
     let taken = Rc::new(RefCell::new(Some(taken)));
@@ -49,7 +49,7 @@ pub async fn take_lock(name: &str) -> bool {
     let granted = {
         let tell = tell.clone();
         Closure::<dyn FnMut(JsValue) -> Promise>::new(move |lock: JsValue| {
-            let held = !lock.is_null();
+            let held = !lock.is_null() && !lock.is_undefined();
             tell(held);
             if held {
                 // Held until the page goes.
@@ -60,20 +60,25 @@ pub async fn take_lock(name: &str) -> bool {
         })
     };
     let options = Object::new();
-    let _ = Reflect::set(&options, &"ifAvailable".into(), &JsValue::TRUE);
-    let requested = request.call3(&locks, &name.into(), &options, granted.as_ref());
-    // Called once, but the lock's promise lives with the page.
-    granted.forget();
-    // A request that fails, like no locks, must not keep the page loading forever.
-    match requested.map(Promise::from) {
-        Ok(requested) => spawn_local(async move {
-            if JsFuture::from(requested).await.is_err() {
-                tell(true);
-            }
-        }),
-        Err(_) => tell(true),
+    if Reflect::set(&options, &"ifAvailable".into(), &JsValue::TRUE).is_err() {
+        return false;
     }
-    told.await.unwrap_or(true)
+    let requested = request
+        .call3(&locks, &name.into(), &options, granted.as_ref())
+        .and_then(|value| value.dyn_into::<Promise>());
+    match requested {
+        Ok(requested) => {
+            // Called once, and when held the lock's promise lives with the page.
+            granted.forget();
+            spawn_local(async move {
+                // Fail closed if the request promise rejects or settles without granting the lock.
+                let _ = JsFuture::from(requested).await;
+                tell(false);
+            });
+        }
+        Err(_) => tell(false),
+    }
+    told.await.unwrap_or(false)
 }
 
 /// Copy `text` to the clipboard; `false` if the browser refused.

@@ -1,8 +1,8 @@
 //! The previews' web workers, of [`e2ee_chat_preview`], each started when a preview first needs
 //! it: PDF pages, Mermaid diagrams, and code, highlighted by four workers, a group of languages
-//! each. A call waits for its worker to be ready, however long it takes to load; one that then
-//! takes more than [`TIMEOUT`], as a peer's file might make it, stops the worker, failing what it
-//! was doing, and the next call starts it again.
+//! each. Both waiting for a worker to be ready and waiting for a call to answer are bounded by
+//! [`TIMEOUT`]; a stalled worker is terminated, failing its pending calls, and the next call
+//! starts a fresh one.
 
 use std::{
     cell::{Cell, RefCell},
@@ -18,9 +18,51 @@ use web_sys::{Event, ImageData, MessageEvent};
 
 use crate::util::js_error;
 
-/// How long a worker may take to answer: drawing a page or highlighting a file of the most it
-/// highlights takes seconds.
+/// How long a worker may take to start or answer: drawing a page or highlighting a file of the
+/// most it highlights takes seconds.
 const TIMEOUT: i32 = 60_000;
+/// Call ID reserved for the worker's initial `READY` handshake.
+const READY_ID: u32 = 0;
+
+/// Clears a browser timeout before dropping its closure, even if the awaiting future is cancelled.
+struct TimeoutGuard {
+    window: web_sys::Window,
+    timer: Option<i32>,
+    _closure: Closure<dyn FnMut()>,
+}
+
+impl TimeoutGuard {
+    fn arm(kind: Worker, calls: &Rc<Calls>, id: u32, reason: &'static str) -> Self {
+        let calls = Rc::downgrade(calls);
+        let closure = Closure::<dyn FnMut()>::new(move || {
+            if let Some(calls) = calls.upgrade()
+                && calls.pending.borrow().contains_key(&id)
+            {
+                stop(kind, &calls, reason);
+            }
+        });
+        let window = web_sys::window().expect("a window");
+        let timer = window
+            .set_timeout_with_callback_and_timeout_and_arguments_0(
+                closure.as_ref().unchecked_ref(),
+                TIMEOUT,
+            )
+            .ok();
+        Self {
+            window,
+            timer,
+            _closure: closure,
+        }
+    }
+}
+
+impl Drop for TimeoutGuard {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            self.window.clear_timeout_with_handle(timer);
+        }
+    }
+}
 
 /// A worker, started.
 struct Running {
@@ -80,13 +122,14 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
     }
     let worker = web_sys::Worker::new(kind.script()).map_err(js_error)?;
     let calls = Rc::new(Calls::default());
-    let (_, ready) = calls.add();
+    let (ready_id, ready) = calls.add();
+    debug_assert_eq!(ready_id, READY_ID);
     let on_message = {
         let calls = calls.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let data = event.data();
             if data.as_string().as_deref() == Some(READY) {
-                calls.settle(0, true, &JsValue::UNDEFINED);
+                calls.settle(READY_ID, true, &JsValue::UNDEFINED);
                 return;
             }
             let reply = Array::from(&data);
@@ -158,9 +201,24 @@ async fn call(
             .ok_or("the preview restarted: open the file again")?,
         None => running(kind)?,
     };
-    JsFuture::from(running.ready.clone())
-        .await
-        .map_err(failure)?;
+    {
+        let _ready_timeout = running
+            .calls
+            .pending
+            .borrow()
+            .contains_key(&READY_ID)
+            .then(|| {
+                TimeoutGuard::arm(
+                    kind,
+                    &running.calls,
+                    READY_ID,
+                    "the preview took too long to start",
+                )
+            });
+        JsFuture::from(running.ready.clone())
+            .await
+            .map_err(failure)?;
+    }
     let (id, answer) = running.calls.add();
     let request = Array::of2(&id.into(), &method.into());
     for argument in arguments {
@@ -176,26 +234,9 @@ async fn call(
         running.calls.settle(id, false, &e);
     }
     // Stuck, if it takes that long: whatever it is doing, it would not finish.
-    let calls = Rc::downgrade(&running.calls);
-    let timeout = Closure::<dyn FnMut()>::new(move || {
-        if let Some(calls) = calls.upgrade()
-            && calls.pending.borrow().contains_key(&id)
-        {
-            stop(kind, &calls, "the preview took too long");
-        }
-    });
-    let window = web_sys::window().expect("a window");
-    let timer = window
-        .set_timeout_with_callback_and_timeout_and_arguments_0(
-            timeout.as_ref().unchecked_ref(),
-            TIMEOUT,
-        )
-        .ok();
+    let _call_timeout = TimeoutGuard::arm(kind, &running.calls, id, "the preview took too long");
     let answer = JsFuture::from(answer).await.map_err(failure);
-    if let Some(timer) = timer {
-        window.clear_timeout_with_handle(timer);
-    }
-    drop(timeout);
+    drop(_call_timeout);
     Ok((answer?, running.start))
 }
 

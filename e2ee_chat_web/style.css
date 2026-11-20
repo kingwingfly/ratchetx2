@@ -311,6 +311,30 @@ pre.code { margin: 0; padding: 24px; font-family: var(--mono); font-size: 13px; 
 .markdown img, .markdown .diagram { max-width: 100%; }
 .markdown .diagram { display: block; margin: 16px auto; padding: 16px; border-radius: 8px; background: var(--raised); }
 .markdown math[display="block"] { margin: 12px 0; }
+.markdown math .ml-small { font-size: 70%; }
+.markdown math .ml-box { border: 0.06em solid currentColor; padding: 0.1em; }
+.markdown math .ml-negated { background: linear-gradient(to top left, transparent 0%, transparent calc(50% - 0.8px), currentColor 50%, transparent calc(50% + 0.8px), transparent 100%); }
+.markdown math mtable { border-color: currentColor; border-spacing: 0; border-collapse: collapse; }
+.markdown math mtd { padding-left: 0; padding-right: 0; }
+.markdown math mtr:last-child > mtd:empty:only-child { display: none; }
+.markdown math mtable.ml-alignlike > mtr > mtd:nth-child(odd),
+.markdown math mtable.ml-cells-right > mtr > mtd,
+.markdown math mtable.ml-multline > mtr > mtd:last-child,
+.markdown math mtd.ml-cell-right { text-align: right; }
+.markdown math mtable.ml-alignlike > mtr > mtd:nth-child(even),
+.markdown math mtable.ml-cells-left > mtr > mtd,
+.markdown math mtable.ml-multline > mtr > mtd:first-child,
+.markdown math mtd.ml-cell-left { text-align: left; }
+.markdown math mtable.ml-align > mtr > mtd:nth-child(2n + 3) { padding-left: 1em; }
+.markdown math mtable.ml-cases > mtr > mtd:first-child { padding-right: 1em; }
+.markdown math mtable.ml-arraylike > mtr > mtd { padding-left: 0.4em; padding-right: 0.4em; }
+.markdown math mtd.ml-left-solid { border-left: 0.06em solid; }
+.markdown math mtd.ml-right-solid { border-right: 0.06em solid; }
+.markdown math mtd.ml-left-dashed { border-left: 0.06em dashed; }
+.markdown math mtd.ml-right-dashed { border-right: 0.06em dashed; }
+.markdown math mtr.ml-hline { border-top: 0.06em solid; }
+.markdown math mtr.ml-hdashline { border-top: 0.06em dashed; }
+.markdown math mtd.ml-border-only:empty { width: 0.1em; padding: 0; margin: 0; }
 .slides { min-height: calc(100% - 50px); display: flex; flex-direction: column; }
 .slides .enhanced { flex: 1; display: grid; place-items: center; }
 .slide { width: 100%; font-size: 20px; text-align: center; }
