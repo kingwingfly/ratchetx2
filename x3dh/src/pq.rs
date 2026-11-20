@@ -403,7 +403,12 @@ pub(crate) fn compute_transcript_hash(
     manifest_digest: Option<&[u8]>,
 ) -> Result<[u8; 32]> {
     let manifest_len: u8 = match manifest_digest {
-        Some(digest) => u8::try_from(digest.len()).map_err(|_| ErrorKind::MalformedState)?,
+        Some(digest) => {
+            if digest.is_empty() {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            u8::try_from(digest.len()).map_err(|_| ErrorKind::MalformedState)?
+        }
         None => 0,
     };
 

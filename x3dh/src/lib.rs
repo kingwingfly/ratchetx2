@@ -794,6 +794,7 @@ impl LocalPrekeys {
             &message.signed_prekey,
             message.one_time_prekey.as_ref(),
         )?;
+        XEdDSAPublicKey::new(alice_identity_key)?;
         let generation = &self.generations[self.generation(message)?];
 
         let mut key_material = KeyMaterial::new_classical();
@@ -853,6 +854,12 @@ impl LocalPrekeys {
             &message.signed_prekey,
             message.one_time_prekey.as_ref(),
         )?;
+        XEdDSAPublicKey::new(alice_identity_key)?;
+        if let Some(digest) = manifest_digest
+            && (digest.is_empty() || u8::try_from(digest.len()).is_err())
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
         if message.pq_ciphertext.len() != message.pq_suite.ct_len() {
             return Err(ErrorKind::InvalidCiphertext.into());
         }
@@ -912,6 +919,7 @@ impl LocalPrekeys {
             &message.signed_prekey,
             message.one_time_prekey.as_ref(),
         )?;
+        XEdDSAPublicKey::new(&message.identity_key)?;
         let index = self.generation(message)?;
         let generation = &mut self.generations[index];
         if let Some(one_time_prekey) = &message.one_time_prekey {
@@ -938,6 +946,7 @@ impl LocalPrekeys {
             &message.signed_prekey,
             message.one_time_prekey.as_ref(),
         )?;
+        XEdDSAPublicKey::new(&message.identity_key)?;
         if message.pq_ciphertext.len() != message.pq_suite.ct_len() {
             return Err(ErrorKind::InvalidCiphertext.into());
         }
@@ -1284,7 +1293,7 @@ impl PqPrekeyBundle {
             return Err(ErrorKind::InvalidPublicKey.into());
         }
         if let Some(digest) = manifest_digest
-            && u8::try_from(digest.len()).is_err()
+            && (digest.is_empty() || u8::try_from(digest.len()).is_err())
         {
             return Err(ErrorKind::MalformedState.into());
         }
@@ -1293,7 +1302,7 @@ impl PqPrekeyBundle {
         match &self.signed_prekey_signature {
             Some(sig) => bob_pk.verify(self.signed_prekey, sig)?,
             None => {
-                if manifest_digest.is_none() {
+                if manifest_digest.is_none_or(|d| d.is_empty()) {
                     return Err(ErrorKind::InvalidSignature.into());
                 }
             }
@@ -1643,12 +1652,35 @@ mod test {
         let (fresh, _) = no_opk.initiate(&alice, &bob_key).unwrap();
         let mut nc_alice = alice_key;
         nc_alice[31] |= 0x80;
-        let mut nc_msg = fresh;
+        let mut nc_msg = fresh.clone();
         nc_msg.identity_key = nc_alice;
         assert_eq!(
             prekeys.accept(&bob, &nc_alice, &nc_msg).err().unwrap().kind(),
             ErrorKind::InvalidPublicKey
         );
+
+        // Mixed-order (B + order_8) and twist (u = 2) Alice IKs fail accept and confirm even
+        // though they are canonically encoded and contributory under clamped X25519.
+        let mixed_order_ik: PublicKey = [
+            52, 252, 108, 183, 200, 222, 88, 151, 119, 112, 217, 82, 22, 204, 220, 108, 133, 144,
+            190, 205, 145, 156, 7, 89, 148, 20, 86, 59, 75, 164, 71, 15,
+        ];
+        let mut twist_ik = [0u8; 32];
+        twist_ik[0] = 2;
+        for bad_ik in [mixed_order_ik, twist_ik] {
+            assert!(xeddsa::is_canonical_public_key(&bad_ik));
+            assert!(XEdDSAPublicKey::new(&bad_ik).is_err());
+            let mut bad_msg = fresh.clone();
+            bad_msg.identity_key = bad_ik;
+            assert_eq!(
+                prekeys.accept(&bob, &bad_ik, &bad_msg).err().unwrap().kind(),
+                ErrorKind::InvalidPublicKey
+            );
+            assert_eq!(
+                prekeys.confirm(&bad_msg).unwrap_err().kind(),
+                ErrorKind::InvalidPublicKey
+            );
+        }
     }
 
     #[test]
@@ -2197,6 +2229,75 @@ mod test {
                         .kind(),
                     ErrorKind::InvalidSignature
                 );
+
+                // Empty manifest_digest Some(&[]) must NOT bypass strict mode or collide with None.
+                assert_eq!(
+                    unauth_bundle
+                        .initiate_pq(&alice, &bob_ik, Some(&[]))
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::MalformedState
+                );
+                let compat_bundle = PqPrekeyBundle {
+                    signed_prekey_signature: Some(published.classical.signed_prekey_signature),
+                    ..unauth_bundle
+                };
+                assert_eq!(
+                    compat_bundle
+                        .initiate_pq(&alice, &bob_ik, Some(&[]))
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::MalformedState
+                );
+                assert_eq!(
+                    compat_bundle
+                        .initiate_pq(&alice, &bob_ik, Some(&[0u8; 256]))
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::MalformedState
+                );
+
+                let (valid_msg, _) = compat_bundle.initiate_pq(&alice, &bob_ik, None).unwrap();
+                assert_eq!(
+                    prekeys
+                        .accept_pq(&bob, &alice_ik, &valid_msg, Some(&[]))
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    ErrorKind::MalformedState
+                );
+                assert_eq!(
+                    prekeys
+                        .accept_pq(&bob, &alice_ik, &valid_msg, Some(&[0u8; 256]))
+                        .err()
+                        .unwrap()
+                        .kind(),
+                    ErrorKind::MalformedState
+                );
+
+                // Mixed-order (B + order_8) and twist (u = 2) Alice IKs fail accept_pq and confirm_pq.
+                let mixed_order_ik: PublicKey = [
+                    52, 252, 108, 183, 200, 222, 88, 151, 119, 112, 217, 82, 22, 204, 220, 108,
+                    133, 144, 190, 205, 145, 156, 7, 89, 148, 20, 86, 59, 75, 164, 71, 15,
+                ];
+                let mut twist_ik = [0u8; 32];
+                twist_ik[0] = 2;
+                for bad_ik in [mixed_order_ik, twist_ik] {
+                    let mut bad_msg = valid_msg.clone();
+                    bad_msg.identity_key = bad_ik;
+                    assert_eq!(
+                        prekeys
+                            .accept_pq(&bob, &bad_ik, &bad_msg, None)
+                            .err()
+                            .unwrap()
+                            .kind(),
+                        ErrorKind::InvalidPublicKey
+                    );
+                    assert_eq!(
+                        prekeys.confirm_pq(&bad_msg).unwrap_err().kind(),
+                        ErrorKind::InvalidPublicKey
+                    );
+                }
             }
         }
 
