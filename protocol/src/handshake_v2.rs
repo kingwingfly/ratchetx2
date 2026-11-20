@@ -1011,7 +1011,9 @@ mod server {
             verify_manifest_at(manifest, &self.info.server_id, now)?;
             let signed_prekey: PublicKey = fixed(&manifest.signed_prekey)?;
 
-            // Legacy raw v1 SPK signature: forbidden in strict_pq mode; verified when supplied.
+            // Legacy raw v1 SPK signature: forbidden in strict_pq mode; REQUIRED when pq_enabled
+            // is false (otherwise a classical peer cannot verify the SPK and the user becomes
+            // unreachable); verified whenever supplied.
             let signed_prekey_signature = match &request.signed_prekey_signature {
                 Some(sig) => {
                     if manifest.strict_pq {
@@ -1021,7 +1023,12 @@ mod server {
                     XEdDSAPublicKey::new(&identity_key)?.verify(signed_prekey, &sig)?;
                     Some(sig)
                 }
-                None => None,
+                None => {
+                    if !manifest.pq_enabled {
+                        return Err(ErrorKind::Malformed.into());
+                    }
+                    None
+                }
             };
 
             // Classical OPKs: canonical and unique.
@@ -1163,6 +1170,7 @@ mod server {
                     pq_one_time_prekeys,
                     max_one_time_prekeys: self.limits.max_one_time_prekeys,
                     max_pq_one_time_prekeys: self.limits.max_pq_one_time_prekeys,
+                    timestamp: request.timestamp,
                 })
                 .await?;
             match status {
@@ -1180,7 +1188,9 @@ mod server {
                         .collect(),
                 }),
                 RefillStatus::NotFound => Err(ErrorKind::NotFound.into()),
-                RefillStatus::StaleGeneration => Err(ErrorKind::StaleTimestamp.into()),
+                RefillStatus::StaleGeneration | RefillStatus::StaleTimestamp => {
+                    Err(ErrorKind::StaleTimestamp.into())
+                }
                 RefillStatus::DuplicatePrekey => Err(ErrorKind::Malformed.into()),
                 RefillStatus::LimitExceeded => Err(ErrorKind::LimitExceeded.into()),
             }
@@ -1643,22 +1653,42 @@ mod server {
                 now,
             )
             .unwrap();
-            let refilled = v2.refill_prekeys(refill).await.unwrap();
+            let refilled = v2.refill_prekeys(refill.clone()).await.unwrap();
             assert_eq!(refilled.classical_one_time_count, 1);
             assert_eq!(
                 refilled.pq_one_time_counts,
                 vec![SuiteCount { suite: 2, count: 1 }]
             );
+            // Claim the refilled OPK & PQOPK, then replay the exact RefillPrekeysRequest:
+            // monotonic refill timestamp MUST reject the replay so consumed keys cannot return.
+            let claimed_refill = v2
+                .claim_bundle(ClaimBundleRequest {
+                    identity_key: Bytes::copy_from_slice(&bob_pk),
+                    preferred_suites: vec![2],
+                })
+                .await
+                .unwrap();
+            assert_eq!(claimed_refill.one_time_prekey.as_deref(), Some(&[0x44; 32][..]));
+            assert_eq!(claimed_refill.pq_one_time_prekey, Some(fresh_opk768));
+            assert_eq!(
+                v2.refill_prekeys(refill).await.unwrap_err().kind(),
+                ErrorKind::StaleTimestamp
+            );
 
-            // Legacy v1 publish MUST NOT wipe v2 manifest or PQ prekeys.
+            // Legacy v1 publish MUST be refused once a v2 manifest exists (neither wiping v2
+            // manifest/PQ prekeys nor corrupting the shared classical OPK pool).
             let v1_prekeys = x3dh::PublishedPrekeys {
                 signed_prekey: [0x55; 32],
                 signed_prekey_signature: bob.sign([0x55; 32]),
                 one_time_prekeys: vec![[0x56; 32]],
             };
-            v1.publish(PublishRequest::sign(&bob, &v1_prekeys, now + 1).unwrap())
-                .await
-                .unwrap();
+            assert_eq!(
+                v1.publish(PublishRequest::sign(&bob, &v1_prekeys, now + 1).unwrap())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
             assert_eq!(
                 v2.get_manifest(GetManifestRequest {
                     identity_key: Bytes::copy_from_slice(&bob_pk),
@@ -1669,7 +1699,9 @@ mod server {
                 Some(m1)
             );
 
-            // Strict PQ publish clears legacy v1 bundle so v1 FetchBundle returns NotFound.
+            // Strict PQ publish clears legacy v1 bundle so v1 FetchBundle returns NotFound;
+            // replaying an old captured v1 PublishRequest MUST remain rejected and leave strict
+            // PQ bundle & OPKs intact.
             let m2 = signed_manifest(
                 &bob,
                 "relay.example",
@@ -1693,6 +1725,13 @@ mod server {
             .unwrap();
             v2.publish_v2(strict_req).await.unwrap();
             assert_eq!(
+                v1.publish(PublishRequest::sign(&bob, &v1_prekeys, 100).unwrap())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
+            assert_eq!(
                 v1.fetch_bundle(FetchBundleRequest {
                     identity_key: Bytes::copy_from_slice(&bob_pk),
                 })
@@ -1702,7 +1741,8 @@ mod server {
                 ErrorKind::NotFound
             );
 
-            // Affirmative OFF (manifest_seq = 3) clears PQ prekeys while persisting signed OFF manifest.
+            // Affirmative OFF without a raw SPK signature is rejected as Malformed (otherwise
+            // classical peers cannot verify the SPK and the identity becomes unreachable).
             let m3 = signed_manifest(
                 &bob,
                 "relay.example",
@@ -1714,6 +1754,22 @@ mod server {
                 &[],
                 now,
             );
+            let off_no_sig = PublishV2Request::sign(
+                &bob,
+                m3.clone(),
+                None,
+                &[[0x46; 32]],
+                vec![],
+                vec![],
+                now,
+            )
+            .unwrap();
+            assert_eq!(
+                v2.publish_v2(off_no_sig).await.unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
+
+            // Affirmative OFF with raw SPK signature clears PQ prekeys while persisting OFF manifest.
             let off_req = PublishV2Request::sign(
                 &bob,
                 m3.clone(),

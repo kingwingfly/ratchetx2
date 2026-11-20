@@ -48,8 +48,10 @@ const PING: &str = "ping";
 const PONG: &str = "pong";
 /// How long, in milliseconds, a socket may go without a ping: its client pings every minute.
 const STALE: f64 = 3.0 * 60_000.0;
-/// Maximum concurrent WebSocket connections per Identity DO.
+/// Maximum concurrent authenticated WebSocket connections per Identity DO.
 const MAX_WEBSOCKETS: usize = 16;
+/// Maximum concurrent unauthenticated first-frame-auth pending WebSockets per Identity DO.
+const MAX_PENDING_WEBSOCKETS: usize = 4;
 /// Maximum time (in ms) a first-frame-auth WebSocket may stay unauthenticated.
 const MAX_UNAUTH_AGE_MS: f64 = 15_000.0;
 /// Maximum bytes accepted in an authentication WebSocket frame.
@@ -162,6 +164,11 @@ CREATE TABLE IF NOT EXISTS mailbox_dedup (
     PRIMARY KEY (sender, client_message_id)
 );
 CREATE INDEX IF NOT EXISTS mailbox_dedup_by_age ON mailbox_dedup (created_at);
+CREATE TABLE IF NOT EXISTS publish_watermarks (
+    only INTEGER PRIMARY KEY CHECK (only = 0),
+    last_v1_publish_ts INTEGER NOT NULL DEFAULT 0,
+    last_refill_ts INTEGER NOT NULL DEFAULT 0
+);
 ";
 
 /// Per-WebSocket attachment stored via hibernation API.
@@ -291,6 +298,11 @@ impl DurableObject for Identity {
             // Authenticated clients send nothing but pings (auto-responded).
             return Ok(());
         }
+        let now_f64 = js_sys::Date::now();
+        if now_f64 - attachment.opened_at > MAX_UNAUTH_AGE_MS {
+            let _ = socket.close(Some(1008), Some("auth timeout"));
+            return Ok(());
+        }
         let Some(expected_identity) = attachment.expected_identity.take() else {
             let _ = socket.close(Some(1008), Some("unauthorized"));
             return Ok(());
@@ -339,7 +351,12 @@ impl DurableObject for Identity {
             return Ok(());
         }
         attachment.authenticated = true;
-        let _ = socket.serialize_attachment(&attachment);
+        attachment.opened_at = now_f64;
+        if socket.serialize_attachment(&attachment).is_err() {
+            let _ = socket.close(Some(1011), Some("state error"));
+            return Ok(());
+        }
+        self.prune_and_cap_authenticated(now_f64, MAX_WEBSOCKETS, Some(&socket));
         Ok(())
     }
 
@@ -429,8 +446,12 @@ impl Identity {
     }
 
     /// Accepts a WebSocket connection after checking replay protection (query-param auth) or
-    /// setting up pending first-frame auth, while pruning stale sockets and capping total open
-    /// sockets to [`MAX_WEBSOCKETS`].
+    /// setting up pending first-frame auth.
+    ///
+    /// Pending unauthenticated sockets are capped separately ([`MAX_PENDING_WEBSOCKETS`], HTTP
+    /// 429) and NEVER evict authenticated sockets. Authenticated sockets are capped at
+    /// [`MAX_WEBSOCKETS`], evicting the oldest authenticated socket only when an authenticated
+    /// connection arrives.
     fn accept_websocket(&self, request: &Request) -> Result<Response> {
         let now_ms = Date::now().as_millis();
         let now_f64 = js_sys::Date::now();
@@ -448,6 +469,7 @@ impl Identity {
             if !self.record_subscribe_signature(sig, ts, now_ms) {
                 return Response::error("replayed subscription", 403);
             }
+            self.prune_and_cap_authenticated(now_f64, MAX_WEBSOCKETS - 1, None);
             WsAttachment {
                 opened_at: now_f64,
                 authenticated: true,
@@ -457,6 +479,9 @@ impl Identity {
             let Some(id) = decode_hex_fixed::<32>(&id_hex) else {
                 return Response::error("malformed identity", 400);
             };
+            if self.prune_and_count_pending(now_f64) >= MAX_PENDING_WEBSOCKETS {
+                return Response::error("too many pending connections", 429);
+            }
             WsAttachment {
                 opened_at: now_f64,
                 authenticated: false,
@@ -466,37 +491,70 @@ impl Identity {
             return Response::error("unauthorized", 403);
         };
 
-        self.prune_and_cap_sockets(now_f64);
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
-        let _ = pair.server.serialize_attachment(&attachment);
+        if let Err(e) = pair.server.serialize_attachment(&attachment) {
+            let _ = pair.server.close(Some(1011), Some("state error"));
+            return Err(e);
+        }
         Response::from_websocket(pair.client)
     }
 
-    /// Prunes stale or expired unauthenticated sockets and closes oldest sockets if the count
-    /// would reach [`MAX_WEBSOCKETS`].
-    fn prune_and_cap_sockets(&self, now: f64) {
-        let mut active: Vec<(f64, WebSocket)> = Vec::new();
+    /// Prunes expired pending sockets and sockets missing state, returning the remaining count of
+    /// unauthenticated pending sockets. Never touches or evicts authenticated sockets.
+    fn prune_and_count_pending(&self, now: f64) -> usize {
+        let mut pending = 0usize;
         for socket in self.state.get_websockets() {
-            let att = read_ws_attachment(&socket);
-            if let Some(ref a) = att
-                && !a.authenticated
-                && now - a.opened_at > MAX_UNAUTH_AGE_MS
-            {
-                let _ = socket.close(Some(1008), Some("auth timeout"));
+            let Some(att) = read_ws_attachment(&socket) else {
+                let _ = socket.close(Some(1008), Some("missing state"));
+                continue;
+            };
+            if !att.authenticated {
+                if now - att.opened_at > MAX_UNAUTH_AGE_MS {
+                    let _ = socket.close(Some(1008), Some("auth timeout"));
+                } else {
+                    pending += 1;
+                }
+            }
+        }
+        pending
+    }
+
+    /// Prunes stale authenticated sockets, expired pending sockets, and sockets missing state,
+    /// then caps authenticated sockets at `keep_max` by closing the oldest authenticated sockets
+    /// (never closing `preserve`, if supplied).
+    fn prune_and_cap_authenticated(&self, now: f64, keep_max: usize, preserve: Option<&WebSocket>) {
+        let mut authenticated: Vec<(f64, WebSocket)> = Vec::new();
+        for socket in self.state.get_websockets() {
+            let Some(att) = read_ws_attachment(&socket) else {
+                let _ = socket.close(Some(1008), Some("missing state"));
+                continue;
+            };
+            if !att.authenticated {
+                if now - att.opened_at > MAX_UNAUTH_AGE_MS {
+                    let _ = socket.close(Some(1008), Some("auth timeout"));
+                }
                 continue;
             }
+            let is_preserved = preserve.is_some_and(|p| p.as_ref() == socket.as_ref());
             let seen = self.last_seen(&socket);
-            if seen.is_some_and(|s| now - s > STALE) {
+            if !is_preserved && seen.is_some_and(|s| now - s > STALE) {
                 let _ = socket.close(Some(1001), Some("no pings"));
                 continue;
             }
-            active.push((seen.unwrap_or(0.0), socket));
+            if !is_preserved {
+                authenticated.push((seen.unwrap_or(0.0), socket));
+            }
         }
-        if active.len() >= MAX_WEBSOCKETS {
-            active.sort_by(|a, b| a.0.total_cmp(&b.0));
-            let to_close = active.len() + 1 - MAX_WEBSOCKETS;
-            for (_, socket) in active.into_iter().take(to_close) {
+        let effective_cap = if preserve.is_some() {
+            keep_max.saturating_sub(1)
+        } else {
+            keep_max
+        };
+        if authenticated.len() > effective_cap {
+            authenticated.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let to_close = authenticated.len() - effective_cap;
+            for (_, socket) in authenticated.into_iter().take(to_close) {
                 let _ = socket.close(Some(1008), Some("too many connections"));
             }
         }
@@ -605,6 +663,7 @@ impl Identity {
                 pq_one_time_prekeys,
                 max_one_time_prekeys,
                 max_pq_one_time_prekeys,
+                timestamp,
             } => {
                 if !self.has_tables()? {
                     return answer(Ok(RefillOutcome::NotFound));
@@ -616,6 +675,7 @@ impl Identity {
                     &pq_one_time_prekeys,
                     max_one_time_prekeys,
                     max_pq_one_time_prekeys,
+                    timestamp,
                 ))
             }
             #[cfg(feature = "pq")]
@@ -673,9 +733,8 @@ impl Identity {
         }
     }
 
-    /// Legacy v1 publish: updates classical `bundle` and `one_time_prekeys` ONLY.
-    /// NEVER overwrites or clears stored v2 `capability_manifest`, `pq_last_resort`, or
-    /// `pq_one_time_prekeys`.
+    /// Legacy v1 publish: refused once a v2 `capability_manifest` exists, and guarded by a
+    /// persistent `last_v1_publish_ts` watermark that survives v1 bundle removal.
     fn publish(
         &self,
         signed_prekey: &[u8],
@@ -685,24 +744,56 @@ impl Identity {
     ) -> Result<bool> {
         let ts_val = checked_integer(timestamp)?;
         let sql = self.sql();
+        if has_table(&sql, "capability_manifest")? {
+            let manifests: CountRow = sql
+                .exec("SELECT count(*) AS count FROM capability_manifest", None)?
+                .one()?;
+            if manifests.count > 0 {
+                return Ok(false);
+            }
+        }
+        if has_table(&sql, "publish_watermarks")? {
+            let wm: Vec<WatermarkRow> = sql
+                .exec(
+                    "SELECT last_v1_publish_ts, last_refill_ts FROM publish_watermarks",
+                    None,
+                )?
+                .to_array()?;
+            if wm.first().is_some_and(|row| row.last_v1_publish_ts >= timestamp) {
+                return Ok(false);
+            }
+        }
         let stored: Vec<TimestampRow> =
             sql.exec("SELECT timestamp FROM bundle", None)?.to_array()?;
         if stored.first().is_some_and(|row| row.timestamp >= timestamp) {
             return Ok(false);
         }
+        let mut opk_positions = Vec::with_capacity(one_time_prekeys.len());
+        for pos in 0..one_time_prekeys.len() {
+            opk_positions.push(checked_integer(pos as u64)?);
+        }
         sql.exec("DELETE FROM one_time_prekeys", None)?;
-        for (position, prekey) in one_time_prekeys.iter().enumerate() {
+        for (pos_val, prekey) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
             sql.exec(
                 "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
-                vec![checked_integer(position as u64)?, blob(prekey)],
+                vec![pos_val, blob(prekey)],
             )?;
         }
         sql.exec(
             "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, ?) \
              ON CONFLICT (only) DO UPDATE SET signed_prekey = excluded.signed_prekey, \
              signature = excluded.signature, timestamp = excluded.timestamp",
-            vec![blob(signed_prekey), blob(signature), ts_val],
+            vec![blob(signed_prekey), blob(signature), ts_val.clone()],
         )?;
+        if has_table(&sql, "publish_watermarks")? {
+            sql.exec(
+                "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
+                 VALUES (0, ?, 0) \
+                 ON CONFLICT (only) DO UPDATE SET \
+                 last_v1_publish_ts = max(publish_watermarks.last_v1_publish_ts, excluded.last_v1_publish_ts)",
+                vec![ts_val],
+            )?;
+        }
         Ok(true)
     }
 
@@ -1019,6 +1110,15 @@ impl Identity {
              AND (object IS NULL OR object IN (SELECT value FROM json_each(?)))",
             vec![blob(sender), hashes_json(hashes).into(), objects.into()],
         )?;
+        let sql = self.sql();
+        if has_table(&sql, "mailbox_dedup")? {
+            sql.exec(
+                "DELETE FROM mailbox_dedup WHERE sender = ? \
+                 AND NOT EXISTS (SELECT 1 FROM messages m \
+                 WHERE m.sender = mailbox_dedup.sender AND m.sequence = mailbox_dedup.sequence)",
+                vec![blob(sender)],
+            )?;
+        }
         Ok(())
     }
 
@@ -1032,31 +1132,46 @@ impl Identity {
         pq_one_time_prekeys: &[PqPrekeyWire],
         timestamp: u64,
     ) -> Result<PublishV2Outcome> {
+        // Validate and prepare ALL fallible values BEFORE executing any mutating SQL statement so
+        // no partial wipe can occur on a validation or serialization failure.
         let ts_val = checked_integer(timestamp)?;
         let seq_val = checked_integer(manifest.manifest_seq)?;
         let gen_val = checked_integer(manifest.generation)?;
         let issued_val = checked_integer(manifest.issued_at)?;
         let expires_val = checked_integer(manifest.expires_at)?;
+        let pq_enabled_val = checked_integer(u64::from(manifest.pq_enabled))?;
+        let strict_pq_val = checked_integer(u64::from(manifest.strict_pq))?;
+        let pq_ratchet_val = checked_integer(u64::from(manifest.pq_ratchet_supported))?;
 
-        // Check duplicate classical OPKs and PQ prekey IDs.
+        // Check duplicate classical OPKs, duplicate PQ last-resort suites, and duplicate PQ IDs.
         let mut seen_opks = std::collections::HashSet::with_capacity(one_time_prekeys.len());
-        for opk in one_time_prekeys {
+        let mut opk_positions = Vec::with_capacity(one_time_prekeys.len());
+        for (pos, opk) in one_time_prekeys.iter().enumerate() {
             if !seen_opks.insert(opk.as_slice()) {
                 return Ok(PublishV2Outcome::DuplicatePrekey);
             }
+            opk_positions.push(checked_integer(pos as u64)?);
         }
+        let mut seen_lr_suites = std::collections::HashSet::with_capacity(pq_last_resort.len());
         let mut seen_pq =
             std::collections::HashSet::with_capacity(pq_last_resort.len() + pq_one_time_prekeys.len());
+        let mut lr_suite_vals = Vec::with_capacity(pq_last_resort.len());
         for lr in pq_last_resort {
-            if !seen_pq.insert(lr.id.as_slice()) {
+            if !seen_lr_suites.insert(lr.suite) || !seen_pq.insert(lr.id.as_slice()) {
                 return Ok(PublishV2Outcome::DuplicatePrekey);
             }
+            lr_suite_vals.push(checked_integer(lr.suite.into())?);
         }
+        let mut pq_opk_suite_vals = Vec::with_capacity(pq_one_time_prekeys.len());
         for opk in pq_one_time_prekeys {
             if !seen_pq.insert(opk.id.as_slice()) {
                 return Ok(PublishV2Outcome::DuplicatePrekey);
             }
+            pq_opk_suite_vals.push(checked_integer(opk.suite.into())?);
         }
+
+        let commitments_blob = postcard::to_allocvec(&manifest.pq_last_resort)
+            .map_err(|e| Error::RustError(e.to_string()))?;
 
         let sql = self.sql();
         let existing: Vec<ManifestSeqRow> = sql
@@ -1069,22 +1184,25 @@ impl Identity {
             return Ok(PublishV2Outcome::StaleSequence);
         }
 
-        // Update or clear legacy v1 bundle depending on strict_pq and signed_prekey_signature.
-        if manifest.strict_pq {
-            sql.exec("DELETE FROM bundle", None)?;
-        } else if let Some(sig) = signed_prekey_signature {
+        // Prepare v1 bundle timestamp before any mutations.
+        let next_v1_ts = if !manifest.strict_pq
+            && signed_prekey_signature.is_some()
+        {
             let prev: Vec<TimestampRow> =
                 sql.exec("SELECT timestamp FROM bundle", None)?.to_array()?;
             let next_ts = prev.first().map_or(timestamp, |r| r.timestamp.max(timestamp));
+            Some(checked_integer(next_ts)?)
+        } else {
+            None
+        };
+
+        // Update or clear legacy v1 bundle depending on strict_pq and signed_prekey_signature.
+        if let (Some(sig), Some(next_ts_val)) = (signed_prekey_signature, next_v1_ts) {
             sql.exec(
                 "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, ?) \
                  ON CONFLICT (only) DO UPDATE SET signed_prekey = excluded.signed_prekey, \
                  signature = excluded.signature, timestamp = excluded.timestamp",
-                vec![
-                    blob(&manifest.signed_prekey),
-                    blob(sig),
-                    checked_integer(next_ts)?,
-                ],
+                vec![blob(&manifest.signed_prekey), blob(sig), next_ts_val],
             )?;
         } else {
             sql.exec("DELETE FROM bundle", None)?;
@@ -1092,10 +1210,10 @@ impl Identity {
 
         // Replace classical OPKs.
         sql.exec("DELETE FROM one_time_prekeys", None)?;
-        for (pos, prekey) in one_time_prekeys.iter().enumerate() {
+        for (pos_val, prekey) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
             sql.exec(
                 "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
-                vec![checked_integer(pos as u64)?, blob(prekey)],
+                vec![pos_val, blob(prekey)],
             )?;
         }
 
@@ -1103,24 +1221,27 @@ impl Identity {
         sql.exec("DELETE FROM pq_last_resort", None)?;
         sql.exec("DELETE FROM pq_one_time_prekeys", None)?;
         if manifest.pq_enabled {
-            for lr in pq_last_resort {
+            for (suite_val, lr) in lr_suite_vals.into_iter().zip(pq_last_resort.iter()) {
                 sql.exec(
                     "INSERT INTO pq_last_resort (suite, prekey_id, encapsulation_key, signature) \
                      VALUES (?, ?, ?, ?)",
                     vec![
-                        checked_integer(lr.suite.into())?,
+                        suite_val,
                         blob(&lr.id),
                         blob(&lr.encapsulation_key),
                         blob(&lr.signature),
                     ],
                 )?;
             }
-            for opk in pq_one_time_prekeys {
+            for (suite_val, opk) in pq_opk_suite_vals
+                .into_iter()
+                .zip(pq_one_time_prekeys.iter())
+            {
                 sql.exec(
                     "INSERT INTO pq_one_time_prekeys (suite, prekey_id, encapsulation_key, signature) \
                      VALUES (?, ?, ?, ?)",
                     vec![
-                        checked_integer(opk.suite.into())?,
+                        suite_val,
                         blob(&opk.id),
                         blob(&opk.encapsulation_key),
                         blob(&opk.signature),
@@ -1129,9 +1250,6 @@ impl Identity {
             }
         }
 
-        let commitments_blob = postcard::to_allocvec(&manifest.pq_last_resort)
-            .map_err(|e| Error::RustError(e.to_string()))?;
-        let _ = ts_val;
         sql.exec(
             "INSERT INTO capability_manifest \
              (only, audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
@@ -1154,14 +1272,21 @@ impl Identity {
                 gen_val,
                 issued_val,
                 expires_val,
-                checked_integer(u64::from(manifest.pq_enabled))?,
-                checked_integer(u64::from(manifest.strict_pq))?,
-                checked_integer(u64::from(manifest.pq_ratchet_supported))?,
+                pq_enabled_val,
+                strict_pq_val,
+                pq_ratchet_val,
                 blob(&manifest.offered_suites),
                 blob(&manifest.signed_prekey),
                 blob(&commitments_blob),
                 blob(&manifest.signature),
             ],
+        )?;
+        sql.exec(
+            "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
+             VALUES (0, ?, 0) \
+             ON CONFLICT (only) DO UPDATE SET \
+             last_v1_publish_ts = max(publish_watermarks.last_v1_publish_ts, excluded.last_v1_publish_ts)",
+            vec![ts_val],
         )?;
         Ok(PublishV2Outcome::Stored)
     }
@@ -1174,8 +1299,10 @@ impl Identity {
         pq_one_time_prekeys: &[PqPrekeyWire],
         max_one_time_prekeys: u64,
         max_pq_one_time_prekeys: u64,
+        timestamp: u64,
     ) -> Result<RefillOutcome> {
         let _ = checked_integer(generation)?;
+        let ts_val = checked_integer(timestamp)?;
         let Some(manifest) = self.get_manifest()? else {
             return Ok(RefillOutcome::NotFound);
         };
@@ -1187,6 +1314,15 @@ impl Identity {
         }
 
         let sql = self.sql();
+        let wm: Vec<WatermarkRow> = sql
+            .exec(
+                "SELECT last_v1_publish_ts, last_refill_ts FROM publish_watermarks",
+                None,
+            )?
+            .to_array()?;
+        if wm.first().is_some_and(|row| row.last_refill_ts >= timestamp) {
+            return Ok(RefillOutcome::StaleTimestamp);
+        }
         let existing_opks: Vec<PrekeyRow> = sql
             .exec(
                 "SELECT position, prekey FROM one_time_prekeys ORDER BY position",
@@ -1231,21 +1367,37 @@ impl Identity {
             }
         }
 
-        // Append classical OPKs starting after max existing position.
+        // Pre-validate all integer bindings before mutating SQLite.
         let start_pos = existing_opks.last().map_or(0, |r| r.position + 1);
-        for (next_pos, opk) in (start_pos..).zip(one_time_prekeys.iter()) {
+        let mut opk_positions = Vec::with_capacity(one_time_prekeys.len());
+        for offset in 0..one_time_prekeys.len() {
+            opk_positions.push(checked_integer(start_pos.saturating_add(offset as u64))?);
+        }
+        let mut pq_suite_vals = Vec::with_capacity(pq_one_time_prekeys.len());
+        for pq in pq_one_time_prekeys {
+            pq_suite_vals.push(checked_integer(pq.suite.into())?);
+        }
+
+        // Record monotonic refill watermark and append OPKs/PQOPKs without rotating SPK.
+        sql.exec(
+            "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
+             VALUES (0, 0, ?) \
+             ON CONFLICT (only) DO UPDATE SET last_refill_ts = excluded.last_refill_ts",
+            vec![ts_val],
+        )?;
+        for (pos_val, opk) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
             sql.exec(
                 "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
-                vec![checked_integer(next_pos)?, blob(opk)],
+                vec![pos_val, blob(opk)],
             )?;
         }
         // Append PQOPKs.
-        for pq in pq_one_time_prekeys {
+        for (suite_val, pq) in pq_suite_vals.into_iter().zip(pq_one_time_prekeys.iter()) {
             sql.exec(
                 "INSERT INTO pq_one_time_prekeys (suite, prekey_id, encapsulation_key, signature) \
                  VALUES (?, ?, ?, ?)",
                 vec![
-                    checked_integer(pq.suite.into())?,
+                    suite_val,
                     blob(&pq.id),
                     blob(&pq.encapsulation_key),
                     blob(&pq.signature),
@@ -1635,20 +1787,24 @@ impl Identity {
         })
     }
 
-    /// Set the alarm for when the oldest of what is kept expires.
+    /// Set the alarm for when the oldest of what is kept expires (including `mailbox_dedup` rows
+    /// so delivered-message deduplication entries do not grow unboundedly).
     async fn schedule_expiry(&self, again: bool) -> Result<()> {
         let storage = self.state.storage();
         if !again && storage.get_alarm().await?.is_some() {
             return Ok(());
         }
-        let oldest: OldestRow = self
-            .sql()
-            .exec(
-                "SELECT min(created_at) AS oldest FROM \
-                 (SELECT created_at FROM messages UNION ALL SELECT created_at FROM initial_messages)",
-                None,
-            )?
-            .one()?;
+        let sql = self.sql();
+        let query = if has_table(&sql, "mailbox_dedup")? {
+            "SELECT min(created_at) AS oldest FROM \
+             (SELECT created_at FROM messages \
+              UNION ALL SELECT created_at FROM initial_messages \
+              UNION ALL SELECT created_at FROM mailbox_dedup)"
+        } else {
+            "SELECT min(created_at) AS oldest FROM \
+             (SELECT created_at FROM messages UNION ALL SELECT created_at FROM initial_messages)"
+        };
+        let oldest: OldestRow = sql.exec(query, None)?.one()?;
         let oldest = match (oldest.oldest, again) {
             (Some(oldest), _) => oldest,
             (None, false) => Date::now().as_millis(),
@@ -1659,17 +1815,18 @@ impl Identity {
             .await
     }
 
-    /// Tell every authenticated subscriber of `notification`, pruning stale or unauthenticated
-    /// timed-out sockets.
+    /// Tell every authenticated subscriber of `notification`, failing closed on missing state and
+    /// pruning stale or unauthenticated timed-out sockets.
     fn notify(&self, notification: &Notification) {
         let notification = notification.encode_to_vec();
         let now = js_sys::Date::now();
         for socket in self.state.get_websockets() {
-            let att = read_ws_attachment(&socket);
-            if let Some(ref a) = att
-                && !a.authenticated
-            {
-                if now - a.opened_at > MAX_UNAUTH_AGE_MS {
+            let Some(att) = read_ws_attachment(&socket) else {
+                let _ = socket.close(Some(1008), Some("missing state"));
+                continue;
+            };
+            if !att.authenticated {
+                if now - att.opened_at > MAX_UNAUTH_AGE_MS {
                     let _ = socket.close(Some(1008), Some("auth timeout"));
                 }
                 continue;
@@ -1745,6 +1902,13 @@ fn hashes_json(hashes: &[Vec<u8>]) -> String {
 #[derive(Deserialize)]
 struct TimestampRow {
     timestamp: u64,
+}
+
+#[derive(Deserialize)]
+struct WatermarkRow {
+    last_v1_publish_ts: u64,
+    #[cfg_attr(not(feature = "pq"), allow(dead_code))]
+    last_refill_ts: u64,
 }
 
 #[derive(Deserialize)]

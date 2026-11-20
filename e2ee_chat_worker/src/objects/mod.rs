@@ -127,6 +127,7 @@ pub enum IdentityCall {
         pq_one_time_prekeys: Vec<PqPrekeyWire>,
         max_one_time_prekeys: u64,
         max_pq_one_time_prekeys: u64,
+        timestamp: u64,
     },
     /// Non-consuming read of the stored CapabilityManifest.
     #[cfg(feature = "pq")]
@@ -249,6 +250,7 @@ pub enum RefillOutcome {
     },
     NotFound,
     StaleGeneration,
+    StaleTimestamp,
     DuplicatePrekey,
     LimitExceeded,
 }

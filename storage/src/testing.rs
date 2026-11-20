@@ -398,9 +398,10 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
     let snap = store.pq_snapshot(&bob).await.unwrap();
     assert_eq!(snap.pq_one_time_counts, vec![(1, 1), (2, 1)]);
 
-    // Legacy v1 publish MUST NOT wipe stored v2 manifest or PQ prekeys.
+    // Legacy v1 publish MUST be refused once a v2 manifest exists, leaving v2 manifest, PQ
+    // prekeys, and the remaining classical OPK pool untouched.
     assert!(
-        store
+        !store
             .publish(
                 Bundle {
                     identity_key: bob,
@@ -422,11 +423,14 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
         vec![(1, 1), (2, 1)]
     );
 
-    // Claim ML-KEM-768 (suite 2) pops suite 2 PQOPK; second claim falls back to last-resort.
+    // Claim ML-KEM-768 (suite 2) pops suite 2 PQOPK and remaining classical OPK [41; 32];
+    // second claim falls back to last-resort.
     let claim1 = store.claim_bundle(&bob, &[2]).await.unwrap().unwrap();
+    assert_eq!(claim1.one_time_prekey, Some([41; 32]));
     assert_eq!(claim1.pq_last_resort, Some(pq_key(2, 0xA2)));
     assert_eq!(claim1.pq_one_time_prekey, Some(pq_key(2, 0xB2)));
     let claim2 = store.claim_bundle(&bob, &[2]).await.unwrap().unwrap();
+    assert_eq!(claim2.one_time_prekey, None);
     assert_eq!(claim2.pq_last_resort, Some(pq_key(2, 0xA2)));
     assert_eq!(claim2.pq_one_time_prekey, None);
 
@@ -440,6 +444,7 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
                 pq_one_time_prekeys: vec![],
                 max_one_time_prekeys: 10,
                 max_pq_one_time_prekeys: 10,
+                timestamp: 2000,
             })
             .await
             .unwrap(),
@@ -454,6 +459,7 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
                 pq_one_time_prekeys: vec![pq_key(2, 0xB3)],
                 max_one_time_prekeys: 10,
                 max_pq_one_time_prekeys: 10,
+                timestamp: 2001,
             })
             .await
             .unwrap(),
@@ -462,7 +468,23 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
             pq_counts: vec![(1, 1), (2, 1)],
         }
     );
-    // Refill rejects duplicate PQOPK ID.
+    // Replaying RefillPrekeys with the same or older timestamp fails even after claiming keys.
+    assert_eq!(
+        store
+            .refill_prekeys(RefillPrekeysRecord {
+                identity_key: bob,
+                generation: 1,
+                one_time_prekeys: vec![[51; 32]],
+                pq_one_time_prekeys: vec![],
+                max_one_time_prekeys: 10,
+                max_pq_one_time_prekeys: 10,
+                timestamp: 2001,
+            })
+            .await
+            .unwrap(),
+        RefillStatus::StaleTimestamp
+    );
+    // Refill rejects duplicate PQOPK ID on a newer timestamp.
     assert_eq!(
         store
             .refill_prekeys(RefillPrekeysRecord {
@@ -472,13 +494,15 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
                 pq_one_time_prekeys: vec![pq_key(2, 0xB3)],
                 max_one_time_prekeys: 10,
                 max_pq_one_time_prekeys: 10,
+                timestamp: 2002,
             })
             .await
             .unwrap(),
         RefillStatus::DuplicatePrekey
     );
 
-    // Strict PQ publish clears legacy v1 bundle so v1 take_bundle returns None.
+    // Strict PQ publish clears legacy v1 bundle so v1 take_bundle returns None; replaying an
+    // old or new v1 publish MUST remain refused and must NOT restore v1 bundle or overwrite OPKs.
     assert_eq!(
         store
             .publish_v2(PublishV2Record {
@@ -493,8 +517,23 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
             .unwrap(),
         PublishV2Status::Stored
     );
+    assert!(
+        !store
+            .publish(
+                Bundle {
+                    identity_key: bob,
+                    signed_prekey: [99; 32],
+                    signed_prekey_signature: [98; 64],
+                    timestamp: 100,
+                },
+                vec![[97; 32]],
+            )
+            .await
+            .unwrap()
+    );
     assert_eq!(store.take_bundle(&bob).await.unwrap(), None);
     let strict_claim = store.claim_bundle(&bob, &[1]).await.unwrap().unwrap();
+    assert_eq!(strict_claim.one_time_prekey, Some([60; 32]));
     assert_eq!(strict_claim.signed_prekey_signature, None);
     assert_eq!(strict_claim.pq_one_time_prekey, Some(pq_key(1, 0xB4)));
 

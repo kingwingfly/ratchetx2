@@ -110,6 +110,8 @@ pub struct RefillPrekeysRecord {
     pub max_one_time_prekeys: usize,
     /// Maximum total post-quantum one-time prekeys allowed in the current generation.
     pub max_pq_one_time_prekeys: usize,
+    /// Strictly increasing request timestamp in milliseconds since the Unix epoch.
+    pub timestamp: u64,
 }
 
 /// Outcome of [`LocalPqHandshakeStore::refill_prekeys`].
@@ -127,6 +129,8 @@ pub enum RefillStatus {
     /// The supplied generation does not match the currently published manifest's generation,
     /// or PQOPKs were supplied while PQ is disabled in the current manifest.
     StaleGeneration,
+    /// The request timestamp was not strictly greater than the previous accepted refill's.
+    StaleTimestamp,
     /// One or more supplied prekeys collided with existing or sibling prekeys.
     DuplicatePrekey,
     /// Appending the supplied prekeys would exceed the configured pool cap.

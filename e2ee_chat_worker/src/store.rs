@@ -345,6 +345,7 @@ impl LocalPqHandshakeStore for Store {
 
     async fn refill_prekeys(&self, record: RefillPrekeysRecord) -> Result<RefillStatus> {
         check_safe(record.generation)?;
+        check_safe(record.timestamp)?;
         let call = IdentityCall::RefillPrekeys {
             generation: record.generation,
             one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
@@ -355,6 +356,7 @@ impl LocalPqHandshakeStore for Store {
                 .collect(),
             max_one_time_prekeys: record.max_one_time_prekeys as u64,
             max_pq_one_time_prekeys: record.max_pq_one_time_prekeys as u64,
+            timestamp: record.timestamp,
         };
         let outcome: RefillOutcome = self.identity(&record.identity_key, &call).await?;
         Ok(match outcome {
@@ -370,6 +372,7 @@ impl LocalPqHandshakeStore for Store {
             },
             RefillOutcome::NotFound => RefillStatus::NotFound,
             RefillOutcome::StaleGeneration => RefillStatus::StaleGeneration,
+            RefillOutcome::StaleTimestamp => RefillStatus::StaleTimestamp,
             RefillOutcome::DuplicatePrekey => RefillStatus::DuplicatePrekey,
             RefillOutcome::LimitExceeded => RefillStatus::LimitExceeded,
         })

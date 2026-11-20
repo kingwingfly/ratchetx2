@@ -31,6 +31,8 @@ pub struct MemoryStore {
 struct Inner {
     /// Legacy classical v1 bundles (cleared when v2 `strict_pq` is enabled).
     bundles: HashMap<PublicKey, Bundle>,
+    /// Persistent v1 publish replay watermark per identity (survives v1 bundle removal).
+    last_v1_publish_ts: HashMap<PublicKey, u64>,
     /// Classical X25519 one-time prekeys per identity (shared between v1 and v2).
     one_time_prekeys: HashMap<PublicKey, VecDeque<PublicKey>>,
     /// Per-identity inboxes holding both classical v1 and (when `pq`) v2 initial messages.
@@ -44,6 +46,9 @@ struct Inner {
     /// Post-quantum v2 capability manifests.
     #[cfg(feature = "pq")]
     manifests: HashMap<PublicKey, StoredCapabilityManifest>,
+    /// Per-identity strictly increasing refill watermark (blocks refill replays within ±5 min).
+    #[cfg(feature = "pq")]
+    last_refill_ts: HashMap<PublicKey, u64>,
     /// Last-resort PQSPKs per identity, keyed by suite ID.
     #[cfg(feature = "pq")]
     pq_last_resort: HashMap<PublicKey, HashMap<u8, StoredPqPrekey>>,
@@ -60,6 +65,8 @@ struct Inner {
 struct Queued {
     message: StoredMessage,
     delivery_hash: Option<[u8; 32]>,
+    #[cfg(feature = "pq")]
+    client_message_id: Option<[u8; 16]>,
     bytes: u64,
 }
 
@@ -116,6 +123,7 @@ impl Inner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn append_inner(
         &mut self,
         sender: &PublicKey,
@@ -124,6 +132,7 @@ impl Inner {
         content: Bytes,
         initial_message: Option<Bytes>,
         delivery_hash: Option<[u8; 32]>,
+        #[cfg(feature = "pq")] client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
         let incoming_bytes = message_bytes(&header, &content, initial_message.as_ref());
         let key = (*sender, *recipient);
@@ -156,6 +165,8 @@ impl Inner {
         self.queues.entry(key).or_default().push(Queued {
             message,
             delivery_hash,
+            #[cfg(feature = "pq")]
+            client_message_id,
             bytes: incoming_bytes,
         });
         Ok(next)
@@ -166,14 +177,27 @@ impl HandshakeStore for MemoryStore {
     async fn publish(&self, bundle: Bundle, one_time_prekeys: Vec<PublicKey>) -> Result<bool> {
         check_safe_int(bundle.timestamp)?;
         let mut inner = self.inner.lock();
-        if let Some(stored) = inner.bundles.get(&bundle.identity_key)
+        let id = bundle.identity_key;
+        // Once an identity has upgraded to a v2 CapabilityManifest, legacy v1 Publish is refused
+        // so old or cross-generation v1 publishes can neither restore a strict-PQ v1 bundle nor
+        // overwrite the shared classical OPK pool.
+        #[cfg(feature = "pq")]
+        if inner.manifests.contains_key(&id) {
+            return Ok(false);
+        }
+        if inner
+            .last_v1_publish_ts
+            .get(&id)
+            .is_some_and(|&ts| ts >= bundle.timestamp)
+        {
+            return Ok(false);
+        }
+        if let Some(stored) = inner.bundles.get(&id)
             && stored.timestamp >= bundle.timestamp
         {
             return Ok(false);
         }
-        // Legacy v1 publish updates classical bundle and OPKs only; it NEVER clears or overwrites
-        // any stored v2 CapabilityManifest or PQ prekeys.
-        let id = bundle.identity_key;
+        inner.last_v1_publish_ts.insert(id, bundle.timestamp);
         inner.bundles.insert(id, bundle);
         inner.one_time_prekeys.insert(id, one_time_prekeys.into());
         Ok(true)
@@ -294,6 +318,14 @@ impl PqHandshakeStore for MemoryStore {
             return Ok(PublishV2Status::StaleSequence);
         }
 
+        // Advance persistent v1 publish replay watermark so old captured v1 publishes cannot replay
+        // even if `bundles` is cleared under `strict_pq`.
+        inner
+            .last_v1_publish_ts
+            .entry(id)
+            .and_modify(|ts| *ts = (*ts).max(record.timestamp))
+            .or_insert(record.timestamp);
+
         // Classical v1 bundle handling: strict_pq or missing raw signature clears v1 bundle so
         // Bob unilaterally blocks legacy v1 FetchBundle.
         if record.manifest.strict_pq {
@@ -341,6 +373,7 @@ impl PqHandshakeStore for MemoryStore {
 
     async fn refill_prekeys(&self, record: RefillPrekeysRecord) -> Result<RefillStatus> {
         check_safe_int(record.generation)?;
+        check_safe_int(record.timestamp)?;
         let mut inner = self.inner.lock();
         let id = record.identity_key;
         let Some(manifest) = inner.manifests.get(&id).cloned() else {
@@ -351,6 +384,13 @@ impl PqHandshakeStore for MemoryStore {
         }
         if !record.pq_one_time_prekeys.is_empty() && !manifest.pq_enabled {
             return Ok(RefillStatus::StaleGeneration);
+        }
+        if inner
+            .last_refill_ts
+            .get(&id)
+            .is_some_and(|&ts| ts >= record.timestamp)
+        {
+            return Ok(RefillStatus::StaleTimestamp);
         }
 
         // Check duplicate classical OPKs against existing pool and siblings.
@@ -398,6 +438,7 @@ impl PqHandshakeStore for MemoryStore {
         }
 
         // Append atomically without rotating SPK or last-resort PQSPKs.
+        inner.last_refill_ts.insert(id, record.timestamp);
         let opk_queue = inner.one_time_prekeys.entry(id).or_default();
         opk_queue.extend(record.one_time_prekeys);
         let classical_count = opk_queue.len();
@@ -641,6 +682,8 @@ impl MailboxStore for MemoryStore {
             content,
             initial_message,
             delivery_hash,
+            #[cfg(feature = "pq")]
+            None,
         )
     }
 
@@ -651,12 +694,23 @@ impl MailboxStore for MemoryStore {
         hashes: &[[u8; 32]],
     ) -> Result<()> {
         let mut inner = self.inner.lock();
+        #[cfg(feature = "pq")]
+        let mut removed_cids = Vec::new();
         if let Some(queue) = inner.queues.get_mut(&(*sender, *recipient)) {
             queue.retain(|queued| {
-                !queued
+                let delete = queued
                     .delivery_hash
-                    .is_some_and(|hash| hashes.contains(&hash))
+                    .is_some_and(|hash| hashes.contains(&hash));
+                #[cfg(feature = "pq")]
+                if delete && let Some(cid) = queued.client_message_id {
+                    removed_cids.push(cid);
+                }
+                !delete
             });
+        }
+        #[cfg(feature = "pq")]
+        for cid in removed_cids {
+            inner.mailbox_dedup.remove(&(*sender, *recipient, cid));
         }
         Ok(())
     }
@@ -707,6 +761,7 @@ impl IdempotentMailboxStore for MemoryStore {
             content,
             initial_message,
             delivery_hash,
+            client_message_id,
         )?;
         if let Some(cid) = client_message_id {
             inner.mailbox_dedup.insert((*sender, *recipient, cid), seq);
@@ -785,6 +840,33 @@ mod test {
             assert!(store.inner.lock().inboxes.is_empty());
             assert_eq!(store.take_initial_messages(&ghost, 50).await.unwrap(), Some(vec![]));
             assert!(store.inner.lock().inboxes.is_empty());
+        });
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn mailbox_dedup_pruned_on_delete_delivered() {
+        futures::executor::block_on(async {
+            let store = MemoryStore::default();
+            let (alice, bob) = ([1; 32], [2; 32]);
+            let cid = [0xAA; 16];
+            let hash = [0xBB; 32];
+            let seq = store
+                .append_idempotent(
+                    &alice,
+                    &bob,
+                    Bytes::from_static(b"h"),
+                    Bytes::from_static(b"c"),
+                    None,
+                    Some(hash),
+                    Some(cid),
+                )
+                .await
+                .unwrap();
+            assert_eq!(seq, 1);
+            assert_eq!(store.inner.lock().mailbox_dedup.len(), 1);
+            store.delete_delivered(&alice, &bob, &[hash]).await.unwrap();
+            assert!(store.inner.lock().mailbox_dedup.is_empty());
         });
     }
 }
