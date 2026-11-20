@@ -722,6 +722,7 @@ impl TryFrom<&InitialMessageV2> for crate::handshake::InitialMessage {
 }
 
 /// Validated fields extracted from an [`InitialMessageV2`].
+#[cfg(feature = "server")]
 pub(crate) struct ValidatedInitialMessageV2 {
     pub sender: PublicKey,
     pub ephemeral_key: PublicKey,
@@ -734,6 +735,7 @@ pub(crate) struct ValidatedInitialMessageV2 {
 }
 
 /// Validates structural, key, and PQ ciphertext invariants of an [`InitialMessageV2`].
+#[cfg(feature = "server")]
 pub(crate) fn validate_initial_message_v2(
     message: &InitialMessageV2,
     supported_suites: &[u32],
