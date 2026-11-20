@@ -290,7 +290,8 @@ mod v2 {
             ClaimBundleResponse, GetManifestRequest, GetServerInfoRequest, GetServerInfoResponse,
             ListInitialMessagesRequest, LocalHandshakeV2, PqLastResortCommitment, PqPrekey,
             PublishV2Request, RefillPrekeysRequest, RefillPrekeysResponse, SendInitialV2Request,
-            manifest_digest, sign_manifest, verify_manifest_at, verify_wire_pq_prekey,
+            manifest_digest, sign_manifest, verify_manifest, verify_manifest_at,
+            verify_wire_pq_prekey,
         },
         mailbox::{DELIVERY_TOKEN_LENGTH, FetchRequest, LocalMailbox, MAX_DELIVERED},
         mailbox_v2::{
@@ -309,7 +310,8 @@ mod v2 {
         DEFAULT_MANIFEST_TTL_MS, PeerPqState, SessionSecurity, check_peer_hello,
     };
     use crate::{
-        Active, Client, DeliveryKey, InitialMessage, Sealed, Session,
+        Active, Client, DeliveryKey, InitialMessage, MAX_CARRIED_INITIALS, MAX_EXPIRED_PAGES,
+        Sealed, Session,
         error::{Error, ErrorKind, Result},
         extract_hello,
     };
@@ -700,6 +702,7 @@ mod v2 {
                 signature: Bytes::new(),
             };
             sign_manifest(&self.state.identity, &mut manifest)?;
+            let own_digest = manifest_digest(&manifest)?;
 
             let spk_sig = if pq_enabled && strict_pq {
                 None
@@ -719,6 +722,7 @@ mod v2 {
             self.state.manifest_seq = manifest_seq;
             self.state.prekey_generation = generation;
             self.state.publishing = true;
+            self.state.record_manifest_digest(own_digest);
 
             Ok(PreparedPublishV2 {
                 request,
@@ -826,12 +830,21 @@ mod v2 {
         }
 
         /// Accept an inbound v1 or v2 initial message from `peer`, applying local PQ and
-        /// inbound classical quarantine policies:
+        /// inbound classical quarantine policies.
         ///
-        /// - **PQXDH (version 2)**: runs `accept_pq`, decrypts `first_message` (supporting both
-        ///   PQ-ratchet and classical-ratchet PQXDH sessions symmetrically), confirms prekey
-        ///   consumption, pins `peer_pq.pq_pinned = true`, and returns
-        ///   [`AcceptedInitial::Accepted`]. Works even after local PQ was toggled OFF so
+        /// **Two-phase ack rule**: this method is purely local and has no transient errors — any
+        /// `Err` (`InvalidInitialMessage`, `InvalidKeys`, `UnexpectedPeer`, `PqRequired`,
+        /// `UnsupportedSuite`, `DowngradeDetected`, `MalformedState`, etc.) is permanent for that
+        /// inbox entry. In a manual `list_initial_messages_v2` -> `accept_initial_v2` -> persist
+        /// -> `ack_initial_messages_v2` loop, callers MUST acknowledge every processed `msg.id`
+        /// (both `Ok` and `Err` outcomes) after persisting state so unaccepted/malformed entries
+        /// cannot permanently fill the inbox.
+        ///
+        /// - **PQXDH (version 2)**: verifies any supplied `manifest_digest` belongs to this
+        ///   client's recent signed manifests (when recorded), runs `accept_pq`, decrypts
+        ///   `first_message` (supporting both PQ-ratchet and classical-ratchet PQXDH sessions
+        ///   symmetrically), confirms prekey consumption, pins `peer_pq.pq_pinned = true`, and
+        ///   returns [`AcceptedInitial::Accepted`]. Works even after local PQ was toggled OFF so
         ///   in-flight PQ handshakes still decrypt cleanly.
         /// - **Classical (version 1)**:
         ///   - If local `strict_pq` is `true`: rejects with [`ErrorKind::PqRequired`] without
@@ -865,6 +878,12 @@ mod v2 {
                 } => {
                     if !pq_init.pq_suite.is_supported() {
                         return Err(ErrorKind::UnsupportedSuite.into());
+                    }
+                    if let Some(d) = digest
+                        && !self.state.recent_manifest_digests.is_empty()
+                        && !self.state.recent_manifest_digests.contains(d)
+                    {
+                        return Err(ErrorKind::DowngradeDetected.into());
                     }
                     let (agreement, signed_prekey) = self.state.prekeys.accept_pq(
                         &self.state.identity,
@@ -1046,8 +1065,13 @@ mod v2 {
                 })
                 .await?;
             if let Some(manifest) = &response.manifest {
-                let verified_id = verify_manifest_at(manifest, audience, self.clock.now())
-                    .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
+                let verified_id = match verify_manifest_at(manifest, audience, self.clock.now()) {
+                    Ok(id) => id,
+                    Err(e) if e.kind() == protocol::ErrorKind::StaleTimestamp => {
+                        return Err(Error::new(ErrorKind::PeerManifestExpired, e));
+                    }
+                    Err(e) => return Err(Error::new(ErrorKind::DowngradeDetected, e)),
+                };
                 if verified_id != *peer {
                     return Err(ErrorKind::DowngradeDetected.into());
                 }
@@ -1092,6 +1116,11 @@ mod v2 {
 
         /// Explicitly acknowledge and delete pending inbox initial messages by their stable
         /// server-assigned IDs (call ONLY after persisting accepted sessions locally).
+        ///
+        /// Include EVERY listed ID whose local `accept_initial_v2` finished — both accepted /
+        /// quarantined AND permanently rejected IDs (such as `InvalidKeys`, `InvalidInitialMessage`,
+        /// `PqRequired`, `UnsupportedSuite`, `DowngradeDetected`, or `malformed_ids`) — so
+        /// invalid entries cannot permanently clog the inbox.
         pub async fn ack_initial_messages_v2(
             &mut self,
             audience: &str,
@@ -1253,9 +1282,10 @@ mod v2 {
 
             match &response.manifest {
                 Some(manifest) => {
-                    // Verify manifest signature, audience binding, validity window, identity,
-                    // monotonic manifest_seq, and SPK match.
-                    let verified_id = verify_manifest_at(manifest, audience, self.clock.now())
+                    // 1. Verify signature, audience binding, structural invariants, identity,
+                    //    monotonic manifest_seq, and SPK match BEFORE checking expiry so a
+                    //    replayed older expired manifest still hard-fails as DowngradeDetected!
+                    let verified_id = verify_manifest(manifest, audience)
                         .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                     if verified_id != *peer {
                         return Err(ErrorKind::DowngradeDetected.into());
@@ -1263,6 +1293,16 @@ mod v2 {
                     if manifest.manifest_seq < peer_state.pinned_manifest_seq {
                         return Err(ErrorKind::DowngradeDetected.into());
                     }
+                    // 2. Check manifest validity window against server clock (a peer offline past
+                    //    DEFAULT_MANIFEST_TTL_MS surfaces PeerManifestExpired rather than a false
+                    //    downgrade alarm).
+                    verify_manifest_at(manifest, audience, self.clock.now())
+                        .map_err(|e| match e.kind() {
+                            protocol::ErrorKind::StaleTimestamp => {
+                                Error::new(ErrorKind::PeerManifestExpired, e)
+                            }
+                            _ => Error::new(ErrorKind::DowngradeDetected, e),
+                        })?;
                     let resp_spk: PublicKey = protocol::fixed(&response.signed_prekey)
                         .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                     if manifest.signed_prekey.as_ref() != resp_spk.as_slice() {
@@ -1706,26 +1746,17 @@ mod v2 {
             let mut outcomes = Vec::with_capacity(listed.messages.len());
             for msg in &listed.messages {
                 let peer_state = peer_state_for(&msg.sender);
-                match self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone()) {
-                    Ok(outcome) => {
-                        if msg.id != 0 {
-                            ack_ids.push(msg.id);
-                        }
-                        outcomes.push((msg.sender, outcome));
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            ErrorKind::InvalidInitialMessage
-                                | ErrorKind::UnexpectedPeer
-                                | ErrorKind::PqRequired
-                        ) =>
-                    {
-                        if msg.id != 0 {
-                            ack_ids.push(msg.id);
-                        }
-                    }
-                    Err(_) => {}
+                // `accept_initial_v2` is purely local with no transient errors: always acknowledge
+                // every processed inbox ID so permanent failures (e.g. canonical low-order sender
+                // `InvalidKeys`, `UnsupportedSuite`, `InvalidInitialMessage`, `PqRequired`,
+                // `DowngradeDetected`, etc.) cannot permanently DoS the inbox.
+                if msg.id != 0 {
+                    ack_ids.push(msg.id);
+                }
+                if let Ok(outcome) =
+                    self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone())
+                {
+                    outcomes.push((msg.sender, outcome));
                 }
             }
             if !listed.fell_back_to_v1 && !ack_ids.is_empty() {
@@ -1845,6 +1876,7 @@ mod v2 {
                 return Err(ErrorKind::Protocol.into());
             }
             let mut carried: Vec<InitialMessageV2> = vec![];
+            let mut expired_pages = 0usize;
             loop {
                 let cursor = self.state.cursor;
                 match self
@@ -1861,7 +1893,21 @@ mod v2 {
                         }
                         return Ok(vec![]);
                     }
-                    Some(received) if received.is_empty() && self.state.cursor > cursor => {}
+                    Some(received) if received.is_empty() && self.state.cursor > cursor => {
+                        expired_pages += 1;
+                        if expired_pages >= MAX_EXPIRED_PAGES
+                            || carried.len() >= MAX_CARRIED_INITIALS
+                        {
+                            if !carried.is_empty() {
+                                return Ok(vec![ReceivedV2 {
+                                    content: Err(ErrorKind::Expired.into()),
+                                    earlier: false,
+                                    initial_messages: carried,
+                                }]);
+                            }
+                            return Ok(vec![]);
+                        }
+                    }
                     Some(mut received) => {
                         if !carried.is_empty() {
                             received.push(ReceivedV2 {
@@ -1951,6 +1997,7 @@ mod v2 {
                 let Some(message) = &envelope.message else {
                     self.state.cursor = self.state.cursor.max(envelope.sequence);
                     if let Some(im) = attached(&envelope)
+                        && carried.len() < MAX_CARRIED_INITIALS
                         && !carried.contains(&im)
                     {
                         carried.push(im);
@@ -1960,6 +2007,7 @@ mod v2 {
                 let decrypted = self.decrypt(message);
                 let mut initial_messages = mem::take(carried);
                 if let Some(im) = attached(&envelope)
+                    && initial_messages.len() < MAX_CARRIED_INITIALS
                     && !initial_messages.contains(&im)
                 {
                     initial_messages.push(im);
@@ -1973,6 +2021,9 @@ mod v2 {
                 if stalls {
                     self.state.stalled_through = last;
                     for im in envelopes.by_ref().filter_map(|env| attached(&env)) {
+                        if initial_messages.len() >= MAX_CARRIED_INITIALS {
+                            break;
+                        }
                         if !initial_messages.contains(&im) {
                             initial_messages.push(im);
                         }

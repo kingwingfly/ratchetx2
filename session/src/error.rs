@@ -163,6 +163,11 @@ pub enum ErrorKind {
     /// was detected.
     #[error("post-quantum downgrade detected")]
     DowngradeDetected,
+    /// A peer's signed capability manifest is cryptographically valid and not rolled back, but
+    /// its validity window has expired (or lies beyond clock skew), e.g. the peer has been
+    /// offline past its manifest TTL.
+    #[error("peer capability manifest has expired")]
+    PeerManifestExpired,
     /// Peer lacks PQ (or published a signed `OFF` manifest) while local PQ is enabled, and no
     /// classical exception has been approved yet.
     #[error("classical fallback requires explicit user approval (peer_signed_off={peer_signed_off})")]

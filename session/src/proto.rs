@@ -21,6 +21,7 @@ impl fmt::Debug for ClientState {
             .field("strict_pq", &self.strict_pq)
             .field("manifest_seq", &self.manifest_seq)
             .field("prekey_generation", &self.prekey_generation)
+            .field("recent_manifest_digests", &self.recent_manifest_digests.len())
             .finish_non_exhaustive()
     }
 }

@@ -25,10 +25,7 @@ use session::{
 };
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use session::{PqConfig, PqSuite};
-#[cfg(all(
-    feature = "prost",
-    any(feature = "ml-kem-1024", feature = "ml-kem-768")
-))]
+#[cfg(all(feature = "prost", feature = "ml-kem-1024"))]
 use session::Session;
 use storage::MemoryStore;
 
@@ -316,11 +313,38 @@ async fn hello_session_seq_anti_rollback_protects_active_session() {
     assert_eq!(inbox.len(), 4);
 
     // Suppose Bob receives session #2 FIRST (e.g. server withheld #1 and #0).
-    let (mut bob_session, _) = bob
+    let (mut bob_session, first2) = bob
         .accept(&alice.identity_key(), &inbox[1], mb.clone())
         .unwrap();
     let active_s2 = *bob_session.active_id().unwrap();
     assert_eq!(bob_session.peer_session_seq(), 2);
+
+    // Calling `session.check_peer_hello` right after `Client::accept` with the session's own
+    // Hello MUST NOT falsely flag `stale_session_seq = true`!
+    let Some(ContentKind::Hello(h2)) = ContentKind::from_bytes(&first2) else {
+        panic!("expected Hello");
+    };
+    let own_check = bob_session.check_peer_hello(&h2, false);
+    assert!(!own_check.stale_session_seq);
+    assert!(!own_check.downgrade_detected);
+    // Checking a strictly older seq (1) or 0 on the same session IS flagged stale.
+    assert!(
+        bob_session
+            .check_peer_hello(
+                &Hello {
+                    name: "alice".into(),
+                    session_seq: 1,
+                    ..Hello::default()
+                },
+                false,
+            )
+            .stale_session_seq
+    );
+    assert!(
+        bob_session
+            .check_peer_hello(&Hello::classical("alice"), false)
+            .stale_session_seq
+    );
 
     // Delayed/withheld session #1 (seq=1 <= 2) MUST be rejected and NEVER overwrite active #2!
     let (stale_1, _) = bob
@@ -523,6 +547,51 @@ async fn trailing_carried_initial_message_survives_expired_page_boundary() {
     drop(new_bob);
 }
 
+#[tokio::test]
+async fn infinite_expired_pages_relay_terminates_cleanly() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct InfiniteExpiredMailbox {
+        fetches: Arc<AtomicU64>,
+    }
+
+    impl LocalMailbox for InfiniteExpiredMailbox {
+        async fn push(&self, _: PushRequest) -> protocol::Result<PushResponse> {
+            Ok(PushResponse::default())
+        }
+
+        async fn fetch(&self, request: FetchRequest) -> protocol::Result<FetchResponse> {
+            self.fetches.fetch_add(1, Ordering::Relaxed);
+            Ok(FetchResponse {
+                messages: vec![protocol::mailbox::Envelope {
+                    sequence: request.after + 1,
+                    message: None,
+                    initial_message: None,
+                }],
+            })
+        }
+    }
+
+    let store = SharedStore::default();
+    let hs = V1Handshake(Arc::new(HandshakeServer::new(store)));
+    let fetches = Arc::new(AtomicU64::new(0));
+    let mb = InfiniteExpiredMailbox {
+        fetches: fetches.clone(),
+    };
+    let mut alice = Client::new(hs.clone());
+    let mut bob = Client::new(hs);
+    bob.publish_keys(1).await.unwrap();
+    let mut alice_session = alice
+        .initiate(&bob.identity_key(), b"hi", mb)
+        .await
+        .unwrap();
+
+    // Even with strictly increasing expired sequences, receive() stops cleanly at the page cap.
+    let received = alice_session.receive().await.unwrap();
+    assert!(received.is_empty());
+    assert_eq!(fetches.load(Ordering::Relaxed), 8);
+}
+
 #[cfg(feature = "prost")]
 #[tokio::test]
 async fn state_validation_on_prost_restore_rejects_corruption() {
@@ -575,6 +644,7 @@ async fn state_validation_on_prost_restore_rejects_corruption() {
         strict_pq: false,
         manifest_seq: 0,
         prekey_generation: 0,
+        recent_manifest_digests: vec![],
     };
     let restored_client = session::ClientState::try_from(&legacy_client).unwrap();
     assert_eq!(
@@ -908,6 +978,7 @@ mod pq_e2e {
         StripPqPrekeys,
         StripManifest,
         ReplayBundle(Box<ClaimBundleResponse>),
+        #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         DowngradeSuiteTo768,
     }
 
@@ -962,7 +1033,7 @@ mod pq_e2e {
         }
         async fn claim_bundle(
             &self,
-            mut request: ClaimBundleRequest,
+            request: ClaimBundleRequest,
         ) -> protocol::Result<ClaimBundleResponse> {
             match &self.attack {
                 AttackMode::StripPqPrekeys => {
@@ -979,7 +1050,9 @@ mod pq_e2e {
                     Ok(resp)
                 }
                 AttackMode::ReplayBundle(captured) => Ok((**captured).clone()),
+                #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                 AttackMode::DowngradeSuiteTo768 => {
+                    let mut request = request;
                     request.preferred_suites = vec![u32::from(PqSuite::MlKem768.as_u8())];
                     self.inner.claim_bundle(request).await
                 }
@@ -1177,7 +1250,12 @@ mod pq_e2e {
         };
         assert_eq!(security, SessionSecurity::pq(PqSuite::MlKem1024, true));
         assert_eq!(session.peer_session_seq(), 1);
-        assert!(ContentKind::from_bytes(&first_message).is_some());
+        let Some(ContentKind::Hello(h1)) = ContentKind::from_bytes(&first_message) else {
+            panic!("expected Hello");
+        };
+        let hello_check = session.check_peer_hello(&h1, true);
+        assert!(!hello_check.stale_session_seq);
+        assert!(!hello_check.downgrade_detected);
         assert_eq!(
             bob.ack_initial_messages_v2(AUDIENCE, vec![listed.messages[0].id])
                 .await
@@ -2064,5 +2142,225 @@ mod pq_e2e {
             rkyv::from_bytes::<session::SessionState, rkyv::rancor::Error>(&sess_bytes).unwrap();
         assert_eq!(sess_restored.security(), alice_session.security());
         assert_eq!(sess_restored.peer_pq_state(), alice_session.peer_pq_state());
+    }
+
+    #[tokio::test]
+    async fn permanent_inbox_errors_like_low_order_sender_are_acked_and_cleared() {
+        let store = SharedStore::default();
+        let hs = DualHandshake::new(store.clone(), AUDIENCE);
+        let mb = DualMailbox::new(store, AUDIENCE);
+
+        let mut bob = Client::new(hs.clone());
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        let bob_spk = bob.current_signed_prekey().unwrap();
+
+        // Canonical non-zero low-order Curve25519 point (u = 1): passes server's
+        // `check_canonical_key`, fails `XEdDSAPublicKey::new` (`InvalidKeys`) locally on Bob!
+        let mut low_order_sender = [0u8; 32];
+        low_order_sender[0] = 1;
+        let mut valid_ephemeral = [0u8; 32];
+        valid_ephemeral[0] = 9;
+        hs.send_initial_v2(SendInitialV2Request {
+            recipient: Bytes::copy_from_slice(&bob.identity_key()),
+            message: Some(protocol::handshake_v2::InitialMessageV2 {
+                id: 0,
+                version: 1,
+                identity_key: Bytes::copy_from_slice(&low_order_sender),
+                ephemeral_key: Bytes::copy_from_slice(&valid_ephemeral),
+                signed_prekey: Bytes::copy_from_slice(&bob_spk),
+                one_time_prekey: None,
+                first_message: Some(party::EncryptedMessage {
+                    header: Bytes::from_static(b"hdr"),
+                    content: Bytes::from_static(b"body"),
+                }),
+                pq_suite: 0,
+                pq_last_resort: false,
+                pq_prekey_id: Bytes::new(),
+                pq_ciphertext: Bytes::new(),
+                manifest_digest: Bytes::new(),
+            }),
+        })
+        .await
+        .unwrap();
+
+        // Confirm `accept_initial_v2` returns `InvalidKeys` (the exact error that used to go un-acked).
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        assert_eq!(listed.messages.len(), 1);
+        assert_eq!(
+            bob.accept_initial_v2(
+                &low_order_sender,
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb.clone(),
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::InvalidKeys
+        );
+
+        // `list_and_accept_v2` MUST ack and clear it so Bob's inbox cannot be permanently DoSed!
+        let outcomes = bob
+            .list_and_accept_v2(AUDIENCE, 10, mb, |_| PeerPqState::default())
+            .await
+            .unwrap();
+        assert!(outcomes.is_empty());
+        assert!(
+            bob.list_initial_messages_v2(AUDIENCE, 10)
+                .await
+                .unwrap()
+                .messages
+                .is_empty(),
+            "permanently rejected low-order sender entry must be acknowledged and removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_manifest_is_distinct_from_downgrade_and_foreign_digest_is_rejected() {
+        let store = SharedStore::default();
+        let hs = DualHandshake::new(store.clone(), AUDIENCE);
+        let mb = DualMailbox::new(store, AUDIENCE);
+
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs.clone());
+        bob.publish_v2(AUDIENCE, 3, 3).await.unwrap();
+
+        // Advance Alice's ServerClock past DEFAULT_MANIFEST_TTL_MS (31 days): Bob's valid manifest
+        // at seq 1 (>= pinned 1) returns `PeerManifestExpired`, NOT a false `DowngradeDetected`!
+        let future = alice.clock().now() + session::DEFAULT_MANIFEST_TTL_MS + 60_000;
+        alice.clock().observe(future);
+        let pinned_seq1 = PeerPqState {
+            pq_pinned: true,
+            pinned_manifest_seq: 1,
+            peer_pq_capable: true,
+            ..PeerPqState::default()
+        };
+        assert_eq!(
+            alice
+                .initiate_v2(AUDIENCE, &bob.identity_key(), &pinned_seq1, b"hi", mb.clone())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PeerManifestExpired
+        );
+        assert_eq!(
+            alice
+                .get_peer_manifest(AUDIENCE, &bob.identity_key())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::PeerManifestExpired
+        );
+
+        // Even when expired, a replayed older manifest (`seq 1 < pinned 2`) MUST STILL return
+        // `DowngradeDetected`!
+        let pinned_seq2 = PeerPqState {
+            pq_pinned: true,
+            pinned_manifest_seq: 2,
+            peer_pq_capable: true,
+            ..PeerPqState::default()
+        };
+        assert_eq!(
+            alice
+                .initiate_v2(AUDIENCE, &bob.identity_key(), &pinned_seq2, b"hi", mb.clone())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DowngradeDetected
+        );
+
+        // Reset Alice's clock to current time, initiate normally, then tamper `manifest_digest` to
+        // an unrecognized digest -> Bob's `accept_initial_v2` rejects with `DowngradeDetected`!
+        let now_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        alice.clock().observe(now_ms);
+        let _alice_sess = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi-valid",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let mut listed = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        let mut tampered = listed.messages.pop().unwrap();
+        if let session::InitialMessageKind::Pq {
+            manifest_digest, ..
+        } = &mut tampered.kind
+        {
+            *manifest_digest = Some([0xAB; 32]);
+        }
+        assert_eq!(
+            bob.accept_initial_v2(
+                &alice.identity_key(),
+                &PeerPqState::default(),
+                &tampered,
+                mb,
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::DowngradeDetected
+        );
+    }
+
+    #[tokio::test]
+    async fn v2_infinite_expired_pages_relay_terminates_cleanly() {
+        #[derive(Debug, Clone)]
+        struct InfiniteExpiredV2Mailbox {
+            fetches: Arc<AtomicUsize>,
+        }
+        impl LocalMailbox for InfiniteExpiredV2Mailbox {
+            async fn push(&self, _: PushRequest) -> protocol::Result<PushResponse> {
+                Ok(PushResponse::default())
+            }
+            async fn fetch(&self, _: FetchRequest) -> protocol::Result<FetchResponse> {
+                Ok(FetchResponse::default())
+            }
+        }
+        impl LocalMailboxV2 for InfiniteExpiredV2Mailbox {
+            async fn push_v2(&self, _: PushV2Request) -> protocol::Result<PushV2Response> {
+                Ok(PushV2Response::default())
+            }
+            async fn fetch_signed(
+                &self,
+                request: FetchSignedRequest,
+            ) -> protocol::Result<FetchSignedResponse> {
+                self.fetches.fetch_add(1, Ordering::Relaxed);
+                Ok(FetchSignedResponse {
+                    messages: vec![protocol::mailbox_v2::EnvelopeV2 {
+                        sequence: request.after + 1,
+                        message: None,
+                        initial_message: None,
+                    }],
+                })
+            }
+        }
+
+        let store = SharedStore::default();
+        let hs = DualHandshake::new(store, AUDIENCE);
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let mb = InfiniteExpiredV2Mailbox {
+            fetches: fetches.clone(),
+        };
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs);
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        let mut alice_session = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi",
+                mb,
+            )
+            .await
+            .unwrap();
+
+        let received = alice_session.receive_v2(&alice, AUDIENCE).await.unwrap();
+        assert!(received.is_empty());
+        assert_eq!(fetches.load(Ordering::Relaxed), 8);
     }
 }

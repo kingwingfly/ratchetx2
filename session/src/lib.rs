@@ -43,13 +43,30 @@ use sha2::{Digest, Sha256};
 pub use x3dh::{PqSuite, PublicKey};
 use x3dh::{LocalPrekeys, PrekeyBundle};
 use xeddsa::XEdDSAPrivateKey;
-#[cfg(any(feature = "prost", feature = "serde"))]
+#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
 use xeddsa::XEdDSAPublicKey;
 use zeroize::Zeroizing;
 
 /// Upper bound on queued delivery tokens permitted when restoring saved session state.
-#[cfg(any(feature = "prost", feature = "serde"))]
+#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
 const MAX_STORED_DELIVERED: usize = 4096;
+
+/// Maximum number of recent locally signed `CapabilityManifest` digests retained in `ClientState`.
+#[cfg(any(
+    feature = "prost",
+    feature = "serde",
+    feature = "rkyv",
+    feature = "ml-kem-1024",
+    feature = "ml-kem-768"
+))]
+pub(crate) const MAX_RECENT_MANIFEST_DIGESTS: usize = 16;
+
+/// Maximum consecutive all-expired mailbox pages fetched within one [`Session::receive`] (or v2
+/// receive) call before returning control to the caller.
+pub(crate) const MAX_EXPIRED_PAGES: usize = 8;
+
+/// Maximum carried initial messages accumulated across expired envelopes or a stalled page.
+pub(crate) const MAX_CARRIED_INITIALS: usize = 64;
 
 /// An initial message from a peer who wants to start a session, with the session's first
 /// message; accept it with [`Client::accept`].
@@ -182,7 +199,8 @@ pub struct Client<H> {
 )]
 #[cfg_attr(
     feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
+    rkyv(bytecheck(verify))
 )]
 pub struct ClientState {
     pub(crate) identity: XEdDSAPrivateKey,
@@ -197,6 +215,19 @@ pub struct ClientState {
     pub(crate) manifest_seq: u64,
     /// Prekey generation counter published via v2.
     pub(crate) prekey_generation: u64,
+    /// SHA-256 digests of recent `CapabilityManifest`s signed by this client (bounded by
+    /// `MAX_RECENT_MANIFEST_DIGESTS`).
+    #[cfg_attr(
+        not(any(
+            feature = "prost",
+            feature = "serde",
+            feature = "rkyv",
+            feature = "ml-kem-1024",
+            feature = "ml-kem-768"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) recent_manifest_digests: Vec<[u8; 32]>,
 }
 
 impl ClientState {
@@ -209,6 +240,24 @@ impl ClientState {
             pq_config: PqConfig::default(),
             manifest_seq: 0,
             prekey_generation: 0,
+            recent_manifest_digests: vec![],
+        }
+    }
+
+    /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    pub(crate) fn record_manifest_digest(&mut self, digest: [u8; 32]) {
+        if let Some(pos) = self
+            .recent_manifest_digests
+            .iter()
+            .position(|d| *d == digest)
+        {
+            self.recent_manifest_digests.remove(pos);
+        }
+        self.recent_manifest_digests.push(digest);
+        if self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
+            let excess = self.recent_manifest_digests.len() - MAX_RECENT_MANIFEST_DIGESTS;
+            self.recent_manifest_digests.drain(..excess);
         }
     }
 
@@ -222,11 +271,49 @@ impl ClientState {
         if self.last_timestamp > protocol::MAX_SAFE_INTEGER
             || self.manifest_seq > protocol::MAX_SAFE_INTEGER
             || self.prekey_generation > protocol::MAX_SAFE_INTEGER
+            || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
         {
             return Err(ErrorKind::MalformedState.into());
         }
         self.pq_config.validate()?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "rkyv")]
+fn archived_pq_suite(suite: &x3dh::pq::ArchivedPqSuite) -> PqSuite {
+    match suite {
+        x3dh::pq::ArchivedPqSuite::MlKem1024 => PqSuite::MlKem1024,
+        x3dh::pq::ArchivedPqSuite::MlKem768 => PqSuite::MlKem768,
+    }
+}
+
+#[cfg(feature = "rkyv")]
+unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedClientState
+where
+    C: rkyv::rancor::Fallible + ?Sized,
+    C::Error: rkyv::rancor::Source,
+{
+    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
+        use rkyv::rancor::Source;
+        let check = || -> Result<()> {
+            if self.last_timestamp.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.manifest_seq.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.prekey_generation.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            let pq_config = PqConfig {
+                pq_enabled: self.pq_config.pq_enabled,
+                preferred_suite: archived_pq_suite(&self.pq_config.preferred_suite),
+                pq_ratchet_enabled: self.pq_config.pq_ratchet_enabled,
+                strict_pq: self.pq_config.strict_pq,
+            };
+            pq_config.validate()?;
+            Ok(())
+        };
+        check().map_err(C::Error::new)
     }
 }
 
@@ -244,6 +331,8 @@ struct RawClientState {
     manifest_seq: u64,
     #[serde(default)]
     prekey_generation: u64,
+    #[serde(default)]
+    recent_manifest_digests: Vec<[u8; 32]>,
 }
 
 #[cfg(feature = "serde")]
@@ -259,6 +348,7 @@ impl TryFrom<RawClientState> for ClientState {
             pq_config: raw.pq_config,
             manifest_seq: raw.manifest_seq,
             prekey_generation: raw.prekey_generation,
+            recent_manifest_digests: raw.recent_manifest_digests,
         };
         state.validate()?;
         Ok(state)
@@ -279,6 +369,11 @@ impl From<&ClientState> for proto::ClientState {
             strict_pq: state.pq_config.strict_pq,
             manifest_seq: state.manifest_seq,
             prekey_generation: state.prekey_generation,
+            recent_manifest_digests: state
+                .recent_manifest_digests
+                .iter()
+                .map(|d| d.to_vec())
+                .collect(),
         }
     }
 }
@@ -303,6 +398,16 @@ impl TryFrom<&proto::ClientState> for ClientState {
         if state.strict_pq && (state.pq_disabled || !has_pq) {
             return Err(ErrorKind::MalformedState.into());
         }
+        if state.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        let recent_manifest_digests = state
+            .recent_manifest_digests
+            .iter()
+            .map(|d| {
+                <[u8; 32]>::try_from(d.as_slice()).map_err(|_| Error::from(ErrorKind::MalformedState))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let pq_config = PqConfig {
             pq_enabled: has_pq && !state.pq_disabled,
             preferred_suite,
@@ -322,6 +427,7 @@ impl TryFrom<&proto::ClientState> for ClientState {
             pq_config,
             manifest_seq: state.manifest_seq,
             prekey_generation: state.prekey_generation,
+            recent_manifest_digests,
         };
         restored.validate()?;
         Ok(restored)
@@ -831,7 +937,8 @@ pub struct Session<M> {
 )]
 #[cfg_attr(
     feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
+    rkyv(bytecheck(verify))
 )]
 pub struct SessionState {
     /// The session messages are sent on; none once retired, until a new one starts.
@@ -1068,6 +1175,72 @@ impl SessionState {
             }
             self.direction_changes = 0;
         }
+    }
+}
+
+#[cfg(feature = "rkyv")]
+unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedSessionState
+where
+    C: rkyv::rancor::Fallible + ?Sized,
+    C::Error: rkyv::rancor::Source,
+{
+    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
+        use rkyv::rancor::Source;
+        let check = || -> Result<()> {
+            if !xeddsa::is_canonical_public_key(&self.me)
+                || XEdDSAPublicKey::new(&self.me).is_err()
+                || !xeddsa::is_canonical_public_key(&self.peer)
+                || XEdDSAPublicKey::new(&self.peer).is_err()
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if self.others.len() > KEPT_SESSIONS || self.delivered.len() > MAX_STORED_DELIVERED {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if self.cursor.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.stalled_through.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.skip_through.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.next_session_seq.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.peer_pq.pinned_manifest_seq.to_native() > protocol::MAX_SAFE_INTEGER
+                || self.peer_pq.peer_session_seq.to_native() > protocol::MAX_SAFE_INTEGER
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if let rkyv::option::ArchivedOption::Some(active) = &self.active {
+                if !xeddsa::is_canonical_public_key(&active.id) || active.id == [0u8; 32] {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+                if active.peer_session_seq.to_native() > protocol::MAX_SAFE_INTEGER {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+                let suite = match &active.security.suite {
+                    rkyv::option::ArchivedOption::Some(s) => Some(archived_pq_suite(s)),
+                    rkyv::option::ArchivedOption::None => None,
+                };
+                let is_pq = active.security.is_pq;
+                let pq_ratchet = active.security.pq_ratchet;
+                if is_pq {
+                    if suite.is_none() {
+                        return Err(ErrorKind::MalformedState.into());
+                    }
+                } else if suite.is_some() || pq_ratchet {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+                let party = rkyv::deserialize::<Party, rkyv::rancor::Error>(&active.party)
+                    .map_err(|_| ErrorKind::MalformedState)?;
+                if pq_ratchet != party.is_pq_ratchet_active() {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                if let Some(ratchet_suite) = party.pq_suite()
+                    && suite.map(PqSuite::as_u8) != Some(ratchet_suite.id())
+                {
+                    return Err(ErrorKind::MalformedState.into());
+                }
+            }
+            Ok(())
+        };
+        check().map_err(C::Error::new)
     }
 }
 
@@ -1507,8 +1680,36 @@ impl<M> Session<M> {
 
     /// Validate a peer's decrypted [`Hello`] against this session's [`PeerPqState`] and active
     /// [`SessionSecurity`].
+    ///
+    /// When called immediately after [`Client::accept`] or `Client::accept_initial_v2` with the
+    /// active peer-initiated session's own greeting (`hello.session_seq > 0` matching
+    /// `active.peer_session_seq == peer_session_seq`), does not falsely flag
+    /// `stale_session_seq = true` while still enforcing downgrade detection and rejecting `0` or
+    /// any strictly smaller `session_seq`.
     pub fn check_peer_hello(&mut self, hello: &Hello, local_pq_enabled: bool) -> HelloCheck {
         let security = self.security().unwrap_or_default();
+        let is_own_initial_hello = hello.session_seq > 0
+            && self.state.peer_pq.peer_session_seq == hello.session_seq
+            && self
+                .state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.known_by_peer && active.peer_session_seq == hello.session_seq);
+        if is_own_initial_hello {
+            if hello.pq_capable {
+                self.state.peer_pq.peer_pq_capable = true;
+                self.state.peer_pq.pq_pinned = true;
+            }
+            let downgrade_detected = !security.is_pq && local_pq_enabled && hello.pq_capable;
+            if downgrade_detected {
+                self.state.peer_pq.downgrade_detected = true;
+            }
+            return HelloCheck {
+                downgrade_detected,
+                recommend_start_again: downgrade_detected,
+                stale_session_seq: false,
+            };
+        }
         check_peer_hello(&mut self.state.peer_pq, security, hello, local_pq_enabled)
     }
 
@@ -1800,6 +2001,7 @@ impl<M: LocalMailbox> Session<M> {
     /// expired.
     pub async fn receive(&mut self) -> Result<Vec<Received>> {
         let mut carried: Vec<InitialMessage> = vec![];
+        let mut expired_pages = 0usize;
         loop {
             let cursor = self.state.cursor;
             match self.receive_page(&mut carried).await? {
@@ -1814,8 +2016,21 @@ impl<M: LocalMailbox> Session<M> {
                     return Ok(vec![]);
                 }
                 // Their contents all expired; unless the page went nowhere, as a server that
-                // sends it again would have it, which must not hold this here forever.
-                Some(received) if received.is_empty() && self.state.cursor > cursor => {}
+                // sends it again would have it, or we hit the consecutive expired-page / carried
+                // cap, which must not hold this here forever.
+                Some(received) if received.is_empty() && self.state.cursor > cursor => {
+                    expired_pages += 1;
+                    if expired_pages >= MAX_EXPIRED_PAGES || carried.len() >= MAX_CARRIED_INITIALS {
+                        if !carried.is_empty() {
+                            return Ok(vec![Received {
+                                content: Err(ErrorKind::Expired.into()),
+                                earlier: false,
+                                initial_messages: carried,
+                            }]);
+                        }
+                        return Ok(vec![]);
+                    }
+                }
                 Some(mut received) => {
                     if !carried.is_empty() {
                         received.push(Received {
@@ -1873,6 +2088,7 @@ impl<M: LocalMailbox> Session<M> {
             let Some(message) = &envelope.message else {
                 self.state.cursor = self.state.cursor.max(envelope.sequence);
                 if let Some(initial_message) = attached(&envelope)
+                    && carried.len() < MAX_CARRIED_INITIALS
                     && !carried.contains(&initial_message)
                 {
                     carried.push(initial_message);
@@ -1882,6 +2098,7 @@ impl<M: LocalMailbox> Session<M> {
             let decrypted = self.decrypt(message);
             let mut initial_messages = mem::take(carried);
             if let Some(initial_message) = attached(&envelope)
+                && initial_messages.len() < MAX_CARRIED_INITIALS
                 && !initial_messages.contains(&initial_message)
             {
                 initial_messages.push(initial_message);
@@ -1900,6 +2117,9 @@ impl<M: LocalMailbox> Session<M> {
                     .by_ref()
                     .filter_map(|envelope| attached(&envelope))
                 {
+                    if initial_messages.len() >= MAX_CARRIED_INITIALS {
+                        break;
+                    }
                     if !initial_messages.contains(&initial_message) {
                         initial_messages.push(initial_message);
                     }
@@ -3243,5 +3463,81 @@ mod test {
             contents(receive_all(&mut alice_session).await),
             [b"hello".to_vec()]
         );
+    }
+
+    #[cfg(feature = "rkyv")]
+    #[tokio::test]
+    async fn rkyv_verify_rejects_corrupted_client_and_session_states() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (_alice, mut alice_session, mut bob, _bob_session) =
+            talking(&handshake, &mailbox).await;
+
+        // Valid states round-trip cleanly through rkyv::from_bytes (with bytecheck::Verify).
+        let valid_client = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
+        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&valid_client).is_ok());
+        let valid_session = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&valid_session).is_ok());
+
+        // 1. ClientState: strict_pq with pq_enabled == false rejected.
+        bob.state.pq_config.pq_enabled = false;
+        bob.state.pq_config.strict_pq = true;
+        let bad_client = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
+        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_client).is_err());
+
+        // 2. ClientState: last_timestamp > MAX_SAFE_INTEGER rejected.
+        bob.state.pq_config.strict_pq = false;
+        bob.state.last_timestamp = protocol::MAX_SAFE_INTEGER + 1;
+        let bad_ts = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
+        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_ts).is_err());
+
+        // 3. SessionState: non-canonical `me` rejected.
+        let orig_me = alice_session.state.me;
+        alice_session.state.me[31] |= 0x80;
+        let bad_me = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_me).is_err());
+        alice_session.state.me = orig_me;
+
+        // 4. SessionState: cursor > MAX_SAFE_INTEGER, others > KEPT_SESSIONS, delivered > cap rejected.
+        let orig_cursor = alice_session.state.cursor;
+        alice_session.state.cursor = protocol::MAX_SAFE_INTEGER + 1;
+        let bad_cursor = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_cursor).is_err());
+        alice_session.state.cursor = orig_cursor;
+
+        alice_session.state.delivered = vec![[0u8; DELIVERY_TOKEN_LENGTH]; MAX_STORED_DELIVERED + 1];
+        let bad_delivered = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_delivered).is_err());
+        alice_session.state.delivered.clear();
+
+        // 4b. `others.len() > KEPT_SESSIONS` rejected.
+        let extra = Earlier::from(alice_session.state.active.take().unwrap());
+        let saved_party_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&extra).unwrap();
+        alice_session.state.others.push(extra);
+        for _ in 0..KEPT_SESSIONS {
+            alice_session.state.others.push(
+                rkyv::from_bytes::<Earlier, rkyv::rancor::Error>(&saved_party_bytes).unwrap(),
+            );
+        }
+        assert!(alice_session.state.others.len() > KEPT_SESSIONS);
+        let bad_others = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_others).is_err());
+        alice_session.state.others.truncate(1);
+        let restored_earlier = alice_session.state.others.pop().unwrap();
+        alice_session.state.active = Some(Active {
+            party: restored_earlier.party,
+            id: bob.state().identity.compute_public_key().to_bytes(),
+            known_by_peer: true,
+            initial_message: vec![],
+            delivery_key: restored_earlier.delivery_key,
+            security: SessionSecurity::classical(),
+            peer_session_seq: 0,
+        });
+
+        // 5. SessionState: mismatched `active.security` vs `party` rejected.
+        alice_session.state.active.as_mut().unwrap().security =
+            SessionSecurity::pq(PqSuite::MlKem1024, true);
+        let bad_sec = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_sec).is_err());
     }
 }

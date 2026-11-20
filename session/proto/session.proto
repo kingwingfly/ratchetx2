@@ -29,6 +29,9 @@ message ClientState {
   uint64 manifest_seq = 9;
   // Monotonic prekey generation number published via HandshakeV2.
   uint64 prekey_generation = 10;
+  // SHA-256 digests (32 bytes each) of recent CapabilityManifests signed by this client,
+  // bounded so accept_initial_v2 can verify incoming manifest_digest values belong to this client.
+  repeated bytes recent_manifest_digests = 11;
 }
 
 // Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
