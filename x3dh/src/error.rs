@@ -50,7 +50,7 @@ pub enum ErrorKind {
     /// A peer's identity key, prekey or ephemeral key is invalid.
     #[error("invalid public key")]
     InvalidPublicKey,
-    /// The signature on Bob's signed prekey does not verify.
+    /// The signature on Bob's signed prekey or post-quantum prekey does not verify.
     #[error("invalid prekey signature")]
     InvalidSignature,
     /// The initial message is not from the identity key Bob expects.
@@ -65,9 +65,22 @@ pub enum ErrorKind {
     /// The initial message was confirmed already, and is sent again.
     #[error("initial message replayed")]
     Replayed,
-    /// The protobuf state of the local prekeys is malformed, e.g. a key of the wrong length.
+    /// The serialized state of the local prekeys is malformed, e.g. a key of the wrong length
+    /// or inconsistent key material.
     #[error("malformed prekey state")]
     MalformedState,
+    /// The requested post-quantum suite is unknown or not enabled in this build.
+    #[error("unsupported post-quantum suite")]
+    UnsupportedSuite,
+    /// The initial message carries an unsupported PQXDH protocol version.
+    #[error("unsupported PQXDH version")]
+    UnsupportedVersion,
+    /// The initial message references a post-quantum prekey Bob does not have in that generation.
+    #[error("post-quantum prekey not found")]
+    PqPrekeyNotFound,
+    /// The post-quantum ciphertext has an invalid length or encoding for its suite.
+    #[error("invalid post-quantum ciphertext")]
+    InvalidCiphertext,
 }
 
 /// Result type with [`Error`].

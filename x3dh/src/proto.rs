@@ -22,6 +22,8 @@ impl fmt::Debug for Generation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Generation")
             .field("one_time_prekeys", &self.one_time_prekeys.len())
+            .field("pq_last_resort", &self.pq_last_resort.len())
+            .field("pq_one_time_prekeys", &self.pq_one_time_prekeys.len())
             .finish_non_exhaustive()
     }
 }
@@ -30,5 +32,14 @@ impl fmt::Debug for OneTimePrekey {
     /// Shows no keys.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OneTimePrekey").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for PqPrekey {
+    /// Shows no keys or seeds.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PqPrekey")
+            .field("suite", &self.suite)
+            .finish_non_exhaustive()
     }
 }

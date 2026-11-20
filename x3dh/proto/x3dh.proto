@@ -20,6 +20,10 @@ message Generation {
   // The ephemeral keys of the initial messages confirmed (32 bytes each), so that none is
   // accepted twice.
   repeated bytes confirmed_ephemeral_keys = 4;
+  // Last-resort post-quantum signed prekeys for this generation (at most one per suite).
+  repeated PqPrekey pq_last_resort = 5;
+  // Post-quantum one-time prekeys not used yet for this generation.
+  repeated PqPrekey pq_one_time_prekeys = 6;
 }
 
 // A one-time prekey.
@@ -28,4 +32,16 @@ message OneTimePrekey {
   bytes public_key = 1;
   // Its private key (32 bytes).
   bytes secret = 2;
+}
+
+// A post-quantum prekey (last-resort PQSPK or PQOPK), persisted by its 64-byte FIPS 203 seed.
+message PqPrekey {
+  // PqSuite identifier (1 = ML-KEM-1024, 2 = ML-KEM-768).
+  uint32 suite = 1;
+  // Deterministic 32-byte identifier: SHA-256("pqxdh.v1/id\0" || suite || ek).
+  bytes id = 2;
+  // ML-KEM encapsulation key bytes (1568 bytes for ML-KEM-1024, 1184 bytes for ML-KEM-768).
+  bytes encapsulation_key = 3;
+  // FIPS 203 64-byte (d || z) seed. Secret.
+  bytes seed = 4;
 }
