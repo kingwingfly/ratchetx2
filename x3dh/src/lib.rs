@@ -1040,12 +1040,17 @@ impl From<&LocalPrekeys> for proto::LocalPrekeys {
             .iter()
             .map(|generation| {
                 let signed_secret = Zeroizing::new(generation.signed_secret.to_bytes());
+                let mut one_time: Vec<_> = generation.one_time.iter().collect();
+                one_time.sort_unstable_by_key(|(public_key, _)| *public_key);
+                let mut confirmed: Vec<_> = generation.confirmed.iter().collect();
+                confirmed.sort_unstable();
+                let mut pq_one_time: Vec<_> = generation.pq_one_time.iter().collect();
+                pq_one_time.sort_unstable_by_key(|(id, pq)| (pq.suite.as_u8(), *id));
                 proto::Generation {
                     signed_prekey: generation.signed_prekey.to_vec(),
                     signed_secret: signed_secret.to_vec(),
-                    one_time_prekeys: generation
-                        .one_time
-                        .iter()
+                    one_time_prekeys: one_time
+                        .into_iter()
                         .map(|(public_key, secret)| {
                             let secret_bytes = Zeroizing::new(secret.to_bytes());
                             proto::OneTimePrekey {
@@ -1054,9 +1059,8 @@ impl From<&LocalPrekeys> for proto::LocalPrekeys {
                             }
                         })
                         .collect(),
-                    confirmed_ephemeral_keys: generation
-                        .confirmed
-                        .iter()
+                    confirmed_ephemeral_keys: confirmed
+                        .into_iter()
                         .map(|ephemeral_key| ephemeral_key.to_vec())
                         .collect(),
                     pq_last_resort: generation
@@ -1069,9 +1073,8 @@ impl From<&LocalPrekeys> for proto::LocalPrekeys {
                             seed: pq.seed.to_vec(),
                         })
                         .collect(),
-                    pq_one_time_prekeys: generation
-                        .pq_one_time
-                        .iter()
+                    pq_one_time_prekeys: pq_one_time
+                        .into_iter()
                         .map(|(id, pq)| proto::PqPrekey {
                             suite: u32::from(pq.suite.as_u8()),
                             id: id.to_vec(),
@@ -1904,6 +1907,51 @@ mod test {
                 .err()
                 .unwrap();
             assert_eq!(error.kind(), ErrorKind::Replayed);
+        }
+    }
+
+    #[cfg(feature = "prost")]
+    #[test]
+    fn prost_encoding_is_deterministic_across_reloads() {
+        let alice = XEdDSAPrivateKey::generate();
+        let (bob, mut prekeys, bundle) = bob_setup(4);
+        let no_otpk = PrekeyBundle {
+            one_time_prekey: None,
+            ..bundle
+        };
+        for _ in 0..3 {
+            let (msg, _) = no_otpk.initiate(&alice, &public_key(&bob)).unwrap();
+            prekeys.confirm(&msg).unwrap();
+        }
+        #[cfg(feature = "ml-kem-1024")]
+        prekeys.extend_pq(&bob, PqSuite::MlKem1024, 0, 2).unwrap();
+        #[cfg(feature = "ml-kem-768")]
+        prekeys.extend_pq(&bob, PqSuite::MlKem768, 0, 2).unwrap();
+
+        let encoded = proto::LocalPrekeys::from(&prekeys);
+        let generation = &encoded.generations[0];
+        assert!(
+            generation
+                .one_time_prekeys
+                .windows(2)
+                .all(|w| w[0].public_key < w[1].public_key)
+        );
+        assert!(
+            generation
+                .confirmed_ephemeral_keys
+                .windows(2)
+                .all(|w| w[0] < w[1])
+        );
+        assert!(
+            generation
+                .pq_one_time_prekeys
+                .windows(2)
+                .all(|w| (w[0].suite, &w[0].id) < (w[1].suite, &w[1].id))
+        );
+
+        for _ in 0..10 {
+            let reloaded = LocalPrekeys::try_from(&encoded).unwrap();
+            assert_eq!(proto::LocalPrekeys::from(&reloaded), encoded);
         }
     }
 
