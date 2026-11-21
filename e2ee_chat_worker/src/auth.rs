@@ -5,11 +5,14 @@
 //! that signed in with SIWE, SIWS or SIWX (CAIP-122), whose bought storage would be counted
 //! against it.
 //!
-//! Best-effort brute-force throttling tracks recent failed password attempts per isolate; internet-
-//! facing deployments should additionally configure Cloudflare Rate Limiting rules or a dedicated
-//! Durable Object counter binding for cross-edge enforcement.
+//! Each isolate throttles failed password attempts per client IP from Cloudflare's
+//! `CF-Connecting-IP` header. Requests without a usable address share one fallback bucket.
 
-use std::{cell::RefCell, collections::VecDeque, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    time::Duration,
+};
 
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
@@ -26,22 +29,21 @@ const PASSWORD: &str = "PASSWORD";
 const AUTH_KEY: &str = "AUTH_KEY";
 /// How long a sign-in lasts, unless the `SESSION_DAYS` variable says.
 const DEFAULT_SESSION_DAYS: u64 = 30;
-/// Base delay after a wrong password, which scales with recent isolate failures.
+/// Base delay after a wrong password, which scales with recent failures from the same client.
 const WRONG_PASSWORD_BASE_DELAY_MS: u64 = 1000;
 /// Cap on per-request wrong-password delay.
 const WRONG_PASSWORD_MAX_DELAY_MS: u64 = 5000;
-/// Sliding window for best-effort per-isolate password failure throttling (60 seconds).
+/// Sliding window for best-effort per-client password failure throttling (60 seconds).
 const THROTTLE_WINDOW_MS: u64 = 60_000;
-/// Maximum failed password attempts permitted per isolate within [`THROTTLE_WINDOW_MS`].
+/// Maximum failed password attempts permitted per client within [`THROTTLE_WINDOW_MS`].
 const MAX_FAILURES_PER_WINDOW: usize = 20;
+/// Maximum number of IP buckets retained by one isolate.
+const MAX_TRACKED_CLIENTS: usize = 1024;
 /// The longest password read.
 const MAX_PASSWORD: usize = 1024;
 
 thread_local! {
-    /// Best-effort per-isolate sliding window of failed password timestamps (in ms).
-    /// Note: Cloudflare Workers isolates are ephemeral and per-colo; combine with Cloudflare
-    /// Rate Limiting rules for global distributed throttling without extra DO bindings.
-    static FAILED_ATTEMPTS: RefCell<VecDeque<u64>> = const { RefCell::new(VecDeque::new()) };
+    static FAILED_ATTEMPTS: RefCell<FailureTracker> = RefCell::new(FailureTracker::default());
 }
 
 /// What a cookie says of who signed in.
@@ -127,27 +129,69 @@ fn url_matches_origin(candidate: &str, target: &Url) -> bool {
         && parsed.port_or_known_default() == target.port_or_known_default()
 }
 
-fn recent_failures(now: u64) -> usize {
-    FAILED_ATTEMPTS.with(|cell| {
-        let mut q = cell.borrow_mut();
-        let cutoff = now.saturating_sub(THROTTLE_WINDOW_MS);
-        while q.front().is_some_and(|&ts| ts < cutoff) {
-            q.pop_front();
-        }
-        q.len()
-    })
+fn client_ip_key(request: &Request) -> String {
+    request
+        .headers()
+        .get("CF-Connecting-IP")
+        .ok()
+        .flatten()
+        .as_deref()
+        .map(str::trim)
+        .filter(|ip| !ip.is_empty() && ip.len() <= 128)
+        .unwrap_or("<unknown>")
+        .to_owned()
 }
 
-fn record_failure(now: u64) -> usize {
-    FAILED_ATTEMPTS.with(|cell| {
-        let mut q = cell.borrow_mut();
+#[derive(Default)]
+struct FailureTracker {
+    clients: HashMap<String, VecDeque<u64>>,
+}
+
+impl FailureTracker {
+    fn prune(attempts: &mut VecDeque<u64>, now: u64) {
         let cutoff = now.saturating_sub(THROTTLE_WINDOW_MS);
-        while q.front().is_some_and(|&ts| ts < cutoff) {
-            q.pop_front();
+        while attempts.front().is_some_and(|&ts| ts < cutoff) {
+            attempts.pop_front();
         }
-        q.push_back(now);
-        q.len()
-    })
+    }
+
+    fn recent_failures(&mut self, client_key: &str, now: u64) -> usize {
+        let Some(attempts) = self.clients.get_mut(client_key) else {
+            return 0;
+        };
+        Self::prune(attempts, now);
+        let count = attempts.len();
+        if count == 0 {
+            self.clients.remove(client_key);
+        }
+        count
+    }
+
+    fn record_failure(&mut self, client_key: &str, now: u64) -> usize {
+        if let Some(attempts) = self.clients.get_mut(client_key) {
+            Self::prune(attempts, now);
+            attempts.push_back(now);
+            return attempts.len();
+        }
+        if self.clients.len() >= MAX_TRACKED_CLIENTS {
+            self.clients.retain(|_, attempts| {
+                Self::prune(attempts, now);
+                !attempts.is_empty()
+            });
+            if self.clients.len() >= MAX_TRACKED_CLIENTS
+                && let Some((key, _)) = self
+                    .clients
+                    .iter()
+                    .min_by_key(|(_, q)| (q.len(), q.back().copied().unwrap_or(0)))
+            {
+                let key = key.clone();
+                self.clients.remove(&key);
+            }
+        }
+        self.clients
+            .insert(client_key.to_owned(), VecDeque::from([now]));
+        1
+    }
 }
 
 /// Sign `request` in with the server's password, its body.
@@ -158,27 +202,32 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
             503,
         );
     };
+    let client_key = client_ip_key(&request);
     let now = Date::now().as_millis();
-    if recent_failures(now) >= MAX_FAILURES_PER_WINDOW {
+    if FAILED_ATTEMPTS.with_borrow_mut(|tracker| tracker.recent_failures(&client_key, now))
+        >= MAX_FAILURES_PER_WINDOW
+    {
         return Response::error("too many failed sign-in attempts", 429);
     }
-    let Some(given) = crate::read_body(&mut request, MAX_PASSWORD).await? else {
-        let failures = record_failure(Date::now().as_millis());
-        let delay_ms = WRONG_PASSWORD_BASE_DELAY_MS
-            .saturating_mul(1u64 << (failures.saturating_sub(1).min(3)))
-            .min(WRONG_PASSWORD_MAX_DELAY_MS);
-        Delay::from(Duration::from_millis(delay_ms)).await;
-        return Response::error("wrong password", 403);
-    };
-    // Compared as MACs, in constant time, so that the time it takes tells nothing of it.
+    let given = crate::read_body(&mut request, MAX_PASSWORD).await?;
+    // Compare MACs in constant time so the comparison reveals nothing about the password.
     let expected = mac(&key, b"password", password.as_bytes())
         .finalize()
         .into_bytes();
-    if mac(&key, b"password", &given)
-        .verify_slice(&expected)
-        .is_err()
-    {
-        let failures = record_failure(Date::now().as_millis());
+    if !given.is_some_and(|body| {
+        mac(&key, b"password", &body)
+            .verify_slice(&expected)
+            .is_ok()
+    }) {
+        let now = Date::now().as_millis();
+        // Several request bodies can arrive concurrently after the first throttle check.
+        let failures = FAILED_ATTEMPTS.with_borrow_mut(|tracker| {
+            (tracker.recent_failures(&client_key, now) < MAX_FAILURES_PER_WINDOW)
+                .then(|| tracker.record_failure(&client_key, now))
+        });
+        let Some(failures) = failures else {
+            return Response::error("too many failed sign-in attempts", 429);
+        };
         let delay_ms = WRONG_PASSWORD_BASE_DELAY_MS
             .saturating_mul(1u64 << (failures.saturating_sub(1).min(3)))
             .min(WRONG_PASSWORD_MAX_DELAY_MS);
@@ -241,4 +290,71 @@ fn answer(claims: Option<&Claims>, cookie: Option<String>) -> Result<Response> {
         headers.set("set-cookie", &cookie)?;
     }
     Ok(Response::ok(body)?.with_headers(headers))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_failures_are_per_client() {
+        let mut tracker = FailureTracker::default();
+        for count in 1..=MAX_FAILURES_PER_WINDOW {
+            assert_eq!(tracker.record_failure("192.0.2.1", 100), count);
+        }
+        assert_eq!(
+            tracker.recent_failures("192.0.2.1", 100),
+            MAX_FAILURES_PER_WINDOW
+        );
+        assert_eq!(tracker.recent_failures("192.0.2.2", 100), 0);
+        assert_eq!(tracker.record_failure("192.0.2.2", 100), 1);
+    }
+
+    #[test]
+    fn expired_timestamps_and_empty_buckets_are_removed() {
+        let mut tracker = FailureTracker::default();
+        tracker.record_failure("client", 10);
+        tracker.record_failure("client", 20);
+        assert_eq!(
+            tracker.recent_failures("client", 10 + THROTTLE_WINDOW_MS),
+            2
+        );
+        assert_eq!(
+            tracker.recent_failures("client", 11 + THROTTLE_WINDOW_MS),
+            1
+        );
+        assert_eq!(
+            tracker.recent_failures("client", 21 + THROTTLE_WINDOW_MS),
+            0
+        );
+        assert!(tracker.clients.is_empty());
+    }
+
+    #[test]
+    fn a_full_tracker_retains_heavy_offenders_and_evicts_oldest_noise() {
+        let mut tracker = FailureTracker::default();
+        for _ in 0..MAX_FAILURES_PER_WINDOW {
+            tracker.record_failure("locked", 0);
+        }
+        for n in 1..=2 * MAX_TRACKED_CLIENTS {
+            tracker.record_failure(&n.to_string(), n as u64);
+            assert!(tracker.clients.len() <= MAX_TRACKED_CLIENTS);
+        }
+        assert_eq!(tracker.clients.len(), MAX_TRACKED_CLIENTS);
+        assert!(!tracker.clients.contains_key("1"));
+        assert!(
+            tracker
+                .clients
+                .contains_key(&(2 * MAX_TRACKED_CLIENTS).to_string())
+        );
+        assert_eq!(
+            tracker.recent_failures("locked", 2 * MAX_TRACKED_CLIENTS as u64),
+            MAX_FAILURES_PER_WINDOW
+        );
+        tracker.record_failure(
+            "later",
+            2 * MAX_TRACKED_CLIENTS as u64 + THROTTLE_WINDOW_MS + 1,
+        );
+        assert_eq!(tracker.clients.len(), 1);
+    }
 }
