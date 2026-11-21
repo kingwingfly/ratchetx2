@@ -18,6 +18,9 @@ use worker::{
 use super::{Identity, rows::CountRow, schema::SCHEMA_SEEN_SUBSCRIBES};
 use crate::objects::checked_integer;
 
+/// Internal header set to `"1"` when deployment password auth is satisfied (either `PASSWORD`
+/// is not configured, or the request carried a valid sign-in cookie).
+pub const HEADER_DEPLOYMENT_AUTH: &str = "x-e2ee-deployment-auth";
 /// Internal header carrying the hex-encoded signature of a query-param verified `SubscribeRequest`.
 pub const HEADER_SUBSCRIBE_SIG: &str = "x-e2ee-subscribe-sig";
 /// Internal header carrying the decimal timestamp of a query-param verified `SubscribeRequest`.
@@ -63,6 +66,14 @@ enum SubscribeRecordOutcome {
     Fresh,
     Replayed,
     CapacityExceeded,
+}
+
+fn deployment_auth_header_satisfied(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn allow_subscription_storage(deployment_authenticated: bool, has_core_tables: bool) -> bool {
+    deployment_authenticated || has_core_tables
 }
 
 /// Per-WebSocket attachment stored via hibernation API.
@@ -230,6 +241,16 @@ impl Identity {
     pub(super) async fn accept_websocket(&self, request: &Request) -> Result<Response> {
         let now_ms = Date::now().as_millis();
         let now_f64 = js_sys::Date::now();
+        let deployment_authenticated = deployment_auth_header_satisfied(
+            request.headers().get(HEADER_DEPLOYMENT_AUTH)?.as_deref(),
+        );
+        let storage_allowed = || -> Result<bool> {
+            let has_core_tables = !deployment_authenticated && self.has_tables()?;
+            Ok(allow_subscription_storage(
+                deployment_authenticated,
+                has_core_tables,
+            ))
+        };
 
         let attachment = if let (Some(sig_hex), Some(ts_str)) = (
             request.headers().get(HEADER_SUBSCRIBE_SIG)?,
@@ -243,6 +264,9 @@ impl Identity {
             };
             if ts.abs_diff(now_ms) > MAX_CLOCK_SKEW {
                 return Response::error("invalid subscription", 403);
+            }
+            if !storage_allowed()? {
+                return Response::error("sign in to this server to use it", 403);
             }
             match self.record_subscribe_signature(&sig, ts, now_ms).await? {
                 SubscribeRecordOutcome::Fresh => {}
@@ -270,6 +294,9 @@ impl Identity {
             let Ok(audience) = protocol::normalize_audience(&crate::subscribe_audience(raw)) else {
                 return Response::error("malformed subscription audience", 400);
             };
+            if !storage_allowed()? {
+                return Response::error("sign in to this server to use it", 403);
+            }
             if self.prune_and_count_pending(now_f64) >= MAX_PENDING_WEBSOCKETS {
                 return Response::error("too many pending connections", 429);
             }
@@ -404,4 +431,25 @@ fn read_ws_attachment(socket: &WebSocket) -> Option<WsAttachment> {
             expected_identity: None,
             expected_audience: None,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deployment_auth_header_requires_exactly_one() {
+        assert!(deployment_auth_header_satisfied(Some("1")));
+        for value in [None, Some("0"), Some("true"), Some("1 ")] {
+            assert!(!deployment_auth_header_satisfied(value));
+        }
+    }
+
+    #[test]
+    fn subscription_storage_requires_deployment_auth_or_core_tables() {
+        assert!(!allow_subscription_storage(false, false));
+        assert!(allow_subscription_storage(false, true));
+        assert!(allow_subscription_storage(true, false));
+        assert!(allow_subscription_storage(true, true));
+    }
 }

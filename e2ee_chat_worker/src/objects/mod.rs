@@ -17,8 +17,8 @@ use worker::{
 
 pub use attachment::{Attachment, DEFAULT_FILE_RETENTION_DAYS};
 pub use identity::{
-    HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE, HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS,
-    Identity,
+    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE,
+    HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS, Identity,
 };
 
 /// The binding of the identities' namespace.

@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS publish_watermarks (
 );
 ";
 
-/// A verified subscription can create this table independently of the identity's core tables.
+/// Tracks verified subscriptions. On a password-protected server, creating replay state before
+/// the identity has core tables requires a sign-in cookie.
 pub(super) const SCHEMA_SEEN_SUBSCRIBES: &str = "
 CREATE TABLE IF NOT EXISTS seen_subscribes (
     sig_hash TEXT PRIMARY KEY,

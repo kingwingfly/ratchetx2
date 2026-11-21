@@ -398,6 +398,22 @@ fn env_bool(env: &Env, name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+fn is_internal_subscribe_header(name: &str) -> bool {
+    [
+        objects::HEADER_DEPLOYMENT_AUTH,
+        objects::HEADER_PENDING_IDENTITY,
+        objects::HEADER_SUBSCRIBE_AUDIENCE,
+        objects::HEADER_SUBSCRIBE_SIG,
+        objects::HEADER_SUBSCRIBE_TS,
+    ]
+    .iter()
+    .any(|header| name.eq_ignore_ascii_case(header))
+}
+
+fn deployment_auth_satisfied(password_configured: bool, signed_in: bool) -> bool {
+    !password_configured || signed_in
+}
+
 /// Hand a WebSocket asking for an identity's notifications to its object.
 ///
 /// Supports BOTH:
@@ -428,17 +444,15 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
     // Clone incoming headers and strip any client-supplied internal auth headers.
     let forward_headers = Headers::new();
     for (name, value) in request.headers().entries() {
-        let lower = name.to_ascii_lowercase();
-        if lower == objects::HEADER_SUBSCRIBE_SIG
-            || lower == objects::HEADER_SUBSCRIBE_TS
-            || lower == objects::HEADER_PENDING_IDENTITY
-            || lower == objects::HEADER_SUBSCRIBE_AUDIENCE
-        {
-            continue;
+        if !is_internal_subscribe_header(&name) {
+            forward_headers.set(&name, &value)?;
         }
-        forward_headers.set(&name, &value)?;
     }
 
+    let deployment_authenticated = deployment_auth_satisfied(
+        auth::password_configured(env),
+        auth::signed_in(&request, env).is_some(),
+    );
     let identity_key = if let Some(encoded) = query_request {
         let subscription = BASE64_URL_SAFE_NO_PAD
             .decode(encoded.as_bytes())
@@ -458,6 +472,10 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
             Ok(key) => key,
             Err(e) => return Response::error(e.to_string(), 403),
         };
+        forward_headers.set(
+            objects::HEADER_DEPLOYMENT_AUTH,
+            if deployment_authenticated { "1" } else { "0" },
+        )?;
         forward_headers.set(objects::HEADER_SUBSCRIBE_SIG, &hex(&subscription.signature))?;
         forward_headers.set(
             objects::HEADER_SUBSCRIBE_TS,
@@ -468,7 +486,7 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         // Require a valid sign-in cookie before upgrading unauthenticated first-frame WS sockets
         // whenever server PASSWORD authentication is configured, preventing unauthenticated
         // third parties from exhausting an identity's pending WebSocket cap.
-        if auth::password_configured(env) && auth::signed_in(&request, env).is_none() {
+        if !deployment_authenticated {
             return Response::error("sign in to this server to use it", 403);
         }
         let Some(identity_key) = crate::decode_hex_fixed::<32>(&identity_hex) else {
@@ -477,6 +495,7 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         if XEdDSAPublicKey::new(&identity_key).is_err() {
             return Response::error("invalid identity key", 400);
         }
+        forward_headers.set(objects::HEADER_DEPLOYMENT_AUTH, "1")?;
         forward_headers.set(objects::HEADER_PENDING_IDENTITY, &hex(&identity_key))?;
         let audience = server_id(env, &request)?;
         forward_headers.set(objects::HEADER_SUBSCRIBE_AUDIENCE, &audience)?;
@@ -535,6 +554,31 @@ mod tests {
     use super::*;
     use worker::Url;
     use xeddsa::XEdDSAPrivateKey;
+
+    #[test]
+    fn internal_subscribe_headers_are_filtered_case_insensitively() {
+        for header in [
+            objects::HEADER_DEPLOYMENT_AUTH,
+            objects::HEADER_PENDING_IDENTITY,
+            objects::HEADER_SUBSCRIBE_AUDIENCE,
+            objects::HEADER_SUBSCRIBE_SIG,
+            objects::HEADER_SUBSCRIBE_TS,
+        ] {
+            assert!(is_internal_subscribe_header(header));
+            assert!(is_internal_subscribe_header(&header.to_ascii_uppercase()));
+        }
+        assert!(is_internal_subscribe_header("X-E2EE-Deployment-Auth"));
+        assert!(!is_internal_subscribe_header("upgrade"));
+        assert!(!is_internal_subscribe_header("cookie"));
+    }
+
+    #[test]
+    fn deployment_auth_requires_sign_in_when_a_password_is_configured() {
+        assert!(deployment_auth_satisfied(false, false));
+        assert!(deployment_auth_satisfied(false, true));
+        assert!(!deployment_auth_satisfied(true, false));
+        assert!(deployment_auth_satisfied(true, true));
+    }
 
     #[test]
     fn subscribe_verifies_only_the_signed_audience_and_version() {
