@@ -4326,4 +4326,199 @@ mod pq_e2e {
         assert!(received.is_empty());
         assert_eq!(fetches.load(Ordering::Relaxed), 8);
     }
+
+    #[tokio::test]
+    async fn v2_list_initial_messages_skips_zero_and_oversized_ids() {
+        use session::InitialMessageV2;
+
+        #[derive(Clone)]
+        struct ScriptedListHandshake {
+            inner: DualHandshake,
+            listed: Arc<std::sync::Mutex<Vec<protocol::handshake_v2::InitialMessageV2>>>,
+            acked: Arc<std::sync::Mutex<Vec<u64>>>,
+        }
+        impl LocalHandshake for ScriptedListHandshake {
+            async fn publish(&self, r: PublishRequest) -> protocol::Result<PublishResponse> {
+                self.inner.publish(r).await
+            }
+            async fn fetch_bundle(
+                &self,
+                r: FetchBundleRequest,
+            ) -> protocol::Result<FetchBundleResponse> {
+                self.inner.fetch_bundle(r).await
+            }
+            async fn send_initial_message(
+                &self,
+                r: SendInitialMessageRequest,
+            ) -> protocol::Result<SendInitialMessageResponse> {
+                self.inner.send_initial_message(r).await
+            }
+            async fn take_initial_messages(
+                &self,
+                r: TakeInitialMessagesRequest,
+            ) -> protocol::Result<TakeInitialMessagesResponse> {
+                self.inner.take_initial_messages(r).await
+            }
+        }
+        impl LocalHandshakeV2 for ScriptedListHandshake {
+            async fn get_server_info(
+                &self,
+                r: GetServerInfoRequest,
+            ) -> protocol::Result<GetServerInfoResponse> {
+                self.inner.get_server_info(r).await
+            }
+            async fn publish_v2(&self, r: PublishV2Request) -> protocol::Result<PublishV2Response> {
+                self.inner.publish_v2(r).await
+            }
+            async fn refill_prekeys(
+                &self,
+                r: RefillPrekeysRequest,
+            ) -> protocol::Result<RefillPrekeysResponse> {
+                self.inner.refill_prekeys(r).await
+            }
+            async fn get_manifest(
+                &self,
+                r: GetManifestRequest,
+            ) -> protocol::Result<GetManifestResponse> {
+                self.inner.get_manifest(r).await
+            }
+            async fn claim_bundle(
+                &self,
+                r: ClaimBundleRequest,
+            ) -> protocol::Result<ClaimBundleResponse> {
+                self.inner.claim_bundle(r).await
+            }
+            async fn send_initial_v2(
+                &self,
+                r: SendInitialV2Request,
+            ) -> protocol::Result<SendInitialV2Response> {
+                self.inner.send_initial_v2(r).await
+            }
+            async fn list_initial_messages(
+                &self,
+                _r: ListInitialMessagesRequest,
+            ) -> protocol::Result<ListInitialMessagesResponse> {
+                Ok(ListInitialMessagesResponse {
+                    messages: self.listed.lock().unwrap().clone(),
+                })
+            }
+            async fn ack_initial_messages(
+                &self,
+                r: AckInitialMessagesRequest,
+            ) -> protocol::Result<AckInitialMessagesResponse> {
+                self.acked.lock().unwrap().extend(r.ids.iter().copied());
+                Ok(AckInitialMessagesResponse {
+                    deleted: r.ids.len() as u32,
+                })
+            }
+        }
+
+        let store = SharedStore::default();
+        let inner = DualHandshake::new(store.clone(), AUDIENCE);
+        let mb = DualMailbox::new(store, AUDIENCE);
+        let listed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let acked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hs = ScriptedListHandshake {
+            inner: inner.clone(),
+            listed: listed.clone(),
+            acked: acked.clone(),
+        };
+
+        let mut alice = Client::new(inner.clone());
+        let mut carol = Client::new(inner.clone());
+        let mut dave = Client::new(inner.clone());
+        let mut bob = Client::new(hs);
+        bob.publish_v2(AUDIENCE, 4, 4).await.unwrap();
+
+        // Produce three real PQXDH wire initial messages for Bob.
+        let prep_zero = alice
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"zero-id",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let prep_oversized = carol
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"oversized-id",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let prep_valid = dave
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"valid-id",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+
+        let extract_wire = |req: session::OutgoingInitialMessage| match req {
+            session::OutgoingInitialMessage::V2(v2) => v2.message.expect("v2 initial message"),
+            session::OutgoingInitialMessage::V1(_) => panic!("expected v2 initial"),
+        };
+        let mut zero_id_wire = extract_wire(prep_zero.request);
+        zero_id_wire.id = 0;
+        let mut oversized_id_wire = extract_wire(prep_oversized.request);
+        oversized_id_wire.id = protocol::MAX_SAFE_INTEGER + 1;
+        let mut valid_id_wire = extract_wire(prep_valid.request);
+        valid_id_wire.id = 42;
+
+        // `InitialMessageV2::try_from` still accepts `id == 0` for carried/legacy v1 payloads.
+        let decoded_zero = InitialMessageV2::try_from(&zero_id_wire).unwrap();
+        assert_eq!(decoded_zero.id, 0);
+
+        let malformed_zero = protocol::handshake_v2::InitialMessageV2 {
+            id: 0,
+            version: 99,
+            ..Default::default()
+        };
+        let malformed_valid = protocol::handshake_v2::InitialMessageV2 {
+            id: 43,
+            version: 99,
+            ..Default::default()
+        };
+
+        *listed.lock().unwrap() = vec![
+            zero_id_wire,
+            malformed_zero,
+            oversized_id_wire,
+            valid_id_wire,
+            malformed_valid,
+        ];
+
+        // 1. `list_initial_messages_v2` skips `id == 0` and `id > MAX_SAFE_INTEGER` rows.
+        let page = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        assert!(!page.fell_back_to_v1);
+        assert_eq!(page.messages.len(), 1);
+        assert_eq!(page.messages[0].id, 42);
+        assert_eq!(page.messages[0].sender, dave.identity_key());
+        assert_eq!(page.malformed_ids, vec![43]);
+
+        // 2. `list_and_accept_v2` only accepts the valid-ID row, never consumes prekeys for
+        //    the `id == 0` row, and only acknowledges valid IDs (43 and 42).
+        let suite = PqConfig::default_suite();
+        let classical_before = bob.current_one_time_count();
+        let pq_before = bob.current_pq_one_time_count(suite);
+        let outcome = bob
+            .list_and_accept_v2(AUDIENCE, 10, mb, |_| PeerPqState::default())
+            .await
+            .unwrap();
+        assert!(outcome.ack_error.is_none());
+        assert!(outcome.unacked_ids.is_empty());
+        assert_eq!(outcome.outcomes.len(), 1);
+        assert_eq!(outcome.outcomes[0].0, dave.identity_key());
+        assert_eq!(bob.current_one_time_count(), classical_before - 1);
+        assert_eq!(bob.current_pq_one_time_count(suite), pq_before - 1);
+        assert_eq!(*acked.lock().unwrap(), vec![43, 42]);
+    }
 }

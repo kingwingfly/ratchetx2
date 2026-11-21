@@ -106,6 +106,8 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .badge { min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--accent-fill); color: var(--on-accent); font-size: 11px; font-weight: 600; text-align: center; }
 .avatar { width: 38px; height: 38px; border-radius: 50%; display: grid; place-items: center; background: var(--raised-strong); border: 1px solid var(--line-strong); color: var(--accent); font-family: var(--mono); font-size: 13px; text-transform: uppercase; }
 .chats-empty { margin: 16px 10px; color: var(--muted); font-size: 13px; }
+.isolated-banner { margin: 4px 2px 8px; padding: 9px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; border: 1px solid var(--danger-line); border-radius: 10px; background: var(--danger-bg); color: var(--danger); font-size: 12px; }
+.isolated-banner span { flex: 1; min-width: 0; }
 .sidebar-foot { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--line); }
 .whoami { flex: 1; min-width: 0; }
 .whoami strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; color: var(--text-bright); }
@@ -231,6 +233,12 @@ dialog::backdrop { background: #020706d9; backdrop-filter: blur(4px); }
 .settings-error { color: var(--danger); font-size: 12px; line-height: 1.45; overflow-wrap: anywhere; }
 .settings-note { margin: 0; padding: 8px 14px 12px; color: var(--muted); font-size: 12px; line-height: 1.45; border-top: 1px solid var(--line); }
 .settings-warn { margin: 0; padding: 8px 14px 10px; color: var(--warn); background: var(--warn-bg); font-size: 12px; line-height: 1.45; border-top: 1px solid var(--warn-line); }
+.settings-warn.isolated-intro { border-top: 0; border-radius: 9px 9px 0 0; }
+.isolated-row { padding: 12px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+.isolated-row-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+.isolated-confirm { padding: 10px 12px; border: 1px solid var(--danger-line); border-radius: 8px; background: var(--danger-bg); display: flex; flex-direction: column; gap: 8px; }
+.isolated-confirm p { margin: 0; color: var(--danger); font-size: 12px; line-height: 1.45; }
+.isolated-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .modal label.switch-row { margin-top: 0; padding: 12px 14px; display: flex; align-items: center; justify-content: space-between; gap: 14px; color: var(--text); font-size: 13px; cursor: pointer; transition: opacity .15s ease; }
 .modal label.switch-row + label.switch-row { border-top: 1px solid var(--line); }
 .modal label.switch-row.disabled { opacity: .48; cursor: default; }

@@ -44,6 +44,27 @@ pub(super) fn Sidebar() -> impl IntoView {
                 </div>
             </div>
             <nav class="chats">
+                <Show when=move || !ui.isolated_contacts.with(Vec::is_empty)>
+                    <div class="isolated-banner" role="alert">
+                        <span>
+                            {move || {
+                                let count = ui.isolated_contacts.with(Vec::len);
+                                if count == 1 {
+                                    "1 corrupt contact isolated.".to_string()
+                                } else {
+                                    format!("{count} corrupt contacts isolated.")
+                                }
+                            }}
+                        </span>
+                        <button
+                            type="button"
+                            class="btn small"
+                            on:click=move |_| ui.dialog.set(Some(Dialog::Settings))
+                        >
+                            "Review"
+                        </button>
+                    </div>
+                </Show>
                 <For
                     each=move || peers.get()
                     key=|peer| *peer

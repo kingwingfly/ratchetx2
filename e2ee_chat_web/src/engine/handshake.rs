@@ -711,6 +711,7 @@ impl Engine {
                 Ok(outcome) => {
                     inner.client.commit_publish_v2(prepared);
                     self.publish_waits_sign_in.set(false);
+                    self.publish_waits_settings.set(false);
                     inner.state.used_pq_one_time_prekeys = 0;
                     inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
                     let log_msg = match outcome {
@@ -768,6 +769,7 @@ impl Engine {
                 Ok(()) => {
                     inner.client.commit_publish(prepared);
                     self.publish_waits_sign_in.set(false);
+                    self.publish_waits_settings.set(false);
                     inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
                     inner
                         .save_full_publish_success()
@@ -799,20 +801,39 @@ impl Engine {
         if error.needs_sign_in() {
             self.publish_waits_sign_in.set(true);
         }
-        if error.rejects_settings()
-            && let Some(rollback) = &inner.state.pending_pq_rollback
-        {
-            match inner.client.set_pq_config(rollback.config()) {
-                Ok(()) => {
-                    inner.state.needs_publish = rollback.previous_needs_publish;
-                    inner.state.pending_pq_rollback = None;
-                    self.ui.me.set(Some(inner.me()));
-                    self.ui.log("The server refused the pending post-quantum settings. Restored the previous settings.");
+        if error.rejects_settings() {
+            if error.kind == Some(ErrorKind::PqRequired) {
+                inner.server_pq = ServerPqStatus::Disabled;
+                self.ui.me.set(Some(inner.me()));
+            }
+            if let Some(rollback) = &inner.state.pending_pq_rollback {
+                match inner.client.set_pq_config(rollback.config()) {
+                    Ok(()) => {
+                        inner.state.needs_publish = rollback.previous_needs_publish;
+                        inner.state.pending_pq_rollback = None;
+                        self.ui.me.set(Some(inner.me()));
+                        self.ui.log("The server refused the pending post-quantum settings. Restored the previous settings.");
+                    }
+                    Err(e) => {
+                        inner.state.needs_publish = false;
+                        self.publish_waits_settings.set(true);
+                        error.message.push_str(&format!(
+                            ". Could not restore previous settings: {}. Adjust post-quantum settings in Settings to retry.",
+                            describe(&e)
+                        ));
+                    }
                 }
-                Err(e) => error.message.push_str(&format!(
-                    ". Could not restore previous settings: {}",
-                    describe(&e)
-                )),
+            } else {
+                inner.state.needs_publish = false;
+                self.publish_waits_settings.set(true);
+                let guidance = "The server refused the current post-quantum settings; automatic prekey publishing is paused. Open Settings to adjust post-quantum settings and retry.";
+                self.ui.log(format!("{guidance} ({})", error.message));
+                if !now_anyway {
+                    self.ui.notify(guidance);
+                }
+                error
+                    .message
+                    .push_str(". Adjust post-quantum settings in Settings or retry manually.");
             }
         }
         if let Err(e) = inner.save_state().await {
@@ -926,8 +947,13 @@ impl Engine {
             || now().saturating_sub(inner.state.published_at) > REPUBLISH_AGE;
 
         if full_due {
-            if self.publish_waits_sign_in.get() && !now_anyway {
+            if (self.publish_waits_sign_in.get() || self.publish_waits_settings.get())
+                && !now_anyway
+            {
                 return Ok(());
+            }
+            if now_anyway {
+                self.publish_waits_settings.set(false);
             }
             return self
                 .publish_full(inner, now_anyway)
@@ -936,7 +962,7 @@ impl Engine {
         }
 
         // M-5: Non-rotating OPK/PQOPK refill (does NOT rotate SPK!).
-        if self.publish_waits_sign_in.get() {
+        if self.publish_waits_sign_in.get() || self.publish_waits_settings.get() {
             return Ok(());
         }
         let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;

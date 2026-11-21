@@ -70,6 +70,37 @@ pub(crate) const MAX_EXPIRED_PAGES: usize = 8;
 /// Maximum carried initial messages accumulated across expired envelopes or a stalled page.
 pub(crate) const MAX_CARRIED_INITIALS: usize = 64;
 
+/// Merge incoming delivery tokens into `existing`, deduplicating and retaining at most the
+/// [`MAX_STORED_DELIVERED`] most recent unique tokens in chronological order.
+fn merge_delivered(
+    existing: &mut Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
+    incoming: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
+) {
+    if incoming.is_empty() && existing.len() <= MAX_STORED_DELIVERED {
+        return;
+    }
+    let cap = existing
+        .len()
+        .saturating_add(incoming.len())
+        .min(MAX_STORED_DELIVERED);
+    let mut seen = std::collections::BTreeSet::new();
+    let mut merged = Vec::with_capacity(cap);
+    for token in incoming
+        .into_iter()
+        .rev()
+        .chain(existing.iter().copied().rev())
+    {
+        if seen.insert(token) {
+            merged.push(token);
+            if merged.len() == MAX_STORED_DELIVERED {
+                break;
+            }
+        }
+    }
+    merged.reverse();
+    *existing = merged;
+}
+
 /// An initial message from a peer who wants to start a session, with the session's first
 /// message; accept it with [`Client::accept`].
 #[derive(Debug, Clone, PartialEq)]
@@ -1911,7 +1942,7 @@ impl<M> Session<M> {
         state.stalled_through = state.stalled_through.max(new.stalled_through);
         state.skip_through = state.skip_through.max(new.skip_through);
         state.next_session_seq = state.next_session_seq.max(new.next_session_seq);
-        state.delivered.extend(new.delivered);
+        merge_delivered(&mut state.delivered, new.delivered);
         for earlier in new.others.into_iter().rev() {
             state.archive(earlier);
         }
@@ -2147,9 +2178,10 @@ impl<M: LocalMailbox> Session<M> {
                     .collect(),
             };
             let page = fetch(&self.mailbox, request).await?;
-            let receipts_fit = (delivered.len() - told)
+            let after_drain = delivered.len().saturating_sub(told);
+            let receipts_fit = after_drain
                 .checked_add(page.len())
-                .is_some_and(|n| n <= MAX_STORED_DELIVERED);
+                .is_some_and(|n| n <= MAX_STORED_DELIVERED || n < delivered.len());
             if page.len() > MAX_RECEIVE_PAGE as usize || !receipts_fit {
                 return Err(ErrorKind::Protocol.into());
             }
@@ -2486,11 +2518,10 @@ mod test {
             session.state.stalled_through = 7;
             session.mailbox.ignore_cursor = true;
             let token = [5; DELIVERY_TOKEN_LENGTH];
-            // With at most 100 new receipts and up to 1000 acknowledged, a state already
-            // within the 4096-token cap always fits. Merged sessions can start above it.
+            // Oversized pages (> MAX_RECEIVE_PAGE) and non-monotonic or out-of-range sequences
+            // must be rejected without mutating cursor, stall markers, or queued receipts.
             for (sequences, receipt_count) in [
                 ((6..=106).collect::<Vec<_>>(), MAX_STORED_DELIVERED),
-                (vec![6], MAX_STORED_DELIVERED + MAX_DELIVERED),
                 (vec![5], 1),
                 (vec![4], 1),
                 (vec![6, 6], 1),
@@ -2539,6 +2570,102 @@ mod test {
                 session.state.delivered.len(),
                 MAX_STORED_DELIVERED - MAX_DELIVERED + 1
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn merging_two_large_delivered_queues_deduplicates_caps_and_drains() {
+        let token = |n: u32| {
+            let mut out = [0u8; DELIVERY_TOKEN_LENGTH];
+            out[..4].copy_from_slice(&n.to_be_bytes());
+            out
+        };
+
+        // 1. Merging two disjoint 3,000-receipt sessions via `Session::keep` caps `delivered` to
+        //    `MAX_STORED_DELIVERED` (4,096), retaining the most recent tokens in order.
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, mut alice_session, mut bob, mut bob_session) =
+            talking(&handshake, &mailbox).await;
+        let mut newer = alice
+            .initiate(&bob.identity_key(), b"again", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        let initial = bob.take_initial_messages().await.unwrap();
+        let (mut bob_newer, _) = bob
+            .accept(
+                &alice.identity_key(),
+                &initial[0],
+                InProcessMailbox(&mailbox),
+            )
+            .unwrap();
+
+        bob_session.state.delivered = (0u32..3000).map(token).collect();
+        bob_newer.state.delivered = (3000u32..6000).map(token).collect();
+        bob_newer.keep(bob_session).unwrap();
+
+        let expected_start = 6000u32 - MAX_STORED_DELIVERED as u32;
+        assert_eq!(bob_newer.state.delivered.len(), MAX_STORED_DELIVERED);
+        assert_eq!(bob_newer.state.delivered[0], token(expected_start));
+        assert_eq!(*bob_newer.state.delivered.last().unwrap(), token(5999));
+        // Receiving on the merged session succeeds immediately and drains `MAX_DELIVERED`.
+        newer.send(b"after-merge").await.unwrap();
+        assert_eq!(
+            contents(bob_newer.receive().await.unwrap()),
+            [b"after-merge"]
+        );
+        assert_eq!(
+            bob_newer.state.delivered.len(),
+            MAX_STORED_DELIVERED - MAX_DELIVERED + 1
+        );
+        let _ = &mut alice_session;
+
+        // 2. Overlapping receipts are deduplicated before capping so unique tokens are preserved.
+        let mut existing: Vec<_> = (0u32..3000).map(token).collect();
+        let incoming: Vec<_> = (1500u32..4500).map(token).collect();
+        merge_delivered(&mut existing, incoming);
+        assert_eq!(existing.len(), MAX_STORED_DELIVERED);
+        assert_eq!(existing[0], token(4500 - MAX_STORED_DELIVERED as u32));
+        assert_eq!(*existing.last().unwrap(), token(4499));
+    }
+
+    #[tokio::test]
+    async fn over_capacity_delivered_queue_drains_without_wedging_receive() {
+        for version in MailboxVersion::ALL {
+            let (bob, mut session, message) = scripted_mailbox().await;
+            let token = [9u8; DELIVERY_TOKEN_LENGTH];
+            // Even if pre-existing `delivered` is far above `MAX_STORED_DELIVERED + MAX_DELIVERED`,
+            // receiving MUST drain `MAX_DELIVERED` per batch instead of wedging permanently.
+            let initial_len = MAX_STORED_DELIVERED + MAX_DELIVERED + 500;
+            session.state.delivered = vec![token; initial_len];
+            session.mailbox.page = vec![Envelope {
+                sequence: 1,
+                message: Some(message),
+                initial_message: None,
+            }];
+            assert_eq!(
+                contents(version.receive(&mut session, &bob).await.unwrap()),
+                [b"message"]
+            );
+            assert_eq!(
+                session.state.delivered.len(),
+                initial_len - MAX_DELIVERED + 1
+            );
+
+            // Subsequent empty fetches continue draining cleanly back below `MAX_STORED_DELIVERED`.
+            session.mailbox.page.clear();
+            while session.state.delivered.len() > MAX_STORED_DELIVERED {
+                let before = session.state.delivered.len();
+                assert!(
+                    version
+                        .receive(&mut session, &bob)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(session.state.delivered.len(), before - MAX_DELIVERED);
+            }
+            assert!(session.state.delivered.len() <= MAX_STORED_DELIVERED);
         }
     }
 

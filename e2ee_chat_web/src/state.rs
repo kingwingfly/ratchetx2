@@ -1,6 +1,8 @@
 //! What the page shows: plain data in signals, which the engine keeps up to date.
 
-use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
+#[cfg(target_arch = "wasm32")]
+use std::time::Duration;
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use leptos::prelude::*;
 use session::{PqConfig, PqSuite, PublicKey, SessionSecurity};
@@ -186,6 +188,27 @@ impl ContactView {
             ClassicalPrompt::InboundQuarantined { .. }
         )
     }
+}
+
+/// Summary of a corrupt contact record isolated on unlock, awaiting explicit user confirmation
+/// before permanent deletion (preserving any pinning state until confirmed).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IsolatedContactView {
+    /// Raw peer key bytes as stored in the vault (32 bytes for a valid key, or raw bytes if the
+    /// stored key itself was malformed).
+    pub raw_peer: Vec<u8>,
+    /// Valid 32-byte identity key when parseable.
+    pub peer: Option<PublicKey>,
+    /// Saved display name, if any.
+    pub name: String,
+    /// Display label including the saved name and/or short key.
+    pub label: String,
+    /// Why the stored record was isolated.
+    pub reason: String,
+    /// Whether the isolated session had post-quantum encryption pinned.
+    pub pq_pinned: bool,
+    /// Number of corrupt records grouped under `raw_peer`.
+    pub records: usize,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -638,7 +661,10 @@ impl SignInFlow {
         if still_needs_sign_in {
             return (false, None);
         }
-        let reopened = self.pending_new_chat.take().map(PendingNewChat::into_dialog);
+        let reopened = self
+            .pending_new_chat
+            .take()
+            .map(PendingNewChat::into_dialog);
         (false, reopened)
     }
 
@@ -648,7 +674,9 @@ impl SignInFlow {
     /// if a preserved invitation/draft should be restored immediately.
     pub fn on_dismiss_sign_in(&mut self) -> Option<Dialog> {
         self.declined_sign_in = true;
-        self.pending_new_chat.take().map(PendingNewChat::into_dialog)
+        self.pending_new_chat
+            .take()
+            .map(PendingNewChat::into_dialog)
     }
 
     /// Hint metadata for `SignInDialog`: `Some((auto_start, has_key))` when a `NewChat` draft is
@@ -723,6 +751,8 @@ pub struct Ui {
     pub gone: RwSignal<HashSet<(PublicKey, u64)>>,
     pub me: RwSignal<Option<Me>>,
     pub contacts: RwSignal<Vec<ContactView>>,
+    /// Corrupt contact records isolated on unlock, awaiting confirmed deletion.
+    pub isolated_contacts: RwSignal<Vec<IsolatedContactView>>,
     /// The chat on screen, if any.
     pub open: RwSignal<Option<PublicKey>>,
     /// The messages of the chat on screen.
@@ -762,6 +792,7 @@ impl Ui {
             gone: RwSignal::new(HashSet::new()),
             me: RwSignal::new(None),
             contacts: RwSignal::new(vec![]),
+            isolated_contacts: RwSignal::new(vec![]),
             open: RwSignal::new(None),
             messages: RwSignal::new(vec![]),
             log: RwSignal::new(vec![]),
@@ -777,15 +808,20 @@ impl Ui {
     pub fn notify(&self, text: impl Into<String>) {
         let id = now();
         self.notice.set(Some((id, text.into())));
-        let notice = self.notice;
-        set_timeout(
-            move || {
-                if notice.with_untracked(|notice| notice.as_ref().is_some_and(|(n, _)| *n == id)) {
-                    notice.set(None);
-                }
-            },
-            Duration::from_secs(6),
-        );
+        #[cfg(target_arch = "wasm32")]
+        {
+            let notice = self.notice;
+            set_timeout(
+                move || {
+                    if notice
+                        .with_untracked(|notice| notice.as_ref().is_some_and(|(n, _)| *n == id))
+                    {
+                        notice.set(None);
+                    }
+                },
+                Duration::from_secs(6),
+            );
+        }
     }
 
     /// Add `text` to the activity list.
@@ -988,8 +1024,14 @@ mod tests {
         );
 
         // Other dialogs (Identity, Settings, Contact, Files) are never hijacked by background refusals.
-        assert_eq!(flow.on_ask_sign_in(Some(&Dialog::Identity), true, true), None);
-        assert_eq!(flow.on_ask_sign_in(Some(&Dialog::Settings), true, true), None);
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Identity), true, true),
+            None
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Settings), true, true),
+            None
+        );
         // Cross-origin vaults never show SignInDialog.
         assert_eq!(flow.on_ask_sign_in(Some(&initial), false, true), None);
     }
@@ -1034,7 +1076,10 @@ mod tests {
         );
 
         // Explicit `start_chat` SignInRequired works even when `declined_sign_in == true`.
-        assert_eq!(flow.on_start_chat_sign_in_required(draft.clone()), Dialog::SignIn);
+        assert_eq!(
+            flow.on_start_chat_sign_in_required(draft.clone()),
+            Dialog::SignIn
+        );
         assert_eq!(flow.pending_new_chat_hint(), Some((true, true)));
 
         // Sign-in succeeds -> triggers AutoStartChat while keeping draft until start_chat ends.
@@ -1059,7 +1104,10 @@ mod tests {
         assert_eq!(flow.pending_new_chat_hint(), None);
 
         // Successful AutoStartChat closes SignInDialog and clears pending state.
-        assert_eq!(flow.on_start_chat_sign_in_required(draft.clone()), Dialog::SignIn);
+        assert_eq!(
+            flow.on_start_chat_sign_in_required(draft.clone()),
+            Dialog::SignIn
+        );
         assert_eq!(
             flow.on_sign_in_succeeded(),
             SignInSuccessAction::AutoStartChat(expected_auto)
@@ -1068,14 +1116,20 @@ mod tests {
         assert_eq!(flow.pending_new_chat_hint(), None);
 
         // Cancelling SignInDialog in Case B restores NewChat with invitation intact.
-        assert_eq!(flow.on_start_chat_sign_in_required(draft.clone()), Dialog::SignIn);
+        assert_eq!(
+            flow.on_start_chat_sign_in_required(draft.clone()),
+            Dialog::SignIn
+        );
         assert_eq!(flow.on_dismiss_sign_in(), Some(open_dialog));
         assert_eq!(flow.pending_new_chat_hint(), None);
 
         // If chat was already persisted and only sending greeting hit SignInRequired, pending
         // NewChat is cleared so signing in does not re-open NewChat.
         flow.begin_new_chat_submit(draft);
-        assert_eq!(flow.on_chat_created_greeting_needs_sign_in(), Dialog::SignIn);
+        assert_eq!(
+            flow.on_chat_created_greeting_needs_sign_in(),
+            Dialog::SignIn
+        );
         assert_eq!(flow.pending_new_chat_hint(), None);
         assert_eq!(flow.on_sign_in_succeeded(), SignInSuccessAction::Close);
     }

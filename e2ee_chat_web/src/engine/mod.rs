@@ -17,15 +17,16 @@ mod tests;
 use crate::content::{Deleted, Kind, stamp};
 use crate::glue::LockStatus;
 use crate::state::{
-    Body, ContactView, Dialog, Link, Me, MessageView, PendingNewChat, Phase, ServerPqStatus,
-    SignIn, SignInFlow, SignInSuccessAction, Ui, UnavailableReason, UploadState, order,
+    Body, ContactView, Dialog, IsolatedContactView, Link, Me, MessageView, PendingNewChat, Phase,
+    ServerPqStatus, SignIn, SignInFlow, SignInSuccessAction, Ui, UnavailableReason, UploadState,
+    order,
 };
 use crate::transport::{Connect, Fetch};
-use crate::util::{describe, js_error, key_to_url, size_u64, sleep};
+use crate::util::{describe, js_error, key_to_url, short, size_u64, sleep};
 use crate::vault::{AppState, ContactState, HistoryEntry, OutgoingRecord, Vault, history_key};
 use crate::{content, glue, transport};
 use attachments::upload_of;
-use contact::{Contact, forget_told, restore_contacts, stored_contacts};
+use contact::{Contact, forget_told, isolated_contact_views, restore_contacts, stored_contacts};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use futures::lock::Mutex;
@@ -188,6 +189,9 @@ pub struct Engine {
     /// Whether publishing the prekeys was refused for the sign-in: it waits for one, rather than
     /// tries every round.
     publish_waits_sign_in: Cell<bool>,
+    /// Whether publishing prekeys was definitively refused for the current settings with no
+    /// rollback snapshot: background publishing pauses until the user adjusts settings or retries.
+    publish_waits_settings: Cell<bool>,
 }
 
 /// SHA-256 digest of an attachment key, binding plaintext/file caches without storing raw keys as map keys.
@@ -284,6 +288,7 @@ impl Engine {
             sign_in_flow: RefCell::default(),
             new_chat_feedback: RefCell::default(),
             publish_waits_sign_in: Cell::default(),
+            publish_waits_settings: Cell::default(),
         });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
         let weak = Rc::downgrade(&engine);
@@ -702,13 +707,18 @@ impl Engine {
             inner.unsaved_state = true;
         }
         self.unlocked(inner).await;
-        let isolated = warnings.len();
+        let warning_count = warnings.len();
         for warning in warnings {
             self.ui.log(warning);
         }
+        let isolated = self.ui.isolated_contacts.with_untracked(Vec::len);
         if isolated > 0 {
             self.ui.notify(format!(
-                "Vault unlocked. Isolated {isolated} corrupt contact record(s)."
+                "Vault unlocked. Isolated {isolated} corrupt contact(s). Review in Settings."
+            ));
+        } else if warning_count > 0 {
+            self.ui.notify(format!(
+                "Vault unlocked. Ignored {warning_count} corrupt duplicate contact record(s)."
             ));
         }
         Ok(())
@@ -719,6 +729,7 @@ impl Engine {
         self.can_sign_in_here.set(can_sign_in_here);
         self.ui.me.set(Some(inner.me()));
         self.ui.contacts.set(inner.views());
+        self.ui.isolated_contacts.set(inner.isolated_views());
         // Uploads the page left: their files are gone with it.
         match inner.vault.uploads(None).await {
             Ok(uploads) => {
@@ -1035,6 +1046,7 @@ impl Engine {
         // Nor does what waited for a sign-in, which would otherwise hold up a chat started
         // again with the peer, or go to it.
         self.waits_sign_in.borrow_mut().remove(&peer);
+        let was_isolated = inner.is_isolated_peer(&peer);
         inner.contacts.retain(|contact| contact.peer != peer);
         inner.forget_isolated_peer(&peer);
         inner.contacts_dirty_late |= std::mem::take(&mut inner.unsaved_state);
@@ -1054,6 +1066,13 @@ impl Engine {
             self.ui.messages.set(vec![]);
         }
         self.ui.contacts.set(inner.views());
+        self.ui.isolated_contacts.set(inner.isolated_views());
+        if was_isolated {
+            self.ui.log(format!(
+                "deleted isolated corrupt contact record for {}",
+                short(&peer)
+            ));
+        }
         // What the server has of the uploads that never can finish now goes, so that the peer
         // does not wait for the rest; with their upload tokens, which name nobody.
         if !unfinished.is_empty() {
@@ -1069,6 +1088,30 @@ impl Engine {
                 }
             });
         }
+        Ok(())
+    }
+
+    /// Permanently delete an isolated corrupt contact record (and any local history/outbox under
+    /// that peer key) after explicit user confirmation. Refuses to delete an active healthy chat.
+    pub async fn delete_isolated(&self, raw_peer: Vec<u8>) -> Result<(), String> {
+        if let Ok(peer) = PublicKey::try_from(raw_peer.as_slice()) {
+            {
+                let guard = self.inner.lock().await;
+                let inner = guard.as_ref().ok_or("locked")?;
+                if !inner.is_isolated_peer(&peer) {
+                    return Err("That contact is no longer isolated.".to_string());
+                }
+            }
+            return self.delete(peer).await;
+        }
+        let mut guard = self.inner.lock().await;
+        let inner = guard.as_mut().ok_or("locked")?;
+        if !inner.delete_isolated_raw(&raw_peer).await? {
+            return Err("That isolated contact record was already removed.".to_string());
+        }
+        self.ui.isolated_contacts.set(inner.isolated_views());
+        self.ui
+            .log("deleted isolated contact record with a malformed identity key");
         Ok(())
     }
 
@@ -1139,15 +1182,17 @@ impl<V: HistoryStore> Inner<V> {
         state: AppState,
         client: Client<Connect>,
         contacts: Vec<Contact>,
-        isolated_contacts: Vec<ContactState>,
+        mut isolated_contacts: Vec<ContactState>,
     ) -> Self {
-        let mut isolated_peers: HashSet<_> = isolated_contacts
+        let active_peers: HashSet<_> = contacts.iter().map(|c| c.peer).collect();
+        isolated_contacts.retain(|c| {
+            PublicKey::try_from(c.peer.as_slice())
+                .map_or(true, |peer| !active_peers.contains(&peer))
+        });
+        let isolated_peers: HashSet<_> = isolated_contacts
             .iter()
             .filter_map(|c| PublicKey::try_from(c.peer.as_slice()).ok())
             .collect();
-        for contact in &contacts {
-            isolated_peers.remove(&contact.peer);
-        }
         Self {
             vault,
             server,
@@ -1249,6 +1294,25 @@ impl<V: HistoryStore> Inner<V> {
     fn forget_isolated_peer(&mut self, peer: &PublicKey) {
         self.isolated_contacts.retain(|c| c.peer != peer.as_slice());
         self.isolated_peers.remove(peer);
+    }
+
+    /// Remove and persist deletion of an isolated record with a non-32-byte malformed peer key.
+    async fn delete_isolated_raw(&mut self, raw_peer: &[u8]) -> Result<bool, String> {
+        let saved = self.isolated_contacts.clone();
+        self.isolated_contacts.retain(|c| c.peer != raw_peer);
+        if self.isolated_contacts.len() == saved.len() {
+            return Ok(false);
+        }
+        if let Err(e) = self.save(&[]).await {
+            self.isolated_contacts = saved;
+            return Err(describe(&e));
+        }
+        Ok(true)
+    }
+
+    /// Summaries of genuinely isolated corrupt contact records for the UI.
+    fn isolated_views(&self) -> Vec<IsolatedContactView> {
+        isolated_contact_views(&self.isolated_contacts, &self.client.identity_key())
     }
 
     /// Undo the changes to the contact `peer` since `snapshot`, after saving them failed, so

@@ -1802,13 +1802,12 @@ mod v2 {
                     let mut messages = Vec::with_capacity(response.messages.len());
                     let mut malformed_ids = vec![];
                     for wire in &response.messages {
-                        if wire.id > protocol::MAX_SAFE_INTEGER {
+                        if wire.id == 0 || wire.id > protocol::MAX_SAFE_INTEGER {
                             continue;
                         }
                         match InitialMessageV2::try_from(wire) {
                             Ok(msg) => messages.push(msg),
-                            Err(_) if wire.id != 0 => malformed_ids.push(wire.id),
-                            Err(_) => {}
+                            Err(_) => malformed_ids.push(wire.id),
                         }
                     }
                     Ok(ListedInitialMessages {
@@ -1862,12 +1861,15 @@ mod v2 {
             ack_ids.retain(|&id| can_ack(id));
             let mut outcomes = Vec::with_capacity(listed.messages.len());
             for msg in &listed.messages {
+                if !listed.fell_back_to_v1 && !can_ack(msg.id) {
+                    continue;
+                }
                 let peer_state = peer_state_for(&msg.sender);
                 // `accept_initial_v2` is purely local with no transient errors: always acknowledge
                 // every processed inbox ID so permanent failures (e.g. canonical low-order sender
                 // `InvalidKeys`, `UnsupportedSuite`, `InvalidInitialMessage`, `PqRequired`,
                 // `DowngradeDetected`, etc.) cannot permanently DoS the inbox.
-                if can_ack(msg.id) {
+                if !listed.fell_back_to_v1 {
                     ack_ids.push(msg.id);
                 }
                 if let Ok(outcome) =

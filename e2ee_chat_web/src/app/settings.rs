@@ -82,8 +82,9 @@ pub(super) fn Settings() -> impl IntoView {
     let strict_pq = RwSignal::new(pq_compiled && initial_pq.pq_enabled && initial_pq.strict_pq);
     let advanced_open = pq_compiled && (initial_pq.strict_pq || !initial_pq.pq_ratchet_enabled);
     let server_pq_disabled = Signal::derive(move || server_pq_disabled(ui));
-    // Saving settings or signing out, which its buttons wait for.
+    // Saving settings, signing out, or deleting an isolated contact, which buttons wait for.
     let busy = RwSignal::new(false);
+    let confirm_isolated = RwSignal::new(None::<Vec<u8>>);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         if !pq_compiled {
@@ -336,6 +337,110 @@ pub(super) fn Settings() -> impl IntoView {
                 </div>
                 <div class="settings-card">{server_row}</div>
             </section>
+            <Show when=move || !ui.isolated_contacts.with(Vec::is_empty)>
+                <section class="settings-section">
+                    <div class="settings-section-head">
+                        <h3>"Isolated contacts"</h3>
+                        <span class="sec-badge danger">"Corrupt record"</span>
+                    </div>
+                    <div class="settings-card">
+                        <p class="settings-warn isolated-intro">
+                            "Corrupt contact records stay isolated so post-quantum pinning and \
+                             local history are never silently discarded. Delete an isolated record \
+                             to permanently clear it and allow starting a new chat with that peer."
+                        </p>
+                        <For
+                            each=move || ui.isolated_contacts.get()
+                            key=|item| (item.raw_peer.clone(), item.records, item.pq_pinned)
+                            children=move |item| {
+                                let raw_peer = StoredValue::new(item.raw_peer);
+                                let label = StoredValue::new(item.label);
+                                let pq_pinned = item.pq_pinned;
+                                let detail = if item.records > 1 {
+                                    format!("{} ({} corrupt records)", item.reason, item.records)
+                                } else {
+                                    item.reason
+                                };
+                                let asking = Signal::derive(move || {
+                                    confirm_isolated.with(|pending| {
+                                        pending.as_ref().is_some_and(|p| raw_peer.with_value(|r| p == r))
+                                    })
+                                });
+                                view! {
+                                    <div class="isolated-row">
+                                        <div class="isolated-row-head">
+                                            <div class="settings-copy">
+                                                <strong>{label.get_value()}</strong>
+                                                <small>{detail}</small>
+                                            </div>
+                                            <Show when=move || !asking.get()>
+                                                <button
+                                                    type="button"
+                                                    class="btn danger small"
+                                                    disabled=move || busy.get()
+                                                    on:click=move |_| {
+                                                        confirm_isolated.set(Some(raw_peer.get_value()));
+                                                    }
+                                                >
+                                                    "Delete…"
+                                                </button>
+                                            </Show>
+                                        </div>
+                                        {pq_pinned.then(|| {
+                                            view! {
+                                                <span class="sec-meta">
+                                                    "Post-quantum encryption was pinned for this peer."
+                                                </span>
+                                            }
+                                        })}
+                                        <Show when=move || asking.get()>
+                                            <div class="isolated-confirm" role="alert">
+                                                <p>
+                                                    {if pq_pinned {
+                                                        "Permanently delete this isolated contact, its local history, and its post-quantum pin?"
+                                                    } else {
+                                                        "Permanently delete this isolated contact and its local history?"
+                                                    }}
+                                                </p>
+                                                <div class="isolated-actions">
+                                                    <button
+                                                        type="button"
+                                                        class="btn small"
+                                                        disabled=move || busy.get()
+                                                        on:click=move |_| confirm_isolated.set(None)
+                                                    >
+                                                        "Keep"
+                                                    </button>
+                                                    <button
+                                                        type="button"
+                                                        class="btn danger small"
+                                                        disabled=move || busy.get()
+                                                        on:click=move |_| {
+                                                            let engine = engine();
+                                                            let peer_bytes = raw_peer.get_value();
+                                                            let name = label.get_value();
+                                                            act_while(busy, async move {
+                                                                engine.delete_isolated(peer_bytes).await?;
+                                                                confirm_isolated.try_set(None);
+                                                                engine.ui().notify(format!(
+                                                                    "Deleted isolated contact {name}."
+                                                                ));
+                                                                Ok(())
+                                                            });
+                                                        }
+                                                    >
+                                                        "Confirm delete"
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        </Show>
+                                    </div>
+                                }
+                            }
+                        />
+                    </div>
+                </section>
+            </Show>
             <div class="actions">
                 {if pq_compiled {
                     view! {

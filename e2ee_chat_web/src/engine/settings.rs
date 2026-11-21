@@ -35,7 +35,10 @@ impl Engine {
         {
             let guard = self.inner.lock().await;
             let inner = guard.as_ref().ok_or("locked")?;
-            if *inner.client.pq_config() == config && !inner.state.needs_publish {
+            if *inner.client.pq_config() == config
+                && !inner.state.needs_publish
+                && !self.publish_waits_settings.get()
+            {
                 return Ok(PqSaveOutcome::Unchanged);
             }
         }
@@ -46,10 +49,14 @@ impl Engine {
 
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        if *inner.client.pq_config() == config && !inner.state.needs_publish {
+        if *inner.client.pq_config() == config
+            && !inner.state.needs_publish
+            && !self.publish_waits_settings.get()
+        {
             return Ok(PqSaveOutcome::Unchanged);
         }
         inner.save_pq_config(config).await?;
+        self.publish_waits_settings.set(false);
         self.ui.me.set(Some(inner.me()));
 
         // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.

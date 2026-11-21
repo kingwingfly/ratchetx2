@@ -3,8 +3,8 @@
 use super::EVENTS_KEPT;
 use crate::content::{Content, Events, Kind};
 use crate::state::{
-    Attachment, Body, ClassicalPrompt, ContactView, Delivery, LocalFile, MessageView, RemoteFile,
-    SecurityAlert, SecurityView, Step,
+    Attachment, Body, ClassicalPrompt, ContactView, Delivery, IsolatedContactView, LocalFile,
+    MessageView, RemoteFile, SecurityAlert, SecurityView, Step,
 };
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, now, short};
@@ -439,8 +439,24 @@ fn validate_history(state: &ContactState) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn validate_contact_state(
+    state: &ContactState,
+    me: &PublicKey,
+) -> Result<(PublicKey, SessionState), String> {
+    let peer = PublicKey::try_from(state.peer.as_slice())
+        .map_err(|_| "malformed identity key".to_string())?;
+    validate_history(state)?;
+    let raw_session = state.session.as_ref().ok_or("missing session")?;
+    let session = SessionState::try_from(raw_session).map_err(|e| describe(&e))?;
+    if session.peer() != &peer || raw_session.me != me.as_slice() {
+        return Err("session identities do not match the contact and vault".into());
+    }
+    Ok((peer, session))
+}
+
 /// Restore each contact independently. Validate from borrowed fields so every failure retains
-/// the original session, including its pinning state.
+/// the original session, including its pinning state. An earlier corrupt record never hides a
+/// later healthy valid contact for the same `peer`.
 pub(super) fn restore_contacts(
     raw: Vec<ContactState>,
     me: &PublicKey,
@@ -449,24 +465,19 @@ pub(super) fn restore_contacts(
     let mut contacts = Vec::new();
     let mut isolated = Vec::new();
     let mut warnings = Vec::new();
-    let mut seen = HashSet::new();
+    let mut active_peers = HashSet::new();
     for mut state in raw {
         let peer = PublicKey::try_from(state.peer.as_slice());
         let restored: Result<_, String> = (|| {
             let peer = peer.map_err(|_| "malformed identity key".to_string())?;
-            if !seen.insert(peer) {
+            if active_peers.contains(&peer) {
                 return Err("duplicate identity key".into());
             }
-            validate_history(&state)?;
-            let raw_session = state.session.as_ref().ok_or("missing session")?;
-            let session = SessionState::try_from(raw_session).map_err(|e| describe(&e))?;
-            if session.peer() != &peer || raw_session.me != me.as_slice() {
-                return Err("session identities do not match the contact and vault".into());
-            }
-            Ok((peer, session))
+            validate_contact_state(&state, me)
         })();
         match restored {
             Ok((peer, session)) => {
+                active_peers.insert(peer);
                 state.session = None;
                 contacts.push(Contact {
                     peer,
@@ -486,6 +497,54 @@ pub(super) fn restore_contacts(
         }
     }
     (contacts, isolated, warnings)
+}
+
+/// Summarize genuinely isolated corrupt contact records for UI inspection and confirmed deletion.
+pub(super) fn isolated_contact_views(
+    isolated: &[ContactState],
+    me: &PublicKey,
+) -> Vec<IsolatedContactView> {
+    let mut views: Vec<IsolatedContactView> = Vec::new();
+    for state in isolated {
+        let peer = PublicKey::try_from(state.peer.as_slice()).ok();
+        let pq_pinned = state
+            .session
+            .as_ref()
+            .and_then(|s| s.peer_pq.as_ref())
+            .is_some_and(|pq| pq.pq_pinned);
+        let reason = validate_contact_state(state, me)
+            .err()
+            .unwrap_or_else(|| "corrupt contact record".to_string());
+        if let Some(existing) = views.iter_mut().find(|v| v.raw_peer == state.peer) {
+            existing.pq_pinned |= pq_pinned;
+            existing.records += 1;
+            if existing.name.is_empty() && !state.name.trim().is_empty() {
+                existing.name = state.name.trim().to_string();
+                existing.label = match existing.peer {
+                    Some(key) => format!("{} ({})", existing.name, short(&key)),
+                    None => format!("{} (invalid key)", existing.name),
+                };
+            }
+            continue;
+        }
+        let name = state.name.trim().to_string();
+        let label = match (name.as_str(), peer) {
+            ("", Some(key)) => short(&key),
+            (name, Some(key)) => format!("{name} ({})", short(&key)),
+            ("", None) => "Corrupt contact (invalid key)".to_string(),
+            (name, None) => format!("{name} (invalid key)"),
+        };
+        views.push(IsolatedContactView {
+            raw_peer: state.peer.clone(),
+            peer,
+            name,
+            label,
+            reason,
+            pq_pinned,
+            records: 1,
+        });
+    }
+    views
 }
 
 pub(super) fn stored_contacts(active: &[Contact], isolated: &[ContactState]) -> Vec<ContactState> {

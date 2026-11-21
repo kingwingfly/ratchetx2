@@ -654,12 +654,22 @@ fn isolated_peer_blocks_both_handshake_directions_until_forgotten() {
         let engine = Engine::new(Ui::new());
         let mut client = Client::new(Fetch::client(TEST_SERVER));
         let (peer, message) = carried_initial(&mut client).await;
-        let duplicate = stored_contact(client.identity_key(), peer);
-        let mut corrupt = duplicate.clone();
+        let mut corrupt = stored_contact(client.identity_key(), peer);
+        corrupt.name = "Pinned Peer".into();
         corrupt.session.as_mut().unwrap().cursor = u64::MAX;
-        let original = vec![corrupt, duplicate];
+        let missing_session = ContactState {
+            peer: peer.to_vec(),
+            ..Default::default()
+        };
+        let original = vec![corrupt, missing_session];
         let mut inner = load_contacts(&client, original.clone());
         assert!(inner.is_isolated_peer(&peer));
+        let views = inner.isolated_views();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].peer, Some(peer));
+        assert!(views[0].label.contains("Pinned Peer") && views[0].label.contains(&short(&peer)));
+        assert!(views[0].pq_pinned);
+        assert_eq!(views[0].records, 2);
         assert!(
             matches!(inner.check_outgoing_peer(&peer), Err(super::StartChatError::Other(reason)) if reason.contains("isolated"))
         );
@@ -689,6 +699,7 @@ fn isolated_peer_blocks_both_handshake_directions_until_forgotten() {
         inner.save(&[]).await.unwrap();
         let mut inner = reload(inner.vault);
         assert!(inner.is_isolated_peer(&peer));
+        assert_eq!(inner.isolated_views().len(), 1);
         assert!(
             inner.isolated_contacts[0]
                 .session
@@ -702,6 +713,7 @@ fn isolated_peer_blocks_both_handshake_directions_until_forgotten() {
 
         inner.forget_isolated_peer(&peer);
         assert!(inner.isolated_contacts.is_empty());
+        assert!(inner.isolated_views().is_empty());
         assert!(inner.check_outgoing_peer(&peer).is_ok());
         engine.process_initial(
             &mut inner,
@@ -713,6 +725,95 @@ fn isolated_peer_blocks_both_handshake_directions_until_forgotten() {
         assert_eq!(inner.contacts.len(), 1);
         assert_eq!(inner.contacts[0].state.history_len, 1);
         assert_eq!(inner.state.used_one_time_prekeys, 1);
+    });
+}
+
+#[test]
+fn corrupt_duplicate_before_healthy_row_keeps_healthy_contact_active() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let mut client = Client::new(Fetch::client(TEST_SERVER));
+        let (peer, message) = carried_initial(&mut client).await;
+        let mut healthy = stored_contact(client.identity_key(), peer);
+        healthy.name = "Alice".into();
+        healthy.history_len = 5;
+        let mut corrupt = healthy.clone();
+        corrupt.name = "Corrupt Duplicate".into();
+        corrupt.session.as_mut().unwrap().cursor = u64::MAX;
+
+        // Direct restore_contacts check: [corrupt_row(peer), healthy_row(peer)] keeps healthy active.
+        let (contacts, isolated, warnings) = restore_contacts(
+            vec![corrupt.clone(), healthy.clone()],
+            &client.identity_key(),
+            TEST_SERVER,
+        );
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].peer, peer);
+        assert_eq!(contacts[0].state.name, "Alice");
+        assert_eq!(contacts[0].state.history_len, 5);
+        assert!(contacts[0].session.peer_pq_state().pq_pinned);
+        assert_eq!(isolated, vec![corrupt.clone()]);
+        assert_eq!(warnings.len(), 1);
+
+        // Full Inner load drops the superseded corrupt duplicate without isolating `peer`.
+        let mut inner = load_contacts(&client, vec![corrupt, healthy]);
+        assert!(!inner.is_isolated_peer(&peer));
+        assert!(inner.isolated_contacts.is_empty());
+        assert!(inner.isolated_views().is_empty());
+        assert_eq!(inner.contacts.len(), 1);
+        assert_eq!(inner.contacts[0].state.name, "Alice");
+        assert_eq!(inner.contacts[0].state.history_len, 5);
+        assert!(inner.contacts[0].session.peer_pq_state().pq_pinned);
+        assert!(inner.check_outgoing_peer(&peer).is_ok());
+
+        // Saving and reloading retains only the healthy contact and keeps it usable.
+        inner.save(&[]).await.unwrap();
+        let mut inner = reload(inner.vault);
+        assert!(!inner.is_isolated_peer(&peer));
+        assert!(inner.isolated_contacts.is_empty());
+        assert_eq!(inner.contacts.len(), 1);
+        assert_eq!(inner.contacts[0].state.name, "Alice");
+        assert_eq!(inner.contacts[0].state.history_len, 5);
+        let mut batch = InitialBatch::default();
+        engine.process_initial(&mut inner, &peer, &message, false, &mut batch);
+        assert_eq!(inner.contacts[0].state.name, "Alice");
+        assert!(inner.contacts[0].session.peer_pq_state().pq_pinned);
+    });
+}
+
+#[test]
+fn delete_isolated_raw_removes_malformed_key_record_atomically() {
+    futures::executor::block_on(async {
+        let client = Client::new(Fetch::client(TEST_SERVER));
+        let me = client.identity_key();
+        let valid_peer = identity();
+        let mut valid_corrupt = stored_contact(me, valid_peer);
+        valid_corrupt.session.as_mut().unwrap().cursor = u64::MAX;
+        let mut bad_key = stored_contact(me, identity());
+        bad_key.peer.pop();
+        bad_key.name = "broken tablet".into();
+        let bad_bytes = bad_key.peer.clone();
+
+        let mut inner = load_contacts(&client, vec![bad_key.clone(), valid_corrupt.clone()]);
+        let views = inner.isolated_views();
+        assert_eq!(views.len(), 2);
+        assert!(views[0].peer.is_none());
+        assert!(views[0].label.contains("broken tablet"));
+        assert_eq!(views[1].peer, Some(valid_peer));
+
+        // Failed save rolls back in-memory removal cleanly.
+        inner.vault.fail_save.set(true);
+        assert!(inner.delete_isolated_raw(&bad_bytes).await.is_err());
+        assert_eq!(inner.isolated_contacts.len(), 2);
+
+        // Successful save removes only the malformed-key record and preserves the other peer.
+        inner.vault.fail_save.set(false);
+        assert_eq!(inner.delete_isolated_raw(&bad_bytes).await, Ok(true));
+        assert_eq!(inner.delete_isolated_raw(&bad_bytes).await, Ok(false));
+        let reloaded = reload(inner.vault);
+        assert_eq!(reloaded.isolated_contacts, vec![valid_corrupt]);
+        assert!(reloaded.is_isolated_peer(&valid_peer));
+        assert_eq!(reloaded.isolated_views().len(), 1);
     });
 }
 
@@ -1593,5 +1694,85 @@ fn a_later_save_commits_staged_history_outbox_and_inbox_ids_together() {
         assert_eq!(inner.vault.state.borrow().pending_inbox_acks, [9]);
         assert!(!inner.needs_save() && inner.contacts_dirty_late);
         assert_eq!(inner.saved_late, [peer]);
+    });
+}
+
+#[test]
+fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
+    futures::executor::block_on(async {
+        // 1. Upgraded vault already has `needs_publish = true` with `pending_pq_rollback = None`.
+        let engine = Engine::new(Ui::new());
+        let (mut inner, _) = unlocked_client();
+        inner.state.published_at = 1_700_000_000_000;
+        inner.state.needs_publish = true;
+        inner.state.pending_pq_rollback = None;
+        inner.save(&[]).await.unwrap();
+
+        let refusal = PublishError::transmitted(
+            protocol::Error::from(protocol::ErrorKind::Malformed).into(),
+            true,
+        );
+        let err = engine
+            .finish_publish_rollback(&mut inner, refusal, false)
+            .await
+            .unwrap_err();
+        assert!(err.rejects_settings());
+        assert!(err.message.contains("Settings"));
+        assert!(!inner.state.needs_publish);
+        assert!(engine.publish_waits_settings.get());
+        assert!(
+            engine
+                .ui
+                .log
+                .get_untracked()
+                .iter()
+                .any(|(_, line)| line.contains("Settings") && line.contains("paused"))
+        );
+        assert!(
+            engine
+                .ui
+                .notice
+                .get_untracked()
+                .is_some_and(|(_, text)| text.contains("Settings"))
+        );
+
+        // Cleared `needs_publish = false` persists cleanly across reload.
+        let mut reloaded = reload(inner.vault);
+        assert!(!reloaded.state.needs_publish);
+        assert!(reloaded.state.pending_pq_rollback.is_none());
+
+        // 2. Strict PQ refusal (`PqRequired`) without rollback also marks server PQ disabled and
+        //    survives a transient vault save failure.
+        reloaded.state.needs_publish = true;
+        reloaded.save(&[]).await.unwrap();
+        reloaded.vault.fail_save.set(true);
+        let engine2 = Engine::new(Ui::new());
+        let strict_refusal = PublishError::transmitted(ErrorKind::PqRequired.into(), true);
+        let err = engine2
+            .finish_publish_rollback(&mut reloaded, strict_refusal, true)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("Settings") && err.message.contains("will retry"));
+        assert!(!reloaded.state.needs_publish);
+        assert!(reloaded.unsaved_state);
+        assert!(engine2.publish_waits_settings.get());
+        assert_eq!(reloaded.server_pq, ServerPqStatus::Disabled);
+        assert_eq!(
+            engine2.ui.me.get_untracked().unwrap().server_pq,
+            ServerPqStatus::Disabled
+        );
+        // Persisting after storage recovers commits `needs_publish = false`.
+        reloaded.vault.fail_save.set(false);
+        reloaded.save(&[]).await.unwrap();
+        assert!(!reloaded.vault.state.borrow().needs_publish);
+
+        // Adjusting settings re-enables publishing cleanly.
+        let adjusted = PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..reloaded.client.pq_config().clone()
+        };
+        reloaded.save_pq_config(adjusted).await.unwrap();
+        assert!(reloaded.state.needs_publish);
     });
 }
