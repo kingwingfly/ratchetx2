@@ -48,7 +48,7 @@ SESSION_DAYS = "30"
 #   routes/storage and advertises pq_enabled: false / x-e2ee-pq: 0 for classical-only operation.
 # - LEGACY_V1: "true" keeps legacy handshake.v1/mailbox.v1 routes enabled for archived TUI clients.
 # - ALLOW_UNSIGNED_FETCH: "true" permits legacy unsigned mailbox.v1 Fetch during transition.
-# Optional SERVER_ID sets the canonical audience string (defaults to the request URL host).
+# Optional SERVER_ID sets the canonical audience string as host[:port] (defaults to the request URL host[:port]).
 PQ_ENABLED = "true"
 LEGACY_V1 = "true"
 ALLOW_UNSIGNED_FETCH = "true"

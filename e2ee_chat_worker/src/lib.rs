@@ -76,35 +76,51 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
     }
 
     let path = request.path();
+    // Answer CORS preflights before procedure lookup so cross-origin clients cleanly decode v2->v1
+    // fallback errors (e.g. `Unimplemented` / `404`) even when compiled without `feature = "pq"`.
+    if request.method() == Method::Options {
+        return with_cors(Response::empty()?, pq_enabled);
+    }
+
     let route = Procedure::from_path(&path).map(Route::V1);
     #[cfg(feature = "pq")]
     let route = route.or_else(|| ProcedureV2::from_path(&path).map(Route::V2));
-    let Some(route) = route else {
-        return Response::error("not found", 404);
-    };
-
-    let response = match request.method() {
-        // A CORS preflight, which the headers below answer.
-        Method::Options => Response::empty()?,
-        Method::Post => match route {
-            Route::V1(procedure) => call_v1(request, &env, procedure).await?,
-            #[cfg(feature = "pq")]
-            Route::V2(procedure) => call_v2(request, &env, procedure).await?,
+    let response = match route {
+        Some(route) => match request.method() {
+            Method::Post => match route {
+                Route::V1(procedure) => call_v1(request, &env, procedure).await?,
+                #[cfg(feature = "pq")]
+                Route::V2(procedure) => call_v2(request, &env, procedure).await?,
+            },
+            _ => {
+                let headers = Headers::new();
+                headers.set("allow", "POST, OPTIONS")?;
+                Response::error("method not allowed", 405)?.with_headers(headers)
+            }
         },
-        _ => {
-            let headers = Headers::new();
-            headers.set("allow", "POST, OPTIONS")?;
-            Response::error("method not allowed", 405)?.with_headers(headers)
+        None => {
+            #[cfg(not(feature = "pq"))]
+            if is_v2_path(&path) {
+                if request.method() != Method::Post {
+                    let headers = Headers::new();
+                    headers.set("allow", "POST, OPTIONS")?;
+                    Response::error("method not allowed", 405)?.with_headers(headers)
+                } else {
+                    respond(connect::error(
+                        ErrorKind::Unimplemented,
+                        "post-quantum v2 routes are not enabled on this server",
+                    ))?
+                }
+            } else {
+                Response::error("not found", 404)?
+            }
+            #[cfg(feature = "pq")]
+            {
+                Response::error("not found", 404)?
+            }
         }
     };
-    with_metadata(response, pq_enabled)?.with_cors(
-        &Cors::new()
-            .with_origins(["*"])
-            .with_methods([Method::Post, Method::Options])
-            .with_allowed_headers(["content-type", PROTOCOL_VERSION_HEADER])
-            .with_exposed_headers(["date", PQ_HEADER])
-            .with_max_age(86400),
-    )
+    with_cors(response, pq_enabled)
 }
 
 async fn call_v1(mut request: Request, env: &Env, procedure: Procedure) -> Result<Response> {
@@ -115,10 +131,11 @@ async fn call_v1(mut request: Request, env: &Env, procedure: Procedure) -> Resul
         ));
     }
     if procedure == Procedure::Fetch && !allow_unsigned_fetch(env) {
-        return respond(connect::error(
-            ErrorKind::InvalidSignature,
-            "unsigned mailbox fetch is disabled; use mailbox.v2 FetchSigned",
-        ));
+        #[cfg(feature = "pq")]
+        let message = "unsigned mailbox fetch is disabled; use mailbox.v2 FetchSigned";
+        #[cfg(not(feature = "pq"))]
+        let message = "unsigned mailbox fetch is disabled";
+        return respond(connect::error(ErrorKind::InvalidSignature, message));
     }
     // Check sign-in BEFORE buffering the request body!
     if writes(procedure) && auth::signed_in(&request, env).is_none() {
@@ -194,6 +211,7 @@ async fn call_v2(mut request: Request, env: &Env, procedure: ProcedureV2) -> Res
             let mailbox = MailboxV2Server::builder(store)
                 .server_id(server_id)
                 .supported_suites(supported_suites)
+                .allow_pq_drain(true)
                 .limits(limits)
                 .build();
             connect::handle_v2(&handshake, &mailbox, procedure, content_type.as_deref(), &body)
@@ -202,6 +220,18 @@ async fn call_v2(mut request: Request, env: &Env, procedure: ProcedureV2) -> Res
         None => connect::error(ErrorKind::LimitExceeded, "request too large"),
     };
     respond(response)
+}
+
+/// Adds `Date`, `x-e2ee-pq`, and Connect CORS headers.
+fn with_cors(response: Response, pq_enabled: bool) -> Result<Response> {
+    with_metadata(response, pq_enabled)?.with_cors(
+        &Cors::new()
+            .with_origins(["*"])
+            .with_methods([Method::Post, Method::Options])
+            .with_allowed_headers(["content-type", PROTOCOL_VERSION_HEADER])
+            .with_exposed_headers(["date", PQ_HEADER])
+            .with_max_age(86400),
+    )
 }
 
 /// Adds `Date` and `x-e2ee-pq` response headers.
@@ -259,18 +289,19 @@ fn writes_v2(procedure: ProcedureV2) -> bool {
     )
 }
 
+#[cfg(not(feature = "pq"))]
+fn is_v2_path(path: &str) -> bool {
+    path.starts_with("/handshake.v2.") || path.starts_with("/mailbox.v2.")
+}
+
+/// V2 procedures that are completely disabled when `PQ_ENABLED="false"` without inspecting the
+/// request body. Other v2 procedures (`PublishV2`, `RefillPrekeys`, `ClaimBundle`,
+/// `SendInitialV2`, `ListInitialMessages`, `AckInitialMessages`, `PushV2`, `FetchSigned`) enforce
+/// fine-grained `PQ_ENABLED="false"` rollback rules inside `HandshakeV2Server` / `MailboxV2Server`
+/// so existing PQ users can drain in-flight handshakes and publish signed OFF manifests.
 #[cfg(feature = "pq")]
 fn is_pq_only_v2(procedure: ProcedureV2) -> bool {
-    matches!(
-        procedure,
-        ProcedureV2::PublishV2
-            | ProcedureV2::RefillPrekeys
-            | ProcedureV2::GetManifest
-            | ProcedureV2::ClaimBundle
-            | ProcedureV2::SendInitialV2
-            | ProcedureV2::ListInitialMessages
-            | ProcedureV2::AckInitialMessages
-    )
+    matches!(procedure, ProcedureV2::GetManifest)
 }
 
 /// Whether post-quantum routes and storage are enabled at runtime.
@@ -296,14 +327,16 @@ fn allow_unsigned_fetch(env: &Env) -> bool {
     env_bool(env, "ALLOW_UNSIGNED_FETCH", true)
 }
 
-/// Canonical server audience identifier: `SERVER_ID` env var if non-empty, else request URL host.
+/// Canonical server audience identifier: normalized `SERVER_ID` env var (`host[:port]`) if
+/// non-empty, else request URL's canonical `host[:port]`.
 #[cfg(feature = "pq")]
 fn server_id(env: &Env, request: &Request) -> Result<String> {
     if let Ok(var) = env.var("SERVER_ID") {
-        let trimmed = var.to_string();
-        let trimmed = trimmed.trim();
+        let raw = var.to_string();
+        let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+            return protocol::handshake_v2::normalize_audience(trimmed)
+                .map_err(|_| worker::Error::RustError("invalid SERVER_ID".into()));
         }
     }
     let url = request.url()?;
@@ -392,6 +425,12 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
             .fetch_with_request(forwarded)
             .await
     } else if let Some(identity_hex) = query_identity {
+        // Require a valid sign-in cookie before upgrading unauthenticated first-frame WS sockets
+        // whenever server PASSWORD authentication is configured, preventing unauthenticated
+        // third parties from exhausting an identity's pending WebSocket cap.
+        if auth::password_configured(env) && auth::signed_in(&request, env).is_none() {
+            return Response::error("sign in to this server to use it", 403);
+        }
         let Some(identity_key) = decode_hex_32(&identity_hex) else {
             return Response::error("malformed identity", 400);
         };

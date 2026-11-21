@@ -16,6 +16,7 @@ use protocol::{
     notify::{Notification, SubscribeRequest},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use storage::{MAX_QUEUE_BYTES, MAX_QUEUE_MESSAGES, MAX_SAFE_INTEGER};
 use worker::{
     Date, DurableObject, Env, Error, Method, Request, Response, Result, SqlStorage,
@@ -46,17 +47,19 @@ pub const HEADER_PENDING_IDENTITY: &str = "x-e2ee-pending-identity";
 /// object.
 const PING: &str = "ping";
 const PONG: &str = "pong";
+/// Text frame sent once a first-frame-auth WebSocket's `SubscribeRequest` is verified.
+const AUTH_OK: &str = "ok";
 /// How long, in milliseconds, a socket may go without a ping: its client pings every minute.
 const STALE: f64 = 3.0 * 60_000.0;
 /// Maximum concurrent authenticated WebSocket connections per Identity DO.
 const MAX_WEBSOCKETS: usize = 16;
 /// Maximum concurrent unauthenticated first-frame-auth pending WebSockets per Identity DO.
-const MAX_PENDING_WEBSOCKETS: usize = 4;
+const MAX_PENDING_WEBSOCKETS: usize = 8;
 /// Maximum time (in ms) a first-frame-auth WebSocket may stay unauthenticated.
-const MAX_UNAUTH_AGE_MS: f64 = 15_000.0;
+const MAX_UNAUTH_AGE_MS: f64 = 5_000.0;
 /// Maximum bytes accepted in an authentication WebSocket frame.
 const MAX_AUTH_FRAME_BYTES: usize = 512;
-/// Maximum entries kept in the in-memory subscribe-signature replay cache.
+/// Maximum entries kept in the subscribe-signature replay cache (in-memory and SQLite).
 const MAX_SEEN_SUBSCRIBES: usize = 256;
 /// Maximum expired R2 objects deleted in a single alarm tick.
 const ALARM_R2_BATCH: u64 = 500;
@@ -171,6 +174,16 @@ CREATE TABLE IF NOT EXISTS publish_watermarks (
 );
 ";
 
+/// Additive persistent WebSocket subscribe replay cache table (created only when `has_tables()` is
+/// already true or during `create_tables()`, preserving zero-allocation on unknown identities).
+const SCHEMA_SEEN_SUBSCRIBES: &str = "
+CREATE TABLE IF NOT EXISTS seen_subscribes (
+    sig_hash TEXT PRIMARY KEY,
+    expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS seen_subscribes_by_expiry ON seen_subscribes (expires_at);
+";
+
 /// Per-WebSocket attachment stored via hibernation API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WsAttachment {
@@ -184,8 +197,8 @@ struct WsAttachment {
 pub struct Identity {
     state: State,
     env: Env,
-    /// In-memory replay cache of seen `SubscribeRequest` signatures -> timestamp (ms) over the
-    /// `2 * MAX_CLOCK_SKEW` window.
+    /// In-memory replay cache of seen `SubscribeRequest` signatures -> `expires_at` (ms), used as
+    /// a fast path and as fallback when `!has_tables()` (unknown identities).
     seen_subscribes: RefCell<HashMap<[u8; 64], u64>>,
 }
 
@@ -204,7 +217,7 @@ impl DurableObject for Identity {
 
     async fn fetch(&self, mut request: Request) -> Result<Response> {
         match request.method() {
-            Method::Get => self.accept_websocket(&request),
+            Method::Get => self.accept_websocket(&request).await,
             Method::Post => {
                 let call = decode(&mut request).await?;
                 self.serve(call).await
@@ -214,12 +227,14 @@ impl DurableObject for Identity {
     }
 
     /// Expires messages and initial messages older than `RETENTION_DAYS`, paging R2 deletions so
-    /// a large backlog cannot OOM the alarm, and explicitly purging orphaned v2 side-table rows.
+    /// a large backlog cannot OOM the alarm, explicitly purging orphaned v2 side-table rows, and
+    /// pruning expired entries from `seen_subscribes`.
     async fn alarm(&self) -> Result<Response> {
         if !self.has_tables()? {
             return Response::empty();
         }
-        let before = Date::now().as_millis().saturating_sub(self.retention());
+        let now = Date::now().as_millis();
+        let before = now.saturating_sub(self.retention());
         let before_val = checked_integer(before)?;
         let sql = self.sql();
 
@@ -272,6 +287,12 @@ impl DurableObject for Identity {
             sql.exec(
                 "DELETE FROM mailbox_dedup WHERE created_at < ?",
                 vec![before_val],
+            )?;
+        }
+        if has_table(&sql, "seen_subscribes")? {
+            sql.exec(
+                "DELETE FROM seen_subscribes WHERE expires_at < ?",
+                vec![checked_integer(now)?],
             )?;
         }
 
@@ -346,17 +367,31 @@ impl DurableObject for Identity {
             let _ = socket.close(Some(1008), Some("invalid signature"));
             return Ok(());
         };
-        if !self.record_subscribe_signature(sig, subscription.timestamp, now_ms) {
-            let _ = socket.close(Some(1008), Some("replayed subscription"));
-            return Ok(());
-        }
+        let persisted = match self.record_subscribe_signature(sig, subscription.timestamp, now_ms) {
+            Ok((true, persisted)) => persisted,
+            Ok((false, _)) => {
+                let _ = socket.close(Some(1008), Some("replayed subscription"));
+                return Ok(());
+            }
+            Err(_) => {
+                let _ = socket.close(Some(1011), Some("state error"));
+                return Ok(());
+            }
+        };
         attachment.authenticated = true;
         attachment.opened_at = now_f64;
         if socket.serialize_attachment(&attachment).is_err() {
             let _ = socket.close(Some(1011), Some("state error"));
             return Ok(());
         }
+        if socket.send_with_str(AUTH_OK).is_err() {
+            let _ = socket.close(Some(1011), Some("send error"));
+            return Ok(());
+        }
         self.prune_and_cap_authenticated(now_f64, MAX_WEBSOCKETS, Some(&socket));
+        if persisted && let Err(e) = self.schedule_expiry(false).await {
+            console_error!("cannot schedule subscribe replay expiry: {e}");
+        }
         Ok(())
     }
 
@@ -392,6 +427,7 @@ impl Identity {
         let sql = self.sql();
         sql.exec(SCHEMA_V1, None)?;
         sql.exec(SCHEMA_V2, None)?;
+        sql.exec(SCHEMA_SEEN_SUBSCRIBES, None)?;
         Ok(())
     }
 
@@ -424,25 +460,80 @@ impl Identity {
         ))
     }
 
-    /// Records a subscribe signature in DO memory over the `2 * MAX_CLOCK_SKEW` window; returns
-    /// `false` if this exact signature was already used.
-    fn record_subscribe_signature(&self, sig: [u8; 64], timestamp: u64, now_ms: u64) -> bool {
-        let mut seen = self.seen_subscribes.borrow_mut();
-        let cutoff = now_ms.saturating_sub(MAX_CLOCK_SKEW.saturating_mul(2));
-        seen.retain(|_, ts| *ts >= cutoff);
-        if seen.contains_key(&sig) {
-            return false;
+    /// Records a subscribe signature over its `timestamp + MAX_CLOCK_SKEW` validity window;
+    /// returns `Ok((true, persisted))` if fresh (with `persisted = true` when written to SQLite),
+    /// or `Ok((false, false))` if this exact signature was already used.
+    ///
+    /// When `has_tables()` is true, persists `SHA-256(sig)` into `seen_subscribes` so replay
+    /// protection survives DO hibernation. When `!has_tables()`, falls back to the in-memory cache
+    /// to preserve zero SQLite storage allocation on unknown identities.
+    fn record_subscribe_signature(
+        &self,
+        sig: [u8; 64],
+        timestamp: u64,
+        now_ms: u64,
+    ) -> Result<(bool, bool)> {
+        let expires_at = timestamp
+            .saturating_add(MAX_CLOCK_SKEW)
+            .min(MAX_SAFE_INTEGER);
+        {
+            let mut seen = self.seen_subscribes.borrow_mut();
+            seen.retain(|_, exp| *exp >= now_ms);
+            if seen.contains_key(&sig) {
+                return Ok((false, false));
+            }
         }
+
+        let persisted = if self.has_tables()? {
+            let sql = self.sql();
+            sql.exec(SCHEMA_SEEN_SUBSCRIBES, None)?;
+            let now_val = checked_integer(now_ms)?;
+            let expires_val = checked_integer(expires_at)?;
+            sql.exec(
+                "DELETE FROM seen_subscribes WHERE expires_at < ?",
+                vec![now_val],
+            )?;
+            let sig_hash = crate::hex(&Sha256::digest(sig));
+            let existing: CountRow = sql
+                .exec(
+                    "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
+                    vec![sig_hash.as_str().into()],
+                )?
+                .one()?;
+            if existing.count > 0 {
+                return Ok((false, false));
+            }
+            let total: CountRow = sql
+                .exec("SELECT count(*) AS count FROM seen_subscribes", None)?
+                .one()?;
+            if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
+                let to_evict = total.count - MAX_SEEN_SUBSCRIBES as u64 + 1;
+                sql.exec(
+                    "DELETE FROM seen_subscribes WHERE sig_hash IN \
+                     (SELECT sig_hash FROM seen_subscribes ORDER BY expires_at ASC LIMIT ?)",
+                    vec![checked_integer(to_evict)?],
+                )?;
+            }
+            sql.exec(
+                "INSERT INTO seen_subscribes (sig_hash, expires_at) VALUES (?, ?)",
+                vec![sig_hash.into(), expires_val],
+            )?;
+            true
+        } else {
+            false
+        };
+
+        let mut seen = self.seen_subscribes.borrow_mut();
         if seen.len() >= MAX_SEEN_SUBSCRIBES
             && let Some(oldest_key) = seen
                 .iter()
-                .min_by_key(|&(_, ts)| *ts)
+                .min_by_key(|&(_, exp)| *exp)
                 .map(|(k, _)| *k)
         {
             seen.remove(&oldest_key);
         }
-        seen.insert(sig, timestamp);
-        true
+        seen.insert(sig, expires_at);
+        Ok((true, persisted))
     }
 
     /// Accepts a WebSocket connection after checking replay protection (query-param auth) or
@@ -452,11 +543,11 @@ impl Identity {
     /// 429) and NEVER evict authenticated sockets. Authenticated sockets are capped at
     /// [`MAX_WEBSOCKETS`], evicting the oldest authenticated socket only when an authenticated
     /// connection arrives.
-    fn accept_websocket(&self, request: &Request) -> Result<Response> {
+    async fn accept_websocket(&self, request: &Request) -> Result<Response> {
         let now_ms = Date::now().as_millis();
         let now_f64 = js_sys::Date::now();
 
-        let attachment = if let (Some(sig_hex), Some(ts_str)) = (
+        let (attachment, persisted_replay) = if let (Some(sig_hex), Some(ts_str)) = (
             request.headers().get(HEADER_SUBSCRIBE_SIG)?,
             request.headers().get(HEADER_SUBSCRIBE_TS)?,
         ) {
@@ -466,15 +557,19 @@ impl Identity {
             let Ok(ts) = ts_str.parse::<u64>() else {
                 return Response::error("malformed subscription", 400);
             };
-            if !self.record_subscribe_signature(sig, ts, now_ms) {
+            let (fresh, persisted) = self.record_subscribe_signature(sig, ts, now_ms)?;
+            if !fresh {
                 return Response::error("replayed subscription", 403);
             }
             self.prune_and_cap_authenticated(now_f64, MAX_WEBSOCKETS - 1, None);
-            WsAttachment {
-                opened_at: now_f64,
-                authenticated: true,
-                expected_identity: None,
-            }
+            (
+                WsAttachment {
+                    opened_at: now_f64,
+                    authenticated: true,
+                    expected_identity: None,
+                },
+                persisted,
+            )
         } else if let Some(id_hex) = request.headers().get(HEADER_PENDING_IDENTITY)? {
             let Some(id) = decode_hex_fixed::<32>(&id_hex) else {
                 return Response::error("malformed identity", 400);
@@ -482,14 +577,21 @@ impl Identity {
             if self.prune_and_count_pending(now_f64) >= MAX_PENDING_WEBSOCKETS {
                 return Response::error("too many pending connections", 429);
             }
-            WsAttachment {
-                opened_at: now_f64,
-                authenticated: false,
-                expected_identity: Some(id.to_vec()),
-            }
+            (
+                WsAttachment {
+                    opened_at: now_f64,
+                    authenticated: false,
+                    expected_identity: Some(id.to_vec()),
+                },
+                false,
+            )
         } else {
             return Response::error("unauthorized", 403);
         };
+
+        if persisted_replay && let Err(e) = self.schedule_expiry(false).await {
+            console_error!("cannot schedule subscribe replay expiry: {e}");
+        }
 
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
@@ -1788,7 +1890,7 @@ impl Identity {
     }
 
     /// Set the alarm for when the oldest of what is kept expires (including `mailbox_dedup` rows
-    /// so delivered-message deduplication entries do not grow unboundedly).
+    /// and `seen_subscribes` replay-cache rows so neither table grows unboundedly).
     async fn schedule_expiry(&self, again: bool) -> Result<()> {
         let storage = self.state.storage();
         if !again && storage.get_alarm().await?.is_some() {
@@ -1805,14 +1907,27 @@ impl Identity {
              (SELECT created_at FROM messages UNION ALL SELECT created_at FROM initial_messages)"
         };
         let oldest: OldestRow = sql.exec(query, None)?.one()?;
-        let oldest = match (oldest.oldest, again) {
-            (Some(oldest), _) => oldest,
-            (None, false) => Date::now().as_millis(),
-            (None, true) => return Ok(()),
+        let retention_at = oldest
+            .oldest
+            .map(|oldest| oldest.saturating_add(self.retention()));
+        let subscribe_at = if has_table(&sql, "seen_subscribes")? {
+            let earliest: OldestRow = sql
+                .exec("SELECT min(expires_at) AS oldest FROM seen_subscribes", None)?
+                .one()?;
+            earliest.oldest.map(|ts| ts.saturating_add(1))
+        } else {
+            None
         };
-        storage
-            .set_alarm(alarm_at(oldest.saturating_add(self.retention())))
-            .await
+        let next_at = match (retention_at, subscribe_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) if !again => Some(Date::now().as_millis().saturating_add(self.retention())),
+            (None, None) => None,
+        };
+        let Some(next_at) = next_at else {
+            return Ok(());
+        };
+        storage.set_alarm(alarm_at(next_at)).await
     }
 
     /// Tell every authenticated subscriber of `notification`, failing closed on missing state and

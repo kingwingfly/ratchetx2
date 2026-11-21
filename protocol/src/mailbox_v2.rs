@@ -190,6 +190,11 @@ mod server {
         /// Supported PQ suites for carried v2 initial messages (empty when PQ is disabled).
         #[builder(default = vec![u32::from(PqSuite::MlKem1024.as_u8()), u32::from(PqSuite::MlKem768.as_u8())])]
         supported_suites: Vec<u32>,
+        /// Allow draining in-flight carried `version == 2` PQ initial messages validated against
+        /// known [`PqSuite::from_u8`] even when `supported_suites` is empty (e.g. during a
+        /// `PQ_ENABLED="false"` rollback so unacknowledged PQ outboxes never wedge).
+        #[builder(default = true)]
+        allow_pq_drain: bool,
         /// Size and pagination limits (shared with v1 [`MailboxLimits`]).
         #[builder(default)]
         limits: MailboxLimits,
@@ -216,7 +221,7 @@ mod server {
 
             let initial_message = match request.initial_message {
                 Some(ref init) => {
-                    validate_initial_message_v2(init, &self.supported_suites)?;
+                    validate_initial_message_v2(init, &self.supported_suites, self.allow_pq_drain)?;
                     let encoded = encode_carried_initial(init)?;
                     if encoded.len() > self.limits.max_initial_message_size {
                         return Err(ErrorKind::LimitExceeded.into());
@@ -539,6 +544,77 @@ mod server {
                 .unwrap();
             assert_eq!(v1_fetched.messages.len(), 2);
             assert_eq!(v1_fetched.messages[1].initial_message, None);
+        }
+
+        #[tokio::test]
+        async fn push_v2_drains_carried_pq_initial_when_pq_disabled_and_validates_lengths() {
+            let shared = SharedStore(Arc::new(MemoryStore::default()));
+            let alice = XEdDSAPrivateKey::generate();
+            let bob = XEdDSAPrivateKey::generate();
+            let alice_pk = alice.compute_public_key().to_bytes();
+            let bob_pk = bob.compute_public_key().to_bytes();
+
+            let drain_server = MailboxV2Server::builder(shared.clone())
+                .server_id("relay.example".to_string())
+                .supported_suites(vec![])
+                .build();
+
+            let pq_init = InitialMessageV2 {
+                id: 0,
+                version: PQXDH_VERSION,
+                identity_key: Bytes::copy_from_slice(&alice_pk),
+                ephemeral_key: Bytes::from_static(&[0x11; 32]),
+                signed_prekey: Bytes::from_static(&[0x22; 32]),
+                one_time_prekey: None,
+                first_message: None,
+                pq_suite: u32::from(PqSuite::MlKem1024.as_u8()),
+                pq_last_resort: false,
+                pq_prekey_id: Bytes::from_static(&[0x33; 32]),
+                pq_ciphertext: Bytes::from(vec![0x55; PqSuite::MlKem1024.ct_len()]),
+                manifest_digest: Bytes::from_static(&[0x44; 32]),
+            };
+            let push = |init: InitialMessageV2| PushV2Request {
+                sender: Bytes::copy_from_slice(&alice_pk),
+                recipient: Bytes::copy_from_slice(&bob_pk),
+                message: Some(EncryptedMessage {
+                    header: Bytes::from_static(b"h"),
+                    content: Bytes::from_static(b"c"),
+                }),
+                initial_message: Some(init),
+                delivery_hash: Bytes::new(),
+                client_message_id: Bytes::new(),
+            };
+
+            // Valid known PQ suite drains cleanly even with supported_suites = [].
+            assert_eq!(
+                drain_server.push_v2(push(pq_init.clone())).await.unwrap().sequence,
+                1
+            );
+
+            // Unknown suite or wrong ciphertext length is STILL rejected as Malformed.
+            let mut bad_suite = pq_init.clone();
+            bad_suite.pq_suite = 99;
+            assert_eq!(
+                drain_server.push_v2(push(bad_suite)).await.unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
+            let mut bad_ct = pq_init.clone();
+            bad_ct.pq_ciphertext = Bytes::from(vec![0x55; 10]);
+            assert_eq!(
+                drain_server.push_v2(push(bad_ct)).await.unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
+
+            // Explicitly disabling allow_pq_drain enforces supported_suites strictly.
+            let strict_server = MailboxV2Server::builder(shared)
+                .server_id("relay.example".to_string())
+                .supported_suites(vec![])
+                .allow_pq_drain(false)
+                .build();
+            assert_eq!(
+                strict_server.push_v2(push(pq_init)).await.unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
         }
     }
 }
