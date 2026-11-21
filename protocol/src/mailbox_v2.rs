@@ -587,7 +587,11 @@ mod server {
 
             // Valid known PQ suite drains cleanly even with supported_suites = [].
             assert_eq!(
-                drain_server.push_v2(push(pq_init.clone())).await.unwrap().sequence,
+                drain_server
+                    .push_v2(push(pq_init.clone()))
+                    .await
+                    .unwrap()
+                    .sequence,
                 1
             );
 
@@ -595,7 +599,11 @@ mod server {
             let mut bad_suite = pq_init.clone();
             bad_suite.pq_suite = 99;
             assert_eq!(
-                drain_server.push_v2(push(bad_suite)).await.unwrap_err().kind(),
+                drain_server
+                    .push_v2(push(bad_suite))
+                    .await
+                    .unwrap_err()
+                    .kind(),
                 ErrorKind::Malformed
             );
             let mut bad_ct = pq_init.clone();
@@ -612,7 +620,11 @@ mod server {
                 .allow_pq_drain(false)
                 .build();
             assert_eq!(
-                strict_server.push_v2(push(pq_init)).await.unwrap_err().kind(),
+                strict_server
+                    .push_v2(push(pq_init))
+                    .await
+                    .unwrap_err()
+                    .kind(),
                 ErrorKind::Malformed
             );
         }

@@ -511,7 +511,8 @@ mod server {
                     .kind(),
                 ErrorKind::StaleTimestamp
             );
-            let over_safe_take = TakeInitialMessagesRequest::sign(&bob, crate::MAX_SAFE_INTEGER + 1);
+            let over_safe_take =
+                TakeInitialMessagesRequest::sign(&bob, crate::MAX_SAFE_INTEGER + 1);
             assert_eq!(
                 server
                     .take_initial_messages(over_safe_take)

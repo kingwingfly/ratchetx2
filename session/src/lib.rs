@@ -40,8 +40,8 @@ use protocol::{
 use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 pub use safety::safety_number;
 use sha2::{Digest, Sha256};
-pub use x3dh::{PqSuite, PublicKey};
 use x3dh::{LocalPrekeys, PrekeyBundle};
+pub use x3dh::{PqSuite, PublicKey};
 use xeddsa::XEdDSAPrivateKey;
 #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
 use xeddsa::XEdDSAPublicKey;
@@ -92,6 +92,43 @@ impl TryFrom<&handshake::InitialMessage> for InitialMessage {
             first_message: message.first_message.clone().ok_or_else(malformed)?,
         })
     }
+}
+
+/// The wire versions share sequence and ciphertext semantics, with different carried initials.
+trait MailboxEnvelope {
+    type Initial: PartialEq;
+    fn sequence(&self) -> u64;
+    fn into_parts(self) -> (Option<EncryptedMessage>, Option<Self::Initial>);
+}
+
+impl MailboxEnvelope for Envelope {
+    type Initial = InitialMessage;
+
+    fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn into_parts(self) -> (Option<EncryptedMessage>, Option<InitialMessage>) {
+        (
+            self.message,
+            self.initial_message
+                .as_ref()
+                .and_then(|im| InitialMessage::try_from(im).ok()),
+        )
+    }
+}
+
+/// Return false if this envelope must be fetched again to surface a new initial.
+fn carry_initial<I: PartialEq>(carried: &mut Vec<I>, initial: Option<I>) -> bool {
+    if let Some(initial) = initial
+        && !carried.contains(&initial)
+    {
+        if carried.len() == MAX_CARRIED_INITIALS {
+            return false;
+        }
+        carried.push(initial);
+    }
+    true
 }
 
 /// A message received, see [`Session::receive`].
@@ -152,6 +189,18 @@ pub(crate) fn extract_hello(content: &[u8]) -> Option<Hello> {
         Some(ContentKind::Hello(hello)) => Some(hello),
         _ => None,
     }
+}
+
+/// Read a greeting only after authentication, before confirming the claimed prekeys.
+fn checked_initial_hello(content: &[u8]) -> Result<Option<Hello>> {
+    let hello = extract_hello(content);
+    if hello
+        .as_ref()
+        .is_some_and(|h| h.session_seq > protocol::MAX_SAFE_INTEGER)
+    {
+        return Err(ErrorKind::InvalidInitialMessage.into());
+    }
+    Ok(hello)
 }
 
 /// Number of earlier sessions with its peer that a [`Session`] keeps, only to decrypt the
@@ -406,7 +455,8 @@ impl TryFrom<&proto::ClientState> for ClientState {
             .recent_manifest_digests
             .iter()
             .map(|d| {
-                <[u8; 32]>::try_from(d.as_slice()).map_err(|_| Error::from(ErrorKind::MalformedState))
+                <[u8; 32]>::try_from(d.as_slice())
+                    .map_err(|_| Error::from(ErrorKind::MalformedState))
             })
             .collect::<Result<Vec<_>>>()?;
         let pq_config = PqConfig {
@@ -722,16 +772,16 @@ impl<H: LocalHandshake> Client<H> {
         if let Some(hello) = extract_hello(content)
             && hello.session_seq > 0
         {
-            session.state.next_session_seq = hello.session_seq.saturating_add(1);
+            session.state.next_session_seq = hello
+                .session_seq
+                .saturating_add(1)
+                .min(protocol::MAX_SAFE_INTEGER);
         }
         Ok(PreparedInitiate { session, request })
     }
 
     /// Transmit a prepared classical initial message request (after persisting `session.state()`).
-    pub async fn send_prepared_initiate(
-        &self,
-        request: &SendInitialMessageRequest,
-    ) -> Result<()> {
+    pub async fn send_prepared_initiate(&self, request: &SendInitialMessageRequest) -> Result<()> {
         self.handshake.send_initial_message(request.clone()).await?;
         Ok(())
     }
@@ -829,8 +879,8 @@ impl<H: LocalHandshake> Client<H> {
         let content = party
             .decrypt(&initial_message.first_message)
             .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
+        let peer_session_seq = checked_initial_hello(&content)?.map_or(0, |h| h.session_seq);
         self.state.prekeys.confirm(&initial_message.x3dh)?;
-        let peer_session_seq = extract_hello(&content).map_or(0, |h| h.session_seq);
         let active = Active {
             party,
             id: initial_message.x3dh.ephemeral_key,
@@ -885,6 +935,15 @@ impl<H: LocalHandshake> Client<H> {
             &self.state.identity,
             self.clock.now().min(protocol::MAX_SAFE_INTEGER),
         )
+    }
+
+    /// Sign a notification subscription bound to the configured relay audience using its clock.
+    pub fn subscription_for_audience(&self, audience: &str) -> Result<SubscribeRequest> {
+        Ok(SubscribeRequest::sign_for_audience(
+            &self.state.identity,
+            audience,
+            self.clock.now(),
+        )?)
     }
 }
 
@@ -1128,6 +1187,65 @@ fn check_party_identity_ad(
     Ok(())
 }
 
+#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+struct ActiveStateView<'a, F> {
+    id: &'a PublicKey,
+    peer_session_seq: u64,
+    security: SessionSecurity,
+    associated_data: &'a [u8],
+    // Only materialize an archived party after checking all bounds and identity bindings.
+    load_party: F,
+}
+
+#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+fn validate_session_state<'a, P: std::borrow::Borrow<Party>>(
+    me: &PublicKey,
+    peer: &PublicKey,
+    counters: [u64; 6],
+    delivered: usize,
+    earlier: impl ExactSizeIterator<Item = &'a [u8]>,
+    active: Option<ActiveStateView<'a, impl FnOnce() -> Result<P>>>,
+) -> Result<()> {
+    if [me, peer]
+        .into_iter()
+        .any(|key| !xeddsa::is_canonical_public_key(key) || XEdDSAPublicKey::new(key).is_err())
+        || earlier.len() > KEPT_SESSIONS
+        || delivered > MAX_STORED_DELIVERED
+        || counters
+            .into_iter()
+            .any(|seq| seq > protocol::MAX_SAFE_INTEGER)
+    {
+        return Err(ErrorKind::MalformedState.into());
+    }
+    for ad in earlier {
+        check_party_identity_ad(ad, me, peer, None)?;
+    }
+    if let Some(active) = active {
+        let security = active.security;
+        if !xeddsa::is_canonical_public_key(active.id)
+            || *active.id == [0; 32]
+            || active.peer_session_seq > protocol::MAX_SAFE_INTEGER
+            || security.is_pq != security.suite.is_some()
+            || (!security.is_pq && security.pq_ratchet)
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        check_party_identity_ad(active.associated_data, me, peer, Some(security.is_pq))?;
+        let party = (active.load_party)()?;
+        let party = party.borrow();
+        if security.pq_ratchet != party.is_pq_ratchet_active() {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        if let Some(suite) = party.pq_suite()
+            && security.suite.map(PqSuite::as_u8) != Some(suite.id())
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
+    }
+    Ok(())
+}
+
 impl SessionState {
     /// The peer's identity key.
     pub fn peer(&self) -> &PublicKey {
@@ -1148,59 +1266,27 @@ impl SessionState {
     /// and PQ metadata invariants.
     #[cfg(any(feature = "prost", feature = "serde"))]
     fn validate(&self) -> Result<()> {
-        if !xeddsa::is_canonical_public_key(&self.me)
-            || XEdDSAPublicKey::new(&self.me).is_err()
-            || !xeddsa::is_canonical_public_key(&self.peer)
-            || XEdDSAPublicKey::new(&self.peer).is_err()
-        {
-            return Err(ErrorKind::MalformedState.into());
-        }
-        if self.others.len() > KEPT_SESSIONS || self.delivered.len() > MAX_STORED_DELIVERED {
-            return Err(ErrorKind::MalformedState.into());
-        }
-        if self.cursor > protocol::MAX_SAFE_INTEGER
-            || self.stalled_through > protocol::MAX_SAFE_INTEGER
-            || self.skip_through > protocol::MAX_SAFE_INTEGER
-            || self.next_session_seq > protocol::MAX_SAFE_INTEGER
-            || self.peer_pq.pinned_manifest_seq > protocol::MAX_SAFE_INTEGER
-            || self.peer_pq.peer_session_seq > protocol::MAX_SAFE_INTEGER
-        {
-            return Err(ErrorKind::MalformedState.into());
-        }
-        if let Some(active) = &self.active {
-            if !xeddsa::is_canonical_public_key(&active.id) || active.id == [0u8; 32] {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if active.peer_session_seq > protocol::MAX_SAFE_INTEGER {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if active.security.is_pq {
-                if active.security.suite.is_none() {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-            } else if active.security.suite.is_some() || active.security.pq_ratchet {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            check_party_identity_ad(
-                active.party.associated_data(),
-                &self.me,
-                &self.peer,
-                Some(active.security.is_pq),
-            )?;
-            if active.security.pq_ratchet != active.party.is_pq_ratchet_active() {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            if let Some(ratchet_suite) = active.party.pq_suite()
-                && active.security.suite.map(PqSuite::as_u8) != Some(ratchet_suite.id())
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-        }
-        for earlier in &self.others {
-            check_party_identity_ad(earlier.party.associated_data(), &self.me, &self.peer, None)?;
-        }
-        Ok(())
+        validate_session_state(
+            &self.me,
+            &self.peer,
+            [
+                self.cursor,
+                self.stalled_through,
+                self.skip_through,
+                self.next_session_seq,
+                self.peer_pq.pinned_manifest_seq,
+                self.peer_pq.peer_session_seq,
+            ],
+            self.delivered.len(),
+            self.others.iter().map(|e| e.party.associated_data()),
+            self.active.as_ref().map(|a| ActiveStateView {
+                id: &a.id,
+                peer_session_seq: a.peer_session_seq,
+                security: a.security,
+                associated_data: a.party.associated_data(),
+                load_party: || Ok(&a.party),
+            }),
+        )
     }
 
     /// Keep `earlier`, an earlier session, only to decrypt, dropping the oldest beyond
@@ -1236,75 +1322,35 @@ where
 {
     fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
         use rkyv::rancor::Source;
-        let check = || -> Result<()> {
-            if !xeddsa::is_canonical_public_key(&self.me)
-                || XEdDSAPublicKey::new(&self.me).is_err()
-                || !xeddsa::is_canonical_public_key(&self.peer)
-                || XEdDSAPublicKey::new(&self.peer).is_err()
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if self.others.len() > KEPT_SESSIONS || self.delivered.len() > MAX_STORED_DELIVERED {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if self.cursor.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.stalled_through.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.skip_through.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.next_session_seq.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.peer_pq.pinned_manifest_seq.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.peer_pq.peer_session_seq.to_native() > protocol::MAX_SAFE_INTEGER
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if let rkyv::option::ArchivedOption::Some(active) = &self.active {
-                if !xeddsa::is_canonical_public_key(&active.id) || active.id == [0u8; 32] {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if active.peer_session_seq.to_native() > protocol::MAX_SAFE_INTEGER {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                let suite = match &active.security.suite {
-                    rkyv::option::ArchivedOption::Some(s) => Some(archived_pq_suite(s)),
-                    rkyv::option::ArchivedOption::None => None,
-                };
-                let is_pq = active.security.is_pq;
-                let pq_ratchet = active.security.pq_ratchet;
-                if is_pq {
-                    if suite.is_none() {
-                        return Err(ErrorKind::MalformedState.into());
-                    }
-                } else if suite.is_some() || pq_ratchet {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                check_party_identity_ad(
-                    active.party.associated_data(),
-                    &self.me,
-                    &self.peer,
-                    Some(is_pq),
-                )?;
-                let party = rkyv::deserialize::<Party, rkyv::rancor::Error>(&active.party)
-                    .map_err(|_| ErrorKind::MalformedState)?;
-                if pq_ratchet != party.is_pq_ratchet_active() {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                if let Some(ratchet_suite) = party.pq_suite()
-                    && suite.map(PqSuite::as_u8) != Some(ratchet_suite.id())
-                {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-            }
-            for earlier in self.others.iter() {
-                check_party_identity_ad(
-                    earlier.party.associated_data(),
-                    &self.me,
-                    &self.peer,
-                    None,
-                )?;
-            }
-            Ok(())
-        };
-        check().map_err(C::Error::new)
+        validate_session_state(
+            &self.me,
+            &self.peer,
+            [
+                self.cursor.to_native(),
+                self.stalled_through.to_native(),
+                self.skip_through.to_native(),
+                self.next_session_seq.to_native(),
+                self.peer_pq.pinned_manifest_seq.to_native(),
+                self.peer_pq.peer_session_seq.to_native(),
+            ],
+            self.delivered.len(),
+            self.others.iter().map(|e| e.party.associated_data()),
+            self.active.as_ref().map(|a| ActiveStateView {
+                id: &a.id,
+                peer_session_seq: a.peer_session_seq.to_native(),
+                security: SessionSecurity {
+                    is_pq: a.security.is_pq,
+                    suite: a.security.suite.as_ref().map(archived_pq_suite),
+                    pq_ratchet: a.security.pq_ratchet,
+                },
+                associated_data: a.party.associated_data(),
+                load_party: || {
+                    rkyv::deserialize::<Party, rkyv::rancor::Error>(&a.party)
+                        .map_err(|e| Error::new(ErrorKind::MalformedState, e))
+                },
+            }),
+        )
+        .map_err(C::Error::new)
     }
 }
 
@@ -1475,7 +1521,10 @@ impl From<&SessionState> for proto::SessionState {
             skip_through: state.skip_through,
             peer_pq: Some((&state.peer_pq).into()),
             next_session_seq: state.next_session_seq,
-            active_security: state.active.as_ref().map(|active| (&active.security).into()),
+            active_security: state
+                .active
+                .as_ref()
+                .map(|active| (&active.security).into()),
             active_peer_session_seq: state
                 .active
                 .as_ref()
@@ -1692,10 +1741,11 @@ impl<M> Session<M> {
         self.state.next_session_seq.max(1)
     }
 
-    /// Allocate and advance the next monotonic outgoing `Hello.session_seq` (`>= 1`).
+    /// Allocate and advance the next outgoing `Hello.session_seq`, saturating at
+    /// [`protocol::MAX_SAFE_INTEGER`].
     pub fn allocate_session_seq(&mut self) -> u64 {
-        let seq = self.state.next_session_seq.max(1);
-        self.state.next_session_seq = seq.saturating_add(1);
+        let seq = self.next_session_seq();
+        self.state.next_session_seq = seq.saturating_add(1).min(protocol::MAX_SAFE_INTEGER);
         seq
     }
 
@@ -1730,29 +1780,17 @@ impl<M> Session<M> {
     /// any strictly smaller `session_seq`.
     pub fn check_peer_hello(&mut self, hello: &Hello, local_pq_enabled: bool) -> HelloCheck {
         let security = self.security().unwrap_or_default();
-        let is_own_initial_hello = hello.session_seq > 0
+        let is_own_initial_hello = (1..=protocol::MAX_SAFE_INTEGER).contains(&hello.session_seq)
             && self.state.peer_pq.peer_session_seq == hello.session_seq
-            && self
-                .state
-                .active
-                .as_ref()
-                .is_some_and(|active| active.known_by_peer && active.peer_session_seq == hello.session_seq);
+            && self.state.active.as_ref().is_some_and(|active| {
+                active.known_by_peer && active.peer_session_seq == hello.session_seq
+            });
+        let mut check =
+            check_peer_hello(&mut self.state.peer_pq, security, hello, local_pq_enabled);
         if is_own_initial_hello {
-            if hello.pq_capable {
-                self.state.peer_pq.peer_pq_capable = true;
-                self.state.peer_pq.pq_pinned = true;
-            }
-            let downgrade_detected = !security.is_pq && local_pq_enabled && hello.pq_capable;
-            if downgrade_detected {
-                self.state.peer_pq.downgrade_detected = true;
-            }
-            return HelloCheck {
-                downgrade_detected,
-                recommend_start_again: downgrade_detected,
-                stale_session_seq: false,
-            };
+            check.stale_session_seq = false;
         }
-        check_peer_hello(&mut self.state.peer_pq, security, hello, local_pq_enabled)
+        check
     }
 
     /// Go on past the messages that receiving stopped at, as they did not decrypt, once the
@@ -1795,7 +1833,7 @@ impl<M> Session<M> {
             return Err(ErrorKind::UnexpectedPeer.into());
         }
         let new = mem::replace(&mut self.state, older.state);
-        self.merge_incoming_state(new).map(|_| ())
+        self.merge_incoming_state(new, true).map(|_| ())
     }
 
     /// Merge an incoming newly accepted or locally initiated session `incoming` into `self`
@@ -1806,15 +1844,33 @@ impl<M> Session<M> {
     /// `Err(ErrorKind::StaleSession)` / `Err(ErrorKind::DowngradeDetected)` if rejected (leaving
     /// `self`'s active session intact).
     pub fn accept_replacement(&mut self, incoming: Session<M>) -> Result<bool> {
+        self.accept_replacement_with_policy(incoming, true)
+    }
+
+    /// Merge a replacement using the current local PQ setting. Disabling PQ permits a
+    /// classical replacement for this call without granting a persistent classical exception.
+    pub fn accept_replacement_with_policy(
+        &mut self,
+        incoming: Session<M>,
+        local_pq_enabled: bool,
+    ) -> Result<bool> {
         if incoming.state.me != self.state.me || incoming.state.peer != self.state.peer {
             return Err(ErrorKind::UnexpectedPeer.into());
         }
-        self.merge_incoming_state(incoming.state)
+        self.merge_incoming_state(incoming.state, local_pq_enabled)
     }
 
     /// Core session-replacement logic enforcing monotonic `peer_session_seq` anti-rollback,
     /// crossed-start tie-breaking, and PQ-pin downgrade defense.
-    fn merge_incoming_state(&mut self, new: SessionState) -> Result<bool> {
+    fn merge_incoming_state(&mut self, new: SessionState, local_pq_enabled: bool) -> Result<bool> {
+        if new.peer_pq.peer_session_seq > protocol::MAX_SAFE_INTEGER
+            || new
+                .active
+                .as_ref()
+                .is_some_and(|a| a.peer_session_seq > protocol::MAX_SAFE_INTEGER)
+        {
+            return Err(ErrorKind::InvalidInitialMessage.into());
+        }
         let state = &mut self.state;
         if let Some(active) = &new.active {
             let started_here = !active.known_by_peer;
@@ -1829,6 +1885,7 @@ impl<M> Session<M> {
                 // Defense-in-depth: never let an unapproved classical peer-initiated session
                 // silently overwrite a PQ-pinned session.
                 if !active.security.is_pq
+                    && local_pq_enabled
                     && state.peer_pq.pq_pinned
                     && !state.peer_pq.allow_classical_exception
                     && !new.peer_pq.allow_classical_exception
@@ -2032,8 +2089,8 @@ impl<M: LocalMailbox> Session<M> {
     /// the initial messages, then [`skip_stalled`](Session::skip_stalled) and receive again: what
     /// of that page still does not decrypt never will, and is skipped, so that it cannot block
     /// the messages after it. A message whose content expired on the server before it was
-    /// fetched is gone past, as one lost: a page of only those is not the end, and the next one
-    /// is fetched.
+    /// fetched is gone past, as one lost: carried initial messages are returned at the end of the page with
+    /// [`ErrorKind::Expired`]. Empty expired pages are skipped up to a bounded number per call.
     ///
     /// The fetch tells the server which messages the last receive got, with their delivery
     /// tokens, so that it deletes them: save the [state](Session::state) after each receive,
@@ -2042,153 +2099,107 @@ impl<M: LocalMailbox> Session<M> {
     /// Cancel-safe: if the future is dropped, no message is consumed, but those whose contents
     /// expired.
     pub async fn receive(&mut self) -> Result<Vec<Received>> {
-        let mut carried: Vec<InitialMessage> = vec![];
-        let mut expired_pages = 0usize;
-        loop {
-            let cursor = self.state.cursor;
-            match self.receive_page(&mut carried).await? {
-                None => {
-                    if !carried.is_empty() {
-                        return Ok(vec![Received {
-                            content: Err(ErrorKind::Expired.into()),
-                            earlier: false,
-                            initial_messages: carried,
-                        }]);
-                    }
-                    return Ok(vec![]);
-                }
-                // Their contents all expired; unless the page went nowhere, as a server that
-                // sends it again would have it, or we hit the consecutive expired-page / carried
-                // cap, which must not hold this here forever.
-                Some(received) if received.is_empty() && self.state.cursor > cursor => {
-                    expired_pages += 1;
-                    if expired_pages >= MAX_EXPIRED_PAGES || carried.len() >= MAX_CARRIED_INITIALS {
-                        if !carried.is_empty() {
-                            return Ok(vec![Received {
-                                content: Err(ErrorKind::Expired.into()),
-                                earlier: false,
-                                initial_messages: carried,
-                            }]);
-                        }
-                        return Ok(vec![]);
-                    }
-                }
-                Some(mut received) => {
-                    if !carried.is_empty() {
-                        received.push(Received {
-                            content: Err(ErrorKind::Expired.into()),
-                            earlier: false,
-                            initial_messages: mem::take(&mut carried),
-                        });
-                    }
-                    return Ok(received);
-                }
-            }
-        }
-    }
-
-    /// One page of [`receive`](Session::receive), none once the server has no new message.
-    async fn receive_page(
-        &mut self,
-        carried: &mut Vec<InitialMessage>,
-    ) -> Result<Option<Vec<Received>>> {
-        let told = self.state.delivered.len().min(MAX_DELIVERED);
-        let delivered = self.state.delivered[..told]
-            .iter()
-            .map(|token| Bytes::copy_from_slice(token))
-            .collect();
-        let response = self
-            .mailbox
-            .fetch(FetchRequest {
-                sender: Bytes::copy_from_slice(&self.state.peer),
-                recipient: Bytes::copy_from_slice(&self.state.me),
-                after: self.state.cursor,
-                limit: 0,
-                delivered,
-            })
-            .await?;
-        self.state.delivered.drain(..told);
-        if response.messages.is_empty() {
-            return Ok(None);
-        }
-        let last = response
-            .messages
-            .last()
-            .map_or(0, |envelope| envelope.sequence);
-        let attached = |envelope: &Envelope| {
-            envelope
-                .initial_message
-                .as_ref()
-                .and_then(|initial_message| InitialMessage::try_from(initial_message).ok())
-        };
-        let mut received = Vec::with_capacity(response.messages.len());
-        let mut envelopes = response.messages.into_iter();
-        while let Some(envelope) = envelopes.next() {
-            // Its content expired on the server before it was fetched: gone past, as the
-            // ratchet goes past a message lost, while carrying any attached initial message
-            // forward so it is never dropped across expired envelopes or page boundaries.
-            let Some(message) = &envelope.message else {
-                self.state.cursor = self.state.cursor.max(envelope.sequence);
-                if let Some(initial_message) = attached(&envelope)
-                    && carried.len() < MAX_CARRIED_INITIALS
-                    && !carried.contains(&initial_message)
-                {
-                    carried.push(initial_message);
-                }
-                continue;
-            };
-            let decrypted = self.decrypt(message);
-            let stalls = decrypted.as_ref().is_err_and(|e| {
-                !matches!(
-                    e.kind(),
-                    ErrorKind::DuplicateMessage | ErrorKind::EvictedMessage
-                )
-            }) && envelope.sequence > self.state.skip_through;
-            if stalls {
-                self.state.stalled_through = last;
-                let mut initial_messages = mem::take(carried);
-                if let Some(initial_message) = attached(&envelope)
-                    && initial_messages.len() < MAX_CARRIED_INITIALS
-                    && !initial_messages.contains(&initial_message)
-                {
-                    initial_messages.push(initial_message);
-                }
-                // What still does not decrypt once they are accepted is skipped, the rest of
-                // the page with it: so each of its sessions is offered now.
-                for initial_message in envelopes
-                    .by_ref()
-                    .filter_map(|envelope| attached(&envelope))
-                {
-                    if initial_messages.len() >= MAX_CARRIED_INITIALS {
-                        break;
-                    }
-                    if !initial_messages.contains(&initial_message) {
-                        initial_messages.push(initial_message);
-                    }
-                }
-                received.push(Received {
-                    content: Err(ErrorKind::Stalled.into()),
-                    earlier: false,
-                    initial_messages,
-                });
-                return Ok(Some(received));
-            }
-            // Keep expired-envelope carried initials in `carried` so they always flush at page
-            // end via the trailing `Err(ErrorKind::Expired)` entry instead of being attached to
-            // `Ok`/`DuplicateMessage`/`EvictedMessage` entries.
-            let initial_messages = attached(&envelope).into_iter().collect();
-            self.state.cursor = self.state.cursor.max(envelope.sequence);
-            let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
-            if let Ok((_, _, token)) = &decrypted {
-                self.state.delivered.push(*token);
-            }
-            received.push(Received {
-                content: decrypted.map(|(content, ..)| content),
+        self.receive_pages(
+            async |mailbox, request| Ok(mailbox.fetch(request).await?.messages),
+            |content, earlier, initial_messages| Received {
+                content,
                 earlier,
                 initial_messages,
-            });
+            },
+        )
+        .await
+    }
+
+    async fn receive_pages<E: MailboxEnvelope, R>(
+        &mut self,
+        fetch: impl AsyncFn(&M, FetchRequest) -> Result<Vec<E>>,
+        entry: impl Fn(Result<Vec<u8>>, bool, Vec<E::Initial>) -> R,
+    ) -> Result<Vec<R>> {
+        let mut expired_pages = 0;
+        loop {
+            let cursor = self.state.cursor;
+            let told = self.state.delivered.len().min(MAX_DELIVERED);
+            let request = FetchRequest {
+                sender: Bytes::copy_from_slice(&self.state.peer),
+                recipient: Bytes::copy_from_slice(&self.state.me),
+                after: cursor,
+                limit: 0,
+                delivered: self.state.delivered[..told]
+                    .iter()
+                    .map(|token| Bytes::copy_from_slice(token))
+                    .collect(),
+            };
+            let page = fetch(&self.mailbox, request).await?;
+            if page
+                .iter()
+                .any(|env| env.sequence() > protocol::MAX_SAFE_INTEGER)
+            {
+                return Err(ErrorKind::Protocol.into());
+            }
+            self.state.delivered.drain(..told);
+
+            let mut received = Vec::with_capacity(page.len());
+            let mut carried = Vec::new();
+            let mut envelopes = page.into_iter();
+            while let Some(envelope) = envelopes.next() {
+                let sequence = envelope.sequence();
+                let (message, initial) = envelope.into_parts();
+                let Some(message) = message else {
+                    if !carry_initial(&mut carried, initial) {
+                        break;
+                    }
+                    self.state.cursor = self.state.cursor.max(sequence);
+                    continue;
+                };
+
+                let decrypted = self.decrypt(&message);
+                if sequence > self.state.skip_through
+                    && decrypted.as_ref().is_err_and(|e| {
+                        !matches!(
+                            e.kind(),
+                            ErrorKind::DuplicateMessage | ErrorKind::EvictedMessage
+                        )
+                    })
+                {
+                    if !carry_initial(&mut carried, initial) {
+                        break;
+                    }
+                    // Only offer to skip envelopes whose carried initials were surfaced.
+                    self.state.stalled_through = sequence;
+                    for next in envelopes {
+                        let next_sequence = next.sequence();
+                        if !carry_initial(&mut carried, next.into_parts().1) {
+                            break;
+                        }
+                        self.state.stalled_through = next_sequence;
+                    }
+                    received.push(entry(Err(ErrorKind::Stalled.into()), false, carried));
+                    return Ok(received);
+                }
+
+                self.state.cursor = self.state.cursor.max(sequence);
+                let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
+                // decrypt() already queues the tokens of duplicate and evicted messages.
+                if let Ok((_, _, token)) = &decrypted {
+                    self.state.delivered.push(*token);
+                }
+                received.push(entry(
+                    decrypted.map(|(content, ..)| content),
+                    earlier,
+                    initial.into_iter().collect(),
+                ));
+            }
+            if !carried.is_empty() {
+                received.push(entry(Err(ErrorKind::Expired.into()), false, carried));
+            }
+            if !received.is_empty() || self.state.cursor == cursor {
+                return Ok(received);
+            }
+            expired_pages += 1;
+            if expired_pages == MAX_EXPIRED_PAGES {
+                return Ok(received);
+            }
         }
-        Ok(Some(received))
     }
 }
 
@@ -2288,6 +2299,261 @@ mod test {
         assert!(bob_session.receive().await.unwrap().is_empty());
     }
 
+    #[derive(Default)]
+    struct ScriptedMailbox {
+        page: Vec<Envelope>,
+        fail_after: Option<u64>,
+        fetches: Cell<usize>,
+    }
+
+    impl ScriptedMailbox {
+        fn page_after(&self, after: u64) -> protocol::Result<Vec<Envelope>> {
+            self.fetches.set(self.fetches.get() + 1);
+            if self.fail_after == Some(after) {
+                return Err(protocol::ErrorKind::Connect.into());
+            }
+            Ok(self
+                .page
+                .iter()
+                .filter(|e| e.sequence > after)
+                .cloned()
+                .collect())
+        }
+    }
+
+    impl LocalMailbox for ScriptedMailbox {
+        async fn fetch(&self, req: FetchRequest) -> protocol::Result<FetchResponse> {
+            Ok(FetchResponse {
+                messages: self.page_after(req.after)?,
+            })
+        }
+
+        async fn push(&self, _: PushRequest) -> protocol::Result<PushResponse> {
+            unreachable!()
+        }
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    impl protocol::mailbox_v2::LocalMailboxV2 for ScriptedMailbox {
+        async fn fetch_signed(
+            &self,
+            req: protocol::mailbox_v2::FetchSignedRequest,
+        ) -> protocol::Result<protocol::mailbox_v2::FetchSignedResponse> {
+            Ok(protocol::mailbox_v2::FetchSignedResponse {
+                messages: self
+                    .page_after(req.after)?
+                    .into_iter()
+                    .map(|e| protocol::mailbox_v2::EnvelopeV2 {
+                        sequence: e.sequence,
+                        message: e.message,
+                        initial_message: e.initial_message.as_ref().map(Into::into),
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn push_v2(
+            &self,
+            _: protocol::mailbox_v2::PushV2Request,
+        ) -> protocol::Result<protocol::mailbox_v2::PushV2Response> {
+            unreachable!()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum MailboxVersion {
+        V1,
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        V2,
+    }
+
+    impl MailboxVersion {
+        const ALL: &[Self] = &[
+            Self::V1,
+            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+            Self::V2,
+        ];
+
+        async fn receive(
+            self,
+            session: &mut Session<ScriptedMailbox>,
+            _client: &Client<()>,
+        ) -> Result<Vec<Received>> {
+            match self {
+                Self::V1 => session.receive().await,
+                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                Self::V2 => Ok(session
+                    .receive_v2(_client, "relay.example")
+                    .await?
+                    .into_iter()
+                    .map(|r| Received {
+                        content: r.content,
+                        earlier: r.earlier,
+                        initial_messages: r
+                            .initial_messages
+                            .into_iter()
+                            .map(|im| {
+                                let InitialMessageKind::Classical(m) = im.kind else {
+                                    panic!("expected classical fixture")
+                                };
+                                m
+                            })
+                            .collect(),
+                    })
+                    .collect()),
+            }
+        }
+    }
+
+    async fn scripted_mailbox() -> (Client<()>, Session<ScriptedMailbox>, EncryptedMessage) {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (_, mut sender, bob, session) = talking(&handshake, &mailbox).await;
+        let message = sender.encrypt(b"message").unwrap().message;
+        (
+            Client::restore((), bob.state),
+            Session::restore(ScriptedMailbox::default(), session.state),
+            message,
+        )
+    }
+
+    fn expired_page() -> Vec<Envelope> {
+        (1u8..=100)
+            .map(|id| Envelope {
+                sequence: u64::from(id),
+                message: None,
+                initial_message: (id <= 70).then(|| handshake::InitialMessage {
+                    identity_key: Bytes::from_static(&[1; 32]),
+                    ephemeral_key: Bytes::from(vec![id; 32]),
+                    signed_prekey: Bytes::from_static(&[3; 32]),
+                    one_time_prekey: None,
+                    first_message: Some(EncryptedMessage::default()),
+                }),
+            })
+            .collect()
+    }
+
+    fn carried_ids(result: &Received, kind: ErrorKind) -> Vec<u8> {
+        assert_eq!(result.content.as_ref().unwrap_err().kind(), kind);
+        result
+            .initial_messages
+            .iter()
+            .map(|im| im.x3dh.ephemeral_key[0])
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn unsafe_sequence_rejects_the_entire_page_before_decryption() {
+        for version in MailboxVersion::ALL {
+            let (bob, mut session, message) = scripted_mailbox().await;
+            session.mailbox.page = vec![
+                Envelope {
+                    sequence: 1,
+                    message: Some(message),
+                    initial_message: None,
+                },
+                Envelope {
+                    sequence: protocol::MAX_SAFE_INTEGER + 1,
+                    ..Default::default()
+                },
+            ];
+            session.state.delivered.push([5; DELIVERY_TOKEN_LENGTH]);
+            assert_eq!(
+                version
+                    .receive(&mut session, &bob)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Protocol
+            );
+            assert_eq!(
+                (session.state.cursor, session.state.stalled_through),
+                (0, 0)
+            );
+            assert_eq!(session.state.delivered, [[5; DELIVERY_TOKEN_LENGTH]]);
+            session.mailbox.page.pop();
+            assert_eq!(
+                contents(version.receive(&mut session, &bob).await.unwrap()),
+                [b"message"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_initial_is_returned_before_a_later_fetch_error() {
+        for version in MailboxVersion::ALL {
+            let (bob, mut session, _) = scripted_mailbox().await;
+            session.mailbox.page = expired_page();
+            session.mailbox.page.truncate(1);
+            session.mailbox.fail_after = Some(1);
+            let received = version.receive(&mut session, &bob).await.unwrap();
+            assert_eq!(received.len(), 1);
+            assert_eq!(carried_ids(&received[0], ErrorKind::Expired), [1]);
+            assert_eq!(session.mailbox.fetches.get(), 1);
+            assert_eq!(
+                version
+                    .receive(&mut session, &bob)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Server
+            );
+            assert_eq!(session.mailbox.fetches.get(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_and_stalled_carried_initials_resume_at_the_first_one_that_did_not_fit() {
+        for version in MailboxVersion::ALL {
+            for first_stall in [None, Some(1), Some(65)] {
+                let (bob, mut session, _) = scripted_mailbox().await;
+                session.mailbox.page = expired_page();
+                if let Some(sequence) = first_stall {
+                    for env in &mut session.mailbox.page {
+                        if env.sequence >= sequence {
+                            env.message = Some(EncryptedMessage::default());
+                        }
+                    }
+                }
+                let received = version.receive(&mut session, &bob).await.unwrap();
+                assert_eq!(received.len(), 1);
+                let stalled = first_stall == Some(1);
+                let kind = if stalled {
+                    ErrorKind::Stalled
+                } else {
+                    ErrorKind::Expired
+                };
+                assert_eq!(
+                    carried_ids(&received[0], kind),
+                    (1..=64).collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    (session.state.cursor, session.state.stalled_through),
+                    if stalled { (0, 64) } else { (64, 0) }
+                );
+                session.skip_stalled();
+                let next = version.receive(&mut session, &bob).await.unwrap();
+                let kind = if first_stall.is_some() {
+                    ErrorKind::Stalled
+                } else {
+                    ErrorKind::Expired
+                };
+                assert_eq!(
+                    carried_ids(next.last().unwrap(), kind),
+                    (65..=70).collect::<Vec<_>>()
+                );
+                if first_stall.is_some() {
+                    assert_eq!(
+                        (session.state.cursor, session.state.stalled_through),
+                        (64, 100)
+                    );
+                } else {
+                    assert_eq!(session.state.cursor, 100);
+                }
+            }
+        }
+    }
+
     /// A mailbox that answers every fetch with the same expired message, as a faulty server may.
     struct Repeating(Cell<usize>);
 
@@ -2301,6 +2567,45 @@ mod test {
             Ok(FetchResponse {
                 messages: vec![Envelope::default()],
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn sequence_limits_survive_allocation_and_replacement() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (mut alice, _, mut bob, mut session) = talking(&handshake, &mailbox).await;
+        session.state.next_session_seq = protocol::MAX_SAFE_INTEGER - 1;
+        for expected in [
+            protocol::MAX_SAFE_INTEGER - 1,
+            protocol::MAX_SAFE_INTEGER,
+            protocol::MAX_SAFE_INTEGER,
+        ] {
+            assert_eq!(session.allocate_session_seq(), expected);
+            assert_eq!(session.next_session_seq(), protocol::MAX_SAFE_INTEGER);
+        }
+        let id = *session.active_id().unwrap();
+        for invalid_active in [true, false] {
+            alice
+                .initiate(&bob.identity_key(), b"next", ())
+                .await
+                .unwrap();
+            let inbox = bob.take_initial_messages().await.unwrap();
+            let (mut incoming, _) = bob
+                .accept(&alice.identity_key(), &inbox[0], InProcessMailbox(&mailbox))
+                .unwrap();
+            if invalid_active {
+                incoming.state.active.as_mut().unwrap().peer_session_seq =
+                    protocol::MAX_SAFE_INTEGER + 1;
+            } else {
+                incoming.state.peer_pq.peer_session_seq = protocol::MAX_SAFE_INTEGER + 1;
+            }
+            assert_eq!(
+                session.accept_replacement(incoming).unwrap_err().kind(),
+                ErrorKind::InvalidInitialMessage
+            );
+            assert_eq!(session.active_id(), Some(&id));
+            assert_eq!(session.peer_session_seq(), 0);
         }
     }
 
@@ -3339,6 +3644,25 @@ mod test {
         alice.clock().observe(behind);
         let key = alice.subscription().verify(behind).unwrap();
         assert_eq!(key, alice.identity_key());
+        let bound = alice
+            .subscription_for_audience("https://München.example:443/")
+            .unwrap();
+        assert!(bound.is_audience_bound());
+        assert_eq!(
+            bound
+                .verify_for_audience("xn--mnchen-3ya.example", behind)
+                .unwrap(),
+            key
+        );
+        assert!(
+            bound
+                .verify_for_audience("relay-b.example", behind)
+                .is_err()
+        );
+        assert_eq!(
+            alice.subscription_for_audience("").unwrap_err().kind(),
+            ErrorKind::Protocol
+        );
     }
 
     #[tokio::test]
@@ -3551,7 +3875,8 @@ mod test {
         assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_cursor).is_err());
         alice_session.state.cursor = orig_cursor;
 
-        alice_session.state.delivered = vec![[0u8; DELIVERY_TOKEN_LENGTH]; MAX_STORED_DELIVERED + 1];
+        alice_session.state.delivered =
+            vec![[0u8; DELIVERY_TOKEN_LENGTH]; MAX_STORED_DELIVERED + 1];
         let bad_delivered = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
         assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_delivered).is_err());
         alice_session.state.delivered.clear();

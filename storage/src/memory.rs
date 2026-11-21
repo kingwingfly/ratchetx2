@@ -1,30 +1,78 @@
 //! In-memory backend.
 
-#[cfg(feature = "pq")]
-use std::collections::HashSet;
 use std::collections::{HashMap, VecDeque};
+#[cfg(feature = "pq")]
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use crate::{
+    AttachmentId, AttachmentStore, Bundle, ErrorKind, HandshakeStore, MAX_QUEUE_BYTES,
+    MAX_QUEUE_MESSAGES, MAX_SAFE_INTEGER, MailboxStore, PublicKey, Result, StoredAttachment,
+    StoredInitialMessage, StoredMessage,
+};
 #[cfg(feature = "pq")]
 use crate::{
     ClaimedPqBundle, IdempotentMailboxStore, PqHandshakeStore, PqPrekeyId, PqStorageSnapshot,
     PublishV2Record, PublishV2Status, RefillPrekeysRecord, RefillStatus, StoredCapabilityManifest,
     StoredInitialMessageV2, StoredPqPrekey,
 };
-use crate::{
-    AttachmentId, AttachmentStore, Bundle, ErrorKind, HandshakeStore, MAX_QUEUE_BYTES,
-    MAX_QUEUE_MESSAGES, MAX_SAFE_INTEGER, MailboxStore, PublicKey, Result, StoredAttachment,
-    StoredInitialMessage, StoredMessage,
-};
+
+/// How long a mailbox retry can recover the original sequence after insertion.
+#[cfg(feature = "pq")]
+pub const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Maximum retained client-message IDs per sender and recipient.
+#[cfg(feature = "pq")]
+pub const DEFAULT_MAX_DEDUP_TOMBSTONES: usize = 4096;
+
+#[cfg(feature = "pq")]
+#[derive(Debug)]
+struct DedupLimits {
+    ttl: Duration,
+    max_per_queue: usize,
+}
+
+#[cfg(feature = "pq")]
+impl Default for DedupLimits {
+    fn default() -> Self {
+        Self {
+            ttl: DEFAULT_DEDUP_TTL,
+            max_per_queue: DEFAULT_MAX_DEDUP_TOMBSTONES,
+        }
+    }
+}
+
+#[cfg(feature = "pq")]
+#[derive(Debug)]
+struct Tombstone {
+    id: [u8; 16],
+    sequence: u64,
+    inserted: Instant,
+}
 
 /// Keeps everything in memory until dropped. Implements [`HandshakeStore`], [`MailboxStore`],
-/// [`AttachmentStore`], and (with the `pq` feature) [`PqHandshakeStore`] and
-/// [`IdempotentMailboxStore`].
+/// [`AttachmentStore`], and the PQ handshake and idempotent mailbox traits with the `pq` feature.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
     inner: Mutex<Inner>,
+    #[cfg(feature = "pq")]
+    dedup: DedupLimits,
+}
+
+#[cfg(feature = "pq")]
+impl MemoryStore {
+    /// Create a store with a fixed retry window and tombstone cap for each mailbox queue.
+    /// A zero TTL or cap disables deduplication.
+    pub fn with_dedup_limits(ttl: Duration, max_per_queue: usize) -> Self {
+        Self {
+            dedup: DedupLimits { ttl, max_per_queue },
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -55,9 +103,9 @@ struct Inner {
     /// One-time PQOPKs per identity, FIFO order.
     #[cfg(feature = "pq")]
     pq_one_time: HashMap<PublicKey, VecDeque<StoredPqPrekey>>,
-    /// Deduplication map `(sender, recipient, client_message_id) -> sequence`.
+    /// Tombstones in insertion order for each queue, independent of queued message rows.
     #[cfg(feature = "pq")]
-    mailbox_dedup: HashMap<(PublicKey, PublicKey, [u8; 16]), u64>,
+    mailbox_dedup: HashMap<(PublicKey, PublicKey), VecDeque<Tombstone>>,
 }
 
 /// A message of a queue, with SHA-256 of its delivery token, if any.
@@ -65,8 +113,6 @@ struct Inner {
 struct Queued {
     message: StoredMessage,
     delivery_hash: Option<[u8; 32]>,
-    #[cfg(feature = "pq")]
-    client_message_id: Option<[u8; 16]>,
     bytes: u64,
 }
 
@@ -132,7 +178,6 @@ impl Inner {
         content: Bytes,
         initial_message: Option<Bytes>,
         delivery_hash: Option<[u8; 32]>,
-        #[cfg(feature = "pq")] client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
         let incoming_bytes = message_bytes(&header, &content, initial_message.as_ref());
         let key = (*sender, *recipient);
@@ -140,7 +185,9 @@ impl Inner {
             if queue.len() >= MAX_QUEUE_MESSAGES {
                 return Err(ErrorKind::LimitExceeded.into());
             }
-            let current_bytes: u64 = queue.iter().fold(0u64, |acc, q| acc.saturating_add(q.bytes));
+            let current_bytes: u64 = queue
+                .iter()
+                .fold(0u64, |acc, q| acc.saturating_add(q.bytes));
             if current_bytes.saturating_add(incoming_bytes) > MAX_QUEUE_BYTES {
                 return Err(ErrorKind::LimitExceeded.into());
             }
@@ -165,8 +212,6 @@ impl Inner {
         self.queues.entry(key).or_default().push(Queued {
             message,
             delivery_hash,
-            #[cfg(feature = "pq")]
-            client_message_id,
             bytes: incoming_bytes,
         });
         Ok(next)
@@ -684,8 +729,6 @@ impl MailboxStore for MemoryStore {
             content,
             initial_message,
             delivery_hash,
-            #[cfg(feature = "pq")]
-            None,
         )
     }
 
@@ -696,23 +739,12 @@ impl MailboxStore for MemoryStore {
         hashes: &[[u8; 32]],
     ) -> Result<()> {
         let mut inner = self.inner.lock();
-        #[cfg(feature = "pq")]
-        let mut removed_cids = Vec::new();
         if let Some(queue) = inner.queues.get_mut(&(*sender, *recipient)) {
             queue.retain(|queued| {
-                let delete = queued
+                !queued
                     .delivery_hash
-                    .is_some_and(|hash| hashes.contains(&hash));
-                #[cfg(feature = "pq")]
-                if delete && let Some(cid) = queued.client_message_id {
-                    removed_cids.push(cid);
-                }
-                !delete
+                    .is_some_and(|hash| hashes.contains(&hash))
             });
-        }
-        #[cfg(feature = "pq")]
-        for cid in removed_cids {
-            inner.mailbox_dedup.remove(&(*sender, *recipient, cid));
         }
         Ok(())
     }
@@ -751,10 +783,20 @@ impl IdempotentMailboxStore for MemoryStore {
         client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
         let mut inner = self.inner.lock();
-        if let Some(cid) = client_message_id
-            && let Some(&existing_seq) = inner.mailbox_dedup.get(&(*sender, *recipient, cid))
-        {
-            return Ok(existing_seq);
+        let key = (*sender, *recipient);
+        let now = Instant::now();
+        if let Some(entries) = inner.mailbox_dedup.get_mut(&key) {
+            while entries
+                .front()
+                .is_some_and(|entry| now.duration_since(entry.inserted) >= self.dedup.ttl)
+            {
+                entries.pop_front();
+            }
+            if let Some(id) = client_message_id
+                && let Some(entry) = entries.iter().find(|entry| entry.id == id)
+            {
+                return Ok(entry.sequence);
+            }
         }
         let seq = inner.append_inner(
             sender,
@@ -763,10 +805,32 @@ impl IdempotentMailboxStore for MemoryStore {
             content,
             initial_message,
             delivery_hash,
-            client_message_id,
         )?;
-        if let Some(cid) = client_message_id {
-            inner.mailbox_dedup.insert((*sender, *recipient, cid), seq);
+        if let Some(id) = client_message_id
+            && self.dedup.max_per_queue > 0
+            && !self.dedup.ttl.is_zero()
+        {
+            let Inner {
+                mailbox_dedup,
+                queues,
+                ..
+            } = &mut *inner;
+            let entries = mailbox_dedup.entry(key).or_default();
+            if entries.len() == self.dedup.max_per_queue {
+                // Prefer the oldest delivered message. Queue rows are sorted by sequence.
+                let queue = &queues[&key];
+                let oldest_delivered = entries.iter().position(|entry| {
+                    queue
+                        .binary_search_by_key(&entry.sequence, |row| row.message.sequence)
+                        .is_err()
+                });
+                entries.remove(oldest_delivered.unwrap_or(0));
+            }
+            entries.push_back(Tombstone {
+                id,
+                sequence: seq,
+                inserted: now,
+            });
         }
         Ok(seq)
     }
@@ -837,38 +901,91 @@ mod test {
         futures::executor::block_on(async {
             let store = MemoryStore::default();
             let ghost = [0x99; 32];
-            assert_eq!(store.take_initial_messages(&ghost, 100).await.unwrap(), Some(vec![]));
+            assert_eq!(
+                store.take_initial_messages(&ghost, 100).await.unwrap(),
+                Some(vec![])
+            );
             // Still does not allocate an inbox entry or record a replay watermark.
             assert!(store.inner.lock().inboxes.is_empty());
-            assert_eq!(store.take_initial_messages(&ghost, 50).await.unwrap(), Some(vec![]));
+            assert_eq!(
+                store.take_initial_messages(&ghost, 50).await.unwrap(),
+                Some(vec![])
+            );
             assert!(store.inner.lock().inboxes.is_empty());
         });
     }
 
     #[cfg(feature = "pq")]
     #[test]
-    fn mailbox_dedup_pruned_on_delete_delivered() {
+    fn tombstones_expire_at_the_configured_age() {
         futures::executor::block_on(async {
-            let store = MemoryStore::default();
+            let ttl = Duration::from_secs(60);
+            let store = MemoryStore::with_dedup_limits(ttl, 4);
             let (alice, bob) = ([1; 32], [2; 32]);
-            let cid = [0xAA; 16];
-            let hash = [0xBB; 32];
-            let seq = store
-                .append_idempotent(
+            let append = || {
+                store.append_idempotent(
                     &alice,
                     &bob,
-                    Bytes::from_static(b"h"),
-                    Bytes::from_static(b"c"),
+                    Bytes::new(),
+                    Bytes::new(),
                     None,
-                    Some(hash),
-                    Some(cid),
+                    Some([3; 32]),
+                    Some([4; 16]),
                 )
+            };
+            let seq = append().await.unwrap();
+            store
+                .delete_delivered(&alice, &bob, &[[3; 32]])
                 .await
                 .unwrap();
-            assert_eq!(seq, 1);
-            assert_eq!(store.inner.lock().mailbox_dedup.len(), 1);
-            store.delete_delivered(&alice, &bob, &[hash]).await.unwrap();
-            assert!(store.inner.lock().mailbox_dedup.is_empty());
+            assert_eq!(append().await.unwrap(), seq);
+            assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
+            store
+                .inner
+                .lock()
+                .mailbox_dedup
+                .get_mut(&(alice, bob))
+                .unwrap()[0]
+                .inserted -= ttl;
+            assert_eq!(append().await.unwrap(), seq + 1);
+            assert_eq!(store.inner.lock().mailbox_dedup[&(alice, bob)].len(), 1);
+        });
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn tombstone_cap_is_per_queue_and_evicts_delivered_messages_first() {
+        futures::executor::block_on(async {
+            let store = MemoryStore::with_dedup_limits(DEFAULT_DEDUP_TTL, 2);
+            let (alice, bob, carol) = ([1; 32], [2; 32], [3; 32]);
+            let append = async |recipient: &PublicKey, id: u8| {
+                store
+                    .append_idempotent(
+                        &alice,
+                        recipient,
+                        Bytes::new(),
+                        Bytes::new(),
+                        None,
+                        Some([id; 32]),
+                        Some([id; 16]),
+                    )
+                    .await
+                    .unwrap()
+            };
+            assert_eq!(append(&bob, 1).await, 1);
+            assert_eq!(append(&carol, 1).await, 1);
+            assert_eq!(append(&bob, 2).await, 2);
+            for id in 3..=20 {
+                store
+                    .delete_delivered(&alice, &bob, &[[id - 1; 32]])
+                    .await
+                    .unwrap();
+                assert_eq!(append(&bob, id).await, u64::from(id));
+                assert_eq!(store.inner.lock().mailbox_dedup[&(alice, bob)].len(), 2);
+            }
+            assert_eq!(append(&bob, 1).await, 1);
+            assert_eq!(append(&carol, 1).await, 1);
+            assert_eq!(append(&bob, 2).await, 21);
         });
     }
 }

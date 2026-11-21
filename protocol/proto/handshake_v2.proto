@@ -192,7 +192,8 @@ message InitialMessageV2 {
   bytes pq_prekey_id = 10;
   // ML-KEM ciphertext (exact suite ct_len for version 2; empty for version 1).
   bytes pq_ciphertext = 11;
-  // Optional SHA-256 digest of the recipient's verified CapabilityManifest (32 bytes).
+  // SHA-256 digest of the recipient's verified CapabilityManifest (32 bytes when
+  // present for version 2). Must be empty for version 1.
   bytes manifest_digest = 12;
 }
 

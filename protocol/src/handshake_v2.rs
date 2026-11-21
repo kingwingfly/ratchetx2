@@ -27,6 +27,7 @@ pub(crate) mod proto {
     include!(concat!(env!("OUT_DIR"), "/handshake.v2.rs"));
 }
 
+pub use crate::normalize_audience;
 pub use proto::*;
 #[cfg(feature = "server")]
 pub use server::{HandshakeV2Limits, HandshakeV2Server, ServerInfoConfig};
@@ -46,10 +47,8 @@ pub const ACK_INITIAL_DOMAIN: &[u8] = b"ratchetx2.ack-initial.v2\0";
 #[trait_variant::make(HandshakeV2: Send)]
 pub trait LocalHandshakeV2 {
     /// Discover server PQ capabilities and canonical server audience.
-    async fn get_server_info(
-        &self,
-        request: GetServerInfoRequest,
-    ) -> Result<GetServerInfoResponse>;
+    async fn get_server_info(&self, request: GetServerInfoRequest)
+    -> Result<GetServerInfoResponse>;
     /// Publish a signed [`CapabilityManifest`] and classical + PQ prekeys.
     async fn publish_v2(&self, request: PublishV2Request) -> Result<PublishV2Response>;
     /// Append fresh classical OPKs and/or signed PQOPKs to the current generation without
@@ -154,10 +153,7 @@ pub fn manifest_digest(manifest: &CapabilityManifest) -> Result<[u8; 32]> {
 }
 
 /// Populates `manifest.identity_key` and `manifest.signature` using `identity`.
-pub fn sign_manifest(
-    identity: &XEdDSAPrivateKey,
-    manifest: &mut CapabilityManifest,
-) -> Result<()> {
+pub fn sign_manifest(identity: &XEdDSAPrivateKey, manifest: &mut CapabilityManifest) -> Result<()> {
     let identity_key = identity.compute_public_key().to_bytes();
     manifest.identity_key = Bytes::copy_from_slice(&identity_key);
     let input = manifest_signing_input(manifest)?;
@@ -576,12 +572,12 @@ impl TryFrom<&ClaimBundleResponse> for PqPrekeyBundle {
     /// Converts a PQ-enabled [`ClaimBundleResponse`] into an [`x3dh::PqPrekeyBundle`], choosing
     /// `pq_one_time_prekey` when present and falling back to `pq_last_resort` otherwise.
     fn try_from(response: &ClaimBundleResponse) -> Result<Self> {
-        let (pq_key, pq_last_resort) = match (&response.pq_one_time_prekey, &response.pq_last_resort)
-        {
-            (Some(opk), _) => (opk, false),
-            (None, Some(lr)) => (lr, true),
-            (None, None) => return Err(ErrorKind::Malformed.into()),
-        };
+        let (pq_key, pq_last_resort) =
+            match (&response.pq_one_time_prekey, &response.pq_last_resort) {
+                (Some(opk), _) => (opk, false),
+                (None, Some(lr)) => (lr, true),
+                (None, None) => return Err(ErrorKind::Malformed.into()),
+            };
         let parsed = PublishedPqPrekey::try_from(pq_key)?;
         Ok(Self {
             signed_prekey: fixed(&response.signed_prekey)?,
@@ -673,7 +669,7 @@ impl TryFrom<&InitialMessageV2> for x3dh::InitialMessage {
     type Error = Error;
 
     fn try_from(message: &InitialMessageV2) -> Result<Self> {
-        if message.version != 1 {
+        if message.version != 1 || !message.manifest_digest.is_empty() {
             return Err(ErrorKind::Malformed.into());
         }
         Ok(Self {
@@ -708,7 +704,7 @@ impl TryFrom<&InitialMessageV2> for crate::handshake::InitialMessage {
     type Error = Error;
 
     fn try_from(message: &InitialMessageV2) -> Result<Self> {
-        if message.version != 1 {
+        if message.version != 1 || !message.manifest_digest.is_empty() {
             return Err(ErrorKind::Malformed.into());
         }
         Ok(Self {
@@ -719,92 +715,6 @@ impl TryFrom<&InitialMessageV2> for crate::handshake::InitialMessage {
             first_message: message.first_message.clone(),
         })
     }
-}
-
-/// Normalizes a configured server audience or URL (such as `SERVER_ID`) into canonical
-/// `host[:port]` form:
-///
-/// - trims surrounding whitespace
-/// - strips an optional `http://`, `https://`, `ws://`, or `wss://` scheme case-insensitively
-/// - strips any trailing path, query, or fragment
-/// - lowercases hostnames and canonicalizes bracketed IPv6 literals via [`std::net::Ipv6Addr`]
-/// - parses numeric ports (stripping leading zeros and empty trailing `:`)
-/// - drops default ports (`:443` for `https`/`wss`, `:80` for `http`/`ws`, and both `:80` and
-///   `:443` when no scheme was specified)
-pub fn normalize_audience(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
-        return Err(ErrorKind::Malformed.into());
-    }
-    let (explicit_scheme, rest) = if let Some((scheme, after)) = trimmed.split_once("://") {
-        match scheme.to_ascii_lowercase().as_str() {
-            "https" | "wss" => (Some("https"), after),
-            "http" | "ws" => (Some("http"), after),
-            _ => return Err(ErrorKind::Malformed.into()),
-        }
-    } else {
-        (None, trimmed)
-    };
-
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') {
-        return Err(ErrorKind::Malformed.into());
-    }
-
-    let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix('[') {
-        let Some((ipv6_raw, tail)) = after_bracket.split_once(']') else {
-            return Err(ErrorKind::Malformed.into());
-        };
-        let ipv6: std::net::Ipv6Addr = ipv6_raw.parse().map_err(|_| ErrorKind::Malformed)?;
-        let port_str = if tail.is_empty() {
-            None
-        } else if let Some(p) = tail.strip_prefix(':') {
-            Some(p)
-        } else {
-            return Err(ErrorKind::Malformed.into());
-        };
-        (format!("[{ipv6}]"), port_str)
-    } else {
-        if authority.contains('[') || authority.contains(']') {
-            return Err(ErrorKind::Malformed.into());
-        }
-        let (host_raw, port_str) = match authority.split_once(':') {
-            Some((h, p)) => {
-                if p.contains(':') {
-                    return Err(ErrorKind::Malformed.into());
-                }
-                (h, Some(p))
-            }
-            None => (authority, None),
-        };
-        if host_raw.is_empty() || host_raw.bytes().any(|b| b.is_ascii_control()) {
-            return Err(ErrorKind::Malformed.into());
-        }
-        (host_raw.to_ascii_lowercase(), port_str)
-    };
-
-    let port = match port_str {
-        None | Some("") => None,
-        Some(p) => {
-            if !p.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(ErrorKind::Malformed.into());
-            }
-            let parsed: u16 = p.parse().map_err(|_| ErrorKind::Malformed)?;
-            Some(parsed)
-        }
-    };
-
-    let port = match (explicit_scheme, port) {
-        (Some("https"), Some(443)) => None,
-        (Some("http"), Some(80)) => None,
-        (None, Some(80 | 443)) => None,
-        (_, other) => other,
-    };
-
-    Ok(match port {
-        Some(p) => format!("{host}:{p}"),
-        None => host,
-    })
 }
 
 /// Validated fields extracted from an [`InitialMessageV2`].
@@ -834,26 +744,18 @@ pub(crate) fn validate_initial_message_v2(
     let sender: PublicKey = fixed(&message.identity_key)?;
     let ephemeral_key: PublicKey = fixed(&message.ephemeral_key)?;
     let signed_prekey: PublicKey = fixed(&message.signed_prekey)?;
-    let one_time_prekey: Option<PublicKey> = message
-        .one_time_prekey
-        .as_deref()
-        .map(fixed)
-        .transpose()?;
+    let one_time_prekey: Option<PublicKey> =
+        message.one_time_prekey.as_deref().map(fixed).transpose()?;
     check_canonical_key(&sender)?;
     check_canonical_key(&ephemeral_key)?;
     check_canonical_key(&signed_prekey)?;
     if let Some(opk) = &one_time_prekey {
         check_canonical_key(opk)?;
     }
-    let manifest_digest = if message.manifest_digest.is_empty() {
-        None
-    } else {
-        Some(fixed(&message.manifest_digest)?)
-    };
-
     match message.version {
         1 => {
-            if message.pq_suite != 0
+            if !message.manifest_digest.is_empty()
+                || message.pq_suite != 0
                 || message.pq_last_resort
                 || !message.pq_prekey_id.is_empty()
                 || !message.pq_ciphertext.is_empty()
@@ -868,7 +770,7 @@ pub(crate) fn validate_initial_message_v2(
                 pq_suite: None,
                 pq_prekey_id: None,
                 pq_ciphertext: None,
-                manifest_digest,
+                manifest_digest: None,
             })
         }
         PQXDH_VERSION => {
@@ -889,7 +791,9 @@ pub(crate) fn validate_initial_message_v2(
                 pq_suite: Some(suite_u8),
                 pq_prekey_id: Some(prekey_id),
                 pq_ciphertext: Some(message.pq_ciphertext.clone()),
-                manifest_digest,
+                manifest_digest: (!message.manifest_digest.is_empty())
+                    .then(|| fixed(&message.manifest_digest))
+                    .transpose()?,
             })
         }
         _ => Err(ErrorKind::Malformed.into()),
@@ -1038,11 +942,7 @@ mod server {
             pq_enabled: manifest.pq_enabled,
             strict_pq: manifest.strict_pq,
             pq_ratchet_supported: manifest.pq_ratchet_supported,
-            offered_suites: manifest
-                .offered_suites
-                .into_iter()
-                .map(u32::from)
-                .collect(),
+            offered_suites: manifest.offered_suites.into_iter().map(u32::from).collect(),
             signed_prekey: Bytes::copy_from_slice(&manifest.signed_prekey),
             pq_last_resort: manifest
                 .pq_last_resort
@@ -1847,7 +1747,10 @@ mod server {
                 })
                 .await
                 .unwrap();
-            assert_eq!(claimed_refill.one_time_prekey.as_deref(), Some(&[0x44; 32][..]));
+            assert_eq!(
+                claimed_refill.one_time_prekey.as_deref(),
+                Some(&[0x44; 32][..])
+            );
             assert_eq!(claimed_refill.pq_one_time_prekey, Some(fresh_opk768));
             assert_eq!(
                 v2.refill_prekeys(refill).await.unwrap_err().kind(),
@@ -1892,16 +1795,9 @@ mod server {
                 std::slice::from_ref(&lr1024),
                 now,
             );
-            let strict_req = PublishV2Request::sign(
-                &bob,
-                m2,
-                None,
-                &[[0x45; 32]],
-                vec![lr1024],
-                vec![],
-                now,
-            )
-            .unwrap();
+            let strict_req =
+                PublishV2Request::sign(&bob, m2, None, &[[0x45; 32]], vec![lr1024], vec![], now)
+                    .unwrap();
             v2.publish_v2(strict_req).await.unwrap();
             assert_eq!(
                 v1.publish(PublishRequest::sign(&bob, &v1_prekeys, 100).unwrap())
@@ -1933,16 +1829,9 @@ mod server {
                 &[],
                 now,
             );
-            let off_no_sig = PublishV2Request::sign(
-                &bob,
-                m3.clone(),
-                None,
-                &[[0x46; 32]],
-                vec![],
-                vec![],
-                now,
-            )
-            .unwrap();
+            let off_no_sig =
+                PublishV2Request::sign(&bob, m3.clone(), None, &[[0x46; 32]], vec![], vec![], now)
+                    .unwrap();
             assert_eq!(
                 v2.publish_v2(off_no_sig).await.unwrap_err().kind(),
                 ErrorKind::Malformed
@@ -2025,6 +1914,32 @@ mod server {
             })
             .await
             .unwrap();
+
+            let classical_with_digest = InitialMessageV2 {
+                version: 1,
+                identity_key: Bytes::copy_from_slice(&alice_pk),
+                ephemeral_key: Bytes::from_static(&[0x11; 32]),
+                signed_prekey: Bytes::from_static(&[0x22; 32]),
+                first_message: Some(EncryptedMessage::default()),
+                manifest_digest: Bytes::from_static(&[0x44; 32]),
+                ..Default::default()
+            };
+            assert_eq!(
+                x3dh::InitialMessage::try_from(&classical_with_digest)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Malformed
+            );
+            assert_eq!(
+                v2.send_initial_v2(SendInitialV2Request {
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(classical_with_digest)
+                })
+                .await
+                .unwrap_err()
+                .kind(),
+                ErrorKind::Malformed
+            );
 
             // Bad PQ ciphertext length is rejected.
             let bad_ct = SendInitialV2Request {
@@ -2152,7 +2067,8 @@ mod server {
 
         #[tokio::test]
         async fn rejects_unsafe_and_future_timestamps_on_v2_requests() {
-            let v2 = HandshakeV2Server::new(MemoryStore::default(), ServerInfoConfig::new("r.test"));
+            let v2 =
+                HandshakeV2Server::new(MemoryStore::default(), ServerInfoConfig::new("r.test"));
             let bob = XEdDSAPrivateKey::generate();
             let now = now_millis();
             let future = now + crate::MAX_CLOCK_SKEW + 120_000;
@@ -2418,7 +2334,14 @@ mod server {
                     .kind(),
                 ErrorKind::Unimplemented
             );
-            assert_eq!(shared.pq_snapshot(&bob_pk).await.unwrap().classical_one_time_count, 1);
+            assert_eq!(
+                shared
+                    .pq_snapshot(&bob_pk)
+                    .await
+                    .unwrap()
+                    .classical_one_time_count,
+                1
+            );
 
             // ClaimBundle with empty preferred_suites (classical client) against non-strict Dave
             // returns classical bundle without consuming PQ prekeys.
@@ -2434,7 +2357,11 @@ mod server {
             assert_eq!(dave_claim.pq_one_time_prekey, None);
             assert_eq!(dave_claim.one_time_prekey.as_deref(), Some(&[0x45; 32][..]));
             assert_eq!(
-                shared.pq_snapshot(&dave_pk).await.unwrap().pq_one_time_counts,
+                shared
+                    .pq_snapshot(&dave_pk)
+                    .await
+                    .unwrap()
+                    .pq_one_time_counts,
                 vec![(2, 1)]
             );
 
@@ -2614,7 +2541,10 @@ mod server {
             assert_eq!(claimed_off.manifest, Some(bob_off));
             assert_eq!(claimed_off.signed_prekey.as_ref(), &bob_spk2);
             assert!(claimed_off.signed_prekey_signature.is_some());
-            assert_eq!(claimed_off.one_time_prekey.as_deref(), Some(&[0x71; 32][..]));
+            assert_eq!(
+                claimed_off.one_time_prekey.as_deref(),
+                Some(&[0x71; 32][..])
+            );
             assert_eq!(claimed_off.pq_last_resort, None);
             assert_eq!(claimed_off.pq_one_time_prekey, None);
 
@@ -2650,7 +2580,10 @@ mod server {
                 ("http://localhost:8787/", "localhost:8787"),
                 ("http://example.com:443", "example.com:443"),
                 ("https://example.com:80", "example.com:80"),
-                ("WSS://Chat.Example.com:443/notifications", "chat.example.com"),
+                (
+                    "WSS://Chat.Example.com:443/notifications",
+                    "chat.example.com",
+                ),
                 ("WS://localhost:80/notifications", "localhost"),
                 ("http://[0:0::1]:8787", "[::1]:8787"),
                 ("https://[0:0::1]:0443/", "[::1]"),

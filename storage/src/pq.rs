@@ -264,6 +264,10 @@ pub trait LocalPqHandshakeStore {
 pub trait LocalIdempotentMailboxStore {
     /// Append a message to the queue from `sender` to `recipient`, deduplicating retries when
     /// `client_message_id` is `Some` and has already been committed for `(sender, recipient)`.
+    /// Backends must retain bounded, expiring `(sender, recipient, client_message_id) -> sequence`
+    /// tombstones independently of row deletion by [`delete_delivered`](crate::LocalMailboxStore::delete_delivered).
+    /// While the tombstone is retained, a retry returns the original sequence even after the recipient has
+    /// acknowledged the message, without inserting another queue slot.
     #[allow(clippy::too_many_arguments)]
     async fn append_idempotent(
         &self,

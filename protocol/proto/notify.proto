@@ -14,6 +14,9 @@ message SubscribeRequest {
   uint64 timestamp = 2;
   // The identity key's XEdDSA signature of this request (64 bytes).
   bytes signature = 3;
+  // Canonical relay audience for v2 subscriptions signed with "notify.v2/subscribe".
+  // Empty for legacy subscriptions signed with "notify.v1/subscribe".
+  string audience = 4;
 }
 
 // Something arrived for the subscriber.
