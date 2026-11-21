@@ -237,6 +237,6 @@ mod tests {
         assert!(MIGRATE_DEDUP_INDEXES.contains("mailbox_dedup_by_sender"));
         assert!(MIGRATE_META_TO_V3.contains("schema_version = 3"));
         assert!(SCHEMA_SEEN_SUBSCRIBES.contains("CREATE TABLE IF NOT EXISTS seen_subscribes"));
-        assert!(MAX_SAFE_INTEGER > DEDUP_TTL_MS);
+        const { assert!(MAX_SAFE_INTEGER > DEDUP_TTL_MS) };
     }
 }
