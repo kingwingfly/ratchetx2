@@ -1,0 +1,728 @@
+use leptos::{ev, html, prelude::*};
+use session::PublicKey;
+
+use crate::{
+    icon::{Icon, icon},
+    state::{
+        Body, ClassicalPrompt, ContactView, Delivery, Dialog, MessageView, SecurityAlert,
+        UploadState, UploadView,
+    },
+    util::{clock, short},
+};
+
+use super::{
+    common::{
+        AllowClassical, act, act_while, can_allow_classical, extension, initials, open_chat,
+        pq_available, pq_retry_ready, server_pq_disabled, strict_pq_enabled, upgrade_disabled_tip,
+    },
+    composer::Composer,
+    engine,
+    media::{InlineMedia, Source, file_card, inline_media},
+    ui,
+};
+
+/// Compute `(css_class, label, tooltip)` for a contact's security badge (`detailed` shows the full
+/// label in `ContactInfo`).
+pub(super) fn security_badge_parts(
+    contact: &ContactView,
+    detailed: bool,
+) -> (&'static str, String, String) {
+    if contact.has_downgrade() {
+        (
+            "sec-badge danger",
+            "Downgrade detected".to_string(),
+            "Post-quantum downgrade detected for this chat".to_string(),
+        )
+    } else if contact.is_quarantined() {
+        let label = if detailed {
+            "Classical chat quarantined — review before replying"
+        } else {
+            "Quarantined"
+        };
+        (
+            "sec-badge classical",
+            label.to_string(),
+            "Classical chat quarantined — review before replying".to_string(),
+        )
+    } else if !contact.has_active_session {
+        if contact.pq_pinned {
+            let label = if detailed {
+                "Session ended — next message starts a new post-quantum session"
+            } else {
+                "PQ · Session ended"
+            };
+            (
+                "sec-badge neutral",
+                label.to_string(),
+                "Session ended; post-quantum encryption is pinned for the next session".to_string(),
+            )
+        } else {
+            let label = if detailed {
+                "No active session — next message starts a new session"
+            } else {
+                "Session ended"
+            };
+            (
+                "sec-badge neutral",
+                label.to_string(),
+                "No active session — next message starts a new session".to_string(),
+            )
+        }
+    } else if contact.security.is_pq {
+        let text = if detailed {
+            contact.security.detail_label()
+        } else {
+            contact.security.badge_label()
+        };
+        ("sec-badge pq", text, contact.security.detail_label())
+    } else {
+        (
+            "sec-badge classical",
+            "Classical only".to_string(),
+            contact.security.detail_label(),
+        )
+    }
+}
+
+/// Whether `ContactInfo` should offer `"Upgrade to PQ"` for `contact` when local PQ is available.
+pub(super) fn contact_can_upgrade_to_pq(contact: &ContactView) -> bool {
+    contact.has_downgrade()
+        || contact.is_quarantined()
+        || (contact.has_active_session && !contact.security.is_pq)
+}
+
+/// Render a security status badge for `contact` (`detailed` shows the full label in `ContactInfo`).
+pub(super) fn security_badge(contact: &ContactView, detailed: bool) -> AnyView {
+    let (class, label, title) = security_badge_parts(contact, detailed);
+    view! {
+        <span class=class title=title>
+            {label}
+        </span>
+    }
+    .into_any()
+}
+
+#[component]
+pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
+    let ui = ui();
+    let contact = move || ui.contact(&peer);
+    let label = move || contact().map(|contact| contact.label()).unwrap_or_default();
+    let request = move || contact().is_some_and(|contact| contact.request);
+    let quarantined = move || contact().is_some_and(|contact| contact.is_quarantined());
+    let strict_pq = Memo::new(move |_| strict_pq_enabled(ui));
+    let composer_disabled = move || request() || quarantined();
+    let composer_placeholder = move || {
+        if quarantined() {
+            if strict_pq.get() {
+                "Strict PQ mode: upgrade to PQ to write"
+            } else {
+                "Allow classical or upgrade to PQ to write"
+            }
+        } else if request() {
+            "Accept the request to write"
+        } else {
+            "Write a message"
+        }
+    };
+    let sec_busy = RwSignal::new(false);
+    view! {
+        <section class="pane">
+            <header class="pane-head">
+                <button
+                    class="btn icon quiet back"
+                    title="Back to the chats"
+                    aria-label="Back to the chats"
+                    on:click=move |_| open_chat(None)
+                >
+                    {icon(Icon::Back)}
+                </button>
+                <span class="avatar">{move || initials(&label())}</span>
+                <div class="pane-title">
+                    <strong>{label}</strong>
+                    <div class="pane-sub">
+                        <span>{short(&peer)}</span>
+                        {move || contact().map(|c| security_badge(&c, false))}
+                    </div>
+                </div>
+                <button
+                    class="btn icon"
+                    title="Files of this chat"
+                    aria-label="Files of this chat"
+                    on:click=move |_| ui.dialog.set(Some(Dialog::Files(peer)))
+                >
+                    {icon(Icon::Folder)}
+                </button>
+                <button
+                    class="btn icon"
+                    title="About this chat"
+                    aria-label="About this chat"
+                    on:click=move |_| ui.dialog.set(Some(Dialog::Contact(peer)))
+                >
+                    {icon(Icon::Info)}
+                </button>
+                <button
+                    class="btn icon quiet close"
+                    title="Close the chat"
+                    aria-label="Close the chat"
+                    on:click=move |_| open_chat(None)
+                >
+                    {icon(Icon::Close)}
+                </button>
+            </header>
+            {move || {
+                let c = contact()?;
+                // Suppress standalone downgrade banner when the merged quarantine banner is active
+                // so the user never sees two stacked "Upgrade to PQ" primary buttons.
+                if c.has_downgrade() && !c.is_quarantined() {
+                    Some(
+                        view! {
+                            <div class="banner danger" role="alert">
+                                <span>
+                                    "Downgrade detected: this peer supports or was pinned for post-quantum encryption, but a classical or tampered handshake was received."
+                                </span>
+                                <div class="banner-actions">
+                                    <Show when=move || pq_available(ui)>
+                                        <button
+                                            type="button"
+                                            class="btn primary small"
+                                            title=move || upgrade_disabled_tip(ui)
+                                            disabled=move || sec_busy.get() || server_pq_disabled(ui)
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().upgrade_to_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Upgrade to PQ"
+                                        </button>
+                                    </Show>
+                                    <button
+                                        type="button"
+                                        class="btn small"
+                                        disabled=move || sec_busy.get()
+                                        on:click=move |_| {
+                                            act_while(sec_busy, async move {
+                                                engine().dismiss_downgrade(peer).await
+                                            });
+                                        }
+                                    >
+                                        "Dismiss"
+                                    </button>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    )
+                } else {
+                    None
+                }
+            }}
+            {move || {
+                let c = contact()?;
+                let strict_pq = strict_pq.get();
+                let show_allow = can_allow_classical(c.classical_prompt, strict_pq);
+                match c.classical_prompt {
+                    ClassicalPrompt::InboundQuarantined { peer_was_pq_pinned } => {
+                        let downgrade = peer_was_pq_pinned || c.has_downgrade();
+                        let banner_class = if downgrade {
+                            "banner danger"
+                        } else {
+                            "banner warn"
+                        };
+                        Some(
+                            view! {
+                                <div class=banner_class role="alert">
+                                    <span>
+                                        {if downgrade {
+                                            "Downgrade detected — classical session quarantined: this peer was previously pinned as post-quantum capable. "
+                                        } else {
+                                            "Classical chat request quarantined: this peer initiated without post-quantum encryption. "
+                                        }}
+                                        {if strict_pq {
+                                            "Require post-quantum (strict mode) blocks classical exceptions. Upgrade to PQ or disable strict mode in Settings."
+                                        } else if downgrade {
+                                            "Its incoming message is held until you explicitly allow classical encryption or upgrade to PQ."
+                                        } else {
+                                            "Its message is held until you allow classical encryption."
+                                        }}
+                                    </span>
+                                    <div class="banner-actions">
+                                        {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
+                                        <Show when=move || pq_available(ui)>
+                                            <button
+                                                type="button"
+                                                class="btn primary small"
+                                                title=move || upgrade_disabled_tip(ui)
+                                                disabled=move || {
+                                                    sec_busy.get() || server_pq_disabled(ui)
+                                                }
+                                                on:click=move |_| {
+                                                    act_while(sec_busy, async move {
+                                                        engine().upgrade_to_pq(peer).await
+                                                    });
+                                                }
+                                            >
+                                                "Upgrade to PQ"
+                                            </button>
+                                        </Show>
+                                    </div>
+                                </div>
+                            }
+                            .into_any(),
+                        )
+                    }
+                    ClassicalPrompt::Outbound { peer_signed_off } => Some(
+                        view! {
+                            <div class="banner warn" role="alert">
+                                <span>
+                                    {if peer_signed_off {
+                                        "Sending paused: this peer published a signed manifest disabling post-quantum encryption. "
+                                    } else {
+                                        "Sending paused: this peer has no post-quantum prekeys on the server. "
+                                    }}
+                                    {if strict_pq {
+                                        "Require post-quantum (strict mode) blocks classical fallback. Retry PQ when available or disable strict mode in Settings."
+                                    } else if peer_signed_off {
+                                        "Allow classical fallback to send?"
+                                    } else {
+                                        "Allow classical encryption for this chat?"
+                                    }}
+                                </span>
+                                <div class="banner-actions">
+                                    {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
+                                    <Show when=move || pq_retry_ready(ui)>
+                                        <button
+                                            type="button"
+                                            class="btn primary small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().retry_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Retry PQ"
+                                        </button>
+                                    </Show>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    ),
+                    ClassicalPrompt::None => None,
+                }
+            }}
+            {move || {
+                let c = contact()?;
+                match c.alert {
+                    SecurityAlert::ManifestExpired => Some(
+                        view! {
+                            <div class="banner warn" role="alert">
+                                <span>
+                                    "Peer's signed post-quantum capability manifest has expired (they may have been offline for a while)."
+                                </span>
+                                <div class="banner-actions">
+                                    <Show
+                                        when=move || pq_retry_ready(ui)
+                                        fallback=move || {
+                                            view! {
+                                                <button
+                                                    type="button"
+                                                    class="btn small"
+                                                    disabled=move || sec_busy.get()
+                                                    on:click=move |_| {
+                                                        act_while(sec_busy, async move {
+                                                            engine().dismiss_downgrade(peer).await
+                                                        });
+                                                    }
+                                                >
+                                                    "Dismiss"
+                                                </button>
+                                            }
+                                        }
+                                    >
+                                        <button
+                                            type="button"
+                                            class="btn small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().retry_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Retry"
+                                        </button>
+                                    </Show>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    ),
+                    SecurityAlert::PqRequired => Some(
+                        view! {
+                            <div class="banner warn" role="alert">
+                                <span>
+                                    "Require PQ (strict mode) is enabled, and a post-quantum session could not be established with this peer."
+                                </span>
+                                <div class="banner-actions">
+                                    <Show
+                                        when=move || pq_retry_ready(ui)
+                                        fallback=move || {
+                                            view! {
+                                                <button
+                                                    type="button"
+                                                    class="btn small"
+                                                    disabled=move || sec_busy.get()
+                                                    on:click=move |_| {
+                                                        act_while(sec_busy, async move {
+                                                            engine().dismiss_downgrade(peer).await
+                                                        });
+                                                    }
+                                                >
+                                                    "Dismiss"
+                                                </button>
+                                            }
+                                        }
+                                    >
+                                        <button
+                                            type="button"
+                                            class="btn small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().retry_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Retry"
+                                        </button>
+                                    </Show>
+                                </div>
+                            </div>
+                        }
+                        .into_any(),
+                    ),
+                    _ => None,
+                }
+            }}
+            <Show when=move || request() && !quarantined()>
+                <div class="banner">
+                    <span>
+                        {format!(
+                            "{} wants to chat. Read what they sent, then accept or delete the request.",
+                            short(&peer),
+                        )}
+                    </span>
+                    <button
+                        class="btn primary small"
+                        on:click=move |_| ui.dialog.set(Some(Dialog::Contact(peer)))
+                    >
+                        "accept or delete…"
+                    </button>
+                </div>
+            </Show>
+            <Messages label=Signal::derive(label) />
+            <Uploads peer />
+            <Composer
+                peer
+                disabled=Signal::derive(composer_disabled)
+                placeholder=Signal::derive(composer_placeholder)
+            />
+        </section>
+    }
+}
+
+/// Pixels from the bottom of a chat within which it still follows the latest message.
+const FOLLOW_SLACK: i32 = 40;
+
+#[component]
+fn Messages(label: Signal<String>) -> impl IntoView {
+    let ui = ui();
+    let list = NodeRef::<html::Div>::new();
+    // Follow the latest message while at the bottom, so that what changes, as a sync goes,
+    // does not move the history away from the user reading it; and on sending one.
+    let follow = StoredValue::new(true);
+    let newest = StoredValue::new(None::<u64>);
+    Effect::new(move || {
+        let sent = ui.messages.with(|messages| {
+            let last = messages.iter().max_by_key(|message| message.index)?;
+            let new = newest.get_value().is_some_and(|newest| last.index > newest);
+            newest.set_value(Some(last.index));
+            Some(new && last.outgoing)
+        });
+        if sent == Some(true) {
+            follow.set_value(true);
+        }
+        if let Some(list) = list.get() {
+            // Unless the chat went meanwhile.
+            request_animation_frame(move || {
+                if follow.try_get_value() == Some(true) {
+                    list.set_scroll_top(list.scroll_height());
+                }
+            });
+        }
+    });
+    let scrolled = move |_| {
+        if let Some(list) = list.try_get_untracked().flatten() {
+            let below = list.scroll_height() - list.scroll_top() - list.client_height();
+            follow.try_set_value(below < FOLLOW_SLACK);
+        }
+    };
+    view! {
+        <div class="messages" node_ref=list aria-live="polite" on:scroll=scrolled>
+            <For
+                each=move || ui.messages.get()
+                key=|message| message.index
+                children=move |message| message_item(message, label)
+            />
+        </div>
+    }
+}
+
+/// A message, as a bubble, an image, a file or a note.
+/// The notes name the peer by `label`, which changes once a request is accepted.
+/// Delivery ticks and held-attachment pointer upgrades update reactively without remounting
+/// active `<InlineMedia>` players.
+fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
+    let ui = ui();
+    let index = message.index;
+    let outgoing = message.outgoing;
+    let initial_delivery = message.delivery;
+    let time = clock(message.at);
+    let content = match message.body {
+        Body::Text(text) => view! { <div class="bubble">{text}</div> }.into_any(),
+        // Small inline files keep stable identity; render directly so delivery ticks never remount them.
+        Body::File(_) => match inline_media(&message.body) {
+            Some((source, sort)) => view! { <InlineMedia source sort /> }.into_any(),
+            None => match Source::of(&message.body) {
+                Some(source) => file_card(source),
+                None => ().into_any(),
+            },
+        },
+        // Remote attachments track body updates via a fine-grained Memo so held attachments
+        // (empty pointer before sign-in) transition seamlessly to live cards/inline media once
+        // `start_waiting` populates their pointer, while ordinary delivery ticks never remount them.
+        Body::Remote(_) => {
+            let initial_body = message.body;
+            let body = Memo::new(move |_| {
+                ui.messages.with(|messages| {
+                    messages
+                        .iter()
+                        .find(|m| m.index == index)
+                        .map(|m| m.body.clone())
+                        .unwrap_or_else(|| initial_body.clone())
+                })
+            });
+            (move || {
+                let current = body.get();
+                match inline_media(&current) {
+                    Some((source, sort)) => view! { <InlineMedia source sort /> }.into_any(),
+                    None => match Source::of(&current) {
+                        Some(source) => file_card(source),
+                        None => ().into_any(),
+                    },
+                }
+            })
+            .into_any()
+        }
+        Body::Hello(name) => {
+            let note = move || match (outgoing, name.is_empty()) {
+                (true, _) => format!("You started this chat · {time}"),
+                (false, true) => format!("{} started this chat · {time}", label.get()),
+                (false, false) => {
+                    format!("{} started this chat, as “{name}” · {time}", label.get())
+                }
+            };
+            return view! { <div class="note">{note}</div> }.into_any();
+        }
+        Body::Deleted => {
+            let note = move || format!("{} deleted this chat · {time}", label.get());
+            return view! { <div class="note">{note}</div> }.into_any();
+        }
+        Body::Evicted => {
+            let note = move || {
+                format!(
+                    "A message from {} could not be decrypted (its key expired) · {time}",
+                    label.get()
+                )
+            };
+            return view! { <div class="note evicted">{note}</div> }.into_any();
+        }
+        Body::Unknown => {
+            let note = move || {
+                format!(
+                    "{} sent something this client cannot show · {time}",
+                    label.get()
+                )
+            };
+            return view! { <div class="note">{note}</div> }.into_any();
+        }
+    };
+    let delivery = Memo::new(move |_| {
+        ui.messages.with(|messages| {
+            messages
+                .iter()
+                .find(|m| m.index == index)
+                .map(|m| m.delivery)
+                .unwrap_or(initial_delivery)
+        })
+    });
+    // How far it got, right of its time, as Telegram shows it: a clock while it waits, one tick
+    // once the server has it, two once the peer read it, and three once it downloaded its
+    // attachment; what that says, for its tooltip and screen readers; and whether the peer read
+    // it.
+    let status = move || match delivery.get() {
+        Delivery::Received => None,
+        Delivery::Pending => Some((Icon::Pending, "waiting to be sent", false)),
+        Delivery::Failed => Some((Icon::Failed, "could not be sent", false)),
+        Delivery::Sent => Some((Icon::Sent, "sent", false)),
+        Delivery::Read => Some((Icon::Read, "read", true)),
+        Delivery::Downloaded => Some((Icon::Downloaded, "read and downloaded", true)),
+    };
+    // Held until this browser signs in to the server, which keeps it only for those who do: it
+    // can be cancelled, which lets what was sent after it go.
+    let held = outgoing.then(|| {
+        let cancelling = RwSignal::new(false);
+        move || {
+            let peer = ui.open.get()?;
+            ui.held.with(|held| held.contains(&(peer, index))).then(|| {
+                view! {
+                    <button
+                        type="button"
+                        class="btn icon quiet cancel-held"
+                        title="Cancel it, so that what was sent after it goes"
+                        aria-label="Cancel it"
+                        disabled=move || cancelling.get()
+                        on:click=move |_| {
+                            act_while(
+                                cancelling,
+                                async move { engine().cancel_held(peer, index).await },
+                            )
+                        }
+                    >
+                        {icon(Icon::Close)}
+                    </button>
+                }
+            })
+        }
+    });
+    view! {
+        <div class="message" class:me=outgoing>
+            {content}
+            <span class="meta" class:failed=move || delivery.get() == Delivery::Failed>
+                {held}
+                {time}
+                {move || {
+                    status().map(|(shown, title, read)| {
+                        view! {
+                            <span
+                                class="status"
+                                class:read=read
+                                class:downloaded=shown == Icon::Downloaded
+                                title=title
+                                role="img"
+                                aria-label=title
+                            >
+                                {icon(shown)}
+                            </span>
+                        }
+                    })
+                }}
+            </span>
+        </div>
+    }
+    .into_any()
+}
+
+/// The uploads to `peer`: how far each got, and the means to go on with it or cancel it.
+#[component]
+fn Uploads(peer: PublicKey) -> impl IntoView {
+    let ui = ui();
+    let uploads = move || {
+        ui.uploads.with(|uploads| {
+            uploads
+                .iter()
+                .filter(|upload| upload.peer == peer)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    };
+    view! {
+        <div class="uploads">
+            <For each=uploads key=|upload| (upload.peer, upload.id) children=upload_row />
+        </div>
+    }
+}
+
+fn upload_row(initial: UploadView) -> impl IntoView {
+    let ui = ui();
+    let (peer, id) = (initial.peer, initial.id);
+    let name = initial.name.clone();
+    let live = Memo::new(move |_| {
+        ui.uploads.with(|uploads| {
+            uploads
+                .iter()
+                .find(|u| u.peer == peer && u.id == id)
+                .cloned()
+                .unwrap_or_else(|| initial.clone())
+        })
+    });
+    let status = move || {
+        let upload = live.get();
+        let percent = upload.done * 100 / upload.size.max(1);
+        match &upload.state {
+            UploadState::Running => format!("uploading · {percent}%"),
+            UploadState::Checking => format!("{percent}% · checking the file…"),
+            UploadState::Retrying => format!("{percent}% · waiting for the server"),
+            UploadState::Paused(reason) => format!("{percent}% · {reason}"),
+        }
+    };
+    let paused = move || matches!(live.get().state, UploadState::Paused(_));
+    let file_input = NodeRef::<html::Input>::new();
+    // Without the file, which went with the page that chose it, the file is chosen again via a
+    // declarative hidden `<input type="file">`.
+    let resume = move |_| {
+        if engine().has_file(&peer, &id) {
+            act(async move { engine().resume_upload(peer, id, None).await });
+        } else if let Some(input) = file_input.get_untracked() {
+            input.click();
+        }
+    };
+    let on_file_change = move |event: ev::Event| {
+        let input: web_sys::HtmlInputElement = event_target(&event);
+        if let Some(file) = input.files().and_then(|files| files.get(0)) {
+            act(async move { engine().resume_upload(peer, id, Some(file)).await });
+        }
+        input.set_value("");
+    };
+    let cancel = move |_| act(async move { engine().cancel_upload(peer, id).await });
+    view! {
+        <div class="upload">
+            <span class="file-icon">{extension(&name)}</span>
+            <span class="upload-text">
+                <strong>{name}</strong>
+                <span>{status}</span>
+            </span>
+            <input type="file" hidden node_ref=file_input on:change=on_file_change />
+            <Show when=paused>
+                <button
+                    class="btn icon small"
+                    title="Resume"
+                    aria-label="Resume"
+                    on:click=resume
+                >
+                    {icon(Icon::Resume)}
+                </button>
+            </Show>
+            <button
+                class="btn icon small quiet"
+                title="Cancel the upload"
+                aria-label="Cancel the upload"
+                on:click=cancel
+            >
+                {icon(Icon::Close)}
+            </button>
+        </div>
+    }
+}
