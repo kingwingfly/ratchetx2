@@ -205,13 +205,21 @@ impl Contact {
         }
     }
 
+    pub(super) fn next_history_index(&mut self) -> Result<u64, &'static str> {
+        let index = self.state.history_len;
+        self.state.history_len = index
+            .checked_add(1)
+            .filter(|&len| len <= session::protocol::MAX_SAFE_INTEGER)
+            .ok_or("This chat has reached its history limit.")?;
+        Ok(index)
+    }
+
     /// Record an evicted (undecryptable-aged) message distinctly in history.
-    pub(super) fn add_evicted(&mut self) -> (u64, HistoryEntry) {
+    pub(super) fn add_evicted(&mut self) -> Result<(u64, HistoryEntry), &'static str> {
+        let index = self.next_history_index()?;
         let place = place_of(0, &self.state);
         self.state.clock = self.state.clock.max(place);
         self.state.peer_last = place;
-        let index = self.state.history_len;
-        self.state.history_len += 1;
         self.state.last_activity = now();
         let entry = HistoryEntry {
             outgoing: false,
@@ -221,19 +229,24 @@ impl Contact {
             evicted: true,
             ..HistoryEntry::default()
         };
-        (index, entry)
+        Ok((index, entry))
     }
 
     /// Add `content`, received, to the history, at its place in the chat, counting it as unread
     /// unless the chat is `open`: then it is read, which the peer is told. Returns the entry and
     /// its index.
-    pub(super) fn add_received(&mut self, content: Content, open: bool) -> (u64, HistoryEntry) {
+    pub(super) fn add_received(
+        &mut self,
+        content: Content,
+        open: bool,
+    ) -> Result<(u64, HistoryEntry), &'static str> {
+        let index = self.next_history_index()?;
         let place = place_of(content.clock, &self.state);
         self.state.clock = self.state.clock.max(place);
         self.state.peer_last = place;
         match &content.kind {
             Some(Kind::Hello(hello)) => self.state.hello_name = hello.name.clone(),
-            _ if !open => self.state.unread += 1,
+            _ if !open => self.state.unread = self.state.unread.saturating_add(1),
             _ => {}
         }
         // A message to read, which the peer waits to hear of, by its clock.
@@ -246,8 +259,6 @@ impl Contact {
                 keep_last(&mut self.state.unseen);
             }
         }
-        let index = self.state.history_len;
-        self.state.history_len += 1;
         self.state.last_activity = now();
         let entry = HistoryEntry {
             outgoing: false,
@@ -256,7 +267,7 @@ impl Contact {
             place,
             ..HistoryEntry::default()
         };
-        (index, entry)
+        Ok((index, entry))
     }
 
     /// Tell the peer that its message at `clock` was read.
@@ -404,6 +415,30 @@ pub(super) fn forget_told(events: &mut Events, told: &Events) {
         .retain(|clock| !told.downloaded.contains(clock));
 }
 
+fn validate_history(state: &ContactState) -> Result<(), &'static str> {
+    if state.history_len > session::protocol::MAX_SAFE_INTEGER {
+        return Err("history length exceeds the supported limit");
+    }
+    if u64::from(state.unread) > state.history_len {
+        return Err("unread count exceeds history length");
+    }
+    if state
+        .outbox
+        .iter()
+        .any(|o| o.history_index >= state.history_len)
+    {
+        return Err("outbox refers to an entry outside the history");
+    }
+    if state
+        .awaiting
+        .iter()
+        .any(|a| a.history_index >= state.history_len)
+    {
+        return Err("delivery receipt refers to an entry outside the history");
+    }
+    Ok(())
+}
+
 /// Restore each contact independently. Validate from borrowed fields so every failure retains
 /// the original session, including its pinning state.
 pub(super) fn restore_contacts(
@@ -419,9 +454,10 @@ pub(super) fn restore_contacts(
         let peer = PublicKey::try_from(state.peer.as_slice());
         let restored: Result<_, String> = (|| {
             let peer = peer.map_err(|_| "malformed identity key".to_string())?;
-            if seen.contains(&peer) {
+            if !seen.insert(peer) {
                 return Err("duplicate identity key".into());
             }
+            validate_history(&state)?;
             let raw_session = state.session.as_ref().ok_or("missing session")?;
             let session = SessionState::try_from(raw_session).map_err(|e| describe(&e))?;
             if session.peer() != &peer || raw_session.me != me.as_slice() {
@@ -431,7 +467,6 @@ pub(super) fn restore_contacts(
         })();
         match restored {
             Ok((peer, session)) => {
-                seen.insert(peer);
                 state.session = None;
                 contacts.push(Contact {
                     peer,

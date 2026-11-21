@@ -405,14 +405,13 @@ impl Inner {
         }
         // If saving fails, the message is forgotten: it never left.
         let snapshot = contact.snapshot();
+        let index = contact.next_history_index().map_err(str::to_string)?;
         // Encrypted as it goes, once its place in the chat is known, see `flush`.
         let record = OutgoingRecord {
             message: None,
             content: content.to_bytes(),
             delivery_hash: vec![],
         };
-        let index = contact.state.history_len;
-        contact.state.history_len += 1;
         contact.state.last_activity = now();
         contact.state.outbox.push(Outgoing {
             history_index: index,

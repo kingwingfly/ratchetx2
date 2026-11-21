@@ -51,8 +51,16 @@ pub fn short(key: &PublicKey) -> String {
 }
 
 /// Milliseconds since the Unix epoch.
+#[cfg(target_arch = "wasm32")]
 pub fn now() -> u64 {
     js_sys::Date::now() as u64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
 /// Saturating conversion from non-negative floating-point milliseconds to `u64`.

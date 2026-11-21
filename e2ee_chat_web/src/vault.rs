@@ -297,6 +297,47 @@ pub struct AppState {
     /// Locally processed v2 inbox IDs awaiting acknowledgement after durable persistence.
     #[prost(uint64, repeated, tag = "10")]
     pub pending_inbox_acks: Vec<u64>,
+    /// Preferences to restore if the relay refuses a pending settings change.
+    #[prost(message, optional, tag = "11")]
+    pub pending_pq_rollback: Option<PendingPqRollback>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PendingPqRollback {
+    #[prost(bool, tag = "1")]
+    pub pq_enabled: bool,
+    #[prost(uint32, tag = "2")]
+    pub preferred_suite: u32,
+    #[prost(bool, tag = "3")]
+    pub pq_ratchet_enabled: bool,
+    #[prost(bool, tag = "4")]
+    pub strict_pq: bool,
+    #[prost(bool, tag = "5")]
+    pub previous_needs_publish: bool,
+}
+
+impl PendingPqRollback {
+    pub fn from_config(config: &session::PqConfig, previous_needs_publish: bool) -> Self {
+        Self {
+            pq_enabled: config.pq_enabled,
+            preferred_suite: u32::from(config.preferred_suite.as_u8()),
+            pq_ratchet_enabled: config.pq_ratchet_enabled,
+            strict_pq: config.strict_pq,
+            previous_needs_publish,
+        }
+    }
+
+    pub fn config(&self) -> session::PqConfig {
+        session::PqConfig {
+            pq_enabled: self.pq_enabled,
+            preferred_suite: u8::try_from(self.preferred_suite)
+                .ok()
+                .and_then(session::PqSuite::from_u8)
+                .unwrap_or_else(session::PqConfig::default_suite),
+            pq_ratchet_enabled: self.pq_ratchet_enabled,
+            strict_pq: self.strict_pq,
+        }
+    }
 }
 
 /// A peer, and the session with it.
@@ -376,6 +417,9 @@ pub struct ContactState {
     /// A replacement session took over before the sealed outbox could be rebuilt from history.
     #[prost(bool, tag = "25")]
     pub needs_requeue_sealed: bool,
+    /// Carried initial messages persisted atomically with the mailbox cursor until durably joined.
+    #[prost(bytes = "vec", repeated, tag = "26")]
+    pub pending_carried_initials: Vec<Vec<u8>>,
 }
 
 /// Events encrypted for the peer, waiting to be pushed, see [`ContactState::sealed_events`].

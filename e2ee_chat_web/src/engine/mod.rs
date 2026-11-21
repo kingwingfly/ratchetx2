@@ -243,8 +243,10 @@ struct Inner<V = Vault> {
     state: AppState,
     client: Client<Connect>,
     contacts: Vec<Contact>,
-    /// Unreadable records retained verbatim until the contact is replaced or deleted.
+    /// Unreadable records retained verbatim until explicitly deleted.
     isolated_contacts: Vec<ContactState>,
+    /// History namespaces reserved by unreadable contacts with no healthy active record.
+    isolated_peers: HashSet<PublicKey>,
     /// A non-rollbackable state change still needs a successful transaction.
     unsaved_state: bool,
     /// A later transaction committed that change. Refresh contact and identity views on sync.
@@ -683,7 +685,8 @@ impl Engine {
             &client.identity_key(),
             &address,
         );
-        self.unlocked(Inner::new(
+        let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
+        let mut inner = Inner::new(
             vault,
             address,
             audience,
@@ -691,8 +694,14 @@ impl Engine {
             client,
             contacts,
             isolated_contacts,
-        ))
-        .await;
+        );
+        if pruned > 0 {
+            self.ui.log(format!(
+                "Removed {pruned} invalid or duplicate inbox acknowledgement ID(s) from the vault."
+            ));
+            inner.unsaved_state = true;
+        }
+        self.unlocked(inner).await;
         let isolated = warnings.len();
         for warning in warnings {
             self.ui.log(warning);
@@ -1027,9 +1036,7 @@ impl Engine {
         // again with the peer, or go to it.
         self.waits_sign_in.borrow_mut().remove(&peer);
         inner.contacts.retain(|contact| contact.peer != peer);
-        inner
-            .isolated_contacts
-            .retain(|c| c.peer != peer.as_slice());
+        inner.forget_isolated_peer(&peer);
         inner.contacts_dirty_late |= std::mem::take(&mut inner.unsaved_state);
         // The other chats' records left unsaved were saved with it, and show at the next sync.
         inner.saved_late.extend(
@@ -1134,6 +1141,13 @@ impl<V: HistoryStore> Inner<V> {
         contacts: Vec<Contact>,
         isolated_contacts: Vec<ContactState>,
     ) -> Self {
+        let mut isolated_peers: HashSet<_> = isolated_contacts
+            .iter()
+            .filter_map(|c| PublicKey::try_from(c.peer.as_slice()).ok())
+            .collect();
+        for contact in &contacts {
+            isolated_peers.remove(&contact.peer);
+        }
         Self {
             vault,
             server,
@@ -1142,6 +1156,7 @@ impl<V: HistoryStore> Inner<V> {
             client,
             contacts,
             isolated_contacts,
+            isolated_peers,
             server_pq: ServerPqStatus::Unknown,
             last_server_classical_opks: None,
             #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -1216,6 +1231,26 @@ impl<V: HistoryStore> Inner<V> {
             .find(|contact| contact.peer == *peer)
     }
 
+    pub(super) fn is_isolated_peer(&self, peer: &PublicKey) -> bool {
+        self.isolated_peers.contains(peer)
+    }
+
+    fn check_isolation(&self, peer: &PublicKey) -> Result<(), String> {
+        if self.is_isolated_peer(peer) {
+            return Err(format!(
+                "The contact record for {} is isolated due to corruption. Recover or delete it before starting a new session.",
+                crate::util::short(peer)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Release the key only after the vault has deleted the peer's records and history.
+    fn forget_isolated_peer(&mut self, peer: &PublicKey) {
+        self.isolated_contacts.retain(|c| c.peer != peer.as_slice());
+        self.isolated_peers.remove(peer);
+    }
+
     /// Undo the changes to the contact `peer` since `snapshot`, after saving them failed, so
     /// that what is kept in memory is what the vault has.
     fn roll_back(
@@ -1252,7 +1287,12 @@ impl<V: HistoryStore> Inner<V> {
 
 impl Engine {
     /// Show `views`, new in the chat with `peer`, if it is on screen, in its order.
-    fn show_new(&self, inner: &Inner, peer: &PublicKey, views: Vec<MessageView>) {
+    fn show_new(
+        &self,
+        inner: &Inner<impl HistoryStore>,
+        peer: &PublicKey,
+        views: Vec<MessageView>,
+    ) {
         if self.ui.open.get_untracked() != Some(*peer) || views.is_empty() {
             return;
         }
@@ -1266,7 +1306,12 @@ impl Engine {
     /// Show the history entries of the chat with `peer` that changed, `entries`, if it is on
     /// screen: how far each got, its place, and updated body (such as held attachments gaining
     /// their real upload pointer once signed in), in the chat's order.
-    fn show_changes(&self, inner: &Inner, peer: &PublicKey, entries: &[(u64, HistoryEntry)]) {
+    fn show_changes(
+        &self,
+        inner: &Inner<impl HistoryStore>,
+        peer: &PublicKey,
+        entries: &[(u64, HistoryEntry)],
+    ) {
         if self.ui.open.get_untracked() != Some(*peer) || entries.is_empty() {
             return;
         }
