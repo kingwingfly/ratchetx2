@@ -3,28 +3,29 @@ use super::contact::{
     record_quarantined_initial_state, restore_contacts, stored_contacts,
 };
 use super::handshake::{
-    Incoming, InitialBatch, PublishError, prune_invalid_inbox_acks, refill_batch_counts,
-    stage_carried_initials, stage_inbox_ack,
+    DEFERRED_REPLAY_WINDOW_MS, Incoming, InitialBatch, JoinCarriedOutcome, PublishError,
+    merge_legacy_deferred_initials, preserved_deferred_prekeys, prune_invalid_inbox_acks,
+    refill_batch_counts, sanitize_deferred_initials, stage_carried_initials, stage_inbox_ack,
 };
 use super::settings::{
     describe_upgrade_pq_error, finalize_upgrade_to_pq_request_state, validate_pq_config_for_server,
 };
+use super::sync::{farewell_push_v2_request, resolve_stalled_peer};
 use super::{
-    AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, REFILL_USED,
-    SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash, build_invitation_link, checked_name,
-    parse_invitation_hash,
+    AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS,
+    ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash,
+    build_invitation_link, checked_name, normalize_update_reason, parse_invitation_hash,
+    should_require_update_for_rpc,
 };
 use crate::content::{Content, Kind};
 use crate::state::{Delivery, Dialog, Me, ServerPqStatus, Ui};
 use crate::transport::{Connect, Fetch};
 use crate::util::{hex, key_from_text, key_to_url, short};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use crate::vault::Farewell;
 use crate::vault::{
-    AppState, Awaiting, ContactState, HistoryEntry, Outgoing, OutgoingRecord, history_key,
+    AppState, Awaiting, CarriedDeferredTimestamp, ContactState, DeferredInitial,
+    DeferredInitialsRecord, Farewell, HistoryEntry, Outgoing, OutgoingRecord, history_key,
     outbox_key,
 };
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use bytes::Bytes;
 use leptos::prelude::GetUntracked;
 use prost::Message;
@@ -32,13 +33,12 @@ use session::protocol::{
     self, MAX_SAFE_INTEGER,
     connect::{ConnectClient, LocalPost},
     content::Hello,
-};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use session::protocol::{
-    handshake_v2::InitialMessageV2 as WireInitialMessageV2, mailbox_v2::PushV2Request,
+    handshake_v2::InitialMessageV2 as WireInitialMessageV2,
+    mailbox_v2::PushV2Request,
 };
 use session::{
-    Client, ClientState, ErrorKind, PqConfig, PqSuite, PublicKey, Session, SessionState, proto,
+    AcceptedInitial, Client, ClientState, ErrorKind, ListedInitialMessages, PqConfig, PqSuite,
+    PublicKey, Session, SessionState, proto,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -215,6 +215,24 @@ fn describe_upgrade_pq_error_maps_plain_english_and_prioritizes_server_disabled(
     let downgrade =
         describe_upgrade_pq_error(ErrorKind::DowngradeDetected, &unknown, "raw".to_string());
     assert!(downgrade.contains("Downgrade detected"), "{downgrade}");
+
+    // Genuine Connect `Unimplemented` while server PQ is NOT known disabled falls back to raw
+    // error instead of falsely blaming PQ-disabled.
+    let missing_rpc = describe_upgrade_pq_error(
+        ErrorKind::Unimplemented,
+        &unknown,
+        "procedure not implemented by server".to_string(),
+    );
+    assert_eq!(missing_rpc, "procedure not implemented by server");
+    let disabled_rpc = describe_upgrade_pq_error(
+        ErrorKind::Unimplemented,
+        &disabled,
+        "procedure not implemented by server".to_string(),
+    );
+    assert!(
+        disabled_rpc.contains("this server does not have post-quantum encryption enabled"),
+        "{disabled_rpc}"
+    );
 }
 
 #[test]
@@ -289,7 +307,6 @@ fn quarantined_primary_survives_second_initial_and_blocks_accept() {
     assert_eq!(state.name, "Alice");
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 #[test]
 fn farewell_push_v2_preserves_carried_initial_message_v2() {
     let pq_initial = WireInitialMessageV2 {
@@ -314,6 +331,7 @@ fn farewell_push_v2_preserves_carried_initial_message_v2() {
         client_message_id: vec![0xAB; 16],
         push_v2: req.encode_to_vec(),
     };
+    assert_eq!(farewell.recipient().as_deref(), Some([0x22; 32].as_slice()));
     let decoded = PushV2Request::decode(farewell.push_v2.as_slice()).expect("decode push_v2");
     assert_eq!(decoded.initial_message, Some(pq_initial));
     assert_eq!(decoded.client_message_id.as_ref(), &[0xAB; 16]);
@@ -401,6 +419,7 @@ const TEST_SERVER: &str = "https://chat.example";
 #[derive(Default)]
 struct MemoryHistory {
     state: RefCell<AppState>,
+    deferred: RefCell<DeferredInitialsRecord>,
     entries: RefCell<HashMap<String, HistoryEntry>>,
     outbox: RefCell<HashMap<String, OutgoingRecord>>,
     fail_read_at: Cell<Option<u64>>,
@@ -435,6 +454,7 @@ impl HistoryStore for MemoryHistory {
     async fn save<'a>(
         &self,
         state: &AppState,
+        deferred: &DeferredInitialsRecord,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()> {
@@ -442,6 +462,7 @@ impl HistoryStore for MemoryHistory {
             return Err(crate::vault::Error::Storage("write failed".into()));
         }
         self.state.replace(state.clone());
+        self.deferred.replace(deferred.clone());
         self.entries
             .borrow_mut()
             .extend(entries.into_iter().cloned());
@@ -476,6 +497,8 @@ fn stored_contact(me: PublicKey, peer: PublicKey) -> ContactState {
 /// Reopen only the committed vault bytes, discarding all transient engine state.
 fn reload(vault: MemoryHistory) -> Inner<MemoryHistory> {
     let mut state = AppState::decode(vault.state.borrow().encode_to_vec().as_slice()).unwrap();
+    let mut deferred =
+        DeferredInitialsRecord::decode(vault.deferred.borrow().encode_to_vec().as_slice()).unwrap();
     let client = Client::restore(
         Fetch::client(TEST_SERVER),
         ClientState::try_from(&state.client.take().unwrap()).unwrap(),
@@ -485,6 +508,11 @@ fn reload(vault: MemoryHistory) -> Inner<MemoryHistory> {
         &client.identity_key(),
         TEST_SERVER,
     );
+    let _ = merge_legacy_deferred_initials(
+        &mut deferred.entries,
+        std::mem::take(&mut state.deferred_initials),
+    );
+    let _ = sanitize_deferred_initials(&mut deferred.entries, crate::util::now());
     Inner::new(
         vault,
         TEST_SERVER.into(),
@@ -493,6 +521,7 @@ fn reload(vault: MemoryHistory) -> Inner<MemoryHistory> {
         client,
         contacts,
         isolated,
+        deferred,
     )
 }
 
@@ -516,62 +545,40 @@ impl<T: Message> LocalPost for BundleResponse<T> {
     }
 }
 
-/// Encrypt a real first message for the recipient using the build's mailbox wire format.
+/// Encrypt a real first message for the recipient using the v2 wire format (PQXDH when ML-KEM
+/// suites are compiled in, or classical X3DH over v2 in classical-only builds).
 async fn carried_initial(recipient: &mut Client<Connect>) -> (PublicKey, Incoming) {
     let greeting = Kind::Text("first message".into()).to_bytes();
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    {
-        let published = recipient.prepare_publish_v2("chat.example", 1, 1).unwrap();
-        let p = &published.request;
-        let bundle = protocol::handshake_v2::ClaimBundleResponse {
-            signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
-            signed_prekey_signature: p.signed_prekey_signature.clone(),
-            one_time_prekey: p.one_time_prekeys.first().cloned(),
-            pq_last_resort: p.pq_last_resort.first().cloned(),
-            pq_one_time_prekey: p.pq_one_time_prekeys.first().cloned(),
-            manifest: p.manifest.clone(),
-        };
-        recipient.commit_publish_v2(published);
-        let mut sender = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
-        let prepared = sender
-            .prepare_initiate_v2(
-                "chat.example",
-                &recipient.identity_key(),
-                &Default::default(),
-                &greeting,
-                (),
-            )
-            .await
-            .unwrap();
-        assert!(prepared.security.is_pq);
-        let session::OutgoingInitialMessage::V2(request) = prepared.request else {
-            panic!("expected PQ initial")
-        };
-        (
-            sender.identity_key(),
-            Incoming::try_from(request.message.as_ref().unwrap()).unwrap(),
+    let published = recipient.prepare_publish_v2("chat.example", 1, 1).unwrap();
+    let p = &published.request;
+    let bundle = protocol::handshake_v2::ClaimBundleResponse {
+        signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+        signed_prekey_signature: p.signed_prekey_signature.clone(),
+        one_time_prekey: p.one_time_prekeys.first().cloned(),
+        pq_last_resort: p.pq_last_resort.first().cloned(),
+        pq_one_time_prekey: p.pq_one_time_prekeys.first().cloned(),
+        manifest: p.manifest.clone(),
+    };
+    recipient.commit_publish_v2(published);
+    let mut sender = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
+    let prepared = sender
+        .prepare_initiate_v2(
+            "chat.example",
+            &recipient.identity_key(),
+            &Default::default(),
+            &greeting,
+            (),
         )
-    }
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    {
-        let published = recipient.prepare_publish(1).unwrap();
-        let p = &published.request;
-        let bundle = protocol::handshake::FetchBundleResponse {
-            signed_prekey: p.signed_prekey.clone(),
-            signed_prekey_signature: p.signed_prekey_signature.clone(),
-            one_time_prekey: p.one_time_prekeys.first().cloned(),
-        };
-        recipient.commit_publish(published);
-        let mut sender = Client::new(ConnectClient::new(BundleResponse("/FetchBundle", bundle)));
-        let prepared = sender
-            .prepare_initiate(&recipient.identity_key(), &greeting, ())
-            .await
-            .unwrap();
-        (
-            sender.identity_key(),
-            Incoming::try_from(prepared.request.message.as_ref().unwrap()).unwrap(),
-        )
-    }
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.security.is_pq,
+        cfg!(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
+    );
+    (
+        sender.identity_key(),
+        Incoming::try_from(prepared.request.message.as_ref().unwrap()).unwrap(),
+    )
 }
 
 fn change_session(session: &mut Session<Connect>, change: impl FnOnce(&mut proto::SessionState)) {
@@ -599,6 +606,7 @@ fn unlocked_client() -> (Inner<MemoryHistory>, PublicKey) {
             client,
             contacts,
             isolated,
+            DeferredInitialsRecord::default(),
         ),
         peer,
     )
@@ -1019,29 +1027,55 @@ fn partial_ack_persists_remaining_ids_and_retries_failed_shrink() {
 
 #[test]
 fn local_pq_off_accepts_classical_replacement_without_granting_an_exception() {
-    use session::protocol::handshake::FetchBundleResponse;
+    use session::protocol::handshake_v2::ClaimBundleResponse;
 
     futures::executor::block_on(async {
+        let classical_cfg = PqConfig {
+            pq_enabled: false,
+            pq_ratchet_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        };
         let mut bob = Client::new(Fetch::client(TEST_SERVER));
-        let publish = bob.prepare_publish(1).unwrap().request;
-        let mut alice = Client::new(ConnectClient::new(BundleResponse(
-            "/FetchBundle",
-            FetchBundleResponse {
-                signed_prekey: publish.signed_prekey,
-                signed_prekey_signature: publish.signed_prekey_signature,
-                one_time_prekey: publish.one_time_prekeys.first().cloned(),
-            },
-        )));
+        bob.set_pq_config(classical_cfg.clone()).unwrap();
+        let published = bob.prepare_publish_v2("chat.example", 1, 0).unwrap();
+        let p = &published.request;
+        let bundle = ClaimBundleResponse {
+            signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+            signed_prekey_signature: p.signed_prekey_signature.clone(),
+            one_time_prekey: p.one_time_prekeys.first().cloned(),
+            pq_last_resort: None,
+            pq_one_time_prekey: None,
+            manifest: p.manifest.clone(),
+        };
+        bob.commit_publish_v2(published);
+        let mut alice = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
+        alice.set_pq_config(classical_cfg).unwrap();
         let initiation = alice
-            .prepare_initiate(&bob.identity_key(), b"hello", ())
+            .prepare_initiate_v2(
+                "chat.example",
+                &bob.identity_key(),
+                &Default::default(),
+                b"hello",
+                (),
+            )
             .await
             .unwrap();
-        let message =
-            session::InitialMessage::try_from(initiation.request.message.as_ref().unwrap())
-                .unwrap();
-        let (incoming, _) = bob
-            .accept(&alice.identity_key(), &message, Fetch::client(TEST_SERVER))
-            .unwrap();
+        assert!(!initiation.security.is_pq);
+        let message = Incoming::try_from(initiation.request.message.as_ref().unwrap()).unwrap();
+        let AcceptedInitial::Accepted {
+            session: incoming, ..
+        } = bob
+            .accept_initial_v2(
+                &alice.identity_key(),
+                &Default::default(),
+                &message,
+                Fetch::client(TEST_SERVER),
+            )
+            .unwrap()
+        else {
+            panic!("expected classical initial accepted when local PQ is off");
+        };
         let stored: proto::SessionState = incoming.state().into();
         let (mut contacts, _, _) = restore_contacts(
             vec![stored_contact(bob.identity_key(), alice.identity_key())],
@@ -1351,10 +1385,7 @@ fn staging_bounds_distinct_carried_initials_and_preserves_legacy_wire_bytes() {
     let mut state = ContactState::default();
     for i in 0..=128 {
         let wire = legacy_wire_initial(i);
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         let initial = Incoming::try_from(&WireInitialMessageV2::from(&wire)).unwrap();
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let initial = Incoming::try_from(&wire).unwrap();
         let staged = stage_carried_initials(&mut state, [&initial, &initial]);
         if i < 128 {
             staged.unwrap();
@@ -1453,14 +1484,11 @@ fn empty_receive_persists_changed_cursor_and_receipts_and_skips_idle_writes() {
 #[test]
 fn publish_rolls_back_only_definitive_refusals_and_strict_v2_fallback() {
     use session::protocol::{Error, ErrorKind as WireError};
-    let refused = PublishError::transmitted(Error::from(WireError::LimitExceeded).into(), true);
+    let refused = PublishError::transmitted(Error::from(WireError::LimitExceeded).into());
     assert!(refused.rejects_settings());
-    assert!(
-        PublishError::transmitted(Error::from(WireError::Malformed).into(), true)
-            .rejects_settings()
-    );
+    assert!(PublishError::transmitted(Error::from(WireError::Malformed).into()).rejects_settings());
     for kind in [WireError::StaleTimestamp, WireError::InvalidSignature] {
-        assert!(!PublishError::transmitted(Error::from(kind).into(), true).rejects_settings());
+        assert!(!PublishError::transmitted(Error::from(kind).into()).rejects_settings());
     }
     for kind in [
         WireError::Malformed,
@@ -1468,18 +1496,22 @@ fn publish_rolls_back_only_definitive_refusals_and_strict_v2_fallback() {
         WireError::InvalidResponse,
         WireError::Connect,
     ] {
-        let ambiguous = PublishError::transmitted(
-            Error::ambiguous_response(kind, "reply unreadable").into(),
-            true,
+        let ambiguous =
+            PublishError::transmitted(Error::ambiguous_response(kind, "reply unreadable").into());
+        assert!(
+            !ambiguous.rejects_settings()
+                && !ambiguous.needs_sign_in()
+                && !ambiguous.is_unimplemented()
         );
-        assert!(!ambiguous.rejects_settings() && !ambiguous.needs_sign_in());
     }
     assert!(
-        PublishError::transmitted(Error::from(WireError::SignInRequired).into(), true)
-            .needs_sign_in()
+        PublishError::transmitted(Error::from(WireError::SignInRequired).into()).needs_sign_in()
     );
-    assert!(PublishError::transmitted(ErrorKind::PqRequired.into(), true).rejects_settings());
-    assert!(!PublishError::transmitted(ErrorKind::PqRequired.into(), false).rejects_settings());
+    assert!(PublishError::transmitted(ErrorKind::PqRequired.into()).rejects_settings());
+    let unimplemented = PublishError::transmitted(Error::from(WireError::Unimplemented).into());
+    assert!(unimplemented.is_unimplemented());
+    assert!(!unimplemented.rejects_settings());
+    assert!(!unimplemented.needs_sign_in());
 }
 
 #[test]
@@ -1527,10 +1559,8 @@ fn refused_settings_rollback_survives_a_failed_vault_save() {
         };
         inner.save_pq_config(rejected).await.unwrap();
         inner.vault.fail_save.set(true);
-        let refusal = PublishError::transmitted(
-            protocol::Error::from(protocol::ErrorKind::Malformed).into(),
-            true,
-        );
+        let refusal =
+            PublishError::transmitted(protocol::Error::from(protocol::ErrorKind::Malformed).into());
         let warning = engine
             .finish_publish_rollback(&mut inner, refusal, false)
             .await
@@ -1609,7 +1639,6 @@ fn offline_edits_keep_the_original_rollback_across_reload_until_publication() {
         inner.save_pq_config(last.clone()).await.unwrap();
         let sign_in = PublishError::transmitted(
             protocol::Error::from(protocol::ErrorKind::SignInRequired).into(),
-            true,
         );
         assert!(
             engine
@@ -1622,10 +1651,8 @@ fn offline_edits_keep_the_original_rollback_across_reload_until_publication() {
         assert_eq!(inner.client.pq_config(), &last);
         assert_eq!(inner.state.pending_pq_rollback.as_ref(), Some(&rollback));
 
-        let refused = PublishError::transmitted(
-            protocol::Error::from(protocol::ErrorKind::Malformed).into(),
-            true,
-        );
+        let refused =
+            PublishError::transmitted(protocol::Error::from(protocol::ErrorKind::Malformed).into());
         assert!(
             engine
                 .finish_publish_rollback(&mut inner, refused, false)
@@ -1708,10 +1735,8 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         inner.state.pending_pq_rollback = None;
         inner.save(&[]).await.unwrap();
 
-        let refusal = PublishError::transmitted(
-            protocol::Error::from(protocol::ErrorKind::Malformed).into(),
-            true,
-        );
+        let refusal =
+            PublishError::transmitted(protocol::Error::from(protocol::ErrorKind::Malformed).into());
         let err = engine
             .finish_publish_rollback(&mut inner, refusal, false)
             .await
@@ -1747,7 +1772,7 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         reloaded.save(&[]).await.unwrap();
         reloaded.vault.fail_save.set(true);
         let engine2 = Engine::new(Ui::new());
-        let strict_refusal = PublishError::transmitted(ErrorKind::PqRequired.into(), true);
+        let strict_refusal = PublishError::transmitted(ErrorKind::PqRequired.into());
         let err = engine2
             .finish_publish_rollback(&mut reloaded, strict_refusal, true)
             .await
@@ -1775,4 +1800,735 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         reloaded.save_pq_config(adjusted).await.unwrap();
         assert!(reloaded.state.needs_publish);
     });
+}
+
+#[test]
+fn update_required_banner_handles_unimplemented_and_normalizes_reason() {
+    assert!(normalize_update_reason("").contains("Refresh the page"));
+    assert!(
+        normalize_update_reason("procedure not implemented by server").contains("Refresh the page")
+    );
+    assert_eq!(
+        normalize_update_reason("Legacy v1 notifications deprecated; refresh or upgrade the app"),
+        "Legacy v1 notifications deprecated; refresh or upgrade the app"
+    );
+    assert!(normalize_update_reason("protocol mismatch").contains("Refresh the page"));
+
+    let ui = Ui::new();
+    let engine = Engine::new(ui);
+    assert!(ui.update_required.get_untracked().is_none());
+
+    // Non-Unimplemented errors do not trigger the update banner.
+    engine.check_protocol_error(
+        ProtocolRpcScope::CoreV2,
+        &session::Error::from(ErrorKind::Server),
+    );
+    assert!(ui.update_required.get_untracked().is_none());
+
+    // Unconfirmed / ambiguous Unimplemented does not trigger the update banner.
+    engine.check_protocol_error(
+        ProtocolRpcScope::CoreV2,
+        &session::Error::from(protocol::Error::ambiguous_response(
+            protocol::ErrorKind::Unimplemented,
+            "ambiguous",
+        )),
+    );
+    assert!(ui.update_required.get_untracked().is_none());
+
+    #[derive(Clone)]
+    struct HttpError(u16, Vec<u8>);
+    impl LocalPost for HttpError {
+        async fn post(&self, _path: &str, _body: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
+            Ok((self.0, self.1.clone()))
+        }
+    }
+    let core_unimpl = futures::executor::block_on(async {
+        let proxy = ConnectClient::new(HttpError(404, b"<html>Not Found</html>".to_vec()));
+        let proxy_client = Client::new(proxy);
+        let err = proxy_client
+            .check_server_info("chat.example")
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unimplemented);
+        assert!(!err.is_server_refusal());
+        assert!(!err.is_connect_error());
+        engine.check_protocol_error(ProtocolRpcScope::CoreV2, &err);
+        assert!(ui.update_required.get_untracked().is_none());
+
+        let worker =
+            protocol::connect::error(protocol::ErrorKind::Unimplemented, "upgrade required");
+        let relay = ConnectClient::new(HttpError(worker.status, worker.body));
+        let client = Client::new(relay.clone());
+        let err = client.start_upload(&relay, 16).await.unwrap_err();
+        assert!(err.is_connect_error());
+        engine.check_protocol_error(ProtocolRpcScope::Attachment, &err);
+        assert!(ui.update_required.get_untracked().is_none());
+
+        client.check_server_info("chat.example").await.unwrap_err()
+    });
+
+    assert!(core_unimpl.is_connect_error());
+    assert!(should_require_update_for_rpc(
+        ProtocolRpcScope::CoreV2,
+        &core_unimpl
+    ));
+    engine.check_protocol_error(ProtocolRpcScope::CoreV2, &core_unimpl);
+    assert!(
+        ui.update_required
+            .get_untracked()
+            .is_some_and(|msg| msg.contains("upgrade required"))
+    );
+    assert_eq!(ui.log.get_untracked().len(), 1);
+    // Repeated calls do not spam duplicate activity log entries.
+    engine.require_update("Please refresh to continue.");
+    assert_eq!(ui.log.get_untracked().len(), 1);
+    assert_eq!(
+        ui.update_required.get_untracked().as_deref(),
+        Some("Please refresh to continue.")
+    );
+}
+
+#[test]
+fn permanently_invalid_classical_initial_is_staged_for_ack() {
+    let engine = Engine::new(Ui::new());
+    let (mut inner, _) = unlocked_client();
+    let wire = WireInitialMessageV2 {
+        id: 41,
+        ..WireInitialMessageV2::from(&legacy_wire_initial(9))
+    };
+    let mut batch = InitialBatch::default();
+    engine.process_inbox_messages(
+        &mut inner,
+        ListedInitialMessages {
+            messages: vec![Incoming::try_from(&wire).unwrap()],
+            malformed_ids: vec![],
+        },
+        None,
+        &mut batch,
+    );
+    assert_eq!(inner.state.pending_inbox_acks, vec![41]);
+    assert!(inner.deferred_initials.is_empty());
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+fn unsupported_wire_initial(peer: PublicKey, id: u64) -> WireInitialMessageV2 {
+    unsupported_wire_initial_with_payload(peer, id, &id.to_be_bytes())
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+fn unsupported_wire_initial_with_payload(
+    peer: PublicKey,
+    id: u64,
+    content: &[u8],
+) -> WireInitialMessageV2 {
+    WireInitialMessageV2 {
+        id,
+        version: 2,
+        identity_key: Bytes::copy_from_slice(&peer),
+        ephemeral_key: Bytes::from_static(&[0x55; 32]),
+        signed_prekey: Bytes::from_static(&[0x66; 32]),
+        one_time_prekey: Some(Bytes::from_static(&[0x22; 32])),
+        first_message: Some(party::EncryptedMessage {
+            header: Bytes::from_static(b"header"),
+            content: Bytes::copy_from_slice(content),
+        }),
+        pq_suite: PqSuite::MlKem1024.as_u8().into(),
+        pq_last_resort: true,
+        pq_prekey_id: Bytes::from_static(&[0x77; 32]),
+        pq_ciphertext: Bytes::from(vec![0x88; PqSuite::MlKem1024.ct_len()]),
+        manifest_digest: Bytes::from_static(&[0x99; 32]),
+    }
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn unsupported_carried_initial_survives_reload_and_allows_later_joins() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let mut client = Client::new(Fetch::client(TEST_SERVER));
+        let (peer, supported) = carried_initial(&mut client).await;
+        let mut inner = load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
+        let wire = unsupported_wire_initial(peer, 0);
+        let deferred = Incoming::try_from(&wire).unwrap();
+        stage_carried_initials(&mut inner.contacts[0].state, [&deferred, &supported]).unwrap();
+        inner.save(&[]).await.unwrap();
+
+        let join = engine.join_carried(&mut inner, &peer).await.unwrap();
+        assert_eq!(
+            join,
+            JoinCarriedOutcome {
+                recommend_upgrade: false,
+                has_deferred: true,
+            }
+        );
+        let expected = [protocol::mailbox_v2::encode_carried_initial(&wire)
+            .unwrap()
+            .to_vec()];
+        assert_eq!(
+            inner.vault.state.borrow().contacts[0].pending_carried_initials,
+            expected
+        );
+        assert_eq!(inner.vault.entries.borrow().len(), 1);
+        let logged = engine.ui.log.get_untracked().len();
+        inner.vault.fail_save.set(true);
+        assert!(
+            engine
+                .join_carried(&mut inner, &peer)
+                .await
+                .unwrap()
+                .has_deferred
+        );
+        assert_eq!(engine.ui.log.get_untracked().len(), logged);
+
+        let mut inner = reload(inner.vault);
+        assert_eq!(inner.contacts[0].state.pending_carried_initials, expected);
+        assert!(
+            engine
+                .join_carried(&mut inner, &peer)
+                .await
+                .unwrap()
+                .has_deferred
+        );
+        assert_eq!(engine.ui.log.get_untracked().len(), logged + 1);
+        assert_eq!(inner.contacts[0].state.pending_carried_initials, expected);
+    });
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn full_unsupported_carried_queue_still_stages_and_joins_supported_handshake() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let mut client = Client::new(Fetch::client(TEST_SERVER));
+        let (peer, supported) = carried_initial(&mut client).await;
+        let mut inner = load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
+
+        // Fill all 128 unsupported carried-initial slots.
+        let unsupported: Vec<_> = (1u64..=129)
+            .map(|n| Incoming::try_from(&unsupported_wire_initial(peer, n)).unwrap())
+            .collect();
+        stage_carried_initials(&mut inner.contacts[0].state, unsupported.iter()).unwrap();
+        assert_eq!(inner.contacts[0].state.pending_carried_initials.len(), 128);
+        inner.save(&[]).await.unwrap();
+        assert!(
+            engine
+                .join_carried(&mut inner, &peer)
+                .await
+                .unwrap()
+                .has_deferred
+        );
+
+        // Even with 128 unsupported entries retained, staging and joining a new supported carried
+        // initial succeeds cleanly without cursor rollback!
+        let before = inner.contacts[0].snapshot();
+        inner
+            .persist_received_page(0, before, &[supported], &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(inner.contacts[0].state.pending_carried_initials.len(), 129);
+        let outcome = engine.join_carried(&mut inner, &peer).await.unwrap();
+        assert!(outcome.has_deferred);
+        assert_eq!(inner.contacts[0].state.pending_carried_initials.len(), 128);
+        assert_eq!(inner.vault.entries.borrow().len(), 1);
+    });
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn deferred_inbox_ack_waits_for_durable_ciphertext_and_survives_restart() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let (mut inner, peer) = unlocked_client();
+        inner.save(&[]).await.unwrap();
+        let wire = unsupported_wire_initial(peer, 77);
+        let normalized_wire = WireInitialMessageV2 {
+            id: 0,
+            ..wire.clone()
+        };
+        let message = Incoming::try_from(&wire).unwrap();
+        let mut batch = InitialBatch::default();
+        engine.process_inbox_messages(
+            &mut inner,
+            ListedInitialMessages {
+                messages: vec![message.clone(), message],
+                malformed_ids: vec![],
+            },
+            None,
+            &mut batch,
+        );
+        assert!(inner.needs_save());
+        assert!(inner.state.pending_inbox_acks.is_empty());
+        assert!(inner.has_deferred_initial_for(&peer));
+        inner.vault.fail_save.set(true);
+        assert!(engine.save_initial_batch(&mut inner, batch).await.is_err());
+        inner
+            .ack_persisted_inbox(async |_, _, _| panic!("ack before commit"))
+            .await
+            .unwrap();
+        assert!(inner.state.pending_inbox_acks.is_empty());
+        assert!(inner.vault.deferred.borrow().entries.is_empty());
+        assert!(inner.vault.state.borrow().deferred_initials.is_empty());
+        assert!(inner.vault.state.borrow().pending_inbox_acks.is_empty());
+
+        inner.vault.fail_save.set(false);
+        inner.save(&[]).await.unwrap();
+        // Separate record holds the deferred initial; `AppState` tag 12 remains empty!
+        assert!(inner.vault.state.borrow().deferred_initials.is_empty());
+        let mut inner = reload(inner.vault);
+        assert_eq!(inner.deferred_initials.len(), 1);
+        assert_eq!(
+            inner.deferred_initials[0].initial.as_ref(),
+            Some(&normalized_wire)
+        );
+        assert!(inner.deferred_initials[0].deferred_at > 0);
+        assert_eq!(inner.state.pending_inbox_acks, [77]);
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut sent = vec![];
+        inner
+            .ack_persisted_inbox(async |_, _, ids| {
+                sent.extend(ids);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(sent, [77]);
+        assert!(inner.vault.state.borrow().pending_inbox_acks.is_empty());
+        assert_eq!(inner.vault.deferred.borrow().entries.len(), 1);
+        assert_eq!(
+            inner.vault.deferred.borrow().entries[0].initial.as_ref(),
+            Some(&normalized_wire)
+        );
+    });
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn full_deferred_inbox_dedups_distinct_relay_ids_and_leaves_new_ciphertext_on_server() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let (mut inner, peer) = unlocked_client();
+        let listed = |ids: std::ops::RangeInclusive<u64>| ListedInitialMessages {
+            messages: ids
+                .map(|id| Incoming::try_from(&unsupported_wire_initial(peer, id)).unwrap())
+                .collect(),
+            malformed_ids: vec![],
+        };
+        let mut batch = InitialBatch::default();
+        engine.process_inbox_messages(&mut inner, listed(1..=100), None, &mut batch);
+        engine.save_initial_batch(&mut inner, batch).await.unwrap();
+        inner
+            .ack_persisted_inbox(async |_, _, ids| {
+                assert_eq!(ids, (1..=100).collect::<Vec<_>>());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // A retransmission of entry #100 with a DIFFERENT relay ID (200) shares the existing
+        // deferred slot and still gets acknowledged, while a distinct ciphertext (id=101) is
+        // left unacked on the server!
+        let retransmitted = Incoming::try_from(&unsupported_wire_initial_with_payload(
+            peer,
+            200,
+            &100u64.to_be_bytes(),
+        ))
+        .unwrap();
+        let distinct_new = Incoming::try_from(&unsupported_wire_initial(peer, 101)).unwrap();
+        let mut batch = InitialBatch::default();
+        engine.process_inbox_messages(
+            &mut inner,
+            ListedInitialMessages {
+                messages: vec![retransmitted, distinct_new],
+                malformed_ids: vec![],
+            },
+            None,
+            &mut batch,
+        );
+        engine.save_initial_batch(&mut inner, batch).await.unwrap();
+        assert_eq!(inner.vault.state.borrow().pending_inbox_acks, [200]);
+        let saved_deferred = inner.vault.deferred.borrow();
+        assert_eq!(saved_deferred.entries.len(), 100);
+        assert!(
+            saved_deferred
+                .entries
+                .iter()
+                .all(|e| e.initial.as_ref().unwrap().id == 0)
+        );
+    });
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn pq_incompatible_isolated_contact_defers_greetings_while_corrupt_contact_acks() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let mut client = Client::new(Fetch::client(TEST_SERVER));
+        let me = client.identity_key();
+        let (pq_peer, classical_or_supported_msg) = carried_initial(&mut client).await;
+        let corrupt_peer = identity();
+
+        // Healthy contact isolated ONLY because its active KEM ratchet uses ML-KEM-1024.
+        let mut pq_isolated = stored_contact(me, pq_peer);
+        let mut party = party::proto::Party::default();
+        party.kem_ratchet.get_or_insert_default().suite = PqSuite::MlKem1024.as_u8().into();
+        pq_isolated.session.as_mut().unwrap().party = Some(party);
+        // Genuinely corrupt contact (invalid cursor, no unsupported PQ suite).
+        let mut corrupt_isolated = stored_contact(me, corrupt_peer);
+        corrupt_isolated.session.as_mut().unwrap().cursor = u64::MAX;
+
+        let mut inner = load_contacts(&client, vec![pq_isolated, corrupt_isolated]);
+        assert!(inner.is_pq_incompatible_isolated_peer(&pq_peer));
+        assert!(inner.is_isolated_peer(&corrupt_peer));
+        assert!(!inner.is_pq_incompatible_isolated_peer(&corrupt_peer));
+
+        let mut msg_from_pq_peer = classical_or_supported_msg;
+        msg_from_pq_peer.id = 51;
+        let msg_from_corrupt_peer =
+            Incoming::try_from(&unsupported_wire_initial(corrupt_peer, 52)).unwrap();
+        let mut batch = InitialBatch::default();
+        engine.process_inbox_messages(
+            &mut inner,
+            ListedInitialMessages {
+                messages: vec![msg_from_pq_peer, msg_from_corrupt_peer],
+                malformed_ids: vec![],
+            },
+            None,
+            &mut batch,
+        );
+        // Greeting from the PQ-isolated contact is DEFERRED (acked only after durable save);
+        // greeting from the genuinely corrupt contact is rejected & staged directly for ack.
+        assert_eq!(inner.deferred_initials.len(), 1);
+        assert!(inner.has_deferred_initial_for(&pq_peer));
+        assert!(!inner.has_deferred_initial_for(&corrupt_peer));
+        assert_eq!(inner.state.pending_inbox_acks, [52]);
+        assert_eq!(inner.deferred_acks_after_save, [51]);
+
+        // Saving and attempting replay on this build leaves the entry deferred while the contact
+        // remains PQ-isolated (does NOT drop or destroy it).
+        engine.save_initial_batch(&mut inner, batch).await.unwrap();
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(inner.deferred_initials.len(), 1);
+    });
+}
+
+#[test]
+fn sanitize_deferred_initials_prunes_malformed_dedups_caps_and_migrates_legacy() {
+    let peer = identity();
+    let valid_v2 = WireInitialMessageV2 {
+        id: 19,
+        version: 2,
+        identity_key: Bytes::copy_from_slice(&peer),
+        ephemeral_key: Bytes::from_static(&[0x55; 32]),
+        signed_prekey: Bytes::from_static(&[0x66; 32]),
+        first_message: Some(party::EncryptedMessage {
+            header: Bytes::from_static(b"h"),
+            content: Bytes::from_static(b"c"),
+        }),
+        pq_suite: PqSuite::MlKem1024.as_u8().into(),
+        pq_last_resort: true,
+        pq_prekey_id: Bytes::from_static(&[0x77; 32]),
+        pq_ciphertext: Bytes::from(vec![0x88; PqSuite::MlKem1024.ct_len()]),
+        manifest_digest: Bytes::from_static(&[0x99; 32]),
+        ..Default::default()
+    };
+    let dup_other_id = WireInitialMessageV2 {
+        id: 99,
+        ..valid_v2.clone()
+    };
+    // Malformed v2 with suite == 0 must be pruned so it cannot occupy a deferred slot forever.
+    let bad_suite_zero = WireInitialMessageV2 {
+        pq_suite: 0,
+        ..valid_v2.clone()
+    };
+    let mut entries = vec![
+        DeferredInitial {
+            initial: None,
+            deferred_at: 0,
+        },
+        DeferredInitial {
+            initial: Some(bad_suite_zero),
+            deferred_at: 100,
+        },
+        DeferredInitial {
+            initial: Some(valid_v2.clone()),
+            deferred_at: 0,
+        },
+    ];
+    assert!(merge_legacy_deferred_initials(
+        &mut entries,
+        vec![dup_other_id]
+    ));
+
+    let (removed, modified) = sanitize_deferred_initials(&mut entries, 5_000);
+    assert_eq!(removed, 3);
+    assert!(modified);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].deferred_at, 5_000);
+    assert_eq!(entries[0].initial.as_ref().unwrap().id, 0);
+
+    // Deleting `peer` prunes `peer`'s deferred greetings while preserving other peers' entries.
+    let (mut inner, other_peer) = unlocked_client();
+    let other_v2 = WireInitialMessageV2 {
+        identity_key: Bytes::copy_from_slice(&other_peer),
+        id: 0,
+        ..valid_v2
+    };
+    inner.deferred_initials = vec![
+        entries[0].clone(),
+        DeferredInitial {
+            initial: Some(other_v2.clone()),
+            deferred_at: 6_000,
+        },
+    ];
+    let after_delete = inner.deferred_record_without_peer(&peer);
+    assert_eq!(after_delete.entries.len(), 1);
+    assert_eq!(after_delete.entries[0].initial.as_ref(), Some(&other_v2));
+
+    // Replay window bounds prekey/digest preservation to DEFERRED_REPLAY_WINDOW_MS (30 days).
+    let (spks_fresh, digests_fresh) =
+        preserved_deferred_prekeys(&inner, 5_000 + DEFERRED_REPLAY_WINDOW_MS);
+    assert_eq!(spks_fresh, vec![[0x66; 32]]);
+    assert_eq!(digests_fresh, vec![[0x99; 32]]);
+    let (spks_expired, digests_expired) =
+        preserved_deferred_prekeys(&inner, 6_000 + DEFERRED_REPLAY_WINDOW_MS + 1);
+    assert!(spks_expired.is_empty());
+    assert!(digests_expired.is_empty());
+
+    // Carried initial timestamps also respect the 30-day window.
+    inner.deferred_initials.clear();
+    let carried_bytes = protocol::mailbox_v2::encode_carried_initial(&other_v2)
+        .unwrap()
+        .to_vec();
+    inner.contacts[0]
+        .state
+        .pending_carried_initials
+        .push(carried_bytes);
+    inner
+        .carried_deferred_timestamps
+        .push(CarriedDeferredTimestamp {
+            signed_prekey: vec![0x66; 32],
+            deferred_at: 10_000,
+        });
+    let (c_spks_fresh, _) = preserved_deferred_prekeys(&inner, 10_000 + DEFERRED_REPLAY_WINDOW_MS);
+    assert_eq!(c_spks_fresh, vec![[0x66; 32]]);
+    let (c_spks_old, _) =
+        preserved_deferred_prekeys(&inner, 10_000 + DEFERRED_REPLAY_WINDOW_MS + 1);
+    assert!(c_spks_old.is_empty());
+    // Deleting the contact prunes its orphaned carried timestamp.
+    let pruned_for_delete = inner.deferred_record_without_peer(&other_peer);
+    assert!(pruned_for_delete.carried_timestamps.is_empty());
+}
+
+#[test]
+fn stalled_receive_pauses_without_skipping_when_peer_has_deferred_initial() {
+    let (mut inner, peer) = unlocked_client();
+    change_session(&mut inner.contacts[0].session, |s| {
+        s.cursor = 4;
+        s.stalled_through = 12;
+        s.skip_through = 0;
+    });
+
+    // 1. Deferred carried initial pauses receive and preserves skip_through == 0.
+    assert!(resolve_stalled_peer(
+        &mut inner,
+        &peer,
+        JoinCarriedOutcome {
+            recommend_upgrade: false,
+            has_deferred: true,
+        },
+    ));
+    assert_eq!(
+        proto::SessionState::from(inner.contacts[0].session.state()).skip_through,
+        0
+    );
+
+    // 2. Deferred inbox initial for `peer` also pauses receive and preserves skip_through == 0.
+    let deferred_wire = WireInitialMessageV2 {
+        version: 2,
+        identity_key: Bytes::copy_from_slice(&peer),
+        ephemeral_key: Bytes::from_static(&[0x55; 32]),
+        signed_prekey: Bytes::from_static(&[0x66; 32]),
+        first_message: Some(party::EncryptedMessage::default()),
+        pq_suite: PqSuite::MlKem1024.as_u8().into(),
+        pq_last_resort: true,
+        pq_prekey_id: Bytes::from_static(&[0x77; 32]),
+        pq_ciphertext: Bytes::from(vec![0x88; PqSuite::MlKem1024.ct_len()]),
+        ..Default::default()
+    };
+    inner.deferred_initials.push(DeferredInitial {
+        initial: Some(deferred_wire),
+        deferred_at: 1_000,
+    });
+    assert!(resolve_stalled_peer(
+        &mut inner,
+        &peer,
+        JoinCarriedOutcome::default(),
+    ));
+    assert_eq!(
+        proto::SessionState::from(inner.contacts[0].session.state()).skip_through,
+        0
+    );
+
+    // 3. Once no deferred initials remain for `peer`, stalled receive calls skip_stalled().
+    inner.deferred_initials.clear();
+    assert!(!resolve_stalled_peer(
+        &mut inner,
+        &peer,
+        JoinCarriedOutcome::default(),
+    ));
+    assert_eq!(
+        proto::SessionState::from(inner.contacts[0].session.state()).skip_through,
+        12
+    );
+}
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[test]
+fn pq_build_replays_deferred_inbox_ciphertext_once_after_reload() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let mut client = Client::new(Fetch::client(TEST_SERVER));
+        let (peer, mut message) = carried_initial(&mut client).await;
+        message.id = 77;
+        client
+            .set_pq_config(PqConfig {
+                pq_enabled: false,
+                pq_ratchet_enabled: false,
+                ..client.pq_config().clone()
+            })
+            .unwrap();
+        let mut inner = load_contacts(&client, vec![]);
+        // Save the same encrypted wire record and ack as the build lacking this suite.
+        assert!(inner.defer_inbox_initial(&message));
+        inner.save(&[]).await.unwrap();
+        assert!(inner.vault.state.borrow().deferred_initials.is_empty());
+        assert_eq!(inner.vault.deferred.borrow().entries.len(), 1);
+        inner
+            .ack_persisted_inbox(async |_, _, ids| {
+                assert_eq!(ids, [77]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let mut inner = reload(inner.vault);
+        inner.vault.fail_save.set(true);
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(inner.vault.deferred.borrow().entries.len(), 1);
+        assert!(inner.vault.entries.borrow().is_empty());
+
+        inner.vault.fail_save.set(false);
+        let mut inner = reload(inner.vault);
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut inner = reload(inner.vault);
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(inner.deferred_initials.is_empty());
+        assert!(inner.vault.deferred.borrow().is_empty());
+        assert!(inner.state.pending_inbox_acks.is_empty());
+        assert_eq!(inner.state.used_one_time_prekeys, 1);
+        assert_eq!(inner.state.used_pq_one_time_prekeys, 1);
+        assert!(inner.contact(&peer).unwrap().has_healthy_pq_session());
+        let entries = inner.vault.entries.borrow();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[&history_key(&peer, 0)]
+                .content
+                .as_ref()
+                .unwrap()
+                .kind,
+            Some(Kind::Text("first message".into()))
+        );
+    });
+}
+
+#[test]
+fn legacy_farewell_without_client_message_id_derives_deterministic_id() {
+    let encrypted = party::EncryptedMessage {
+        header: Bytes::from_static(b"ratchet-header"),
+        content: Bytes::from_static(b"encrypted-farewell-body"),
+    };
+    let expected_id = session::Sealed::client_message_id_for(&encrypted);
+    assert_eq!(expected_id.len(), 16);
+
+    let legacy_farewell = Farewell {
+        push: Some(session::protocol::mailbox::PushRequest {
+            sender: Bytes::from_static(&[0x11; 32]),
+            recipient: Bytes::from_static(&[0x22; 32]),
+            message: Some(encrypted.clone()),
+            initial_message: None,
+            delivery_hash: Bytes::from_static(&[0x33; 32]),
+        }),
+        client_message_id: vec![],
+        push_v2: vec![],
+    };
+
+    let first = farewell_push_v2_request(&legacy_farewell);
+    let retry = farewell_push_v2_request(&legacy_farewell);
+    assert_eq!(first.client_message_id.as_ref(), &expected_id);
+    assert_eq!(
+        first, retry,
+        "retries must derive identical client_message_id"
+    );
+
+    // Existing explicit 16-byte client_message_id is preserved verbatim.
+    let explicit_farewell = Farewell {
+        client_message_id: vec![0xAB; 16],
+        ..legacy_farewell.clone()
+    };
+    assert_eq!(
+        farewell_push_v2_request(&explicit_farewell)
+            .client_message_id
+            .as_ref(),
+        &[0xAB; 16]
+    );
+
+    // A push_v2 farewell with empty client_message_id also backfills the deterministic ID.
+    let v2_without_cid = PushV2Request {
+        sender: Bytes::from_static(&[0x11; 32]),
+        recipient: Bytes::from_static(&[0x22; 32]),
+        message: Some(encrypted),
+        initial_message: None,
+        delivery_hash: Bytes::new(),
+        client_message_id: Bytes::new(),
+    };
+    let v2_farewell = Farewell {
+        push: None,
+        client_message_id: vec![],
+        push_v2: v2_without_cid.encode_to_vec(),
+    };
+    assert_eq!(
+        farewell_push_v2_request(&v2_farewell)
+            .client_message_id
+            .as_ref(),
+        &expected_id
+    );
 }

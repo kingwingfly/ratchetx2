@@ -70,9 +70,11 @@ message GetServerInfoResponse {
   bool pq_ratchet_supported = 3;
   // Canonical server audience identifier bound into signed v2 requests and manifests.
   string server_id = 4;
-  // Whether legacy v1 handshake/mailbox routes are enabled.
+  // Deprecated compatibility flag kept at false for wire stability: whether legacy v1
+  // handshake/mailbox routes are enabled.
   bool legacy_v1_enabled = 5;
-  // Whether unsigned legacy v1 mailbox Fetch requests are allowed.
+  // Deprecated compatibility flag kept at false for wire stability: whether unsigned legacy
+  // v1 mailbox Fetch requests are allowed.
   bool allow_unsigned_fetch = 6;
 }
 

@@ -1,7 +1,11 @@
 # Served with the web client by Workers Static Assets. Peers' messages are shown in this page,
 # where the keys live, so it runs no script but its own, and no other page may frame it.
+# Trunk builds use `filehash = false` (fixed filenames for HTML, JS, WASM, CSS, and workers), so
+# `Cache-Control: no-cache` forces conditional ETag revalidation across all assets and prevents
+# stale bundles or JS/WASM version skew after clicking Refresh.
 /*
   Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob: data:; media-src 'self' blob:; connect-src * ws: wss:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; frame-ancestors 'none'
   Referrer-Policy: no-referrer
   X-Content-Type-Options: nosniff
   Permissions-Policy: camera=(), microphone=(), geolocation=()
+  Cache-Control: no-cache

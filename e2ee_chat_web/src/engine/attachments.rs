@@ -102,7 +102,10 @@ impl Engine {
                     file.name()
                 ));
             }
-            Err(e) => return Err(describe(&e)),
+            Err(e) => {
+                // Report attachment 404/Unimplemented locally without tripping global update_required.
+                return Err(describe(&e));
+            }
         };
         let pending = PendingUpload {
             id: upload.id().to_vec(),
@@ -279,7 +282,10 @@ impl Engine {
                 self.ask_sign_in();
                 return Ok(());
             }
-            Err(e) => return Err(describe(&e)),
+            Err(e) => {
+                // Report attachment 404/Unimplemented locally without tripping global update_required.
+                return Err(describe(&e));
+            }
         };
         // Cancelled meanwhile: the server forgets it too, and cancelling fails its message.
         if self.cancelled.borrow().contains(&waiting) {
@@ -796,7 +802,10 @@ impl Engine {
             // Gone already, e.g. expired, or deleted by the peer, as it should be.
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
-            Err(e) => return Err(describe(&e)),
+            Err(e) => {
+                // Report attachment 404/Unimplemented locally without tripping global update_required.
+                return Err(describe(&e));
+            }
         }
         self.drop_upload(&peer, id).await?;
         self.note_gone(&peer, index, &id).await

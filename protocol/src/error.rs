@@ -10,16 +10,23 @@ use std::error::Error as StdError;
 pub struct Error {
     kind: ErrorKind,
     source: Option<Box<dyn StdError + Send + Sync>>,
-    ambiguous: bool,
+    origin: ErrorOrigin,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ErrorOrigin {
+    Protocol,
+    #[cfg(feature = "connect")]
+    HttpStatus,
+    Transport,
 }
 
 impl Error {
     /// New an error of `kind`, caused by `source`.
     pub fn new(kind: ErrorKind, source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
         Self {
-            kind,
             source: Some(source.into()),
-            ambiguous: false,
+            ..kind.into()
         }
     }
 
@@ -29,15 +36,34 @@ impl Error {
         source: impl Into<Box<dyn StdError + Send + Sync>>,
     ) -> Self {
         Self {
-            ambiguous: true,
+            origin: ErrorOrigin::Transport,
             ..Self::new(kind, source)
         }
     }
 
-    /// Whether the server definitively refused the request, so locally prepared keys can be
-    /// rolled back. Transport, response-decoding and internal server errors leave this unknown.
+    #[cfg(feature = "connect")]
+    pub(crate) fn from_http_status(
+        kind: ErrorKind,
+        source: impl Into<Box<dyn StdError + Send + Sync>>,
+    ) -> Self {
+        Self {
+            origin: ErrorOrigin::HttpStatus,
+            ..Self::new(kind, source)
+        }
+    }
+
+    /// Whether the error came directly from the protocol handler or from a decoded Connect
+    /// error body. Transport failures and errors inferred from a bare HTTP status return false.
+    pub fn is_connect_error(&self) -> bool {
+        self.origin == ErrorOrigin::Protocol
+    }
+
+    /// Whether the server definitively refused the request (directly from a protocol handler or
+    /// via a decoded Connect error body), so locally prepared keys can be rolled back. Transport,
+    /// response-decoding, bare HTTP status (e.g. proxy 404), and internal server errors leave
+    /// this unknown.
     pub fn is_server_refusal(&self) -> bool {
-        !self.ambiguous
+        self.origin == ErrorOrigin::Protocol
             && matches!(
                 self.kind,
                 ErrorKind::SignInRequired
@@ -61,7 +87,10 @@ impl From<ErrorKind> for Error {
         Self {
             kind,
             source: None,
-            ambiguous: false,
+            origin: match kind {
+                ErrorKind::Connect | ErrorKind::InvalidResponse => ErrorOrigin::Transport,
+                _ => ErrorOrigin::Protocol,
+            },
         }
     }
 }

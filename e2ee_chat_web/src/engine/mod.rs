@@ -23,7 +23,10 @@ use crate::state::{
 };
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, js_error, key_to_url, short, size_u64, sleep};
-use crate::vault::{AppState, ContactState, HistoryEntry, OutgoingRecord, Vault, history_key};
+use crate::vault::{
+    AppState, CarriedDeferredTimestamp, ContactState, DeferredInitial, DeferredInitialsRecord,
+    HistoryEntry, OutgoingRecord, Vault, history_key,
+};
 use crate::{content, glue, transport};
 use attachments::upload_of;
 use contact::{Contact, forget_told, isolated_contact_views, restore_contacts, stored_contacts};
@@ -36,7 +39,7 @@ use leptos::task::spawn_local;
 use session::attachment::{CHUNK_SIZE, Upload};
 use session::protocol::attachment::DEFAULT_MAX_CHUNKS;
 use session::{
-    Client, ClientState, PqConfig, PublicKey, Session, SessionState, attachment,
+    Client, ClientState, ErrorKind, PqConfig, PublicKey, Session, SessionState, attachment,
     expected_audience_from_url, proto,
 };
 use sha2::{Digest, Sha256};
@@ -56,12 +59,10 @@ const NOT_SIGNED_IN_HERE: &str =
 /// Classical one-time prekeys in each initial/rotating publish.
 const ONE_TIME_PREKEYS: usize = 20;
 /// Post-quantum one-time prekeys per suite in each v2 initial/rotating publish.
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 const PQ_ONE_TIME_PREKEYS: usize = 20;
 /// Server-enforced cumulative classical OPK cap (`HandshakeV2Limits::default()`).
 const SERVER_MAX_ONE_TIME_PREKEYS: usize = 100;
 /// Server-enforced cumulative PQOPK cap summed across all suites (`HandshakeV2Limits::default()`).
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 const SERVER_MAX_PQ_ONE_TIME_PREKEYS: usize = 100;
 /// Replenish one-time prekeys (without rotating SPK) once this many are used...
 const REFILL_USED: u32 = 10;
@@ -69,10 +70,6 @@ const REFILL_USED: u32 = 10;
 const REPUBLISH_AGE: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Structured error returned by [`Engine::start_chat`] so the UI can offer actionable prompts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
-    allow(dead_code)
-)]
 pub enum StartChatError {
     /// The server requires sign-in on this page's origin before fetching prekeys / starting a chat.
     SignInRequired,
@@ -231,20 +228,20 @@ struct Inner<V = Vault> {
     /// The server's address.
     server: String,
     /// Canonical expected server audience derived from `server` via `expected_audience_from_url`.
-    #[cfg_attr(
-        not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
-        allow(dead_code)
-    )]
     audience: String,
     /// Server PQ availability discovered via `check_server_info`.
     server_pq: ServerPqStatus,
     /// Last known server-stored classical OPK count (from publish or `RefillPrekeysResponse`).
     last_server_classical_opks: Option<u32>,
     /// Last known server-stored total PQOPK count across all suites.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     last_server_pq_opks: Option<u32>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
+    /// Encrypted inbox initials retained in the separate `deferred_initials` vault record.
+    deferred_initials: Vec<DeferredInitial>,
+    /// Earliest timestamps (Unix ms) at which unsupported carried initials referencing an SPK
+    /// were retained, bounding signed-prekey preservation across rotations.
+    carried_deferred_timestamps: Vec<CarriedDeferredTimestamp>,
     client: Client<Connect>,
     contacts: Vec<Contact>,
     /// Unreadable records retained verbatim until explicitly deleted.
@@ -253,6 +250,8 @@ struct Inner<V = Vault> {
     isolated_peers: HashSet<PublicKey>,
     /// A non-rollbackable state change still needs a successful transaction.
     unsaved_state: bool,
+    /// Inbox IDs to commit with their deferred ciphertext before they become eligible for ack.
+    deferred_acks_after_save: Vec<u64>,
     /// A later transaction committed that change. Refresh contact and identity views on sync.
     contacts_dirty_late: bool,
     /// History records that a save failed to write after what they record could not be undone:
@@ -266,6 +265,33 @@ struct Inner<V = Vault> {
     unsaved_outbox: Vec<(PublicKey, (String, Option<OutgoingRecord>))>,
     /// The chats whose records left unsaved a save wrote, which then show them.
     saved_late: Vec<PublicKey>,
+}
+
+/// Which server RPC surface produced a protocol error, controlling whether `Unimplemented`
+/// should trip the global `Ui::update_required` banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProtocolRpcScope {
+    /// Required core `handshake.v2` / `mailbox.v2` RPCs.
+    CoreV2,
+    /// Optional `attachment.v1` upload/download/delete RPCs.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Attachment,
+}
+
+/// Whether `error` on an RPC in `scope` should trip the global `Ui::update_required` banner
+/// (and slow foreground polling to `POLL_LIVE`).
+///
+/// The core v2 handler must report `Unimplemented`, either directly or in a Connect error body.
+/// The transport handles explicit `x-e2ee-deprecated` headers and sync handles WebSocket close
+/// code `4010` independently.
+pub(super) fn should_require_update_for_rpc(
+    scope: ProtocolRpcScope,
+    error: &session::Error,
+) -> bool {
+    scope == ProtocolRpcScope::CoreV2
+        && error.is_server_refusal()
+        && error.is_connect_error()
+        && error.kind() == ErrorKind::Unimplemented
 }
 
 impl Engine {
@@ -297,7 +323,34 @@ impl Engine {
                 engine.refused_for_sign_in();
             }
         });
+        let weak = Rc::downgrade(&engine);
+        transport::on_update_required(move |reason| {
+            if let Some(engine) = weak.upgrade() {
+                engine.require_update(reason);
+            }
+        });
         engine
+    }
+
+    /// Surface a persistent upgrade/refresh banner when the server rejects this client's protocol
+    /// (e.g. WebSocket close `4010`, `x-e2ee-deprecated`, or `ErrorKind::Unimplemented`).
+    pub(super) fn require_update(&self, reason: impl Into<String>) {
+        let message = normalize_update_reason(&reason.into());
+        let already_shown = self.ui.update_required.with_untracked(Option::is_some);
+        if !already_shown {
+            self.ui.log(format!("update required: {message}"));
+            self.ui.notify(message.clone());
+        }
+        self.ui.update_required.set(Some(message));
+    }
+
+    /// If `error` is a confirmed `ErrorKind::Unimplemented` server refusal on a core v2
+    /// procedure (`handshake.v2` / `mailbox.v2`), prompt the user to refresh/upgrade the page.
+    /// Attachment errors (`ProtocolRpcScope::Attachment`) never trigger the global update banner.
+    pub(super) fn check_protocol_error(&self, scope: ProtocolRpcScope, error: &session::Error) {
+        if should_require_update_for_rpc(scope, error) {
+            self.require_update(describe(error));
+        }
     }
 
     /// Send `what` once everything sent before it went: messages go in the order they were
@@ -665,6 +718,7 @@ impl Engine {
             client,
             vec![],
             vec![],
+            DeferredInitialsRecord::default(),
         ))
         .await;
         Ok(())
@@ -672,7 +726,7 @@ impl Engine {
 
     /// Unlock the vault with `passphrase`.
     pub async fn unlock(self: &Rc<Self>, passphrase: Zeroizing<String>) -> Result<(), String> {
-        let (vault, mut state) = Vault::unlock(passphrase.as_bytes())
+        let (vault, mut state, mut deferred) = Vault::unlock(passphrase.as_bytes())
             .await
             .map_err(|e| describe(&e))?;
         drop(passphrase);
@@ -691,6 +745,16 @@ impl Engine {
             &address,
         );
         let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
+        let migrated_deferred = handshake::merge_legacy_deferred_initials(
+            &mut deferred.entries,
+            std::mem::take(&mut state.deferred_initials),
+        );
+        let (pruned_deferred, modified_deferred) =
+            handshake::sanitize_deferred_initials(&mut deferred.entries, crate::util::now());
+        let pruned_carried_ts = handshake::prune_carried_timestamps_for_contacts(
+            &mut deferred.carried_timestamps,
+            contacts.iter(),
+        );
         let mut inner = Inner::new(
             vault,
             address,
@@ -699,11 +763,24 @@ impl Engine {
             client,
             contacts,
             isolated_contacts,
+            deferred,
         );
         if pruned > 0 {
             self.ui.log(format!(
                 "Removed {pruned} invalid or duplicate inbox acknowledgement ID(s) from the vault."
             ));
+        }
+        if pruned_deferred > 0 {
+            self.ui.log(format!(
+                "Removed {pruned_deferred} invalid, duplicate, or excess deferred initial message(s) from the vault."
+            ));
+        }
+        if pruned > 0
+            || pruned_deferred > 0
+            || modified_deferred
+            || migrated_deferred
+            || pruned_carried_ts > 0
+        {
             inner.unsaved_state = true;
         }
         self.unlocked(inner).await;
@@ -1002,6 +1079,7 @@ impl Engine {
         let mut state = inner.app_state();
         state.contacts.retain(|contact| contact.peer != peer);
         state.farewells.extend(farewell.clone());
+        let deferred = inner.deferred_record_without_peer(&peer);
         let unsaved = inner
             .unsaved
             .iter()
@@ -1014,7 +1092,7 @@ impl Engine {
             .map(|(_, record)| record);
         if let Err(e) = inner
             .vault
-            .forget(&state, &peer, unsaved, unsaved_outbox)
+            .forget(&state, &deferred, &peer, unsaved, unsaved_outbox)
             .await
         {
             if let Some(snapshot) = snapshot {
@@ -1049,7 +1127,9 @@ impl Engine {
         let was_isolated = inner.is_isolated_peer(&peer);
         inner.contacts.retain(|contact| contact.peer != peer);
         inner.forget_isolated_peer(&peer);
-        inner.contacts_dirty_late |= std::mem::take(&mut inner.unsaved_state);
+        inner.deferred_initials = deferred.entries;
+        inner.carried_deferred_timestamps = deferred.carried_timestamps;
+        inner.finish_state_save(state.pending_inbox_acks);
         // The other chats' records left unsaved were saved with it, and show at the next sync.
         inner.saved_late.extend(
             inner
@@ -1143,6 +1223,7 @@ trait HistoryStore {
     async fn save<'a>(
         &self,
         state: &AppState,
+        deferred: &DeferredInitialsRecord,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()>;
@@ -1167,23 +1248,27 @@ impl HistoryStore for Vault {
     async fn save<'a>(
         &self,
         state: &AppState,
+        deferred: &DeferredInitialsRecord,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()> {
-        Vault::save(self, state, entries, outgoing).await
+        Vault::save(self, state, deferred, entries, outgoing).await
     }
 }
 
 impl<V: HistoryStore> Inner<V> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         vault: V,
         server: String,
         audience: String,
-        state: AppState,
+        mut state: AppState,
         client: Client<Connect>,
         contacts: Vec<Contact>,
         mut isolated_contacts: Vec<ContactState>,
+        deferred: DeferredInitialsRecord,
     ) -> Self {
+        state.deferred_initials.clear();
         let active_peers: HashSet<_> = contacts.iter().map(|c| c.peer).collect();
         isolated_contacts.retain(|c| {
             PublicKey::try_from(c.peer.as_slice())
@@ -1198,15 +1283,17 @@ impl<V: HistoryStore> Inner<V> {
             server,
             audience,
             state,
+            deferred_initials: deferred.entries,
+            carried_deferred_timestamps: deferred.carried_timestamps,
             client,
             contacts,
             isolated_contacts,
             isolated_peers,
             server_pq: ServerPqStatus::Unknown,
             last_server_classical_opks: None,
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
             last_server_pq_opks: None,
             unsaved_state: false,
+            deferred_acks_after_save: vec![],
             contacts_dirty_late: false,
             unsaved: vec![],
             unsaved_outbox: vec![],
@@ -1214,13 +1301,55 @@ impl<V: HistoryStore> Inner<V> {
         }
     }
 
-    /// What the vault keeps.
+    /// What the vault keeps in `STATE` (never writes tag 12 `deferred_initials`, which live in
+    /// the separate `deferred_initials` record).
     fn app_state(&self) -> AppState {
-        AppState {
+        let mut state = AppState {
             client: Some(self.client.state().into()),
             contacts: stored_contacts(&self.contacts, &self.isolated_contacts),
+            deferred_initials: vec![],
             ..self.state.clone()
+        };
+        for &id in &self.deferred_acks_after_save {
+            handshake::stage_inbox_ack(&mut state.pending_inbox_acks, id);
         }
+        state
+    }
+
+    fn deferred_record(&self) -> DeferredInitialsRecord {
+        DeferredInitialsRecord {
+            entries: self.deferred_initials.clone(),
+            carried_timestamps: self.carried_deferred_timestamps.clone(),
+        }
+    }
+
+    pub(super) fn deferred_record_without_peer(&self, peer: &PublicKey) -> DeferredInitialsRecord {
+        let entries = self
+            .deferred_initials
+            .iter()
+            .filter(|entry| {
+                entry
+                    .initial
+                    .as_ref()
+                    .is_none_or(|w| w.identity_key.as_ref() != peer.as_slice())
+            })
+            .cloned()
+            .collect();
+        let mut carried_timestamps = self.carried_deferred_timestamps.clone();
+        handshake::prune_carried_timestamps_for_contacts(
+            &mut carried_timestamps,
+            self.contacts.iter().filter(|c| c.peer != *peer),
+        );
+        DeferredInitialsRecord {
+            entries,
+            carried_timestamps,
+        }
+    }
+
+    fn finish_state_save(&mut self, committed_acks: Vec<u64>) {
+        self.state.pending_inbox_acks = committed_acks;
+        self.deferred_acks_after_save.clear();
+        self.contacts_dirty_late |= std::mem::take(&mut self.unsaved_state);
     }
 
     fn local_pq_enabled(&self) -> bool {
@@ -1230,7 +1359,10 @@ impl<V: HistoryStore> Inner<V> {
     }
 
     fn needs_save(&self) -> bool {
-        self.unsaved_state || !self.unsaved.is_empty() || !self.unsaved_outbox.is_empty()
+        self.unsaved_state
+            || !self.deferred_acks_after_save.is_empty()
+            || !self.unsaved.is_empty()
+            || !self.unsaved_outbox.is_empty()
     }
 
     /// Save a state-only mutation that remains in memory even if storage is unavailable.
@@ -1256,14 +1388,17 @@ impl<V: HistoryStore> Inner<V> {
     ) -> crate::vault::Result<()> {
         let unsaved = self.unsaved.iter().map(|(_, record)| record);
         let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
+        let state = self.app_state();
+        let deferred = self.deferred_record();
         self.vault
             .save(
-                &self.app_state(),
+                &state,
+                &deferred,
                 unsaved.chain(entries),
                 unsaved_outbox.chain(outgoing),
             )
             .await?;
-        self.contacts_dirty_late |= std::mem::take(&mut self.unsaved_state);
+        self.finish_state_save(state.pending_inbox_acks);
         self.saved_late
             .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
         self.unsaved_outbox.clear();
@@ -1278,6 +1413,27 @@ impl<V: HistoryStore> Inner<V> {
 
     pub(super) fn is_isolated_peer(&self, peer: &PublicKey) -> bool {
         self.isolated_peers.contains(peer)
+    }
+
+    /// Whether `peer` is isolated specifically because its saved session uses a known ML-KEM suite
+    /// not compiled into this build (rather than structural corruption).
+    pub(super) fn is_pq_incompatible_isolated_peer(&self, peer: &PublicKey) -> bool {
+        let me = self.client.identity_key();
+        self.is_isolated_peer(peer)
+            && self
+                .isolated_contacts
+                .iter()
+                .any(|c| c.peer == peer.as_slice() && contact::is_pq_incompatible_isolated(c, &me))
+    }
+
+    /// Whether any deferred inbox initial from `peer` is currently awaiting a capable build.
+    pub(super) fn has_deferred_initial_for(&self, peer: &PublicKey) -> bool {
+        self.deferred_initials.iter().any(|entry| {
+            entry
+                .initial
+                .as_ref()
+                .is_some_and(|w| w.identity_key.as_ref() == peer.as_slice())
+        })
     }
 
     fn check_isolation(&self, peer: &PublicKey) -> Result<(), String> {
@@ -1407,6 +1563,23 @@ impl Engine {
             }
             order(messages, &me, peer);
         });
+    }
+}
+
+/// Normalize a protocol-deprecation / `Unimplemented` reason into clear refresh guidance for the UI.
+pub(super) fn normalize_update_reason(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("procedure not implemented by server") {
+        return "This app version is no longer supported by the server. Refresh the page to load the latest version."
+            .to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("refresh") || lower.contains("reload") || lower.contains("upgrade") {
+        trimmed.to_string()
+    } else {
+        format!(
+            "This app version is out of date ({trimmed}). Refresh the page to load the latest version."
+        )
     }
 }
 

@@ -11,6 +11,7 @@ addresses = ["127.0.0.1"]
 port = 8080
 
 # During `trunk serve`, the Connect calls go to `wrangler dev`, as they would to the Worker.
+# Forward legacy v1 Connect paths to the Worker's 501 deprecation handler for cached v1 dev tabs.
 [[proxy]]
 backend = "http://127.0.0.1:8787/handshake.v1.HandshakeService/"
 

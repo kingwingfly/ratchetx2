@@ -47,19 +47,15 @@ pub enum Link {
 
 /// Server post-quantum capability status discovered via `GetServerInfo` with expected-audience check.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
-    allow(dead_code)
-)]
 pub enum ServerPqStatus {
-    /// Not queried yet (or classical-only build).
+    /// Not queried yet.
     Unknown,
     /// Server verified expected audience and advertises post-quantum routes enabled.
     Enabled {
         suites: Vec<PqSuite>,
         pq_ratchet: bool,
     },
-    /// Server explicitly reported `pq_enabled = false` or returned `Unimplemented`.
+    /// Server explicitly reported `pq_enabled = false`.
     Disabled,
     /// Server's `server_id` did not match the client's locally configured expected audience.
     AudienceMismatch,
@@ -761,6 +757,9 @@ pub struct Ui {
     pub log: RwSignal<Vec<(u64, String)>>,
     /// A message for the notice, and its number, so that a newer one is not hidden early.
     pub notice: RwSignal<Option<(u64, String)>>,
+    /// Set when the server rejects this client's protocol (e.g. WebSocket close `4010` or
+    /// `ErrorKind::Unimplemented`), prompting the user to refresh/reload the page.
+    pub update_required: RwSignal<Option<String>>,
     pub dialog: RwSignal<Option<Dialog>>,
     /// The file in the viewer, ...
     pub viewer: RwSignal<Option<Attachment>>,
@@ -797,6 +796,7 @@ impl Ui {
             messages: RwSignal::new(vec![]),
             log: RwSignal::new(vec![]),
             notice: RwSignal::new(None),
+            update_required: RwSignal::new(None),
             dialog: RwSignal::new(None),
             viewer: RwSignal::new(None),
             opening: RwSignal::new(None),

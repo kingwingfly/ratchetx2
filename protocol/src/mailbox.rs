@@ -14,6 +14,7 @@ mod proto {
 
 pub use proto::*;
 #[cfg(feature = "server")]
+#[allow(deprecated)]
 pub use server::{MailboxLimits, MailboxServer};
 
 /// Length of a delivery token.
@@ -27,17 +28,29 @@ pub const MAX_HEADER_SIZE: usize = 8 << 10;
 /// while preventing Durable Object OOM / queue bricking).
 pub const MAX_INITIAL_MESSAGE_SIZE: usize = 8 << 10;
 
-/// Client side of the mailbox service.
-#[trait_variant::make(Mailbox: Send)]
-pub trait LocalMailbox {
-    /// Append a message to the queue from its sender to its recipient.
-    async fn push(&self, request: PushRequest) -> Result<PushResponse>;
-    /// Read messages from a queue, after a sequence number, first deleting those whose delivery
-    /// tokens it gives.
-    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse>;
+#[allow(deprecated)]
+mod legacy_trait {
+    use super::*;
+
+    /// Client side of the legacy v1 mailbox service.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+    )]
+    #[trait_variant::make(Mailbox: Send)]
+    pub trait LocalMailbox {
+        /// Append a message to the queue from its sender to its recipient.
+        async fn push(&self, request: PushRequest) -> Result<PushResponse>;
+        /// Read messages from a queue, after a sequence number, first deleting those whose delivery
+        /// tokens it gives.
+        async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse>;
+    }
 }
 
+#[allow(deprecated)]
+pub use legacy_trait::{LocalMailbox, Mailbox};
+
 #[cfg(feature = "server")]
+#[allow(deprecated)]
 mod server {
     use bon::Builder;
     use bytes::Bytes;
@@ -49,7 +62,7 @@ mod server {
     use super::*;
     use crate::{error::ErrorKind, fixed, handshake::InitialMessage};
 
-    /// Limits of a [`MailboxServer`].
+    /// Limits of a mailbox server (shared between v1 and v2).
     #[derive(Debug, Clone, Copy)]
     pub struct MailboxLimits {
         /// Largest message, header and content together, in bytes.
@@ -79,10 +92,13 @@ mod server {
         }
     }
 
-    /// The mailbox server's logic, over any mailbox store.
+    /// The legacy v1 mailbox server's logic, over any mailbox store.
     ///
     /// [`MailboxServer::new`] gives it the default limits, and [`MailboxServer::builder`] can
     /// set them: `MailboxServer::builder(store).limits(limits).build()`.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+    )]
     #[derive(Debug, Builder)]
     pub struct MailboxServer<S> {
         #[builder(start_fn)]

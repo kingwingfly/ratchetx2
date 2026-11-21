@@ -1,10 +1,11 @@
-//! Optional post-quantum (PQXDH + ML-KEM ratchet) configuration, per-peer pinning & downgrade
-//! defense, and v2 handshake/mailbox client flows.
+//! Post-quantum (PQXDH + ML-KEM ratchet) configuration, per-peer pinning & downgrade defense,
+//! and v2 handshake/mailbox client flows.
 //!
-//! Configuration and state types ([`PqConfig`], [`PeerPqState`], [`SessionSecurity`],
-//! [`HelloCheck`], [`check_peer_hello`], [`expected_audience_from_url`]) are compiled
-//! unconditionally with **zero** `ml-kem` dependency. The cryptographic PQXDH / v2 wire methods
-//! are compiled only when `ml-kem-1024`, `ml-kem-768`, or `pq` is enabled.
+//! All configuration, state types, and v2 wire protocol methods (`handshake.v2`, `mailbox.v2`,
+//! signed `CapabilityManifest`s, non-rotating prekey refills, two-phase initial-message delivery,
+//! idempotent `PushV2`, and signed `FetchSigned`) are compiled unconditionally with **zero**
+//! `ml-kem` dependency. ML-KEM cryptographic encapsulation/decapsulation is enabled only when
+//! `ml-kem-1024`, `ml-kem-768`, or `pq` is selected.
 
 pub use protocol::{NormalizedAudience, normalize_audience};
 use x3dh::PqSuite;
@@ -247,7 +248,6 @@ pub fn expected_audience_from_url(url_or_host: &str) -> Result<String> {
     normalize_audience(url_or_host).map_err(|_| ErrorKind::Protocol.into())
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 mod v2 {
     use core::mem;
 
@@ -255,28 +255,28 @@ mod v2 {
     use party::{EncryptedMessage, Party};
     use prost::Message as _;
     use protocol::{
-        handshake::{
-            self, FetchBundleRequest, LocalHandshake, PublishRequest, SendInitialMessageRequest,
-        },
+        handshake,
         handshake_v2::{
             self, AckInitialMessagesRequest, CapabilityManifest, ClaimBundleRequest,
             ClaimBundleResponse, GetManifestRequest, GetServerInfoRequest, GetServerInfoResponse,
             ListInitialMessagesRequest, LocalHandshakeV2, PqLastResortCommitment, PqPrekey,
             PublishV2Request, RefillPrekeysRequest, RefillPrekeysResponse, SendInitialV2Request,
             manifest_digest, sign_manifest, verify_manifest, verify_manifest_at,
-            verify_wire_pq_prekey,
         },
-        mailbox::LocalMailbox,
         mailbox_v2::{
             CLIENT_MESSAGE_ID_LENGTH, EnvelopeV2, FetchSignedRequest, LocalMailboxV2,
-            PushV2Request, decode_carried_initial, encode_carried_initial,
+            PushV2Request, decode_carried_initial,
         },
     };
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    use protocol::{handshake_v2::verify_wire_pq_prekey, mailbox_v2::encode_carried_initial};
     use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
     use x3dh::{
-        PQXDH_VERSION, PqInitialMessage, PqPrekeyBundle, PqPrekeyId, PqSuite, PrekeyBundle,
-        PublicKey, PublishedPrekeys, pq_prekey_id,
+        PQXDH_VERSION, PqInitialMessage, PqPrekeyId, PqSuite, PrekeyBundle, PublicKey,
+        PublishedPrekeys,
     };
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    use x3dh::{PqPrekeyBundle, pq_prekey_id};
     use xeddsa::XEdDSAPublicKey;
 
     use super::{DEFAULT_MANIFEST_TTL_MS, PeerPqState, SessionSecurity, check_peer_hello};
@@ -291,27 +291,27 @@ mod v2 {
     const MAX_ACK_BATCH: usize = 100;
 
     fn unimplemented_refusal(error: &protocol::Error) -> bool {
-        error.is_server_refusal() && error.kind() == protocol::ErrorKind::Unimplemented
+        error.is_connect_error()
+            && error.is_server_refusal()
+            && error.kind() == protocol::ErrorKind::Unimplemented
     }
 
-    /// Which transport path succeeded in [`Client::transmit_publish_v2_or_v1_fallback`].
+    /// Which v2 manifest mode succeeded in [`Client::transmit_publish_v2`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum PublishV2Outcome {
         /// Published post-quantum + classical prekeys and a PQ-enabled signed manifest via `PublishV2`.
         V2Pq,
         /// Published classical prekeys and a signed PQ-off manifest via `PublishV2` (either
-        /// because local PQ is disabled or because the server rejected PQ-ON with `Unimplemented`
-        /// under `PQ_ENABLED="false"`).
+        /// because local PQ is disabled / not compiled in, or because the v2 server rejected PQ-ON
+        /// with `Unimplemented` under runtime `PQ_ENABLED="false"`).
         V2ClassicalOff,
-        /// Fell back to legacy v1 `Handshake::publish` (server does not implement `PublishV2`).
-        V1Fallback,
     }
 
     /// A prepared v2 prekey + [`CapabilityManifest`] publish request.
     ///
-    /// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish_v2`] (or
-    /// [`Client::transmit_publish_v2_or_v1_fallback`]), then call [`Client::commit_publish_v2`]
-    /// on success or [`Client::rollback_publish_v2_on_refusal`] on definitive refusal.
+    /// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish_v2`], then call
+    /// [`Client::commit_publish_v2`] on success or [`Client::rollback_publish_v2_on_refusal`] on
+    /// definitive refusal.
     #[derive(Debug, Clone)]
     pub struct PreparedPublishV2 {
         /// The signed v2 publish request to transmit.
@@ -324,12 +324,15 @@ mod v2 {
         pub(crate) manifest_digest: [u8; 32],
         pub(crate) classical: PublishedPrekeys,
         pub(crate) extended: bool,
+        pub(crate) was_publishing: bool,
         pub(crate) pq_one_time_prekeys: Vec<PqPrekeyId>,
     }
 
     /// A prepared v2 non-rotating prekey refill request.
     ///
-    /// Persist [`Client::state`] BEFORE calling [`Client::transmit_refill_v2`].
+    /// Persist [`Client::state`] BEFORE calling [`Client::transmit_refill_v2`], then call
+    /// [`Client::commit_refill_v2`] on success or [`Client::rollback_refill_v2_on_refusal`] on
+    /// definitive refusal.
     #[derive(Debug, Clone)]
     pub struct PreparedRefillV2 {
         /// The signed v2 refill request to transmit.
@@ -338,25 +341,15 @@ mod v2 {
         pub(crate) pq_one_time_prekeys: Vec<PqPrekeyId>,
     }
 
-    /// An outgoing initial message prepared by [`Client::prepare_initiate_v2`], ready to be
-    /// transmitted after persisting the newly created [`Session`].
-    #[derive(Debug, Clone)]
-    pub enum OutgoingInitialMessage {
-        /// Legacy v1 `SendInitialMessageRequest` (used only on v1 fallback when the server
-        /// returns `Unimplemented` and local `strict_pq` is `false`).
-        V1(SendInitialMessageRequest),
-        /// Hardened v2 `SendInitialV2Request` (carries either PQXDH v2 or classical v1).
-        V2(SendInitialV2Request),
-    }
-
     /// Result of [`Client::prepare_initiate_v2`]: persist [`session`](Self::session) BEFORE
     /// sending [`request`](Self::request) with [`Client::send_prepared_initiate_v2`].
     #[derive(Debug)]
     pub struct PreparedInitiateV2<M> {
         /// The newly established session (with updated [`PeerPqState`] and [`SessionSecurity`]).
         pub session: Session<M>,
-        /// The initial message request to transmit after persisting `session.state()`.
-        pub request: OutgoingInitialMessage,
+        /// The v2 initial message request (carrying either PQXDH v2 or classical v1) to transmit
+        /// after persisting `session.state()`.
+        pub request: SendInitialV2Request,
         /// Negotiated security metadata for this session.
         pub security: SessionSecurity,
     }
@@ -482,9 +475,6 @@ mod v2 {
         pub messages: Vec<InitialMessageV2>,
         /// Inbox IDs of malformed messages that can never be accepted and should be acknowledged.
         pub malformed_ids: Vec<u64>,
-        /// `true` if the server returned `Unimplemented` and the call fell back to destructive
-        /// legacy v1 `TakeInitialMessages` (no ack call is needed).
-        pub fell_back_to_v1: bool,
     }
 
     /// Locally processed inbox outcomes and the progress of their server acknowledgement.
@@ -492,7 +482,7 @@ mod v2 {
     pub struct ListAndAcceptOutcome<M> {
         /// Every initial message accepted or quarantined locally, with its prekeys confirmed.
         pub outcomes: Vec<(PublicKey, AcceptedInitial<M>)>,
-        /// Handled IDs whose acknowledgement is still outstanding. Empty on success or v1 fallback.
+        /// Handled IDs whose acknowledgement is still outstanding. Empty on success.
         pub unacked_ids: Vec<u64>,
         /// Acknowledgement failure. Persist `outcomes` and retry
         /// [`Client::ack_initial_messages_v2`] with `unacked_ids`.
@@ -598,6 +588,31 @@ mod v2 {
             one_time_count: usize,
             pq_one_time_count: usize,
         ) -> Result<PreparedPublishV2> {
+            self.prepare_publish_v2_preserving(
+                audience,
+                one_time_count,
+                pq_one_time_count,
+                &[],
+                &[],
+            )
+        }
+
+        /// Prepare a v2 prekey + signed [`CapabilityManifest`] publish request while preserving
+        /// any local prekey generation referenced by `preserve_signed_prekeys` and preferring to
+        /// retain any manifest digests listed in `preserve_manifest_digests` (e.g. for deferred
+        /// unsupported-suite initials awaiting replay on a capable build).
+        ///
+        /// When rotating would otherwise evict the oldest kept generation and its signed prekey
+        /// appears in `preserve_signed_prekeys`, this extends the current generation in place
+        /// instead of rotating it out.
+        pub fn prepare_publish_v2_preserving(
+            &mut self,
+            audience: &str,
+            one_time_count: usize,
+            pq_one_time_count: usize,
+            preserve_signed_prekeys: &[PublicKey],
+            preserve_manifest_digests: &[[u8; 32]],
+        ) -> Result<PreparedPublishV2> {
             if audience.trim().is_empty() {
                 return Err(ErrorKind::Protocol.into());
             }
@@ -616,58 +631,77 @@ mod v2 {
                 .filter(|&s| s <= protocol::MAX_SAFE_INTEGER)
                 .ok_or(ErrorKind::Protocol)?;
 
-            let extended = self.state.publishing;
-            let (classical, pq_last_resort_wire, pq_one_time_wire, pq_opk_ids, generation) =
-                if pq_enabled {
-                    let first_suite = offered[0];
-                    let first = if extended {
-                        self.state.prekeys.extend_pq(
-                            &self.state.identity,
-                            first_suite,
-                            one_time_count,
-                            pq_one_time_count,
-                        )?
-                    } else {
-                        self.state.prekeys.generate_pq(
-                            &self.state.identity,
-                            first_suite,
-                            one_time_count,
-                            pq_one_time_count,
-                        )?
-                    };
-                    let generation = if extended {
-                        self.state.prekey_generation.max(1)
-                    } else {
-                        self.state
-                            .prekey_generation
-                            .checked_add(1)
-                            .filter(|&g| g <= protocol::MAX_SAFE_INTEGER)
-                            .ok_or(ErrorKind::Protocol)?
-                    };
-                    let mut lr_wire = vec![PqPrekey::from(&first.pq_last_resort)];
-                    let mut opk_wire: Vec<PqPrekey> = first
-                        .pq_one_time_prekeys
-                        .iter()
-                        .map(PqPrekey::from)
-                        .collect();
-                    let mut pq_opk_ids: Vec<PqPrekeyId> =
-                        first.pq_one_time_prekeys.iter().map(|k| k.id).collect();
-                    for &extra_suite in &offered[1..] {
-                        let extra = self.state.prekeys.extend_pq(
-                            &self.state.identity,
-                            extra_suite,
-                            0,
-                            pq_one_time_count,
-                        )?;
-                        lr_wire.push(PqPrekey::from(&extra.pq_last_resort));
-                        pq_opk_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
-                        opk_wire.extend(extra.pq_one_time_prekeys.iter().map(PqPrekey::from));
+            let was_publishing = self.state.publishing;
+            let preserve_oldest = self
+                .state
+                .prekeys
+                .oldest_evictable_signed_prekey()
+                .is_some_and(|spk| preserve_signed_prekeys.contains(&spk));
+            let extended = was_publishing || preserve_oldest;
+            let (classical, pq_last_resort_wire, pq_one_time_wire, pq_opk_ids, generation) = {
+                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                let pq_branch = pq_enabled;
+                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                let pq_branch = {
+                    let _ = pq_one_time_count;
+                    false
+                };
+                if pq_branch {
+                    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                    {
+                        let first_suite = offered[0];
+                        let first = if extended {
+                            self.state.prekeys.extend_pq(
+                                &self.state.identity,
+                                first_suite,
+                                one_time_count,
+                                pq_one_time_count,
+                            )?
+                        } else {
+                            self.state.prekeys.generate_pq(
+                                &self.state.identity,
+                                first_suite,
+                                one_time_count,
+                                pq_one_time_count,
+                            )?
+                        };
+                        let generation = if extended {
+                            self.state.prekey_generation.max(1)
+                        } else {
+                            self.state
+                                .prekey_generation
+                                .checked_add(1)
+                                .filter(|&g| g <= protocol::MAX_SAFE_INTEGER)
+                                .ok_or(ErrorKind::Protocol)?
+                        };
+                        let mut lr_wire = vec![PqPrekey::from(&first.pq_last_resort)];
+                        let mut opk_wire: Vec<PqPrekey> = first
+                            .pq_one_time_prekeys
+                            .iter()
+                            .map(PqPrekey::from)
+                            .collect();
+                        let mut pq_opk_ids: Vec<PqPrekeyId> =
+                            first.pq_one_time_prekeys.iter().map(|k| k.id).collect();
+                        for &extra_suite in &offered[1..] {
+                            let extra = self.state.prekeys.extend_pq(
+                                &self.state.identity,
+                                extra_suite,
+                                0,
+                                pq_one_time_count,
+                            )?;
+                            lr_wire.push(PqPrekey::from(&extra.pq_last_resort));
+                            pq_opk_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
+                            opk_wire.extend(extra.pq_one_time_prekeys.iter().map(PqPrekey::from));
+                        }
+                        (first.classical, lr_wire, opk_wire, pq_opk_ids, generation)
                     }
-                    (first.classical, lr_wire, opk_wire, pq_opk_ids, generation)
+                    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                    unreachable!("pq_branch is false when no ML-KEM suite is compiled in")
                 } else {
-                    // PQ toggled OFF: rotate SPK cleanly on non-retry publishes (`KEPT_GENERATIONS
-                    // = 2` retains the prior PQ generation so in-flight PQ handshakes still
-                    // decrypt while avoiding dead OPK accumulation across repeated publishes).
+                    // PQ toggled OFF (or classical-only build): rotate SPK cleanly on non-retry
+                    // publishes (`KEPT_GENERATIONS = 2` retains the prior PQ generation so
+                    // in-flight PQ handshakes still decrypt while avoiding dead OPK accumulation
+                    // across repeated publishes).
                     let classical = if extended {
                         self.state
                             .prekeys
@@ -686,8 +720,15 @@ mod v2 {
                             .filter(|&g| g <= protocol::MAX_SAFE_INTEGER)
                             .ok_or(ErrorKind::Protocol)?
                     };
-                    (classical, vec![], vec![], vec![], generation)
-                };
+                    (
+                        classical,
+                        Vec::<PqPrekey>::new(),
+                        Vec::<PqPrekey>::new(),
+                        Vec::<PqPrekeyId>::new(),
+                        generation,
+                    )
+                }
+            };
 
             let issued_at = timestamp;
             let expires_at = issued_at
@@ -741,7 +782,8 @@ mod v2 {
             self.state.manifest_seq = manifest_seq;
             self.state.prekey_generation = generation;
             self.state.publishing = true;
-            self.state.record_manifest_digest(own_digest);
+            self.state
+                .record_manifest_digest_preserving(own_digest, preserve_manifest_digests);
 
             Ok(PreparedPublishV2 {
                 request,
@@ -751,6 +793,7 @@ mod v2 {
                 manifest_digest: own_digest,
                 classical,
                 extended,
+                was_publishing,
                 pq_one_time_prekeys: pq_opk_ids,
             })
         }
@@ -769,6 +812,7 @@ mod v2 {
                     &prepared.classical.one_time_prekeys,
                     &prepared.pq_one_time_prekeys,
                 );
+                self.state.publishing = prepared.was_publishing;
             }
             self.state.manifest_seq = prepared.prev_manifest_seq;
             if self.state.recent_manifest_digests.last() == Some(&prepared.manifest_digest) {
@@ -798,37 +842,51 @@ mod v2 {
             let pq_enabled = self.state.pq_config.pq_enabled && !offered.is_empty();
             let timestamp = self.next_timestamp()?;
 
-            let (classical_opks, pq_opk_wire, pq_opk_ids) = if pq_enabled {
-                let first = self.state.prekeys.extend_pq(
-                    &self.state.identity,
-                    offered[0],
-                    one_time_count,
-                    pq_one_time_count,
-                )?;
-                let mut pq_wire: Vec<PqPrekey> = first
-                    .pq_one_time_prekeys
-                    .iter()
-                    .map(PqPrekey::from)
-                    .collect();
-                let mut pq_ids: Vec<PqPrekeyId> =
-                    first.pq_one_time_prekeys.iter().map(|k| k.id).collect();
-                for &extra_suite in &offered[1..] {
-                    let extra = self.state.prekeys.extend_pq(
-                        &self.state.identity,
-                        extra_suite,
-                        0,
-                        pq_one_time_count,
-                    )?;
-                    pq_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
-                    pq_wire.extend(extra.pq_one_time_prekeys.iter().map(PqPrekey::from));
+            let (classical_opks, pq_opk_wire, pq_opk_ids) = {
+                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                let pq_branch = pq_enabled;
+                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                let pq_branch = {
+                    let _ = (pq_enabled, pq_one_time_count);
+                    false
+                };
+                if pq_branch {
+                    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                    {
+                        let first = self.state.prekeys.extend_pq(
+                            &self.state.identity,
+                            offered[0],
+                            one_time_count,
+                            pq_one_time_count,
+                        )?;
+                        let mut pq_wire: Vec<PqPrekey> = first
+                            .pq_one_time_prekeys
+                            .iter()
+                            .map(PqPrekey::from)
+                            .collect();
+                        let mut pq_ids: Vec<PqPrekeyId> =
+                            first.pq_one_time_prekeys.iter().map(|k| k.id).collect();
+                        for &extra_suite in &offered[1..] {
+                            let extra = self.state.prekeys.extend_pq(
+                                &self.state.identity,
+                                extra_suite,
+                                0,
+                                pq_one_time_count,
+                            )?;
+                            pq_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
+                            pq_wire.extend(extra.pq_one_time_prekeys.iter().map(PqPrekey::from));
+                        }
+                        (first.classical.one_time_prekeys, pq_wire, pq_ids)
+                    }
+                    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                    unreachable!("pq_branch is false when no ML-KEM suite is compiled in")
+                } else {
+                    let extended = self
+                        .state
+                        .prekeys
+                        .extend(&self.state.identity, one_time_count);
+                    (extended.one_time_prekeys, vec![], vec![])
                 }
-                (first.classical.one_time_prekeys, pq_wire, pq_ids)
-            } else {
-                let extended = self
-                    .state
-                    .prekeys
-                    .extend(&self.state.identity, one_time_count);
-                (extended.one_time_prekeys, vec![], vec![])
             };
 
             let request = RefillPrekeysRequest::sign(
@@ -847,6 +905,9 @@ mod v2 {
             })
         }
 
+        /// Mark a prepared v2 refill as confirmed by the server.
+        pub fn commit_refill_v2(&mut self, _prepared: PreparedRefillV2) {}
+
         /// Retract newly added OPKs/PQOPKs from a prepared v2 refill after
         /// [`Error::is_server_refusal`] confirms the relay refused it.
         pub fn rollback_refill_v2_on_refusal(&mut self, prepared: PreparedRefillV2) {
@@ -858,13 +919,13 @@ mod v2 {
         /// Accept an inbound v1 or v2 initial message from `peer`, applying local PQ and
         /// inbound classical quarantine policies.
         ///
-        /// **Two-phase ack rule**: this method is purely local and has no transient errors — any
-        /// `Err` (`InvalidInitialMessage`, `InvalidKeys`, `UnexpectedPeer`, `PqRequired`,
-        /// `UnsupportedSuite`, `DowngradeDetected`, `MalformedState`, etc.) is permanent for that
-        /// inbox entry. In a manual `list_initial_messages_v2` -> `accept_initial_v2` -> persist
-        /// -> `ack_initial_messages_v2` loop, callers MUST acknowledge every processed `msg.id`
-        /// (both `Ok` and `Err` outcomes) after persisting state so unaccepted/malformed entries
-        /// cannot permanently fill the inbox.
+        /// **Two-phase ack rule**: this method is purely local — permanent failures
+        /// (`InvalidInitialMessage`, `InvalidKeys`, `UnexpectedPeer`, `PqRequired`,
+        /// `DowngradeDetected`, `MalformedState`, etc.) should be acknowledged in a manual
+        /// `list_initial_messages_v2` -> `accept_initial_v2` -> persist -> `ack_initial_messages_v2`
+        /// loop so unaccepted/malformed entries cannot permanently fill the inbox. For
+        /// [`ErrorKind::UnsupportedSuite`], acknowledge only after durably storing the encrypted
+        /// initial for replay by a capable build. Otherwise leave it in the server inbox.
         ///
         /// - **PQXDH (version 2)**: authenticates the sender first via `accept_pq` + `first_message`
         ///   AEAD decryption (supporting both PQ-ratchet and classical-ratchet PQXDH sessions
@@ -910,82 +971,96 @@ mod v2 {
                     if !pq_init.pq_suite.is_supported() {
                         return Err(ErrorKind::UnsupportedSuite.into());
                     }
-                    let (agreement, signed_prekey) = self.state.prekeys.accept_pq(
-                        &self.state.identity,
-                        peer,
-                        pq_init,
-                        digest.as_ref().map(|d| d.as_slice()),
-                    )?;
-                    let ratchet = Ratchet::bob(
-                        &SharedKeys::from_secret(&agreement.secret_key),
-                        DhPrivateKey::from(signed_prekey.to_bytes()),
-                    );
-                    // Try classical ratchet first: if Alice used Party::new (PQ ratchet off),
-                    // classical Party decrypts cleanly; if Alice used Party::new_pq, classical
-                    // Party rejects the PQ header with InvalidHeader and we decrypt with
-                    // Party::new_pq.
-                    let (party, content, pq_ratchet) = {
-                        let mut classical_party =
-                            Party::new(ratchet.clone(), agreement.associated_data);
-                        match classical_party.decrypt(first_message) {
-                            Ok(content) => (classical_party, content, false),
-                            Err(e) if e.kind() == party::error::ErrorKind::InvalidHeader => {
-                                let party_suite = party::PqSuite::from_id(agreement.suite.as_u8())
-                                    .ok_or(ErrorKind::UnsupportedSuite)?;
-                                let mut pq_party =
-                                    Party::new_pq(ratchet, agreement.associated_data, party_suite);
-                                let content = pq_party.decrypt(first_message).map_err(|err| {
-                                    Error::new(ErrorKind::InvalidInitialMessage, err)
-                                })?;
-                                (pq_party, content, true)
+                    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                    {
+                        let (agreement, signed_prekey) = self.state.prekeys.accept_pq(
+                            &self.state.identity,
+                            peer,
+                            pq_init,
+                            digest.as_ref().map(|d| d.as_slice()),
+                        )?;
+                        let ratchet = Ratchet::bob(
+                            &SharedKeys::from_secret(&agreement.secret_key),
+                            DhPrivateKey::from(signed_prekey.to_bytes()),
+                        );
+                        // Try classical ratchet first: if Alice used Party::new (PQ ratchet off),
+                        // classical Party decrypts cleanly; if Alice used Party::new_pq, classical
+                        // Party rejects the PQ header with InvalidHeader and we decrypt with
+                        // Party::new_pq.
+                        let (party, content, pq_ratchet) = {
+                            let mut classical_party =
+                                Party::new(ratchet.clone(), agreement.associated_data);
+                            match classical_party.decrypt(first_message) {
+                                Ok(content) => (classical_party, content, false),
+                                Err(e) if e.kind() == party::error::ErrorKind::InvalidHeader => {
+                                    let party_suite =
+                                        party::PqSuite::from_id(agreement.suite.as_u8())
+                                            .ok_or(ErrorKind::UnsupportedSuite)?;
+                                    let mut pq_party = Party::new_pq(
+                                        ratchet,
+                                        agreement.associated_data,
+                                        party_suite,
+                                    );
+                                    let content =
+                                        pq_party.decrypt(first_message).map_err(|err| {
+                                            Error::new(ErrorKind::InvalidInitialMessage, err)
+                                        })?;
+                                    (pq_party, content, true)
+                                }
+                                Err(e) => {
+                                    return Err(Error::new(ErrorKind::InvalidInitialMessage, e));
+                                }
                             }
-                            Err(e) => {
-                                return Err(Error::new(ErrorKind::InvalidInitialMessage, e));
+                        };
+                        // Sender is now cryptographically authenticated via PQXDH + AEAD. Enforce
+                        // manifest-digest binding BEFORE confirming prekey consumption so
+                        // unauthenticated forgeries never surface sender-attributed
+                        // `DowngradeDetected`.
+                        if !self.state.recent_manifest_digests.is_empty() {
+                            match digest {
+                                Some(d) if !self.state.recent_manifest_digests.contains(d) => {
+                                    return Err(ErrorKind::DowngradeDetected.into());
+                                }
+                                None if strict_pq => {
+                                    return Err(ErrorKind::DowngradeDetected.into());
+                                }
+                                _ => {}
                             }
                         }
-                    };
-                    // Sender is now cryptographically authenticated via PQXDH + AEAD. Enforce
-                    // manifest-digest binding BEFORE confirming prekey consumption so unauthenticated
-                    // forgeries never surface sender-attributed `DowngradeDetected`.
-                    if !self.state.recent_manifest_digests.is_empty() {
-                        match digest {
-                            Some(d) if !self.state.recent_manifest_digests.contains(d) => {
-                                return Err(ErrorKind::DowngradeDetected.into());
-                            }
-                            None if strict_pq => {
-                                return Err(ErrorKind::DowngradeDetected.into());
-                            }
-                            _ => {}
+                        let incoming_seq =
+                            checked_initial_hello(&content)?.map_or(0, |h| h.session_seq);
+                        self.state.prekeys.confirm_pq(pq_init)?;
+                        let security = SessionSecurity::pq(agreement.suite, pq_ratchet);
+                        let mut updated_peer_pq = peer_state.clone();
+                        updated_peer_pq.pq_pinned = true;
+                        updated_peer_pq.peer_pq_capable = true;
+                        updated_peer_pq.allow_classical_exception = false;
+                        updated_peer_pq.downgrade_detected = false;
+                        if incoming_seq > updated_peer_pq.peer_session_seq {
+                            updated_peer_pq.peer_session_seq = incoming_seq;
                         }
+                        let active = Active {
+                            party,
+                            id: pq_init.ephemeral_key,
+                            known_by_peer: true,
+                            initial_message: vec![],
+                            delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
+                            security,
+                            peer_session_seq: incoming_seq,
+                        };
+                        let mut session = Session::new(mailbox, active, self.identity_key, *peer);
+                        session.state.peer_pq = updated_peer_pq;
+                        Ok(AcceptedInitial::Accepted {
+                            session,
+                            first_message: content,
+                            security,
+                        })
                     }
-                    let incoming_seq =
-                        checked_initial_hello(&content)?.map_or(0, |h| h.session_seq);
-                    self.state.prekeys.confirm_pq(pq_init)?;
-                    let security = SessionSecurity::pq(agreement.suite, pq_ratchet);
-                    let mut updated_peer_pq = peer_state.clone();
-                    updated_peer_pq.pq_pinned = true;
-                    updated_peer_pq.peer_pq_capable = true;
-                    updated_peer_pq.allow_classical_exception = false;
-                    updated_peer_pq.downgrade_detected = false;
-                    if incoming_seq > updated_peer_pq.peer_session_seq {
-                        updated_peer_pq.peer_session_seq = incoming_seq;
+                    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                    {
+                        let _ = (first_message, digest, mailbox);
+                        Err(ErrorKind::UnsupportedSuite.into())
                     }
-                    let active = Active {
-                        party,
-                        id: pq_init.ephemeral_key,
-                        known_by_peer: true,
-                        initial_message: vec![],
-                        delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
-                        security,
-                        peer_session_seq: incoming_seq,
-                    };
-                    let mut session = Session::new(mailbox, active, self.identity_key, *peer);
-                    session.state.peer_pq = updated_peer_pq;
-                    Ok(AcceptedInitial::Accepted {
-                        session,
-                        first_message: content,
-                        security,
-                    })
                 }
                 InitialMessageKind::Classical(classical) => {
                     let (agreement, signed_prekey) =
@@ -1076,6 +1151,14 @@ mod v2 {
             Ok(info)
         }
 
+        /// Alias for [`Client::check_server_info`].
+        pub async fn fetch_server_info(
+            &self,
+            expected_audience: &str,
+        ) -> Result<GetServerInfoResponse> {
+            self.check_server_info(expected_audience).await
+        }
+
         /// Non-consuming read and verification of `peer`'s signed [`CapabilityManifest`] against
         /// the locally configured `audience` and server clock.
         pub async fn get_peer_manifest(
@@ -1108,10 +1191,153 @@ mod v2 {
             Ok(response.manifest)
         }
 
+        /// Alias for [`Client::get_peer_manifest`].
+        pub async fn fetch_peer_manifest(
+            &self,
+            audience: &str,
+            peer: &PublicKey,
+        ) -> Result<Option<CapabilityManifest>> {
+            self.get_peer_manifest(audience, peer).await
+        }
+
         /// Transmit a previously prepared v2 publish request (after persisting `self.state()`).
-        pub async fn transmit_publish_v2(&self, prepared: &PreparedPublishV2) -> Result<()> {
-            self.handshake.publish_v2(prepared.request.clone()).await?;
-            Ok(())
+        ///
+        /// If `prepared` carried a PQ-enabled manifest and a v2 server rolled back to runtime
+        /// `PQ_ENABLED="false"` refuses PQ-ON with confirmed `Unimplemented` while `strict_pq` is
+        /// `false`, automatically publishes a signed `PQ-OFF` manifest via `PublishV2` using the
+        /// exact same classical prekeys and returns [`PublishV2Outcome::V2ClassicalOff`]. Never
+        /// falls back to legacy v1 `Handshake::publish`.
+        pub async fn transmit_publish_v2(
+            &mut self,
+            prepared: &PreparedPublishV2,
+        ) -> Result<PublishV2Outcome> {
+            let prepared_pq = prepared
+                .request
+                .manifest
+                .as_ref()
+                .is_some_and(|m| m.pq_enabled);
+            match self.handshake.publish_v2(prepared.request.clone()).await {
+                Ok(_) => Ok(if prepared_pq {
+                    PublishV2Outcome::V2Pq
+                } else {
+                    PublishV2Outcome::V2ClassicalOff
+                }),
+                Err(e) if unimplemented_refusal(&e) => {
+                    if prepared_pq && let Some(orig_manifest) = prepared.request.manifest.as_ref() {
+                        // Confirm via `GetServerInfo` that the relay has runtime `PQ_ENABLED=false`
+                        // before switching to a signed `PQ-OFF` manifest or mapping `strict_pq` to
+                        // `PqRequired` (a proxy 404 or missing `PublishV2` RPC must not downgrade).
+                        match self.check_server_info(&orig_manifest.audience).await {
+                            Ok(info) if !info.pq_enabled => {
+                                if self.state.pq_config.strict_pq {
+                                    return Err(Error::from_protocol_with_kind(
+                                        ErrorKind::PqRequired,
+                                        e,
+                                    ));
+                                }
+                                let timestamp = self.next_timestamp()?;
+                                let expires_at = timestamp
+                                    .checked_add(DEFAULT_MANIFEST_TTL_MS)
+                                    .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
+                                    .ok_or(ErrorKind::Protocol)?;
+                                let mut off_manifest = CapabilityManifest {
+                                    audience: orig_manifest.audience.clone(),
+                                    identity_key: Bytes::new(),
+                                    manifest_seq: prepared.manifest_seq,
+                                    generation: prepared.generation,
+                                    issued_at: timestamp,
+                                    expires_at,
+                                    pq_enabled: false,
+                                    strict_pq: false,
+                                    pq_ratchet_supported: false,
+                                    offered_suites: vec![],
+                                    signed_prekey: Bytes::copy_from_slice(
+                                        &prepared.classical.signed_prekey,
+                                    ),
+                                    pq_last_resort: vec![],
+                                    signature: Bytes::new(),
+                                };
+                                sign_manifest(&self.state.identity, &mut off_manifest)?;
+                                let off_req = PublishV2Request::sign(
+                                    &self.state.identity,
+                                    off_manifest,
+                                    Some(prepared.classical.signed_prekey_signature),
+                                    &prepared.classical.one_time_prekeys,
+                                    vec![],
+                                    vec![],
+                                    timestamp,
+                                )?;
+                                self.handshake.publish_v2(off_req).await?;
+                                // PQOPKs and the PQ-ON manifest were never uploaded under
+                                // PQ_ENABLED=false; retract them locally so unused keys and
+                                // digests do not accumulate.
+                                self.state
+                                    .prekeys
+                                    .retract_pq(&[], &prepared.pq_one_time_prekeys);
+                                if self.state.recent_manifest_digests.last()
+                                    == Some(&prepared.manifest_digest)
+                                {
+                                    self.state.recent_manifest_digests.pop();
+                                }
+                                return Ok(PublishV2Outcome::V2ClassicalOff);
+                            }
+                            Ok(_) => return Err(e.into()),
+                            Err(info_err) if info_err.kind() == ErrorKind::DowngradeDetected => {
+                                return Err(info_err);
+                            }
+                            Err(info_err)
+                                if info_err.is_connect_error()
+                                    && info_err.is_server_refusal()
+                                    && info_err.kind() == ErrorKind::Unimplemented =>
+                            {
+                                return Err(e.into());
+                            }
+                            Err(info_err) => return Err(info_err),
+                        }
+                    }
+                    Err(e.into())
+                }
+                Err(e) => Err(e.into()),
+            }
+        }
+
+        /// Generate and publish prekeys + signed [`CapabilityManifest`] via `HandshakeV2`.
+        ///
+        /// If the server is a v2 relay with runtime `PQ_ENABLED="false"` and `strict_pq` is
+        /// `false`, falls back cleanly from PQ-ON to a signed `PQ-OFF` manifest on `PublishV2`.
+        /// Never falls back to legacy v1 `Handshake::publish`.
+        ///
+        /// For persist-before-transmit flows, use [`Client::prepare_publish_v2`], persist
+        /// [`Client::state`], then call [`Client::transmit_publish_v2`] and
+        /// [`Client::commit_publish_v2`].
+        pub async fn publish_v2(
+            &mut self,
+            audience: &str,
+            one_time_count: usize,
+            pq_one_time_count: usize,
+        ) -> Result<()> {
+            let prepared = self.prepare_publish_v2(audience, one_time_count, pq_one_time_count)?;
+            match self.transmit_publish_v2(&prepared).await {
+                Ok(_) => {
+                    self.commit_publish_v2(prepared);
+                    Ok(())
+                }
+                Err(e)
+                    if e.is_server_refusal()
+                        && matches!(
+                            e.kind(),
+                            ErrorKind::SignInRequired
+                                | ErrorKind::PqRequired
+                                | ErrorKind::LimitExceeded
+                                | ErrorKind::Protocol
+                                | ErrorKind::Unimplemented
+                        ) =>
+                {
+                    self.rollback_publish_v2_on_refusal(prepared);
+                    Err(e)
+                }
+                Err(e) => Err(e),
+            }
         }
 
         /// Transmit a previously prepared v2 refill request (after persisting `self.state()`).
@@ -1134,7 +1360,10 @@ mod v2 {
         ) -> Result<RefillPrekeysResponse> {
             let prepared = self.prepare_refill_v2(audience, one_time_count, pq_one_time_count)?;
             match self.transmit_refill_v2(&prepared).await {
-                Ok(response) => Ok(response),
+                Ok(response) => {
+                    self.commit_refill_v2(prepared);
+                    Ok(response)
+                }
                 Err(e) if e.is_server_refusal() => {
                     self.rollback_refill_v2_on_refusal(prepared);
                     Err(e)
@@ -1146,10 +1375,12 @@ mod v2 {
         /// Explicitly acknowledge and delete pending inbox initial messages by their stable
         /// server-assigned IDs (call ONLY after persisting accepted sessions locally).
         ///
-        /// Include EVERY listed ID whose local `accept_initial_v2` finished — both accepted /
-        /// quarantined AND permanently rejected IDs (such as `InvalidKeys`, `InvalidInitialMessage`,
-        /// `PqRequired`, `UnsupportedSuite`, `DowngradeDetected`, or `malformed_ids`) — so
-        /// invalid entries cannot permanently clog the inbox.
+        /// Include EVERY listed ID whose local `accept_initial_v2` finished permanently — both
+        /// accepted / quarantined AND permanent rejection IDs (such as `InvalidKeys`,
+        /// `InvalidInitialMessage`, `PqRequired`, `DowngradeDetected`, or `malformed_ids`) — so
+        /// invalid entries cannot permanently clog the inbox. An ID that returned
+        /// [`ErrorKind::UnsupportedSuite`] can be acknowledged once its encrypted initial is
+        /// durably stored for later replay.
         pub async fn ack_initial_messages_v2(
             &mut self,
             audience: &str,
@@ -1179,144 +1410,14 @@ mod v2 {
             )?;
             Ok(self.handshake.ack_initial_messages(request).await?.deleted)
         }
-    }
 
-    impl<H: LocalHandshake + LocalHandshakeV2> Client<H> {
-        /// Transmit a prepared v2 publish request, falling back gracefully ONLY when the server
-        /// returns `Unimplemented` and `strict_pq` is `false`:
+        /// Claim `peer`'s bundle via `HandshakeV2::claim_bundle`, verify `peer`'s signed
+        /// [`CapabilityManifest`] against `audience` and `peer_state`, negotiate the highest
+        /// mutually supported suite (or enforce downgrade / approval policy), and build a
+        /// [`PreparedInitiateV2`] WITHOUT sending the initial message yet so callers can persist
+        /// `session.state()` first.
         ///
-        /// 1. If `prepared` carried a PQ-enabled manifest and the server returned `Unimplemented`
-        ///    (e.g. a v2 server rolled back to `PQ_ENABLED="false"`), first publishes a signed
-        ///    `PQ-OFF` manifest via `PublishV2` using the exact same classical prekeys so existing
-        ///    v2 users are not locked out of `Identity::publish`.
-        /// 2. If `PublishV2` still returns `Unimplemented` (true legacy v1-only server), falls
-        ///    back to v1 `Handshake::publish` using the exact same classical prekeys.
-        pub async fn transmit_publish_v2_or_v1_fallback(
-            &mut self,
-            prepared: &PreparedPublishV2,
-        ) -> Result<PublishV2Outcome> {
-            let prepared_pq = prepared
-                .request
-                .manifest
-                .as_ref()
-                .is_some_and(|m| m.pq_enabled);
-            match self.handshake.publish_v2(prepared.request.clone()).await {
-                Ok(_) => Ok(if prepared_pq {
-                    PublishV2Outcome::V2Pq
-                } else {
-                    PublishV2Outcome::V2ClassicalOff
-                }),
-                Err(e) if unimplemented_refusal(&e) => {
-                    if self.state.pq_config.strict_pq {
-                        return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
-                    }
-                    if prepared_pq && let Some(orig_manifest) = prepared.request.manifest.as_ref() {
-                        let timestamp = self.next_timestamp()?;
-                        let expires_at = timestamp
-                            .checked_add(DEFAULT_MANIFEST_TTL_MS)
-                            .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
-                            .ok_or(ErrorKind::Protocol)?;
-                        let mut off_manifest = CapabilityManifest {
-                            audience: orig_manifest.audience.clone(),
-                            identity_key: Bytes::new(),
-                            manifest_seq: prepared.manifest_seq,
-                            generation: prepared.generation,
-                            issued_at: timestamp,
-                            expires_at,
-                            pq_enabled: false,
-                            strict_pq: false,
-                            pq_ratchet_supported: false,
-                            offered_suites: vec![],
-                            signed_prekey: Bytes::copy_from_slice(
-                                &prepared.classical.signed_prekey,
-                            ),
-                            pq_last_resort: vec![],
-                            signature: Bytes::new(),
-                        };
-                        sign_manifest(&self.state.identity, &mut off_manifest)?;
-                        let off_req = PublishV2Request::sign(
-                            &self.state.identity,
-                            off_manifest,
-                            Some(prepared.classical.signed_prekey_signature),
-                            &prepared.classical.one_time_prekeys,
-                            vec![],
-                            vec![],
-                            timestamp,
-                        )?;
-                        match self.handshake.publish_v2(off_req).await {
-                            Ok(_) => {
-                                // PQOPKs were never uploaded under PQ_ENABLED=false; retract them
-                                // locally so unused ML-KEM keys do not accumulate.
-                                self.state
-                                    .prekeys
-                                    .retract_pq(&[], &prepared.pq_one_time_prekeys);
-                                return Ok(PublishV2Outcome::V2ClassicalOff);
-                            }
-                            Err(e2) if unimplemented_refusal(&e2) => {
-                                // True v1-only server; fall through to v1 Handshake::publish.
-                            }
-                            Err(e2) => return Err(e2.into()),
-                        }
-                    }
-                    let timestamp = self.next_timestamp()?;
-                    let v1_req =
-                        PublishRequest::sign(&self.state.identity, &prepared.classical, timestamp)?;
-                    self.handshake.publish(v1_req).await?;
-                    self.state
-                        .prekeys
-                        .retract_pq(&[], &prepared.pq_one_time_prekeys);
-                    self.state.manifest_seq = prepared.prev_manifest_seq;
-                    if self.state.recent_manifest_digests.last() == Some(&prepared.manifest_digest)
-                    {
-                        self.state.recent_manifest_digests.pop();
-                    }
-                    Ok(PublishV2Outcome::V1Fallback)
-                }
-                Err(e) => Err(e.into()),
-            }
-        }
-
-        /// Generate and publish prekeys + signed [`CapabilityManifest`] via `HandshakeV2`, with
-        /// graceful fallback to signed OFF `PublishV2` or v1 `Handshake::publish` ONLY when the
-        /// server returns `Unimplemented` and `strict_pq` is `false`.
-        ///
-        /// For persist-before-transmit flows, use [`Client::prepare_publish_v2`], persist
-        /// [`Client::state`], then call [`Client::transmit_publish_v2_or_v1_fallback`] and
-        /// [`Client::commit_publish_v2`].
-        pub async fn publish_v2(
-            &mut self,
-            audience: &str,
-            one_time_count: usize,
-            pq_one_time_count: usize,
-        ) -> Result<()> {
-            let prepared = self.prepare_publish_v2(audience, one_time_count, pq_one_time_count)?;
-            match self.transmit_publish_v2_or_v1_fallback(&prepared).await {
-                Ok(_) => {
-                    self.commit_publish_v2(prepared);
-                    Ok(())
-                }
-                Err(e)
-                    if e.is_server_refusal()
-                        && matches!(
-                            e.kind(),
-                            ErrorKind::SignInRequired
-                                | ErrorKind::PqRequired
-                                | ErrorKind::LimitExceeded
-                                | ErrorKind::Protocol
-                        ) =>
-                {
-                    self.rollback_publish_v2_on_refusal(prepared);
-                    Err(e)
-                }
-                Err(e) => Err(e),
-            }
-        }
-
-        /// Claim `peer`'s bundle via `HandshakeV2::claim_bundle` (with v1 fallback on
-        /// `Unimplemented` when policy allows), verify `peer`'s signed [`CapabilityManifest`]
-        /// against `audience` and `peer_state`, negotiate the highest mutually supported suite
-        /// (or enforce downgrade / approval policy), and build a [`PreparedInitiateV2`] WITHOUT
-        /// sending the initial message yet so callers can persist `session.state()` first.
+        /// Never falls back to legacy v1 `Handshake::fetch_bundle`.
         pub async fn prepare_initiate_v2<M>(
             &mut self,
             audience: &str,
@@ -1344,47 +1445,62 @@ mod v2 {
                 vec![]
             };
 
-            let claim = self
+            let mut server_pq_disabled_fallback = false;
+            let response = match self
                 .handshake
                 .claim_bundle(ClaimBundleRequest {
                     identity_key: Bytes::copy_from_slice(peer),
                     preferred_suites,
                 })
-                .await;
-
-            let response = match claim {
+                .await
+            {
                 Ok(resp) => resp,
-                Err(e) if unimplemented_refusal(&e) => {
-                    // Legacy v1-only server.
-                    if strict_pq {
-                        return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
-                    }
-                    if local_pq_enabled {
-                        if peer_state.pq_pinned {
-                            return Err(ErrorKind::DowngradeDetected.into());
-                        }
-                        if !peer_state.allow_classical_exception {
-                            return Err(ErrorKind::ClassicalApprovalRequired {
-                                peer_signed_off: false,
+                Err(e) if unimplemented_refusal(&e) && local_pq_enabled => {
+                    // When the relay rolled back to `PQ_ENABLED="false"` while `peer`'s stored
+                    // manifest still advertises PQ, `ClaimBundle` with non-empty `preferred_suites`
+                    // returns Connect `Unimplemented` before popping an OPK. Verify `GetServerInfo`
+                    // to distinguish a genuine PQ-off v2 relay from a server lacking `ClaimBundle`
+                    // (or a transient error), enforce strict mode and existing PQ pins, prompt for
+                    // explicit classical approval if unapproved, and retry with empty
+                    // `preferred_suites` once explicitly approved.
+                    match self.check_server_info(audience).await {
+                        Ok(info) if !info.pq_enabled => {
+                            if strict_pq {
+                                return Err(Error::from_protocol_with_kind(
+                                    ErrorKind::PqRequired,
+                                    e,
+                                ));
                             }
-                            .into());
+                            if peer_state.pq_pinned {
+                                return Err(ErrorKind::DowngradeDetected.into());
+                            }
+                            if !peer_state.allow_classical_exception {
+                                return Err(ErrorKind::ClassicalApprovalRequired {
+                                    peer_signed_off: false,
+                                }
+                                .into());
+                            }
+                            server_pq_disabled_fallback = true;
+                            self.handshake
+                                .claim_bundle(ClaimBundleRequest {
+                                    identity_key: Bytes::copy_from_slice(peer),
+                                    preferred_suites: vec![],
+                                })
+                                .await?
                         }
+                        Ok(_) => return Err(e.into()),
+                        Err(info_err) if info_err.kind() == ErrorKind::DowngradeDetected => {
+                            return Err(info_err);
+                        }
+                        Err(info_err)
+                            if info_err.is_connect_error()
+                                && info_err.is_server_refusal()
+                                && info_err.kind() == ErrorKind::Unimplemented =>
+                        {
+                            return Err(e.into());
+                        }
+                        Err(info_err) => return Err(info_err),
                     }
-                    let v1_resp = self
-                        .handshake
-                        .fetch_bundle(FetchBundleRequest {
-                            identity_key: Bytes::copy_from_slice(peer),
-                        })
-                        .await?;
-                    let bundle = PrekeyBundle::try_from(&v1_resp)?;
-                    return self.build_classical_initiate_v2(
-                        peer,
-                        peer_state.clone(),
-                        bundle,
-                        content,
-                        mailbox,
-                        true,
-                    );
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1422,12 +1538,20 @@ mod v2 {
                     }
 
                     if manifest.pq_enabled {
-                        updated_peer_state.pq_pinned = true;
+                        // During an explicitly approved `PQ_ENABLED="false"` relay rollback on an
+                        // unpinned peer, keep `pq_pinned` unchanged so the approved classical chat
+                        // can still rekey while rollback remains active; `pinned_manifest_seq` and
+                        // `peer_pq_capable` still prevent rollback to older OFF manifests or
+                        // manifest stripping.
+                        if !server_pq_disabled_fallback {
+                            updated_peer_state.pq_pinned = true;
+                        }
                         updated_peer_state.peer_pq_capable = true;
                         updated_peer_state.pinned_manifest_seq =
                             peer_state.pinned_manifest_seq.max(manifest.manifest_seq);
 
-                        if local_pq_enabled {
+                        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                        if local_pq_enabled && !server_pq_disabled_fallback {
                             return self.build_pq_initiate_v2(
                                 peer,
                                 updated_peer_state,
@@ -1438,8 +1562,12 @@ mod v2 {
                                 mailbox,
                             );
                         }
+                        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                        let _ = server_pq_disabled_fallback;
 
-                        // Local PQ is OFF while peer has PQ ON.
+                        // Local PQ is OFF (or classical-only build), or the server rolled back to
+                        // `PQ_ENABLED="false"` with explicit classical approval while the peer has
+                        // non-strict PQ ON.
                         if manifest.strict_pq {
                             return Err(ErrorKind::PqRequired.into());
                         }
@@ -1450,11 +1578,10 @@ mod v2 {
                             bundle,
                             content,
                             mailbox,
-                            false,
                         )
                     } else {
                         // Peer published a valid signed OFF manifest.
-                        if peer_state.pq_pinned
+                        if (peer_state.pq_pinned || peer_state.peer_pq_capable)
                             && peer_state.pinned_manifest_seq > 0
                             && manifest.manifest_seq <= peer_state.pinned_manifest_seq
                         {
@@ -1480,7 +1607,6 @@ mod v2 {
                             bundle,
                             content,
                             mailbox,
-                            false,
                         )
                     }
                 }
@@ -1489,16 +1615,14 @@ mod v2 {
                     if strict_pq {
                         return Err(ErrorKind::PqRequired.into());
                     }
-                    if local_pq_enabled {
-                        if peer_state.pq_pinned {
-                            return Err(ErrorKind::DowngradeDetected.into());
+                    if peer_state.pq_pinned || peer_state.pinned_manifest_seq > 0 {
+                        return Err(ErrorKind::DowngradeDetected.into());
+                    }
+                    if local_pq_enabled && !peer_state.allow_classical_exception {
+                        return Err(ErrorKind::ClassicalApprovalRequired {
+                            peer_signed_off: false,
                         }
-                        if !peer_state.allow_classical_exception {
-                            return Err(ErrorKind::ClassicalApprovalRequired {
-                                peer_signed_off: false,
-                            }
-                            .into());
-                        }
+                        .into());
                     }
                     let bundle = classical_bundle_from_claim(&response)?;
                     self.build_classical_initiate_v2(
@@ -1507,12 +1631,12 @@ mod v2 {
                         bundle,
                         content,
                         mailbox,
-                        false,
                     )
                 }
             }
         }
 
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         #[allow(clippy::too_many_arguments)]
         fn build_pq_initiate_v2<M>(
             &self,
@@ -1625,10 +1749,10 @@ mod v2 {
 
             Ok(PreparedInitiateV2 {
                 session,
-                request: OutgoingInitialMessage::V2(SendInitialV2Request {
+                request: SendInitialV2Request {
                     recipient: Bytes::copy_from_slice(peer),
                     message: Some(wire_initial),
-                }),
+                },
                 security,
             })
         }
@@ -1640,7 +1764,6 @@ mod v2 {
             bundle: PrekeyBundle,
             content: &[u8],
             mailbox: M,
-            use_v1_rpc: bool,
         ) -> Result<PreparedInitiateV2<M>> {
             let (message, agreement) = bundle.initiate(&self.state.identity, peer)?;
             let ratchet = Ratchet::alice(
@@ -1653,18 +1776,11 @@ mod v2 {
                 first_message: Some(first_message.clone()),
                 ..handshake::InitialMessage::from(&message)
             };
-            let request = if use_v1_rpc {
-                OutgoingInitialMessage::V1(SendInitialMessageRequest {
-                    recipient: Bytes::copy_from_slice(peer),
-                    message: Some(v1_initial.clone()),
-                })
-            } else {
-                let mut v2_initial = handshake_v2::InitialMessageV2::from(&message);
-                v2_initial.first_message = Some(first_message);
-                OutgoingInitialMessage::V2(SendInitialV2Request {
-                    recipient: Bytes::copy_from_slice(peer),
-                    message: Some(v2_initial),
-                })
+            let mut v2_initial = handshake_v2::InitialMessageV2::from(&message);
+            v2_initial.first_message = Some(first_message);
+            let request = SendInitialV2Request {
+                recipient: Bytes::copy_from_slice(peer),
+                message: Some(v2_initial),
             };
             let security = SessionSecurity::classical();
             let mut session = Session::new(
@@ -1697,20 +1813,13 @@ mod v2 {
             })
         }
 
-        /// Transmit an [`OutgoingInitialMessage`] prepared by [`Client::prepare_initiate_v2`] or
+        /// Transmit a [`SendInitialV2Request`] prepared by [`Client::prepare_initiate_v2`] or
         /// [`Client::prepare_start_again_v2`] (after persisting `session.state()`).
         pub async fn send_prepared_initiate_v2(
             &self,
-            request: &OutgoingInitialMessage,
+            request: &SendInitialV2Request,
         ) -> Result<()> {
-            match request {
-                OutgoingInitialMessage::V1(req) => {
-                    self.handshake.send_initial_message(req.clone()).await?;
-                }
-                OutgoingInitialMessage::V2(req) => {
-                    self.handshake.send_initial_v2(req.clone()).await?;
-                }
-            }
+            self.handshake.send_initial_v2(request.clone()).await?;
             Ok(())
         }
 
@@ -1745,14 +1854,14 @@ mod v2 {
         }
 
         /// Prepare starting a new v2 session with `session`'s peer and merge it into `session`
-        /// via [`Session::keep`], returning the [`OutgoingInitialMessage`] so the caller can
+        /// via [`Session::keep`], returning the [`SendInitialV2Request`] so the caller can
         /// persist `session.state()` BEFORE transmitting.
         pub async fn prepare_start_again_v2<M: Clone>(
             &mut self,
             audience: &str,
             session: &mut Session<M>,
             content: &[u8],
-        ) -> Result<OutgoingInitialMessage> {
+        ) -> Result<SendInitialV2Request> {
             if session.state.me != self.identity_key {
                 return Err(ErrorKind::UnexpectedPeer.into());
             }
@@ -1784,8 +1893,7 @@ mod v2 {
         /// Phase 1 of two-phase inbox receive: non-destructively list pending v1 and v2 initial
         /// messages from the server using `HandshakeV2::list_initial_messages`.
         ///
-        /// Falls back to destructive v1 `TakeInitialMessages` ONLY when the server returns
-        /// `Unimplemented` and `strict_pq` is `false`.
+        /// Never falls back to destructive legacy v1 `TakeInitialMessages`.
         pub async fn list_initial_messages_v2(
             &mut self,
             audience: &str,
@@ -1797,46 +1905,22 @@ mod v2 {
             let timestamp = self.next_timestamp()?;
             let request =
                 ListInitialMessagesRequest::sign(&self.state.identity, audience, limit, timestamp)?;
-            match self.handshake.list_initial_messages(request).await {
-                Ok(response) => {
-                    let mut messages = Vec::with_capacity(response.messages.len());
-                    let mut malformed_ids = vec![];
-                    for wire in &response.messages {
-                        if wire.id == 0 || wire.id > protocol::MAX_SAFE_INTEGER {
-                            continue;
-                        }
-                        match InitialMessageV2::try_from(wire) {
-                            Ok(msg) => messages.push(msg),
-                            Err(_) => malformed_ids.push(wire.id),
-                        }
-                    }
-                    Ok(ListedInitialMessages {
-                        messages,
-                        malformed_ids,
-                        fell_back_to_v1: false,
-                    })
+            let response = self.handshake.list_initial_messages(request).await?;
+            let mut messages = Vec::with_capacity(response.messages.len());
+            let mut malformed_ids = vec![];
+            for wire in &response.messages {
+                if wire.id == 0 || wire.id > protocol::MAX_SAFE_INTEGER {
+                    continue;
                 }
-                Err(e) if unimplemented_refusal(&e) => {
-                    if self.state.pq_config.strict_pq {
-                        return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
-                    }
-                    let v1_messages = self.take_initial_messages().await?;
-                    let messages = v1_messages
-                        .into_iter()
-                        .map(|m| InitialMessageV2 {
-                            id: 0,
-                            sender: m.x3dh.identity_key,
-                            kind: InitialMessageKind::Classical(m),
-                        })
-                        .collect();
-                    Ok(ListedInitialMessages {
-                        messages,
-                        malformed_ids: vec![],
-                        fell_back_to_v1: true,
-                    })
+                match InitialMessageV2::try_from(wire) {
+                    Ok(msg) => messages.push(msg),
+                    Err(_) => malformed_ids.push(wire.id),
                 }
-                Err(e) => Err(e.into()),
             }
+            Ok(ListedInitialMessages {
+                messages,
+                malformed_ids,
+            })
         }
 
         /// Convenience two-phase inbox flow: list, accept locally (returning both
@@ -1861,21 +1945,22 @@ mod v2 {
             ack_ids.retain(|&id| can_ack(id));
             let mut outcomes = Vec::with_capacity(listed.messages.len());
             for msg in &listed.messages {
-                if !listed.fell_back_to_v1 && !can_ack(msg.id) {
+                if !can_ack(msg.id) {
                     continue;
                 }
                 let peer_state = peer_state_for(&msg.sender);
-                // `accept_initial_v2` is purely local with no transient errors: always acknowledge
-                // every processed inbox ID so permanent failures (e.g. canonical low-order sender
-                // `InvalidKeys`, `UnsupportedSuite`, `InvalidInitialMessage`, `PqRequired`,
-                // `DowngradeDetected`, etc.) cannot permanently DoS the inbox.
-                if !listed.fell_back_to_v1 {
-                    ack_ids.push(msg.id);
-                }
-                if let Ok(outcome) =
-                    self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone())
-                {
-                    outcomes.push((msg.sender, outcome));
+                // `accept_initial_v2` is purely local: acknowledge accepted, quarantined, and
+                // permanently rejected IDs so invalid entries cannot DoS the inbox, but leave
+                // `UnsupportedSuite` queued on the server so a capable build can decrypt it later.
+                match self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone()) {
+                    Ok(outcome) => {
+                        ack_ids.push(msg.id);
+                        outcomes.push((msg.sender, outcome));
+                    }
+                    Err(e) if e.kind() == ErrorKind::UnsupportedSuite => {}
+                    Err(_) => {
+                        ack_ids.push(msg.id);
+                    }
                 }
             }
             let mut result = ListAndAcceptOutcome {
@@ -1883,13 +1968,11 @@ mod v2 {
                 unacked_ids: vec![],
                 ack_error: None,
             };
-            if !listed.fell_back_to_v1 {
-                for (index, chunk) in ack_ids.chunks(MAX_ACK_BATCH).enumerate() {
-                    if let Err(error) = self.ack_initial_chunk(audience, chunk).await {
-                        result.ack_error = Some(error);
-                        result.unacked_ids = ack_ids.split_off(index * MAX_ACK_BATCH);
-                        break;
-                    }
+            for (index, chunk) in ack_ids.chunks(MAX_ACK_BATCH).enumerate() {
+                if let Err(error) = self.ack_initial_chunk(audience, chunk).await {
+                    result.ack_error = Some(error);
+                    result.unacked_ids = ack_ids.split_off(index * MAX_ACK_BATCH);
+                    break;
                 }
             }
             Ok(result)
@@ -1952,20 +2035,12 @@ mod v2 {
         }
     }
 
-    impl<M: LocalMailbox + LocalMailboxV2> Session<M> {
+    impl<M: LocalMailboxV2> Session<M> {
         /// Push `sealed` via `MailboxV2::push_v2` (with stable `client_message_id` and v1/v2
-        /// carried initial message), falling back cleanly to v1 `Mailbox::push` on
-        /// `ErrorKind::Unimplemented`.
+        /// carried initial message). Never falls back to legacy v1 `Mailbox::push`.
         pub async fn push_v2(&mut self, sealed: Sealed) -> Result<u64> {
-            let request = self.push_v2_request(sealed.clone());
-            match self.mailbox.push_v2(request).await {
-                Ok(resp) => Ok(resp.sequence),
-                Err(e) if unimplemented_refusal(&e) => {
-                    let resp = self.mailbox.push(self.push_request(sealed)).await?;
-                    Ok(resp.sequence)
-                }
-                Err(e) => Err(e.into()),
-            }
+            let request = self.push_v2_request(sealed);
+            Ok(self.mailbox.push_v2(request).await?.sequence)
         }
 
         /// Encrypt `content` and push via [`Session::push_v2`].
@@ -1975,9 +2050,8 @@ mod v2 {
         }
 
         /// Alias for [`Session::receive_v2`]: fetch and decrypt messages using recipient-signed
-        /// `MailboxV2::fetch_signed` bound to `audience`, falling back cleanly to v1
-        /// `Mailbox::fetch` on `ErrorKind::Unimplemented` unless `client.pq_config().strict_pq`
-        /// is `true`.
+        /// `MailboxV2::fetch_signed` bound to `audience`. Never falls back to legacy v1
+        /// `Mailbox::fetch`.
         pub async fn fetch_v2<H>(
             &mut self,
             client: &Client<H>,
@@ -1987,9 +2061,8 @@ mod v2 {
         }
 
         /// Fetch and decrypt the next page of messages from the peer using recipient-signed
-        /// `MailboxV2::fetch_signed` bound to `audience`, falling back cleanly to v1
-        /// `Mailbox::fetch` on `ErrorKind::Unimplemented` unless `client.pq_config().strict_pq`
-        /// is `true`.
+        /// `MailboxV2::fetch_signed` bound to `audience`. Never falls back to legacy v1
+        /// `Mailbox::fetch`.
         ///
         /// Surfaces `ErrorKind::EvictedMessage` distinctly while still acknowledging its
         /// delivery token, and never discards trailing carried v1/v2 initial messages across
@@ -2019,35 +2092,10 @@ mod v2 {
                         request.after,
                         request.limit,
                         0,
-                        request.delivered.clone(),
+                        request.delivered,
                         timestamp,
                     )?;
-                    match mailbox.fetch_signed(signed).await {
-                        Ok(response) => Ok(response.messages),
-                        Err(e) if unimplemented_refusal(&e) => {
-                            if client.state.pq_config.strict_pq {
-                                return Err(Error::from_protocol_with_kind(
-                                    ErrorKind::PqRequired,
-                                    e,
-                                ));
-                            }
-                            Ok(mailbox
-                                .fetch(request)
-                                .await?
-                                .messages
-                                .into_iter()
-                                .map(|env| EnvelopeV2 {
-                                    sequence: env.sequence,
-                                    message: env.message,
-                                    initial_message: env
-                                        .initial_message
-                                        .as_ref()
-                                        .map(handshake_v2::InitialMessageV2::from),
-                                })
-                                .collect())
-                        }
-                        Err(e) => Err(e.into()),
-                    }
+                    Ok(mailbox.fetch_signed(signed).await?.messages)
                 },
                 |content, earlier, initial_messages| ReceivedV2 {
                     content,
@@ -2060,5 +2108,4 @@ mod v2 {
     }
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 pub use v2::*;

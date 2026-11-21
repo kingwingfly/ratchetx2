@@ -1,38 +1,31 @@
 //! Server notifications, synchronization and incoming mailbox pages.
 
-use super::handshake::{Incoming, stage_carried_initials};
+use super::handshake::{
+    Incoming, JoinCarriedOutcome, record_carried_timestamps, stage_carried_initials,
+};
 use super::outbox::{RequeueOutcome, needs_new_session};
 use super::{
     AWAY_CHECK, Engine, HIDDEN_GRACE, HistoryStore, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE,
-    POLL_SLOW, POLL_STEP, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE, origin, records,
-    same_server,
+    POLL_SLOW, POLL_STEP, ProtocolRpcScope, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE,
+    origin, records, same_server, should_require_update_for_rpc,
 };
 use crate::content::{Content, Kind};
 use crate::notify::{Event, Subscription};
-use crate::state::Link;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use crate::state::ServerPqStatus;
+use crate::state::{Link, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, monotonic_now_ms, now, sleep};
-use crate::vault::{ContactState, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+use crate::vault::{
+    ContactState, Farewell, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
+};
 use bytes::Bytes;
 use futures::future::{Either, select};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use prost::Message as _;
-use session::protocol::mailbox::LocalMailbox;
+use session::protocol::handshake_v2::InitialMessageV2 as WireInitialMessageV2;
+use session::protocol::mailbox_v2::{CLIENT_MESSAGE_ID_LENGTH, LocalMailboxV2, PushV2Request};
 use session::protocol::notify::{self, Notification};
-use session::{Client, ErrorKind, PublicKey, Session, proto};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use session::{
-    PqSuite,
-    protocol::{
-        handshake_v2::InitialMessageV2 as WireInitialMessageV2,
-        mailbox_v2::{LocalMailboxV2, PushV2Request},
-    },
-};
+use session::{Client, ErrorKind, PqSuite, PublicKey, Sealed, Session, proto};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -77,7 +70,9 @@ impl Engine {
                 if asked {
                     self.ui.syncing.set(false);
                 }
-                delay = if self.ui.live.get_untracked() {
+                delay = if self.ui.live.get_untracked()
+                    || self.ui.update_required.with_untracked(Option::is_some)
+                {
                     POLL_LIVE
                 } else if active {
                     POLL_FAST
@@ -115,7 +110,15 @@ impl Engine {
         spawn_local(async move {
             let mut retry = RESUBSCRIBE_MIN;
             loop {
+                if self.ui.update_required.with_untracked(Option::is_some) {
+                    self.ui.live.set(false);
+                    return;
+                }
                 while !self.present() {
+                    if self.ui.update_required.with_untracked(Option::is_some) {
+                        self.ui.live.set(false);
+                        return;
+                    }
                     sleep(AWAY_CHECK).await;
                 }
                 let subscribed = {
@@ -145,7 +148,18 @@ impl Engine {
                                 self.notified(notification).await
                             }
                             Either::Left((Event::Resync, _)) => self.wake(),
+                            Either::Left((Event::UpgradeRequired(reason), _)) => {
+                                self.require_update(reason);
+                                self.ui.live.set(false);
+                                return;
+                            }
                             Either::Left((Event::Closed, _)) => break,
+                            Either::Right(_)
+                                if self.ui.update_required.with_untracked(Option::is_some) =>
+                            {
+                                self.ui.live.set(false);
+                                return;
+                            }
                             // Away: dropped, the subscription closes its socket.
                             Either::Right(_) if !self.present() => {
                                 left = true;
@@ -159,6 +173,9 @@ impl Engine {
                         .log(format!("cannot subscribe to notifications: {e}")),
                 }
                 self.ui.live.set(false);
+                if self.ui.update_required.with_untracked(Option::is_some) {
+                    return;
+                }
                 if left {
                     retry = RESUBSCRIBE_MIN;
                     continue;
@@ -205,50 +222,46 @@ impl Engine {
     /// Query `GetServerInfo` verifying `server_id` against the client's locally derived expected
     /// audience (never blindly trusting server-supplied audience strings).
     pub(super) async fn refresh_server_info(&self, force: bool) {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            let mut guard = self.inner.lock().await;
-            let Some(inner) = guard.as_mut() else {
-                return;
-            };
-            if !force && inner.server_pq != ServerPqStatus::Unknown {
-                return;
-            }
-            let status = match inner.client.check_server_info(&inner.audience).await {
-                Ok(info) if info.pq_enabled => {
-                    let suites = info
-                        .supported_suites
-                        .iter()
-                        .filter_map(|&s| u8::try_from(s).ok().and_then(PqSuite::from_u8))
-                        .collect();
-                    ServerPqStatus::Enabled {
-                        suites,
-                        pq_ratchet: info.pq_ratchet_supported,
-                    }
-                }
-                Ok(_) => ServerPqStatus::Disabled,
-                Err(e) if e.kind() == ErrorKind::Unimplemented => ServerPqStatus::Disabled,
-                Err(e) if e.kind() == ErrorKind::DowngradeDetected => {
-                    self.ui.log(format!(
-                        "server identity mismatch for {}: possible relay impersonation",
-                        inner.audience
-                    ));
-                    self.ui.notify(format!(
-                        "Server identity mismatch for {} — refusing to trust server PQ metadata.",
-                        inner.audience
-                    ));
-                    ServerPqStatus::AudienceMismatch
-                }
-                Err(_) => return,
-            };
-            if inner.server_pq != status {
-                inner.server_pq = status;
-                self.ui.me.set(Some(inner.me()));
-            }
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return;
+        };
+        if !force && inner.server_pq != ServerPqStatus::Unknown {
+            return;
         }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            let _ = force;
+        let status = match inner.client.check_server_info(&inner.audience).await {
+            Ok(info) if info.pq_enabled => {
+                let suites = info
+                    .supported_suites
+                    .iter()
+                    .filter_map(|&s| u8::try_from(s).ok().and_then(PqSuite::from_u8))
+                    .collect();
+                ServerPqStatus::Enabled {
+                    suites,
+                    pq_ratchet: info.pq_ratchet_supported,
+                }
+            }
+            Ok(_) => ServerPqStatus::Disabled,
+            Err(e) if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) => {
+                self.require_update(describe(&e));
+                return;
+            }
+            Err(e) if e.kind() == ErrorKind::DowngradeDetected => {
+                self.ui.log(format!(
+                    "server identity mismatch for {}: possible relay impersonation",
+                    inner.audience
+                ));
+                self.ui.notify(format!(
+                    "Server identity mismatch for {} — refusing to trust server PQ metadata.",
+                    inner.audience
+                ));
+                ServerPqStatus::AudienceMismatch
+            }
+            Err(_) => return,
+        };
+        if inner.server_pq != status {
+            inner.server_pq = status;
+            self.ui.me.set(Some(inner.me()));
         }
     }
 
@@ -328,17 +341,26 @@ impl Engine {
                 self.show_history(inner, &open).await;
             }
         }
+        let open_peer = self
+            .ui
+            .open
+            .get_untracked()
+            .filter(|_| !document().hidden());
+        let replayed = self.replay_deferred_initials(inner, open_peer).await?;
         let pending: Vec<_> = inner
             .contacts
             .iter()
-            .filter(|c| !c.state.pending_carried_initials.is_empty() && !c.is_new_quarantined())
+            .filter(|c| {
+                c.deferred_carried < c.state.pending_carried_initials.len()
+                    && !c.is_new_quarantined()
+            })
             .map(|c| c.peer)
             .collect();
-        let recovered = !pending.is_empty();
-        let mut upgrades = vec![];
+        let recovered = replayed.is_some() || !pending.is_empty();
+        let mut upgrades = replayed.unwrap_or_default();
         for peer in pending {
-            if self.join_carried(inner, &peer).await? {
-                upgrades.push(peer);
+            if self.join_carried(inner, &peer).await?.recommend_upgrade {
+                upgrades.insert(peer);
             }
         }
         drop(guard);
@@ -357,63 +379,12 @@ impl Engine {
         };
         let signs_in_here = same_server(&inner.server, &origin());
         while let Some(farewell) = inner.state.farewells.first().cloned() {
-            let push_req = farewell.push.unwrap_or_default();
-            let pushed: session::Result<()> = {
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                {
-                    let client = Fetch::client(&inner.server);
-                    let v2_req = if !farewell.push_v2.is_empty() {
-                        PushV2Request::decode(farewell.push_v2.as_slice()).unwrap_or_else(|_| {
-                            PushV2Request {
-                                sender: push_req.sender.clone(),
-                                recipient: push_req.recipient.clone(),
-                                message: push_req.message.clone(),
-                                initial_message: push_req
-                                    .initial_message
-                                    .as_ref()
-                                    .map(WireInitialMessageV2::from),
-                                delivery_hash: push_req.delivery_hash.clone(),
-                                client_message_id: Bytes::from(farewell.client_message_id.clone()),
-                            }
-                        })
-                    } else {
-                        PushV2Request {
-                            sender: push_req.sender.clone(),
-                            recipient: push_req.recipient.clone(),
-                            message: push_req.message.clone(),
-                            initial_message: push_req
-                                .initial_message
-                                .as_ref()
-                                .map(WireInitialMessageV2::from),
-                            delivery_hash: push_req.delivery_hash.clone(),
-                            client_message_id: Bytes::from(farewell.client_message_id.clone()),
-                        }
-                    };
-                    match client.push_v2(v2_req).await {
-                        Ok(_) => Ok(()),
-                        Err(e) if e.kind() == session::protocol::ErrorKind::Unimplemented => {
-                            if inner.client.pq_config().strict_pq {
-                                Err(ErrorKind::PqRequired.into())
-                            } else {
-                                client
-                                    .push(push_req)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(session::Error::from)
-                            }
-                        }
-                        Err(e) => Err(e.into()),
-                    }
-                }
-                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-                {
-                    Fetch::client(&inner.server)
-                        .push(push_req)
-                        .await
-                        .map(|_| ())
-                        .map_err(session::Error::from)
-                }
-            };
+            let v2_req = farewell_push_v2_request(&farewell);
+            let pushed: session::Result<()> = Fetch::client(&inner.server)
+                .push_v2(v2_req)
+                .await
+                .map(|_| ())
+                .map_err(session::Error::from);
             match pushed {
                 Ok(()) => {}
                 // Pushing takes a sign-in: they wait for it, without failing the round.
@@ -434,7 +405,10 @@ impl Engine {
                         describe(&e)
                     ));
                 }
-                Err(e) => return Err(describe(&e)),
+                Err(e) => {
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                    return Err(describe(&e));
+                }
             }
             inner.state.farewells.remove(0);
             inner.save_state().await.map_err(|e| describe(&e))?;
@@ -468,17 +442,14 @@ impl Engine {
             if inner.contacts[index].is_new_quarantined() {
                 return Ok(received);
             }
-            recommend_upgrade |= self.join_carried(inner, peer).await?;
+            recommend_upgrade |= self.join_carried(inner, peer).await?.recommend_upgrade;
             let (page, snapshot) = inner
-                .fetch_page(index, async |session, _client, _audience| {
-                    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                    {
-                        session.fetch_v2(_client, _audience).await
+                .fetch_page(index, async |session, client, audience| {
+                    let res = session.fetch_v2(client, audience).await;
+                    if let Err(ref e) = res {
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, e);
                     }
-                    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-                    {
-                        session.receive().await
-                    }
+                    res
                 })
                 .await?;
             if page.is_empty() {
@@ -623,21 +594,24 @@ impl Engine {
             if stalled {
                 // Its initial message, which went first, may have come since they were last
                 // taken, or have been lost, and come with the page: once they are taken, and
-                // those are accepted, receiving goes on, past what still does not decrypt.
+                // those are accepted, receiving goes on, past what still does not decrypt —
+                // UNLESS a deferred unsupported-suite initial exists for this peer, in which case
+                // pause right before the first undecryptable envelope so a capable build can
+                // decrypt those messages after replaying the greeting.
                 drop(guard);
                 self.take_initial_messages().await?;
                 let mut guard = self.inner.lock().await;
                 if let Some(inner) = guard.as_mut() {
-                    recommend_upgrade |= self.join_carried(inner, peer).await?;
-                    if let Some(contact) = inner.contact(peer)
-                        && !contact.is_new_quarantined()
-                    {
-                        contact.session.skip_stalled();
-                    }
+                    let join = self.join_carried(inner, peer).await?;
+                    recommend_upgrade |= join.recommend_upgrade;
+                    let paused = resolve_stalled_peer(inner, peer, join);
                     self.ui.contacts.set(inner.views());
+                    if paused {
+                        break;
+                    }
                 }
             } else if !carried_initials.is_empty() {
-                recommend_upgrade |= self.join_carried(inner, peer).await?;
+                recommend_upgrade |= self.join_carried(inner, peer).await?.recommend_upgrade;
             }
         }
         if recommend_upgrade {
@@ -645,6 +619,57 @@ impl Engine {
         }
         Ok(received)
     }
+}
+
+/// Resolve a stalled mailbox page for `peer`: pause without calling `skip_stalled()` if any
+/// deferred carried or inbox initial exists for `peer` so a later capable build can decrypt the
+/// stalled envelopes after replaying the greeting. Returns `true` when receiving should pause.
+pub(super) fn resolve_stalled_peer<V: HistoryStore>(
+    inner: &mut Inner<V>,
+    peer: &PublicKey,
+    join: JoinCarriedOutcome,
+) -> bool {
+    if join.has_deferred || inner.has_deferred_initial_for(peer) {
+        return true;
+    }
+    if let Some(contact) = inner.contact(peer)
+        && !contact.is_new_quarantined()
+    {
+        contact.session.skip_stalled();
+    }
+    false
+}
+
+/// Build a [`PushV2Request`] for a persisted [`Farewell`], deterministically deriving a 16-byte
+/// `client_message_id` from the encrypted message whenever a legacy vaulted farewell has an empty
+/// `client_message_id` so retries remain idempotent.
+pub(super) fn farewell_push_v2_request(farewell: &Farewell) -> PushV2Request {
+    let mut req = if !farewell.push_v2.is_empty()
+        && let Ok(decoded) = PushV2Request::decode(farewell.push_v2.as_slice())
+    {
+        decoded
+    } else {
+        let push_req = farewell.push.clone().unwrap_or_default();
+        PushV2Request {
+            sender: push_req.sender,
+            recipient: push_req.recipient,
+            message: push_req.message,
+            initial_message: push_req
+                .initial_message
+                .as_ref()
+                .map(WireInitialMessageV2::from),
+            delivery_hash: push_req.delivery_hash,
+            client_message_id: Bytes::copy_from_slice(&farewell.client_message_id),
+        }
+    };
+    if req.client_message_id.is_empty() {
+        if farewell.client_message_id.len() == CLIENT_MESSAGE_ID_LENGTH {
+            req.client_message_id = Bytes::copy_from_slice(&farewell.client_message_id);
+        } else if let Some(message) = req.message.as_ref() {
+            req.client_message_id = Bytes::copy_from_slice(&Sealed::client_message_id_for(message));
+        }
+    }
+    req
 }
 
 impl<V: HistoryStore> Inner<V> {
@@ -674,16 +699,35 @@ impl<V: HistoryStore> Inner<V> {
         records: &[(String, HistoryEntry)],
         outbox: &[(String, Option<OutgoingRecord>)],
     ) -> Result<(), String> {
-        let contact = &mut self.contacts[index];
-        let peer = contact.peer;
-        let saved = match stage_carried_initials(&mut contact.state, initials) {
-            Ok(()) => self
-                .save_with(records, outbox)
-                .await
-                .map_err(|e| describe(&e)),
+        let peer = self.contacts[index].peer;
+        let saved_carried_ts = self.carried_deferred_timestamps.clone();
+        let staged = stage_carried_initials(&mut self.contacts[index].state, initials);
+        let saved = match staged {
+            Ok(()) => {
+                record_carried_timestamps(
+                    &mut self.carried_deferred_timestamps,
+                    &self.contacts[index].state.pending_carried_initials,
+                    now(),
+                );
+                let unchanged = records.is_empty()
+                    && outbox.is_empty()
+                    && !self.needs_save()
+                    && proto::SessionState::from(self.contacts[index].session.state())
+                        == snapshot.0
+                    && self.contacts[index].state == snapshot.1
+                    && self.carried_deferred_timestamps == saved_carried_ts;
+                if unchanged {
+                    Ok(())
+                } else {
+                    self.save_with(records, outbox)
+                        .await
+                        .map_err(|e| describe(&e))
+                }
+            }
             Err(e) => Err(e),
         };
         if saved.is_err() {
+            self.carried_deferred_timestamps = saved_carried_ts;
             self.roll_back(&peer, snapshot)?;
         }
         saved

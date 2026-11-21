@@ -52,26 +52,38 @@ pub(crate) mod v2 {
 
 pub use proto::*;
 #[cfg(feature = "server")]
+#[allow(deprecated)]
 pub use server::{HandshakeLimits, HandshakeServer};
 
-/// Client side of the handshake service.
-#[trait_variant::make(Handshake: Send)]
-pub trait LocalHandshake {
-    /// Publish Bob's prekeys, replacing his previous ones; see [`PublishRequest::sign`].
-    async fn publish(&self, request: PublishRequest) -> Result<PublishResponse>;
-    /// Fetch Bob's prekey bundle, consuming one of his one-time prekeys.
-    async fn fetch_bundle(&self, request: FetchBundleRequest) -> Result<FetchBundleResponse>;
-    /// Leave Alice's initial message in Bob's inbox.
-    async fn send_initial_message(
-        &self,
-        request: SendInitialMessageRequest,
-    ) -> Result<SendInitialMessageResponse>;
-    /// Take the initial messages in Bob's inbox; see [`TakeInitialMessagesRequest::sign`].
-    async fn take_initial_messages(
-        &self,
-        request: TakeInitialMessagesRequest,
-    ) -> Result<TakeInitialMessagesResponse>;
+#[allow(deprecated)]
+mod legacy_trait {
+    use super::*;
+
+    /// Client side of the legacy v1 handshake service.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+    )]
+    #[trait_variant::make(Handshake: Send)]
+    pub trait LocalHandshake {
+        /// Publish Bob's prekeys, replacing his previous ones; see [`PublishRequest::sign`].
+        async fn publish(&self, request: PublishRequest) -> Result<PublishResponse>;
+        /// Fetch Bob's prekey bundle, consuming one of his one-time prekeys.
+        async fn fetch_bundle(&self, request: FetchBundleRequest) -> Result<FetchBundleResponse>;
+        /// Leave Alice's initial message in Bob's inbox.
+        async fn send_initial_message(
+            &self,
+            request: SendInitialMessageRequest,
+        ) -> Result<SendInitialMessageResponse>;
+        /// Take the initial messages in Bob's inbox; see [`TakeInitialMessagesRequest::sign`].
+        async fn take_initial_messages(
+            &self,
+            request: TakeInitialMessagesRequest,
+        ) -> Result<TakeInitialMessagesResponse>;
+    }
 }
+
+#[allow(deprecated)]
+pub use legacy_trait::{Handshake, LocalHandshake};
 
 impl PublishRequest {
     /// A request publishing `prekeys` as `identity`'s, signed by it.
@@ -222,6 +234,7 @@ impl TryFrom<&InitialMessage> for x3dh::InitialMessage {
 }
 
 #[cfg(feature = "server")]
+#[allow(deprecated)]
 mod server {
     use std::collections::HashSet;
 
@@ -234,7 +247,10 @@ mod server {
         check_canonical_key, check_monotonic_timestamp, mailbox::MAX_HEADER_SIZE, now_millis,
     };
 
-    /// Limits of a [`HandshakeServer`].
+    /// Limits of a legacy v1 [`HandshakeServer`].
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+    )]
     #[derive(Debug, Clone, Copy)]
     pub struct HandshakeLimits {
         /// Most one-time prekeys in one publish.
@@ -255,10 +271,13 @@ mod server {
         }
     }
 
-    /// The handshake server's logic, over any handshake store.
+    /// The legacy v1 handshake server's logic, over any handshake store.
     ///
     /// [`HandshakeServer::new`] gives it the default limits, and [`HandshakeServer::builder`] can
     /// set them: `HandshakeServer::builder(store).limits(limits).build()`.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+    )]
     #[derive(Debug, Builder)]
     pub struct HandshakeServer<S> {
         #[builder(start_fn)]

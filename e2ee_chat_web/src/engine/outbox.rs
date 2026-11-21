@@ -1,18 +1,18 @@
 //! Durable outgoing messages, delivery updates and session replacement recovery.
 
 use super::contact::{forget_told, keep_last};
-use super::{Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, origin, records, same_server};
+use super::{
+    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ProtocolRpcScope, origin, records,
+    same_server, should_require_update_for_rpc,
+};
 use crate::content::{Content, Events, Kind, stamp};
 use crate::state::{Delivery, MessageView, Step, Ui};
 use crate::util::{describe, now, short};
 use crate::vault::{
-    Awaiting, CLASSICAL_APPROVAL_NONE, ContactState, HistoryEntry, Outgoing, OutgoingRecord,
-    SECURITY_ALERT_NONE, SealedEvents, history_key, outbox_key,
-};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use crate::vault::{
-    CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_SIGNED_OFF, SECURITY_ALERT_DOWNGRADE,
-    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_PQ_REQUIRED,
+    Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
+    ContactState, HistoryEntry, Outgoing, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
+    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
+    history_key, outbox_key,
 };
 use leptos::prelude::*;
 use session::{ErrorKind, PublicKey};
@@ -105,6 +105,11 @@ impl Engine {
                         }
                         changed = true;
                     }
+                    Ok(SealOutcome::UpdateRequired(reason)) => {
+                        self.require_update(reason.clone());
+                        result = Err(reason);
+                        break;
+                    }
                     Err(e) => {
                         result = Err(e);
                         break;
@@ -122,16 +127,7 @@ impl Engine {
             let Some(contact) = inner.contact(peer) else {
                 break;
             };
-            let push_res: session::Result<()> = {
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                {
-                    contact.session.push_v2(record.to_push()).await.map(|_| ())
-                }
-                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-                {
-                    contact.session.push(record.to_push()).await
-                }
-            };
+            let push_res = contact.session.push_v2(record.to_push()).await.map(|_| ());
             let step = match push_res {
                 Ok(()) => {
                     self.release(peer, outgoing.history_index);
@@ -158,6 +154,7 @@ impl Engine {
                     (Step::Refused, 0)
                 }
                 Err(e) => {
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                     result = Err(describe(&e));
                     break;
                 }
@@ -293,25 +290,18 @@ impl Engine {
         };
         let contact = inner.contact(peer).ok_or("no such chat")?;
         let message = sealed.record.unwrap_or_default().to_push();
-        let push_res: session::Result<()> = {
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            {
-                contact.session.push_v2(message).await.map(|_| ())
-            }
-            #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-            {
-                contact.session.push(message).await
-            }
-        };
-        match push_res {
-            Ok(()) => {}
+        match contact.session.push_v2(message).await {
+            Ok(_) => {}
             // The chat waits for the sign-in, as a message refused for it does, rather than
             // tries every round, and goes once signed in.
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
                 self.waits_sign_in.borrow_mut().insert(*peer);
                 return Ok(false);
             }
-            Err(e) => return Err(describe(&e)),
+            Err(e) => {
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                return Err(describe(&e));
+            }
         }
         // Those told since it was encrypted stay, to go in the next. Persist immediately after
         // clearing `sealed_events` so reload never re-pushes already-sent events.
@@ -373,10 +363,6 @@ impl Engine {
 }
 
 /// Result of [`Inner::seal_next`].
-#[cfg_attr(
-    not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
-    allow(dead_code)
-)]
 enum SealOutcome {
     /// Ready to push (or nothing unsealed left).
     Ready,
@@ -384,6 +370,8 @@ enum SealOutcome {
     Paused,
     /// Permanently failed to start a session (e.g. peer has no keys); outbox entries marked failed.
     Failed(String),
+    /// Server rejected the v2 protocol (`ErrorKind::Unimplemented`); prompt the user to refresh.
+    UpdateRequired(String),
 }
 
 impl Inner {
@@ -463,108 +451,77 @@ impl Inner {
             let mut hello = greeting.to_bytes();
             stamp(&mut hello, self.contacts[index].state.clock);
 
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            {
-                let prepared = {
-                    let audience = &self.audience;
-                    let client = &mut self.client;
-                    let contact = &mut self.contacts[index];
-                    client
-                        .prepare_start_again_v2(audience, &mut contact.session, &hello)
-                        .await
-                };
-                match prepared {
-                    Ok(outgoing) => {
-                        if let Some(contact) = self.contact(peer) {
-                            contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                            contact.state.security_alert = SECURITY_ALERT_NONE;
-                        }
-                        // H-2: Persist new session BEFORE transmitting!
-                        if let Err(e) = self.save(&[]).await {
-                            self.roll_back(peer, snapshot)?;
-                            return Err(describe(&e));
-                        }
-                        let _ = self.client.send_prepared_initiate_v2(&outgoing).await;
+            let prepared = {
+                let audience = &self.audience;
+                let client = &mut self.client;
+                let contact = &mut self.contacts[index];
+                client
+                    .prepare_start_again_v2(audience, &mut contact.session, &hello)
+                    .await
+            };
+            match prepared {
+                Ok(outgoing) => {
+                    if let Some(contact) = self.contact(peer) {
+                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                        contact.state.security_alert = SECURITY_ALERT_NONE;
                     }
-                    Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
+                    // H-2: Persist new session BEFORE transmitting!
+                    if let Err(e) = self.save(&[]).await {
                         self.roll_back(peer, snapshot)?;
-                        return self
-                            .fail_waiting(peer, describe(&e))
-                            .await
-                            .map(SealOutcome::Failed);
-                    }
-                    Err(e) => {
-                        let kind = e.kind();
-                        self.roll_back(peer, snapshot)?;
-                        let paused = match kind {
-                            ErrorKind::ClassicalApprovalRequired { peer_signed_off } => {
-                                if let Some(contact) = self.contact(peer) {
-                                    contact.state.classical_approval_needed = if peer_signed_off {
-                                        CLASSICAL_APPROVAL_SIGNED_OFF
-                                    } else {
-                                        CLASSICAL_APPROVAL_LEGACY
-                                    };
-                                }
-                                true
-                            }
-                            ErrorKind::DowngradeDetected => {
-                                if let Some(contact) = self.contact(peer) {
-                                    contact.session.peer_pq_state_mut().downgrade_detected = true;
-                                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                                }
-                                true
-                            }
-                            ErrorKind::PeerManifestExpired => {
-                                if let Some(contact) = self.contact(peer) {
-                                    contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
-                                }
-                                true
-                            }
-                            ErrorKind::PqRequired => {
-                                if let Some(contact) = self.contact(peer) {
-                                    contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
-                                }
-                                true
-                            }
-                            _ => false,
-                        };
-                        if paused {
-                            self.save_state().await.map_err(|e| describe(&e))?;
-                            return Ok(SealOutcome::Paused);
-                        }
                         return Err(describe(&e));
                     }
+                    let _ = self.client.send_prepared_initiate_v2(&outgoing).await;
                 }
-            }
-            #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-            {
-                let prepared = {
-                    let client = &mut self.client;
-                    let contact = &mut self.contacts[index];
-                    client
-                        .prepare_start_again(&mut contact.session, &hello)
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
+                    self.roll_back(peer, snapshot)?;
+                    return self
+                        .fail_waiting(peer, describe(&e))
                         .await
-                };
-                match prepared {
-                    Ok(request) => {
-                        // H-2: Persist new session BEFORE transmitting!
-                        if let Err(e) = self.save(&[]).await {
-                            self.roll_back(peer, snapshot)?;
-                            return Err(describe(&e));
+                        .map(SealOutcome::Failed);
+                }
+                Err(e) => {
+                    let kind = e.kind();
+                    self.roll_back(peer, snapshot)?;
+                    if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) {
+                        return Ok(SealOutcome::UpdateRequired(describe(&e)));
+                    }
+                    let paused = match kind {
+                        ErrorKind::ClassicalApprovalRequired { peer_signed_off } => {
+                            if let Some(contact) = self.contact(peer) {
+                                contact.state.classical_approval_needed = if peer_signed_off {
+                                    CLASSICAL_APPROVAL_SIGNED_OFF
+                                } else {
+                                    CLASSICAL_APPROVAL_LEGACY
+                                };
+                            }
+                            true
                         }
-                        let _ = self.client.send_prepared_initiate(&request).await;
+                        ErrorKind::DowngradeDetected => {
+                            if let Some(contact) = self.contact(peer) {
+                                contact.session.peer_pq_state_mut().downgrade_detected = true;
+                                contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                            }
+                            true
+                        }
+                        ErrorKind::PeerManifestExpired => {
+                            if let Some(contact) = self.contact(peer) {
+                                contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
+                            }
+                            true
+                        }
+                        ErrorKind::PqRequired => {
+                            if let Some(contact) = self.contact(peer) {
+                                contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                            }
+                            true
+                        }
+                        _ => false,
+                    };
+                    if paused {
+                        self.save_state().await.map_err(|e| describe(&e))?;
+                        return Ok(SealOutcome::Paused);
                     }
-                    Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
-                        self.roll_back(peer, snapshot)?;
-                        return self
-                            .fail_waiting(peer, describe(&e))
-                            .await
-                            .map(SealOutcome::Failed);
-                    }
-                    Err(e) => {
-                        self.roll_back(peer, snapshot)?;
-                        return Err(describe(&e));
-                    }
+                    return Err(describe(&e));
                 }
             }
         }

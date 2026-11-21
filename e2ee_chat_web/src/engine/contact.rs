@@ -30,6 +30,8 @@ pub(super) struct Contact {
     pub(super) session: Session<Connect>,
     /// Everything but the session, which is in `session`.
     pub(super) state: ContactState,
+    /// Length of the pending carried queue's prefix deferred by this unlocked build.
+    pub(super) deferred_carried: usize,
 }
 
 /// The place in the chat of the peer's message whose clock is `clock`, as the chat is `state`,
@@ -46,10 +48,6 @@ pub(super) fn contact_state_is_new_quarantined(state: &ContactState) -> bool {
 /// Pure quarantine helper: record an incoming quarantined classical initial message on an existing
 /// contact without clearing `quarantined_primary` (preventing a 2nd classical initial from
 /// unblocking `receive()`/`flush()`).
-#[cfg_attr(
-    not(any(feature = "ml-kem-1024", feature = "ml-kem-768", test)),
-    allow(dead_code)
-)]
 pub(super) fn record_quarantined_initial_state(
     state: &mut ContactState,
     held_session: Option<proto::SessionState>,
@@ -454,6 +452,47 @@ fn validate_contact_state(
     Ok((peer, session))
 }
 
+fn is_unsupported_known_pq_suite(suite: u32) -> bool {
+    u8::try_from(suite)
+        .ok()
+        .and_then(session::PqSuite::from_u8)
+        .is_some_and(|s| !s.is_supported())
+}
+
+/// Whether an isolated contact record failed restoration specifically because its active or
+/// earlier session uses a known ML-KEM suite not compiled into this build (rather than structural
+/// corruption). New greetings from such peers must be deferred rather than acknowledged and lost.
+pub(super) fn is_pq_incompatible_isolated(state: &ContactState, me: &PublicKey) -> bool {
+    if PublicKey::try_from(state.peer.as_slice()).is_err() || validate_history(state).is_err() {
+        return false;
+    }
+    let Some(raw) = state.session.as_ref() else {
+        return false;
+    };
+    if raw.me != me.as_slice()
+        || raw.peer != state.peer
+        || raw.cursor > session::protocol::MAX_SAFE_INTEGER
+    {
+        return false;
+    }
+    let active_kem = raw
+        .party
+        .as_ref()
+        .and_then(|p| p.kem_ratchet.as_ref())
+        .is_some_and(|k| is_unsupported_known_pq_suite(k.suite));
+    let earlier_kem = raw.others.iter().any(|o| {
+        o.party
+            .as_ref()
+            .and_then(|p| p.kem_ratchet.as_ref())
+            .is_some_and(|k| is_unsupported_known_pq_suite(k.suite))
+    });
+    let active_sec = raw
+        .active_security
+        .as_ref()
+        .is_some_and(|s| s.is_pq && is_unsupported_known_pq_suite(s.suite));
+    active_kem || earlier_kem || active_sec
+}
+
 /// Restore each contact independently. Validate from borrowed fields so every failure retains
 /// the original session, including its pinning state. An earlier corrupt record never hides a
 /// later healthy valid contact for the same `peer`.
@@ -483,6 +522,7 @@ pub(super) fn restore_contacts(
                     peer,
                     session: Session::restore(Fetch::client(address), session),
                     state,
+                    deferred_carried: 0,
                 });
             }
             Err(reason) => {

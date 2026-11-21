@@ -2,82 +2,73 @@
 
 use super::contact::Contact;
 use super::{
-    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, REFILL_USED, REPUBLISH_AGE,
-    SERVER_MAX_ONE_TIME_PREKEYS, StartChatError, origin, records, same_server,
+    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS,
+    ProtocolRpcScope, REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS,
+    SERVER_MAX_PQ_ONE_TIME_PREKEYS, StartChatError, origin, records, same_server,
+    should_require_update_for_rpc,
 };
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use super::{PQ_ONE_TIME_PREKEYS, SERVER_MAX_PQ_ONE_TIME_PREKEYS};
 use crate::content::{Content, Kind, stamp};
 use crate::state::{Delivery, MessageView, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, key_from_text, now, short};
 use crate::vault::{
-    CLASSICAL_APPROVAL_NONE, ContactState, Farewell, HistoryEntry, OutgoingRecord,
-    SECURITY_ALERT_DOWNGRADE, history_key,
+    CLASSICAL_APPROVAL_NONE, CarriedDeferredTimestamp, ContactState, DeferredInitial, Farewell,
+    HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, history_key,
 };
 use leptos::prelude::*;
 use prost::Message as _;
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-use session::InitialMessage;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use session::{AcceptedInitial, InitialMessageV2, PublishV2Outcome};
-use session::{ErrorKind, PeerPqState, PublicKey, Session};
+use session::protocol::handshake_v2::InitialMessageV2 as WireInitial;
+use session::{
+    AcceptedInitial, ErrorKind, InitialMessageKind, InitialMessageV2, ListedInitialMessages,
+    PeerPqState, PqSuite, PublicKey, PublishV2Outcome, Session,
+};
+use std::collections::BTreeSet;
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 pub(super) type Incoming = InitialMessageV2;
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-pub(super) type Incoming = InitialMessage;
 
 // A page can include 64 initials from retrying a previous stall and another 64
 // surfaced together at its expired or newly stalled tail.
 const MAX_PENDING_CARRIED_INITIALS: usize = 2 * 64;
+const MAX_DEFERRED_INITIALS: usize = 100;
+/// Maximum age (30 days in ms) for which deferred initials preserve their target signed prekey
+/// generation and manifest digest across scheduled prekey rotations.
+pub(super) const DEFERRED_REPLAY_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
-    use session::InitialMessageKind;
-    use session::protocol::handshake_v2::InitialMessageV2 as Wire;
-    let wire = match &message.kind {
-        InitialMessageKind::Classical(m) => Wire {
+/// Result of [`Engine::join_carried`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JoinCarriedOutcome {
+    /// Whether an accepted session's `Hello` triggered an automatic PQ upgrade recommendation.
+    pub(super) recommend_upgrade: bool,
+    /// Whether at least one carried initial for this contact remains deferred on this build.
+    pub(super) has_deferred: bool,
+}
+
+fn initial_payload(kind: &InitialMessageKind) -> WireInitial {
+    match kind {
+        InitialMessageKind::Classical(m) => WireInitial {
             first_message: Some(m.first_message.clone()),
-            ..Wire::from(&m.x3dh)
+            ..WireInitial::from(&m.x3dh)
         },
         InitialMessageKind::Pq {
             x3dh,
             first_message,
             manifest_digest,
-        } => Wire {
+        } => WireInitial {
             first_message: Some(first_message.clone()),
             manifest_digest: manifest_digest
                 .as_ref()
                 .map_or_else(bytes::Bytes::new, |digest| {
                     bytes::Bytes::copy_from_slice(digest)
                 }),
-            ..Wire::from(x3dh)
+            ..WireInitial::from(x3dh)
         },
-    };
-    Ok(session::protocol::mailbox_v2::encode_carried_initial(&wire)?.to_vec())
+    }
 }
 
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
-    use session::protocol::handshake::InitialMessage as Wire;
-    Ok(Wire {
-        first_message: Some(message.first_message.clone()),
-        ..Wire::from(&message.x3dh)
-    }
-    .encode_to_vec())
-}
-
-fn decode_carried_initial(bytes: &[u8]) -> Option<Incoming> {
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    {
-        InitialMessageV2::decode_carried(bytes)
-    }
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    {
-        let wire = session::protocol::handshake::InitialMessage::decode(bytes).ok()?;
-        InitialMessage::try_from(&wire).ok()
-    }
+fn is_unsupported_carried_bytes(bytes: &[u8]) -> bool {
+    Incoming::decode_carried(bytes)
+        .and_then(|message| message.pq_suite())
+        .is_some_and(|suite| !suite.is_supported())
 }
 
 pub(super) fn stage_carried_initials<'a>(
@@ -85,22 +76,238 @@ pub(super) fn stage_carried_initials<'a>(
     initials: impl IntoIterator<Item = &'a Incoming>,
 ) -> Result<(), String> {
     let pending = &mut state.pending_carried_initials;
+    let mut unsupported_count = pending
+        .iter()
+        .filter(|entry| is_unsupported_carried_bytes(entry))
+        .count();
+    let mut supported_count = pending.len() - unsupported_count;
     for message in initials {
-        let bytes = encode_carried_initial(message).map_err(|e| describe(&e))?;
+        let bytes =
+            session::protocol::mailbox_v2::encode_carried_initial(&initial_payload(&message.kind))
+                .map_err(|e| describe(&e))?
+                .to_vec();
         if !pending.contains(&bytes) {
-            if pending.len() >= MAX_PENDING_CARRIED_INITIALS {
-                return Err("Too many pending carried initial messages for this chat.".into());
+            if message
+                .pq_suite()
+                .is_some_and(|suite| !suite.is_supported())
+            {
+                // Bound retained unsupported entries independently so a full unsupported queue
+                // never blocks supported handshakes or causes cursor rollback loops.
+                if unsupported_count >= MAX_PENDING_CARRIED_INITIALS {
+                    continue;
+                }
+                pending.push(bytes);
+                unsupported_count += 1;
+            } else {
+                if supported_count >= MAX_PENDING_CARRIED_INITIALS {
+                    return Err("Too many pending carried initial messages for this chat.".into());
+                }
+                pending.push(bytes);
+                supported_count += 1;
             }
-            pending.push(bytes);
         }
     }
     Ok(())
 }
 
-struct Inbox {
-    // The destructive v1 inbox has no acknowledgement IDs.
-    messages: Vec<(PublicKey, Option<u64>, Incoming)>,
-    malformed_ids: Vec<u64>,
+/// Merge any legacy `AppState.deferred_initials` (tag 12) entries into the separate
+/// `DeferredInitialsRecord` list. Returns `true` if any legacy entries were migrated.
+pub(super) fn merge_legacy_deferred_initials(
+    entries: &mut Vec<DeferredInitial>,
+    legacy: Vec<WireInitial>,
+) -> bool {
+    if legacy.is_empty() {
+        return false;
+    }
+    for wire in legacy {
+        entries.push(DeferredInitial {
+            initial: Some(wire),
+            deferred_at: 0,
+        });
+    }
+    true
+}
+
+/// Validate, normalize (`id = 0`), deduplicate, cap, and timestamp deferred inbox initials
+/// restored from disk. Returns `(removed_count, modified)`.
+pub(super) fn sanitize_deferred_initials(
+    entries: &mut Vec<DeferredInitial>,
+    now_ms: u64,
+) -> (usize, bool) {
+    let mut cleaned = Vec::with_capacity(entries.len().min(MAX_DEFERRED_INITIALS));
+    let mut removed = 0usize;
+    let mut modified = false;
+    for entry in entries.drain(..) {
+        let Some(mut wire) = entry.initial else {
+            removed += 1;
+            modified = true;
+            continue;
+        };
+        if wire.id != 0 {
+            wire.id = 0;
+            modified = true;
+        }
+        if Incoming::try_from(&wire).is_err() {
+            removed += 1;
+            modified = true;
+            continue;
+        }
+        let deferred_at = if entry.deferred_at == 0 {
+            if now_ms != 0 {
+                modified = true;
+            }
+            now_ms
+        } else {
+            entry.deferred_at
+        };
+        if let Some(existing) = cleaned
+            .iter_mut()
+            .find(|e: &&mut DeferredInitial| e.initial.as_ref() == Some(&wire))
+        {
+            if deferred_at != 0 && (existing.deferred_at == 0 || deferred_at < existing.deferred_at)
+            {
+                existing.deferred_at = deferred_at;
+            }
+            removed += 1;
+            modified = true;
+            continue;
+        }
+        if cleaned.len() >= MAX_DEFERRED_INITIALS {
+            removed += 1;
+            modified = true;
+            continue;
+        }
+        cleaned.push(DeferredInitial {
+            initial: Some(wire),
+            deferred_at,
+        });
+    }
+    *entries = cleaned;
+    (removed, modified)
+}
+
+fn initial_spk_and_digest(initial: &Incoming) -> (PublicKey, Option<[u8; 32]>) {
+    match &initial.kind {
+        InitialMessageKind::Classical(m) => (m.x3dh.signed_prekey, None),
+        InitialMessageKind::Pq {
+            x3dh,
+            manifest_digest,
+            ..
+        } => (x3dh.signed_prekey, *manifest_digest),
+    }
+}
+
+/// Record earliest retention timestamps for any unsupported-suite carried initials staged in
+/// `pending_carried_initials` so prekey preservation stays bounded to [`DEFERRED_REPLAY_WINDOW_MS`].
+pub(super) fn record_carried_timestamps(
+    timestamps: &mut Vec<CarriedDeferredTimestamp>,
+    pending_carried: &[Vec<u8>],
+    now_ms: u64,
+) {
+    for bytes in pending_carried {
+        let Some(initial) = Incoming::decode_carried(bytes) else {
+            continue;
+        };
+        if !initial.pq_suite().is_some_and(|s| !s.is_supported()) {
+            continue;
+        }
+        let (spk, _) = initial_spk_and_digest(&initial);
+        if !timestamps
+            .iter()
+            .any(|t| t.signed_prekey.as_slice() == spk.as_slice())
+        {
+            timestamps.push(CarriedDeferredTimestamp {
+                signed_prekey: spk.to_vec(),
+                deferred_at: now_ms,
+            });
+        }
+    }
+}
+
+/// Prune `carried_deferred_timestamps` entries whose signed prekeys are no longer referenced by
+/// any contact's `pending_carried_initials`. Returns how many entries were removed.
+pub(super) fn prune_carried_timestamps_for_contacts<'a>(
+    timestamps: &mut Vec<CarriedDeferredTimestamp>,
+    contacts: impl IntoIterator<Item = &'a Contact>,
+) -> usize {
+    if timestamps.is_empty() {
+        return 0;
+    }
+    let mut active_spks = std::collections::HashSet::new();
+    for contact in contacts {
+        for bytes in &contact.state.pending_carried_initials {
+            if let Some(initial) = Incoming::decode_carried(bytes) {
+                active_spks.insert(initial_spk_and_digest(&initial).0);
+            }
+        }
+    }
+    let before = timestamps.len();
+    timestamps.retain(|entry| {
+        PublicKey::try_from(entry.signed_prekey.as_slice())
+            .is_ok_and(|spk| active_spks.contains(&spk))
+    });
+    before - timestamps.len()
+}
+
+/// Collect signed prekeys and manifest digests referenced by deferred inbox or carried initials
+/// still within [`DEFERRED_REPLAY_WINDOW_MS`] so scheduled prekey rotations do not evict them.
+pub(super) fn preserved_deferred_prekeys<V>(
+    inner: &Inner<V>,
+    now_ms: u64,
+) -> (Vec<PublicKey>, Vec<[u8; 32]>) {
+    let mut spks = Vec::new();
+    let mut digests = Vec::new();
+    let mut record = |initial: &Incoming| {
+        let (spk, digest) = initial_spk_and_digest(initial);
+        if !spks.contains(&spk) {
+            spks.push(spk);
+        }
+        if let Some(d) = digest
+            && !digests.contains(&d)
+        {
+            digests.push(d);
+        }
+    };
+    for entry in &inner.deferred_initials {
+        let within_window = entry.deferred_at == 0
+            || now_ms.saturating_sub(entry.deferred_at) <= DEFERRED_REPLAY_WINDOW_MS;
+        if !within_window {
+            continue;
+        }
+        if let Some(wire) = &entry.initial
+            && let Ok(initial) = Incoming::try_from(wire)
+        {
+            record(&initial);
+        }
+    }
+    for contact in &inner.contacts {
+        for bytes in &contact.state.pending_carried_initials {
+            let Some(initial) = Incoming::decode_carried(bytes) else {
+                continue;
+            };
+            let (spk, _) = initial_spk_and_digest(&initial);
+            let deferred_at = inner
+                .carried_deferred_timestamps
+                .iter()
+                .find(|t| t.signed_prekey.as_slice() == spk.as_slice())
+                .map_or(0, |t| t.deferred_at);
+            let within_window =
+                deferred_at == 0 || now_ms.saturating_sub(deferred_at) <= DEFERRED_REPLAY_WINDOW_MS;
+            if within_window {
+                record(&initial);
+            }
+        }
+    }
+    (spks, digests)
+}
+
+/// Whether local processing has finished for this initial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InitialOutcome {
+    /// Accepted, quarantined, or permanently rejected — safe to acknowledge after local save.
+    Ack,
+    /// Keep the ciphertext so a build with the required suite can process it.
+    DeferUnsupportedSuite,
 }
 
 struct OpenedInitial {
@@ -115,15 +322,15 @@ pub(super) struct InitialBatch {
     dirty: bool,
     records: Vec<(PublicKey, (String, HistoryEntry))>,
     views: Vec<(PublicKey, MessageView)>,
-    requeue: std::collections::BTreeSet<PublicKey>,
-    upgrades: std::collections::BTreeSet<PublicKey>,
+    requeue: BTreeSet<PublicKey>,
+    upgrades: BTreeSet<PublicKey>,
 }
 
 fn is_valid_inbox_ack_id(id: u64) -> bool {
     id != 0 && id <= session::protocol::MAX_SAFE_INTEGER
 }
 
-/// Zero is reserved for carried messages and the destructive v1 inbox.
+/// Zero is reserved for carried initial messages in mailbox envelopes.
 pub(super) fn stage_inbox_ack(pending: &mut Vec<u64>, id: u64) -> bool {
     if !is_valid_inbox_ack_id(id) || pending.contains(&id) {
         return false;
@@ -140,6 +347,29 @@ pub(super) fn prune_invalid_inbox_acks(pending: &mut Vec<u64>) -> usize {
 }
 
 impl<V: HistoryStore> Inner<V> {
+    /// Reserve a local copy deduplicated by payload (ignoring relay-assigned inbox ID) and
+    /// include its ack ID in the same vault transaction.
+    pub(super) fn defer_inbox_initial(&mut self, message: &Incoming) -> bool {
+        let wire = WireInitial {
+            id: 0,
+            ..initial_payload(&message.kind)
+        };
+        let already_stored = self
+            .deferred_initials
+            .iter()
+            .any(|entry| entry.initial.as_ref() == Some(&wire));
+        if !already_stored {
+            if self.deferred_initials.len() >= MAX_DEFERRED_INITIALS {
+                return false;
+            }
+            self.deferred_initials.push(DeferredInitial {
+                initial: Some(wire),
+                deferred_at: now(),
+            });
+        }
+        stage_inbox_ack(&mut self.deferred_acks_after_save, message.id) || !already_stored
+    }
+
     pub(super) fn check_outgoing_peer(&self, peer: &PublicKey) -> Result<(), StartChatError> {
         if *peer == self.client.identity_key() {
             return Err(StartChatError::Other(
@@ -157,98 +387,41 @@ impl<V: HistoryStore> Inner<V> {
         self.save_state().await
     }
 
-    async fn list_inbox(&mut self) -> session::Result<Inbox> {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            let listed = self
-                .client
-                .list_initial_messages_v2(&self.audience, 100)
-                .await?;
-            Ok(Inbox {
-                messages: listed
-                    .messages
-                    .into_iter()
-                    .map(|m| {
-                        let id = (!listed.fell_back_to_v1).then_some(m.id);
-                        (m.sender, id, m)
-                    })
-                    .collect(),
-                malformed_ids: if listed.fell_back_to_v1 {
-                    vec![]
-                } else {
-                    listed.malformed_ids
-                },
-            })
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            Ok(Inbox {
-                messages: self
-                    .client
-                    .take_initial_messages()
-                    .await?
-                    .into_iter()
-                    .map(|m| (m.x3dh.identity_key, None, m))
-                    .collect(),
-                malformed_ids: vec![],
-            })
-        }
-    }
-
     fn open_initial(
         &mut self,
         peer: &PublicKey,
         message: &Incoming,
     ) -> session::Result<OpenedInitial> {
         let mailbox = Fetch::client(&self.server);
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let (opened, classical_used, pq_used) = {
-            let pin = self
-                .contact(peer)
-                .map(|c| c.session.peer_pq_state().clone())
-                .unwrap_or_default();
-            let opened = match self
-                .client
-                .accept_initial_v2(peer, &pin, message, mailbox)?
-            {
-                AcceptedInitial::Accepted {
-                    session,
-                    first_message,
-                    ..
-                } => OpenedInitial {
-                    session,
-                    first_message,
-                    quarantine: None,
-                },
-                AcceptedInitial::Quarantined {
-                    session,
-                    first_message,
-                    peer_was_pq_pinned,
-                } => OpenedInitial {
-                    session,
-                    first_message,
-                    quarantine: Some(peer_was_pq_pinned),
-                },
-            };
-            (
-                opened,
-                message.uses_one_time_prekey(),
-                message.uses_pq_one_time_prekey(),
-            )
+        let pin = self
+            .contact(peer)
+            .map(|c| c.session.peer_pq_state().clone())
+            .unwrap_or_default();
+        let opened = match self
+            .client
+            .accept_initial_v2(peer, &pin, message, mailbox)?
+        {
+            AcceptedInitial::Accepted {
+                session,
+                first_message,
+                ..
+            } => OpenedInitial {
+                session,
+                first_message,
+                quarantine: None,
+            },
+            AcceptedInitial::Quarantined {
+                session,
+                first_message,
+                peer_was_pq_pinned,
+            } => OpenedInitial {
+                session,
+                first_message,
+                quarantine: Some(peer_was_pq_pinned),
+            },
         };
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let (opened, classical_used, pq_used) = {
-            let (session, first_message) = self.client.accept(peer, message, mailbox)?;
-            (
-                OpenedInitial {
-                    session,
-                    first_message,
-                    quarantine: None,
-                },
-                message.x3dh.one_time_prekey.is_some(),
-                false,
-            )
-        };
+        let classical_used = message.uses_one_time_prekey();
+        let pq_used = message.uses_pq_one_time_prekey();
         self.state.used_one_time_prekeys = self
             .state
             .used_one_time_prekeys
@@ -260,18 +433,6 @@ impl<V: HistoryStore> Inner<V> {
         Ok(opened)
     }
 
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    async fn ack_pending_inbox_v2(&mut self) -> Result<(), String> {
-        self.ack_persisted_inbox(async |client, audience, ids| {
-            client
-                .ack_initial_messages_v2(audience, ids)
-                .await
-                .map(drop)
-                .map_err(|e| describe(&e))
-        })
-        .await
-    }
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768", test))]
     pub(super) async fn ack_persisted_inbox(
         &mut self,
         mut acknowledge: impl AsyncFnMut(
@@ -362,9 +523,9 @@ impl PublishError {
         }
     }
 
-    pub(super) fn transmitted(e: session::Error, v2: bool) -> Self {
+    pub(super) fn transmitted(e: session::Error) -> Self {
         // Strict v2 fallback maps the server's Unimplemented refusal to a local PqRequired.
-        let definitive_refusal = e.is_server_refusal() || (v2 && e.kind() == ErrorKind::PqRequired);
+        let definitive_refusal = e.is_server_refusal() || e.kind() == ErrorKind::PqRequired;
         let wire_kind = std::error::Error::source(&e)
             .and_then(|source| source.downcast_ref::<session::protocol::Error>())
             .map(session::protocol::Error::kind);
@@ -393,43 +554,63 @@ impl PublishError {
     pub(super) fn needs_sign_in(&self) -> bool {
         self.definitive_refusal && self.kind == Some(ErrorKind::SignInRequired)
     }
+
+    pub(super) fn is_unimplemented(&self) -> bool {
+        self.definitive_refusal && self.kind == Some(ErrorKind::Unimplemented)
+    }
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 #[derive(PartialEq, Eq)]
 enum RefillV2Outcome {
     Handled,
-    Unsupported,
+    PqDisabled,
 }
 
 impl Engine {
-    pub(super) async fn take_initial_messages(&self) -> Result<bool, String> {
-        let mut guard = self.inner.lock().await;
-        let Some(inner) = guard.as_mut() else {
-            return Ok(false);
-        };
-        if inner.needs_save() {
-            inner.save(&[]).await.map_err(|e| describe(&e))?;
-        }
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        inner.ack_pending_inbox_v2().await?;
-        let inbox = inner.list_inbox().await.map_err(|e| describe(&e))?;
-        let mut batch = InitialBatch::default();
-        for (peer, id, message) in inbox.messages {
-            if let Some(id) = id {
-                if !is_valid_inbox_ack_id(id) {
-                    self.ui.log(format!(
-                        "Skipped initial message with out-of-range inbox ID {id}."
-                    ));
-                    continue;
-                }
-                if !stage_inbox_ack(&mut inner.state.pending_inbox_acks, id) {
-                    continue;
-                }
-                batch.dirty = true;
+    async fn ack_pending_inbox_v2(&self, inner: &mut Inner) -> Result<(), String> {
+        inner
+            .ack_persisted_inbox(async |client, audience, ids| {
+                client
+                    .ack_initial_messages_v2(audience, ids)
+                    .await
+                    .map(drop)
+                    .map_err(|e| {
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                        describe(&e)
+                    })
+            })
+            .await
+    }
+
+    pub(super) fn process_inbox_messages(
+        &self,
+        inner: &mut Inner<impl HistoryStore>,
+        inbox: ListedInitialMessages,
+        open_peer: Option<PublicKey>,
+        batch: &mut InitialBatch,
+    ) {
+        for message in inbox.messages {
+            let (peer, id) = (message.sender, message.id);
+            if !is_valid_inbox_ack_id(id) {
+                self.ui.log(format!(
+                    "Skipped initial message with out-of-range inbox ID {id}."
+                ));
+                continue;
             }
-            let read = self.ui.open.get_untracked() == Some(peer) && !document().hidden();
-            self.process_initial(inner, &peer, &message, read, &mut batch);
+            if inner.state.pending_inbox_acks.contains(&id)
+                || inner.deferred_acks_after_save.contains(&id)
+            {
+                continue;
+            }
+            let read = open_peer == Some(peer);
+            match self.process_initial(inner, &peer, &message, read, batch) {
+                InitialOutcome::Ack => {
+                    batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
+                }
+                InitialOutcome::DeferUnsupportedSuite => {
+                    batch.dirty |= inner.defer_inbox_initial(&message)
+                }
+            }
         }
         for id in inbox.malformed_ids {
             if !is_valid_inbox_ack_id(id) {
@@ -440,71 +621,178 @@ impl Engine {
             }
             batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
         }
+    }
+
+    pub(super) async fn take_initial_messages(&self) -> Result<bool, String> {
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if inner.needs_save() {
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
+        self.ack_pending_inbox_v2(inner).await?;
+        let inbox = match inner
+            .client
+            .list_initial_messages_v2(&inner.audience, 100)
+            .await
+        {
+            Ok(inbox) => inbox,
+            Err(e) => {
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                return Err(describe(&e));
+            }
+        };
+        let mut batch = InitialBatch::default();
+        let open_peer = (!document().hidden())
+            .then(|| self.ui.open.get_untracked())
+            .flatten();
+        self.process_inbox_messages(inner, inbox, open_peer, &mut batch);
         if !batch.dirty {
             return Ok(false);
         }
-        let upgrades = std::mem::take(&mut batch.upgrades);
-        self.save_initial_batch(inner, batch).await?;
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let ack = inner.ack_pending_inbox_v2().await;
+        let upgrades = self.save_initial_batch(inner, batch).await?;
+        let ack = self.ack_pending_inbox_v2(inner).await;
         drop(guard);
         for peer in upgrades {
             let _ = self.upgrade_to_pq(peer).await;
         }
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         ack?;
         Ok(true)
     }
 
-    /// Drain the peer's durable queue. Each removal commits with its prekeys, session and history.
+    /// Commit replayed initials with their history and consumed prekeys. Return the peers to
+    /// upgrade after releasing the lock, or `None` if the queue made no progress.
+    pub(super) async fn replay_deferred_initials(
+        &self,
+        inner: &mut Inner<impl HistoryStore>,
+        open_peer: Option<PublicKey>,
+    ) -> Result<Option<BTreeSet<PublicKey>>, String> {
+        let mut batch = InitialBatch::default();
+        let (pruned, modified) = sanitize_deferred_initials(&mut inner.deferred_initials, now());
+        if pruned > 0 {
+            self.ui.log(format!(
+                "Removed {pruned} invalid, duplicate, or excess deferred initial message(s)."
+            ));
+        }
+        if pruned > 0 || modified {
+            batch.dirty = true;
+        }
+        let mut replayable = Vec::new();
+        let deferred_entries = std::mem::take(&mut inner.deferred_initials);
+        let mut remaining = Vec::with_capacity(deferred_entries.len());
+        for entry in deferred_entries {
+            let Some(wire) = entry.initial.as_ref() else {
+                batch.dirty = true;
+                continue;
+            };
+            match Incoming::try_from(wire) {
+                Ok(message) => {
+                    let suite_supported = message.pq_suite().is_none_or(PqSuite::is_supported);
+                    let contact_blocked = inner.is_pq_incompatible_isolated_peer(&message.sender);
+                    if suite_supported && !contact_blocked {
+                        replayable.push((entry, Ok(message)));
+                    } else {
+                        remaining.push(entry);
+                    }
+                }
+                Err(e) => replayable.push((entry, Err(e))),
+            }
+        }
+        inner.deferred_initials = remaining;
+        for (entry, decoded) in replayable {
+            match decoded {
+                Ok(message) => {
+                    let peer = message.sender;
+                    if self.process_initial(
+                        inner,
+                        &peer,
+                        &message,
+                        open_peer == Some(peer),
+                        &mut batch,
+                    ) == InitialOutcome::DeferUnsupportedSuite
+                    {
+                        inner.deferred_initials.push(entry);
+                        continue;
+                    }
+                }
+                Err(e) => self.ui.log(format!(
+                    "Discarded an unreadable deferred initial message: {}",
+                    describe(&e)
+                )),
+            }
+            batch.dirty = true;
+        }
+        if batch.dirty {
+            Ok(Some(self.save_initial_batch(inner, batch).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Join the peer's pending carried initials. Each removal commits with its prekeys, session and history.
     pub(super) async fn join_carried(
         &self,
         inner: &mut Inner<impl HistoryStore>,
         peer: &PublicKey,
-    ) -> Result<bool, String> {
+    ) -> Result<JoinCarriedOutcome, String> {
         inner.check_isolation(peer)?;
         let Some(index) = inner.contacts.iter().position(|c| c.peer == *peer) else {
-            return Ok(false);
+            return Ok(JoinCarriedOutcome::default());
         };
         if inner.contacts[index].is_new_quarantined() {
-            return Ok(false);
+            return Ok(JoinCarriedOutcome::default());
         }
         // A prior join may have consumed prekeys and staged history after a failed save.
         if inner.needs_save() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
-        let mut upgrade = false;
-        while !inner.contacts[index]
-            .state
-            .pending_carried_initials
-            .is_empty()
-        {
-            let bytes = inner.contacts[index]
-                .state
-                .pending_carried_initials
-                .remove(0);
+        let mut recommend_upgrade = false;
+        loop {
+            let contact = &inner.contacts[index];
+            let next = contact.deferred_carried;
+            let Some(bytes) = contact.state.pending_carried_initials.get(next) else {
+                break;
+            };
             let mut batch = InitialBatch::default();
-            if let Some(message) = decode_carried_initial(&bytes) {
-                self.process_initial(inner, peer, &message, false, &mut batch);
+            if let Some(message) = Incoming::decode_carried(bytes) {
+                if self.process_initial(inner, peer, &message, false, &mut batch)
+                    == InitialOutcome::DeferUnsupportedSuite
+                {
+                    inner.contacts[index].deferred_carried += 1;
+                    continue;
+                }
             } else {
                 self.ui.log(format!(
                     "Discarded an unreadable carried initial message for {}.",
                     short(peer)
                 ));
             }
-            upgrade |= batch.upgrades.contains(peer);
+            let bytes = inner.contacts[index]
+                .state
+                .pending_carried_initials
+                .remove(next);
+            let saved_carried_ts = inner.carried_deferred_timestamps.clone();
+            prune_carried_timestamps_for_contacts(
+                &mut inner.carried_deferred_timestamps,
+                inner.contacts.iter(),
+            );
             if batch.dirty {
-                self.save_initial_batch(inner, batch).await?;
+                recommend_upgrade |= self.save_initial_batch(inner, batch).await?.contains(peer);
             } else if let Err(e) = inner.save_state().await {
                 // Nothing consumed a prekey. Retry the original entry if storage recovers.
                 inner.contacts[index]
                     .state
                     .pending_carried_initials
-                    .insert(0, bytes);
+                    .insert(next, bytes);
+                inner.carried_deferred_timestamps = saved_carried_ts;
                 return Err(describe(&e));
             }
         }
-        Ok(upgrade)
+        Ok(JoinCarriedOutcome {
+            recommend_upgrade,
+            has_deferred: inner.contacts[index].deferred_carried > 0,
+        })
     }
 
     pub(super) fn process_initial(
@@ -514,19 +802,43 @@ impl Engine {
         message: &Incoming,
         read: bool,
         batch: &mut InitialBatch,
-    ) {
+    ) -> InitialOutcome {
         if *peer == inner.client.identity_key() {
             self.ui
                 .log("dropped an initial message claiming to be from your own key");
-            return;
+            return InitialOutcome::Ack;
         }
-        if let Err(reason) = inner.check_isolation(peer) {
-            self.ui.log(reason);
-            return;
+        if inner.is_isolated_peer(peer) {
+            if inner.is_pq_incompatible_isolated_peer(peer) {
+                self.ui.log(format!(
+                    "Deferred initial message from {}: existing contact uses a post-quantum suite unsupported by this build.",
+                    short(peer)
+                ));
+                return InitialOutcome::DeferUnsupportedSuite;
+            }
+            if let Err(reason) = inner.check_isolation(peer) {
+                self.ui.log(reason);
+            }
+            return InitialOutcome::Ack;
+        }
+        if message.pq_suite().is_some_and(|s| !s.is_supported()) {
+            self.ui.log(format!(
+                "Deferred initial message from {}: unsupported post-quantum suite.",
+                short(peer)
+            ));
+            return InitialOutcome::DeferUnsupportedSuite;
         }
         let opened = match inner.open_initial(peer, message) {
             Ok(opened) => opened,
             Err(e) => {
+                if e.kind() == ErrorKind::UnsupportedSuite {
+                    self.ui.log(format!(
+                        "Deferred initial message from {}: {}",
+                        short(peer),
+                        describe(&e)
+                    ));
+                    return InitialOutcome::DeferUnsupportedSuite;
+                }
                 self.ui.log(format!(
                     "dropped an initial message claiming to be from {}: {}",
                     short(peer),
@@ -538,7 +850,7 @@ impl Engine {
                 {
                     batch.dirty |= contact.record_policy_error(e.kind());
                 }
-                return;
+                return InitialOutcome::Ack;
             }
         };
         batch.dirty = true; // Accepting also commits prekey consumption, even if the merge is rejected.
@@ -563,7 +875,7 @@ impl Engine {
                         "quarantined classical session request from {} pending approval",
                         short(peer)
                     ));
-                    return;
+                    return InitialOutcome::Ack;
                 }
                 let is_pq = session.security().is_some_and(|security| security.is_pq);
                 match contact.replace_session(session, local_pq) {
@@ -582,7 +894,7 @@ impl Engine {
                             describe(&e)
                         ));
                         contact.record_policy_error(e.kind());
-                        return;
+                        return InitialOutcome::Ack;
                     }
                 }
                 contact
@@ -591,6 +903,7 @@ impl Engine {
                 let mut contact = Contact {
                     peer: *peer,
                     session,
+                    deferred_carried: 0,
                     state: ContactState {
                         peer: peer.to_vec(),
                         request: true,
@@ -605,7 +918,7 @@ impl Engine {
                         "quarantined classical chat request from {} pending approval",
                         short(peer)
                     ));
-                    return;
+                    return InitialOutcome::Ack;
                 }
                 self.ui.log(format!("chat request from {}", short(peer)));
                 inner.contacts.push(contact);
@@ -632,7 +945,7 @@ impl Engine {
                     "Skipped initial message history entry for {}. {reason}",
                     short(peer)
                 ));
-                return;
+                return InitialOutcome::Ack;
             }
         };
         if self.ui.open.get_untracked() == Some(*peer) {
@@ -643,13 +956,14 @@ impl Engine {
         batch
             .records
             .push((*peer, (history_key(peer, index), entry)));
+        InitialOutcome::Ack
     }
 
-    async fn save_initial_batch(
+    pub(super) async fn save_initial_batch(
         &self,
         inner: &mut Inner<impl HistoryStore>,
         mut batch: InitialBatch,
-    ) -> Result<(), String> {
+    ) -> Result<BTreeSet<PublicKey>, String> {
         let mut outgoing = vec![];
         let mut changed = vec![];
         for peer in batch.requeue {
@@ -684,7 +998,7 @@ impl Engine {
             self.show_new(inner, &open, views);
         }
         self.ui.contacts.set(inner.views());
-        Ok(())
+        Ok(batch.upgrades)
     }
 
     /// Execute a full signed-prekey + manifest publish under the held `inner` lock, preserving the
@@ -695,99 +1009,61 @@ impl Engine {
         inner: &mut Inner,
         now_anyway: bool,
     ) -> Result<(), PublishError> {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            let prepared = inner
-                .client
-                .prepare_publish_v2(&inner.audience, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS)
-                .map_err(PublishError::prepare)?;
-            // H-2: Persist new prekeys & manifest state BEFORE transmitting!
-            inner.save_state().await.map_err(PublishError::storage)?;
-            match inner
-                .client
-                .transmit_publish_v2_or_v1_fallback(&prepared)
-                .await
-            {
-                Ok(outcome) => {
-                    inner.client.commit_publish_v2(prepared);
-                    self.publish_waits_sign_in.set(false);
-                    self.publish_waits_settings.set(false);
-                    inner.state.used_pq_one_time_prekeys = 0;
-                    inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
-                    let log_msg = match outcome {
-                        PublishV2Outcome::V2Pq => {
-                            let suites_len = inner.client.pq_config().offered_suites().len();
-                            inner.last_server_pq_opks =
-                                Some((PQ_ONE_TIME_PREKEYS * suites_len) as u32);
-                            if inner.server_pq == ServerPqStatus::Disabled {
-                                inner.server_pq = ServerPqStatus::Unknown;
-                            }
-                            "published post-quantum + classical prekeys and signed capability manifest"
+        let (preserve_spks, preserve_digests) = preserved_deferred_prekeys(inner, now());
+        let prepared = inner
+            .client
+            .prepare_publish_v2_preserving(
+                &inner.audience,
+                ONE_TIME_PREKEYS,
+                PQ_ONE_TIME_PREKEYS,
+                &preserve_spks,
+                &preserve_digests,
+            )
+            .map_err(PublishError::prepare)?;
+        // H-2: Persist new prekeys & manifest state BEFORE transmitting!
+        inner.save_state().await.map_err(PublishError::storage)?;
+        match inner.client.transmit_publish_v2(&prepared).await {
+            Ok(outcome) => {
+                inner.client.commit_publish_v2(prepared);
+                self.publish_waits_sign_in.set(false);
+                self.publish_waits_settings.set(false);
+                inner.state.used_pq_one_time_prekeys = 0;
+                inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
+                let log_msg = match outcome {
+                    PublishV2Outcome::V2Pq => {
+                        let suites_len = inner.client.pq_config().offered_suites().len();
+                        inner.last_server_pq_opks = Some((PQ_ONE_TIME_PREKEYS * suites_len) as u32);
+                        if inner.server_pq == ServerPqStatus::Disabled {
+                            inner.server_pq = ServerPqStatus::Unknown;
                         }
-                        PublishV2Outcome::V2ClassicalOff => {
-                            inner.last_server_pq_opks = Some(0);
-                            if inner.client.pq_config().pq_enabled {
-                                inner.server_pq = ServerPqStatus::Disabled;
-                                "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
-                            } else {
-                                "published classical prekeys and signed PQ-off capability manifest"
-                            }
-                        }
-                        PublishV2Outcome::V1Fallback => {
-                            inner.last_server_pq_opks = Some(0);
+                        "published post-quantum + classical prekeys and signed capability manifest"
+                    }
+                    PublishV2Outcome::V2ClassicalOff => {
+                        inner.last_server_pq_opks = Some(0);
+                        if inner.client.pq_config().pq_enabled {
                             inner.server_pq = ServerPqStatus::Disabled;
-                            "published classical prekeys via v1 fallback"
+                            "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
+                        } else {
+                            "published classical prekeys and signed PQ-off capability manifest"
                         }
-                    };
-                    inner
-                        .save_full_publish_success()
-                        .await
-                        .map_err(PublishError::storage)?;
-                    self.ui.me.set(Some(inner.me()));
-                    self.ui.log(log_msg);
-                    Ok(())
-                }
-                Err(e) => {
-                    let error = PublishError::transmitted(e, true);
-                    if error.rejects_settings() || error.needs_sign_in() {
-                        inner.client.rollback_publish_v2_on_refusal(prepared);
-                        return self.finish_publish_rollback(inner, error, now_anyway).await;
                     }
-                    Err(error)
-                }
+                };
+                inner
+                    .save_full_publish_success()
+                    .await
+                    .map_err(PublishError::storage)?;
+                self.ui.me.set(Some(inner.me()));
+                self.ui.log(log_msg);
+                Ok(())
             }
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            let prepared = inner
-                .client
-                .prepare_publish(ONE_TIME_PREKEYS)
-                .map_err(PublishError::prepare)?;
-            // H-2: Persist new prekeys BEFORE transmitting!
-            inner.save_state().await.map_err(PublishError::storage)?;
-            match inner.client.transmit_publish(&prepared).await {
-                Ok(()) => {
-                    inner.client.commit_publish(prepared);
-                    self.publish_waits_sign_in.set(false);
-                    self.publish_waits_settings.set(false);
-                    inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
-                    inner
-                        .save_full_publish_success()
-                        .await
-                        .map_err(PublishError::storage)?;
-                    self.ui.log(format!(
-                        "published a new signed prekey and {ONE_TIME_PREKEYS} one-time prekeys"
-                    ));
-                    Ok(())
+            Err(e) => {
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                let error = PublishError::transmitted(e);
+                if error.rejects_settings() || error.needs_sign_in() || error.is_unimplemented() {
+                    inner.client.rollback_publish_v2_on_refusal(prepared);
+                    return self.finish_publish_rollback(inner, error, now_anyway).await;
                 }
-                Err(e) => {
-                    let error = PublishError::transmitted(e, false);
-                    if error.rejects_settings() || error.needs_sign_in() {
-                        inner.client.rollback_publish_on_refusal(prepared);
-                        return self.finish_publish_rollback(inner, error, now_anyway).await;
-                    }
-                    Err(error)
-                }
+                Err(error)
             }
         }
     }
@@ -852,8 +1128,8 @@ impl Engine {
         Err(error)
     }
 
-    /// Try one v2 refill. Only an explicit Unimplemented refusal permits trying a different wire request.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    /// Try one non-rotating v2 refill. When `pq_count > 0` and the relay has runtime PQ disabled,
+    /// returns `Ok(RefillV2Outcome::PqDisabled)` so the caller can retry with classical OPKs only.
     async fn try_refill_v2(
         &self,
         inner: &mut Inner,
@@ -889,13 +1165,38 @@ impl Engine {
                             .log("server one-time prekey pool is already full; skipped refill");
                         Ok(RefillV2Outcome::Handled)
                     }
-                    ErrorKind::Unimplemented => {
-                        inner.server_pq = ServerPqStatus::Disabled;
-                        if inner.client.pq_config().strict_pq {
-                            Err(describe(&e))
-                        } else {
-                            Ok(RefillV2Outcome::Unsupported)
+                    ErrorKind::Unimplemented if pq_count > 0 => {
+                        // Confirm via `GetServerInfo` that the relay has runtime PQ disabled
+                        // before marking `ServerPqStatus::Disabled` (a missing `RefillPrekeys` RPC
+                        // or transient error must not downgrade server PQ status).
+                        match inner.client.check_server_info(&inner.audience).await {
+                            Ok(info) if !info.pq_enabled => {
+                                inner.server_pq = ServerPqStatus::Disabled;
+                                if inner.client.pq_config().strict_pq {
+                                    Err(describe(&e))
+                                } else {
+                                    Ok(RefillV2Outcome::PqDisabled)
+                                }
+                            }
+                            Ok(_) => {
+                                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                                Err(describe(&e))
+                            }
+                            Err(info_err)
+                                if should_require_update_for_rpc(
+                                    ProtocolRpcScope::CoreV2,
+                                    &info_err,
+                                ) =>
+                            {
+                                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                                Err(describe(&e))
+                            }
+                            Err(info_err) => Err(describe(&info_err)),
                         }
+                    }
+                    ErrorKind::Unimplemented => {
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                        Err(describe(&e))
                     }
                     ErrorKind::NotFound | ErrorKind::Protocol => {
                         inner.state.needs_publish = true;
@@ -908,6 +1209,7 @@ impl Engine {
                 return outcome;
             }
         };
+        inner.client.commit_refill_v2(prepared);
         inner.last_server_classical_opks = Some(response.classical_one_time_count);
         inner.last_server_pq_opks = Some(
             response
@@ -935,11 +1237,8 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
-        let pq_compiled = cfg!(any(feature = "ml-kem-1024", feature = "ml-kem-768"));
-        let needs_v2_manifest = pq_compiled
-            && inner.client.pq_config().pq_enabled
-            && inner.client.manifest_seq() == 0
-            && inner.server_pq != ServerPqStatus::Disabled;
+        let needs_v2_manifest =
+            inner.client.manifest_seq() == 0 || inner.client.prekey_generation() == 0;
         let full_due = now_anyway
             || inner.state.published_at == 0
             || inner.state.needs_publish
@@ -966,29 +1265,23 @@ impl Engine {
             return Ok(());
         }
         let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;
-        let pq_suites_len = if pq_compiled
-            && inner.client.pq_config().pq_enabled
-            && inner.server_pq != ServerPqStatus::Disabled
-        {
-            inner.client.pq_config().offered_suites().len()
-        } else {
-            0
-        };
+        let pq_suites_len =
+            if inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled {
+                inner.client.pq_config().offered_suites().len()
+            } else {
+                0
+            };
         let pq_low = pq_suites_len > 0 && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
         if !classical_low && !pq_low {
             return Ok(());
         }
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let server_pq_known = inner.last_server_pq_opks;
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let server_pq_known = None;
         let (classical_count, pq_count) = refill_batch_counts(
             inner.state.used_one_time_prekeys,
             inner.state.used_pq_one_time_prekeys,
             pq_suites_len,
             inner.last_server_classical_opks,
-            server_pq_known,
+            inner.last_server_pq_opks,
         );
         // If server is already at its 100-key cap, reset counters so sync doesn't loop.
         if classical_count == 0 && pq_count == 0 {
@@ -1007,59 +1300,14 @@ impl Engine {
             return Ok(());
         }
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        if inner.client.prekey_generation() > 0 {
-            if self.try_refill_v2(inner, classical_count, pq_count).await?
-                == RefillV2Outcome::Handled
-                || classical_count == 0
-            {
-                return Ok(());
-            }
-            // A PQ-disabled v2 server can still accept a classical-only refill.
-            if pq_count > 0
-                && self.try_refill_v2(inner, classical_count, 0).await? == RefillV2Outcome::Handled
-            {
-                return Ok(());
-            }
+        if self.try_refill_v2(inner, classical_count, pq_count).await? == RefillV2Outcome::Handled
+            || classical_count == 0
+        {
+            return Ok(());
         }
-
-        if classical_count > 0 && !inner.client.pq_config().strict_pq {
-            let prepared = inner
-                .client
-                .prepare_extend_keys(classical_count)
-                .map_err(|e| describe(&e))?;
-            inner.save_state().await.map_err(|e| describe(&e))?;
-            match inner.client.transmit_publish(&prepared).await {
-                Ok(()) => {
-                    inner.client.commit_publish(prepared);
-                    inner.state.used_one_time_prekeys = 0;
-                    inner.last_server_classical_opks = Some(classical_count as u32);
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    self.ui.log(format!(
-                        "replenished {classical_count} one-time prekeys without rotating signed prekey"
-                    ));
-                }
-                Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::SignInRequired => {
-                    inner.client.rollback_publish_on_refusal(prepared);
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    self.publish_waits_sign_in.set(true);
-                }
-                Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::LimitExceeded => {
-                    inner.client.rollback_publish_on_refusal(prepared);
-                    inner.state.used_one_time_prekeys = 0;
-                    inner.last_server_classical_opks = Some(SERVER_MAX_ONE_TIME_PREKEYS as u32);
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    self.ui
-                        .log("server one-time prekey pool is already full; skipped refill");
-                }
-                Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::Protocol => {
-                    inner.client.rollback_publish_on_refusal(prepared);
-                    inner.state.needs_publish = true;
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    return Err(describe(&e));
-                }
-                Err(e) => return Err(describe(&e)),
-            }
+        // A PQ-disabled v2 server can still accept a classical-only v2 refill.
+        if pq_count > 0 {
+            let _ = self.try_refill_v2(inner, classical_count, 0).await?;
         }
         Ok(())
     }
@@ -1129,19 +1377,19 @@ impl Engine {
         stamp(&mut greeting, 1);
         let signs_in_here = same_server(&inner.server, &origin());
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let (session, outgoing_request) = {
-            let prepared = inner
-                .client
-                .prepare_initiate_v2(
-                    &inner.audience,
-                    &peer,
-                    &peer_state,
-                    &greeting,
-                    Fetch::client(&inner.server),
-                )
-                .await
-                .map_err(|e| match e.kind() {
+        let prepared = inner
+            .client
+            .prepare_initiate_v2(
+                &inner.audience,
+                &peer,
+                &peer_state,
+                &greeting,
+                Fetch::client(&inner.server),
+            )
+            .await
+            .map_err(|e| {
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                match e.kind() {
                     ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
                     ErrorKind::SignInRequired => {
                         StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
@@ -1156,37 +1404,17 @@ impl Engine {
                         "nobody published keys for that key on this server".to_string(),
                     ),
                     _ => StartChatError::Other(describe(&e)),
-                })?;
-            (prepared.session, prepared.request)
-        };
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let (session, outgoing_request) = {
-            let _ = &peer_state;
-            let prepared = inner
-                .client
-                .prepare_initiate(&peer, &greeting, Fetch::client(&inner.server))
-                .await
-                .map_err(|e| match e.kind() {
-                    ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
-                    ErrorKind::SignInRequired => {
-                        StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
-                    }
-                    ErrorKind::NotFound => StartChatError::Other(
-                        "nobody published keys for that key on this server".to_string(),
-                    ),
-                    _ => StartChatError::Other(describe(&e)),
-                })?;
-            (prepared.session, prepared.request)
-        };
+                }
+            })?;
+        let (session, outgoing_request) = (prepared.session, prepared.request);
 
         // Telling the peer that the chat was deleted here, if that has not gone yet, goes no
         // more: this session replaces the deleted one there anyway.
         let saved_farewells = inner.state.farewells.clone();
         inner.state.farewells.retain(|farewell| {
             farewell
-                .push
-                .as_ref()
-                .is_none_or(|push| push.recipient != peer.as_slice())
+                .recipient()
+                .is_none_or(|recipient| recipient != peer.as_slice())
         });
         let entry = HistoryEntry {
             outgoing: true,
@@ -1203,6 +1431,7 @@ impl Engine {
         inner.contacts.push(Contact {
             peer,
             session,
+            deferred_carried: 0,
             state: ContactState {
                 peer: peer.to_vec(),
                 name,
@@ -1223,20 +1452,18 @@ impl Engine {
         self.end_new_chat_submit();
 
         // Transmit the prepared initial message after durable local persistence.
-        let send_res: session::Result<()> = {
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            {
-                inner
-                    .client
-                    .send_prepared_initiate_v2(&outgoing_request)
-                    .await
+        if let Err(e) = inner
+            .client
+            .send_prepared_initiate_v2(&outgoing_request)
+            .await
+        {
+            let outgoing_is_pq = outgoing_request
+                .message
+                .as_ref()
+                .is_some_and(|m| m.version >= 2);
+            if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !outgoing_is_pq {
+                self.require_update(describe(&e));
             }
-            #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-            {
-                inner.client.send_prepared_initiate(&outgoing_request).await
-            }
-        };
-        if let Err(e) = send_res {
             if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                 let dialog = self
                     .sign_in_flow
@@ -1257,27 +1484,15 @@ impl Engine {
 }
 
 /// Build a persisted [`Farewell`] for `sealed` on `contact`'s active session, preserving any
-/// carried v2/PQXDH initial message in `push_v2` under PQ builds.
+/// carried v2/PQXDH initial message in `push_v2`.
 pub(super) fn build_farewell(contact: &Contact, sealed: session::Sealed) -> Farewell {
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    {
-        let v2 = contact.session.push_v2_request(sealed.clone());
-        let cid = v2.client_message_id.to_vec();
-        let v2_bytes = v2.encode_to_vec();
-        Farewell {
-            push: Some(contact.session.push_request(sealed)),
-            client_message_id: cid,
-            push_v2: v2_bytes,
-        }
-    }
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    {
-        let cid = sealed.client_message_id().to_vec();
-        Farewell {
-            push: Some(contact.session.push_request(sealed)),
-            client_message_id: cid,
-            push_v2: vec![],
-        }
+    let v2 = contact.session.push_v2_request(sealed);
+    let cid = v2.client_message_id.to_vec();
+    let v2_bytes = v2.encode_to_vec();
+    Farewell {
+        push: None,
+        client_message_id: cid,
+        push_v2: v2_bytes,
     }
 }
 
@@ -1306,18 +1521,11 @@ pub(super) fn refill_batch_counts(
         0
     };
     let pq_per_suite = if pq_suites_len > 0 && used_pq >= REFILL_USED {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         let per_suite_target = (used_pq as usize / pq_suites_len).clamp(1, PQ_ONE_TIME_PREKEYS);
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let per_suite_target = (used_pq as usize / pq_suites_len).max(1);
         match server_pq_total_known {
             Some(known) => {
                 let est_remaining = (known as usize).saturating_sub(used_pq as usize);
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                let cap = SERVER_MAX_PQ_ONE_TIME_PREKEYS;
-                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-                let cap = SERVER_MAX_ONE_TIME_PREKEYS;
-                let headroom = cap.saturating_sub(est_remaining);
+                let headroom = SERVER_MAX_PQ_ONE_TIME_PREKEYS.saturating_sub(est_remaining);
                 per_suite_target.min(headroom / pq_suites_len)
             }
             None => {

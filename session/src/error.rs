@@ -11,15 +11,15 @@ pub struct Error {
     kind: ErrorKind,
     source: Option<Box<dyn StdError + Send + Sync>>,
     server_refusal: bool,
+    connect_error: bool,
 }
 
 impl Error {
     /// New an error of `kind`, caused by `source`.
     pub fn new(kind: ErrorKind, source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
         Self {
-            kind,
             source: Some(source.into()),
-            server_refusal: false,
+            ..kind.into()
         }
     }
 
@@ -34,9 +34,16 @@ impl Error {
         self.server_refusal
     }
 
+    /// Whether the underlying protocol handler returned an error directly or the relay sent
+    /// a decodable Connect error body.
+    pub fn is_connect_error(&self) -> bool {
+        self.connect_error
+    }
+
     pub(crate) fn from_protocol_with_kind(kind: ErrorKind, error: protocol::Error) -> Self {
         Self {
             server_refusal: error.is_server_refusal(),
+            connect_error: error.is_connect_error(),
             ..Self::new(kind, error)
         }
     }
@@ -48,6 +55,7 @@ impl From<ErrorKind> for Error {
             kind,
             source: None,
             server_refusal: false,
+            connect_error: false,
         }
     }
 }
