@@ -1,6 +1,6 @@
 [package]
 name = "ratchetx2"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 keywords = ["E2EE", "double-ratchet", "signal"]
 license = "MIT"

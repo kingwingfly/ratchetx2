@@ -176,6 +176,7 @@ fn validate_evicted_ranges(
 
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+#[serde(rename = "EvictedSet")]
 struct EvictedSetUnchecked {
     ranges: Vec<(u64, u64)>,
     collapsed_below: u64,
@@ -453,7 +454,7 @@ impl SkippedKeys {
                 entry.get_mut().zeroize();
                 entry.remove();
                 oldest.evicted.insert(message_number);
-                let hk = oldest.header_key;
+                let hk = Zeroizing::new(oldest.header_key);
                 on_evict(&hk, message_number);
                 len -= 1;
             }
@@ -534,6 +535,7 @@ impl SkippedKeys {
 
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+#[serde(rename = "SkippedKeys")]
 struct SkippedKeysUnchecked {
     chains: VecDeque<SkippedChain>,
 }

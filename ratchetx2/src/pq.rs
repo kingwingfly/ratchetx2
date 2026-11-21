@@ -42,6 +42,7 @@ pub const DEFAULT_REKEY_TURNS: u64 = 4;
 const KEM_ID_DOMAIN: &[u8] = b"ratchetx2.pq.v1/id\0";
 
 /// Supported post-quantum KEM parameter suites.
+#[non_exhaustive]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -842,6 +843,7 @@ fn decapsulate(
 
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+#[serde(rename = "KemRatchet")]
 struct KemRatchetUnchecked {
     suite: PqSuite,
     rekey_messages: u64,

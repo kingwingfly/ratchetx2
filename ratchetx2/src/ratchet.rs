@@ -63,6 +63,7 @@ fn validate_ratchet_invariants(
 
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+#[serde(rename = "Ratchet")]
 struct RatchetUnchecked {
     dh_root: DhRootRatchet,
     message_ratchet_sender: MessageRatchet,
