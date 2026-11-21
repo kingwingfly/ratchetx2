@@ -296,11 +296,13 @@ impl PqHandshakeStore for MemoryStore {
                 return Ok(PublishV2Status::DuplicatePrekey);
             }
         }
-        // Reject duplicate PQ prekey IDs (last-resort and one-time).
+        // Reject duplicate PQ last-resort suites and duplicate PQ prekey IDs (last-resort and
+        // one-time).
+        let mut seen_lr_suites = HashSet::with_capacity(record.pq_last_resort.len());
         let mut seen_pq_ids =
             HashSet::with_capacity(record.pq_last_resort.len() + record.pq_one_time_prekeys.len());
         for lr in &record.pq_last_resort {
-            if !seen_pq_ids.insert(lr.id) {
+            if !seen_lr_suites.insert(lr.suite) || !seen_pq_ids.insert(lr.id) {
                 return Ok(PublishV2Status::DuplicatePrekey);
             }
         }

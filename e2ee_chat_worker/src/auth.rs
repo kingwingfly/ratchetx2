@@ -53,6 +53,11 @@ pub struct Claims {
     pub expires: u64,
 }
 
+/// Whether server password sign-in is configured (`PASSWORD` secret is set and non-empty).
+pub fn password_configured(env: &Env) -> bool {
+    secret(env, PASSWORD).is_some()
+}
+
 /// Who `request` is signed in as, by its cookie, if this server signed it and it has not
 /// expired.
 pub fn signed_in(request: &Request, env: &Env) -> Option<Claims> {

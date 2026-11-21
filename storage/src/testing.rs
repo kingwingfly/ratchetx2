@@ -362,6 +362,20 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
         PublishV2Status::DuplicatePrekey
     );
 
+    // Duplicate PQ last-resort suite (even with distinct prekey IDs) is rejected.
+    let dup_lr_suite = PublishV2Record {
+        manifest: manifest(1, 1, true, false),
+        signed_prekey_signature: Some([0x44; 64]),
+        one_time_prekeys: vec![[40; 32]],
+        pq_last_resort: vec![pq_key(1, 0xA1), pq_key(1, 0xA9)],
+        pq_one_time_prekeys: vec![],
+        timestamp: 1001,
+    };
+    assert_eq!(
+        store.publish_v2(dup_lr_suite).await.unwrap(),
+        PublishV2Status::DuplicatePrekey
+    );
+
     // Valid compat v2 publish succeeds and is visible via non-consuming get_manifest.
     let valid = PublishV2Record {
         manifest: manifest(1, 1, true, false),

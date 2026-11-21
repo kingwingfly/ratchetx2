@@ -721,6 +721,92 @@ impl TryFrom<&InitialMessageV2> for crate::handshake::InitialMessage {
     }
 }
 
+/// Normalizes a configured server audience or URL (such as `SERVER_ID`) into canonical
+/// `host[:port]` form:
+///
+/// - trims surrounding whitespace
+/// - strips an optional `http://`, `https://`, `ws://`, or `wss://` scheme case-insensitively
+/// - strips any trailing path, query, or fragment
+/// - lowercases hostnames and canonicalizes bracketed IPv6 literals via [`std::net::Ipv6Addr`]
+/// - parses numeric ports (stripping leading zeros and empty trailing `:`)
+/// - drops default ports (`:443` for `https`/`wss`, `:80` for `http`/`ws`, and both `:80` and
+///   `:443` when no scheme was specified)
+pub fn normalize_audience(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return Err(ErrorKind::Malformed.into());
+    }
+    let (explicit_scheme, rest) = if let Some((scheme, after)) = trimmed.split_once("://") {
+        match scheme.to_ascii_lowercase().as_str() {
+            "https" | "wss" => (Some("https"), after),
+            "http" | "ws" => (Some("http"), after),
+            _ => return Err(ErrorKind::Malformed.into()),
+        }
+    } else {
+        (None, trimmed)
+    };
+
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') {
+        return Err(ErrorKind::Malformed.into());
+    }
+
+    let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((ipv6_raw, tail)) = after_bracket.split_once(']') else {
+            return Err(ErrorKind::Malformed.into());
+        };
+        let ipv6: std::net::Ipv6Addr = ipv6_raw.parse().map_err(|_| ErrorKind::Malformed)?;
+        let port_str = if tail.is_empty() {
+            None
+        } else if let Some(p) = tail.strip_prefix(':') {
+            Some(p)
+        } else {
+            return Err(ErrorKind::Malformed.into());
+        };
+        (format!("[{ipv6}]"), port_str)
+    } else {
+        if authority.contains('[') || authority.contains(']') {
+            return Err(ErrorKind::Malformed.into());
+        }
+        let (host_raw, port_str) = match authority.split_once(':') {
+            Some((h, p)) => {
+                if p.contains(':') {
+                    return Err(ErrorKind::Malformed.into());
+                }
+                (h, Some(p))
+            }
+            None => (authority, None),
+        };
+        if host_raw.is_empty() || host_raw.bytes().any(|b| b.is_ascii_control()) {
+            return Err(ErrorKind::Malformed.into());
+        }
+        (host_raw.to_ascii_lowercase(), port_str)
+    };
+
+    let port = match port_str {
+        None | Some("") => None,
+        Some(p) => {
+            if !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ErrorKind::Malformed.into());
+            }
+            let parsed: u16 = p.parse().map_err(|_| ErrorKind::Malformed)?;
+            Some(parsed)
+        }
+    };
+
+    let port = match (explicit_scheme, port) {
+        (Some("https"), Some(443)) => None,
+        (Some("http"), Some(80)) => None,
+        (None, Some(80 | 443)) => None,
+        (_, other) => other,
+    };
+
+    Ok(match port {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    })
+}
+
 /// Validated fields extracted from an [`InitialMessageV2`].
 #[cfg(feature = "server")]
 pub(crate) struct ValidatedInitialMessageV2 {
@@ -735,10 +821,15 @@ pub(crate) struct ValidatedInitialMessageV2 {
 }
 
 /// Validates structural, key, and PQ ciphertext invariants of an [`InitialMessageV2`].
+///
+/// When `allow_pq_drain` is `true`, any known [`PqSuite`] (validated via [`PqSuite::from_u8`] and
+/// exact ciphertext length) is accepted for `version == 2` even if `supported_suites` is empty,
+/// allowing in-flight unacknowledged PQ sessions to drain during a `PQ_ENABLED="false"` rollback.
 #[cfg(feature = "server")]
 pub(crate) fn validate_initial_message_v2(
     message: &InitialMessageV2,
     supported_suites: &[u32],
+    allow_pq_drain: bool,
 ) -> Result<ValidatedInitialMessageV2> {
     let sender: PublicKey = fixed(&message.identity_key)?;
     let ephemeral_key: PublicKey = fixed(&message.ephemeral_key)?;
@@ -783,7 +874,7 @@ pub(crate) fn validate_initial_message_v2(
         PQXDH_VERSION => {
             let suite_u8 = u8::try_from(message.pq_suite).map_err(|_| ErrorKind::Malformed)?;
             let suite = PqSuite::from_u8(suite_u8).ok_or(ErrorKind::Malformed)?;
-            if !supported_suites.contains(&message.pq_suite) {
+            if !allow_pq_drain && !supported_suites.contains(&message.pq_suite) {
                 return Err(ErrorKind::Malformed.into());
             }
             let prekey_id: [u8; PQ_PREKEY_ID_LENGTH] = fixed(&message.pq_prekey_id)?;
@@ -994,7 +1085,8 @@ mod server {
         }
 
         async fn publish_v2(&self, request: PublishV2Request) -> Result<PublishV2Response> {
-            if !self.info.pq_enabled {
+            let manifest = request.manifest.as_ref().ok_or(ErrorKind::Malformed)?;
+            if !self.info.pq_enabled && manifest.pq_enabled {
                 return Err(ErrorKind::Unimplemented.into());
             }
             if request.one_time_prekeys.len() > self.limits.max_one_time_prekeys
@@ -1009,7 +1101,6 @@ mod server {
             }
 
             let identity_key = request.verify(&self.info.server_id)?;
-            let manifest = request.manifest.as_ref().ok_or(ErrorKind::Malformed)?;
             verify_manifest_at(manifest, &self.info.server_id, now)?;
             let signed_prekey: PublicKey = fixed(&manifest.signed_prekey)?;
 
@@ -1124,7 +1215,7 @@ mod server {
             &self,
             request: RefillPrekeysRequest,
         ) -> Result<RefillPrekeysResponse> {
-            if !self.info.pq_enabled {
+            if !self.info.pq_enabled && !request.pq_one_time_prekeys.is_empty() {
                 return Err(ErrorKind::Unimplemented.into());
             }
             if request.one_time_prekeys.len() > self.limits.max_one_time_prekeys
@@ -1213,9 +1304,6 @@ mod server {
         }
 
         async fn claim_bundle(&self, request: ClaimBundleRequest) -> Result<ClaimBundleResponse> {
-            if !self.info.pq_enabled {
-                return Err(ErrorKind::Unimplemented.into());
-            }
             if request.preferred_suites.len() > 8 {
                 return Err(ErrorKind::LimitExceeded.into());
             }
@@ -1227,8 +1315,27 @@ mod server {
                 if PqSuite::from_u8(suite_u8).is_none() {
                     return Err(ErrorKind::Malformed.into());
                 }
-                if self.info.supported_suites.contains(&suite_u32) && !suites.contains(&suite_u8) {
+                if self.info.pq_enabled
+                    && self.info.supported_suites.contains(&suite_u32)
+                    && !suites.contains(&suite_u8)
+                {
                     suites.push(suite_u8);
+                }
+            }
+
+            if !self.info.pq_enabled && !request.preferred_suites.is_empty() {
+                // When PQ is disabled at runtime and the caller requested PQ suites, reject
+                // peers whose manifest is still PQ-ON with `Unimplemented` BEFORE popping a
+                // classical OPK so clients fall back according to their local policy instead of
+                // seeing a stripped PQ-ON manifest. Peers with a signed OFF manifest or classical
+                // v1 bundle proceed below without any PQ prekeys.
+                if self
+                    .store
+                    .get_manifest(&identity_key)
+                    .await?
+                    .is_some_and(|m| m.pq_enabled)
+                {
+                    return Err(ErrorKind::Unimplemented.into());
                 }
             }
 
@@ -1237,6 +1344,12 @@ mod server {
                 .claim_bundle(&identity_key, &suites)
                 .await?
                 .ok_or(ErrorKind::NotFound)?;
+            if !self.info.pq_enabled
+                && !request.preferred_suites.is_empty()
+                && claimed.manifest.as_ref().is_some_and(|m| m.pq_enabled)
+            {
+                return Err(ErrorKind::Unimplemented.into());
+            }
             Ok(ClaimBundleResponse {
                 manifest: claimed.manifest.map(manifest_from_storage),
                 signed_prekey: Bytes::copy_from_slice(&claimed.signed_prekey),
@@ -1255,12 +1368,12 @@ mod server {
             &self,
             request: SendInitialV2Request,
         ) -> Result<SendInitialV2Response> {
-            if !self.info.pq_enabled {
-                return Err(ErrorKind::Unimplemented.into());
-            }
             let recipient: PublicKey = fixed(&request.recipient)?;
             check_canonical_key(&recipient)?;
             let message = request.message.as_ref().ok_or(ErrorKind::Malformed)?;
+            if !self.info.pq_enabled && message.version == PQXDH_VERSION {
+                return Err(ErrorKind::Unimplemented.into());
+            }
             let first_message = message.first_message.clone().ok_or(ErrorKind::Malformed)?;
             if first_message.header.len() > MAX_HEADER_SIZE
                 || first_message.header.len() + first_message.content.len()
@@ -1269,7 +1382,12 @@ mod server {
                 return Err(ErrorKind::LimitExceeded.into());
             }
 
-            let validated = validate_initial_message_v2(message, &self.info.supported_suites)?;
+            let supported_suites: &[u32] = if self.info.pq_enabled {
+                &self.info.supported_suites
+            } else {
+                &[]
+            };
+            let validated = validate_initial_message_v2(message, supported_suites, false)?;
 
             let stored = StoredInitialMessageV2 {
                 id: 0,
@@ -1299,9 +1417,6 @@ mod server {
             &self,
             request: ListInitialMessagesRequest,
         ) -> Result<ListInitialMessagesResponse> {
-            if !self.info.pq_enabled {
-                return Err(ErrorKind::Unimplemented.into());
-            }
             let identity_key = request.verify(&self.info.server_id, now_millis())?;
             let limit = match request.limit {
                 0 => self.limits.max_list_limit,
@@ -1342,9 +1457,6 @@ mod server {
             &self,
             request: AckInitialMessagesRequest,
         ) -> Result<AckInitialMessagesResponse> {
-            if !self.info.pq_enabled {
-                return Err(ErrorKind::Unimplemented.into());
-            }
             if request.ids.len() > self.limits.max_ack_ids {
                 return Err(ErrorKind::LimitExceeded.into());
             }
@@ -1458,6 +1570,71 @@ mod server {
                 identity_key: &PublicKey,
             ) -> storage::Result<storage::PqStorageSnapshot> {
                 PqHandshakeStore::pq_snapshot(&*self.0, identity_key).await
+            }
+        }
+
+        impl storage::LocalMailboxStore for SharedStore {
+            async fn append(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                header: Bytes,
+                content: Bytes,
+                initial_message: Option<Bytes>,
+                delivery_hash: Option<[u8; 32]>,
+            ) -> storage::Result<u64> {
+                storage::MailboxStore::append(
+                    &*self.0,
+                    sender,
+                    recipient,
+                    header,
+                    content,
+                    initial_message,
+                    delivery_hash,
+                )
+                .await
+            }
+            async fn delete_delivered(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                hashes: &[[u8; 32]],
+            ) -> storage::Result<()> {
+                storage::MailboxStore::delete_delivered(&*self.0, sender, recipient, hashes).await
+            }
+            async fn read(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                after: u64,
+                limit: u32,
+            ) -> storage::Result<Vec<storage::StoredMessage>> {
+                storage::MailboxStore::read(&*self.0, sender, recipient, after, limit).await
+            }
+        }
+
+        impl storage::LocalIdempotentMailboxStore for SharedStore {
+            async fn append_idempotent(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                header: Bytes,
+                content: Bytes,
+                initial_message: Option<Bytes>,
+                delivery_hash: Option<[u8; 32]>,
+                client_message_id: Option<[u8; 16]>,
+            ) -> storage::Result<u64> {
+                storage::IdempotentMailboxStore::append_idempotent(
+                    &*self.0,
+                    sender,
+                    recipient,
+                    header,
+                    content,
+                    initial_message,
+                    delivery_hash,
+                    client_message_id,
+                )
+                .await
             }
         }
 
@@ -2009,6 +2186,509 @@ mod server {
                 v2.refill_prekeys(future_refill).await.unwrap_err().kind(),
                 ErrorKind::StaleTimestamp
             );
+        }
+
+        #[tokio::test]
+        async fn pq_disabled_rollback_allows_drain_off_manifest_and_classical_fallback() {
+            use crate::mailbox_v2::{
+                CLIENT_MESSAGE_ID_LENGTH, FetchSignedRequest, LocalMailboxV2, MailboxV2Server,
+                PushV2Request,
+            };
+
+            let shared = SharedStore(Arc::new(MemoryStore::default()));
+            let v1 = HandshakeServer::new(shared.clone());
+            let v2_on =
+                HandshakeV2Server::new(shared.clone(), ServerInfoConfig::new("relay.example"));
+            let now = now_millis();
+
+            let alice = XEdDSAPrivateKey::generate();
+            let bob = XEdDSAPrivateKey::generate();
+            let carol = XEdDSAPrivateKey::generate();
+            let dave = XEdDSAPrivateKey::generate();
+            let alice_pk = alice.compute_public_key().to_bytes();
+            let bob_pk = bob.compute_public_key().to_bytes();
+            let carol_pk = carol.compute_public_key().to_bytes();
+            let dave_pk = dave.compute_public_key().to_bytes();
+
+            // Bob publishes a strict-PQ v2 manifest (which deletes his legacy v1 bundle).
+            let bob_spk1 = [0x11; 32];
+            let bob_lr1024 = make_pq_prekey(&bob, PqSuite::MlKem1024, 0x21, true);
+            let bob_opk1024 = make_pq_prekey(&bob, PqSuite::MlKem1024, 0x31, false);
+            let bob_m1 = signed_manifest(
+                &bob,
+                "relay.example",
+                1,
+                1,
+                true,
+                true,
+                bob_spk1,
+                std::slice::from_ref(&bob_lr1024),
+                now,
+            );
+            v2_on
+                .publish_v2(
+                    PublishV2Request::sign(
+                        &bob,
+                        bob_m1,
+                        None,
+                        &[[0x41; 32]],
+                        vec![bob_lr1024.clone()],
+                        vec![bob_opk1024],
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Dave publishes a non-strict PQ-ON manifest.
+            let dave_spk = [0x15; 32];
+            let dave_lr = make_pq_prekey(&dave, PqSuite::MlKem768, 0x25, true);
+            let dave_opk = make_pq_prekey(&dave, PqSuite::MlKem768, 0x35, false);
+            let dave_m = signed_manifest(
+                &dave,
+                "relay.example",
+                1,
+                1,
+                true,
+                false,
+                dave_spk,
+                std::slice::from_ref(&dave_lr),
+                now,
+            );
+            v2_on
+                .publish_v2(
+                    PublishV2Request::sign(
+                        &dave,
+                        dave_m.clone(),
+                        Some(dave.sign(dave_spk)),
+                        &[[0x45; 32]],
+                        vec![dave_lr],
+                        vec![dave_opk],
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Carol is a classical v1-only user.
+            v1.publish(
+                PublishRequest::sign(
+                    &carol,
+                    &x3dh::PublishedPrekeys {
+                        signed_prekey: [0x61; 32],
+                        signed_prekey_signature: carol.sign([0x61; 32]),
+                        one_time_prekeys: vec![[0x62; 32]],
+                    },
+                    now,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+            // Alice sends Bob a PQXDH v2 initial while PQ is still ON.
+            let pq_init = InitialMessageV2 {
+                id: 0,
+                version: PQXDH_VERSION,
+                identity_key: Bytes::copy_from_slice(&alice_pk),
+                ephemeral_key: Bytes::from_static(&[0x12; 32]),
+                signed_prekey: Bytes::copy_from_slice(&bob_spk1),
+                one_time_prekey: None,
+                first_message: Some(EncryptedMessage {
+                    header: Bytes::from_static(b"pq-h"),
+                    content: Bytes::from_static(b"pq-c"),
+                }),
+                pq_suite: u32::from(PqSuite::MlKem1024.as_u8()),
+                pq_last_resort: false,
+                pq_prekey_id: Bytes::from_static(&[0x33; 32]),
+                pq_ciphertext: Bytes::from(vec![0xAA; PqSuite::MlKem1024.ct_len()]),
+                manifest_digest: Bytes::from_static(&[0x44; 32]),
+            };
+            let sent_pq = v2_on
+                .send_initial_v2(SendInitialV2Request {
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(pq_init.clone()),
+                })
+                .await
+                .unwrap();
+
+            // Operator flips PQ_ENABLED="false" at runtime!
+            let mut off_cfg = ServerInfoConfig::new("relay.example");
+            off_cfg.pq_enabled = false;
+            off_cfg.supported_suites.clear();
+            off_cfg.pq_ratchet_supported = false;
+            let v2_off = HandshakeV2Server::new(shared.clone(), off_cfg);
+            let mb_off = MailboxV2Server::builder(shared.clone())
+                .server_id("relay.example".to_string())
+                .supported_suites(vec![])
+                .build();
+
+            let info = v2_off
+                .get_server_info(GetServerInfoRequest {})
+                .await
+                .unwrap();
+            assert!(!info.pq_enabled);
+            assert!(info.supported_suites.is_empty());
+            assert!(!info.pq_ratchet_supported);
+
+            // PQ-only operations are rejected with Unimplemented.
+            assert_eq!(
+                v2_off
+                    .get_manifest(GetManifestRequest {
+                        identity_key: Bytes::copy_from_slice(&bob_pk),
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Unimplemented
+            );
+            assert_eq!(
+                v2_off
+                    .send_initial_v2(SendInitialV2Request {
+                        recipient: Bytes::copy_from_slice(&bob_pk),
+                        message: Some(pq_init.clone()),
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Unimplemented
+            );
+            let bob_m_on_retry = signed_manifest(
+                &bob,
+                "relay.example",
+                2,
+                2,
+                true,
+                false,
+                [0x19; 32],
+                std::slice::from_ref(&bob_lr1024),
+                now,
+            );
+            assert_eq!(
+                v2_off
+                    .publish_v2(
+                        PublishV2Request::sign(
+                            &bob,
+                            bob_m_on_retry,
+                            Some(bob.sign([0x19; 32])),
+                            &[],
+                            vec![bob_lr1024],
+                            vec![],
+                            now,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Unimplemented
+            );
+            let pq_refill_key = make_pq_prekey(&bob, PqSuite::MlKem1024, 0x39, false);
+            assert_eq!(
+                v2_off
+                    .refill_prekeys(
+                        RefillPrekeysRequest::sign(
+                            &bob,
+                            "relay.example",
+                            1,
+                            &[],
+                            vec![pq_refill_key],
+                            now,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Unimplemented
+            );
+
+            // ClaimBundle with non-empty preferred_suites against a peer still on a PQ-ON manifest
+            // returns Unimplemented WITHOUT wasting their classical OPK.
+            assert_eq!(
+                v2_off
+                    .claim_bundle(ClaimBundleRequest {
+                        identity_key: Bytes::copy_from_slice(&bob_pk),
+                        preferred_suites: vec![1, 2],
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Unimplemented
+            );
+            assert_eq!(shared.pq_snapshot(&bob_pk).await.unwrap().classical_one_time_count, 1);
+
+            // ClaimBundle with empty preferred_suites (classical client) against non-strict Dave
+            // returns classical bundle without consuming PQ prekeys.
+            let dave_claim = v2_off
+                .claim_bundle(ClaimBundleRequest {
+                    identity_key: Bytes::copy_from_slice(&dave_pk),
+                    preferred_suites: vec![],
+                })
+                .await
+                .unwrap();
+            assert_eq!(dave_claim.manifest, Some(dave_m));
+            assert_eq!(dave_claim.pq_last_resort, None);
+            assert_eq!(dave_claim.pq_one_time_prekey, None);
+            assert_eq!(dave_claim.one_time_prekey.as_deref(), Some(&[0x45; 32][..]));
+            assert_eq!(
+                shared.pq_snapshot(&dave_pk).await.unwrap().pq_one_time_counts,
+                vec![(2, 1)]
+            );
+
+            // ClaimBundle for v1-only Carol works seamlessly even with preferred_suites.
+            let carol_claim = v2_off
+                .claim_bundle(ClaimBundleRequest {
+                    identity_key: Bytes::copy_from_slice(&carol_pk),
+                    preferred_suites: vec![1, 2],
+                })
+                .await
+                .unwrap();
+            assert_eq!(carol_claim.manifest, None);
+            assert_eq!(carol_claim.signed_prekey.as_ref(), &[0x61; 32]);
+
+            // SendInitialV2 with classical version == 1 still succeeds when PQ_ENABLED="false".
+            let classical_init = InitialMessageV2 {
+                id: 0,
+                version: 1,
+                identity_key: Bytes::copy_from_slice(&alice_pk),
+                ephemeral_key: Bytes::from_static(&[0x13; 32]),
+                signed_prekey: Bytes::copy_from_slice(&bob_spk1),
+                one_time_prekey: None,
+                first_message: Some(EncryptedMessage {
+                    header: Bytes::from_static(b"v1-h"),
+                    content: Bytes::from_static(b"v1-c"),
+                }),
+                pq_suite: 0,
+                pq_last_resort: false,
+                pq_prekey_id: Bytes::new(),
+                pq_ciphertext: Bytes::new(),
+                manifest_digest: Bytes::new(),
+            };
+            let sent_v1 = v2_off
+                .send_initial_v2(SendInitialV2Request {
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(classical_init),
+                })
+                .await
+                .unwrap();
+
+            // 1. Bob drains his v2 inbox (both queued PQXDH v2 initial and v1 initial) and acks them!
+            let listed = v2_off
+                .list_initial_messages(
+                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, now).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(listed.messages.len(), 2);
+            assert_eq!(listed.messages[0].id, sent_pq.id);
+            assert_eq!(listed.messages[0].version, PQXDH_VERSION);
+            assert_eq!(listed.messages[1].id, sent_v1.id);
+            assert_eq!(listed.messages[1].version, 1);
+            let acked = v2_off
+                .ack_initial_messages(
+                    AckInitialMessagesRequest::sign(
+                        &bob,
+                        "relay.example",
+                        vec![sent_pq.id, sent_v1.id],
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(acked.deleted, 2);
+            assert!(
+                v2_off
+                    .list_initial_messages(
+                        ListInitialMessagesRequest::sign(&bob, "relay.example", 0, now).unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .messages
+                    .is_empty()
+            );
+
+            // 2. Alice flushes an in-flight carried PQ initial via PushV2 while PQ_ENABLED="false",
+            //    and Bob reads it via FetchSigned without HTTP 400!
+            let carried_pq = InitialMessageV2 {
+                first_message: None,
+                ..pq_init.clone()
+            };
+            let pushed = mb_off
+                .push_v2(PushV2Request {
+                    sender: Bytes::copy_from_slice(&alice_pk),
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(EncryptedMessage {
+                        header: Bytes::from_static(b"drain-h"),
+                        content: Bytes::from_static(b"drain-c"),
+                    }),
+                    initial_message: Some(carried_pq.clone()),
+                    delivery_hash: Bytes::new(),
+                    client_message_id: Bytes::from_static(&[0x88; CLIENT_MESSAGE_ID_LENGTH]),
+                })
+                .await
+                .unwrap();
+            assert_eq!(pushed.sequence, 1);
+            let fetched = mb_off
+                .fetch_signed(
+                    FetchSignedRequest::sign(
+                        &bob,
+                        "relay.example",
+                        &alice_pk,
+                        0,
+                        10,
+                        0,
+                        vec![],
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fetched.messages.len(), 1);
+            assert_eq!(fetched.messages[0].initial_message, Some(carried_pq));
+
+            // 3. Previously strict-PQ Bob publishes a signed OFF manifest via PublishV2, which
+            //    clears his PQ prekeys, persists the OFF manifest, and restores his classical v1
+            //    bundle so he is never locked out or stranded!
+            let bob_spk2 = [0x14; 32];
+            let bob_off = signed_manifest(
+                &bob,
+                "relay.example",
+                2,
+                2,
+                false,
+                false,
+                bob_spk2,
+                &[],
+                now,
+            );
+            v2_off
+                .publish_v2(
+                    PublishV2Request::sign(
+                        &bob,
+                        bob_off.clone(),
+                        Some(bob.sign(bob_spk2)),
+                        &[[0x71; 32]],
+                        vec![],
+                        vec![],
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let snap = shared.pq_snapshot(&bob_pk).await.unwrap();
+            assert!(!snap.manifest.as_ref().unwrap().pq_enabled);
+            assert!(snap.pq_last_resort_suites.is_empty());
+            assert!(snap.pq_one_time_counts.is_empty());
+
+            // Classical-only RefillPrekeys works on Bob's OFF manifest generation!
+            let refill_resp = v2_off
+                .refill_prekeys(
+                    RefillPrekeysRequest::sign(
+                        &bob,
+                        "relay.example",
+                        2,
+                        &[[0x72; 32]],
+                        vec![],
+                        now + 1,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(refill_resp.classical_one_time_count, 2);
+
+            // ClaimBundle for Bob now returns his signed OFF manifest + classical bundle!
+            let claimed_off = v2_off
+                .claim_bundle(ClaimBundleRequest {
+                    identity_key: Bytes::copy_from_slice(&bob_pk),
+                    preferred_suites: vec![1, 2],
+                })
+                .await
+                .unwrap();
+            assert_eq!(claimed_off.manifest, Some(bob_off));
+            assert_eq!(claimed_off.signed_prekey.as_ref(), &bob_spk2);
+            assert!(claimed_off.signed_prekey_signature.is_some());
+            assert_eq!(claimed_off.one_time_prekey.as_deref(), Some(&[0x71; 32][..]));
+            assert_eq!(claimed_off.pq_last_resort, None);
+            assert_eq!(claimed_off.pq_one_time_prekey, None);
+
+            // Even legacy v1 FetchBundle now succeeds again for Bob!
+            let v1_bundle = v1
+                .fetch_bundle(FetchBundleRequest {
+                    identity_key: Bytes::copy_from_slice(&bob_pk),
+                })
+                .await
+                .unwrap();
+            assert_eq!(v1_bundle.signed_prekey.as_ref(), &bob_spk2);
+            assert_eq!(v1_bundle.one_time_prekey.as_deref(), Some(&[0x72; 32][..]));
+        }
+
+        #[test]
+        fn normalize_audience_handles_schemes_ipv6_ports_and_invalid_inputs() {
+            for (input, expected) in [
+                ("chat.example.com", "chat.example.com"),
+                ("  Chat.Example.COM  ", "chat.example.com"),
+                ("chat.example.com:8787", "chat.example.com:8787"),
+                ("chat.example.com:08787", "chat.example.com:8787"),
+                ("chat.example.com:443", "chat.example.com"),
+                ("chat.example.com:80", "chat.example.com"),
+                ("chat.example.com:0443", "chat.example.com"),
+                ("chat.example.com:0080", "chat.example.com"),
+                ("chat.example.com:", "chat.example.com"),
+                ("chat.example.com/some/path?q=1#frag", "chat.example.com"),
+                ("https://chat.example.com", "chat.example.com"),
+                ("HTTPS://CHAT.EXAMPLE.COM:443/", "chat.example.com"),
+                ("HTTPS://Chat.Example.com:0443/api", "chat.example.com"),
+                ("HTTP://localhost:80/", "localhost"),
+                ("HTTP://localhost:0080/path", "localhost"),
+                ("http://localhost:8787/", "localhost:8787"),
+                ("http://example.com:443", "example.com:443"),
+                ("https://example.com:80", "example.com:80"),
+                ("WSS://Chat.Example.com:443/notifications", "chat.example.com"),
+                ("WS://localhost:80/notifications", "localhost"),
+                ("http://[0:0::1]:8787", "[::1]:8787"),
+                ("https://[0:0::1]:0443/", "[::1]"),
+                ("[0:0::1]:443", "[::1]"),
+                ("[0:0::1]:80", "[::1]"),
+                ("[2001:0DB8:0000::1]:08443", "[2001:db8::1]:8443"),
+                ("[::1]:", "[::1]"),
+            ] {
+                assert_eq!(
+                    normalize_audience(input).unwrap(),
+                    expected,
+                    "input: {input:?}"
+                );
+            }
+
+            for bad in [
+                "",
+                "   ",
+                "ftp://chat.example.com",
+                "https://user:pass@chat.example.com",
+                "user@chat.example.com",
+                "chat.example.com:99999",
+                "chat.example.com:-1",
+                "chat.example.com:+443",
+                "chat.example.com:abc",
+                ":8787",
+                "http://",
+                "[::1",
+                "[::1]extra",
+                "::1",
+                "chat example.com",
+            ] {
+                assert_eq!(
+                    normalize_audience(bad).unwrap_err().kind(),
+                    ErrorKind::Malformed,
+                    "expected error for {bad:?}"
+                );
+            }
         }
     }
 }
