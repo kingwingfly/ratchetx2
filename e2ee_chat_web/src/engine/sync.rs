@@ -1,6 +1,8 @@
 //! Server notifications, synchronization and incoming mailbox pages.
 
-use super::handshake::{Incoming, stage_carried_initials};
+use super::handshake::{
+    Incoming, JoinCarriedOutcome, record_carried_timestamps, stage_carried_initials,
+};
 use super::outbox::{RequeueOutcome, needs_new_session};
 use super::{
     AWAY_CHECK, Engine, HIDDEN_GRACE, HistoryStore, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE,
@@ -108,7 +110,15 @@ impl Engine {
         spawn_local(async move {
             let mut retry = RESUBSCRIBE_MIN;
             loop {
+                if self.ui.update_required.with_untracked(Option::is_some) {
+                    self.ui.live.set(false);
+                    return;
+                }
                 while !self.present() {
+                    if self.ui.update_required.with_untracked(Option::is_some) {
+                        self.ui.live.set(false);
+                        return;
+                    }
                     sleep(AWAY_CHECK).await;
                 }
                 let subscribed = {
@@ -144,6 +154,12 @@ impl Engine {
                                 return;
                             }
                             Either::Left((Event::Closed, _)) => break,
+                            Either::Right(_)
+                                if self.ui.update_required.with_untracked(Option::is_some) =>
+                            {
+                                self.ui.live.set(false);
+                                return;
+                            }
                             // Away: dropped, the subscription closes its socket.
                             Either::Right(_) if !self.present() => {
                                 left = true;
@@ -157,6 +173,9 @@ impl Engine {
                         .log(format!("cannot subscribe to notifications: {e}")),
                 }
                 self.ui.live.set(false);
+                if self.ui.update_required.with_untracked(Option::is_some) {
+                    return;
+                }
                 if left {
                     retry = RESUBSCRIBE_MIN;
                     continue;
@@ -340,7 +359,7 @@ impl Engine {
         let recovered = replayed.is_some() || !pending.is_empty();
         let mut upgrades = replayed.unwrap_or_default();
         for peer in pending {
-            if self.join_carried(inner, &peer).await? {
+            if self.join_carried(inner, &peer).await?.recommend_upgrade {
                 upgrades.insert(peer);
             }
         }
@@ -423,7 +442,7 @@ impl Engine {
             if inner.contacts[index].is_new_quarantined() {
                 return Ok(received);
             }
-            recommend_upgrade |= self.join_carried(inner, peer).await?;
+            recommend_upgrade |= self.join_carried(inner, peer).await?.recommend_upgrade;
             let (page, snapshot) = inner
                 .fetch_page(index, async |session, client, audience| {
                     let res = session.fetch_v2(client, audience).await;
@@ -575,21 +594,24 @@ impl Engine {
             if stalled {
                 // Its initial message, which went first, may have come since they were last
                 // taken, or have been lost, and come with the page: once they are taken, and
-                // those are accepted, receiving goes on, past what still does not decrypt.
+                // those are accepted, receiving goes on, past what still does not decrypt —
+                // UNLESS a deferred unsupported-suite initial exists for this peer, in which case
+                // pause right before the first undecryptable envelope so a capable build can
+                // decrypt those messages after replaying the greeting.
                 drop(guard);
                 self.take_initial_messages().await?;
                 let mut guard = self.inner.lock().await;
                 if let Some(inner) = guard.as_mut() {
-                    recommend_upgrade |= self.join_carried(inner, peer).await?;
-                    if let Some(contact) = inner.contact(peer)
-                        && !contact.is_new_quarantined()
-                    {
-                        contact.session.skip_stalled();
-                    }
+                    let join = self.join_carried(inner, peer).await?;
+                    recommend_upgrade |= join.recommend_upgrade;
+                    let paused = resolve_stalled_peer(inner, peer, join);
                     self.ui.contacts.set(inner.views());
+                    if paused {
+                        break;
+                    }
                 }
             } else if !carried_initials.is_empty() {
-                recommend_upgrade |= self.join_carried(inner, peer).await?;
+                recommend_upgrade |= self.join_carried(inner, peer).await?.recommend_upgrade;
             }
         }
         if recommend_upgrade {
@@ -597,6 +619,25 @@ impl Engine {
         }
         Ok(received)
     }
+}
+
+/// Resolve a stalled mailbox page for `peer`: pause without calling `skip_stalled()` if any
+/// deferred carried or inbox initial exists for `peer` so a later capable build can decrypt the
+/// stalled envelopes after replaying the greeting. Returns `true` when receiving should pause.
+pub(super) fn resolve_stalled_peer<V: HistoryStore>(
+    inner: &mut Inner<V>,
+    peer: &PublicKey,
+    join: JoinCarriedOutcome,
+) -> bool {
+    if join.has_deferred || inner.has_deferred_initial_for(peer) {
+        return true;
+    }
+    if let Some(contact) = inner.contact(peer)
+        && !contact.is_new_quarantined()
+    {
+        contact.session.skip_stalled();
+    }
+    false
 }
 
 /// Build a [`PushV2Request`] for a persisted [`Farewell`], deterministically deriving a 16-byte
@@ -658,16 +699,35 @@ impl<V: HistoryStore> Inner<V> {
         records: &[(String, HistoryEntry)],
         outbox: &[(String, Option<OutgoingRecord>)],
     ) -> Result<(), String> {
-        let contact = &mut self.contacts[index];
-        let peer = contact.peer;
-        let saved = match stage_carried_initials(&mut contact.state, initials) {
-            Ok(()) => self
-                .save_with(records, outbox)
-                .await
-                .map_err(|e| describe(&e)),
+        let peer = self.contacts[index].peer;
+        let saved_carried_ts = self.carried_deferred_timestamps.clone();
+        let staged = stage_carried_initials(&mut self.contacts[index].state, initials);
+        let saved = match staged {
+            Ok(()) => {
+                record_carried_timestamps(
+                    &mut self.carried_deferred_timestamps,
+                    &self.contacts[index].state.pending_carried_initials,
+                    now(),
+                );
+                let unchanged = records.is_empty()
+                    && outbox.is_empty()
+                    && !self.needs_save()
+                    && proto::SessionState::from(self.contacts[index].session.state())
+                        == snapshot.0
+                    && self.contacts[index].state == snapshot.1
+                    && self.carried_deferred_timestamps == saved_carried_ts;
+                if unchanged {
+                    Ok(())
+                } else {
+                    self.save_with(records, outbox)
+                        .await
+                        .map_err(|e| describe(&e))
+                }
+            }
             Err(e) => Err(e),
         };
         if saved.is_err() {
+            self.carried_deferred_timestamps = saved_carried_ts;
             self.roll_back(&peer, snapshot)?;
         }
         saved

@@ -310,8 +310,14 @@ impl ClientState {
         }
     }
 
-    /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`.
-    pub(crate) fn record_manifest_digest(&mut self, digest: [u8; 32]) {
+    /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`
+    /// while preferring to keep any digests listed in `preserve` (e.g. deferred unsupported-suite
+    /// initials waiting for replay).
+    pub(crate) fn record_manifest_digest_preserving(
+        &mut self,
+        digest: [u8; 32],
+        preserve: &[[u8; 32]],
+    ) {
         if let Some(pos) = self
             .recent_manifest_digests
             .iter()
@@ -320,9 +326,16 @@ impl ClientState {
             self.recent_manifest_digests.remove(pos);
         }
         self.recent_manifest_digests.push(digest);
-        if self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
-            let excess = self.recent_manifest_digests.len() - MAX_RECENT_MANIFEST_DIGESTS;
-            self.recent_manifest_digests.drain(..excess);
+        while self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
+            if let Some(evict) = self
+                .recent_manifest_digests
+                .iter()
+                .position(|d| !preserve.contains(d))
+            {
+                self.recent_manifest_digests.remove(evict);
+            } else {
+                self.recent_manifest_digests.remove(0);
+            }
         }
     }
 
@@ -576,6 +589,12 @@ impl<H> Client<H> {
     /// Latest local signed prekey, if any generation has been generated.
     pub fn current_signed_prekey(&self) -> Option<PublicKey> {
         self.state.prekeys.current_signed_prekey()
+    }
+
+    /// The signed prekey of the oldest retained generation that the next rotating publish would
+    /// evict, if the local prekey store is already at capacity.
+    pub fn oldest_evictable_signed_prekey(&self) -> Option<PublicKey> {
+        self.state.prekeys.oldest_evictable_signed_prekey()
     }
 
     /// Number of unused classical one-time prekeys in the latest local generation.

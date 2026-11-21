@@ -12,8 +12,8 @@ use crate::state::{Delivery, MessageView, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, key_from_text, now, short};
 use crate::vault::{
-    CLASSICAL_APPROVAL_NONE, ContactState, Farewell, HistoryEntry, OutgoingRecord,
-    SECURITY_ALERT_DOWNGRADE, history_key,
+    CLASSICAL_APPROVAL_NONE, CarriedDeferredTimestamp, ContactState, DeferredInitial, Farewell,
+    HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, history_key,
 };
 use leptos::prelude::*;
 use prost::Message as _;
@@ -30,6 +30,18 @@ pub(super) type Incoming = InitialMessageV2;
 // surfaced together at its expired or newly stalled tail.
 const MAX_PENDING_CARRIED_INITIALS: usize = 2 * 64;
 const MAX_DEFERRED_INITIALS: usize = 100;
+/// Maximum age (30 days in ms) for which deferred initials preserve their target signed prekey
+/// generation and manifest digest across scheduled prekey rotations.
+pub(super) const DEFERRED_REPLAY_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Result of [`Engine::join_carried`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct JoinCarriedOutcome {
+    /// Whether an accepted session's `Hello` triggered an automatic PQ upgrade recommendation.
+    pub(super) recommend_upgrade: bool,
+    /// Whether at least one carried initial for this contact remains deferred on this build.
+    pub(super) has_deferred: bool,
+}
 
 fn initial_payload(kind: &InitialMessageKind) -> WireInitial {
     match kind {
@@ -53,24 +65,240 @@ fn initial_payload(kind: &InitialMessageKind) -> WireInitial {
     }
 }
 
+fn is_unsupported_carried_bytes(bytes: &[u8]) -> bool {
+    Incoming::decode_carried(bytes)
+        .and_then(|message| message.pq_suite())
+        .is_some_and(|suite| !suite.is_supported())
+}
+
 pub(super) fn stage_carried_initials<'a>(
     state: &mut ContactState,
     initials: impl IntoIterator<Item = &'a Incoming>,
 ) -> Result<(), String> {
     let pending = &mut state.pending_carried_initials;
+    let mut unsupported_count = pending
+        .iter()
+        .filter(|entry| is_unsupported_carried_bytes(entry))
+        .count();
+    let mut supported_count = pending.len() - unsupported_count;
     for message in initials {
         let bytes =
             session::protocol::mailbox_v2::encode_carried_initial(&initial_payload(&message.kind))
                 .map_err(|e| describe(&e))?
                 .to_vec();
         if !pending.contains(&bytes) {
-            if pending.len() >= MAX_PENDING_CARRIED_INITIALS {
-                return Err("Too many pending carried initial messages for this chat.".into());
+            if message
+                .pq_suite()
+                .is_some_and(|suite| !suite.is_supported())
+            {
+                // Bound retained unsupported entries independently so a full unsupported queue
+                // never blocks supported handshakes or causes cursor rollback loops.
+                if unsupported_count >= MAX_PENDING_CARRIED_INITIALS {
+                    continue;
+                }
+                pending.push(bytes);
+                unsupported_count += 1;
+            } else {
+                if supported_count >= MAX_PENDING_CARRIED_INITIALS {
+                    return Err("Too many pending carried initial messages for this chat.".into());
+                }
+                pending.push(bytes);
+                supported_count += 1;
             }
-            pending.push(bytes);
         }
     }
     Ok(())
+}
+
+/// Merge any legacy `AppState.deferred_initials` (tag 12) entries into the separate
+/// `DeferredInitialsRecord` list. Returns `true` if any legacy entries were migrated.
+pub(super) fn merge_legacy_deferred_initials(
+    entries: &mut Vec<DeferredInitial>,
+    legacy: Vec<WireInitial>,
+) -> bool {
+    if legacy.is_empty() {
+        return false;
+    }
+    for wire in legacy {
+        entries.push(DeferredInitial {
+            initial: Some(wire),
+            deferred_at: 0,
+        });
+    }
+    true
+}
+
+/// Validate, normalize (`id = 0`), deduplicate, cap, and timestamp deferred inbox initials
+/// restored from disk. Returns `(removed_count, modified)`.
+pub(super) fn sanitize_deferred_initials(
+    entries: &mut Vec<DeferredInitial>,
+    now_ms: u64,
+) -> (usize, bool) {
+    let mut cleaned = Vec::with_capacity(entries.len().min(MAX_DEFERRED_INITIALS));
+    let mut removed = 0usize;
+    let mut modified = false;
+    for entry in entries.drain(..) {
+        let Some(mut wire) = entry.initial else {
+            removed += 1;
+            modified = true;
+            continue;
+        };
+        if wire.id != 0 {
+            wire.id = 0;
+            modified = true;
+        }
+        if Incoming::try_from(&wire).is_err() {
+            removed += 1;
+            modified = true;
+            continue;
+        }
+        let deferred_at = if entry.deferred_at == 0 {
+            if now_ms != 0 {
+                modified = true;
+            }
+            now_ms
+        } else {
+            entry.deferred_at
+        };
+        if let Some(existing) = cleaned
+            .iter_mut()
+            .find(|e: &&mut DeferredInitial| e.initial.as_ref() == Some(&wire))
+        {
+            if deferred_at != 0 && (existing.deferred_at == 0 || deferred_at < existing.deferred_at)
+            {
+                existing.deferred_at = deferred_at;
+            }
+            removed += 1;
+            modified = true;
+            continue;
+        }
+        if cleaned.len() >= MAX_DEFERRED_INITIALS {
+            removed += 1;
+            modified = true;
+            continue;
+        }
+        cleaned.push(DeferredInitial {
+            initial: Some(wire),
+            deferred_at,
+        });
+    }
+    *entries = cleaned;
+    (removed, modified)
+}
+
+fn initial_spk_and_digest(initial: &Incoming) -> (PublicKey, Option<[u8; 32]>) {
+    match &initial.kind {
+        InitialMessageKind::Classical(m) => (m.x3dh.signed_prekey, None),
+        InitialMessageKind::Pq {
+            x3dh,
+            manifest_digest,
+            ..
+        } => (x3dh.signed_prekey, *manifest_digest),
+    }
+}
+
+/// Record earliest retention timestamps for any unsupported-suite carried initials staged in
+/// `pending_carried_initials` so prekey preservation stays bounded to [`DEFERRED_REPLAY_WINDOW_MS`].
+pub(super) fn record_carried_timestamps(
+    timestamps: &mut Vec<CarriedDeferredTimestamp>,
+    pending_carried: &[Vec<u8>],
+    now_ms: u64,
+) {
+    for bytes in pending_carried {
+        let Some(initial) = Incoming::decode_carried(bytes) else {
+            continue;
+        };
+        if !initial.pq_suite().is_some_and(|s| !s.is_supported()) {
+            continue;
+        }
+        let (spk, _) = initial_spk_and_digest(&initial);
+        if !timestamps
+            .iter()
+            .any(|t| t.signed_prekey.as_slice() == spk.as_slice())
+        {
+            timestamps.push(CarriedDeferredTimestamp {
+                signed_prekey: spk.to_vec(),
+                deferred_at: now_ms,
+            });
+        }
+    }
+}
+
+/// Prune `carried_deferred_timestamps` entries whose signed prekeys are no longer referenced by
+/// any contact's `pending_carried_initials`. Returns how many entries were removed.
+pub(super) fn prune_carried_timestamps_for_contacts<'a>(
+    timestamps: &mut Vec<CarriedDeferredTimestamp>,
+    contacts: impl IntoIterator<Item = &'a Contact>,
+) -> usize {
+    if timestamps.is_empty() {
+        return 0;
+    }
+    let mut active_spks = std::collections::HashSet::new();
+    for contact in contacts {
+        for bytes in &contact.state.pending_carried_initials {
+            if let Some(initial) = Incoming::decode_carried(bytes) {
+                active_spks.insert(initial_spk_and_digest(&initial).0);
+            }
+        }
+    }
+    let before = timestamps.len();
+    timestamps.retain(|entry| {
+        PublicKey::try_from(entry.signed_prekey.as_slice())
+            .is_ok_and(|spk| active_spks.contains(&spk))
+    });
+    before - timestamps.len()
+}
+
+/// Collect signed prekeys and manifest digests referenced by deferred inbox or carried initials
+/// still within [`DEFERRED_REPLAY_WINDOW_MS`] so scheduled prekey rotations do not evict them.
+pub(super) fn preserved_deferred_prekeys<V>(
+    inner: &Inner<V>,
+    now_ms: u64,
+) -> (Vec<PublicKey>, Vec<[u8; 32]>) {
+    let mut spks = Vec::new();
+    let mut digests = Vec::new();
+    let mut record = |initial: &Incoming| {
+        let (spk, digest) = initial_spk_and_digest(initial);
+        if !spks.contains(&spk) {
+            spks.push(spk);
+        }
+        if let Some(d) = digest
+            && !digests.contains(&d)
+        {
+            digests.push(d);
+        }
+    };
+    for entry in &inner.deferred_initials {
+        let within_window = entry.deferred_at == 0
+            || now_ms.saturating_sub(entry.deferred_at) <= DEFERRED_REPLAY_WINDOW_MS;
+        if !within_window {
+            continue;
+        }
+        if let Some(wire) = &entry.initial
+            && let Ok(initial) = Incoming::try_from(wire)
+        {
+            record(&initial);
+        }
+    }
+    for contact in &inner.contacts {
+        for bytes in &contact.state.pending_carried_initials {
+            let Some(initial) = Incoming::decode_carried(bytes) else {
+                continue;
+            };
+            let (spk, _) = initial_spk_and_digest(&initial);
+            let deferred_at = inner
+                .carried_deferred_timestamps
+                .iter()
+                .find(|t| t.signed_prekey.as_slice() == spk.as_slice())
+                .map_or(0, |t| t.deferred_at);
+            let within_window =
+                deferred_at == 0 || now_ms.saturating_sub(deferred_at) <= DEFERRED_REPLAY_WINDOW_MS;
+            if within_window {
+                record(&initial);
+            }
+        }
+    }
+    (spks, digests)
 }
 
 /// Whether local processing has finished for this initial.
@@ -119,19 +347,27 @@ pub(super) fn prune_invalid_inbox_acks(pending: &mut Vec<u64>) -> usize {
 }
 
 impl<V: HistoryStore> Inner<V> {
-    /// Reserve a local copy and include its ack ID in the same vault transaction.
+    /// Reserve a local copy deduplicated by payload (ignoring relay-assigned inbox ID) and
+    /// include its ack ID in the same vault transaction.
     pub(super) fn defer_inbox_initial(&mut self, message: &Incoming) -> bool {
         let wire = WireInitial {
-            id: message.id,
+            id: 0,
             ..initial_payload(&message.kind)
         };
-        if !self.state.deferred_initials.contains(&wire) {
-            if self.state.deferred_initials.len() >= MAX_DEFERRED_INITIALS {
+        let already_stored = self
+            .deferred_initials
+            .iter()
+            .any(|entry| entry.initial.as_ref() == Some(&wire));
+        if !already_stored {
+            if self.deferred_initials.len() >= MAX_DEFERRED_INITIALS {
                 return false;
             }
-            self.state.deferred_initials.push(wire);
+            self.deferred_initials.push(DeferredInitial {
+                initial: Some(wire),
+                deferred_at: now(),
+            });
         }
-        stage_inbox_ack(&mut self.deferred_acks_after_save, message.id)
+        stage_inbox_ack(&mut self.deferred_acks_after_save, message.id) || !already_stored
     }
 
     pub(super) fn check_outgoing_peer(&self, peer: &PublicKey) -> Result<(), StartChatError> {
@@ -432,19 +668,40 @@ impl Engine {
         inner: &mut Inner<impl HistoryStore>,
         open_peer: Option<PublicKey>,
     ) -> Result<Option<BTreeSet<PublicKey>>, String> {
-        let supported: Vec<_> = inner
-            .state
-            .deferred_initials
-            .extract_if(.., |wire| {
-                u8::try_from(wire.pq_suite)
-                    .ok()
-                    .and_then(PqSuite::from_u8)
-                    .is_some_and(PqSuite::is_supported)
-            })
-            .collect();
         let mut batch = InitialBatch::default();
-        for wire in supported {
-            match Incoming::try_from(&wire) {
+        let (pruned, modified) = sanitize_deferred_initials(&mut inner.deferred_initials, now());
+        if pruned > 0 {
+            self.ui.log(format!(
+                "Removed {pruned} invalid, duplicate, or excess deferred initial message(s)."
+            ));
+        }
+        if pruned > 0 || modified {
+            batch.dirty = true;
+        }
+        let mut replayable = Vec::new();
+        let deferred_entries = std::mem::take(&mut inner.deferred_initials);
+        let mut remaining = Vec::with_capacity(deferred_entries.len());
+        for entry in deferred_entries {
+            let Some(wire) = entry.initial.as_ref() else {
+                batch.dirty = true;
+                continue;
+            };
+            match Incoming::try_from(wire) {
+                Ok(message) => {
+                    let suite_supported = message.pq_suite().is_none_or(PqSuite::is_supported);
+                    let contact_blocked = inner.is_pq_incompatible_isolated_peer(&message.sender);
+                    if suite_supported && !contact_blocked {
+                        replayable.push((entry, Ok(message)));
+                    } else {
+                        remaining.push(entry);
+                    }
+                }
+                Err(e) => replayable.push((entry, Err(e))),
+            }
+        }
+        inner.deferred_initials = remaining;
+        for (entry, decoded) in replayable {
+            match decoded {
                 Ok(message) => {
                     let peer = message.sender;
                     if self.process_initial(
@@ -455,7 +712,7 @@ impl Engine {
                         &mut batch,
                     ) == InitialOutcome::DeferUnsupportedSuite
                     {
-                        inner.state.deferred_initials.push(wire);
+                        inner.deferred_initials.push(entry);
                         continue;
                     }
                 }
@@ -478,19 +735,19 @@ impl Engine {
         &self,
         inner: &mut Inner<impl HistoryStore>,
         peer: &PublicKey,
-    ) -> Result<bool, String> {
+    ) -> Result<JoinCarriedOutcome, String> {
         inner.check_isolation(peer)?;
         let Some(index) = inner.contacts.iter().position(|c| c.peer == *peer) else {
-            return Ok(false);
+            return Ok(JoinCarriedOutcome::default());
         };
         if inner.contacts[index].is_new_quarantined() {
-            return Ok(false);
+            return Ok(JoinCarriedOutcome::default());
         }
         // A prior join may have consumed prekeys and staged history after a failed save.
         if inner.needs_save() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
-        let mut upgrade = false;
+        let mut recommend_upgrade = false;
         loop {
             let contact = &inner.contacts[index];
             let next = contact.deferred_carried;
@@ -515,18 +772,27 @@ impl Engine {
                 .state
                 .pending_carried_initials
                 .remove(next);
+            let saved_carried_ts = inner.carried_deferred_timestamps.clone();
+            prune_carried_timestamps_for_contacts(
+                &mut inner.carried_deferred_timestamps,
+                inner.contacts.iter(),
+            );
             if batch.dirty {
-                upgrade |= self.save_initial_batch(inner, batch).await?.contains(peer);
+                recommend_upgrade |= self.save_initial_batch(inner, batch).await?.contains(peer);
             } else if let Err(e) = inner.save_state().await {
                 // Nothing consumed a prekey. Retry the original entry if storage recovers.
                 inner.contacts[index]
                     .state
                     .pending_carried_initials
                     .insert(next, bytes);
+                inner.carried_deferred_timestamps = saved_carried_ts;
                 return Err(describe(&e));
             }
         }
-        Ok(upgrade)
+        Ok(JoinCarriedOutcome {
+            recommend_upgrade,
+            has_deferred: inner.contacts[index].deferred_carried > 0,
+        })
     }
 
     pub(super) fn process_initial(
@@ -542,9 +808,25 @@ impl Engine {
                 .log("dropped an initial message claiming to be from your own key");
             return InitialOutcome::Ack;
         }
-        if let Err(reason) = inner.check_isolation(peer) {
-            self.ui.log(reason);
+        if inner.is_isolated_peer(peer) {
+            if inner.is_pq_incompatible_isolated_peer(peer) {
+                self.ui.log(format!(
+                    "Deferred initial message from {}: existing contact uses a post-quantum suite unsupported by this build.",
+                    short(peer)
+                ));
+                return InitialOutcome::DeferUnsupportedSuite;
+            }
+            if let Err(reason) = inner.check_isolation(peer) {
+                self.ui.log(reason);
+            }
             return InitialOutcome::Ack;
+        }
+        if message.pq_suite().is_some_and(|s| !s.is_supported()) {
+            self.ui.log(format!(
+                "Deferred initial message from {}: unsupported post-quantum suite.",
+                short(peer)
+            ));
+            return InitialOutcome::DeferUnsupportedSuite;
         }
         let opened = match inner.open_initial(peer, message) {
             Ok(opened) => opened,
@@ -727,9 +1009,16 @@ impl Engine {
         inner: &mut Inner,
         now_anyway: bool,
     ) -> Result<(), PublishError> {
+        let (preserve_spks, preserve_digests) = preserved_deferred_prekeys(inner, now());
         let prepared = inner
             .client
-            .prepare_publish_v2(&inner.audience, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS)
+            .prepare_publish_v2_preserving(
+                &inner.audience,
+                ONE_TIME_PREKEYS,
+                PQ_ONE_TIME_PREKEYS,
+                &preserve_spks,
+                &preserve_digests,
+            )
             .map_err(PublishError::prepare)?;
         // H-2: Persist new prekeys & manifest state BEFORE transmitting!
         inner.save_state().await.map_err(PublishError::storage)?;
@@ -877,11 +1166,32 @@ impl Engine {
                         Ok(RefillV2Outcome::Handled)
                     }
                     ErrorKind::Unimplemented if pq_count > 0 => {
-                        inner.server_pq = ServerPqStatus::Disabled;
-                        if inner.client.pq_config().strict_pq {
-                            Err(describe(&e))
-                        } else {
-                            Ok(RefillV2Outcome::PqDisabled)
+                        // Confirm via `GetServerInfo` that the relay has runtime PQ disabled
+                        // before marking `ServerPqStatus::Disabled` (a missing `RefillPrekeys` RPC
+                        // or transient error must not downgrade server PQ status).
+                        match inner.client.check_server_info(&inner.audience).await {
+                            Ok(info) if !info.pq_enabled => {
+                                inner.server_pq = ServerPqStatus::Disabled;
+                                if inner.client.pq_config().strict_pq {
+                                    Err(describe(&e))
+                                } else {
+                                    Ok(RefillV2Outcome::PqDisabled)
+                                }
+                            }
+                            Ok(_) => {
+                                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                                Err(describe(&e))
+                            }
+                            Err(info_err)
+                                if should_require_update_for_rpc(
+                                    ProtocolRpcScope::CoreV2,
+                                    &info_err,
+                                ) =>
+                            {
+                                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                                Err(describe(&e))
+                            }
+                            Err(info_err) => Err(describe(&info_err)),
                         }
                     }
                     ErrorKind::Unimplemented => {
@@ -1067,7 +1377,6 @@ impl Engine {
         stamp(&mut greeting, 1);
         let signs_in_here = same_server(&inner.server, &origin());
 
-        let local_pq = inner.local_pq_enabled();
         let prepared = inner
             .client
             .prepare_initiate_v2(
@@ -1079,9 +1388,7 @@ impl Engine {
             )
             .await
             .map_err(|e| {
-                if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !local_pq {
-                    self.require_update(describe(&e));
-                }
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 match e.kind() {
                     ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
                     ErrorKind::SignInRequired => {

@@ -484,6 +484,14 @@ impl LocalPrekeys {
         self.generations.back().map(|g| g.signed_prekey)
     }
 
+    /// The signed prekey of the oldest generation that the next [`generate`](Self::generate)
+    /// would evict, if `self.generations.len() >= KEPT_GENERATIONS`.
+    pub fn oldest_evictable_signed_prekey(&self) -> Option<PublicKey> {
+        (self.generations.len() >= KEPT_GENERATIONS)
+            .then(|| self.generations.front().map(|g| g.signed_prekey))
+            .flatten()
+    }
+
     /// The current (latest) generation's last-resort PQSPK identifier for `suite`, if present.
     pub fn current_pq_last_resort_id(&self, suite: PqSuite) -> Option<PqPrekeyId> {
         self.generations

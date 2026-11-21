@@ -451,7 +451,6 @@ impl Inner {
             let mut hello = greeting.to_bytes();
             stamp(&mut hello, self.contacts[index].state.clock);
 
-            let local_pq = self.local_pq_enabled();
             let prepared = {
                 let audience = &self.audience;
                 let client = &mut self.client;
@@ -483,7 +482,7 @@ impl Inner {
                 Err(e) => {
                     let kind = e.kind();
                     self.roll_back(peer, snapshot)?;
-                    if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !local_pq {
+                    if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) {
                         return Ok(SealOutcome::UpdateRequired(describe(&e)));
                     }
                     let paused = match kind {

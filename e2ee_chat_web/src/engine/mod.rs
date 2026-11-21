@@ -23,7 +23,10 @@ use crate::state::{
 };
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, js_error, key_to_url, short, size_u64, sleep};
-use crate::vault::{AppState, ContactState, HistoryEntry, OutgoingRecord, Vault, history_key};
+use crate::vault::{
+    AppState, CarriedDeferredTimestamp, ContactState, DeferredInitial, DeferredInitialsRecord,
+    HistoryEntry, OutgoingRecord, Vault, history_key,
+};
 use crate::{content, glue, transport};
 use attachments::upload_of;
 use contact::{Contact, forget_told, isolated_contact_views, restore_contacts, stored_contacts};
@@ -234,6 +237,11 @@ struct Inner<V = Vault> {
     last_server_pq_opks: Option<u32>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
+    /// Encrypted inbox initials retained in the separate `deferred_initials` vault record.
+    deferred_initials: Vec<DeferredInitial>,
+    /// Earliest timestamps (Unix ms) at which unsupported carried initials referencing an SPK
+    /// were retained, bounding signed-prekey preservation across rotations.
+    carried_deferred_timestamps: Vec<CarriedDeferredTimestamp>,
     client: Client<Connect>,
     contacts: Vec<Contact>,
     /// Unreadable records retained verbatim until explicitly deleted.
@@ -710,6 +718,7 @@ impl Engine {
             client,
             vec![],
             vec![],
+            DeferredInitialsRecord::default(),
         ))
         .await;
         Ok(())
@@ -717,7 +726,7 @@ impl Engine {
 
     /// Unlock the vault with `passphrase`.
     pub async fn unlock(self: &Rc<Self>, passphrase: Zeroizing<String>) -> Result<(), String> {
-        let (vault, mut state) = Vault::unlock(passphrase.as_bytes())
+        let (vault, mut state, mut deferred) = Vault::unlock(passphrase.as_bytes())
             .await
             .map_err(|e| describe(&e))?;
         drop(passphrase);
@@ -736,6 +745,16 @@ impl Engine {
             &address,
         );
         let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
+        let migrated_deferred = handshake::merge_legacy_deferred_initials(
+            &mut deferred.entries,
+            std::mem::take(&mut state.deferred_initials),
+        );
+        let (pruned_deferred, modified_deferred) =
+            handshake::sanitize_deferred_initials(&mut deferred.entries, crate::util::now());
+        let pruned_carried_ts = handshake::prune_carried_timestamps_for_contacts(
+            &mut deferred.carried_timestamps,
+            contacts.iter(),
+        );
         let mut inner = Inner::new(
             vault,
             address,
@@ -744,11 +763,24 @@ impl Engine {
             client,
             contacts,
             isolated_contacts,
+            deferred,
         );
         if pruned > 0 {
             self.ui.log(format!(
                 "Removed {pruned} invalid or duplicate inbox acknowledgement ID(s) from the vault."
             ));
+        }
+        if pruned_deferred > 0 {
+            self.ui.log(format!(
+                "Removed {pruned_deferred} invalid, duplicate, or excess deferred initial message(s) from the vault."
+            ));
+        }
+        if pruned > 0
+            || pruned_deferred > 0
+            || modified_deferred
+            || migrated_deferred
+            || pruned_carried_ts > 0
+        {
             inner.unsaved_state = true;
         }
         self.unlocked(inner).await;
@@ -1047,6 +1079,7 @@ impl Engine {
         let mut state = inner.app_state();
         state.contacts.retain(|contact| contact.peer != peer);
         state.farewells.extend(farewell.clone());
+        let deferred = inner.deferred_record_without_peer(&peer);
         let unsaved = inner
             .unsaved
             .iter()
@@ -1059,7 +1092,7 @@ impl Engine {
             .map(|(_, record)| record);
         if let Err(e) = inner
             .vault
-            .forget(&state, &peer, unsaved, unsaved_outbox)
+            .forget(&state, &deferred, &peer, unsaved, unsaved_outbox)
             .await
         {
             if let Some(snapshot) = snapshot {
@@ -1094,6 +1127,8 @@ impl Engine {
         let was_isolated = inner.is_isolated_peer(&peer);
         inner.contacts.retain(|contact| contact.peer != peer);
         inner.forget_isolated_peer(&peer);
+        inner.deferred_initials = deferred.entries;
+        inner.carried_deferred_timestamps = deferred.carried_timestamps;
         inner.finish_state_save(state.pending_inbox_acks);
         // The other chats' records left unsaved were saved with it, and show at the next sync.
         inner.saved_late.extend(
@@ -1188,6 +1223,7 @@ trait HistoryStore {
     async fn save<'a>(
         &self,
         state: &AppState,
+        deferred: &DeferredInitialsRecord,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()>;
@@ -1212,23 +1248,27 @@ impl HistoryStore for Vault {
     async fn save<'a>(
         &self,
         state: &AppState,
+        deferred: &DeferredInitialsRecord,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()> {
-        Vault::save(self, state, entries, outgoing).await
+        Vault::save(self, state, deferred, entries, outgoing).await
     }
 }
 
 impl<V: HistoryStore> Inner<V> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         vault: V,
         server: String,
         audience: String,
-        state: AppState,
+        mut state: AppState,
         client: Client<Connect>,
         contacts: Vec<Contact>,
         mut isolated_contacts: Vec<ContactState>,
+        deferred: DeferredInitialsRecord,
     ) -> Self {
+        state.deferred_initials.clear();
         let active_peers: HashSet<_> = contacts.iter().map(|c| c.peer).collect();
         isolated_contacts.retain(|c| {
             PublicKey::try_from(c.peer.as_slice())
@@ -1243,6 +1283,8 @@ impl<V: HistoryStore> Inner<V> {
             server,
             audience,
             state,
+            deferred_initials: deferred.entries,
+            carried_deferred_timestamps: deferred.carried_timestamps,
             client,
             contacts,
             isolated_contacts,
@@ -1259,17 +1301,49 @@ impl<V: HistoryStore> Inner<V> {
         }
     }
 
-    /// What the vault keeps.
+    /// What the vault keeps in `STATE` (never writes tag 12 `deferred_initials`, which live in
+    /// the separate `deferred_initials` record).
     fn app_state(&self) -> AppState {
         let mut state = AppState {
             client: Some(self.client.state().into()),
             contacts: stored_contacts(&self.contacts, &self.isolated_contacts),
+            deferred_initials: vec![],
             ..self.state.clone()
         };
         for &id in &self.deferred_acks_after_save {
             handshake::stage_inbox_ack(&mut state.pending_inbox_acks, id);
         }
         state
+    }
+
+    fn deferred_record(&self) -> DeferredInitialsRecord {
+        DeferredInitialsRecord {
+            entries: self.deferred_initials.clone(),
+            carried_timestamps: self.carried_deferred_timestamps.clone(),
+        }
+    }
+
+    pub(super) fn deferred_record_without_peer(&self, peer: &PublicKey) -> DeferredInitialsRecord {
+        let entries = self
+            .deferred_initials
+            .iter()
+            .filter(|entry| {
+                entry
+                    .initial
+                    .as_ref()
+                    .is_none_or(|w| w.identity_key.as_ref() != peer.as_slice())
+            })
+            .cloned()
+            .collect();
+        let mut carried_timestamps = self.carried_deferred_timestamps.clone();
+        handshake::prune_carried_timestamps_for_contacts(
+            &mut carried_timestamps,
+            self.contacts.iter().filter(|c| c.peer != *peer),
+        );
+        DeferredInitialsRecord {
+            entries,
+            carried_timestamps,
+        }
     }
 
     fn finish_state_save(&mut self, committed_acks: Vec<u64>) {
@@ -1315,9 +1389,11 @@ impl<V: HistoryStore> Inner<V> {
         let unsaved = self.unsaved.iter().map(|(_, record)| record);
         let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
         let state = self.app_state();
+        let deferred = self.deferred_record();
         self.vault
             .save(
                 &state,
+                &deferred,
                 unsaved.chain(entries),
                 unsaved_outbox.chain(outgoing),
             )
@@ -1337,6 +1413,27 @@ impl<V: HistoryStore> Inner<V> {
 
     pub(super) fn is_isolated_peer(&self, peer: &PublicKey) -> bool {
         self.isolated_peers.contains(peer)
+    }
+
+    /// Whether `peer` is isolated specifically because its saved session uses a known ML-KEM suite
+    /// not compiled into this build (rather than structural corruption).
+    pub(super) fn is_pq_incompatible_isolated_peer(&self, peer: &PublicKey) -> bool {
+        let me = self.client.identity_key();
+        self.is_isolated_peer(peer)
+            && self
+                .isolated_contacts
+                .iter()
+                .any(|c| c.peer == peer.as_slice() && contact::is_pq_incompatible_isolated(c, &me))
+    }
+
+    /// Whether any deferred inbox initial from `peer` is currently awaiting a capable build.
+    pub(super) fn has_deferred_initial_for(&self, peer: &PublicKey) -> bool {
+        self.deferred_initials.iter().any(|entry| {
+            entry
+                .initial
+                .as_ref()
+                .is_some_and(|w| w.identity_key.as_ref() == peer.as_slice())
+        })
     }
 
     fn check_isolation(&self, peer: &PublicKey) -> Result<(), String> {

@@ -58,10 +58,12 @@ impl Error {
         self.origin == ErrorOrigin::Protocol
     }
 
-    /// Whether the server definitively refused the request, so locally prepared keys can be
-    /// rolled back. Transport, response-decoding and internal server errors leave this unknown.
+    /// Whether the server definitively refused the request (directly from a protocol handler or
+    /// via a decoded Connect error body), so locally prepared keys can be rolled back. Transport,
+    /// response-decoding, bare HTTP status (e.g. proxy 404), and internal server errors leave
+    /// this unknown.
     pub fn is_server_refusal(&self) -> bool {
-        self.origin != ErrorOrigin::Transport
+        self.origin == ErrorOrigin::Protocol
             && matches!(
                 self.kind,
                 ErrorKind::SignInRequired

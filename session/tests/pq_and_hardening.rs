@@ -1366,8 +1366,91 @@ mod pq_e2e {
             )]);
             check_publish_v2_error(&ambiguous, false, expected, false).await;
         }
-        let strict = RpcErrors::new([("publish_on", Kind::Unimplemented.into())]);
-        check_publish_v2_error(&strict, true, ErrorKind::PqRequired, true).await;
+        /// Scripted v2 handshake returning `Ok(GetServerInfoResponse)` on `get_server_info`
+        /// and scripted errors on all other RPCs.
+        struct ScriptedV2InfoAndErrors {
+            info: protocol::Result<GetServerInfoResponse>,
+            errors: RpcErrors,
+        }
+
+        impl LocalHandshakeV2 for &ScriptedV2InfoAndErrors {
+            async fn get_server_info(
+                &self,
+                _: GetServerInfoRequest,
+            ) -> protocol::Result<GetServerInfoResponse> {
+                match &self.info {
+                    Ok(resp) => Ok(resp.clone()),
+                    Err(e) => Err(e.kind().into()),
+                }
+            }
+            async fn publish_v2(
+                &self,
+                request: PublishV2Request,
+            ) -> protocol::Result<PublishV2Response> {
+                self.errors.fail(if request.manifest.unwrap().pq_enabled {
+                    "publish_on"
+                } else {
+                    "publish_off"
+                })
+            }
+            async fn refill_prekeys(
+                &self,
+                _: RefillPrekeysRequest,
+            ) -> protocol::Result<RefillPrekeysResponse> {
+                self.errors.fail("refill_prekeys")
+            }
+            async fn get_manifest(
+                &self,
+                _: GetManifestRequest,
+            ) -> protocol::Result<GetManifestResponse> {
+                self.errors.fail("get_manifest")
+            }
+            async fn claim_bundle(
+                &self,
+                _: ClaimBundleRequest,
+            ) -> protocol::Result<ClaimBundleResponse> {
+                self.errors.fail("claim_bundle")
+            }
+            async fn send_initial_v2(
+                &self,
+                _: SendInitialV2Request,
+            ) -> protocol::Result<SendInitialV2Response> {
+                self.errors.fail("send_initial_v2")
+            }
+            async fn list_initial_messages(
+                &self,
+                _: ListInitialMessagesRequest,
+            ) -> protocol::Result<ListInitialMessagesResponse> {
+                self.errors.fail("list_initial_messages")
+            }
+            async fn ack_initial_messages(
+                &self,
+                _: AckInitialMessagesRequest,
+            ) -> protocol::Result<AckInitialMessagesResponse> {
+                self.errors.fail("ack_initial_messages")
+            }
+        }
+
+        let pq_off_info = GetServerInfoResponse {
+            server_id: AUDIENCE.into(),
+            pq_enabled: false,
+            supported_suites: vec![],
+            pq_ratchet_supported: false,
+            legacy_v1_enabled: false,
+            allow_unsigned_fetch: false,
+        };
+        let strict_pq_off = ScriptedV2InfoAndErrors {
+            info: Ok(pq_off_info),
+            errors: RpcErrors::new([("publish_on", Kind::Unimplemented.into())]),
+        };
+        check_publish_v2_error(&strict_pq_off, true, ErrorKind::PqRequired, true).await;
+        // If `GetServerInfo` also returns `Unimplemented` (old server lacking v2), strict mode
+        // reports `Unimplemented` rather than misclassifying it as `PqRequired`.
+        let strict_missing_v2 = RpcErrors::new([
+            ("publish_on", Kind::Unimplemented.into()),
+            ("get_server_info", Kind::Unimplemented.into()),
+        ]);
+        check_publish_v2_error(&strict_missing_v2, true, ErrorKind::Unimplemented, true).await;
         for (reply, expected) in [
             (LostReply::CorruptBody, ErrorKind::InvalidResponse),
             (LostReply::Transport, ErrorKind::Server),
@@ -1383,17 +1466,79 @@ mod pq_e2e {
         for (calls, strict) in [
             (RpcErrors::new([("publish_on", ambiguous())]), false),
             (RpcErrors::new([("publish_on", ambiguous())]), true),
-            (
-                RpcErrors::new([
-                    ("publish_on", Unimplemented.into()),
-                    ("publish_off", ambiguous()),
-                ]),
-                false,
-            ),
         ] {
             check_publish_v2_error(&calls, strict, ErrorKind::Unimplemented, false).await;
             assert!(calls.0.borrow().is_empty());
         }
+
+        struct PqOffPublishAmbiguous(RpcErrors);
+        impl LocalHandshakeV2 for &PqOffPublishAmbiguous {
+            async fn get_server_info(
+                &self,
+                _: GetServerInfoRequest,
+            ) -> protocol::Result<GetServerInfoResponse> {
+                Ok(GetServerInfoResponse {
+                    server_id: AUDIENCE.into(),
+                    pq_enabled: false,
+                    supported_suites: vec![],
+                    pq_ratchet_supported: false,
+                    legacy_v1_enabled: false,
+                    allow_unsigned_fetch: false,
+                })
+            }
+            async fn publish_v2(
+                &self,
+                request: PublishV2Request,
+            ) -> protocol::Result<PublishV2Response> {
+                self.0.fail(if request.manifest.unwrap().pq_enabled {
+                    "publish_on"
+                } else {
+                    "publish_off"
+                })
+            }
+            async fn refill_prekeys(
+                &self,
+                _: RefillPrekeysRequest,
+            ) -> protocol::Result<RefillPrekeysResponse> {
+                self.0.fail("refill_prekeys")
+            }
+            async fn get_manifest(
+                &self,
+                _: GetManifestRequest,
+            ) -> protocol::Result<GetManifestResponse> {
+                self.0.fail("get_manifest")
+            }
+            async fn claim_bundle(
+                &self,
+                _: ClaimBundleRequest,
+            ) -> protocol::Result<ClaimBundleResponse> {
+                self.0.fail("claim_bundle")
+            }
+            async fn send_initial_v2(
+                &self,
+                _: SendInitialV2Request,
+            ) -> protocol::Result<SendInitialV2Response> {
+                self.0.fail("send_initial_v2")
+            }
+            async fn list_initial_messages(
+                &self,
+                _: ListInitialMessagesRequest,
+            ) -> protocol::Result<ListInitialMessagesResponse> {
+                self.0.fail("list_initial_messages")
+            }
+            async fn ack_initial_messages(
+                &self,
+                _: AckInitialMessagesRequest,
+            ) -> protocol::Result<AckInitialMessagesResponse> {
+                self.0.fail("ack_initial_messages")
+            }
+        }
+        let fallback_ambiguous = PqOffPublishAmbiguous(RpcErrors::new([
+            ("publish_on", Unimplemented.into()),
+            ("publish_off", ambiguous()),
+        ]));
+        check_publish_v2_error(&fallback_ambiguous, false, ErrorKind::Unimplemented, false).await;
+        assert!(fallback_ambiguous.0.0.borrow().is_empty());
     }
 
     #[tokio::test]
@@ -1411,7 +1556,7 @@ mod pq_e2e {
                     ambiguous()
                 }
             };
-            let calls = if !strict && confirmed {
+            let calls = if confirmed {
                 RpcErrors::new([
                     ("claim_bundle", failure()),
                     ("get_server_info", failure()),
@@ -1442,14 +1587,7 @@ mod pq_e2e {
                 )
                 .await
                 .unwrap_err();
-            assert_eq!(
-                err.kind(),
-                if strict && confirmed {
-                    ErrorKind::PqRequired
-                } else {
-                    ErrorKind::Unimplemented
-                }
-            );
+            assert_eq!(err.kind(), ErrorKind::Unimplemented);
             assert_eq!(err.is_server_refusal(), confirmed);
 
             let err = client
@@ -4534,6 +4672,290 @@ mod pq_e2e {
         let msgs = session.receive_v2(&bob, AUDIENCE).await.unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content.as_ref().unwrap(), b"follow-up");
+
+        // 8. Regression: the explicitly approved classical chat MUST be able to rekey via
+        //    `prepare_start_again_v2` while the relay remains rolled back (it must NOT have
+        //    self-pinned `pq_pinned = true` during approved fallback), while still rejecting
+        //    manifest stripping (`None`) and upgrading cleanly once PQ is re-enabled.
+        assert!(!alice_session.peer_pq_state().pq_pinned);
+        assert!(alice_session.peer_pq_state().peer_pq_capable);
+        assert_eq!(alice_session.peer_pq_state().pinned_manifest_seq, 1);
+        let rekey_req = alice
+            .prepare_start_again_v2(AUDIENCE, &mut alice_session, b"rekey-during-rollback")
+            .await
+            .expect("approved classical chat must rekey cleanly during ongoing PQ rollback");
+        assert_eq!(rekey_req.message.as_ref().unwrap().version, 1);
+        assert!(!alice_session.security().unwrap().is_pq);
+        assert!(!alice_session.peer_pq_state().pq_pinned);
+
+        // Even without `pq_pinned = true`, `pinned_manifest_seq > 0` still blocks manifest
+        // stripping (`manifest: None`) with `DowngradeDetected`.
+        let strip_hs = AttackingHandshake {
+            inner: DualHandshake::new(store.clone(), AUDIENCE),
+            attack: AttackMode::StripManifest,
+        };
+        let mut alice_strip = Client::new(strip_hs);
+        let err = alice_strip
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                alice_session.peer_pq_state(),
+                b"stripped",
+                mb.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DowngradeDetected);
+
+        // Once the operator re-enables PQ on the relay, the next rekey upgrades to PQXDH and
+        // pins `pq_pinned = true` while clearing `allow_classical_exception`.
+        enabled.store(true, Ordering::Relaxed);
+        let upgraded_req = alice
+            .prepare_start_again_v2(AUDIENCE, &mut alice_session, b"upgrade-after-recovery")
+            .await
+            .unwrap();
+        assert_eq!(upgraded_req.message.as_ref().unwrap().version, 2);
+        assert!(alice_session.security().unwrap().is_pq);
+        assert!(alice_session.peer_pq_state().pq_pinned);
+        assert!(!alice_session.peer_pq_state().allow_classical_exception);
+    }
+
+    #[tokio::test]
+    async fn bare_proxy_404_never_downgrades_or_retracts_and_pq_on_unimplemented_surfaces() {
+        use prost::Message as _;
+        use protocol::connect::{ConnectClient, LocalPost, ProcedureV2};
+
+        #[derive(Clone)]
+        struct ProxyAndMismatch {
+            calls: Arc<std::sync::Mutex<Vec<String>>>,
+            mode: ProxyMode,
+        }
+        #[derive(Clone, Copy)]
+        enum ProxyMode {
+            Bare404,
+            ConnectUnimplWithPqOnInfo,
+            ConnectUnimplWithTransientInfo502,
+        }
+        impl LocalPost for ProxyAndMismatch {
+            async fn post(&self, path: &str, _: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
+                self.calls.lock().unwrap().push(path.to_string());
+                match self.mode {
+                    ProxyMode::Bare404 => Ok((404, b"<html>Not Found</html>".to_vec())),
+                    ProxyMode::ConnectUnimplWithPqOnInfo => {
+                        if path == ProcedureV2::GetServerInfo.path() {
+                            let info = GetServerInfoResponse {
+                                server_id: AUDIENCE.into(),
+                                pq_enabled: true,
+                                supported_suites: vec![1, 2],
+                                pq_ratchet_supported: true,
+                                legacy_v1_enabled: false,
+                                allow_unsigned_fetch: false,
+                            };
+                            Ok((200, info.encode_to_vec()))
+                        } else {
+                            let err = protocol::connect::error(
+                                protocol::ErrorKind::Unimplemented,
+                                "procedure missing",
+                            );
+                            Ok((err.status, err.body))
+                        }
+                    }
+                    ProxyMode::ConnectUnimplWithTransientInfo502 => {
+                        if path == ProcedureV2::GetServerInfo.path() {
+                            Ok((502, b"Bad Gateway".to_vec()))
+                        } else {
+                            let err = protocol::connect::error(
+                                protocol::ErrorKind::Unimplemented,
+                                "procedure missing",
+                            );
+                            Ok((err.status, err.body))
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1. Bare proxy HTTP 404 on PublishV2, RefillPrekeys, and ClaimBundle MUST NOT downgrade
+        //    to PQ-OFF, MUST NOT map strict_pq to PqRequired, MUST NOT retract keys, and MUST NOT
+        //    report `is_server_refusal() == true` or `is_connect_error() == true`.
+        for strict in [false, true] {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let transport = ConnectClient::new(ProxyAndMismatch {
+                calls: calls.clone(),
+                mode: ProxyMode::Bare404,
+            });
+            let mut client = Client::new(transport)
+                .with_pq_config(PqConfig {
+                    strict_pq: strict,
+                    ..PqConfig::default()
+                })
+                .unwrap();
+            let err = client.publish_v2(AUDIENCE, 2, 2).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Unimplemented);
+            assert!(!err.is_server_refusal());
+            assert!(!err.is_connect_error());
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![ProcedureV2::PublishV2.path().to_string()],
+                "bare proxy 404 must not trigger GetServerInfo or PQ-OFF PublishV2"
+            );
+            assert_eq!(
+                client.current_one_time_count(),
+                2,
+                "bare proxy 404 must preserve prepared prekeys"
+            );
+
+            calls.lock().unwrap().clear();
+            let refill_err = client.refill_prekeys_v2(AUDIENCE, 2, 2).await.unwrap_err();
+            assert_eq!(refill_err.kind(), ErrorKind::Unimplemented);
+            assert!(!refill_err.is_server_refusal());
+            assert_eq!(
+                client.current_one_time_count(),
+                4,
+                "bare proxy 404 must preserve refilled prekeys"
+            );
+
+            calls.lock().unwrap().clear();
+            let peer = Client::new(()).identity_key();
+            let claim_err = client
+                .prepare_initiate_v2(AUDIENCE, &peer, &PeerPqState::default(), b"hi", ())
+                .await
+                .unwrap_err();
+            assert_eq!(claim_err.kind(), ErrorKind::Unimplemented);
+            assert!(!claim_err.is_server_refusal());
+            assert!(!claim_err.is_connect_error());
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![ProcedureV2::ClaimBundle.path().to_string()],
+                "bare proxy 404 on ClaimBundle must not fallback or call GetServerInfo"
+            );
+        }
+
+        // 2. Connect `Unimplemented` on PublishV2 / ClaimBundle while `GetServerInfo` confirms
+        //    `pq_enabled == true` MUST NOT publish PQ-OFF or mislabel strict_pq as `PqRequired`:
+        //    it returns confirmed Connect `Unimplemented` so the client surfaces an update banner.
+        for strict in [false, true] {
+            let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let transport = ConnectClient::new(ProxyAndMismatch {
+                calls: calls.clone(),
+                mode: ProxyMode::ConnectUnimplWithPqOnInfo,
+            });
+            let mut client = Client::new(transport)
+                .with_pq_config(PqConfig {
+                    strict_pq: strict,
+                    ..PqConfig::default()
+                })
+                .unwrap();
+            let err = client.publish_v2(AUDIENCE, 1, 1).await.unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::Unimplemented);
+            assert!(err.is_connect_error());
+            assert!(err.is_server_refusal());
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![
+                    ProcedureV2::PublishV2.path().to_string(),
+                    ProcedureV2::GetServerInfo.path().to_string(),
+                ]
+            );
+
+            calls.lock().unwrap().clear();
+            let peer = Client::new(()).identity_key();
+            let claim_err = client
+                .prepare_initiate_v2(AUDIENCE, &peer, &PeerPqState::default(), b"hi", ())
+                .await
+                .unwrap_err();
+            assert_eq!(claim_err.kind(), ErrorKind::Unimplemented);
+            assert!(claim_err.is_connect_error());
+            assert!(claim_err.is_server_refusal());
+        }
+
+        // 3. Connect `Unimplemented` followed by transient 502 on `GetServerInfo` returns the
+        //    transient error (NOT confirmed `Unimplemented`, NOT `PqRequired`, NOT PQ-OFF).
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let transport = ConnectClient::new(ProxyAndMismatch {
+            calls,
+            mode: ProxyMode::ConnectUnimplWithTransientInfo502,
+        });
+        let mut client = Client::new(transport);
+        let err = client.publish_v2(AUDIENCE, 1, 1).await.unwrap_err();
+        assert_ne!(err.kind(), ErrorKind::Unimplemented);
+        assert!(!err.is_server_refusal());
+        let peer = Client::new(()).identity_key();
+        let claim_err = client
+            .prepare_initiate_v2(AUDIENCE, &peer, &PeerPqState::default(), b"hi", ())
+            .await
+            .unwrap_err();
+        assert_ne!(claim_err.kind(), ErrorKind::Unimplemented);
+        assert!(!claim_err.is_server_refusal());
+    }
+
+    #[tokio::test]
+    async fn prepare_publish_v2_preserving_retains_oldest_generation_and_manifest_digest() {
+        let store = SharedStore::default();
+        let hs = DualHandshake::new(store.clone(), AUDIENCE);
+        let mb = DualMailbox::new(store, AUDIENCE);
+
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs.clone());
+
+        // Gen 1: Bob publishes PQ keys and Alice initiates a PQXDH greeting targeting Gen 1.
+        let p1 = bob.prepare_publish_v2(AUDIENCE, 2, 2).unwrap();
+        let spk1 = bob.current_signed_prekey().unwrap();
+        let digest1 =
+            protocol::handshake_v2::manifest_digest(p1.request.manifest.as_ref().unwrap()).unwrap();
+        bob.transmit_publish_v2(&p1).await.unwrap();
+        bob.commit_publish_v2(p1);
+
+        let init = alice
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"deferred-gen1",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let deferred_msg =
+            InitialMessageV2::try_from(init.request.message.as_ref().unwrap()).unwrap();
+
+        // Rotate 5 times (more than KEPT_GENERATIONS = 2 and MAX_RECENT_MANIFEST_DIGESTS = 4)
+        // while preserving `spk1` and `digest1`.
+        for _ in 0..5 {
+            let prep = bob
+                .prepare_publish_v2_preserving(AUDIENCE, 1, 1, &[spk1], &[digest1])
+                .unwrap();
+            bob.transmit_publish_v2(&prep).await.unwrap();
+            bob.commit_publish_v2(prep);
+        }
+        // Gen 1's SPK and manifest digest MUST still be intact so the deferred PQXDH greeting opens!
+        assert_eq!(bob.oldest_evictable_signed_prekey(), Some(spk1));
+
+        // Refusal rollback on a preserving publish restores `publishing = false` and retracts keys.
+        let count_before = bob.current_one_time_count();
+        let refused = bob
+            .prepare_publish_v2_preserving(AUDIENCE, 3, 2, &[spk1], &[digest1])
+            .unwrap();
+        bob.rollback_publish_v2_on_refusal(refused);
+        assert_eq!(bob.current_one_time_count(), count_before);
+
+        let AcceptedInitial::Accepted { first_message, .. } = bob
+            .accept_initial_v2(
+                &alice.identity_key(),
+                &PeerPqState::default(),
+                &deferred_msg,
+                mb,
+            )
+            .unwrap()
+        else {
+            panic!("deferred Gen 1 PQXDH initial must still decrypt after preserved rotations");
+        };
+        assert_eq!(first_message, b"deferred-gen1");
+
+        // Once no longer preserved, the next rotation advances normally and evicts Gen 1.
+        let rotated = bob.prepare_publish_v2(AUDIENCE, 1, 1).unwrap();
+        bob.commit_publish_v2(rotated);
+        assert_ne!(bob.oldest_evictable_signed_prekey(), Some(spk1));
     }
 
     #[tokio::test]

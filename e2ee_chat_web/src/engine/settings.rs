@@ -1,7 +1,7 @@
 //! Encryption settings, classical approvals and post-quantum upgrades.
 
 use super::outbox::RequeueOutcome;
-use super::{Engine, HistoryStore, Inner, PqSaveOutcome, records};
+use super::{Engine, HistoryStore, Inner, PqSaveOutcome, ProtocolRpcScope, records};
 use crate::content::{Content, Kind, stamp};
 use crate::state::{Delivery, ServerPqStatus};
 use crate::transport::Fetch;
@@ -223,6 +223,7 @@ impl Engine {
             Ok(outgoing) => outgoing,
             Err(e) => {
                 inner.roll_back(&peer, snapshot)?;
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 let kind = e.kind();
                 let persist_alert = inner
                     .contact(&peer)
@@ -362,7 +363,7 @@ pub(super) fn describe_upgrade_pq_error(
     server_pq: &ServerPqStatus,
     fallback: String,
 ) -> String {
-    if *server_pq == ServerPqStatus::Disabled || kind == ErrorKind::Unimplemented {
+    if *server_pq == ServerPqStatus::Disabled {
         return "Cannot upgrade to post-quantum encryption: this server does not have \
                 post-quantum encryption enabled."
             .to_string();

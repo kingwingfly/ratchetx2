@@ -1,7 +1,7 @@
 //! The [Connect protocol](https://connectrpc.com/docs/protocol)'s unary calls: protobuf over
 //! plain HTTP `POST`, for where gRPC cannot go, such as browsers and Cloudflare Workers.
 //!
-//! A call is a `POST` to its procedure's path, e.g. `/handshake.v1.HandshakeService/Publish`,
+//! A call is a `POST` to its procedure's path, e.g. `/handshake.v2.HandshakeService/PublishV2`,
 //! with `Content-Type: application/proto`, `Connect-Protocol-Version: 1` and the protobuf
 //! request as the body. A success is `200 OK` with the protobuf response. An error has another
 //! status and a JSON body such as `{"code":"not_found","message":"not found"}`, whose code maps
@@ -875,10 +875,11 @@ mod test {
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Unimplemented);
-            assert!(error.is_server_refusal());
+            assert_eq!(error.is_server_refusal(), is_connect);
             assert_eq!(error.is_connect_error(), is_connect);
         }
         assert!(Error::from(ErrorKind::Unimplemented).is_connect_error());
+        assert!(Error::from(ErrorKind::Unimplemented).is_server_refusal());
     }
 
     #[tokio::test]

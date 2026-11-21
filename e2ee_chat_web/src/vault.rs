@@ -7,6 +7,10 @@
 //! - `state`: the [`AppState`]: the identity, the prekeys, the contacts and their sessions.
 //!   In v2, its AES-256-GCM AAD is `b"state/v2\0" || encoded(VaultHeader)` so any tampering with
 //!   header parameters, version, or revision fails decryption.
+//! - `deferred_initials`: optional [`DeferredInitialsRecord`] holding encrypted inbox initials
+//!   retained for a build with their suite (or restored contact), encrypted under AAD
+//!   `b"deferred_initials"` and committed atomically in the same CAS transaction as `state` so
+//!   rolling back to an older bundle that rewrites `state` never strips them.
 //! - `history/<peer in hex>/<index>`: one [`HistoryEntry`] of a chat, without the bytes of its
 //!   file, if any, which are in `file/<peer in hex>/<index>`, a [`FileRecord`], read when shown.
 //! - `outbox/<peer in hex>/<index>`: a message of a chat, the history entry `index`, waiting to
@@ -47,6 +51,7 @@ const DATABASE_VERSION: u32 = 2;
 const STORE: &str = "records";
 const HEADER: &str = "vault";
 const STATE: &str = "state";
+const DEFERRED_INITIALS: &str = "deferred_initials";
 
 /// Legacy v1 vault schema version (v1 headers omitted field 5, so protobuf decodes `0`).
 pub const VAULT_VERSION_V1: u32 = 1;
@@ -300,9 +305,59 @@ pub struct AppState {
     /// Preferences to restore if the relay refuses a pending settings change.
     #[prost(message, optional, tag = "11")]
     pub pending_pq_rollback: Option<PendingPqRollback>,
-    /// Encrypted inbox initials retained for a build that supports their ML-KEM suite.
+    /// Legacy migration field for deferred inbox initials; always left empty on writes because
+    /// deferred initials are stored in the separate [`DEFERRED_INITIALS`] record.
     #[prost(message, repeated, tag = "12")]
     pub deferred_initials: Vec<session::protocol::handshake_v2::InitialMessageV2>,
+}
+
+/// One encrypted inbox initial retained until a build with its suite (or restored contact) can
+/// decrypt it, together with when it was first deferred (Unix ms, `0` if unknown).
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeferredInitial {
+    #[prost(message, optional, tag = "1")]
+    pub initial: Option<session::protocol::handshake_v2::InitialMessageV2>,
+    #[prost(uint64, tag = "2")]
+    pub deferred_at: u64,
+}
+
+/// Earliest timestamp (Unix ms) at which a carried initial referencing `signed_prekey` was
+/// retained, bounding signed-prekey preservation across rotations without changing `ContactState`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct CarriedDeferredTimestamp {
+    #[prost(bytes = "vec", tag = "1")]
+    pub signed_prekey: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub deferred_at: u64,
+}
+
+/// Separate encrypted sidecar record committed atomically with `STATE` so rolling back to an
+/// older bundle that rewrites `STATE` cannot strip already-acknowledged greetings.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeferredInitialsRecord {
+    #[prost(message, repeated, tag = "1")]
+    pub entries: Vec<DeferredInitial>,
+    #[prost(message, repeated, tag = "2")]
+    pub carried_timestamps: Vec<CarriedDeferredTimestamp>,
+}
+
+impl DeferredInitialsRecord {
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.carried_timestamps.is_empty()
+    }
+}
+
+/// Seal a [`DeferredInitialsRecord`] under `key` with the `deferred_initials` record AAD.
+pub fn seal_deferred_initials(key: &[u8; 32], record: &DeferredInitialsRecord) -> Vec<u8> {
+    let plaintext = Zeroizing::new(record.encode_to_vec());
+    seal_bytes(key, DEFERRED_INITIALS.as_bytes(), &plaintext)
+}
+
+/// Open a sealed [`DeferredInitialsRecord`] under `key` with the `deferred_initials` record AAD.
+pub fn open_deferred_initials(key: &[u8; 32], sealed: &[u8]) -> Result<DeferredInitialsRecord> {
+    let plain = open_bytes(key, DEFERRED_INITIALS.as_bytes(), sealed)
+        .ok_or_else(|| Error::Corrupt("deferred_initials does not decrypt".into()))?;
+    DeferredInitialsRecord::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -818,7 +873,7 @@ impl Vault {
 
     /// Open the vault with `passphrase`, seamlessly upgrading legacy v1 vaults to v2 atomically
     /// in a single IndexedDB RW transaction.
-    pub async fn unlock(passphrase: &[u8]) -> Result<(Self, AppState)> {
+    pub async fn unlock(passphrase: &[u8]) -> Result<(Self, AppState, DeferredInitialsRecord)> {
         let database = open().await?;
         let header_bytes = get(&database, HEADER)
             .await?
@@ -832,7 +887,7 @@ impl Vault {
             .await?
             .ok_or_else(|| Error::Corrupt("no state".into()))?;
 
-        if header.is_legacy_v1() {
+        let (vault, state) = if header.is_legacy_v1() {
             // Unlock legacy v1 vault with `"state"` AAD, then atomically re-seal as v2.
             let plain =
                 open_bytes(&key, STATE.as_bytes(), &sealed_state).ok_or(Error::WrongPassphrase)?;
@@ -882,7 +937,7 @@ impl Vault {
                 key,
                 header: RefCell::new(v2_header),
             };
-            Ok((vault, state))
+            (vault, state)
         } else {
             let plain = open_bytes(&key, &state_v2_aad(&header_bytes), &sealed_state)
                 .ok_or(Error::WrongPassphrase)?;
@@ -893,8 +948,13 @@ impl Vault {
                 key,
                 header: RefCell::new(header),
             };
-            Ok((vault, state))
-        }
+            (vault, state)
+        };
+        let deferred = match get(&vault.database, DEFERRED_INITIALS).await? {
+            Some(sealed) => open_deferred_initials(&vault.key, &sealed)?,
+            None => DeferredInitialsRecord::default(),
+        };
+        Ok((vault, state, deferred))
     }
 
     /// Open an IndexedDB RW transaction and enforce monotonic CAS revision BEFORE any writes.
@@ -921,12 +981,13 @@ impl Vault {
         }
     }
 
-    /// Save `state`, `entries`, each file of theirs in a record of its own, and `outgoing`,
-    /// the records of messages waiting to be pushed, or none for one that went, together, or
-    /// none of them, enforcing monotonic `revision` CAS inside the transaction.
+    /// Save `state`, `deferred`, `entries`, each file of theirs in a record of its own, and
+    /// `outgoing`, the records of messages waiting to be pushed, or none for one that went,
+    /// together, or none of them, enforcing monotonic `revision` CAS inside the transaction.
     pub async fn save<'a>(
         &self,
         state: &AppState,
+        deferred: &DeferredInitialsRecord,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> Result<()> {
@@ -937,6 +998,7 @@ impl Vault {
         let write_res: Result<()> = (|| {
             self.put_entries(&store, entries)?;
             self.put_outgoing(&store, outgoing)?;
+            self.put_deferred_initials(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
             Ok(())
@@ -947,6 +1009,23 @@ impl Vault {
         }
         commit(transaction).await?;
         *self.header.borrow_mut() = next_header;
+        Ok(())
+    }
+
+    /// Put or delete the separate encrypted [`DEFERRED_INITIALS`] record in `store`.
+    fn put_deferred_initials(
+        &self,
+        store: &idb::ObjectStore,
+        deferred: &DeferredInitialsRecord,
+    ) -> Result<()> {
+        if deferred.is_empty() {
+            store.delete(JsValue::from_str(DEFERRED_INITIALS))?;
+        } else {
+            store.put(
+                &bytes(&seal_deferred_initials(&self.key, deferred)),
+                Some(&DEFERRED_INITIALS.into()),
+            )?;
+        }
         Ok(())
     }
 
@@ -1241,12 +1320,13 @@ impl Vault {
             .collect()
     }
 
-    /// Save `state`, without the history, files, outbox, attachments and uploads of the chat
-    /// with `peer`, and `entries` / `outgoing` of other chats with it, enforcing monotonic
-    /// `revision` CAS.
+    /// Save `state` and `deferred`, without the history, files, outbox, attachments and uploads
+    /// of the chat with `peer`, and `entries` / `outgoing` of other chats with it, enforcing
+    /// monotonic `revision` CAS.
     pub async fn forget<'a>(
         &self,
         state: &AppState,
+        deferred: &DeferredInitialsRecord,
         peer: &PublicKey,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
@@ -1262,6 +1342,7 @@ impl Vault {
             }
             self.put_entries(&store, entries)?;
             self.put_outgoing(&store, outgoing)?;
+            self.put_deferred_initials(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
             Ok(())
@@ -1541,5 +1622,63 @@ mod tests {
         requires_wipe_on_drop(&upload);
         upload.clear_secrets();
         assert!(upload.token.is_empty() && upload.key.is_empty());
+    }
+
+    #[test]
+    fn deferred_initials_separate_record_survives_older_state_overwrite() {
+        let key = [0x5Au8; 32];
+        let header_v1 = VaultHeader::new();
+        let state_v1 = AppState {
+            name: "Alice".to_string(),
+            pending_inbox_acks: vec![42],
+            ..AppState::default()
+        };
+        assert!(state_v1.deferred_initials.is_empty());
+        let deferred = DeferredInitialsRecord {
+            entries: vec![DeferredInitial {
+                initial: Some(session::protocol::handshake_v2::InitialMessageV2 {
+                    version: 2,
+                    identity_key: vec![0x11; 32].into(),
+                    ephemeral_key: vec![0x22; 32].into(),
+                    signed_prekey: vec![0x33; 32].into(),
+                    pq_suite: 1,
+                    pq_last_resort: true,
+                    pq_prekey_id: vec![0x44; 32].into(),
+                    pq_ciphertext: vec![0x55; 1568].into(),
+                    ..Default::default()
+                }),
+                deferred_at: 1_700_000_000_000,
+            }],
+            carried_timestamps: vec![CarriedDeferredTimestamp {
+                signed_prekey: vec![0x33; 32],
+                deferred_at: 1_700_000_000_123,
+            }],
+        };
+
+        let sealed_state_1 = seal_bytes(
+            &key,
+            &state_v2_aad(&header_v1.encode_to_vec()),
+            &state_v1.encode_to_vec(),
+        );
+        let sealed_deferred = seal_deferred_initials(&key, &deferred);
+
+        // Simulate rolling back to an older `dev` bundle that unlocks `STATE`, advances
+        // `VaultHeader.revision`, and overwrites `STATE` without knowing about `DEFERRED_INITIALS`.
+        let (header_v2, header_v2_bytes, sealed_state_2) =
+            reseal_state_for_next_revision(&key, &header_v1, &sealed_state_1).unwrap();
+        assert_eq!(header_v2.revision, header_v1.revision + 1);
+        assert!(open_bytes(&key, &state_v2_aad(&header_v2_bytes), &sealed_state_2).is_some());
+
+        // The separate `DEFERRED_INITIALS` record still decrypts cleanly after the `STATE` overwrite!
+        let restored = open_deferred_initials(&key, &sealed_deferred).unwrap();
+        assert_eq!(restored, deferred);
+
+        // Wrong key or wrong AAD fails authentication.
+        let wrong_key = [0xA5u8; 32];
+        assert!(matches!(
+            open_deferred_initials(&wrong_key, &sealed_deferred),
+            Err(Error::Corrupt(_))
+        ));
+        assert!(open_bytes(&key, STATE.as_bytes(), &sealed_deferred).is_none());
     }
 }
