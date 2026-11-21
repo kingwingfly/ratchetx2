@@ -2,13 +2,15 @@
 //! no script, and the page shows it as an image, where none would run.
 
 use merman::{
-    Engine, MermaidConfig, OperationControl, RenderOutput, RenderRequest, Renderer, SvgRequest,
+    MermaidEngine, OperationControl, RenderOutput, RenderRequest, Renderer,
+    SourcePresentationConfig, SvgRequest,
 };
 
 /// The Mermaid diagram `source`, as SVG, sized as it is drawn.
 pub fn svg(source: &str) -> Result<String, String> {
-    let theme = MermaidConfig::from_value(serde_json::json!({ "theme": "dark" }));
-    let renderer = Renderer::new().with_engine(Engine::new().with_site_config(theme));
+    let theme = SourcePresentationConfig::from_value(serde_json::json!({ "theme": "dark" }));
+    let renderer =
+        Renderer::new().with_presentation_engine(MermaidEngine::new().with_site_config(theme));
     let request = RenderRequest::svg(source, OperationControl::new(), SvgRequest::default());
     match renderer.render(request) {
         Ok(RenderOutput::Svg(Some(svg))) => Ok(sized(svg.svg())),

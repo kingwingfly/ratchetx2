@@ -105,12 +105,12 @@ arborium-xml = { version = "2.18", optional = true }
 arborium-yaml = { version = "2.18", optional = true }
 arborium-zig = { version = "2.18", optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
-hayro = { version = "0.8", optional = true }
+hayro = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
 lofty = { version = "0.25", optional = true }
 regex = { version = "1.13", optional = true }
 # Without the ELK layout, which is under the EPL-2.0.
-merman = { version = "0.9.2", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape", "math"], optional = true }
+merman = { version = "0.10", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape", "math"], optional = true }
 serde_json = { version = "1", optional = true }
 wasm-bindgen = { version = "0.2", optional = true }
 web-sys = { version = "0.3", features = ["console", "DedicatedWorkerGlobalScope", "MessageEvent"], optional = true }
