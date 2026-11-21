@@ -15,7 +15,7 @@ use js_sys::{ArrayBuffer, Uint8Array};
 use prost::Message;
 use session::protocol::notify::{Notification, SubscribeRequest};
 use wasm_bindgen::{JsCast, closure::Closure};
-use web_sys::{BinaryType, MessageEvent, WebSocket};
+use web_sys::{BinaryType, CloseEvent, MessageEvent, WebSocket};
 
 use crate::util::{hex, js_error, sleep};
 
@@ -26,6 +26,9 @@ const PATH: &str = "/notifications";
 const PING: &str = "ping";
 /// Text frame sent by the Worker immediately after verifying the first-frame `SubscribeRequest`.
 const AUTH_OK: &str = "ok";
+/// WebSocket close code sent by the Worker when the client's notification protocol is deprecated
+/// and the user must refresh/upgrade the app.
+pub const CLOSE_DEPRECATED_PROTOCOL: u16 = 4010;
 /// Milliseconds between pings, often enough for proxies that close idle connections.
 const PING_EVERY: i32 = 60_000;
 /// Maximum buffered notification events before coalescing into a resync (bounds memory under flood).
@@ -40,6 +43,9 @@ pub enum Event {
     Notification(Notification),
     /// Some notifications were dropped due to backpressure; the caller should run a sync.
     Resync,
+    /// The server closed the socket with [`CLOSE_DEPRECATED_PROTOCOL`] (`4010`), indicating that
+    /// this app version must be refreshed/upgraded instead of reconnecting in a loop.
+    UpgradeRequired(String),
     /// The socket closed, or never opened, e.g. as the server sends no notifications.
     Closed,
 }
@@ -55,6 +61,7 @@ struct FrameState {
     authenticated: Cell<bool>,
     open_pending: Cell<bool>,
     overflow: Cell<bool>,
+    upgrade_required: RefCell<Option<String>>,
 }
 
 impl FrameState {
@@ -79,7 +86,26 @@ impl FrameState {
         }
     }
 
+    fn close(&self, mut tx: mpsc::Sender<Event>, code: u16, reason: String) {
+        if code == CLOSE_DEPRECATED_PROTOCOL {
+            let reason = if reason.trim().is_empty() {
+                "This app version is no longer supported for live notifications. Refresh the page to continue."
+                    .to_string()
+            } else {
+                reason
+            };
+            if tx.try_send(Event::UpgradeRequired(reason.clone())).is_err() {
+                *self.upgrade_required.borrow_mut() = Some(reason);
+            }
+        } else {
+            let _ = tx.try_send(Event::Closed);
+        }
+    }
+
     async fn next(&self, events: &mut mpsc::Receiver<Event>) -> Event {
+        if let Some(reason) = self.upgrade_required.borrow_mut().take() {
+            return Event::UpgradeRequired(reason);
+        }
         if self.open_pending.replace(false) {
             return Event::Open;
         }
@@ -87,8 +113,17 @@ impl FrameState {
             Ok(Event::Closed) if self.overflow.replace(false) => Event::Resync,
             Ok(event) => event,
             Err(_) if self.overflow.replace(false) => Event::Resync,
-            Err(e) if e.is_closed() => Event::Closed,
-            Err(_) => events.next().await.unwrap_or(Event::Closed),
+            Err(e) if e.is_closed() => self
+                .upgrade_required
+                .borrow_mut()
+                .take()
+                .map_or(Event::Closed, Event::UpgradeRequired),
+            Err(_) => events.next().await.unwrap_or_else(|| {
+                self.upgrade_required
+                    .borrow_mut()
+                    .take()
+                    .map_or(Event::Closed, Event::UpgradeRequired)
+            }),
         }
     }
 }
@@ -100,7 +135,7 @@ pub struct Subscription {
     frames: Rc<FrameState>,
     _on_open: Closure<dyn FnMut()>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
-    _on_close: Closure<dyn FnMut()>,
+    _on_close: Closure<dyn FnMut(CloseEvent)>,
 }
 
 /// Build the first-frame-auth WebSocket URL (`/notifications?identity=<64-hex>`).
@@ -161,11 +196,14 @@ impl Subscription {
             })
         };
         // An error is followed by a close. Dropping the shared sender guarantees the receiver ends.
-        let on_close = Closure::<dyn FnMut()>::new(move || {
-            if let Some(mut tx) = sender.borrow_mut().take() {
-                let _ = tx.try_send(Event::Closed);
-            }
-        });
+        let on_close = {
+            let frames = frames.clone();
+            Closure::<dyn FnMut(CloseEvent)>::new(move |event: CloseEvent| {
+                if let Some(tx) = sender.borrow_mut().take() {
+                    frames.close(tx, event.code(), event.reason());
+                }
+            })
+        };
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
@@ -321,5 +359,45 @@ mod tests {
             Event::Resync
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn close_4010_emits_upgrade_required_even_under_channel_backpressure() {
+        let state = FrameState::default();
+        let (tx, mut rx) = mpsc::channel(0);
+        state.close(
+            tx,
+            CLOSE_DEPRECATED_PROTOCOL,
+            "Legacy v1 notifications deprecated; refresh or upgrade the app".to_string(),
+        );
+        match futures::executor::block_on(state.next(&mut rx)) {
+            Event::UpgradeRequired(reason) => {
+                assert!(reason.contains("refresh or upgrade"));
+            }
+            _ => panic!("expected Event::UpgradeRequired"),
+        }
+        assert!(matches!(
+            futures::executor::block_on(state.next(&mut rx)),
+            Event::Closed
+        ));
+
+        // Empty close reason still yields a clear refresh message, even when the queue is full.
+        let state = FrameState::default();
+        let (mut tx, mut rx) = mpsc::channel(0);
+        assert!(tx.try_send(Event::Resync).is_ok());
+        state.close(tx, CLOSE_DEPRECATED_PROTOCOL, String::new());
+        match futures::executor::block_on(state.next(&mut rx)) {
+            Event::UpgradeRequired(reason) => assert!(reason.contains("Refresh")),
+            _ => panic!("expected Event::UpgradeRequired under backpressure"),
+        }
+
+        // Ordinary close codes emit Event::Closed.
+        let state = FrameState::default();
+        let (tx, mut rx) = mpsc::channel(1);
+        state.close(tx, 1008, "invalid signature".to_string());
+        assert!(matches!(
+            futures::executor::block_on(state.next(&mut rx)),
+            Event::Closed
+        ));
     }
 }

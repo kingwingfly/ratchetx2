@@ -10,6 +10,8 @@ Note: In this file, do not use the hard wrap in the middle of a sentence for com
 
 ## [Unreleased]
 
+- deprecate and remove legacy v1 handshake, mailbox, and notification routes (`LEGACY_V1`, `ALLOW_UNSIGNED_FETCH`) from the Worker and web client: both post-quantum and classical-only builds now use the v2 wire protocol exclusively (`handshake.v2`, `mailbox.v2`, and audience-bound v2 notifications), legacy v1 requests return an upgrade-required error / WebSocket close `4010`, and the web client prompts users to refresh the page while serving `Cache-Control: no-cache` for entry assets; the last v1-compatible version is preserved at the git tag `archive/legacy-v1`
+
 ## [0.3.0] - 2026-10-19
 
 The wire protocol changed, so 0.3 clients and servers cannot talk to 0.2 ones.

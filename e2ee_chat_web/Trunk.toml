@@ -12,13 +12,7 @@ port = 8080
 
 # During `trunk serve`, the Connect calls go to `wrangler dev`, as they would to the Worker.
 [[proxy]]
-backend = "http://127.0.0.1:8787/handshake.v1.HandshakeService/"
-
-[[proxy]]
 backend = "http://127.0.0.1:8787/handshake.v2.HandshakeService/"
-
-[[proxy]]
-backend = "http://127.0.0.1:8787/mailbox.v1.MailboxService/"
 
 [[proxy]]
 backend = "http://127.0.0.1:8787/mailbox.v2.MailboxService/"

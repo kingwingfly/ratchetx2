@@ -89,6 +89,7 @@ pub fn App() -> impl IntoView {
     view! {
         <div class="app">
             <TopBar />
+            <UpdateRequiredBanner />
             <Show
                 when=move || ui.phase.get() == Phase::Unlocked
                 fallback=move || {
@@ -130,9 +131,34 @@ pub fn App() -> impl IntoView {
 }
 
 #[component]
+fn UpdateRequiredBanner() -> impl IntoView {
+    let ui = ui();
+    view! {
+        <Show when=move || ui.update_required.with(Option::is_some)>
+            <div class="update-banner" role="alert">
+                <span>{move || ui.update_required.get().unwrap_or_default()}</span>
+                <div class="banner-actions">
+                    <button
+                        type="button"
+                        class="btn primary small"
+                        on:click=move |_| {
+                            let _ = window().location().reload();
+                        }
+                    >
+                        "Refresh page"
+                    </button>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
+#[component]
 fn TopBar() -> impl IntoView {
     let ui = ui();
-    let offline = move || matches!(ui.link.get(), Link::Offline(_));
+    let offline = move || {
+        matches!(ui.link.get(), Link::Offline(_)) || ui.update_required.with(Option::is_some)
+    };
     let unlocked = move || ui.phase.get() == Phase::Unlocked;
     let status = move || match ui.phase.get() {
         Phase::Loading => "loading".to_string(),
@@ -146,6 +172,9 @@ fn TopBar() -> impl IntoView {
         Phase::Unavailable(UnavailableReason::StorageUnavailable, _) => {
             "storage unavailable".to_string()
         }
+        Phase::Unlocked if ui.update_required.with(Option::is_some) => {
+            "update required".to_string()
+        }
         Phase::Unlocked if ui.syncing.get() => "syncing…".to_string(),
         Phase::Unlocked => match ui.link.get() {
             Link::Connecting => "connecting".to_string(),
@@ -153,10 +182,15 @@ fn TopBar() -> impl IntoView {
             Link::Offline(_) => "offline, retrying".to_string(),
         },
     };
-    let detail = move || match (ui.link.get(), ui.me.get()) {
-        (Link::Offline(error), _) => error,
-        (_, Some(me)) => format!("server: {}", me.server),
-        _ => String::new(),
+    let detail = move || {
+        if let Some(reason) = ui.update_required.get() {
+            return reason;
+        }
+        match (ui.link.get(), ui.me.get()) {
+            (Link::Offline(error), _) => error,
+            (_, Some(me)) => format!("server: {}", me.server),
+            _ => String::new(),
+        }
     };
     view! {
         <header class="topbar">

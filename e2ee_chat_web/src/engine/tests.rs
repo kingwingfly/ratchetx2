@@ -12,19 +12,16 @@ use super::settings::{
 use super::{
     AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, REFILL_USED,
     SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash, build_invitation_link, checked_name,
-    parse_invitation_hash,
+    normalize_update_reason, parse_invitation_hash,
 };
 use crate::content::{Content, Kind};
 use crate::state::{Delivery, Dialog, Me, ServerPqStatus, Ui};
 use crate::transport::{Connect, Fetch};
 use crate::util::{hex, key_from_text, key_to_url, short};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use crate::vault::Farewell;
 use crate::vault::{
-    AppState, Awaiting, ContactState, HistoryEntry, Outgoing, OutgoingRecord, history_key,
-    outbox_key,
+    AppState, Awaiting, ContactState, Farewell, HistoryEntry, Outgoing, OutgoingRecord,
+    history_key, outbox_key,
 };
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use bytes::Bytes;
 use leptos::prelude::GetUntracked;
 use prost::Message;
@@ -32,13 +29,12 @@ use session::protocol::{
     self, MAX_SAFE_INTEGER,
     connect::{ConnectClient, LocalPost},
     content::Hello,
-};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use session::protocol::{
-    handshake_v2::InitialMessageV2 as WireInitialMessageV2, mailbox_v2::PushV2Request,
+    handshake_v2::InitialMessageV2 as WireInitialMessageV2,
+    mailbox_v2::PushV2Request,
 };
 use session::{
-    Client, ClientState, ErrorKind, PqConfig, PqSuite, PublicKey, Session, SessionState, proto,
+    AcceptedInitial, Client, ClientState, ErrorKind, PqConfig, PqSuite, PublicKey, Session,
+    SessionState, proto,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -289,7 +285,6 @@ fn quarantined_primary_survives_second_initial_and_blocks_accept() {
     assert_eq!(state.name, "Alice");
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 #[test]
 fn farewell_push_v2_preserves_carried_initial_message_v2() {
     let pq_initial = WireInitialMessageV2 {
@@ -314,6 +309,7 @@ fn farewell_push_v2_preserves_carried_initial_message_v2() {
         client_message_id: vec![0xAB; 16],
         push_v2: req.encode_to_vec(),
     };
+    assert_eq!(farewell.recipient().as_deref(), Some([0x22; 32].as_slice()));
     let decoded = PushV2Request::decode(farewell.push_v2.as_slice()).expect("decode push_v2");
     assert_eq!(decoded.initial_message, Some(pq_initial));
     assert_eq!(decoded.client_message_id.as_ref(), &[0xAB; 16]);
@@ -516,62 +512,40 @@ impl<T: Message> LocalPost for BundleResponse<T> {
     }
 }
 
-/// Encrypt a real first message for the recipient using the build's mailbox wire format.
+/// Encrypt a real first message for the recipient using the v2 wire format (PQXDH when ML-KEM
+/// suites are compiled in, or classical X3DH over v2 in classical-only builds).
 async fn carried_initial(recipient: &mut Client<Connect>) -> (PublicKey, Incoming) {
     let greeting = Kind::Text("first message".into()).to_bytes();
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    {
-        let published = recipient.prepare_publish_v2("chat.example", 1, 1).unwrap();
-        let p = &published.request;
-        let bundle = protocol::handshake_v2::ClaimBundleResponse {
-            signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
-            signed_prekey_signature: p.signed_prekey_signature.clone(),
-            one_time_prekey: p.one_time_prekeys.first().cloned(),
-            pq_last_resort: p.pq_last_resort.first().cloned(),
-            pq_one_time_prekey: p.pq_one_time_prekeys.first().cloned(),
-            manifest: p.manifest.clone(),
-        };
-        recipient.commit_publish_v2(published);
-        let mut sender = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
-        let prepared = sender
-            .prepare_initiate_v2(
-                "chat.example",
-                &recipient.identity_key(),
-                &Default::default(),
-                &greeting,
-                (),
-            )
-            .await
-            .unwrap();
-        assert!(prepared.security.is_pq);
-        let session::OutgoingInitialMessage::V2(request) = prepared.request else {
-            panic!("expected PQ initial")
-        };
-        (
-            sender.identity_key(),
-            Incoming::try_from(request.message.as_ref().unwrap()).unwrap(),
+    let published = recipient.prepare_publish_v2("chat.example", 1, 1).unwrap();
+    let p = &published.request;
+    let bundle = protocol::handshake_v2::ClaimBundleResponse {
+        signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+        signed_prekey_signature: p.signed_prekey_signature.clone(),
+        one_time_prekey: p.one_time_prekeys.first().cloned(),
+        pq_last_resort: p.pq_last_resort.first().cloned(),
+        pq_one_time_prekey: p.pq_one_time_prekeys.first().cloned(),
+        manifest: p.manifest.clone(),
+    };
+    recipient.commit_publish_v2(published);
+    let mut sender = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
+    let prepared = sender
+        .prepare_initiate_v2(
+            "chat.example",
+            &recipient.identity_key(),
+            &Default::default(),
+            &greeting,
+            (),
         )
-    }
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    {
-        let published = recipient.prepare_publish(1).unwrap();
-        let p = &published.request;
-        let bundle = protocol::handshake::FetchBundleResponse {
-            signed_prekey: p.signed_prekey.clone(),
-            signed_prekey_signature: p.signed_prekey_signature.clone(),
-            one_time_prekey: p.one_time_prekeys.first().cloned(),
-        };
-        recipient.commit_publish(published);
-        let mut sender = Client::new(ConnectClient::new(BundleResponse("/FetchBundle", bundle)));
-        let prepared = sender
-            .prepare_initiate(&recipient.identity_key(), &greeting, ())
-            .await
-            .unwrap();
-        (
-            sender.identity_key(),
-            Incoming::try_from(prepared.request.message.as_ref().unwrap()).unwrap(),
-        )
-    }
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.security.is_pq,
+        cfg!(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
+    );
+    (
+        sender.identity_key(),
+        Incoming::try_from(prepared.request.message.as_ref().unwrap()).unwrap(),
+    )
 }
 
 fn change_session(session: &mut Session<Connect>, change: impl FnOnce(&mut proto::SessionState)) {
@@ -1019,29 +993,55 @@ fn partial_ack_persists_remaining_ids_and_retries_failed_shrink() {
 
 #[test]
 fn local_pq_off_accepts_classical_replacement_without_granting_an_exception() {
-    use session::protocol::handshake::FetchBundleResponse;
+    use session::protocol::handshake_v2::ClaimBundleResponse;
 
     futures::executor::block_on(async {
+        let classical_cfg = PqConfig {
+            pq_enabled: false,
+            pq_ratchet_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        };
         let mut bob = Client::new(Fetch::client(TEST_SERVER));
-        let publish = bob.prepare_publish(1).unwrap().request;
-        let mut alice = Client::new(ConnectClient::new(BundleResponse(
-            "/FetchBundle",
-            FetchBundleResponse {
-                signed_prekey: publish.signed_prekey,
-                signed_prekey_signature: publish.signed_prekey_signature,
-                one_time_prekey: publish.one_time_prekeys.first().cloned(),
-            },
-        )));
+        bob.set_pq_config(classical_cfg.clone()).unwrap();
+        let published = bob.prepare_publish_v2("chat.example", 1, 0).unwrap();
+        let p = &published.request;
+        let bundle = ClaimBundleResponse {
+            signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+            signed_prekey_signature: p.signed_prekey_signature.clone(),
+            one_time_prekey: p.one_time_prekeys.first().cloned(),
+            pq_last_resort: None,
+            pq_one_time_prekey: None,
+            manifest: p.manifest.clone(),
+        };
+        bob.commit_publish_v2(published);
+        let mut alice = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
+        alice.set_pq_config(classical_cfg).unwrap();
         let initiation = alice
-            .prepare_initiate(&bob.identity_key(), b"hello", ())
+            .prepare_initiate_v2(
+                "chat.example",
+                &bob.identity_key(),
+                &Default::default(),
+                b"hello",
+                (),
+            )
             .await
             .unwrap();
-        let message =
-            session::InitialMessage::try_from(initiation.request.message.as_ref().unwrap())
-                .unwrap();
-        let (incoming, _) = bob
-            .accept(&alice.identity_key(), &message, Fetch::client(TEST_SERVER))
-            .unwrap();
+        assert!(!initiation.security.is_pq);
+        let message = Incoming::try_from(initiation.request.message.as_ref().unwrap()).unwrap();
+        let AcceptedInitial::Accepted {
+            session: incoming, ..
+        } = bob
+            .accept_initial_v2(
+                &alice.identity_key(),
+                &Default::default(),
+                &message,
+                Fetch::client(TEST_SERVER),
+            )
+            .unwrap()
+        else {
+            panic!("expected classical initial accepted when local PQ is off");
+        };
         let stored: proto::SessionState = incoming.state().into();
         let (mut contacts, _, _) = restore_contacts(
             vec![stored_contact(bob.identity_key(), alice.identity_key())],
@@ -1351,10 +1351,7 @@ fn staging_bounds_distinct_carried_initials_and_preserves_legacy_wire_bytes() {
     let mut state = ContactState::default();
     for i in 0..=128 {
         let wire = legacy_wire_initial(i);
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         let initial = Incoming::try_from(&WireInitialMessageV2::from(&wire)).unwrap();
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let initial = Incoming::try_from(&wire).unwrap();
         let staged = stage_carried_initials(&mut state, [&initial, &initial]);
         if i < 128 {
             staged.unwrap();
@@ -1453,14 +1450,11 @@ fn empty_receive_persists_changed_cursor_and_receipts_and_skips_idle_writes() {
 #[test]
 fn publish_rolls_back_only_definitive_refusals_and_strict_v2_fallback() {
     use session::protocol::{Error, ErrorKind as WireError};
-    let refused = PublishError::transmitted(Error::from(WireError::LimitExceeded).into(), true);
+    let refused = PublishError::transmitted(Error::from(WireError::LimitExceeded).into());
     assert!(refused.rejects_settings());
-    assert!(
-        PublishError::transmitted(Error::from(WireError::Malformed).into(), true)
-            .rejects_settings()
-    );
+    assert!(PublishError::transmitted(Error::from(WireError::Malformed).into()).rejects_settings());
     for kind in [WireError::StaleTimestamp, WireError::InvalidSignature] {
-        assert!(!PublishError::transmitted(Error::from(kind).into(), true).rejects_settings());
+        assert!(!PublishError::transmitted(Error::from(kind).into()).rejects_settings());
     }
     for kind in [
         WireError::Malformed,
@@ -1468,18 +1462,22 @@ fn publish_rolls_back_only_definitive_refusals_and_strict_v2_fallback() {
         WireError::InvalidResponse,
         WireError::Connect,
     ] {
-        let ambiguous = PublishError::transmitted(
-            Error::ambiguous_response(kind, "reply unreadable").into(),
-            true,
+        let ambiguous =
+            PublishError::transmitted(Error::ambiguous_response(kind, "reply unreadable").into());
+        assert!(
+            !ambiguous.rejects_settings()
+                && !ambiguous.needs_sign_in()
+                && !ambiguous.is_unimplemented()
         );
-        assert!(!ambiguous.rejects_settings() && !ambiguous.needs_sign_in());
     }
     assert!(
-        PublishError::transmitted(Error::from(WireError::SignInRequired).into(), true)
-            .needs_sign_in()
+        PublishError::transmitted(Error::from(WireError::SignInRequired).into()).needs_sign_in()
     );
-    assert!(PublishError::transmitted(ErrorKind::PqRequired.into(), true).rejects_settings());
-    assert!(!PublishError::transmitted(ErrorKind::PqRequired.into(), false).rejects_settings());
+    assert!(PublishError::transmitted(ErrorKind::PqRequired.into()).rejects_settings());
+    let unimplemented = PublishError::transmitted(Error::from(WireError::Unimplemented).into());
+    assert!(unimplemented.is_unimplemented());
+    assert!(!unimplemented.rejects_settings());
+    assert!(!unimplemented.needs_sign_in());
 }
 
 #[test]
@@ -1527,10 +1525,8 @@ fn refused_settings_rollback_survives_a_failed_vault_save() {
         };
         inner.save_pq_config(rejected).await.unwrap();
         inner.vault.fail_save.set(true);
-        let refusal = PublishError::transmitted(
-            protocol::Error::from(protocol::ErrorKind::Malformed).into(),
-            true,
-        );
+        let refusal =
+            PublishError::transmitted(protocol::Error::from(protocol::ErrorKind::Malformed).into());
         let warning = engine
             .finish_publish_rollback(&mut inner, refusal, false)
             .await
@@ -1609,7 +1605,6 @@ fn offline_edits_keep_the_original_rollback_across_reload_until_publication() {
         inner.save_pq_config(last.clone()).await.unwrap();
         let sign_in = PublishError::transmitted(
             protocol::Error::from(protocol::ErrorKind::SignInRequired).into(),
-            true,
         );
         assert!(
             engine
@@ -1622,10 +1617,8 @@ fn offline_edits_keep_the_original_rollback_across_reload_until_publication() {
         assert_eq!(inner.client.pq_config(), &last);
         assert_eq!(inner.state.pending_pq_rollback.as_ref(), Some(&rollback));
 
-        let refused = PublishError::transmitted(
-            protocol::Error::from(protocol::ErrorKind::Malformed).into(),
-            true,
-        );
+        let refused =
+            PublishError::transmitted(protocol::Error::from(protocol::ErrorKind::Malformed).into());
         assert!(
             engine
                 .finish_publish_rollback(&mut inner, refused, false)
@@ -1708,10 +1701,8 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         inner.state.pending_pq_rollback = None;
         inner.save(&[]).await.unwrap();
 
-        let refusal = PublishError::transmitted(
-            protocol::Error::from(protocol::ErrorKind::Malformed).into(),
-            true,
-        );
+        let refusal =
+            PublishError::transmitted(protocol::Error::from(protocol::ErrorKind::Malformed).into());
         let err = engine
             .finish_publish_rollback(&mut inner, refusal, false)
             .await
@@ -1747,7 +1738,7 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         reloaded.save(&[]).await.unwrap();
         reloaded.vault.fail_save.set(true);
         let engine2 = Engine::new(Ui::new());
-        let strict_refusal = PublishError::transmitted(ErrorKind::PqRequired.into(), true);
+        let strict_refusal = PublishError::transmitted(ErrorKind::PqRequired.into());
         let err = engine2
             .finish_publish_rollback(&mut reloaded, strict_refusal, true)
             .await
@@ -1775,4 +1766,41 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         reloaded.save_pq_config(adjusted).await.unwrap();
         assert!(reloaded.state.needs_publish);
     });
+}
+
+#[test]
+fn update_required_banner_handles_unimplemented_and_normalizes_reason() {
+    assert!(normalize_update_reason("").contains("Refresh the page"));
+    assert!(
+        normalize_update_reason("procedure not implemented by server").contains("Refresh the page")
+    );
+    assert_eq!(
+        normalize_update_reason("Legacy v1 notifications deprecated; refresh or upgrade the app"),
+        "Legacy v1 notifications deprecated; refresh or upgrade the app"
+    );
+    assert!(normalize_update_reason("protocol mismatch").contains("Refresh the page"));
+
+    let ui = Ui::new();
+    let engine = Engine::new(ui);
+    assert!(ui.update_required.get_untracked().is_none());
+
+    // Non-Unimplemented errors do not trigger the update banner.
+    engine.check_protocol_error(&session::Error::from(ErrorKind::Server));
+    assert!(ui.update_required.get_untracked().is_none());
+
+    // Unimplemented triggers the update banner, toast notice, and single activity log entry.
+    engine.check_protocol_error(&session::Error::from(ErrorKind::Unimplemented));
+    assert!(
+        ui.update_required
+            .get_untracked()
+            .is_some_and(|msg| msg.contains("Refresh the page"))
+    );
+    assert_eq!(ui.log.get_untracked().len(), 1);
+    // Repeated calls do not spam duplicate activity log entries.
+    engine.require_update("Please refresh to continue.");
+    assert_eq!(ui.log.get_untracked().len(), 1);
+    assert_eq!(
+        ui.update_required.get_untracked().as_deref(),
+        Some("Please refresh to continue.")
+    );
 }
