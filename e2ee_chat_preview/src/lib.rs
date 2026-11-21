@@ -1,21 +1,19 @@
-//! The E2EE chat web client's file previews that are too large to load with the page: PDF pages,
-//! Mermaid diagrams, highlighted code, what audio files' tags say, and searches. Each runs in a
-//! web worker
-//! of its own, which the page starts when a preview first needs it, and which keeps the work off
-//! the page's thread.
+//! File previews for the E2EE chat web client. The page starts a dedicated worker when it first
+//! needs a preview engine, keeping the engine and its work off the page's thread.
 //!
-//! The web client takes only [`language`], to know which worker highlights what, [`Worker`], to
-//! start them, and [`audio::Tags`]. The engines are features, each a worker's:
+//! [`Worker`], [`language`], [`audio::Tags`] and the Rust request and response types in [`rpc`]
+//! are available with default features. The `rpc` feature adds the JavaScript codec for both
+//! sides of the worker protocol. Each engine and the worker runtime have their own feature.
 //!
-//! - `pdf`: [`pdf`], PDF pages as pixels, drawn by hayro.
-//! - `audio`: [`audio::tags`], what audio files' tags say of them, read by lofty.
-//! - `search`: [`search`], text searched with regular expressions, in linear time.
-//! - `diagram`: [`diagram`], Mermaid diagrams as SVG, laid out and drawn by merman.
-//! - `code`: [`code`], code highlighted by tree-sitter, with arborium's grammars.
-//! - `worker`: [`worker`], serving a page's requests in a web worker.
+//! - `pdf` draws PDF pages with hayro.
+//! - `audio` reads audio tags and covers with lofty.
+//! - `search` searches text with regular expressions in linear time.
+//! - `diagram` draws Mermaid diagrams as SVG with merman.
+//! - `code` highlights source with tree-sitter and arborium's grammars.
+//! - `worker` serves the page's requests and includes the `rpc` codec.
 //!
-//! A page asks a worker `[id, method, ...arguments]`, and it answers `[id, true, value]`, or
-//! `[id, false, error]`; it says [`READY`] once it listens, as what comes before goes unheard.
+//! A worker posts [`READY`] once it listens. The page sends `[id, method, ...arguments]`.
+//! The worker replies with `[id, true, value]` or `[id, false, error_string]`.
 
 pub mod audio;
 #[cfg(feature = "code")]
@@ -25,6 +23,7 @@ pub mod diagram;
 pub mod language;
 #[cfg(feature = "pdf")]
 pub mod pdf;
+pub mod rpc;
 #[cfg(feature = "search")]
 pub mod search;
 #[cfg(feature = "worker")]
@@ -38,9 +37,9 @@ pub const READY: &str = "ready";
 /// The workers, by what they do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Worker {
-    /// `open(bytes)`: a document's ID and its pages' sizes, in points, `[width, height, ...]`;
-    /// `render(document, page, width)`: the page drawn `width` pixels wide, `[width, height,
-    /// RGBA pixels]`; `close(document)`.
+    /// `open(bytes)` returns a document ID and its page sizes in points. `render(document,
+    /// page, width)` returns `[width, height, RGBA pixels]` at the requested width subject to
+    /// the side and area limits. `close(document)` releases the document.
     Pdf,
     /// `svg(source)`: the Mermaid diagram `source`, as SVG.
     Diagram,

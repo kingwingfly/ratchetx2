@@ -10,7 +10,8 @@ authors = ["Louis <836250617@qq.com>"]
 repository = "https://github.com/kingwingfly/ratchetx2"
 
 [features]
-# The engines, each run by its worker; the web client takes none, only the table of languages.
+default = []
+# Each engine runs in its own worker.
 pdf = ["dep:hayro"]
 audio = ["dep:lofty"]
 search = ["dep:regex"]
@@ -58,8 +59,9 @@ code = [
     "dep:arborium-yaml",
     "dep:arborium-zig",
 ]
-# Serving a page's requests in a web worker.
-worker = ["dep:console_error_panic_hook", "dep:js-sys", "dep:wasm-bindgen", "dep:web-sys"]
+# The postMessage codec is shared by the page and workers.
+rpc = ["dep:js-sys", "dep:wasm-bindgen"]
+worker = ["rpc", "dep:console_error_panic_hook", "dep:web-sys"]
 
 [dependencies]
 # Tree-sitter's grammars and highlight queries, a crate a language: each worker links only its own.
