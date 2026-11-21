@@ -9,12 +9,12 @@ use dh_root::DhRootRatchet;
 use message::MessageRatchet;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+use crate::error::MalformedState;
 use crate::{
     error::CryptoError,
     key::{DH_KEY_LENGTH, DhPrivateKey, HeaderKey, MessageKey, SharedKeys},
 };
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
-use crate::error::MalformedState;
 
 /// Double ratchet. See the example in [`document`](crate::document).
 ///
@@ -89,6 +89,11 @@ impl TryFrom<RatchetUnchecked> for Ratchet {
 
 #[cfg(feature = "rkyv")]
 impl ArchivedRatchet {
+    /// Whether the next DH step establishes the sending chain.
+    pub fn dh_step_updates_sender(&self) -> bool {
+        self.dh_step_updates_sender
+    }
+
     /// Current sending header key of the archived ratchet, if a sending chain is established.
     pub fn header_key_sender(&self) -> Option<HeaderKey> {
         self.message_ratchet_sender.header_key()
@@ -141,6 +146,11 @@ impl PartialEq for Ratchet {
 }
 
 impl Ratchet {
+    /// Whether the next DH step establishes the sending chain.
+    pub fn dh_step_updates_sender(&self) -> bool {
+        self.dh_step_updates_sender
+    }
+
     /// New a party who sends message first, from the shared `keys`.
     ///
     /// Fails if `public_key` (Bob's) is not a valid X25519 public key.

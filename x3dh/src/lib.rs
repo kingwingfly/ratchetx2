@@ -6,6 +6,8 @@
 )]
 
 pub mod error;
+#[cfg(all(test, any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+mod kat;
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 mod kem;
 pub mod pq;
@@ -17,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 pub use error::{Error, ErrorKind, Result};
 use hkdf::Hkdf;
+use pq::PqPrekeySecret;
 pub use pq::{
     PQ_PREKEY_ID_LENGTH, PQ_SEED_LENGTH, PQ_SHARED_SECRET_LENGTH, PQXDH_ASSOCIATED_DATA_LENGTH,
     PQXDH_VERSION, PqAgreement, PqInitialMessage, PqPrekeyBundle, PqPrekeyId, PqSuite,
@@ -24,7 +27,6 @@ pub use pq::{
     pq_spk_signing_input, sign_pq_opk, sign_pq_spk, verify_pq_opk_signature,
     verify_pq_spk_signature,
 };
-use pq::PqPrekeySecret;
 use sha2::{
     Sha256,
     digest::{OutputSizeUser, typenum::Unsigned},
@@ -33,9 +35,9 @@ use x25519_dalek::SharedSecret;
 /// Re-export x25519_dalek's private key, which [`LocalPrekeys::accept`] returns.
 pub use x25519_dalek::StaticSecret;
 use xeddsa::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, XEdDSAPrivateKey, XEdDSAPublicKey};
+use zeroize::Zeroizing;
 #[cfg(feature = "rkyv")]
 use zeroize::{Zeroize, ZeroizeOnDrop};
-use zeroize::Zeroizing;
 
 /// An X25519 (or XEdDSA identity) public key.
 pub type PublicKey = [u8; PUBLIC_KEY_LENGTH];
@@ -278,11 +280,7 @@ where
 /// Validates that a stored PQ seed derives `ek` when `suite` is compiled into this build.
 #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
 #[allow(unused_variables)]
-fn validate_pq_seed_ek(
-    suite: PqSuite,
-    ek: &[u8],
-    seed: &[u8; PQ_SEED_LENGTH],
-) -> Result<()> {
+fn validate_pq_seed_ek(suite: PqSuite, ek: &[u8], seed: &[u8; PQ_SEED_LENGTH]) -> Result<()> {
     if ek.len() != suite.ek_len() {
         return Err(ErrorKind::MalformedState.into());
     }
@@ -1458,8 +1456,7 @@ impl KeyMaterial {
 
         let mut associated_data = [0u8; PQXDH_ASSOCIATED_DATA_LENGTH];
         associated_data[..PUBLIC_KEY_LENGTH].copy_from_slice(alice_identity_key);
-        associated_data[PUBLIC_KEY_LENGTH..2 * PUBLIC_KEY_LENGTH]
-            .copy_from_slice(bob_identity_key);
+        associated_data[PUBLIC_KEY_LENGTH..2 * PUBLIC_KEY_LENGTH].copy_from_slice(bob_identity_key);
         associated_data[2 * PUBLIC_KEY_LENGTH..].copy_from_slice(&transcript_hash);
 
         PqAgreement {
@@ -1634,13 +1631,21 @@ mod test {
         prekeys.confirm(&message).unwrap();
 
         assert_eq!(
-            prekeys.accept(&bob, &alice_key, &message).err().unwrap().kind(),
+            prekeys
+                .accept(&bob, &alice_key, &message)
+                .err()
+                .unwrap()
+                .kind(),
             ErrorKind::Replayed
         );
         let mut aliased = message.clone();
         aliased.ephemeral_key[31] |= 0x80;
         assert_eq!(
-            prekeys.accept(&bob, &alice_key, &aliased).err().unwrap().kind(),
+            prekeys
+                .accept(&bob, &alice_key, &aliased)
+                .err()
+                .unwrap()
+                .kind(),
             ErrorKind::InvalidPublicKey
         );
         assert_eq!(
@@ -1655,7 +1660,11 @@ mod test {
         let mut nc_msg = fresh.clone();
         nc_msg.identity_key = nc_alice;
         assert_eq!(
-            prekeys.accept(&bob, &nc_alice, &nc_msg).err().unwrap().kind(),
+            prekeys
+                .accept(&bob, &nc_alice, &nc_msg)
+                .err()
+                .unwrap()
+                .kind(),
             ErrorKind::InvalidPublicKey
         );
 
@@ -1673,7 +1682,11 @@ mod test {
             let mut bad_msg = fresh.clone();
             bad_msg.identity_key = bad_ik;
             assert_eq!(
-                prekeys.accept(&bob, &bad_ik, &bad_msg).err().unwrap().kind(),
+                prekeys
+                    .accept(&bob, &bad_ik, &bad_msg)
+                    .err()
+                    .unwrap()
+                    .kind(),
                 ErrorKind::InvalidPublicKey
             );
             assert_eq!(
@@ -1761,13 +1774,19 @@ mod test {
         assert_eq!(PqSuite::MlKem1024.ek_len(), 1568);
         assert_eq!(PqSuite::MlKem1024.ct_len(), 1568);
         assert_eq!(PqSuite::MlKem1024.label(), "ML-KEM-1024");
-        assert_eq!(PqSuite::MlKem1024.is_supported(), cfg!(feature = "ml-kem-1024"));
+        assert_eq!(
+            PqSuite::MlKem1024.is_supported(),
+            cfg!(feature = "ml-kem-1024")
+        );
 
         assert_eq!(PqSuite::MlKem768.as_u8(), 2);
         assert_eq!(PqSuite::MlKem768.ek_len(), 1184);
         assert_eq!(PqSuite::MlKem768.ct_len(), 1088);
         assert_eq!(PqSuite::MlKem768.label(), "ML-KEM-768");
-        assert_eq!(PqSuite::MlKem768.is_supported(), cfg!(feature = "ml-kem-768"));
+        assert_eq!(
+            PqSuite::MlKem768.is_supported(),
+            cfg!(feature = "ml-kem-768")
+        );
 
         // Deterministic pq_prekey_id differs across suites even for identical bytes.
         let fake_ek = vec![0x42u8; 1568];
@@ -1942,7 +1961,9 @@ mod test {
         let mut p = proto::LocalPrekeys::from(&prekeys);
         let mut bad_ek = [0u8; 32];
         bad_ek[31] = 0x80;
-        p.generations[0].confirmed_ephemeral_keys.push(bad_ek.to_vec());
+        p.generations[0]
+            .confirmed_ephemeral_keys
+            .push(bad_ek.to_vec());
         assert_eq!(
             LocalPrekeys::try_from(&p).unwrap_err().kind(),
             ErrorKind::MalformedState
@@ -2030,7 +2051,6 @@ mod test {
 
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     mod pq_tests {
-        use sha2::{Digest, Sha256};
 
         use super::*;
 
@@ -2043,100 +2063,6 @@ mod test {
             ]
         }
 
-        fn hex_encode(bytes: &[u8]) -> String {
-            bytes.iter().map(|b| format!("{b:02x}")).collect()
-        }
-
-        /// FIPS 203 ML-KEM-1024 KAT using the IETF reference seed `0x00..=0x3f`, deterministic
-        /// encaps/decap, implicit rejection, and invalid encapsulation-key modulus rejection.
-        #[cfg(feature = "ml-kem-1024")]
-        #[test]
-        fn fips203_kat_ml_kem_1024() {
-            let seed: [u8; 64] = core::array::from_fn(|i| i as u8);
-            let ek = kem::derive_ek(PqSuite::MlKem1024, &seed).unwrap();
-            assert_eq!(ek.len(), 1568);
-            assert_eq!(hex_encode(&ek[..16]), "4b94c29450111191823b3514c9ac1ea3");
-            assert_eq!(hex_encode(&ek[ek.len() - 16..]), "eb0c8701ed58dc628776b983882e1175");
-            assert_eq!(
-                hex_encode(&Sha256::digest(&ek)),
-                "c7b8fa0aa471d5ae18922d6ccad5b31e1d84f92ae723abfd13747018740a8530"
-            );
-
-            // Deterministic encaps/decap consistency.
-            let m = [0x42u8; 32];
-            let (ct1, ss1) =
-                kem::encapsulate_deterministic(PqSuite::MlKem1024, &ek, &m).unwrap();
-            let (ct2, ss2) =
-                kem::encapsulate_deterministic(PqSuite::MlKem1024, &ek, &m).unwrap();
-            assert_eq!(ct1.len(), 1568);
-            assert_eq!(ct1, ct2);
-            assert_eq!(*ss1, *ss2);
-            let dec = kem::decapsulate(PqSuite::MlKem1024, &seed, &ct1).unwrap();
-            assert_eq!(*dec, *ss1);
-
-            // FIPS 203 implicit rejection on tampered ciphertext.
-            let mut bad_ct = ct1.clone();
-            bad_ct[0] ^= 0x01;
-            let rej = kem::decapsulate(PqSuite::MlKem1024, &seed, &bad_ct).unwrap();
-            assert_ne!(*rej, *ss1);
-
-            // FIPS 203 encapsulation key modulus check (coefficient 4095 >= 3329 rejected).
-            let mut bad_ek = ek;
-            bad_ek[0] = 0xff;
-            bad_ek[1] = 0xff;
-            assert_eq!(
-                kem::encapsulate_deterministic(PqSuite::MlKem1024, &bad_ek, &m)
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::InvalidPublicKey
-            );
-        }
-
-        /// FIPS 203 ML-KEM-768 KAT using the IETF reference seed `0x00..=0x3f`, deterministic
-        /// encaps/decap, implicit rejection, and invalid encapsulation-key modulus rejection.
-        #[cfg(feature = "ml-kem-768")]
-        #[test]
-        fn fips203_kat_ml_kem_768() {
-            let seed: [u8; 64] = core::array::from_fn(|i| i as u8);
-            let ek = kem::derive_ek(PqSuite::MlKem768, &seed).unwrap();
-            assert_eq!(ek.len(), 1184);
-            assert_eq!(hex_encode(&ek[..16]), "298aa10d423c8dda069d02bc59e6cdf0");
-            assert_eq!(hex_encode(&ek[ek.len() - 16..]), "1ea893c3e2cb32da8bc342fa4dea0578");
-            assert_eq!(
-                hex_encode(&Sha256::digest(&ek)),
-                "0b7934c83125c788995e2ba6bd761e33046b3e40571be53e023309a29f398cc9"
-            );
-
-            // Deterministic encaps/decap consistency.
-            let m = [0x42u8; 32];
-            let (ct1, ss1) =
-                kem::encapsulate_deterministic(PqSuite::MlKem768, &ek, &m).unwrap();
-            let (ct2, ss2) =
-                kem::encapsulate_deterministic(PqSuite::MlKem768, &ek, &m).unwrap();
-            assert_eq!(ct1.len(), 1088);
-            assert_eq!(ct1, ct2);
-            assert_eq!(*ss1, *ss2);
-            let dec = kem::decapsulate(PqSuite::MlKem768, &seed, &ct1).unwrap();
-            assert_eq!(*dec, *ss1);
-
-            // FIPS 203 implicit rejection on tampered ciphertext.
-            let mut bad_ct = ct1.clone();
-            bad_ct[0] ^= 0x01;
-            let rej = kem::decapsulate(PqSuite::MlKem768, &seed, &bad_ct).unwrap();
-            assert_ne!(*rej, *ss1);
-
-            // FIPS 203 encapsulation key modulus check (coefficient 4095 >= 3329 rejected).
-            let mut bad_ek = ek;
-            bad_ek[0] = 0xff;
-            bad_ek[1] = 0xff;
-            assert_eq!(
-                kem::encapsulate_deterministic(PqSuite::MlKem768, &bad_ek, &m)
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::InvalidPublicKey
-            );
-        }
-
         #[test]
         fn pqxdh_initiate_accept_all_modes() {
             for suite in enabled_suites() {
@@ -2147,7 +2073,10 @@ mod test {
 
                 let mut prekeys = LocalPrekeys::new();
                 let published = prekeys.generate_pq(&bob, suite, 2, 2).unwrap();
-                assert_eq!(prekeys.current_signed_prekey(), Some(published.classical.signed_prekey));
+                assert_eq!(
+                    prekeys.current_signed_prekey(),
+                    Some(published.classical.signed_prekey)
+                );
                 assert_eq!(
                     prekeys.current_pq_last_resort_id(suite),
                     Some(published.pq_last_resort.id)
@@ -2182,8 +2111,9 @@ mod test {
                                 pq_last_resort: use_last_resort,
                             };
 
-                            let (msg, alice_ag) =
-                                bundle.initiate_pq(&alice, &bob_ik, manifest_digest).unwrap();
+                            let (msg, alice_ag) = bundle
+                                .initiate_pq(&alice, &bob_ik, manifest_digest)
+                                .unwrap();
                             assert_eq!(msg.version, PQXDH_VERSION);
                             assert_eq!(msg.pq_suite, suite);
                             assert_eq!(msg.pq_last_resort, use_last_resort);
@@ -2198,7 +2128,10 @@ mod test {
                             assert_eq!(alice_ag.associated_data, bob_ag.associated_data);
                             assert_eq!(&alice_ag.associated_data[..32], &alice_ik);
                             assert_eq!(&alice_ag.associated_data[32..64], &bob_ik);
-                            assert_eq!(&alice_ag.associated_data[64..96], &alice_ag.transcript_hash);
+                            assert_eq!(
+                                &alice_ag.associated_data[64..96],
+                                &alice_ag.transcript_hash
+                            );
                             assert_eq!(alice_ag.suite, suite);
 
                             // Mismatched manifest digest changes TH and SK.
@@ -2555,8 +2488,9 @@ mod test {
                 // 8. Tampered ciphertext bit yields different SK and TH (implicit rejection + TH).
                 let mut tampered_ct = valid_msg;
                 tampered_ct.pq_ciphertext[0] ^= 0x80;
-                let (bob_tampered, _) =
-                    prekeys.accept_pq(&bob, &alice_ik, &tampered_ct, None).unwrap();
+                let (bob_tampered, _) = prekeys
+                    .accept_pq(&bob, &alice_ik, &tampered_ct, None)
+                    .unwrap();
                 assert_ne!(bob_tampered.transcript_hash, alice_ag.transcript_hash);
                 assert_ne!(*bob_tampered.secret_key, *alice_ag.secret_key);
             }
@@ -2708,12 +2642,13 @@ mod test {
                 {
                     let mut tampered = LocalPrekeys::new();
                     tampered.generate_pq(&bob, suite, 0, 1).unwrap();
-                    let entry = tampered.generations[0].pq_last_resort.get_mut(&suite).unwrap();
+                    let entry = tampered.generations[0]
+                        .pq_last_resort
+                        .get_mut(&suite)
+                        .unwrap();
                     entry.seed[0] ^= 0x01;
                     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&tampered).unwrap();
-                    assert!(
-                        rkyv::from_bytes::<LocalPrekeys, rkyv::rancor::Error>(&bytes).is_err()
-                    );
+                    assert!(rkyv::from_bytes::<LocalPrekeys, rkyv::rancor::Error>(&bytes).is_err());
                 }
             }
         }
