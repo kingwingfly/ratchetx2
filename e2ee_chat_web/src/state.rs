@@ -694,6 +694,8 @@ pub struct FileView {
     /// Whether it is an attachment no longer on the server, as this client deleted it, or it
     /// expired; what is kept here of it still opens.
     pub gone: bool,
+    /// Whether sending or uploading this file failed or was cancelled.
+    pub failed: bool,
     pub name: String,
     pub size: u64,
     pub sort: Sort,

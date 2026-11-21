@@ -3009,7 +3009,16 @@ impl Engine {
                 return Ok(None);
             }
             self.files.borrow_mut().insert(cache_key, file.clone());
-            let pending = self.announce(&peer, pending).await?;
+            let before_announce = pending.clone();
+            let pending = match self.announce(&peer, pending).await {
+                Ok(pending) => pending,
+                Err(e) => {
+                    if !self.cancelled.borrow().contains(&id) {
+                        self.show_upload(&peer, &before_announce, UploadState::Paused(e.clone()));
+                    }
+                    return Err(e);
+                }
+            };
             Ok::<_, String>(Some((pending, file, hasher)))
         }
         .await;
@@ -4446,6 +4455,7 @@ impl Engine {
                     outgoing: message.outgoing,
                     deletable,
                     gone,
+                    failed: message.delivery == Delivery::Failed,
                     sort: match sort {
                         Sort::Unknown => preview::sort(&name, &mime, &[]),
                         sort => sort,
@@ -4684,42 +4694,43 @@ impl Engine {
     /// leaves rejected preferences persisted. Transient offline / sign-in failures keep the
     /// durable local preference with `needs_publish = true` and report that explicitly.
     pub async fn set_pq_config(&self, config: PqConfig) -> Result<PqSaveOutcome, String> {
-        let (previous, previous_needs_publish) = {
-            let mut guard = self.inner.lock().await;
-            let inner = guard.as_mut().ok_or("locked")?;
-            let previous = inner.client.pq_config().clone();
-            let previous_needs_publish = inner.state.needs_publish;
-            if previous == config && !previous_needs_publish {
+        {
+            let guard = self.inner.lock().await;
+            let inner = guard.as_ref().ok_or("locked")?;
+            if *inner.client.pq_config() == config && !inner.state.needs_publish {
                 return Ok(PqSaveOutcome::Unchanged);
             }
-            inner
-                .client
-                .set_pq_config(config.clone())
-                .map_err(|e| describe(&e))?;
-            inner.state.needs_publish = true;
-            if let Err(e) = inner.save(&[]).await {
-                let _ = inner.client.set_pq_config(previous);
-                inner.state.needs_publish = previous_needs_publish;
-                return Err(describe(&e));
-            }
-            self.ui.me.set(Some(inner.me()));
-            (previous, previous_needs_publish)
-        };
+        }
+        // Refresh server capabilities before mutating or persisting `PqConfig` so a concurrent
+        // sync or tab close can never observe an unvalidated `strict_pq = true` on a classical-only
+        // server.
         self.refresh_server_info(true).await;
 
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
+        let previous = inner.client.pq_config().clone();
+        let previous_needs_publish = inner.state.needs_publish;
+        if previous == config && !previous_needs_publish {
+            return Ok(PqSaveOutcome::Unchanged);
+        }
         if config.strict_pq && inner.server_pq == ServerPqStatus::Disabled {
-            let _ = inner.client.set_pq_config(previous);
-            inner.state.needs_publish = previous_needs_publish;
-            let _ = inner.save(&[]).await;
-            self.ui.me.set(Some(inner.me()));
             return Err(
                 "Cannot require post-quantum encryption: this server does not have post-quantum \
                  encryption enabled."
                     .to_string(),
             );
         }
+        inner
+            .client
+            .set_pq_config(config)
+            .map_err(|e| describe(&e))?;
+        inner.state.needs_publish = true;
+        if let Err(e) = inner.save(&[]).await {
+            let _ = inner.client.set_pq_config(previous);
+            inner.state.needs_publish = previous_needs_publish;
+            return Err(describe(&e));
+        }
+        self.ui.me.set(Some(inner.me()));
 
         // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.
         match self.publish_full(inner, true).await {
@@ -4747,7 +4758,10 @@ impl Engine {
                 }
             }
             Err((Some(ErrorKind::SignInRequired), _)) => Ok(PqSaveOutcome::SavedLocallyNeedsSignIn),
-            Err(_) => Ok(PqSaveOutcome::SavedLocallyPendingPublish),
+            Err((Some(_), _)) => Ok(PqSaveOutcome::SavedLocallyPendingPublish),
+            // Local vault persistence error inside `publish_full`: surface it instead of masking
+            // as an offline save.
+            Err((None, msg)) => Err(msg),
         }
     }
 

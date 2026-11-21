@@ -2087,8 +2087,8 @@ fn SignInDialog() -> impl IntoView {
                                         );
                                     } else {
                                         progress.clear();
+                                        engine.ui().notify(format!("Signed in until {until}."));
                                     }
-                                    engine.ui().notify(format!("Signed in until {until}."));
                                 }
                                 Err(StartChatError::SignInRequired) => {
                                     engine.finish_auto_start_chat(Some(
@@ -3461,15 +3461,45 @@ fn FileBrowser(peer: PublicKey) -> impl IntoView {
     }
 }
 
+/// Compute the concise lifecycle status suffix for a file in `FileBrowser` (list row and tile).
+fn file_status_suffix(
+    is_local: bool,
+    gone: bool,
+    failed: bool,
+    deletable: bool,
+    outgoing: bool,
+) -> Option<&'static str> {
+    if is_local {
+        Some(if failed { "not sent" } else { "stored locally" })
+    } else if gone {
+        Some("no longer on the server")
+    } else if failed {
+        Some("upload cancelled")
+    } else if deletable {
+        Some("on server")
+    } else if outgoing {
+        Some("waiting to upload")
+    } else {
+        None
+    }
+}
+
 /// `file` as a tile of the file browser's grid of media: its preview, which for audio, which may
-/// have no cover, goes with its name, plus gone status and server-delete action matching list rows.
+/// have no cover, goes with its name, plus gone/cancelled status and server-delete action matching
+/// list rows.
 fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -> AnyView {
     let Some(source) = Source::of(&file.body) else {
         return ().into_any();
     };
     let ui = ui();
     let shown = inline_media(&file.body).map(|(source, _)| source);
-    let (index, listed_gone) = (file.index, file.gone);
+    let (index, listed_gone, failed, deletable, outgoing) = (
+        file.index,
+        file.gone,
+        file.failed,
+        file.deletable,
+        file.outgoing,
+    );
     let is_local = matches!(file.body, Body::File(_));
     let gone = move || {
         listed_gone
@@ -3477,14 +3507,9 @@ fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -
             || ui.gone.with(|gone| gone.contains(&(peer, index)))
     };
     let base_name = file.name.clone();
-    let title = move || {
-        if is_local {
-            format!("{base_name} (stored locally)")
-        } else if gone() {
-            format!("{base_name} (no longer on the server)")
-        } else {
-            base_name.clone()
-        }
+    let title = move || match file_status_suffix(is_local, gone(), failed, deletable, outgoing) {
+        Some(status) => format!("{base_name} ({status})"),
+        None => base_name.clone(),
     };
     let delete = match &file.body {
         Body::Remote(remote) if file.deletable => {
@@ -3498,7 +3523,7 @@ fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -
         _ => None,
     };
     view! {
-        <div class="tile" class:gone=gone>
+        <div class="tile" class:gone=move || gone() || failed>
             <button
                 type="button"
                 class="tile-open"
@@ -3508,9 +3533,27 @@ fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -
                 <MediaThumb source=shown sort=file.sort />
                 {(file.sort == Sort::Audio).then(|| view! { <span class="tile-name">{file.name}</span> })}
             </button>
-            <Show when=gone>
-                <span class="tile-status" title="No longer on the server">"Off server"</span>
-            </Show>
+            {move || {
+                if gone() {
+                    Some(
+                        view! {
+                            <span class="tile-status" title="No longer on the server">"Off server"</span>
+                        }
+                        .into_any(),
+                    )
+                } else if failed {
+                    Some(
+                        view! {
+                            <span class="tile-status" title="Upload cancelled or failed">
+                                {if is_local { "Not sent" } else { "Cancelled" }}
+                            </span>
+                        }
+                        .into_any(),
+                    )
+                } else {
+                    None
+                }
+            }}
             {delete}
         </div>
     }
@@ -3518,7 +3561,7 @@ fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -
 }
 
 /// `file` as a row of the file browser's list: its extension, name, size and day, and who sent
-/// it, the peer being `from`; whether it is stored locally or on the server (or gone).
+/// it, the peer being `from`; whether it is stored locally or on the server (or gone/cancelled).
 fn file_row(
     peer: PublicKey,
     file: FileView,
@@ -3534,25 +3577,23 @@ fn file_row(
     } else {
         format!("from {from}")
     };
-    let (index, listed_gone) = (file.index, file.gone);
+    let (index, listed_gone, failed, deletable, outgoing) = (
+        file.index,
+        file.gone,
+        file.failed,
+        file.deletable,
+        file.outgoing,
+    );
     let is_local = matches!(file.body, Body::File(_));
-    let deletable = file.deletable;
     let gone = move || {
         listed_gone
             || deleted.with(|deleted| deleted.contains(&index))
             || ui.gone.with(|gone| gone.contains(&(peer, index)))
     };
     let details = format!("{} · {} · {sender}", size_u64(file.size), day(file.at));
-    let details = move || {
-        if is_local {
-            format!("{details} · stored locally")
-        } else if gone() {
-            format!("{details} · no longer on the server")
-        } else if deletable {
-            format!("{details} · on server")
-        } else {
-            format!("{details} · waiting to upload")
-        }
+    let details = move || match file_status_suffix(is_local, gone(), failed, deletable, outgoing) {
+        Some(status) => format!("{details} · {status}"),
+        None => details.clone(),
     };
     // Media shows its preview, the rest its extension.
     let mark = match file.sort {
@@ -4975,5 +5016,37 @@ mod tests {
             chat_item_meta(&strict),
             (false, true, false, "PQ required (paused)".to_string())
         );
+    }
+
+    #[test]
+    fn file_status_suffix_distinguishes_local_cancelled_waiting_and_malformed() {
+        assert_eq!(
+            file_status_suffix(true, false, false, false, true),
+            Some("stored locally")
+        );
+        assert_eq!(
+            file_status_suffix(true, false, true, false, true),
+            Some("not sent")
+        );
+        assert_eq!(
+            file_status_suffix(false, true, false, false, true),
+            Some("no longer on the server")
+        );
+        // Cancelled / failed sign-in-held upload must NOT show "waiting to upload".
+        assert_eq!(
+            file_status_suffix(false, false, true, false, true),
+            Some("upload cancelled")
+        );
+        assert_eq!(
+            file_status_suffix(false, false, false, true, true),
+            Some("on server")
+        );
+        // Outgoing unuploaded non-failed attachment -> waiting to upload.
+        assert_eq!(
+            file_status_suffix(false, false, false, false, true),
+            Some("waiting to upload")
+        );
+        // Malformed incoming remote pointer -> no misleading "waiting to upload".
+        assert_eq!(file_status_suffix(false, false, false, false, false), None);
     }
 }
