@@ -13,7 +13,7 @@ repository = "https://github.com/kingwingfly/ratchetx2"
 crate-type = ["cdylib"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
 hmac = "0.13"
@@ -27,7 +27,7 @@ sha2 = "0.11"
 storage = { path = "../storage", default-features = false }
 # The `#[durable_object]` macro expands to wasm-bindgen code.
 wasm-bindgen = "0.2"
-worker = "0.8"
+worker = "0.9"
 xeddsa = { path = "../xeddsa" }
 
 [features]
