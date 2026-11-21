@@ -46,10 +46,6 @@ pub(super) fn contact_state_is_new_quarantined(state: &ContactState) -> bool {
 /// Pure quarantine helper: record an incoming quarantined classical initial message on an existing
 /// contact without clearing `quarantined_primary` (preventing a 2nd classical initial from
 /// unblocking `receive()`/`flush()`).
-#[cfg_attr(
-    not(any(feature = "ml-kem-1024", feature = "ml-kem-768", test)),
-    allow(dead_code)
-)]
 pub(super) fn record_quarantined_initial_state(
     state: &mut ContactState,
     held_session: Option<proto::SessionState>,

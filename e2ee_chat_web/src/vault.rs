@@ -614,6 +614,20 @@ pub struct Farewell {
     pub push_v2: Vec<u8>,
 }
 
+impl Farewell {
+    /// Recipient identity key of this farewell (from `push_v2`, falling back to any legacy `push`
+    /// persisted in an older vault).
+    pub fn recipient(&self) -> Option<Vec<u8>> {
+        if !self.push_v2.is_empty()
+            && let Ok(v2) =
+                session::protocol::mailbox_v2::PushV2Request::decode(self.push_v2.as_slice())
+        {
+            return Some(v2.recipient.to_vec());
+        }
+        self.push.as_ref().map(|p| p.recipient.to_vec())
+    }
+}
+
 /// A message sent or received.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct HistoryEntry {

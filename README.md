@@ -5,7 +5,7 @@
 - **[E2EE chat Worker](e2ee_chat_worker/README.md)**: the chat server as a Cloudflare Worker, over Connect, storing in Durable Objects and R2, and serving the web client
 - **[E2EE chat web client](e2ee_chat_web/README.md)**: the web client, in Leptos: keys and sessions stay in the browser, in a vault sealed by a passphrase
 
-The TUI chat client, `e2ee_chat_client`, is archived: its last version is at the tag [`archive/e2ee_chat_client`](https://github.com/kingwingfly/ratchetx2/tree/archive/e2ee_chat_client/e2ee_chat_client), where it still talks to the Worker, and with the web client.
+The TUI chat client, `e2ee_chat_client`, is archived: its last version is at the tag [`archive/e2ee_chat_client`](https://github.com/kingwingfly/ratchetx2/tree/archive/e2ee_chat_client/e2ee_chat_client) (it uses the removed legacy v1 wire protocol; the last v1-compatible Worker and web client are preserved at [`archive/legacy-v1`](https://github.com/kingwingfly/ratchetx2/tree/archive/legacy-v1)).
 
 Libraries; only `ratchetx2` is published on crates.io:
 

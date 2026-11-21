@@ -36,7 +36,7 @@ use leptos::task::spawn_local;
 use session::attachment::{CHUNK_SIZE, Upload};
 use session::protocol::attachment::DEFAULT_MAX_CHUNKS;
 use session::{
-    Client, ClientState, PqConfig, PublicKey, Session, SessionState, attachment,
+    Client, ClientState, ErrorKind, PqConfig, PublicKey, Session, SessionState, attachment,
     expected_audience_from_url, proto,
 };
 use sha2::{Digest, Sha256};
@@ -56,12 +56,10 @@ const NOT_SIGNED_IN_HERE: &str =
 /// Classical one-time prekeys in each initial/rotating publish.
 const ONE_TIME_PREKEYS: usize = 20;
 /// Post-quantum one-time prekeys per suite in each v2 initial/rotating publish.
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 const PQ_ONE_TIME_PREKEYS: usize = 20;
 /// Server-enforced cumulative classical OPK cap (`HandshakeV2Limits::default()`).
 const SERVER_MAX_ONE_TIME_PREKEYS: usize = 100;
 /// Server-enforced cumulative PQOPK cap summed across all suites (`HandshakeV2Limits::default()`).
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 const SERVER_MAX_PQ_ONE_TIME_PREKEYS: usize = 100;
 /// Replenish one-time prekeys (without rotating SPK) once this many are used...
 const REFILL_USED: u32 = 10;
@@ -69,10 +67,6 @@ const REFILL_USED: u32 = 10;
 const REPUBLISH_AGE: u64 = 7 * 24 * 60 * 60 * 1000;
 /// Structured error returned by [`Engine::start_chat`] so the UI can offer actionable prompts.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(
-    not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
-    allow(dead_code)
-)]
 pub enum StartChatError {
     /// The server requires sign-in on this page's origin before fetching prekeys / starting a chat.
     SignInRequired,
@@ -231,17 +225,12 @@ struct Inner<V = Vault> {
     /// The server's address.
     server: String,
     /// Canonical expected server audience derived from `server` via `expected_audience_from_url`.
-    #[cfg_attr(
-        not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
-        allow(dead_code)
-    )]
     audience: String,
     /// Server PQ availability discovered via `check_server_info`.
     server_pq: ServerPqStatus,
     /// Last known server-stored classical OPK count (from publish or `RefillPrekeysResponse`).
     last_server_classical_opks: Option<u32>,
     /// Last known server-stored total PQOPK count across all suites.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     last_server_pq_opks: Option<u32>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
@@ -297,7 +286,33 @@ impl Engine {
                 engine.refused_for_sign_in();
             }
         });
+        let weak = Rc::downgrade(&engine);
+        transport::on_update_required(move |reason| {
+            if let Some(engine) = weak.upgrade() {
+                engine.require_update(reason);
+            }
+        });
         engine
+    }
+
+    /// Surface a persistent upgrade/refresh banner when the server rejects this client's protocol
+    /// (e.g. WebSocket close `4010`, `x-e2ee-deprecated`, or `ErrorKind::Unimplemented`).
+    pub(super) fn require_update(&self, reason: impl Into<String>) {
+        let message = normalize_update_reason(&reason.into());
+        let already_shown = self.ui.update_required.with_untracked(Option::is_some);
+        if !already_shown {
+            self.ui.log(format!("update required: {message}"));
+            self.ui.notify(message.clone());
+        }
+        self.ui.update_required.set(Some(message));
+    }
+
+    /// If `error` indicates a server protocol rejection (`ErrorKind::Unimplemented`) on a core
+    /// v2 procedure, prompt the user to refresh/upgrade the page.
+    pub(super) fn check_protocol_error(&self, error: &session::Error) {
+        if error.kind() == ErrorKind::Unimplemented {
+            self.require_update(describe(error));
+        }
     }
 
     /// Send `what` once everything sent before it went: messages go in the order they were
@@ -1204,7 +1219,6 @@ impl<V: HistoryStore> Inner<V> {
             isolated_peers,
             server_pq: ServerPqStatus::Unknown,
             last_server_classical_opks: None,
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
             last_server_pq_opks: None,
             unsaved_state: false,
             contacts_dirty_late: false,
@@ -1407,6 +1421,23 @@ impl Engine {
             }
             order(messages, &me, peer);
         });
+    }
+}
+
+/// Normalize a protocol-deprecation / `Unimplemented` reason into clear refresh guidance for the UI.
+pub(super) fn normalize_update_reason(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("procedure not implemented by server") {
+        return "This app version is no longer supported by the server. Refresh the page to load the latest version."
+            .to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("refresh") || lower.contains("reload") || lower.contains("upgrade") {
+        trimmed.to_string()
+    } else {
+        format!(
+            "This app version is out of date ({trimmed}). Refresh the page to load the latest version."
+        )
     }
 }
 

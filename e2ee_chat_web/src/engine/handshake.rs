@@ -2,11 +2,10 @@
 
 use super::contact::Contact;
 use super::{
-    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, REFILL_USED, REPUBLISH_AGE,
-    SERVER_MAX_ONE_TIME_PREKEYS, StartChatError, origin, records, same_server,
+    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS,
+    REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS, SERVER_MAX_PQ_ONE_TIME_PREKEYS,
+    StartChatError, origin, records, same_server,
 };
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use super::{PQ_ONE_TIME_PREKEYS, SERVER_MAX_PQ_ONE_TIME_PREKEYS};
 use crate::content::{Content, Kind, stamp};
 use crate::state::{Delivery, MessageView, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
@@ -17,24 +16,18 @@ use crate::vault::{
 };
 use leptos::prelude::*;
 use prost::Message as _;
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-use session::InitialMessage;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use session::{AcceptedInitial, InitialMessageV2, PublishV2Outcome};
-use session::{ErrorKind, PeerPqState, PublicKey, Session};
+use session::{
+    AcceptedInitial, ErrorKind, InitialMessageKind, InitialMessageV2, PeerPqState, PublicKey,
+    PublishV2Outcome, Session,
+};
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 pub(super) type Incoming = InitialMessageV2;
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-pub(super) type Incoming = InitialMessage;
 
 // A page can include 64 initials from retrying a previous stall and another 64
 // surfaced together at its expired or newly stalled tail.
 const MAX_PENDING_CARRIED_INITIALS: usize = 2 * 64;
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
-    use session::InitialMessageKind;
     use session::protocol::handshake_v2::InitialMessageV2 as Wire;
     let wire = match &message.kind {
         InitialMessageKind::Classical(m) => Wire {
@@ -58,26 +51,8 @@ fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
     Ok(session::protocol::mailbox_v2::encode_carried_initial(&wire)?.to_vec())
 }
 
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
-    use session::protocol::handshake::InitialMessage as Wire;
-    Ok(Wire {
-        first_message: Some(message.first_message.clone()),
-        ..Wire::from(&message.x3dh)
-    }
-    .encode_to_vec())
-}
-
 fn decode_carried_initial(bytes: &[u8]) -> Option<Incoming> {
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    {
-        InitialMessageV2::decode_carried(bytes)
-    }
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    {
-        let wire = session::protocol::handshake::InitialMessage::decode(bytes).ok()?;
-        InitialMessage::try_from(&wire).ok()
-    }
+    InitialMessageV2::decode_carried(bytes)
 }
 
 pub(super) fn stage_carried_initials<'a>(
@@ -98,8 +73,7 @@ pub(super) fn stage_carried_initials<'a>(
 }
 
 struct Inbox {
-    // The destructive v1 inbox has no acknowledgement IDs.
-    messages: Vec<(PublicKey, Option<u64>, Incoming)>,
+    messages: Vec<(PublicKey, u64, Incoming)>,
     malformed_ids: Vec<u64>,
 }
 
@@ -123,7 +97,7 @@ fn is_valid_inbox_ack_id(id: u64) -> bool {
     id != 0 && id <= session::protocol::MAX_SAFE_INTEGER
 }
 
-/// Zero is reserved for carried messages and the destructive v1 inbox.
+/// Zero is reserved for carried initial messages in mailbox envelopes.
 pub(super) fn stage_inbox_ack(pending: &mut Vec<u64>, id: u64) -> bool {
     if !is_valid_inbox_ack_id(id) || pending.contains(&id) {
         return false;
@@ -158,41 +132,18 @@ impl<V: HistoryStore> Inner<V> {
     }
 
     async fn list_inbox(&mut self) -> session::Result<Inbox> {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            let listed = self
-                .client
-                .list_initial_messages_v2(&self.audience, 100)
-                .await?;
-            Ok(Inbox {
-                messages: listed
-                    .messages
-                    .into_iter()
-                    .map(|m| {
-                        let id = (!listed.fell_back_to_v1).then_some(m.id);
-                        (m.sender, id, m)
-                    })
-                    .collect(),
-                malformed_ids: if listed.fell_back_to_v1 {
-                    vec![]
-                } else {
-                    listed.malformed_ids
-                },
-            })
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            Ok(Inbox {
-                messages: self
-                    .client
-                    .take_initial_messages()
-                    .await?
-                    .into_iter()
-                    .map(|m| (m.x3dh.identity_key, None, m))
-                    .collect(),
-                malformed_ids: vec![],
-            })
-        }
+        let listed = self
+            .client
+            .list_initial_messages_v2(&self.audience, 100)
+            .await?;
+        Ok(Inbox {
+            messages: listed
+                .messages
+                .into_iter()
+                .map(|m| (m.sender, m.id, m))
+                .collect(),
+            malformed_ids: listed.malformed_ids,
+        })
     }
 
     fn open_initial(
@@ -201,54 +152,35 @@ impl<V: HistoryStore> Inner<V> {
         message: &Incoming,
     ) -> session::Result<OpenedInitial> {
         let mailbox = Fetch::client(&self.server);
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let (opened, classical_used, pq_used) = {
-            let pin = self
-                .contact(peer)
-                .map(|c| c.session.peer_pq_state().clone())
-                .unwrap_or_default();
-            let opened = match self
-                .client
-                .accept_initial_v2(peer, &pin, message, mailbox)?
-            {
-                AcceptedInitial::Accepted {
-                    session,
-                    first_message,
-                    ..
-                } => OpenedInitial {
-                    session,
-                    first_message,
-                    quarantine: None,
-                },
-                AcceptedInitial::Quarantined {
-                    session,
-                    first_message,
-                    peer_was_pq_pinned,
-                } => OpenedInitial {
-                    session,
-                    first_message,
-                    quarantine: Some(peer_was_pq_pinned),
-                },
-            };
-            (
-                opened,
-                message.uses_one_time_prekey(),
-                message.uses_pq_one_time_prekey(),
-            )
+        let pin = self
+            .contact(peer)
+            .map(|c| c.session.peer_pq_state().clone())
+            .unwrap_or_default();
+        let opened = match self
+            .client
+            .accept_initial_v2(peer, &pin, message, mailbox)?
+        {
+            AcceptedInitial::Accepted {
+                session,
+                first_message,
+                ..
+            } => OpenedInitial {
+                session,
+                first_message,
+                quarantine: None,
+            },
+            AcceptedInitial::Quarantined {
+                session,
+                first_message,
+                peer_was_pq_pinned,
+            } => OpenedInitial {
+                session,
+                first_message,
+                quarantine: Some(peer_was_pq_pinned),
+            },
         };
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let (opened, classical_used, pq_used) = {
-            let (session, first_message) = self.client.accept(peer, message, mailbox)?;
-            (
-                OpenedInitial {
-                    session,
-                    first_message,
-                    quarantine: None,
-                },
-                message.x3dh.one_time_prekey.is_some(),
-                false,
-            )
-        };
+        let classical_used = message.uses_one_time_prekey();
+        let pq_used = message.uses_pq_one_time_prekey();
         self.state.used_one_time_prekeys = self
             .state
             .used_one_time_prekeys
@@ -260,18 +192,6 @@ impl<V: HistoryStore> Inner<V> {
         Ok(opened)
     }
 
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    async fn ack_pending_inbox_v2(&mut self) -> Result<(), String> {
-        self.ack_persisted_inbox(async |client, audience, ids| {
-            client
-                .ack_initial_messages_v2(audience, ids)
-                .await
-                .map(drop)
-                .map_err(|e| describe(&e))
-        })
-        .await
-    }
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768", test))]
     pub(super) async fn ack_persisted_inbox(
         &mut self,
         mut acknowledge: impl AsyncFnMut(
@@ -362,9 +282,9 @@ impl PublishError {
         }
     }
 
-    pub(super) fn transmitted(e: session::Error, v2: bool) -> Self {
+    pub(super) fn transmitted(e: session::Error) -> Self {
         // Strict v2 fallback maps the server's Unimplemented refusal to a local PqRequired.
-        let definitive_refusal = e.is_server_refusal() || (v2 && e.kind() == ErrorKind::PqRequired);
+        let definitive_refusal = e.is_server_refusal() || e.kind() == ErrorKind::PqRequired;
         let wire_kind = std::error::Error::source(&e)
             .and_then(|source| source.downcast_ref::<session::protocol::Error>())
             .map(session::protocol::Error::kind);
@@ -393,16 +313,34 @@ impl PublishError {
     pub(super) fn needs_sign_in(&self) -> bool {
         self.definitive_refusal && self.kind == Some(ErrorKind::SignInRequired)
     }
+
+    pub(super) fn is_unimplemented(&self) -> bool {
+        self.definitive_refusal && self.kind == Some(ErrorKind::Unimplemented)
+    }
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 #[derive(PartialEq, Eq)]
 enum RefillV2Outcome {
     Handled,
-    Unsupported,
+    PqDisabled,
 }
 
 impl Engine {
+    async fn ack_pending_inbox_v2(&self, inner: &mut Inner) -> Result<(), String> {
+        inner
+            .ack_persisted_inbox(async |client, audience, ids| {
+                client
+                    .ack_initial_messages_v2(audience, ids)
+                    .await
+                    .map(drop)
+                    .map_err(|e| {
+                        self.check_protocol_error(&e);
+                        describe(&e)
+                    })
+            })
+            .await
+    }
+
     pub(super) async fn take_initial_messages(&self) -> Result<bool, String> {
         let mut guard = self.inner.lock().await;
         let Some(inner) = guard.as_mut() else {
@@ -411,23 +349,26 @@ impl Engine {
         if inner.needs_save() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        inner.ack_pending_inbox_v2().await?;
-        let inbox = inner.list_inbox().await.map_err(|e| describe(&e))?;
+        self.ack_pending_inbox_v2(inner).await?;
+        let inbox = match inner.list_inbox().await {
+            Ok(inbox) => inbox,
+            Err(e) => {
+                self.check_protocol_error(&e);
+                return Err(describe(&e));
+            }
+        };
         let mut batch = InitialBatch::default();
         for (peer, id, message) in inbox.messages {
-            if let Some(id) = id {
-                if !is_valid_inbox_ack_id(id) {
-                    self.ui.log(format!(
-                        "Skipped initial message with out-of-range inbox ID {id}."
-                    ));
-                    continue;
-                }
-                if !stage_inbox_ack(&mut inner.state.pending_inbox_acks, id) {
-                    continue;
-                }
-                batch.dirty = true;
+            if !is_valid_inbox_ack_id(id) {
+                self.ui.log(format!(
+                    "Skipped initial message with out-of-range inbox ID {id}."
+                ));
+                continue;
             }
+            if !stage_inbox_ack(&mut inner.state.pending_inbox_acks, id) {
+                continue;
+            }
+            batch.dirty = true;
             let read = self.ui.open.get_untracked() == Some(peer) && !document().hidden();
             self.process_initial(inner, &peer, &message, read, &mut batch);
         }
@@ -445,13 +386,11 @@ impl Engine {
         }
         let upgrades = std::mem::take(&mut batch.upgrades);
         self.save_initial_batch(inner, batch).await?;
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let ack = inner.ack_pending_inbox_v2().await;
+        let ack = self.ack_pending_inbox_v2(inner).await;
         drop(guard);
         for peer in upgrades {
             let _ = self.upgrade_to_pq(peer).await;
         }
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         ack?;
         Ok(true)
     }
@@ -695,99 +634,54 @@ impl Engine {
         inner: &mut Inner,
         now_anyway: bool,
     ) -> Result<(), PublishError> {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            let prepared = inner
-                .client
-                .prepare_publish_v2(&inner.audience, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS)
-                .map_err(PublishError::prepare)?;
-            // H-2: Persist new prekeys & manifest state BEFORE transmitting!
-            inner.save_state().await.map_err(PublishError::storage)?;
-            match inner
-                .client
-                .transmit_publish_v2_or_v1_fallback(&prepared)
-                .await
-            {
-                Ok(outcome) => {
-                    inner.client.commit_publish_v2(prepared);
-                    self.publish_waits_sign_in.set(false);
-                    self.publish_waits_settings.set(false);
-                    inner.state.used_pq_one_time_prekeys = 0;
-                    inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
-                    let log_msg = match outcome {
-                        PublishV2Outcome::V2Pq => {
-                            let suites_len = inner.client.pq_config().offered_suites().len();
-                            inner.last_server_pq_opks =
-                                Some((PQ_ONE_TIME_PREKEYS * suites_len) as u32);
-                            if inner.server_pq == ServerPqStatus::Disabled {
-                                inner.server_pq = ServerPqStatus::Unknown;
-                            }
-                            "published post-quantum + classical prekeys and signed capability manifest"
+        let prepared = inner
+            .client
+            .prepare_publish_v2(&inner.audience, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS)
+            .map_err(PublishError::prepare)?;
+        // H-2: Persist new prekeys & manifest state BEFORE transmitting!
+        inner.save_state().await.map_err(PublishError::storage)?;
+        match inner.client.transmit_publish_v2(&prepared).await {
+            Ok(outcome) => {
+                inner.client.commit_publish_v2(prepared);
+                self.publish_waits_sign_in.set(false);
+                self.publish_waits_settings.set(false);
+                inner.state.used_pq_one_time_prekeys = 0;
+                inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
+                let log_msg = match outcome {
+                    PublishV2Outcome::V2Pq => {
+                        let suites_len = inner.client.pq_config().offered_suites().len();
+                        inner.last_server_pq_opks = Some((PQ_ONE_TIME_PREKEYS * suites_len) as u32);
+                        if inner.server_pq == ServerPqStatus::Disabled {
+                            inner.server_pq = ServerPqStatus::Unknown;
                         }
-                        PublishV2Outcome::V2ClassicalOff => {
-                            inner.last_server_pq_opks = Some(0);
-                            if inner.client.pq_config().pq_enabled {
-                                inner.server_pq = ServerPqStatus::Disabled;
-                                "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
-                            } else {
-                                "published classical prekeys and signed PQ-off capability manifest"
-                            }
-                        }
-                        PublishV2Outcome::V1Fallback => {
-                            inner.last_server_pq_opks = Some(0);
+                        "published post-quantum + classical prekeys and signed capability manifest"
+                    }
+                    PublishV2Outcome::V2ClassicalOff => {
+                        inner.last_server_pq_opks = Some(0);
+                        if inner.client.pq_config().pq_enabled {
                             inner.server_pq = ServerPqStatus::Disabled;
-                            "published classical prekeys via v1 fallback"
+                            "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
+                        } else {
+                            "published classical prekeys and signed PQ-off capability manifest"
                         }
-                    };
-                    inner
-                        .save_full_publish_success()
-                        .await
-                        .map_err(PublishError::storage)?;
-                    self.ui.me.set(Some(inner.me()));
-                    self.ui.log(log_msg);
-                    Ok(())
-                }
-                Err(e) => {
-                    let error = PublishError::transmitted(e, true);
-                    if error.rejects_settings() || error.needs_sign_in() {
-                        inner.client.rollback_publish_v2_on_refusal(prepared);
-                        return self.finish_publish_rollback(inner, error, now_anyway).await;
                     }
-                    Err(error)
-                }
+                };
+                inner
+                    .save_full_publish_success()
+                    .await
+                    .map_err(PublishError::storage)?;
+                self.ui.me.set(Some(inner.me()));
+                self.ui.log(log_msg);
+                Ok(())
             }
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            let prepared = inner
-                .client
-                .prepare_publish(ONE_TIME_PREKEYS)
-                .map_err(PublishError::prepare)?;
-            // H-2: Persist new prekeys BEFORE transmitting!
-            inner.save_state().await.map_err(PublishError::storage)?;
-            match inner.client.transmit_publish(&prepared).await {
-                Ok(()) => {
-                    inner.client.commit_publish(prepared);
-                    self.publish_waits_sign_in.set(false);
-                    self.publish_waits_settings.set(false);
-                    inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
-                    inner
-                        .save_full_publish_success()
-                        .await
-                        .map_err(PublishError::storage)?;
-                    self.ui.log(format!(
-                        "published a new signed prekey and {ONE_TIME_PREKEYS} one-time prekeys"
-                    ));
-                    Ok(())
+            Err(e) => {
+                self.check_protocol_error(&e);
+                let error = PublishError::transmitted(e);
+                if error.rejects_settings() || error.needs_sign_in() || error.is_unimplemented() {
+                    inner.client.rollback_publish_v2_on_refusal(prepared);
+                    return self.finish_publish_rollback(inner, error, now_anyway).await;
                 }
-                Err(e) => {
-                    let error = PublishError::transmitted(e, false);
-                    if error.rejects_settings() || error.needs_sign_in() {
-                        inner.client.rollback_publish_on_refusal(prepared);
-                        return self.finish_publish_rollback(inner, error, now_anyway).await;
-                    }
-                    Err(error)
-                }
+                Err(error)
             }
         }
     }
@@ -852,8 +746,8 @@ impl Engine {
         Err(error)
     }
 
-    /// Try one v2 refill. Only an explicit Unimplemented refusal permits trying a different wire request.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    /// Try one non-rotating v2 refill. When `pq_count > 0` and the relay has runtime PQ disabled,
+    /// returns `Ok(RefillV2Outcome::PqDisabled)` so the caller can retry with classical OPKs only.
     async fn try_refill_v2(
         &self,
         inner: &mut Inner,
@@ -889,13 +783,17 @@ impl Engine {
                             .log("server one-time prekey pool is already full; skipped refill");
                         Ok(RefillV2Outcome::Handled)
                     }
-                    ErrorKind::Unimplemented => {
+                    ErrorKind::Unimplemented if pq_count > 0 => {
                         inner.server_pq = ServerPqStatus::Disabled;
                         if inner.client.pq_config().strict_pq {
                             Err(describe(&e))
                         } else {
-                            Ok(RefillV2Outcome::Unsupported)
+                            Ok(RefillV2Outcome::PqDisabled)
                         }
+                    }
+                    ErrorKind::Unimplemented => {
+                        self.require_update(describe(&e));
+                        Err(describe(&e))
                     }
                     ErrorKind::NotFound | ErrorKind::Protocol => {
                         inner.state.needs_publish = true;
@@ -908,6 +806,7 @@ impl Engine {
                 return outcome;
             }
         };
+        inner.client.commit_refill_v2(prepared);
         inner.last_server_classical_opks = Some(response.classical_one_time_count);
         inner.last_server_pq_opks = Some(
             response
@@ -935,11 +834,8 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
-        let pq_compiled = cfg!(any(feature = "ml-kem-1024", feature = "ml-kem-768"));
-        let needs_v2_manifest = pq_compiled
-            && inner.client.pq_config().pq_enabled
-            && inner.client.manifest_seq() == 0
-            && inner.server_pq != ServerPqStatus::Disabled;
+        let needs_v2_manifest =
+            inner.client.manifest_seq() == 0 || inner.client.prekey_generation() == 0;
         let full_due = now_anyway
             || inner.state.published_at == 0
             || inner.state.needs_publish
@@ -966,29 +862,23 @@ impl Engine {
             return Ok(());
         }
         let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;
-        let pq_suites_len = if pq_compiled
-            && inner.client.pq_config().pq_enabled
-            && inner.server_pq != ServerPqStatus::Disabled
-        {
-            inner.client.pq_config().offered_suites().len()
-        } else {
-            0
-        };
+        let pq_suites_len =
+            if inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled {
+                inner.client.pq_config().offered_suites().len()
+            } else {
+                0
+            };
         let pq_low = pq_suites_len > 0 && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
         if !classical_low && !pq_low {
             return Ok(());
         }
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let server_pq_known = inner.last_server_pq_opks;
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let server_pq_known = None;
         let (classical_count, pq_count) = refill_batch_counts(
             inner.state.used_one_time_prekeys,
             inner.state.used_pq_one_time_prekeys,
             pq_suites_len,
             inner.last_server_classical_opks,
-            server_pq_known,
+            inner.last_server_pq_opks,
         );
         // If server is already at its 100-key cap, reset counters so sync doesn't loop.
         if classical_count == 0 && pq_count == 0 {
@@ -1007,59 +897,14 @@ impl Engine {
             return Ok(());
         }
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        if inner.client.prekey_generation() > 0 {
-            if self.try_refill_v2(inner, classical_count, pq_count).await?
-                == RefillV2Outcome::Handled
-                || classical_count == 0
-            {
-                return Ok(());
-            }
-            // A PQ-disabled v2 server can still accept a classical-only refill.
-            if pq_count > 0
-                && self.try_refill_v2(inner, classical_count, 0).await? == RefillV2Outcome::Handled
-            {
-                return Ok(());
-            }
+        if self.try_refill_v2(inner, classical_count, pq_count).await? == RefillV2Outcome::Handled
+            || classical_count == 0
+        {
+            return Ok(());
         }
-
-        if classical_count > 0 && !inner.client.pq_config().strict_pq {
-            let prepared = inner
-                .client
-                .prepare_extend_keys(classical_count)
-                .map_err(|e| describe(&e))?;
-            inner.save_state().await.map_err(|e| describe(&e))?;
-            match inner.client.transmit_publish(&prepared).await {
-                Ok(()) => {
-                    inner.client.commit_publish(prepared);
-                    inner.state.used_one_time_prekeys = 0;
-                    inner.last_server_classical_opks = Some(classical_count as u32);
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    self.ui.log(format!(
-                        "replenished {classical_count} one-time prekeys without rotating signed prekey"
-                    ));
-                }
-                Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::SignInRequired => {
-                    inner.client.rollback_publish_on_refusal(prepared);
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    self.publish_waits_sign_in.set(true);
-                }
-                Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::LimitExceeded => {
-                    inner.client.rollback_publish_on_refusal(prepared);
-                    inner.state.used_one_time_prekeys = 0;
-                    inner.last_server_classical_opks = Some(SERVER_MAX_ONE_TIME_PREKEYS as u32);
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    self.ui
-                        .log("server one-time prekey pool is already full; skipped refill");
-                }
-                Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::Protocol => {
-                    inner.client.rollback_publish_on_refusal(prepared);
-                    inner.state.needs_publish = true;
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                    return Err(describe(&e));
-                }
-                Err(e) => return Err(describe(&e)),
-            }
+        // A PQ-disabled v2 server can still accept a classical-only v2 refill.
+        if pq_count > 0 {
+            let _ = self.try_refill_v2(inner, classical_count, 0).await?;
         }
         Ok(())
     }
@@ -1129,19 +974,22 @@ impl Engine {
         stamp(&mut greeting, 1);
         let signs_in_here = same_server(&inner.server, &origin());
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let (session, outgoing_request) = {
-            let prepared = inner
-                .client
-                .prepare_initiate_v2(
-                    &inner.audience,
-                    &peer,
-                    &peer_state,
-                    &greeting,
-                    Fetch::client(&inner.server),
-                )
-                .await
-                .map_err(|e| match e.kind() {
+        let local_pq = inner.local_pq_enabled();
+        let prepared = inner
+            .client
+            .prepare_initiate_v2(
+                &inner.audience,
+                &peer,
+                &peer_state,
+                &greeting,
+                Fetch::client(&inner.server),
+            )
+            .await
+            .map_err(|e| {
+                if e.kind() == ErrorKind::Unimplemented && !local_pq {
+                    self.require_update(describe(&e));
+                }
+                match e.kind() {
                     ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
                     ErrorKind::SignInRequired => {
                         StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
@@ -1156,37 +1004,17 @@ impl Engine {
                         "nobody published keys for that key on this server".to_string(),
                     ),
                     _ => StartChatError::Other(describe(&e)),
-                })?;
-            (prepared.session, prepared.request)
-        };
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let (session, outgoing_request) = {
-            let _ = &peer_state;
-            let prepared = inner
-                .client
-                .prepare_initiate(&peer, &greeting, Fetch::client(&inner.server))
-                .await
-                .map_err(|e| match e.kind() {
-                    ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
-                    ErrorKind::SignInRequired => {
-                        StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
-                    }
-                    ErrorKind::NotFound => StartChatError::Other(
-                        "nobody published keys for that key on this server".to_string(),
-                    ),
-                    _ => StartChatError::Other(describe(&e)),
-                })?;
-            (prepared.session, prepared.request)
-        };
+                }
+            })?;
+        let (session, outgoing_request) = (prepared.session, prepared.request);
 
         // Telling the peer that the chat was deleted here, if that has not gone yet, goes no
         // more: this session replaces the deleted one there anyway.
         let saved_farewells = inner.state.farewells.clone();
         inner.state.farewells.retain(|farewell| {
             farewell
-                .push
-                .as_ref()
-                .is_none_or(|push| push.recipient != peer.as_slice())
+                .recipient()
+                .is_none_or(|recipient| recipient != peer.as_slice())
         });
         let entry = HistoryEntry {
             outgoing: true,
@@ -1223,20 +1051,18 @@ impl Engine {
         self.end_new_chat_submit();
 
         // Transmit the prepared initial message after durable local persistence.
-        let send_res: session::Result<()> = {
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            {
-                inner
-                    .client
-                    .send_prepared_initiate_v2(&outgoing_request)
-                    .await
+        if let Err(e) = inner
+            .client
+            .send_prepared_initiate_v2(&outgoing_request)
+            .await
+        {
+            let outgoing_is_pq = outgoing_request
+                .message
+                .as_ref()
+                .is_some_and(|m| m.version >= 2);
+            if e.kind() == ErrorKind::Unimplemented && !outgoing_is_pq {
+                self.require_update(describe(&e));
             }
-            #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-            {
-                inner.client.send_prepared_initiate(&outgoing_request).await
-            }
-        };
-        if let Err(e) = send_res {
             if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                 let dialog = self
                     .sign_in_flow
@@ -1257,27 +1083,15 @@ impl Engine {
 }
 
 /// Build a persisted [`Farewell`] for `sealed` on `contact`'s active session, preserving any
-/// carried v2/PQXDH initial message in `push_v2` under PQ builds.
+/// carried v2/PQXDH initial message in `push_v2`.
 pub(super) fn build_farewell(contact: &Contact, sealed: session::Sealed) -> Farewell {
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    {
-        let v2 = contact.session.push_v2_request(sealed.clone());
-        let cid = v2.client_message_id.to_vec();
-        let v2_bytes = v2.encode_to_vec();
-        Farewell {
-            push: Some(contact.session.push_request(sealed)),
-            client_message_id: cid,
-            push_v2: v2_bytes,
-        }
-    }
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    {
-        let cid = sealed.client_message_id().to_vec();
-        Farewell {
-            push: Some(contact.session.push_request(sealed)),
-            client_message_id: cid,
-            push_v2: vec![],
-        }
+    let v2 = contact.session.push_v2_request(sealed);
+    let cid = v2.client_message_id.to_vec();
+    let v2_bytes = v2.encode_to_vec();
+    Farewell {
+        push: None,
+        client_message_id: cid,
+        push_v2: v2_bytes,
     }
 }
 
@@ -1306,18 +1120,11 @@ pub(super) fn refill_batch_counts(
         0
     };
     let pq_per_suite = if pq_suites_len > 0 && used_pq >= REFILL_USED {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         let per_suite_target = (used_pq as usize / pq_suites_len).clamp(1, PQ_ONE_TIME_PREKEYS);
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let per_suite_target = (used_pq as usize / pq_suites_len).max(1);
         match server_pq_total_known {
             Some(known) => {
                 let est_remaining = (known as usize).saturating_sub(used_pq as usize);
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                let cap = SERVER_MAX_PQ_ONE_TIME_PREKEYS;
-                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-                let cap = SERVER_MAX_ONE_TIME_PREKEYS;
-                let headroom = cap.saturating_sub(est_remaining);
+                let headroom = SERVER_MAX_PQ_ONE_TIME_PREKEYS.saturating_sub(est_remaining);
                 per_suite_target.min(headroom / pq_suites_len)
             }
             None => {

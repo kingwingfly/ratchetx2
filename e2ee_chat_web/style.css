@@ -83,6 +83,8 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .dot.offline { background: var(--danger); box-shadow: 0 0 12px #ffb6a955; }
 .dot.locked { background: var(--faint); box-shadow: none; }
 .status { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.update-banner { flex: none; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 16px; padding: 10px 20px; border-bottom: 1px solid var(--warn-line); background: var(--warn-bg); color: var(--warn); font-size: 13px; }
+.update-banner span { flex: 1; min-width: 220px; }
 .main { flex: 1; min-height: 0; width: 100%; max-width: 1280px; margin: 0 auto; display: grid; grid-template-columns: 300px 1fr; border-inline: 1px solid var(--line); }
 .locked-screen { flex: 1; display: grid; place-items: center; color: var(--muted); }
 
@@ -473,6 +475,7 @@ pre.code { margin: 0; padding: 24px; font-family: var(--mono); font-size: 13px; 
 
 @media (max-width: 720px) {
   .topbar { padding: 10px 14px; }
+  .update-banner { padding: 10px 14px; }
   .brand small { display: none; }
   .main { grid-template-columns: 1fr; border: 0; }
   .main.chat-open .sidebar { display: none; }

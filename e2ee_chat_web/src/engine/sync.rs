@@ -9,30 +9,19 @@ use super::{
 };
 use crate::content::{Content, Kind};
 use crate::notify::{Event, Subscription};
-use crate::state::Link;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use crate::state::ServerPqStatus;
+use crate::state::{Link, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, monotonic_now_ms, now, sleep};
 use crate::vault::{ContactState, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use bytes::Bytes;
 use futures::future::{Either, select};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use prost::Message as _;
-use session::protocol::mailbox::LocalMailbox;
+use session::protocol::handshake_v2::InitialMessageV2 as WireInitialMessageV2;
+use session::protocol::mailbox_v2::{LocalMailboxV2, PushV2Request};
 use session::protocol::notify::{self, Notification};
-use session::{Client, ErrorKind, PublicKey, Session, proto};
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use session::{
-    PqSuite,
-    protocol::{
-        handshake_v2::InitialMessageV2 as WireInitialMessageV2,
-        mailbox_v2::{LocalMailboxV2, PushV2Request},
-    },
-};
+use session::{Client, ErrorKind, PqSuite, PublicKey, Session, proto};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -77,7 +66,9 @@ impl Engine {
                 if asked {
                     self.ui.syncing.set(false);
                 }
-                delay = if self.ui.live.get_untracked() {
+                delay = if self.ui.live.get_untracked()
+                    || self.ui.update_required.with_untracked(Option::is_some)
+                {
                     POLL_LIVE
                 } else if active {
                     POLL_FAST
@@ -145,6 +136,11 @@ impl Engine {
                                 self.notified(notification).await
                             }
                             Either::Left((Event::Resync, _)) => self.wake(),
+                            Either::Left((Event::UpgradeRequired(reason), _)) => {
+                                self.require_update(reason);
+                                self.ui.live.set(false);
+                                return;
+                            }
                             Either::Left((Event::Closed, _)) => break,
                             // Away: dropped, the subscription closes its socket.
                             Either::Right(_) if !self.present() => {
@@ -205,50 +201,46 @@ impl Engine {
     /// Query `GetServerInfo` verifying `server_id` against the client's locally derived expected
     /// audience (never blindly trusting server-supplied audience strings).
     pub(super) async fn refresh_server_info(&self, force: bool) {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            let mut guard = self.inner.lock().await;
-            let Some(inner) = guard.as_mut() else {
-                return;
-            };
-            if !force && inner.server_pq != ServerPqStatus::Unknown {
-                return;
-            }
-            let status = match inner.client.check_server_info(&inner.audience).await {
-                Ok(info) if info.pq_enabled => {
-                    let suites = info
-                        .supported_suites
-                        .iter()
-                        .filter_map(|&s| u8::try_from(s).ok().and_then(PqSuite::from_u8))
-                        .collect();
-                    ServerPqStatus::Enabled {
-                        suites,
-                        pq_ratchet: info.pq_ratchet_supported,
-                    }
-                }
-                Ok(_) => ServerPqStatus::Disabled,
-                Err(e) if e.kind() == ErrorKind::Unimplemented => ServerPqStatus::Disabled,
-                Err(e) if e.kind() == ErrorKind::DowngradeDetected => {
-                    self.ui.log(format!(
-                        "server identity mismatch for {}: possible relay impersonation",
-                        inner.audience
-                    ));
-                    self.ui.notify(format!(
-                        "Server identity mismatch for {} — refusing to trust server PQ metadata.",
-                        inner.audience
-                    ));
-                    ServerPqStatus::AudienceMismatch
-                }
-                Err(_) => return,
-            };
-            if inner.server_pq != status {
-                inner.server_pq = status;
-                self.ui.me.set(Some(inner.me()));
-            }
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return;
+        };
+        if !force && inner.server_pq != ServerPqStatus::Unknown {
+            return;
         }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            let _ = force;
+        let status = match inner.client.check_server_info(&inner.audience).await {
+            Ok(info) if info.pq_enabled => {
+                let suites = info
+                    .supported_suites
+                    .iter()
+                    .filter_map(|&s| u8::try_from(s).ok().and_then(PqSuite::from_u8))
+                    .collect();
+                ServerPqStatus::Enabled {
+                    suites,
+                    pq_ratchet: info.pq_ratchet_supported,
+                }
+            }
+            Ok(_) => ServerPqStatus::Disabled,
+            Err(e) if e.kind() == ErrorKind::Unimplemented => {
+                self.require_update(describe(&e));
+                return;
+            }
+            Err(e) if e.kind() == ErrorKind::DowngradeDetected => {
+                self.ui.log(format!(
+                    "server identity mismatch for {}: possible relay impersonation",
+                    inner.audience
+                ));
+                self.ui.notify(format!(
+                    "Server identity mismatch for {} — refusing to trust server PQ metadata.",
+                    inner.audience
+                ));
+                ServerPqStatus::AudienceMismatch
+            }
+            Err(_) => return,
+        };
+        if inner.server_pq != status {
+            inner.server_pq = status;
+            self.ui.me.set(Some(inner.me()));
         }
     }
 
@@ -358,62 +350,38 @@ impl Engine {
         let signs_in_here = same_server(&inner.server, &origin());
         while let Some(farewell) = inner.state.farewells.first().cloned() {
             let push_req = farewell.push.unwrap_or_default();
-            let pushed: session::Result<()> = {
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                {
-                    let client = Fetch::client(&inner.server);
-                    let v2_req = if !farewell.push_v2.is_empty() {
-                        PushV2Request::decode(farewell.push_v2.as_slice()).unwrap_or_else(|_| {
-                            PushV2Request {
-                                sender: push_req.sender.clone(),
-                                recipient: push_req.recipient.clone(),
-                                message: push_req.message.clone(),
-                                initial_message: push_req
-                                    .initial_message
-                                    .as_ref()
-                                    .map(WireInitialMessageV2::from),
-                                delivery_hash: push_req.delivery_hash.clone(),
-                                client_message_id: Bytes::from(farewell.client_message_id.clone()),
-                            }
-                        })
-                    } else {
-                        PushV2Request {
-                            sender: push_req.sender.clone(),
-                            recipient: push_req.recipient.clone(),
-                            message: push_req.message.clone(),
-                            initial_message: push_req
-                                .initial_message
-                                .as_ref()
-                                .map(WireInitialMessageV2::from),
-                            delivery_hash: push_req.delivery_hash.clone(),
-                            client_message_id: Bytes::from(farewell.client_message_id.clone()),
-                        }
-                    };
-                    match client.push_v2(v2_req).await {
-                        Ok(_) => Ok(()),
-                        Err(e) if e.kind() == session::protocol::ErrorKind::Unimplemented => {
-                            if inner.client.pq_config().strict_pq {
-                                Err(ErrorKind::PqRequired.into())
-                            } else {
-                                client
-                                    .push(push_req)
-                                    .await
-                                    .map(|_| ())
-                                    .map_err(session::Error::from)
-                            }
-                        }
-                        Err(e) => Err(e.into()),
+            let v2_req = if !farewell.push_v2.is_empty() {
+                PushV2Request::decode(farewell.push_v2.as_slice()).unwrap_or_else(|_| {
+                    PushV2Request {
+                        sender: push_req.sender.clone(),
+                        recipient: push_req.recipient.clone(),
+                        message: push_req.message.clone(),
+                        initial_message: push_req
+                            .initial_message
+                            .as_ref()
+                            .map(WireInitialMessageV2::from),
+                        delivery_hash: push_req.delivery_hash.clone(),
+                        client_message_id: Bytes::from(farewell.client_message_id.clone()),
                     }
-                }
-                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-                {
-                    Fetch::client(&inner.server)
-                        .push(push_req)
-                        .await
-                        .map(|_| ())
-                        .map_err(session::Error::from)
+                })
+            } else {
+                PushV2Request {
+                    sender: push_req.sender.clone(),
+                    recipient: push_req.recipient.clone(),
+                    message: push_req.message.clone(),
+                    initial_message: push_req
+                        .initial_message
+                        .as_ref()
+                        .map(WireInitialMessageV2::from),
+                    delivery_hash: push_req.delivery_hash.clone(),
+                    client_message_id: Bytes::from(farewell.client_message_id.clone()),
                 }
             };
+            let pushed: session::Result<()> = Fetch::client(&inner.server)
+                .push_v2(v2_req)
+                .await
+                .map(|_| ())
+                .map_err(session::Error::from);
             match pushed {
                 Ok(()) => {}
                 // Pushing takes a sign-in: they wait for it, without failing the round.
@@ -434,7 +402,10 @@ impl Engine {
                         describe(&e)
                     ));
                 }
-                Err(e) => return Err(describe(&e)),
+                Err(e) => {
+                    self.check_protocol_error(&e);
+                    return Err(describe(&e));
+                }
             }
             inner.state.farewells.remove(0);
             inner.save_state().await.map_err(|e| describe(&e))?;
@@ -470,15 +441,12 @@ impl Engine {
             }
             recommend_upgrade |= self.join_carried(inner, peer).await?;
             let (page, snapshot) = inner
-                .fetch_page(index, async |session, _client, _audience| {
-                    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                    {
-                        session.fetch_v2(_client, _audience).await
+                .fetch_page(index, async |session, client, audience| {
+                    let res = session.fetch_v2(client, audience).await;
+                    if let Err(ref e) = res {
+                        self.check_protocol_error(e);
                     }
-                    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-                    {
-                        session.receive().await
-                    }
+                    res
                 })
                 .await?;
             if page.is_empty() {

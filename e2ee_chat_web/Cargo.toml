@@ -48,6 +48,7 @@ web-sys = { version = "0.3", features = [
     "BlobPropertyBag",
     "CanvasRenderingContext2d",
     "Clipboard",
+    "CloseEvent",
     "CssStyleDeclaration",
     "DataTransfer",
     "Document",
