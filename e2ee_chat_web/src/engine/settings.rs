@@ -7,8 +7,8 @@ use crate::state::{Delivery, ServerPqStatus};
 use crate::transport::Fetch;
 use crate::util::describe;
 use crate::vault::{
-    CLASSICAL_APPROVAL_NONE, ContactState, HistoryEntry, SECURITY_ALERT_DOWNGRADE,
-    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
+    CLASSICAL_APPROVAL_NONE, ContactState, HistoryEntry, PendingPqRollback,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
 };
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use crate::{
@@ -46,28 +46,10 @@ impl Engine {
 
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        let previous = inner.client.pq_config().clone();
-        let previous_needs_publish = inner.state.needs_publish;
-        if previous == config && !previous_needs_publish {
+        if *inner.client.pq_config() == config && !inner.state.needs_publish {
             return Ok(PqSaveOutcome::Unchanged);
         }
-        if config.strict_pq && inner.server_pq == ServerPqStatus::Disabled {
-            return Err(
-                "Cannot require post-quantum encryption: this server does not have post-quantum \
-                 encryption enabled."
-                    .to_string(),
-            );
-        }
-        inner
-            .client
-            .set_pq_config(config)
-            .map_err(|e| describe(&e))?;
-        inner.state.needs_publish = true;
-        if let Err(e) = inner.save(&[]).await {
-            let _ = inner.client.set_pq_config(previous);
-            inner.state.needs_publish = previous_needs_publish;
-            return Err(describe(&e));
-        }
+        inner.save_pq_config(config).await?;
         self.ui.me.set(Some(inner.me()));
 
         // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.
@@ -79,14 +61,6 @@ impl Engine {
                     message =
                         format!("Cannot require post-quantum encryption on this server. {message}");
                 }
-                if let Err(warning) = inner
-                    .rollback_pq_settings(previous, previous_needs_publish)
-                    .await
-                {
-                    self.ui.log(&warning);
-                    message.push_str(&format!(". {warning}"));
-                }
-                self.ui.me.set(Some(inner.me()));
                 Err(message)
             }
             Err(error) if error.needs_sign_in() => Ok(PqSaveOutcome::SavedLocallyNeedsSignIn),
@@ -155,7 +129,13 @@ impl Engine {
                     let open = self.ui.open.get_untracked() == Some(peer)
                         && !document().hidden()
                         && !contact.state.request;
-                    entries.push(contact.add_received(content, open));
+                    match contact.add_received(content, open) {
+                        Ok(entry) => entries.push(entry),
+                        Err(reason) => {
+                            inner.roll_back(&peer, snapshot)?;
+                            return Err(reason.into());
+                        }
+                    }
                 }
             }
             let requeued = if replaced_session {
@@ -476,21 +456,60 @@ pub(super) fn check_classical_approval(config: &PqConfig) -> Result<(), &'static
     }
 }
 
+pub(super) fn validate_pq_config_for_server(
+    config: &PqConfig,
+    server_pq: &ServerPqStatus,
+) -> Result<(), String> {
+    if !config.pq_enabled {
+        return Ok(());
+    }
+    if config.strict_pq && *server_pq == ServerPqStatus::Disabled {
+        return Err("Cannot require post-quantum encryption on a server with post-quantum encryption disabled.".into());
+    }
+    if let ServerPqStatus::Enabled { suites, .. } = server_pq {
+        let unsupported: Vec<_> = config
+            .offered_suites()
+            .into_iter()
+            .filter(|suite| !suites.contains(suite))
+            .map(|suite| suite.label())
+            .collect();
+        if !unsupported.is_empty() {
+            return Err(format!(
+                "This server does not support the offered encryption suites {}.",
+                unsupported.join(", ")
+            ));
+        }
+        if suites.is_empty() {
+            return Err("This server has no supported post-quantum encryption suites.".into());
+        }
+    }
+    Ok(())
+}
+
 impl<V: HistoryStore> Inner<V> {
-    pub(super) async fn rollback_pq_settings(
-        &mut self,
-        previous: PqConfig,
-        needs_publish: bool,
-    ) -> Result<(), String> {
+    pub(super) async fn save_pq_config(&mut self, config: PqConfig) -> Result<(), String> {
+        let previous = self.client.pq_config().clone();
+        let changed = previous != config;
+        let previous_needs_publish = self.state.needs_publish;
+        let previous_rollback = self.state.pending_pq_rollback.clone();
+        validate_pq_config_for_server(&config, &self.server_pq)?;
         self.client
-            .set_pq_config(previous)
+            .set_pq_config(config)
             .map_err(|e| describe(&e))?;
-        self.state.needs_publish = needs_publish;
-        self.save_state().await.map_err(|e| {
-            format!(
-                "failed to persist PQ settings rollback (will retry): {}",
-                describe(&e)
-            )
-        })
+        if changed {
+            self.state.pending_pq_rollback.get_or_insert_with(|| {
+                PendingPqRollback::from_config(&previous, previous_needs_publish)
+            });
+        }
+        self.state.needs_publish = true;
+        if let Err(e) = self.save(&[]).await {
+            self.client
+                .set_pq_config(previous)
+                .map_err(|e| describe(&e))?;
+            self.state.needs_publish = previous_needs_publish;
+            self.state.pending_pq_rollback = previous_rollback;
+            return Err(describe(&e));
+        }
+        Ok(())
     }
 }

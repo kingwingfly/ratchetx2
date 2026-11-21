@@ -1,5 +1,6 @@
 //! Server notifications, synchronization and incoming mailbox pages.
 
+use super::handshake::{Incoming, stage_carried_initials};
 use super::outbox::{RequeueOutcome, needs_new_session};
 use super::{
     AWAY_CHECK, Engine, HIDDEN_GRACE, HistoryStore, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE,
@@ -13,7 +14,7 @@ use crate::state::Link;
 use crate::state::ServerPqStatus;
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, monotonic_now_ms, now, sleep};
-use crate::vault::{ContactState, SECURITY_ALERT_DOWNGRADE};
+use crate::vault::{ContactState, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE};
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use bytes::Bytes;
 use futures::future::{Either, select};
@@ -260,11 +261,10 @@ impl Engine {
         // not keep the round from the other steps and chats: its error is kept, and the round
         // goes on. Receiving goes before pushing, so that what waits since the user was offline
         // goes on a new session if the peer deleted the chat meanwhile.
-        let mut failure = None;
-        let mut active = false;
-        if let Err(e) = self.save_late().await {
-            failure.get_or_insert(e);
-        }
+        let (mut active, mut failure) = match self.recover_local_changes().await {
+            Ok(recovered) => (recovered, None),
+            Err(e) => (false, Some(e)),
+        };
         self.refresh_server_info(false).await;
         if let Err(e) = self.say_farewells().await {
             failure.get_or_insert(e);
@@ -308,12 +308,11 @@ impl Engine {
         active
     }
 
-    /// Save the history records an earlier save failed to write, see `Inner::unsaved`, unless
-    /// another save did, and show their chats.
-    async fn save_late(&self) -> Result<(), String> {
+    /// Retry failed writes and join the initials left on disk before contacting the relay.
+    async fn recover_local_changes(&self) -> Result<bool, String> {
         let mut guard = self.inner.lock().await;
         let Some(inner) = guard.as_mut() else {
-            return Ok(());
+            return Ok(false);
         };
         if inner.needs_save() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
@@ -329,7 +328,24 @@ impl Engine {
                 self.show_history(inner, &open).await;
             }
         }
-        Ok(())
+        let pending: Vec<_> = inner
+            .contacts
+            .iter()
+            .filter(|c| !c.state.pending_carried_initials.is_empty() && !c.is_new_quarantined())
+            .map(|c| c.peer)
+            .collect();
+        let recovered = !pending.is_empty();
+        let mut upgrades = vec![];
+        for peer in pending {
+            if self.join_carried(inner, &peer).await? {
+                upgrades.push(peer);
+            }
+        }
+        drop(guard);
+        for peer in upgrades {
+            let _ = self.upgrade_to_pq(peer).await;
+        }
+        Ok(recovered)
     }
 
     /// Push the messages telling peers that their chats were deleted here, see
@@ -452,6 +468,7 @@ impl Engine {
             if inner.contacts[index].is_new_quarantined() {
                 return Ok(received);
             }
+            recommend_upgrade |= self.join_carried(inner, peer).await?;
             let (page, snapshot) = inner
                 .fetch_page(index, async |session, _client, _audience| {
                     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -465,13 +482,13 @@ impl Engine {
                 })
                 .await?;
             if page.is_empty() {
+                inner.persist_empty_page_progress(peer, snapshot).await?;
                 break;
             }
             let contact = &mut inner.contacts[index];
             let (mut entries, mut undecryptable, mut evicted) = (vec![], 0usize, 0usize);
-            // Where receiving stopped, with the initial messages that came with the rest of the
-            // page.
-            let mut stalled = None;
+            // A stalled page also needs a fresh look at the relay's separate initial-message inbox.
+            let mut stalled = false;
             let mut carried_initials = vec![];
             let mut deleted = false;
             // What the peer told of this client's messages, by their history entries.
@@ -479,7 +496,13 @@ impl Engine {
             for message in page {
                 if message.is_evicted() {
                     evicted += 1;
-                    entries.push(contact.add_evicted());
+                    match contact.add_evicted() {
+                        Ok(entry) => entries.push(entry),
+                        Err(reason) => {
+                            inner.roll_back(peer, snapshot)?;
+                            return Err(reason.into());
+                        }
+                    }
                     continue;
                 }
                 let content = match message.content {
@@ -487,7 +510,8 @@ impl Engine {
                     // At a message that may be on a session whose initial message is waiting,
                     // the page's last.
                     Err(e) if e.kind() == ErrorKind::Stalled => {
-                        stalled = Some(message.initial_messages);
+                        stalled = true;
+                        carried_initials.extend(message.initial_messages);
                         continue;
                     }
                     // Trailing carried initial messages from expired server envelopes.
@@ -528,7 +552,13 @@ impl Engine {
                     contact.session.retire();
                     deleted = true;
                 }
-                entries.push(contact.add_received(content, open));
+                match contact.add_received(content, open) {
+                    Ok(entry) => entries.push(entry),
+                    Err(reason) => {
+                        inner.roll_back(peer, snapshot)?;
+                        return Err(reason.into());
+                    }
+                }
             }
             if undecryptable > 0 {
                 let label = contact.view().label();
@@ -568,10 +598,15 @@ impl Engine {
                 .into_iter()
                 .chain(records(peer, &changed))
                 .collect();
-            if let Err(e) = inner.save_with(&records, &requeued.outbox).await {
-                inner.roll_back(peer, snapshot)?;
-                return Err(describe(&e));
-            }
+            inner
+                .persist_received_page(
+                    index,
+                    snapshot,
+                    &carried_initials,
+                    &records,
+                    &requeued.outbox,
+                )
+                .await?;
             requeued.log_missing(&self.ui, peer);
             received |= !entries.is_empty();
             if self.ui.open.get_untracked() == Some(*peer)
@@ -585,7 +620,7 @@ impl Engine {
                 self.show_new(inner, peer, views);
             }
             self.ui.contacts.set(inner.views());
-            if let Some(initial_messages) = stalled {
+            if stalled {
                 // Its initial message, which went first, may have come since they were last
                 // taken, or have been lost, and come with the page: once they are taken, and
                 // those are accepted, receiving goes on, past what still does not decrypt.
@@ -593,20 +628,16 @@ impl Engine {
                 self.take_initial_messages().await?;
                 let mut guard = self.inner.lock().await;
                 if let Some(inner) = guard.as_mut() {
-                    for initial_message in carried_initials.iter().chain(&initial_messages) {
-                        recommend_upgrade |=
-                            self.join_carried(inner, peer, initial_message).await?;
-                    }
-                    if let Some(contact) = inner.contact(peer) {
+                    recommend_upgrade |= self.join_carried(inner, peer).await?;
+                    if let Some(contact) = inner.contact(peer)
+                        && !contact.is_new_quarantined()
+                    {
                         contact.session.skip_stalled();
                     }
                     self.ui.contacts.set(inner.views());
                 }
             } else if !carried_initials.is_empty() {
-                for initial_message in &carried_initials {
-                    recommend_upgrade |= self.join_carried(inner, peer, initial_message).await?;
-                }
-                self.ui.contacts.set(inner.views());
+                recommend_upgrade |= self.join_carried(inner, peer).await?;
             }
         }
         if recommend_upgrade {
@@ -617,6 +648,47 @@ impl Engine {
 }
 
 impl<V: HistoryStore> Inner<V> {
+    /// An empty page can still acknowledge deliveries or advance past expired envelopes.
+    pub(super) async fn persist_empty_page_progress(
+        &mut self,
+        peer: &PublicKey,
+        snapshot: (proto::SessionState, ContactState),
+    ) -> Result<bool, String> {
+        let contact = self.contact(peer).ok_or("no such chat")?;
+        if proto::SessionState::from(contact.session.state()) == snapshot.0 {
+            return Ok(false);
+        }
+        if let Err(e) = self.save(&[]).await {
+            self.roll_back(peer, snapshot)?;
+            return Err(describe(&e));
+        }
+        Ok(true)
+    }
+
+    /// The cursor can advance only with the history, outbox and carried initials from its page.
+    pub(super) async fn persist_received_page(
+        &mut self,
+        index: usize,
+        snapshot: (proto::SessionState, ContactState),
+        initials: &[Incoming],
+        records: &[(String, HistoryEntry)],
+        outbox: &[(String, Option<OutgoingRecord>)],
+    ) -> Result<(), String> {
+        let contact = &mut self.contacts[index];
+        let peer = contact.peer;
+        let saved = match stage_carried_initials(&mut contact.state, initials) {
+            Ok(()) => self
+                .save_with(records, outbox)
+                .await
+                .map_err(|e| describe(&e)),
+            Err(e) => Err(e),
+        };
+        if saved.is_err() {
+            self.roll_back(&peer, snapshot)?;
+        }
+        saved
+    }
+
     /// A fetch may consume delivery receipts and advance across expired pages before failing.
     /// Restore the whole snapshot on error. Keep it for the caller until the page is persisted.
     pub(super) async fn fetch_page<T>(

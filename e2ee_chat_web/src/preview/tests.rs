@@ -16,6 +16,13 @@ use super::{
     structured::{contacts, diff, events},
 };
 
+// Share the attribute name between sanitizer inputs and checks on rendered output.
+const STYLE_ATTRIBUTE: &str = "style";
+
+fn assert_no_inline_style(html: &str) {
+    assert!(!html.contains(&format!("{STYLE_ATTRIBUTE}=")), "{html}");
+}
+
 #[test]
 fn files_sort_by_content_then_name_then_type() {
     // By content, whatever the name.
@@ -229,17 +236,17 @@ fn mathml_escapes_operator_names_errors_and_relations() {
     assert!(mat.contains("<mi>a</mi>"), "{mat}");
     assert!(mat.contains("<mi>d</mi>"), "{mat}");
 
-    // 5. No inline style="..." attributes anywhere (CSP style-src 'self' compliance).
+    // 5. Inline styles are excluded by the page's content security policy.
     let styled_math = markdown(
         r"$\color{red}{x} + \colorbox{yellow}{y} + \fcolorbox{red}{yellow}{z} \kern -1em w$"
             .to_string()
             .as_str(),
     );
-    assert!(!styled_math.contains("style="), "{styled_math}");
+    assert_no_inline_style(&styled_math);
     assert!(styled_math.contains("class=\"ml-box\""), "{styled_math}");
 
     let spaced_align = markdown("$$\\begin{align} a &= b \\\\[1em] c &= d \\end{align}$$");
-    assert!(!spaced_align.contains("style="), "{spaced_align}");
+    assert_no_inline_style(&spaced_align);
     assert!(spaced_align.contains("<mtable"), "{spaced_align}");
 }
 
@@ -307,9 +314,9 @@ fn markdown_and_sanitizer_block_html_injection_and_unsafe_attributes() {
     assert!(raw.contains("&lt;a ping="), "{raw}");
 
     // Direct sanitizer checks (defense-in-depth if any upstream component ever emits raw HTML).
-    let a_ping = sanitize_html(
-        r#"<a href="https://example.com" ping="https://evil.example" onclick="alert(1)" style="position:fixed" target="_top">go</a>"#,
-    );
+    let a_ping = sanitize_html(&format!(
+        r#"<a href="https://example.com" ping="https://evil.example" onclick="alert(1)" {STYLE_ATTRIBUTE}="position:fixed" target="_top">go</a>"#
+    ));
     assert_eq!(
         a_ping,
         r#"<a href="https://example.com" target="_blank" rel="noopener noreferrer">go</a>"#
@@ -338,19 +345,19 @@ fn markdown_and_sanitizer_block_html_injection_and_unsafe_attributes() {
     assert_eq!(slash_img, r#"<img src="" alt="pic" />"#);
 
     // HTML tags injected inside <math> namespace are dropped; MathML tags outside <math> are dropped.
-    let mxss = sanitize_html(
-        r#"<math display="inline"><mtext><img src=x onerror=alert(1)><a href="https://evil.example">x</a></mtext><mi href="javascript:alert(1)" style="color:red">y</mi></math><mi>stray</mi>"#,
-    );
+    let mxss = sanitize_html(&format!(
+        r#"<math display="inline"><mtext><img src=x onerror=alert(1)><a href="https://evil.example">x</a></mtext><mi href="javascript:alert(1)" {STYLE_ATTRIBUTE}="color:red">y</mi></math><mi>stray</mi>"#
+    ));
     assert_eq!(
         mxss,
         r#"<math display="inline"><mtext>x</mtext><mi>y</mi></math>stray"#
     );
 
-    // GFM aligned table emits no inline style="..." attribute under CSP style-src 'self'.
+    // The aligned table must also satisfy the content security policy.
     let gfm_table = markdown("| a | b |\n| :--- | ---: |\n| 1 | 2 |\n");
     assert!(gfm_table.contains("<table>"), "{gfm_table}");
     assert!(gfm_table.contains("<th>a</th>"), "{gfm_table}");
-    assert!(!gfm_table.contains("style="), "{gfm_table}");
+    assert_no_inline_style(&gfm_table);
 
     // Tasklists keep disabled checkbox inputs while arbitrary <input> is dropped.
     let tasklist = markdown("- [x] done\n- [ ] todo\n");
@@ -387,7 +394,7 @@ fn valid_latex_mathml_and_markdown_render_cleanly() {
     assert!(md.contains("<math display=\"block\">"), "{md}");
     assert!(md.contains("minsize=\"1.2em\" maxsize=\"1.2em\""), "{md}");
     assert!(md.contains("<mo>&lt;</mo>"), "{md}");
-    assert!(!md.contains("style="), "{md}");
+    assert_no_inline_style(&md);
 }
 
 #[test]

@@ -16,7 +16,6 @@ use crate::vault::{
     SECURITY_ALERT_DOWNGRADE, history_key,
 };
 use leptos::prelude::*;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use prost::Message as _;
 #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
 use session::InitialMessage;
@@ -25,12 +24,82 @@ use session::{AcceptedInitial, InitialMessageV2, PublishV2Outcome};
 use session::{ErrorKind, PeerPqState, PublicKey, Session};
 
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-type Incoming = InitialMessageV2;
+pub(super) type Incoming = InitialMessageV2;
 #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-type Incoming = InitialMessage;
+pub(super) type Incoming = InitialMessage;
+
+// A page can include 64 initials from retrying a previous stall and another 64
+// surfaced together at its expired or newly stalled tail.
+const MAX_PENDING_CARRIED_INITIALS: usize = 2 * 64;
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
+    use session::InitialMessageKind;
+    use session::protocol::handshake_v2::InitialMessageV2 as Wire;
+    let wire = match &message.kind {
+        InitialMessageKind::Classical(m) => Wire {
+            first_message: Some(m.first_message.clone()),
+            ..Wire::from(&m.x3dh)
+        },
+        InitialMessageKind::Pq {
+            x3dh,
+            first_message,
+            manifest_digest,
+        } => Wire {
+            first_message: Some(first_message.clone()),
+            manifest_digest: manifest_digest
+                .as_ref()
+                .map_or_else(bytes::Bytes::new, |digest| {
+                    bytes::Bytes::copy_from_slice(digest)
+                }),
+            ..Wire::from(x3dh)
+        },
+    };
+    Ok(session::protocol::mailbox_v2::encode_carried_initial(&wire)?.to_vec())
+}
+
+#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
+    use session::protocol::handshake::InitialMessage as Wire;
+    Ok(Wire {
+        first_message: Some(message.first_message.clone()),
+        ..Wire::from(&message.x3dh)
+    }
+    .encode_to_vec())
+}
+
+fn decode_carried_initial(bytes: &[u8]) -> Option<Incoming> {
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    {
+        InitialMessageV2::decode_carried(bytes)
+    }
+    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+    {
+        let wire = session::protocol::handshake::InitialMessage::decode(bytes).ok()?;
+        InitialMessage::try_from(&wire).ok()
+    }
+}
+
+pub(super) fn stage_carried_initials<'a>(
+    state: &mut ContactState,
+    initials: impl IntoIterator<Item = &'a Incoming>,
+) -> Result<(), String> {
+    let pending = &mut state.pending_carried_initials;
+    for message in initials {
+        let bytes = encode_carried_initial(message).map_err(|e| describe(&e))?;
+        if !pending.contains(&bytes) {
+            if pending.len() >= MAX_PENDING_CARRIED_INITIALS {
+                return Err("Too many pending carried initial messages for this chat.".into());
+            }
+            pending.push(bytes);
+        }
+    }
+    Ok(())
+}
 
 struct Inbox {
-    messages: Vec<(PublicKey, u64, Incoming)>,
+    // The destructive v1 inbox has no acknowledgement IDs.
+    messages: Vec<(PublicKey, Option<u64>, Incoming)>,
     malformed_ids: Vec<u64>,
 }
 
@@ -42,7 +111,7 @@ struct OpenedInitial {
 }
 
 #[derive(Default)]
-struct InitialBatch {
+pub(super) struct InitialBatch {
     dirty: bool,
     records: Vec<(PublicKey, (String, HistoryEntry))>,
     views: Vec<(PublicKey, MessageView)>,
@@ -50,16 +119,44 @@ struct InitialBatch {
     upgrades: std::collections::BTreeSet<PublicKey>,
 }
 
+fn is_valid_inbox_ack_id(id: u64) -> bool {
+    id != 0 && id <= session::protocol::MAX_SAFE_INTEGER
+}
+
 /// Zero is reserved for carried messages and the destructive v1 inbox.
 pub(super) fn stage_inbox_ack(pending: &mut Vec<u64>, id: u64) -> bool {
-    if id == 0 || pending.contains(&id) {
+    if !is_valid_inbox_ack_id(id) || pending.contains(&id) {
         return false;
     }
     pending.push(id);
     true
 }
 
-impl Inner {
+pub(super) fn prune_invalid_inbox_acks(pending: &mut Vec<u64>) -> usize {
+    let before = pending.len();
+    let mut seen = std::collections::HashSet::new();
+    pending.retain(|&id| is_valid_inbox_ack_id(id) && seen.insert(id));
+    before - pending.len()
+}
+
+impl<V: HistoryStore> Inner<V> {
+    pub(super) fn check_outgoing_peer(&self, peer: &PublicKey) -> Result<(), StartChatError> {
+        if *peer == self.client.identity_key() {
+            return Err(StartChatError::Other(
+                "You cannot start a chat with your own identity key.".into(),
+            ));
+        }
+        self.check_isolation(peer).map_err(StartChatError::Other)
+    }
+
+    pub(super) async fn save_full_publish_success(&mut self) -> crate::vault::Result<()> {
+        self.state.published_at = now();
+        self.state.used_one_time_prekeys = 0;
+        self.state.needs_publish = false;
+        self.state.pending_pq_rollback = None;
+        self.save_state().await
+    }
+
     async fn list_inbox(&mut self) -> session::Result<Inbox> {
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         {
@@ -72,7 +169,7 @@ impl Inner {
                     .messages
                     .into_iter()
                     .map(|m| {
-                        let id = if listed.fell_back_to_v1 { 0 } else { m.id };
+                        let id = (!listed.fell_back_to_v1).then_some(m.id);
                         (m.sender, id, m)
                     })
                     .collect(),
@@ -91,7 +188,7 @@ impl Inner {
                     .take_initial_messages()
                     .await?
                     .into_iter()
-                    .map(|m| (m.x3dh.identity_key, 0, m))
+                    .map(|m| (m.x3dh.identity_key, None, m))
                     .collect(),
                 malformed_ids: vec![],
             })
@@ -174,9 +271,6 @@ impl Inner {
         })
         .await
     }
-}
-
-impl<V: HistoryStore> Inner<V> {
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768", test))]
     pub(super) async fn ack_persisted_inbox(
         &mut self,
@@ -186,6 +280,9 @@ impl<V: HistoryStore> Inner<V> {
             Vec<u64>,
         ) -> Result<(), String>,
     ) -> Result<(), String> {
+        if prune_invalid_inbox_acks(&mut self.state.pending_inbox_acks) > 0 {
+            self.save_state().await.map_err(|e| describe(&e))?;
+        }
         if self.needs_save() {
             return Ok(());
         }
@@ -242,6 +339,7 @@ impl<V: HistoryStore> Inner<V> {
 pub(super) struct PublishError {
     pub(super) kind: Option<ErrorKind>,
     definitive_refusal: bool,
+    malformed: bool,
     pub(super) message: String,
 }
 
@@ -250,6 +348,7 @@ impl PublishError {
         Self {
             kind: Some(e.kind()),
             definitive_refusal: false,
+            malformed: false,
             message: describe(&e),
         }
     }
@@ -258,6 +357,7 @@ impl PublishError {
         Self {
             kind: None,
             definitive_refusal: false,
+            malformed: false,
             message: describe(&e),
         }
     }
@@ -265,24 +365,29 @@ impl PublishError {
     pub(super) fn transmitted(e: session::Error, v2: bool) -> Self {
         // Strict v2 fallback maps the server's Unimplemented refusal to a local PqRequired.
         let definitive_refusal = e.is_server_refusal() || (v2 && e.kind() == ErrorKind::PqRequired);
+        let wire_kind = std::error::Error::source(&e)
+            .and_then(|source| source.downcast_ref::<session::protocol::Error>())
+            .map(session::protocol::Error::kind);
         Self {
             kind: Some(e.kind()),
             definitive_refusal,
+            malformed: wire_kind == Some(session::protocol::ErrorKind::Malformed),
             message: describe(&e),
         }
     }
 
     pub(super) fn rejects_settings(&self) -> bool {
         self.definitive_refusal
-            && matches!(
-                self.kind,
-                Some(
-                    ErrorKind::PqRequired
-                        | ErrorKind::LimitExceeded
-                        | ErrorKind::InvalidKeys
-                        | ErrorKind::UnsupportedSuite
-                )
-            )
+            && (self.malformed
+                || matches!(
+                    self.kind,
+                    Some(
+                        ErrorKind::PqRequired
+                            | ErrorKind::LimitExceeded
+                            | ErrorKind::InvalidKeys
+                            | ErrorKind::UnsupportedSuite
+                    )
+                ))
     }
 
     pub(super) fn needs_sign_in(&self) -> bool {
@@ -311,7 +416,13 @@ impl Engine {
         let inbox = inner.list_inbox().await.map_err(|e| describe(&e))?;
         let mut batch = InitialBatch::default();
         for (peer, id, message) in inbox.messages {
-            if id != 0 {
+            if let Some(id) = id {
+                if !is_valid_inbox_ack_id(id) {
+                    self.ui.log(format!(
+                        "Skipped initial message with out-of-range inbox ID {id}."
+                    ));
+                    continue;
+                }
                 if !stage_inbox_ack(&mut inner.state.pending_inbox_acks, id) {
                     continue;
                 }
@@ -321,6 +432,12 @@ impl Engine {
             self.process_initial(inner, &peer, &message, read, &mut batch);
         }
         for id in inbox.malformed_ids {
+            if !is_valid_inbox_ack_id(id) {
+                self.ui.log(format!(
+                    "Skipped malformed initial message with out-of-range inbox ID {id}."
+                ));
+                continue;
+            }
             batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
         }
         if !batch.dirty {
@@ -339,28 +456,60 @@ impl Engine {
         Ok(true)
     }
 
-    /// A mailbox envelope belongs to an existing contact. Carried messages have no inbox ID.
+    /// Drain the peer's durable queue. Each removal commits with its prekeys, session and history.
     pub(super) async fn join_carried(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<impl HistoryStore>,
         peer: &PublicKey,
-        message: &Incoming,
     ) -> Result<bool, String> {
-        if inner.contact(peer).is_none() {
+        inner.check_isolation(peer)?;
+        let Some(index) = inner.contacts.iter().position(|c| c.peer == *peer) else {
+            return Ok(false);
+        };
+        if inner.contacts[index].is_new_quarantined() {
             return Ok(false);
         }
-        let mut batch = InitialBatch::default();
-        self.process_initial(inner, peer, message, false, &mut batch);
-        let upgrade = batch.upgrades.contains(peer);
-        if batch.dirty {
-            self.save_initial_batch(inner, batch).await?;
+        // A prior join may have consumed prekeys and staged history after a failed save.
+        if inner.needs_save() {
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
+        let mut upgrade = false;
+        while !inner.contacts[index]
+            .state
+            .pending_carried_initials
+            .is_empty()
+        {
+            let bytes = inner.contacts[index]
+                .state
+                .pending_carried_initials
+                .remove(0);
+            let mut batch = InitialBatch::default();
+            if let Some(message) = decode_carried_initial(&bytes) {
+                self.process_initial(inner, peer, &message, false, &mut batch);
+            } else {
+                self.ui.log(format!(
+                    "Discarded an unreadable carried initial message for {}.",
+                    short(peer)
+                ));
+            }
+            upgrade |= batch.upgrades.contains(peer);
+            if batch.dirty {
+                self.save_initial_batch(inner, batch).await?;
+            } else if let Err(e) = inner.save_state().await {
+                // Nothing consumed a prekey. Retry the original entry if storage recovers.
+                inner.contacts[index]
+                    .state
+                    .pending_carried_initials
+                    .insert(0, bytes);
+                return Err(describe(&e));
+            }
         }
         Ok(upgrade)
     }
 
-    fn process_initial(
+    pub(super) fn process_initial(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<impl HistoryStore>,
         peer: &PublicKey,
         message: &Incoming,
         read: bool,
@@ -369,6 +518,10 @@ impl Engine {
         if *peer == inner.client.identity_key() {
             self.ui
                 .log("dropped an initial message claiming to be from your own key");
+            return;
+        }
+        if let Err(reason) = inner.check_isolation(peer) {
+            self.ui.log(reason);
             return;
         }
         let opened = match inner.open_initial(peer, message) {
@@ -472,7 +625,16 @@ impl Engine {
                 }
             }
         }
-        let (index, entry) = contact.add_received(content, read);
+        let (index, entry) = match contact.add_received(content, read) {
+            Ok(record) => record,
+            Err(reason) => {
+                self.ui.log(format!(
+                    "Skipped initial message history entry for {}. {reason}",
+                    short(peer)
+                ));
+                return;
+            }
+        };
         if self.ui.open.get_untracked() == Some(*peer) {
             batch
                 .views
@@ -485,7 +647,7 @@ impl Engine {
 
     async fn save_initial_batch(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<impl HistoryStore>,
         mut batch: InitialBatch,
     ) -> Result<(), String> {
         let mut outgoing = vec![];
@@ -549,10 +711,7 @@ impl Engine {
                 Ok(outcome) => {
                     inner.client.commit_publish_v2(prepared);
                     self.publish_waits_sign_in.set(false);
-                    inner.state.published_at = now();
-                    inner.state.used_one_time_prekeys = 0;
                     inner.state.used_pq_one_time_prekeys = 0;
-                    inner.state.needs_publish = false;
                     inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
                     let log_msg = match outcome {
                         PublishV2Outcome::V2Pq => {
@@ -579,7 +738,10 @@ impl Engine {
                             "published classical prekeys via v1 fallback"
                         }
                     };
-                    inner.save_state().await.map_err(PublishError::storage)?;
+                    inner
+                        .save_full_publish_success()
+                        .await
+                        .map_err(PublishError::storage)?;
                     self.ui.me.set(Some(inner.me()));
                     self.ui.log(log_msg);
                     Ok(())
@@ -606,11 +768,11 @@ impl Engine {
                 Ok(()) => {
                     inner.client.commit_publish(prepared);
                     self.publish_waits_sign_in.set(false);
-                    inner.state.published_at = now();
-                    inner.state.used_one_time_prekeys = 0;
-                    inner.state.needs_publish = false;
                     inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
-                    inner.save_state().await.map_err(PublishError::storage)?;
+                    inner
+                        .save_full_publish_success()
+                        .await
+                        .map_err(PublishError::storage)?;
                     self.ui.log(format!(
                         "published a new signed prekey and {ONE_TIME_PREKEYS} one-time prekeys"
                     ));
@@ -628,20 +790,36 @@ impl Engine {
         }
     }
 
-    async fn finish_publish_rollback(
+    pub(super) async fn finish_publish_rollback(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<impl HistoryStore>,
         mut error: PublishError,
         now_anyway: bool,
     ) -> Result<(), PublishError> {
         if error.needs_sign_in() {
             self.publish_waits_sign_in.set(true);
         }
+        if error.rejects_settings()
+            && let Some(rollback) = &inner.state.pending_pq_rollback
+        {
+            match inner.client.set_pq_config(rollback.config()) {
+                Ok(()) => {
+                    inner.state.needs_publish = rollback.previous_needs_publish;
+                    inner.state.pending_pq_rollback = None;
+                    self.ui.me.set(Some(inner.me()));
+                    self.ui.log("The server refused the pending post-quantum settings. Restored the previous settings.");
+                }
+                Err(e) => error.message.push_str(&format!(
+                    ". Could not restore previous settings: {}",
+                    describe(&e)
+                )),
+            }
+        }
         if let Err(e) = inner.save_state().await {
             // Keep a definitive settings refusal even if saving the prekey rollback also failed.
             if error.rejects_settings() {
                 error.message.push_str(&format!(
-                    ". Failed to save prekey rollback (will retry): {}",
+                    ". Failed to save publish rollback (will retry): {}",
                     describe(&e)
                 ));
             } else {
@@ -880,11 +1058,7 @@ impl Engine {
         let inner = guard
             .as_mut()
             .ok_or_else(|| StartChatError::Other("locked".into()))?;
-        if peer == inner.client.identity_key() {
-            return Err(StartChatError::Other(
-                "You cannot start a chat with your own identity key.".into(),
-            ));
-        }
+        inner.check_outgoing_peer(&peer)?;
         if allow_classical
             && super::settings::check_classical_approval(inner.client.pq_config()).is_err()
         {

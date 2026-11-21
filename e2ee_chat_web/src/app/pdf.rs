@@ -1,8 +1,6 @@
 use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ops::Range,
-    rc::Rc,
     sync::Arc,
 };
 
@@ -17,6 +15,115 @@ use crate::{util::js_error, workers};
 
 const PDF_PAGE_BUFFER: usize = 2;
 const PDF_MAX_ACTIVE_CANVASES: usize = 9;
+const PDF_MAX_IN_FLIGHT_RENDERS: usize = 1;
+
+struct PdfRenderScheduler<T> {
+    max_in_flight: usize,
+    in_flight: BTreeSet<u64>,
+    pending: BTreeMap<usize, (u64, T)>,
+    last_token: u64,
+    active_window: Range<usize>,
+    visible: BTreeSet<usize>,
+    anchor: usize,
+}
+
+impl<T> PdfRenderScheduler<T> {
+    fn new(max_in_flight: usize) -> Self {
+        Self {
+            max_in_flight: max_in_flight.max(1),
+            in_flight: BTreeSet::new(),
+            pending: BTreeMap::new(),
+            last_token: 0,
+            active_window: 0..0,
+            visible: BTreeSet::new(),
+            anchor: 0,
+        }
+    }
+
+    fn enqueue(&mut self, page: usize, job: T) -> Option<u64> {
+        if !self.active_window.contains(&page) {
+            return None;
+        }
+        self.last_token = self.last_token.checked_add(1)?;
+        self.pending.insert(page, (self.last_token, job));
+        Some(self.last_token)
+    }
+
+    fn update_viewport(&mut self, window: Range<usize>, visible: BTreeSet<usize>, anchor: usize) {
+        self.pending.retain(|page, _| window.contains(page));
+        self.active_window = window;
+        self.visible = visible;
+        self.anchor = anchor;
+    }
+
+    fn cancel(&mut self, page: usize, token: u64) {
+        if self.pending.get(&page).is_some_and(|(id, _)| *id == token) {
+            self.pending.remove(&page);
+        }
+    }
+
+    fn next_dispatch(&mut self) -> Option<(usize, u64, T)> {
+        if self.in_flight.len() >= self.max_in_flight {
+            return None;
+        }
+        self.pending
+            .retain(|page, _| self.active_window.contains(page));
+        let page = *self.pending.keys().min_by_key(|&&page| {
+            (
+                !self.visible.contains(&page),
+                page.abs_diff(self.anchor),
+                page,
+            )
+        })?;
+        let (token, job) = self.pending.remove(&page)?;
+        self.in_flight.insert(token);
+        Some((page, token, job))
+    }
+
+    fn finish(&mut self, token: u64) {
+        self.in_flight.remove(&token);
+    }
+
+    fn clear(&mut self) {
+        self.update_viewport(0..0, BTreeSet::new(), 0);
+    }
+}
+
+struct RenderJob {
+    pdf: workers::Pdf,
+    canvas: HtmlCanvasElement,
+    mounted: StoredValue<bool>,
+    drawn: RwSignal<bool>,
+    error: RwSignal<Option<String>>,
+}
+
+impl RenderJob {
+    fn is_mounted(&self) -> bool {
+        self.mounted.try_get_value() == Some(true) && self.canvas.is_connected()
+    }
+}
+
+type RenderQueue = StoredValue<PdfRenderScheduler<RenderJob>, LocalStorage>;
+
+fn pump_renders(scheduler: RenderQueue) {
+    spawn_local(async move {
+        while let Some((page, token, job)) = scheduler
+            .try_update_value(PdfRenderScheduler::next_dispatch)
+            .flatten()
+        {
+            if job.is_mounted() {
+                let result = draw_page(job.pdf, page, &job.canvas, job.mounted).await;
+                if job.is_mounted() {
+                    match result {
+                        Ok(()) => job.drawn.set(true),
+                        Err(e) => job.error.set(Some(e)),
+                    }
+                }
+            }
+            scheduler.try_update_value(|s| s.finish(token));
+        }
+    });
+}
 
 fn pdf_aspect_ratio(width: f64, height: f64) -> String {
     if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
@@ -60,19 +167,18 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
     let pdf_handle = StoredValue::new_local(None::<workers::Pdf>);
     let pages = RwSignal::new(Vec::<(usize, f64, f64)>::new());
     let active_window = RwSignal::new(0..0);
+    let scheduler = RenderQueue::new_local(PdfRenderScheduler::new(PDF_MAX_IN_FLIGHT_RENDERS));
     let failed = RwSignal::new(None::<String>);
     let here = StoredValue::new(());
 
     let observer = StoredValue::new_local(None::<IntersectionObserver>);
     let observer_ready = RwSignal::new(false);
-    let visible_pages = Rc::new(RefCell::new(BTreeSet::new()));
-    let last_anchor = Rc::new(Cell::new(0));
     let on_intersection = StoredValue::new_local(Closure::<dyn FnMut(js_sys::Array)>::new(
         move |entries: js_sys::Array| {
             let Some(total) = pages.try_with_untracked(Vec::len) else {
                 return;
             };
-            let mut visible = visible_pages.borrow_mut();
+            let (mut visible, mut anchor) = scheduler.with_value(|s| (s.visible.clone(), s.anchor));
             for entry in entries.iter() {
                 let entry: IntersectionObserverEntry = entry.unchecked_into();
                 let Some(index) = entry
@@ -90,18 +196,20 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
                 }
             }
             if let (Some(&first), Some(&last)) = (visible.first(), visible.last()) {
-                last_anchor.set(first + (last - first) / 2);
+                anchor = first + (last - first) / 2;
             }
             let next = pdf_active_window(
                 total,
                 &visible,
-                last_anchor.get(),
+                anchor,
                 PDF_PAGE_BUFFER,
                 PDF_MAX_ACTIVE_CANVASES,
             );
+            scheduler.update_value(|s| s.update_viewport(next.clone(), visible, anchor));
             if active_window.with_untracked(|current| *current != next) {
                 active_window.set(next);
             }
+            pump_renders(scheduler);
         },
     ));
     container.on_load(move |element| {
@@ -129,19 +237,22 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
                     return;
                 }
                 pdf_handle.set_value(Some(pdf));
-                active_window.set(pdf_active_window(
+                let initial = pdf_active_window(
                     dims.len(),
                     &BTreeSet::new(),
                     0,
                     PDF_PAGE_BUFFER,
                     PDF_MAX_ACTIVE_CANVASES,
-                ));
+                );
+                scheduler.update_value(|s| s.update_viewport(initial.clone(), BTreeSet::new(), 0));
+                active_window.set(initial);
                 pages.set(
                     dims.into_iter()
                         .enumerate()
                         .map(|(index, (width, height))| (index, width, height))
                         .collect(),
                 );
+                pump_renders(scheduler);
             }
             Err(e) => {
                 failed.try_set(Some(e));
@@ -149,6 +260,7 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
         }
     });
     on_cleanup(move || {
+        scheduler.try_update_value(PdfRenderScheduler::clear);
         if let Some(shared) = observer.try_update_value(Option::take).flatten() {
             shared.disconnect();
             // Discard pending entries before the callback is dropped.
@@ -166,7 +278,7 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
                 children=move |(index, width, height)| {
                     let pdf = pdf_handle.get_value().expect("the PDF is open before its pages are listed");
                     view! {
-                        <PdfPageSlot pdf index width height active_window observer observer_ready />
+                        <PdfPageSlot pdf index width height active_window scheduler observer observer_ready />
                     }
                 }
             />
@@ -184,6 +296,7 @@ fn PdfPageSlot(
     width: f64,
     height: f64,
     active_window: RwSignal<Range<usize>>,
+    scheduler: RenderQueue,
     observer: StoredValue<Option<IntersectionObserver>, LocalStorage>,
     observer_ready: RwSignal<bool>,
 ) -> impl IntoView {
@@ -216,17 +329,18 @@ fn PdfPageSlot(
             data-page=index.to_string()
         >
             <Show when=move || is_active.get()>
-                <PdfPageCanvas pdf index />
+                <PdfPageCanvas pdf index scheduler />
             </Show>
         </div>
     }
 }
 
 #[component]
-fn PdfPageCanvas(pdf: workers::Pdf, index: usize) -> impl IntoView {
+fn PdfPageCanvas(pdf: workers::Pdf, index: usize, scheduler: RenderQueue) -> impl IntoView {
     let canvas = NodeRef::<html::Canvas>::new();
     let element = StoredValue::new_local(None::<HtmlCanvasElement>);
     let mounted = StoredValue::new(true);
+    let request_token = StoredValue::new(None::<u64>);
     let drawn = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
     Effect::new(move || {
@@ -236,18 +350,23 @@ fn PdfPageCanvas(pdf: workers::Pdf, index: usize) -> impl IntoView {
         element.set_value(Some(canvas_el.clone()));
         let needs_layout = canvas_el.client_width() == 0;
         let render = move || {
-            spawn_local(async move {
-                if mounted.try_get_value() != Some(true) || !canvas_el.is_connected() {
-                    return;
-                }
-                let result = draw_page(pdf, index, &canvas_el, mounted).await;
-                if mounted.try_get_value() == Some(true) && canvas_el.is_connected() {
-                    match result {
-                        Ok(()) => drawn.set(true),
-                        Err(e) => error.set(Some(e)),
-                    }
-                }
-            });
+            if mounted.try_get_value() != Some(true) || !canvas_el.is_connected() {
+                return;
+            }
+            let job = RenderJob {
+                pdf,
+                canvas: canvas_el,
+                mounted,
+                drawn,
+                error,
+            };
+            if let Some(token) = scheduler
+                .try_update_value(|s| s.enqueue(index, job))
+                .flatten()
+            {
+                request_token.set_value(Some(token));
+                pump_renders(scheduler);
+            }
         };
         if needs_layout {
             request_animation_frame(render);
@@ -257,6 +376,9 @@ fn PdfPageCanvas(pdf: workers::Pdf, index: usize) -> impl IntoView {
     });
     on_cleanup(move || {
         mounted.try_set_value(false);
+        if let Some(token) = request_token.try_get_value().flatten() {
+            scheduler.try_update_value(|s| s.cancel(index, token));
+        }
         if let Some(el) = element
             .try_update_value(Option::take)
             .flatten()
@@ -308,6 +430,82 @@ async fn draw_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatch_respects_the_worker_budget_until_a_render_finishes() {
+        for limit in [1, 2] {
+            let mut scheduler = PdfRenderScheduler::new(limit);
+            scheduler.update_viewport(0..5, BTreeSet::new(), 0);
+            let tokens: Vec<_> = (0..5)
+                .map(|page| scheduler.enqueue(page, page).unwrap())
+                .collect();
+            for (page, &token) in tokens.iter().take(limit).enumerate() {
+                assert_eq!(scheduler.next_dispatch(), Some((page, token, page)));
+            }
+            scheduler.finish(tokens[4]); // A queued token cannot release a worker slot.
+            assert_eq!(scheduler.next_dispatch(), None);
+            scheduler.finish(tokens[0]);
+            assert_eq!(
+                scheduler.next_dispatch(),
+                Some((limit, tokens[limit], limit))
+            );
+            assert_eq!(scheduler.next_dispatch(), None);
+        }
+    }
+
+    #[test]
+    fn scrolling_prunes_old_requests_and_rejects_late_mounts() {
+        let mut scheduler = PdfRenderScheduler::new(1);
+        scheduler.update_viewport(0..3, BTreeSet::from([1]), 1);
+        let active = scheduler.enqueue(1, ()).unwrap();
+        scheduler.next_dispatch().unwrap();
+        scheduler.enqueue(2, ()).unwrap();
+        scheduler.update_viewport(10..13, BTreeSet::from([11]), 11);
+        assert!(scheduler.pending.is_empty());
+        assert_eq!(scheduler.enqueue(1, ()), None);
+        let new = scheduler.enqueue(11, ()).unwrap();
+        assert_eq!(scheduler.next_dispatch(), None);
+        scheduler.finish(active);
+        assert_eq!(scheduler.next_dispatch(), Some((11, new, ())));
+        scheduler.finish(new);
+        assert_eq!(scheduler.next_dispatch(), None);
+    }
+
+    #[test]
+    fn dispatch_uses_current_visibility_distance_and_page_order() {
+        let mut scheduler = PdfRenderScheduler::new(1);
+        scheduler.update_viewport(0..10, BTreeSet::new(), 0);
+        for page in [7, 1, 4, 8, 3, 5, 9] {
+            scheduler.enqueue(page, ()).unwrap();
+        }
+        scheduler.update_viewport(0..10, BTreeSet::from([3, 7, 9]), 5);
+        for expected in [3, 7, 9, 5, 4, 8, 1] {
+            let (page, token, ()) = scheduler.next_dispatch().unwrap();
+            assert_eq!(page, expected);
+            scheduler.finish(token);
+        }
+        assert_eq!(scheduler.next_dispatch(), None);
+    }
+
+    #[test]
+    fn canvas_cleanup_only_cancels_its_own_token_and_close_discards_the_queue() {
+        let mut scheduler = PdfRenderScheduler::new(1);
+        scheduler.update_viewport(0..3, BTreeSet::new(), 0);
+        let old = scheduler.enqueue(0, "old canvas").unwrap();
+        let new = scheduler.enqueue(0, "new canvas").unwrap();
+        assert!(new > old);
+        let cancelled = scheduler.enqueue(1, "unmounted").unwrap();
+        scheduler.cancel(0, old);
+        scheduler.cancel(1, cancelled);
+        assert_eq!(scheduler.next_dispatch(), Some((0, new, "new canvas")));
+        scheduler.finish(new);
+        assert_eq!(scheduler.next_dispatch(), None);
+        scheduler.enqueue(0, "pending").unwrap();
+        scheduler.enqueue(2, "pending").unwrap();
+        scheduler.clear();
+        assert_eq!(scheduler.enqueue(0, "late frame"), None);
+        assert_eq!(scheduler.next_dispatch(), None);
+    }
 
     fn window(
         total: usize,
