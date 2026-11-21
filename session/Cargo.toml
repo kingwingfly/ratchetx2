@@ -17,7 +17,7 @@ hkdf = "0.13"
 hmac = "0.13"
 party = { path = "../party", default-features = false }
 prost = "0.14"
-protocol = { path = "../protocol", default-features = false }
+protocol = { path = "../protocol", default-features = false, features = ["pq"] }
 ratchetx2 = { path = "../ratchetx2", version = "0.4" }
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
@@ -33,8 +33,8 @@ prost-build = { version = "0.14", optional = true }
 protox = { version = "0.10", optional = true }
 
 [dev-dependencies]
-protocol = { path = "../protocol", features = ["server", "connect"] }
-storage = { path = "../storage" }
+protocol = { path = "../protocol", features = ["server", "connect", "pq"] }
+storage = { path = "../storage", features = ["pq"] }
 tokio = { version = "1", default-features = false, features = [
     "macros",
     "rt-multi-thread",

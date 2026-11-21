@@ -29,14 +29,14 @@ use protocol::{
     attachment::{LocalAttachments, StartUploadRequest},
     content::{Content, Hello, Kind as ContentKind},
     handshake::{
-        self, FetchBundleRequest, LocalHandshake, PublishRequest, SendInitialMessageRequest,
+        self, FetchBundleRequest, PublishRequest, SendInitialMessageRequest,
         TakeInitialMessagesRequest,
     },
-    mailbox::{
-        DELIVERY_TOKEN_LENGTH, Envelope, FetchRequest, LocalMailbox, MAX_DELIVERED, PushRequest,
-    },
+    mailbox::{DELIVERY_TOKEN_LENGTH, Envelope, FetchRequest, MAX_DELIVERED, PushRequest},
     notify::SubscribeRequest,
 };
+#[allow(deprecated)]
+use protocol::{handshake::LocalHandshake, mailbox::LocalMailbox};
 use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 pub use safety::safety_number;
 use sha2::{Digest, Sha256};
@@ -54,13 +54,6 @@ const MAX_STORED_DELIVERED: usize = 4096;
 const MAX_RECEIVE_PAGE: u32 = 100;
 
 /// Maximum number of recent locally signed `CapabilityManifest` digests retained in `ClientState`.
-#[cfg(any(
-    feature = "prost",
-    feature = "serde",
-    feature = "rkyv",
-    feature = "ml-kem-1024",
-    feature = "ml-kem-768"
-))]
 pub(crate) const MAX_RECENT_MANIFEST_DIGESTS: usize = 16;
 
 /// Maximum consecutive all-expired mailbox pages fetched within one [`Session::receive`] (or v2
@@ -300,16 +293,6 @@ pub struct ClientState {
     pub(crate) prekey_generation: u64,
     /// SHA-256 digests of recent `CapabilityManifest`s signed by this client (bounded by
     /// `MAX_RECENT_MANIFEST_DIGESTS`).
-    #[cfg_attr(
-        not(any(
-            feature = "prost",
-            feature = "serde",
-            feature = "rkyv",
-            feature = "ml-kem-1024",
-            feature = "ml-kem-768"
-        )),
-        allow(dead_code)
-    )]
     pub(crate) recent_manifest_digests: Vec<[u8; 32]>,
 }
 
@@ -328,7 +311,6 @@ impl ClientState {
     }
 
     /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     pub(crate) fn record_manifest_digest(&mut self, digest: [u8; 32]) {
         if let Some(pos) = self
             .recent_manifest_digests
@@ -519,6 +501,16 @@ impl TryFrom<&proto::ClientState> for ClientState {
 }
 
 impl<H> Client<H> {
+    /// A client with a new random identity key.
+    pub fn new(handshake: H) -> Self {
+        Self::builder(handshake).build()
+    }
+
+    /// This client's public identity key, which peers use to reach it.
+    pub fn identity_key(&self) -> PublicKey {
+        self.identity_key
+    }
+
     /// A client over `handshake`, from the `state` of an earlier one.
     pub fn restore(handshake: H, state: ClientState) -> Self {
         let identity_key = state.identity.compute_public_key().to_bytes();
@@ -615,6 +607,9 @@ impl<H> Client<H> {
     /// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish`], then call
     /// [`Client::commit_publish`] on success or [`Client::rollback_publish_on_refusal`] on
     /// [`ErrorKind::SignInRequired`].
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub fn prepare_publish(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
         let was_publishing = self.state.publishing;
         let extended = was_publishing;
@@ -641,6 +636,9 @@ impl<H> Client<H> {
     /// Prepare a classical v1 publish that replenishes `one_time_count` one-time prekeys on the
     /// current generation WITHOUT rotating the signed prekey (generates a generation if none
     /// exists yet).
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub fn prepare_extend_keys(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
         let was_publishing = self.state.publishing;
         let had_gen = self.state.prekeys.generation_count() > 0;
@@ -660,6 +658,9 @@ impl<H> Client<H> {
     }
 
     /// Mark a prepared classical publish as confirmed by the server.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub fn commit_publish(&mut self, _prepared: PreparedPublish) {
         self.state.publishing = false;
     }
@@ -667,11 +668,78 @@ impl<H> Client<H> {
     /// Retract newly added one-time prekeys from a prepared classical publish that was refused
     /// before storage (e.g. [`ErrorKind::SignInRequired`], [`ErrorKind::LimitExceeded`], or
     /// [`ErrorKind::Protocol`]).
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub fn rollback_publish_on_refusal(&mut self, prepared: PreparedPublish) {
         if prepared.extended {
             self.state.prekeys.retract(&prepared.one_time_prekeys);
             self.state.publishing = prepared.was_publishing;
         }
+    }
+
+    /// Start uploading an attachment of `size` bytes: a new key, and the service's ID and upload
+    /// token for it. Then [encrypt](attachment::Upload::try_encrypt) and
+    /// [put](attachment::Upload::put) each chunk, and send the ID and key to the recipients in a
+    /// message. The upload token may be kept after, to [cancel](attachment::Upload::cancel) it
+    /// later, deleting the attachment.
+    ///
+    /// Fails with [`ErrorKind::LimitExceeded`] if the service takes no attachment that large.
+    pub async fn start_upload(
+        &self,
+        attachments: &impl LocalAttachments,
+        size: u64,
+    ) -> Result<attachment::Upload> {
+        let chunks = u32::try_from(attachment::chunk_count(size))
+            .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
+        let key = attachment::generate_key();
+        let response = attachments
+            .start_upload(StartUploadRequest {
+                chunks,
+                delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
+            })
+            .await?;
+        Ok(attachment::Upload::new(
+            protocol::fixed(&response.id)?,
+            Zeroizing::new(protocol::fixed(&response.upload_token)?),
+            key,
+            chunks,
+            (response.expires != 0).then_some(response.expires),
+        ))
+    }
+
+    /// A legacy non-audience-bound subscription to this client's notifications, signed by its
+    /// identity key; see `protocol::notify`. It is good for a few minutes of the server's
+    /// [clock](Self::clock).
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
+    #[allow(deprecated)]
+    pub fn subscription(&self) -> SubscribeRequest {
+        // Within a few minutes of the server's clock, not by the strictly increasing timestamp,
+        // which may have run ahead of it.
+        SubscribeRequest::sign(
+            &self.state.identity,
+            self.clock.now().min(protocol::MAX_SAFE_INTEGER),
+        )
+    }
+
+    /// Sign a notification subscription for a configured relay URL or host using its clock.
+    /// Use [`Self::subscription_for_canonical_audience`] with a previously parsed audience.
+    pub fn subscription_for_audience(&self, audience: &str) -> Result<SubscribeRequest> {
+        self.subscription_for_canonical_audience(&protocol::NormalizedAudience::parse(audience)?)
+    }
+
+    /// Sign a notification subscription for an already normalized relay audience.
+    pub fn subscription_for_canonical_audience(
+        &self,
+        audience: &protocol::NormalizedAudience,
+    ) -> Result<SubscribeRequest> {
+        Ok(SubscribeRequest::sign_for_canonical_audience(
+            &self.state.identity,
+            audience,
+            self.clock.now(),
+        )?)
     }
 
     /// Milliseconds since the Unix epoch by the server's [clock](Self::clock), strictly
@@ -689,18 +757,12 @@ impl<H> Client<H> {
     }
 }
 
+#[allow(deprecated)]
 impl<H: LocalHandshake> Client<H> {
-    /// A client with a new random identity key.
-    pub fn new(handshake: H) -> Self {
-        Self::builder(handshake).build()
-    }
-
-    /// This client's public identity key, which peers use to reach it.
-    pub fn identity_key(&self) -> PublicKey {
-        self.identity_key
-    }
-
     /// Transmit a prepared classical publish request (after persisting [`Client::state`]).
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn transmit_publish(&self, prepared: &PreparedPublish) -> Result<()> {
         self.handshake.publish(prepared.request.clone()).await?;
         Ok(())
@@ -720,6 +782,9 @@ impl<H: LocalHandshake> Client<H> {
     ///
     /// For persist-before-transmit flows, use [`Client::prepare_publish`], persist
     /// [`Client::state`], then call [`Client::transmit_publish`] and [`Client::commit_publish`].
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn publish_keys(&mut self, one_time_count: usize) -> Result<()> {
         let prepared = self.prepare_publish(one_time_count)?;
         match self.transmit_publish(&prepared).await {
@@ -737,6 +802,9 @@ impl<H: LocalHandshake> Client<H> {
 
     /// Replenish `one_time_count` classical one-time prekeys on the current generation without
     /// rotating the signed prekey (generates a generation if none exists yet).
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn extend_keys(&mut self, one_time_count: usize) -> Result<()> {
         let prepared = self.prepare_extend_keys(one_time_count)?;
         match self.transmit_publish(&prepared).await {
@@ -761,6 +829,9 @@ impl<H: LocalHandshake> Client<H> {
     /// Prepare starting a classical session with `peer` without sending the initial message yet,
     /// so the caller can persist [`PreparedInitiate::session`] BEFORE calling
     /// [`Client::send_prepared_initiate`].
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn prepare_initiate<M>(
         &mut self,
         peer: &PublicKey,
@@ -815,6 +886,9 @@ impl<H: LocalHandshake> Client<H> {
     }
 
     /// Transmit a prepared classical initial message request (after persisting `session.state()`).
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn send_prepared_initiate(&self, request: &SendInitialMessageRequest) -> Result<()> {
         self.handshake.send_initial_message(request.clone()).await?;
         Ok(())
@@ -825,6 +899,9 @@ impl<H: LocalHandshake> Client<H> {
     ///
     /// The first message shows the peer that the initial message is this client's, and lets the
     /// peer write back at once. It can be empty.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn initiate<M>(
         &mut self,
         peer: &PublicKey,
@@ -839,6 +916,9 @@ impl<H: LocalHandshake> Client<H> {
     /// Prepare starting a new classical session with `session`'s peer and merge it into `session`
     /// via [`Session::keep`], returning the `SendInitialMessageRequest` to transmit AFTER
     /// persisting `session.state()`.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn prepare_start_again<M: Clone>(
         &mut self,
         session: &mut Session<M>,
@@ -861,6 +941,9 @@ impl<H: LocalHandshake> Client<H> {
     ///
     /// Fails with [`ErrorKind::UnexpectedPeer`] if `session` is another identity's, before
     /// anything is sent or changed.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn start_again<M: Clone>(
         &mut self,
         session: &mut Session<M>,
@@ -874,6 +957,9 @@ impl<H: LocalHandshake> Client<H> {
     ///
     /// The server deletes them, so keep the ones to accept later. Malformed ones, which could
     /// never be accepted, are left out.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub async fn take_initial_messages(&mut self) -> Result<Vec<InitialMessage>> {
         let timestamp = self.next_timestamp()?;
         let request = TakeInitialMessagesRequest::sign(&self.state.identity, timestamp);
@@ -895,6 +981,9 @@ impl<H: LocalHandshake> Client<H> {
     /// [`ErrorKind::InvalidInitialMessage`] if it does not, or if the initial message was accepted
     /// already, and with [`ErrorKind::UnexpectedPeer`] if it is not from `peer`; failing, it
     /// uses up nothing.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
     pub fn accept<M>(
         &mut self,
         peer: &PublicKey,
@@ -927,66 +1016,6 @@ impl<H: LocalHandshake> Client<H> {
         let mut session = Session::new(mailbox, active, self.identity_key, *peer);
         session.state.peer_pq.peer_session_seq = peer_session_seq;
         Ok((session, content))
-    }
-
-    /// Start uploading an attachment of `size` bytes: a new key, and the service's ID and upload
-    /// token for it. Then [encrypt](attachment::Upload::try_encrypt) and
-    /// [put](attachment::Upload::put) each chunk, and send the ID and key to the recipients in a
-    /// message. The upload token may be kept after, to [cancel](attachment::Upload::cancel) it
-    /// later, deleting the attachment.
-    ///
-    /// Fails with [`ErrorKind::LimitExceeded`] if the service takes no attachment that large.
-    pub async fn start_upload(
-        &self,
-        attachments: &impl LocalAttachments,
-        size: u64,
-    ) -> Result<attachment::Upload> {
-        let chunks = u32::try_from(attachment::chunk_count(size))
-            .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
-        let key = attachment::generate_key();
-        let response = attachments
-            .start_upload(StartUploadRequest {
-                chunks,
-                delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
-            })
-            .await?;
-        Ok(attachment::Upload::new(
-            protocol::fixed(&response.id)?,
-            Zeroizing::new(protocol::fixed(&response.upload_token)?),
-            key,
-            chunks,
-            (response.expires != 0).then_some(response.expires),
-        ))
-    }
-
-    /// A subscription to this client's notifications, signed by its identity key, for a server
-    /// that sends them; see `protocol::notify`. It is good for a few minutes of the server's
-    /// [clock](Self::clock).
-    pub fn subscription(&self) -> SubscribeRequest {
-        // Within a few minutes of the server's clock, not by the strictly increasing timestamp,
-        // which may have run ahead of it.
-        SubscribeRequest::sign(
-            &self.state.identity,
-            self.clock.now().min(protocol::MAX_SAFE_INTEGER),
-        )
-    }
-
-    /// Sign a notification subscription for a configured relay URL or host using its clock.
-    /// Use [`Self::subscription_for_canonical_audience`] with a previously parsed audience.
-    pub fn subscription_for_audience(&self, audience: &str) -> Result<SubscribeRequest> {
-        self.subscription_for_canonical_audience(&protocol::NormalizedAudience::parse(audience)?)
-    }
-
-    /// Sign a notification subscription for an already normalized relay audience.
-    pub fn subscription_for_canonical_audience(
-        &self,
-        audience: &protocol::NormalizedAudience,
-    ) -> Result<SubscribeRequest> {
-        Ok(SubscribeRequest::sign_for_canonical_audience(
-            &self.state.identity,
-            audience,
-            self.clock.now(),
-        )?)
     }
 }
 
@@ -2060,18 +2089,6 @@ impl<M> Session<M> {
             None => Err(ErrorKind::Undecryptable.into()),
         }
     }
-}
-
-impl<M: LocalMailbox> Session<M> {
-    /// Encrypt `content` and push it to the peer.
-    ///
-    /// If pushing fails the message is lost; to retry instead, use [`Session::encrypt`] and
-    /// [`Session::push`].
-    pub async fn send(&mut self, content: &[u8]) -> Result<()> {
-        let message = self.encrypt(content)?;
-        self.push(message).await
-    }
-
     /// Encrypt `content` for the peer, on the active session, with SHA-256 of the message's
     /// delivery token under that session's key, so that it is deleted once the peer has it,
     /// though it is pushed after another session became active.
@@ -2092,68 +2109,7 @@ impl<M: LocalMailbox> Session<M> {
         })
     }
 
-    /// Push a message encrypted for the peer; it can be pushed again if this fails. While the
-    /// peer is not known to have the active session, the initial message that started it goes
-    /// with it, in case the one in the peer's inbox was lost.
-    pub async fn push(&mut self, sealed: Sealed) -> Result<()> {
-        self.mailbox.push(self.push_request(sealed)).await?;
-        Ok(())
-    }
-
-    /// The request [`push`](Session::push) makes for `sealed`, to push later, e.g. once this
-    /// session is gone, as when telling the peer that the chat was deleted.
-    pub fn push_request(&self, sealed: Sealed) -> PushRequest {
-        let initial_message = self
-            .state
-            .active
-            .as_ref()
-            .filter(|active| !active.initial_message.is_empty())
-            .and_then(|active| {
-                handshake::InitialMessage::decode(active.initial_message.as_slice()).ok()
-            });
-        PushRequest {
-            sender: Bytes::copy_from_slice(&self.state.me),
-            recipient: Bytes::copy_from_slice(&self.state.peer),
-            message: Some(sealed.message),
-            initial_message,
-            delivery_hash: sealed
-                .delivery_hash
-                .map_or_else(Bytes::new, |hash| Bytes::copy_from_slice(&hash)),
-        }
-    }
-
-    /// Fetch the next page of the peer's messages and decrypt them: one result per message, in
-    /// order. Returns an empty page once there are no new messages.
-    ///
-    /// A message is tried on the earlier sessions [kept](Session::keep) too. One that does not
-    /// decrypt may be on a session whose initial message is waiting, as it reached the server
-    /// first, but came after the initial messages were last taken: receiving stops there, the
-    /// page ending with an [`ErrorKind::Stalled`] error, and leaves it for later. Take and accept
-    /// the initial messages, then [`skip_stalled`](Session::skip_stalled) and receive again: what
-    /// of that page still does not decrypt never will, and is skipped, so that it cannot block
-    /// the messages after it. A message whose content expired on the server before it was
-    /// fetched is gone past, as one lost: carried initial messages are returned at the end of the page with
-    /// [`ErrorKind::Expired`]. Empty expired pages are skipped up to a bounded number per call.
-    ///
-    /// The fetch tells the server which messages the last receive got, with their delivery
-    /// tokens, so that it deletes them: save the [state](Session::state) after each receive,
-    /// before the next, as the messages are on the server until then.
-    ///
-    /// Cancel-safe: if the future is dropped, no message is consumed, but those whose contents
-    /// expired.
-    pub async fn receive(&mut self) -> Result<Vec<Received>> {
-        self.receive_pages(
-            async |mailbox, request| Ok(mailbox.fetch(request).await?.messages),
-            |content, earlier, initial_messages| Received {
-                content,
-                earlier,
-                initial_messages,
-            },
-        )
-        .await
-    }
-
-    async fn receive_pages<E: MailboxEnvelope, R>(
+    pub(crate) async fn receive_pages<E: MailboxEnvelope, R>(
         &mut self,
         fetch: impl AsyncFn(&M, FetchRequest) -> Result<Vec<E>>,
         entry: impl Fn(Result<Vec<u8>>, bool, Vec<E::Initial>) -> R,
@@ -2268,7 +2224,93 @@ impl<M: LocalMailbox> Session<M> {
     }
 }
 
+#[allow(deprecated)]
+impl<M: LocalMailbox> Session<M> {
+    /// Encrypt `content` and push it to the peer.
+    ///
+    /// If pushing fails the message is lost; to retry instead, use [`Session::encrypt`] and
+    /// [`Session::push`].
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
+    pub async fn send(&mut self, content: &[u8]) -> Result<()> {
+        let message = self.encrypt(content)?;
+        self.push(message).await
+    }
+
+    /// Push a message encrypted for the peer; it can be pushed again if this fails. While the
+    /// peer is not known to have the active session, the initial message that started it goes
+    /// with it, in case the one in the peer's inbox was lost.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
+    pub async fn push(&mut self, sealed: Sealed) -> Result<()> {
+        self.mailbox.push(self.push_request(sealed)).await?;
+        Ok(())
+    }
+
+    /// The request [`push`](Session::push) makes for `sealed`, to push later, e.g. once this
+    /// session is gone, as when telling the peer that the chat was deleted.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
+    pub fn push_request(&self, sealed: Sealed) -> PushRequest {
+        let initial_message = self
+            .state
+            .active
+            .as_ref()
+            .filter(|active| !active.initial_message.is_empty())
+            .and_then(|active| {
+                handshake::InitialMessage::decode(active.initial_message.as_slice()).ok()
+            });
+        PushRequest {
+            sender: Bytes::copy_from_slice(&self.state.me),
+            recipient: Bytes::copy_from_slice(&self.state.peer),
+            message: Some(sealed.message),
+            initial_message,
+            delivery_hash: sealed
+                .delivery_hash
+                .map_or_else(Bytes::new, |hash| Bytes::copy_from_slice(&hash)),
+        }
+    }
+
+    /// Fetch the next page of the peer's messages and decrypt them: one result per message, in
+    /// order. Returns an empty page once there are no new messages.
+    ///
+    /// A message is tried on the earlier sessions [kept](Session::keep) too. One that does not
+    /// decrypt may be on a session whose initial message is waiting, as it reached the server
+    /// first, but came after the initial messages were last taken: receiving stops there, the
+    /// page ending with an [`ErrorKind::Stalled`] error, and leaves it for later. Take and accept
+    /// the initial messages, then [`skip_stalled`](Session::skip_stalled) and receive again: what
+    /// of that page still does not decrypt never will, and is skipped, so that it cannot block
+    /// the messages after it. A message whose content expired on the server before it was
+    /// fetched is gone past, as one lost: carried initial messages are returned at the end of the page with
+    /// [`ErrorKind::Expired`]. Empty expired pages are skipped up to a bounded number per call.
+    ///
+    /// The fetch tells the server which messages the last receive got, with their delivery
+    /// tokens, so that it deletes them: save the [state](Session::state) after each receive,
+    /// before the next, as the messages are on the server until then.
+    ///
+    /// Cancel-safe: if the future is dropped, no message is consumed, but those whose contents
+    /// expired.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
+    )]
+    pub async fn receive(&mut self) -> Result<Vec<Received>> {
+        self.receive_pages(
+            async |mailbox, request| Ok(mailbox.fetch(request).await?.messages),
+            |content, earlier, initial_messages| Received {
+                content,
+                earlier,
+                initial_messages,
+            },
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
+#[allow(deprecated)]
 mod test {
     use core::cell::Cell;
     use protocol::{
@@ -2400,7 +2442,6 @@ mod test {
         }
     }
 
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     impl protocol::mailbox_v2::LocalMailboxV2 for ScriptedMailbox {
         async fn fetch_signed(
             &self,
@@ -2431,27 +2472,21 @@ mod test {
     #[derive(Clone, Copy)]
     enum MailboxVersion {
         V1,
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         V2,
     }
 
     impl MailboxVersion {
-        const ALL: &[Self] = &[
-            Self::V1,
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            Self::V2,
-        ];
+        const ALL: &[Self] = &[Self::V1, Self::V2];
 
         async fn receive(
             self,
             session: &mut Session<ScriptedMailbox>,
-            _client: &Client<()>,
+            client: &Client<()>,
         ) -> Result<Vec<Received>> {
             match self {
                 Self::V1 => session.receive().await,
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                 Self::V2 => Ok(session
-                    .receive_v2(_client, "relay.example")
+                    .receive_v2(client, "relay.example")
                     .await?
                     .into_iter()
                     .map(|r| Received {

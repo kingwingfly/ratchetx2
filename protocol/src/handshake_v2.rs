@@ -829,15 +829,17 @@ mod server {
         pub pq_ratchet_supported: bool,
         /// Canonical server audience identifier bound into signed manifests and requests.
         pub server_id: String,
-        /// Whether legacy v1 handshake/mailbox routes remain enabled.
+        /// Deprecated compatibility flag kept at `false` in [`GetServerInfoResponse`] for wire
+        /// stability: whether legacy v1 handshake/mailbox routes remain enabled.
         pub legacy_v1_enabled: bool,
-        /// Whether unsigned legacy v1 mailbox fetches remain allowed.
+        /// Deprecated compatibility flag kept at `false` in [`GetServerInfoResponse`] for wire
+        /// stability: whether unsigned legacy v1 mailbox fetches remain allowed.
         pub allow_unsigned_fetch: bool,
     }
 
     impl ServerInfoConfig {
         /// Default PQ-enabled configuration for `server_id` supporting both ML-KEM-1024 and
-        /// ML-KEM-768.
+        /// ML-KEM-768, with legacy v1 compatibility flags disabled (`false`).
         pub fn new(server_id: impl Into<String>) -> Self {
             Self {
                 pq_enabled: true,
@@ -847,8 +849,8 @@ mod server {
                 ],
                 pq_ratchet_supported: true,
                 server_id: server_id.into(),
-                legacy_v1_enabled: true,
-                allow_unsigned_fetch: true,
+                legacy_v1_enabled: false,
+                allow_unsigned_fetch: false,
             }
         }
     }
@@ -1372,6 +1374,7 @@ mod server {
     }
 
     #[cfg(test)]
+    #[allow(deprecated)]
     mod test {
         use std::sync::Arc;
 
@@ -1473,46 +1476,6 @@ mod server {
             }
         }
 
-        impl storage::LocalMailboxStore for SharedStore {
-            async fn append(
-                &self,
-                sender: &PublicKey,
-                recipient: &PublicKey,
-                header: Bytes,
-                content: Bytes,
-                initial_message: Option<Bytes>,
-                delivery_hash: Option<[u8; 32]>,
-            ) -> storage::Result<u64> {
-                storage::MailboxStore::append(
-                    &*self.0,
-                    sender,
-                    recipient,
-                    header,
-                    content,
-                    initial_message,
-                    delivery_hash,
-                )
-                .await
-            }
-            async fn delete_delivered(
-                &self,
-                sender: &PublicKey,
-                recipient: &PublicKey,
-                hashes: &[[u8; 32]],
-            ) -> storage::Result<()> {
-                storage::MailboxStore::delete_delivered(&*self.0, sender, recipient, hashes).await
-            }
-            async fn read(
-                &self,
-                sender: &PublicKey,
-                recipient: &PublicKey,
-                after: u64,
-                limit: u32,
-            ) -> storage::Result<Vec<storage::StoredMessage>> {
-                storage::MailboxStore::read(&*self.0, sender, recipient, after, limit).await
-            }
-        }
-
         impl storage::LocalIdempotentMailboxStore for SharedStore {
             async fn append_idempotent(
                 &self,
@@ -1535,6 +1498,27 @@ mod server {
                     client_message_id,
                 )
                 .await
+            }
+            async fn delete_delivered(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                hashes: &[[u8; 32]],
+            ) -> storage::Result<()> {
+                storage::IdempotentMailboxStore::delete_delivered(
+                    &*self.0, sender, recipient, hashes,
+                )
+                .await
+            }
+            async fn read(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                after: u64,
+                limit: u32,
+            ) -> storage::Result<Vec<storage::StoredMessage>> {
+                storage::IdempotentMailboxStore::read(&*self.0, sender, recipient, after, limit)
+                    .await
             }
         }
 
@@ -1607,6 +1591,8 @@ mod server {
             assert!(info.pq_enabled);
             assert_eq!(info.supported_suites, vec![1, 2]);
             assert_eq!(info.server_id, "relay.example");
+            assert!(!info.legacy_v1_enabled);
+            assert!(!info.allow_unsigned_fetch);
 
             let bob = XEdDSAPrivateKey::generate();
             let bob_pk = bob.compute_public_key().to_bytes();

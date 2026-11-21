@@ -4,10 +4,12 @@
 
 use bytes::Bytes;
 
+#[allow(deprecated)]
 use crate::{
-    Bundle, ErrorKind, LocalAttachmentStore, LocalHandshakeStore, LocalMailboxStore,
-    MAX_SAFE_INTEGER, StoredAttachment, StoredInitialMessage, StoredMessage,
+    Bundle, ErrorKind, LocalHandshakeStore, LocalMailboxStore, MAX_SAFE_INTEGER,
+    StoredInitialMessage,
 };
+use crate::{LocalAttachmentStore, StoredAttachment, StoredMessage};
 #[cfg(feature = "pq")]
 use crate::{
     LocalIdempotentMailboxStore, LocalPqHandshakeStore, PqLastResortCommitment, PublishV2Record,
@@ -15,7 +17,11 @@ use crate::{
     StoredInitialMessageV2, StoredPqPrekey,
 };
 
-/// Conformance suite for [`LocalHandshakeStore`].
+/// Conformance suite for legacy v1 [`LocalHandshakeStore`].
+#[deprecated(
+    note = "legacy v1 handshake store conformance is deprecated; use pq_handshake_store (see git tag archive/legacy-v1)"
+)]
+#[allow(deprecated)]
 pub async fn handshake_store<S: LocalHandshakeStore>(store: &S) {
     let (alice, bob) = ([1; 32], [2; 32]);
     let bundle = |timestamp| Bundle {
@@ -124,7 +130,11 @@ pub async fn handshake_store<S: LocalHandshakeStore>(store: &S) {
     );
 }
 
-/// Conformance suite for [`LocalMailboxStore`].
+/// Conformance suite for legacy v1 [`LocalMailboxStore`].
+#[deprecated(
+    note = "legacy v1 mailbox store conformance is deprecated; use idempotent_mailbox_store (see git tag archive/legacy-v1)"
+)]
+#[allow(deprecated)]
 pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
     let (alice, bob) = ([1; 32], [2; 32]);
 
@@ -278,10 +288,10 @@ pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
     store.delete_attachment(&attachment.id).await.unwrap();
 }
 
-/// Conformance suite for [`LocalPqHandshakeStore`] and its v1/v2 isolation invariants.
+/// Conformance suite for [`LocalPqHandshakeStore`].
 #[cfg(feature = "pq")]
-pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(store: &S) {
-    let (alice, bob, carol) = ([11; 32], [12; 32], [13; 32]);
+pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
+    let (alice, bob) = ([11; 32], [12; 32]);
     let pq_key = |suite: u8, tag: u8| StoredPqPrekey {
         suite,
         id: [tag; 32],
@@ -329,29 +339,6 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
             .is_empty()
     );
     assert_eq!(store.ack_initial_messages(&bob, &[1]).await.unwrap(), 0);
-
-    // Legacy v1-only user falls back cleanly in ClaimBundle (manifest = None).
-    assert!(
-        store
-            .publish(
-                Bundle {
-                    identity_key: carol,
-                    signed_prekey: [30; 32],
-                    signed_prekey_signature: [31; 64],
-                    timestamp: 10,
-                },
-                vec![[32; 32]],
-            )
-            .await
-            .unwrap()
-    );
-    let claimed_v1 = store.claim_bundle(&carol, &[1, 2]).await.unwrap().unwrap();
-    assert_eq!(claimed_v1.manifest, None);
-    assert_eq!(claimed_v1.signed_prekey, [30; 32]);
-    assert_eq!(claimed_v1.signed_prekey_signature, Some([31; 64]));
-    assert_eq!(claimed_v1.one_time_prekey, Some([32; 32]));
-    assert_eq!(claimed_v1.pq_last_resort, None);
-    assert_eq!(claimed_v1.pq_one_time_prekey, None);
 
     // Duplicate OPK or PQOPK is rejected.
     let dup = PublishV2Record {
@@ -413,37 +400,14 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
         PublishV2Status::StaleSequence
     );
 
-    // Legacy v1 take_bundle NEVER consumes PQOPKs.
-    let (v1_bundle, v1_opk) = store.take_bundle(&bob).await.unwrap().unwrap();
-    assert_eq!(v1_bundle.signed_prekey, [21; 32]);
-    assert_eq!(v1_opk, Some([40; 32]));
+    // Classical claim (empty preferred_suites) pops a classical OPK and NEVER consumes PQOPKs.
+    let classical_claim = store.claim_bundle(&bob, &[]).await.unwrap().unwrap();
+    assert_eq!(classical_claim.signed_prekey, [21; 32]);
+    assert_eq!(classical_claim.one_time_prekey, Some([40; 32]));
+    assert_eq!(classical_claim.pq_last_resort, None);
+    assert_eq!(classical_claim.pq_one_time_prekey, None);
     let snap = store.pq_snapshot(&bob).await.unwrap();
     assert_eq!(snap.pq_one_time_counts, vec![(1, 1), (2, 1)]);
-
-    // Legacy v1 publish MUST be refused once a v2 manifest exists, leaving v2 manifest, PQ
-    // prekeys, and the remaining classical OPK pool untouched.
-    assert!(
-        !store
-            .publish(
-                Bundle {
-                    identity_key: bob,
-                    signed_prekey: [99; 32],
-                    signed_prekey_signature: [98; 64],
-                    timestamp: 2000,
-                },
-                vec![[42; 32]],
-            )
-            .await
-            .unwrap()
-    );
-    assert_eq!(
-        store.get_manifest(&bob).await.unwrap(),
-        Some(manifest(1, 1, true, false))
-    );
-    assert_eq!(
-        store.pq_snapshot(&bob).await.unwrap().pq_one_time_counts,
-        vec![(1, 1), (2, 1)]
-    );
 
     // Claim ML-KEM-768 (suite 2) pops suite 2 PQOPK and remaining classical OPK [41; 32];
     // second claim falls back to last-resort.
@@ -523,8 +487,7 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
         RefillStatus::DuplicatePrekey
     );
 
-    // Strict PQ publish clears legacy v1 bundle so v1 take_bundle returns None; replaying an
-    // old or new v1 publish MUST remain refused and must NOT restore v1 bundle or overwrite OPKs.
+    // Strict PQ publish omits raw SPK signature and claims cleanly.
     assert_eq!(
         store
             .publish_v2(PublishV2Record {
@@ -539,21 +502,6 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
             .unwrap(),
         PublishV2Status::Stored
     );
-    assert!(
-        !store
-            .publish(
-                Bundle {
-                    identity_key: bob,
-                    signed_prekey: [99; 32],
-                    signed_prekey_signature: [98; 64],
-                    timestamp: 100,
-                },
-                vec![[97; 32]],
-            )
-            .await
-            .unwrap()
-    );
-    assert_eq!(store.take_bundle(&bob).await.unwrap(), None);
     let strict_claim = store.claim_bundle(&bob, &[1]).await.unwrap().unwrap();
     assert_eq!(strict_claim.one_time_prekey, Some([60; 32]));
     assert_eq!(strict_claim.signed_prekey_signature, None);
@@ -579,24 +527,31 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
     assert!(off_snap.pq_last_resort_suites.is_empty());
     assert!(off_snap.pq_one_time_counts.is_empty());
 
-    // Inbox v1/v2 isolation: add 1 classical v1 initial and 1 PQXDH v2 initial.
-    assert!(
-        store
-            .add_initial_message(
-                StoredInitialMessage {
-                    sender: alice,
-                    recipient: bob,
-                    ephemeral_key: [80; 32],
-                    signed_prekey: [23; 32],
-                    one_time_prekey: None,
-                    header: Bytes::from_static(b"v1-h"),
-                    content: Bytes::from_static(b"v1-c"),
-                },
-                10,
-            )
-            .await
-            .unwrap()
-    );
+    // Two-phase inbox: add 1 classical (version 1) initial and 1 PQXDH (version 2) initial.
+    let v1_id = store
+        .add_initial_message_v2(
+            StoredInitialMessageV2 {
+                id: 0,
+                version: 1,
+                sender: alice,
+                recipient: bob,
+                ephemeral_key: [80; 32],
+                signed_prekey: [23; 32],
+                one_time_prekey: None,
+                header: Bytes::from_static(b"v1-h"),
+                content: Bytes::from_static(b"v1-c"),
+                pq_suite: None,
+                pq_last_resort: false,
+                pq_prekey_id: None,
+                pq_ciphertext: None,
+                manifest_digest: None,
+            },
+            2,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(v1_id > 0);
     let pq_id = store
         .add_initial_message_v2(
             StoredInitialMessageV2 {
@@ -615,35 +570,54 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
                 pq_ciphertext: Some(Bytes::from(vec![0xCC; 1568])),
                 manifest_digest: Some([0xDD; 32]),
             },
-            10,
+            2,
         )
         .await
         .unwrap()
         .unwrap();
-    assert!(pq_id > 0);
+    assert!(pq_id > v1_id);
+    // Inbox limit is enforced.
+    assert_eq!(
+        store
+            .add_initial_message_v2(
+                StoredInitialMessageV2 {
+                    id: 0,
+                    version: 1,
+                    sender: alice,
+                    recipient: bob,
+                    ephemeral_key: [82; 32],
+                    signed_prekey: [23; 32],
+                    one_time_prekey: None,
+                    header: Bytes::from_static(b"full"),
+                    content: Bytes::new(),
+                    pq_suite: None,
+                    pq_last_resort: false,
+                    pq_prekey_id: None,
+                    pq_ciphertext: None,
+                    manifest_digest: None,
+                },
+                2,
+            )
+            .await
+            .unwrap(),
+        None
+    );
 
-    // v2 list returns BOTH v1 and v2 without deleting either.
+    // Non-destructive list returns BOTH v1 and v2 oldest-first.
     let listed = store.list_initial_messages(&bob, 10).await.unwrap();
     assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, v1_id);
     assert_eq!(listed[0].version, 1);
-    assert_eq!(listed[1].version, 2);
     assert_eq!(listed[1].id, pq_id);
+    assert_eq!(listed[1].version, 2);
 
-    // Legacy v1 take_initial_messages drains ONLY the classical v1 message; v2 PQ survives!
-    let v1_taken = store
-        .take_initial_messages(&bob, 3000)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(v1_taken.len(), 1);
-    assert_eq!(v1_taken[0].header, Bytes::from_static(b"v1-h"));
-
+    // Ack deletes only the acknowledged IDs.
+    assert_eq!(store.ack_initial_messages(&bob, &[v1_id]).await.unwrap(), 1);
     let remaining = store.list_initial_messages(&bob, 10).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, pq_id);
     assert_eq!(remaining[0].version, 2);
 
-    // Ack deletes only the acknowledged ID.
     assert_eq!(store.ack_initial_messages(&bob, &[pq_id]).await.unwrap(), 1);
     assert!(
         store
@@ -654,13 +628,13 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
     );
 }
 
-/// Conformance suite for [`LocalIdempotentMailboxStore`] sharing state with [`LocalMailboxStore`].
+/// Conformance suite for [`LocalIdempotentMailboxStore`].
 #[cfg(feature = "pq")]
-pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMailboxStore>(
-    store: &S,
-) {
+pub async fn idempotent_mailbox_store<S: LocalIdempotentMailboxStore>(store: &S) {
     let (alice, bob) = ([21; 32], [22; 32]);
     let cid = [0x42; 16];
+
+    assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
 
     let seq1 = store
         .append_idempotent(
@@ -668,7 +642,7 @@ pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMail
             &bob,
             Bytes::from_static(b"h1"),
             Bytes::from_static(b"c1"),
-            None,
+            Some(Bytes::from_static(b"initial")),
             Some([1; 32]),
             Some(cid),
         )
@@ -682,7 +656,7 @@ pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMail
             &bob,
             Bytes::from_static(b"h1"),
             Bytes::from_static(b"c1"),
-            None,
+            Some(Bytes::from_static(b"initial")),
             Some([1; 32]),
             Some(cid),
         )
@@ -690,10 +664,40 @@ pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMail
         .unwrap();
     assert_eq!(seq1_retry, 1);
 
-    store
-        .delete_delivered(&alice, &bob, &[[1; 32]])
+    // The opposite direction is an independent queue.
+    let reverse = store
+        .append_idempotent(
+            &bob,
+            &alice,
+            Bytes::from_static(b"rh"),
+            Bytes::from_static(b"rc"),
+            None,
+            Some([1; 32]),
+            Some(cid),
+        )
         .await
         .unwrap();
+    assert_eq!(reverse, 1);
+
+    let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
+    assert_eq!(
+        messages,
+        vec![StoredMessage {
+            sender: alice,
+            recipient: bob,
+            sequence: 1,
+            header: Bytes::from_static(b"h1"),
+            content: Some(Bytes::from_static(b"c1")),
+            initial_message: Some(Bytes::from_static(b"initial")),
+        }]
+    );
+
+    // Tombstone survives delete_delivered, and deleting only affects the matching direction.
+    store
+        .delete_delivered(&alice, &bob, &[[1; 32], [9; 32]])
+        .await
+        .unwrap();
+    assert_eq!(store.read(&bob, &alice, 0, 10).await.unwrap().len(), 1);
     let retry = store
         .append_idempotent(
             &alice,
@@ -713,31 +717,51 @@ pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMail
         .append_idempotent(
             &alice,
             &bob,
-            Bytes::new(),
-            Bytes::new(),
+            Bytes::from_static(b"h2"),
+            Bytes::from_static(b"c2"),
             None,
-            None,
+            Some([2; 32]),
             Some([0x43; 16]),
         )
         .await
         .unwrap();
     assert_eq!(next, seq1 + 1);
 
-    // Shares the same underlying queue with classical v1 append/read.
-    let seq2 = store
-        .append(
+    // Appending without a client_message_id allocates the next sequence cleanly.
+    let seq3 = store
+        .append_idempotent(
             &alice,
             &bob,
-            Bytes::from_static(b"h2"),
-            Bytes::from_static(b"c2"),
+            Bytes::from_static(b"h3"),
+            Bytes::from_static(b"c3"),
+            None,
             None,
             None,
         )
         .await
         .unwrap();
-    assert_eq!(seq2, next + 1);
+    assert_eq!(seq3, next + 1);
+
     let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].sequence, next);
-    assert_eq!(messages[1].sequence, seq2);
+    assert_eq!(messages[1].sequence, seq3);
+
+    // Pagination and bounds.
+    let page = store.read(&alice, &bob, 0, 1).await.unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].sequence, next);
+    let page2 = store.read(&alice, &bob, next, 10).await.unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].sequence, seq3);
+    assert!(
+        store
+            .read(&alice, &bob, u64::MAX, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Empty hashes list leaves remaining messages untouched.
+    store.delete_delivered(&alice, &bob, &[]).await.unwrap();
+    assert_eq!(store.read(&alice, &bob, 0, 10).await.unwrap().len(), 2);
 }

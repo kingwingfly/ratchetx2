@@ -168,7 +168,7 @@ mod server {
     use bon::Builder;
     use party::EncryptedMessage;
     use sha2::{Digest, Sha256};
-    use storage::{LocalIdempotentMailboxStore, LocalMailboxStore};
+    use storage::LocalIdempotentMailboxStore;
     use x3dh::PqSuite;
 
     use super::*;
@@ -179,8 +179,7 @@ mod server {
         now_millis,
     };
 
-    /// The v2 mailbox server logic over any store implementing both [`LocalMailboxStore`] and
-    /// [`LocalIdempotentMailboxStore`].
+    /// The v2 mailbox server logic over any store implementing [`LocalIdempotentMailboxStore`].
     #[derive(Debug, Builder)]
     pub struct MailboxV2Server<S> {
         #[builder(start_fn)]
@@ -207,7 +206,7 @@ mod server {
         }
     }
 
-    impl<S: LocalMailboxStore + LocalIdempotentMailboxStore> LocalMailboxV2 for MailboxV2Server<S> {
+    impl<S: LocalIdempotentMailboxStore> LocalMailboxV2 for MailboxV2Server<S> {
         async fn push_v2(&self, request: PushV2Request) -> Result<PushV2Response> {
             let sender: PublicKey = fixed(&request.sender)?;
             let recipient: PublicKey = fixed(&request.recipient)?;
@@ -322,10 +321,11 @@ mod server {
     }
 
     #[cfg(test)]
+    #[allow(deprecated)]
     mod test {
         use std::sync::Arc;
 
-        use storage::{IdempotentMailboxStore, MailboxStore, MemoryStore};
+        use storage::{IdempotentMailboxStore, LocalMailboxStore, MailboxStore, MemoryStore};
         use x3dh::PQXDH_VERSION;
 
         use super::*;
@@ -398,6 +398,23 @@ mod server {
                     client_message_id,
                 )
                 .await
+            }
+            async fn delete_delivered(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                hashes: &[[u8; 32]],
+            ) -> storage::Result<()> {
+                IdempotentMailboxStore::delete_delivered(&*self.0, sender, recipient, hashes).await
+            }
+            async fn read(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                after: u64,
+                limit: u32,
+            ) -> storage::Result<Vec<storage::StoredMessage>> {
+                IdempotentMailboxStore::read(&*self.0, sender, recipient, after, limit).await
             }
         }
 
