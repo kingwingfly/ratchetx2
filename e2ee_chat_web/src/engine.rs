@@ -25,7 +25,7 @@ use leptos::{prelude::*, task::spawn_local};
 use session::InitialMessage;
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use session::{
-    AcceptedInitial, InitialMessageV2, PqSuite,
+    AcceptedInitial, InitialMessageV2, PqSuite, PublishV2Outcome,
     protocol::{
         handshake_v2::InitialMessageV2 as WireInitialMessageV2,
         mailbox_v2::{LocalMailboxV2, PushV2Request},
@@ -75,11 +75,16 @@ const WAITS_SIGN_IN: &str = "waits for you to sign in to the server";
 /// sign in to it.
 const NOT_SIGNED_IN_HERE: &str =
     "the server keeps it only for those signed in to it, and only its own page can sign in";
-/// Classical one-time prekeys in each publish or refill.
+/// Classical one-time prekeys in each initial/rotating publish.
 const ONE_TIME_PREKEYS: usize = 20;
-/// Post-quantum one-time prekeys per suite in each v2 publish or refill.
+/// Post-quantum one-time prekeys per suite in each v2 initial/rotating publish.
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 const PQ_ONE_TIME_PREKEYS: usize = 20;
+/// Server-enforced cumulative classical OPK cap (`HandshakeV2Limits::default()`).
+const SERVER_MAX_ONE_TIME_PREKEYS: usize = 100;
+/// Server-enforced cumulative PQOPK cap summed across all suites (`HandshakeV2Limits::default()`).
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+const SERVER_MAX_PQ_ONE_TIME_PREKEYS: usize = 100;
 /// Replenish one-time prekeys (without rotating SPK) once this many are used...
 const REFILL_USED: u32 = 10;
 /// ... and rotate the signed prekey once it is this old, in milliseconds.
@@ -270,6 +275,11 @@ struct Inner {
     audience: String,
     /// Server PQ availability discovered via `check_server_info`.
     server_pq: ServerPqStatus,
+    /// Last known server-stored classical OPK count (from publish or `RefillPrekeysResponse`).
+    last_server_classical_opks: Option<u32>,
+    /// Last known server-stored total PQOPK count across all suites.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    last_server_pq_opks: Option<u32>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
     client: Client<Connect>,
@@ -278,6 +288,11 @@ struct Inner {
     /// initial messages, which the server deleted once taken, and the greeting of a chat started.
     /// Each save writes them too, until one succeeds, so that the history has no gap.
     unsaved: Vec<(PublicKey, (String, HistoryEntry))>,
+    /// Requeued outbox records that a save failed to write after an accepted replacement session
+    /// reset `outbox[*].sealed = false` in memory. Each save writes them before any caller
+    /// `outgoing` updates until one succeeds so `seal_next` never reads stale empty-content
+    /// sealed outbox records from IndexedDB.
+    unsaved_outbox: Vec<(PublicKey, (String, Option<OutgoingRecord>))>,
     /// The chats whose records left unsaved a save wrote, which then show them.
     saved_late: Vec<PublicKey>,
 }
@@ -573,6 +588,9 @@ impl Engine {
             server: address,
             audience,
             server_pq: ServerPqStatus::Unknown,
+            last_server_classical_opks: None,
+            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+            last_server_pq_opks: None,
             state: AppState {
                 client: None,
                 ..state
@@ -580,6 +598,7 @@ impl Engine {
             client,
             contacts: vec![],
             unsaved: vec![],
+            unsaved_outbox: vec![],
             saved_late: vec![],
         })
         .await;
@@ -623,10 +642,14 @@ impl Engine {
             server: address,
             audience,
             server_pq: ServerPqStatus::Unknown,
+            last_server_classical_opks: None,
+            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+            last_server_pq_opks: None,
             state,
             client,
             contacts,
             unsaved: vec![],
+            unsaved_outbox: vec![],
             saved_late: vec![],
         })
         .await;
@@ -919,7 +942,7 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
-        if !inner.unsaved.is_empty() {
+        if !inner.unsaved.is_empty() || !inner.unsaved_outbox.is_empty() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
         let late = std::mem::take(&mut inner.saved_late);
@@ -1060,6 +1083,11 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return Ok(false);
         };
+        // Flush any unsaved requeued outbox records before `seal_next` reads from IndexedDB,
+        // ensuring we never encrypt stale empty-content records after an earlier save failure.
+        if inner.unsaved_outbox.iter().any(|(p, _)| p == peer) {
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
         // Never send or send receipts on a brand-new quarantined classical contact.
         if inner
             .contacts
@@ -1093,12 +1121,15 @@ impl Engine {
         let mut result = Ok(());
         // Completed outbox items (with their original `Outgoing` so M-18 can keep any item whose
         // history entry failed to read from IndexedDB instead of deleting its outbox record).
+        // Items stay in `contact.state.outbox` until the atomic `save_with` below commits (or
+        // rolls back cleanly on failure), indexed via `pushed_count`.
         let mut completed: Vec<(Outgoing, Step, u64)> = vec![];
+        let mut pushed_count = 0usize;
         // Whether this page can sign in to the server, which only its own page can: otherwise a
         // message that takes it never goes, and must not hold up those after it.
         let signs_in_here = same_server(&inner.server, &origin());
         while let Some(contact) = inner.contact(peer)
-            && let Some(outgoing) = contact.state.outbox.first().cloned()
+            && let Some(outgoing) = contact.state.outbox.get(pushed_count).cloned()
         {
             // An attachment whose upload has not started: it, and what was sent after it, wait
             // for it to start.
@@ -1186,14 +1217,15 @@ impl Engine {
                     break;
                 }
             };
-            contact.state.outbox.remove(0);
             completed.push((outgoing, step.0, step.1));
+            pushed_count += 1;
             changed = true;
         }
         if !completed.is_empty() {
             let mut entries = vec![];
             let mut gone = vec![];
             let mut keep_in_outbox = vec![];
+            let mut new_awaiting = vec![];
             for (outgoing, step, clock) in completed {
                 let index = outgoing.history_index;
                 match inner.vault.entry(peer, index).await {
@@ -1205,15 +1237,12 @@ impl Engine {
                             let content = entry.content.get_or_insert_default();
                             content.clock = clock;
                             let attachment = matches!(content.kind, Some(Kind::Attachment(_)));
-                            if let Some(contact) = inner.contact(peer) {
-                                contact.state.awaiting.push(Awaiting {
-                                    place: clock,
-                                    history_index: index,
-                                    read: false,
-                                    attachment,
-                                });
-                                keep_last(&mut contact.state.awaiting);
-                            }
+                            new_awaiting.push(Awaiting {
+                                place: clock,
+                                history_index: index,
+                                read: false,
+                                attachment,
+                            });
                         }
                         entries.push((index, entry));
                         gone.push((outbox_key(peer, index), None));
@@ -1228,16 +1257,25 @@ impl Engine {
                     }
                 }
             }
-            if !keep_in_outbox.is_empty()
-                && let Some(contact) = inner.contact(peer)
-            {
-                contact.state.outbox.splice(0..0, keep_in_outbox);
-            }
             if !gone.is_empty() {
-                inner
-                    .save_with(&records(peer, &entries), &gone)
-                    .await
-                    .map_err(|e| describe(&e))?;
+                // Take a snapshot after any committed `seal_next` advances and BEFORE mutating
+                // `outbox`/`awaiting` so a `save_with` failure rolls back cleanly without
+                // stranding history entries as `Pending`.
+                let snapshot = inner.contact(peer).map(|c| c.snapshot());
+                if let Some(contact) = inner.contact(peer) {
+                    let drain_end = pushed_count.min(contact.state.outbox.len());
+                    contact.state.outbox.splice(0..drain_end, keep_in_outbox);
+                    if !new_awaiting.is_empty() {
+                        contact.state.awaiting.extend(new_awaiting);
+                        keep_last(&mut contact.state.awaiting);
+                    }
+                }
+                if let Err(e) = inner.save_with(&records(peer, &entries), &gone).await {
+                    if let Some(snapshot) = snapshot {
+                        inner.roll_back(peer, snapshot)?;
+                    }
+                    return Err(describe(&e));
+                }
                 self.show_changes(inner, peer, &entries);
             }
         }
@@ -1354,7 +1392,7 @@ impl Engine {
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         {
             let mut to_upgrade: Vec<PublicKey> = vec![];
-            let changed = {
+            let (changed, ack_err) = {
                 let mut guard = self.inner.lock().await;
                 let Some(inner) = guard.as_mut() else {
                     return Ok(false);
@@ -1370,6 +1408,7 @@ impl Engine {
                 let mut ack_ids = listed.malformed_ids;
                 let (mut records, mut views) = (vec![], vec![]);
                 let mut peers = vec![];
+                let mut replaced_peers = vec![];
                 let mut state_dirty = false;
                 let me = inner.client.identity_key();
                 let local_pq = inner.client.pq_config().pq_enabled
@@ -1406,7 +1445,13 @@ impl Engine {
                                 short(&peer),
                                 describe(&e)
                             ));
-                            if let Some(contact) = inner.contact(&peer) {
+                            // `accept_initial_v2` only returns `DowngradeDetected`/`PqRequired`
+                            // after X3DH/PQXDH + AEAD sender authentication; as defense in depth,
+                            // never poison a healthy active PQ chat's alert/downgrade state from
+                            // a rejected inbox initial.
+                            if let Some(contact) = inner.contact(&peer)
+                                && !contact.has_healthy_pq_session()
+                            {
                                 if e.kind() == ErrorKind::DowngradeDetected {
                                     contact.session.peer_pq_state_mut().downgrade_detected = true;
                                     contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
@@ -1441,9 +1486,15 @@ impl Engine {
                                 Some(index) => {
                                     let contact = &mut inner.contacts[index];
                                     match contact.session.accept_replacement(session) {
-                                        Ok(_) => {
+                                        Ok(took_over) => {
                                             if security.is_pq {
                                                 contact.clear_quarantine_and_alerts();
+                                            }
+                                            if took_over {
+                                                contact.state.sealed_events = None;
+                                                if !replaced_peers.contains(&peer) {
+                                                    replaced_peers.push(peer);
+                                                }
                                             }
                                             contact
                                         }
@@ -1549,28 +1600,58 @@ impl Engine {
                     }
                 }
 
+                // Requeue any outbox messages sealed on a replaced session so they re-encrypt onto
+                // the new active session atomically with this save.
+                let mut requeued_outbox = vec![];
+                let mut requeued_peers = vec![];
+                for replaced_peer in replaced_peers {
+                    match inner.requeue_sealed(&replaced_peer).await {
+                        Ok(requeued) => {
+                            requeued_peers.extend(std::iter::repeat_n(replaced_peer, requeued.len()));
+                            requeued_outbox.extend(requeued);
+                        }
+                        Err(e) => {
+                            self.ui.log(format!(
+                                "could not requeue pending messages for {}: {e}",
+                                short(&replaced_peer)
+                            ));
+                        }
+                    }
+                }
+
                 // Persist BEFORE acknowledging v2 inbox IDs so a crash never loses accepted state.
-                if (state_dirty || !records.is_empty())
-                    && let Err(e) = inner.save(&records).await
+                if (state_dirty || !records.is_empty() || !requeued_outbox.is_empty())
+                    && let Err(e) = inner.save_with(&records, &requeued_outbox).await
                 {
                     inner.unsaved.extend(peers.into_iter().zip(records));
+                    inner
+                        .unsaved_outbox
+                        .extend(requeued_peers.into_iter().zip(requeued_outbox));
                     return Err(describe(&e));
                 }
-                if !listed.fell_back_to_v1 && !ack_ids.is_empty() {
-                    inner
-                        .client
-                        .ack_initial_messages_v2(&inner.audience, ack_ids)
-                        .await
-                        .map_err(|e| describe(&e))?;
-                }
+                // Refresh UI immediately after durable local persistence so transient ack errors
+                // never hide saved messages or skip `to_upgrade` recovery.
                 if let Some(open) = self.ui.open.get_untracked() {
                     self.show_new(inner, &open, views);
                 }
                 self.ui.contacts.set(inner.views());
-                state_dirty
+                let ack_err = if !listed.fell_back_to_v1 && !ack_ids.is_empty() {
+                    inner
+                        .client
+                        .ack_initial_messages_v2(&inner.audience, ack_ids)
+                        .await
+                        .err()
+                        .map(|e| describe(&e))
+                } else {
+                    None
+                };
+                (state_dirty, ack_err)
             };
             for peer in to_upgrade {
                 let _ = self.upgrade_to_pq(peer).await;
+            }
+            if let Some(err) = ack_err {
+                return Err(err);
             }
             Ok(changed)
         }
@@ -1590,6 +1671,7 @@ impl Engine {
             }
             let (mut records, mut views) = (vec![], vec![]);
             let mut peers = vec![];
+            let mut replaced_peers = vec![];
             let me = inner.client.identity_key();
             for initial_message in &initial_messages {
                 let peer = initial_message.x3dh.identity_key;
@@ -1624,15 +1706,25 @@ impl Engine {
                 {
                     Some(index) => {
                         let contact = &mut inner.contacts[index];
-                        if let Err(e) = contact.session.accept_replacement(session) {
-                            self.ui.log(format!(
-                                "rejected incoming session from {}: {}",
-                                short(&peer),
-                                describe(&e)
-                            ));
-                            continue;
+                        match contact.session.accept_replacement(session) {
+                            Ok(took_over) => {
+                                if took_over {
+                                    contact.state.sealed_events = None;
+                                    if !replaced_peers.contains(&peer) {
+                                        replaced_peers.push(peer);
+                                    }
+                                }
+                                contact
+                            }
+                            Err(e) => {
+                                self.ui.log(format!(
+                                    "rejected incoming session from {}: {}",
+                                    short(&peer),
+                                    describe(&e)
+                                ));
+                                continue;
+                            }
                         }
-                        contact
                     }
                     None => {
                         self.ui.log(format!("chat request from {}", short(&peer)));
@@ -1659,9 +1751,28 @@ impl Engine {
                     views.push(contact.message(index, entry));
                 }
             }
-            if let Err(e) = inner.save(&records).await {
+            let mut requeued_outbox = vec![];
+            let mut requeued_peers = vec![];
+            for replaced_peer in replaced_peers {
+                match inner.requeue_sealed(&replaced_peer).await {
+                    Ok(requeued) => {
+                        requeued_peers.extend(std::iter::repeat_n(replaced_peer, requeued.len()));
+                        requeued_outbox.extend(requeued);
+                    }
+                    Err(e) => {
+                        self.ui.log(format!(
+                            "could not requeue pending messages for {}: {e}",
+                            short(&replaced_peer)
+                        ));
+                    }
+                }
+            }
+            if let Err(e) = inner.save_with(&records, &requeued_outbox).await {
                 // The server deleted them, and their sessions are accepted: they show once saved.
                 inner.unsaved.extend(peers.into_iter().zip(records));
+                inner
+                    .unsaved_outbox
+                    .extend(requeued_peers.into_iter().zip(requeued_outbox));
                 return Err(describe(&e));
             }
             if let Some(open) = self.ui.open.get_untracked() {
@@ -1708,23 +1819,42 @@ impl Engine {
                     .transmit_publish_v2_or_v1_fallback(&prepared)
                     .await
                 {
-                    Ok(()) => {
+                    Ok(outcome) => {
                         inner.client.commit_publish_v2(prepared);
                         self.publish_waits_sign_in.set(false);
                         inner.state.published_at = now();
                         inner.state.used_one_time_prekeys = 0;
                         inner.state.used_pq_one_time_prekeys = 0;
                         inner.state.needs_publish = false;
+                        inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
+                        let log_msg = match outcome {
+                            PublishV2Outcome::V2Pq => {
+                                let suites_len = inner.client.pq_config().offered_suites().len();
+                                inner.last_server_pq_opks =
+                                    Some((PQ_ONE_TIME_PREKEYS * suites_len) as u32);
+                                if inner.server_pq == ServerPqStatus::Disabled {
+                                    inner.server_pq = ServerPqStatus::Unknown;
+                                }
+                                "published post-quantum + classical prekeys and signed capability manifest"
+                            }
+                            PublishV2Outcome::V2ClassicalOff => {
+                                inner.last_server_pq_opks = Some(0);
+                                if inner.client.pq_config().pq_enabled {
+                                    inner.server_pq = ServerPqStatus::Disabled;
+                                    "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
+                                } else {
+                                    "published classical prekeys and signed PQ-off capability manifest"
+                                }
+                            }
+                            PublishV2Outcome::V1Fallback => {
+                                inner.last_server_pq_opks = Some(0);
+                                inner.server_pq = ServerPqStatus::Disabled;
+                                "published classical prekeys via v1 fallback"
+                            }
+                        };
                         inner.save(&[]).await.map_err(|e| describe(&e))?;
                         self.ui.me.set(Some(inner.me()));
-                        let mode = if inner.client.pq_config().pq_enabled {
-                            "post-quantum + classical"
-                        } else {
-                            "classical (PQ off)"
-                        };
-                        self.ui.log(format!(
-                            "published {mode} prekeys and signed capability manifest"
-                        ));
+                        self.ui.log(log_msg);
                         return Ok(());
                     }
                     Err(e) if e.kind() == ErrorKind::SignInRequired => {
@@ -1734,6 +1864,16 @@ impl Engine {
                         if !now_anyway {
                             return Ok(());
                         }
+                        return Err(describe(&e));
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            ErrorKind::PqRequired | ErrorKind::LimitExceeded
+                        ) =>
+                    {
+                        inner.client.rollback_publish_v2_on_refusal(prepared);
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
                         return Err(describe(&e));
                     }
                     Err(e) => return Err(describe(&e)),
@@ -1754,6 +1894,7 @@ impl Engine {
                         inner.state.published_at = now();
                         inner.state.used_one_time_prekeys = 0;
                         inner.state.needs_publish = false;
+                        inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
                         inner.save(&[]).await.map_err(|e| describe(&e))?;
                         self.ui.log(format!(
                             "published a new signed prekey and {ONE_TIME_PREKEYS} one-time prekeys"
@@ -1769,6 +1910,11 @@ impl Engine {
                         }
                         return Err(describe(&e));
                     }
+                    Err(e) if e.kind() == ErrorKind::LimitExceeded => {
+                        inner.client.rollback_publish_on_refusal(prepared);
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
+                        return Err(describe(&e));
+                    }
                     Err(e) => return Err(describe(&e)),
                 }
             }
@@ -1779,17 +1925,50 @@ impl Engine {
             return Ok(());
         }
         let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;
-        let pq_low = pq_compiled
+        let pq_suites_len = if pq_compiled
             && inner.client.pq_config().pq_enabled
-            && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
+            && inner.server_pq != ServerPqStatus::Disabled
+        {
+            inner.client.pq_config().offered_suites().len()
+        } else {
+            0
+        };
+        let pq_low = pq_suites_len > 0 && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
         if !classical_low && !pq_low {
             return Ok(());
         }
 
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        if inner.client.prekey_generation() > 0 && inner.server_pq != ServerPqStatus::Disabled {
-            let classical_count = if classical_low { ONE_TIME_PREKEYS } else { 0 };
-            let pq_count = if pq_low { PQ_ONE_TIME_PREKEYS } else { 0 };
+        let server_pq_known = inner.last_server_pq_opks;
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        let server_pq_known = None;
+        let (classical_count, pq_count) = refill_batch_counts(
+            inner.state.used_one_time_prekeys,
+            inner.state.used_pq_one_time_prekeys,
+            pq_suites_len,
+            inner.last_server_classical_opks,
+            server_pq_known,
+        );
+        // If server is already at its 100-key cap, reset counters so sync doesn't loop.
+        if classical_count == 0 && pq_count == 0 {
+            let mut cleared = false;
+            if classical_low {
+                inner.state.used_one_time_prekeys = 0;
+                cleared = true;
+            }
+            if pq_low {
+                inner.state.used_pq_one_time_prekeys = 0;
+                cleared = true;
+            }
+            if cleared {
+                inner.save(&[]).await.map_err(|e| describe(&e))?;
+            }
+            return Ok(());
+        }
+
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        if inner.client.prekey_generation() > 0 {
+            let mut try_classical_only_v2 = false;
             let prepared = inner
                 .client
                 .prepare_refill_v2(&inner.audience, classical_count, pq_count)
@@ -1797,11 +1976,17 @@ impl Engine {
             // H-2: Persist refilled OPKs/PQOPKs BEFORE transmitting!
             inner.save(&[]).await.map_err(|e| describe(&e))?;
             match inner.client.transmit_refill_v2(&prepared).await {
-                Ok(_) => {
-                    if classical_low {
+                Ok(resp) => {
+                    inner.last_server_classical_opks = Some(resp.classical_one_time_count);
+                    inner.last_server_pq_opks = Some(
+                        resp.pq_one_time_counts
+                            .iter()
+                            .fold(0u32, |acc, s| acc.saturating_add(s.count)),
+                    );
+                    if classical_count > 0 {
                         inner.state.used_one_time_prekeys = 0;
                     }
-                    if pq_low {
+                    if pq_count > 0 {
                         inner.state.used_pq_one_time_prekeys = 0;
                     }
                     inner.save(&[]).await.map_err(|e| describe(&e))?;
@@ -1815,6 +2000,20 @@ impl Engine {
                     self.publish_waits_sign_in.set(true);
                     return Ok(());
                 }
+                Err(e) if e.kind() == ErrorKind::LimitExceeded => {
+                    inner.client.rollback_refill_v2_on_refusal(prepared);
+                    if classical_count > 0 {
+                        inner.state.used_one_time_prekeys = 0;
+                        inner.last_server_classical_opks = Some(SERVER_MAX_ONE_TIME_PREKEYS as u32);
+                    }
+                    if pq_count > 0 {
+                        inner.state.used_pq_one_time_prekeys = 0;
+                        inner.last_server_pq_opks = Some(SERVER_MAX_PQ_ONE_TIME_PREKEYS as u32);
+                    }
+                    inner.save(&[]).await.map_err(|e| describe(&e))?;
+                    self.ui.log("server one-time prekey pool is already full; skipped refill");
+                    return Ok(());
+                }
                 Err(e) if e.kind() == ErrorKind::Unimplemented => {
                     inner.client.rollback_refill_v2_on_refusal(prepared);
                     inner.server_pq = ServerPqStatus::Disabled;
@@ -1823,9 +2022,17 @@ impl Engine {
                     if inner.client.pq_config().strict_pq {
                         return Err(describe(&e));
                     }
-                    // Fall through to classical non-rotating extend below if classical_low.
+                    if pq_count > 0 && classical_count > 0 {
+                        // Server may have PQ_ENABLED="false" while still keeping classical-only
+                        // `RefillPrekeys` enabled (and rejecting v1 `Publish` for manifest users).
+                        try_classical_only_v2 = true;
+                    } else if pq_count > 0 {
+                        return Ok(());
+                    }
+                    // If `pq_count == 0`, server rejected even classical-only `RefillPrekeys`
+                    // (true v1-only server): fall through to v1 `prepare_extend_keys` below.
                 }
-                Err(e) if e.kind() == ErrorKind::NotFound => {
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::Protocol) => {
                     inner.client.rollback_refill_v2_on_refusal(prepared);
                     inner.state.needs_publish = true;
                     inner.save(&[]).await.map_err(|e| describe(&e))?;
@@ -1833,27 +2040,87 @@ impl Engine {
                 }
                 Err(e) => return Err(describe(&e)),
             }
+
+            if try_classical_only_v2 {
+                let prepared = inner
+                    .client
+                    .prepare_refill_v2(&inner.audience, classical_count, 0)
+                    .map_err(|e| describe(&e))?;
+                inner.save(&[]).await.map_err(|e| describe(&e))?;
+                match inner.client.transmit_refill_v2(&prepared).await {
+                    Ok(resp) => {
+                        inner.last_server_classical_opks = Some(resp.classical_one_time_count);
+                        inner.state.used_one_time_prekeys = 0;
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
+                        self.ui.log(
+                            "replenished classical one-time prekeys without rotating signed prekey",
+                        );
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                        inner.client.rollback_refill_v2_on_refusal(prepared);
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
+                        self.publish_waits_sign_in.set(true);
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == ErrorKind::LimitExceeded => {
+                        inner.client.rollback_refill_v2_on_refusal(prepared);
+                        inner.state.used_one_time_prekeys = 0;
+                        inner.last_server_classical_opks = Some(SERVER_MAX_ONE_TIME_PREKEYS as u32);
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
+                        self.ui
+                            .log("server one-time prekey pool is already full; skipped refill");
+                        return Ok(());
+                    }
+                    Err(e) if e.kind() == ErrorKind::Unimplemented => {
+                        inner.client.rollback_refill_v2_on_refusal(prepared);
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
+                        // True v1-only server: fall through to classical `prepare_extend_keys`.
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::Protocol) => {
+                        inner.client.rollback_refill_v2_on_refusal(prepared);
+                        inner.state.needs_publish = true;
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
+                        return Err(describe(&e));
+                    }
+                    Err(e) => return Err(describe(&e)),
+                }
+            }
         }
 
-        if classical_low && !inner.client.pq_config().strict_pq {
+        if classical_count > 0 && !inner.client.pq_config().strict_pq {
             let prepared = inner
                 .client
-                .prepare_extend_keys(ONE_TIME_PREKEYS)
+                .prepare_extend_keys(classical_count)
                 .map_err(|e| describe(&e))?;
             inner.save(&[]).await.map_err(|e| describe(&e))?;
             match inner.client.transmit_publish(&prepared).await {
                 Ok(()) => {
                     inner.client.commit_publish(prepared);
                     inner.state.used_one_time_prekeys = 0;
+                    inner.last_server_classical_opks = Some(classical_count as u32);
                     inner.save(&[]).await.map_err(|e| describe(&e))?;
                     self.ui.log(format!(
-                        "replenished {ONE_TIME_PREKEYS} one-time prekeys without rotating signed prekey"
+                        "replenished {classical_count} one-time prekeys without rotating signed prekey"
                     ));
                 }
                 Err(e) if e.kind() == ErrorKind::SignInRequired => {
                     inner.client.rollback_publish_on_refusal(prepared);
                     inner.save(&[]).await.map_err(|e| describe(&e))?;
                     self.publish_waits_sign_in.set(true);
+                }
+                Err(e) if e.kind() == ErrorKind::LimitExceeded => {
+                    inner.client.rollback_publish_on_refusal(prepared);
+                    inner.state.used_one_time_prekeys = 0;
+                    inner.last_server_classical_opks = Some(SERVER_MAX_ONE_TIME_PREKEYS as u32);
+                    inner.save(&[]).await.map_err(|e| describe(&e))?;
+                    self.ui.log("server one-time prekey pool is already full; skipped refill");
+                }
+                Err(e) if e.kind() == ErrorKind::Protocol => {
+                    inner.client.rollback_publish_on_refusal(prepared);
+                    inner.state.needs_publish = true;
+                    inner.save(&[]).await.map_err(|e| describe(&e))?;
+                    return Err(describe(&e));
                 }
                 Err(e) => return Err(describe(&e)),
             }
@@ -3975,7 +4242,16 @@ impl Engine {
             .iter()
             .filter(|(unsaved, _)| *unsaved != peer)
             .map(|(_, record)| record);
-        if let Err(e) = inner.vault.forget(&state, &peer, unsaved).await {
+        let unsaved_outbox = inner
+            .unsaved_outbox
+            .iter()
+            .filter(|(unsaved, _)| *unsaved != peer)
+            .map(|(_, record)| record);
+        if let Err(e) = inner
+            .vault
+            .forget(&state, &peer, unsaved, unsaved_outbox)
+            .await
+        {
             if let Some(snapshot) = snapshot {
                 inner.roll_back(&peer, snapshot)?;
             }
@@ -4013,6 +4289,7 @@ impl Engine {
                 .map(|(unsaved, _)| unsaved)
                 .filter(|unsaved| *unsaved != peer),
         );
+        inner.unsaved_outbox.clear();
         inner.state.farewells.extend(farewell);
         self.wake();
         if self.ui.open.get_untracked() == Some(peer) {
@@ -4201,8 +4478,9 @@ impl Engine {
             );
             inner.contacts[index].state.clock =
                 inner.contacts[index].state.clock.saturating_add(1);
+            let clock = inner.contacts[index].state.clock;
             let mut greeting = hello.to_bytes();
-            stamp(&mut greeting, inner.contacts[index].state.clock);
+            stamp(&mut greeting, clock);
 
             let prepared = {
                 let audience = &inner.audience;
@@ -4257,9 +4535,17 @@ impl Engine {
                         .to_string(),
                 );
             }
+            let mut history_records = vec![];
+            let mut added_view = None;
             if let Some(contact) = inner.contact(&peer) {
                 contact.clear_quarantine_and_alerts();
                 contact.state.sealed_events = None;
+                if let Some((entry_index, entry)) =
+                    finalize_upgrade_to_pq_request_state(&mut contact.state, hello, clock, now())
+                {
+                    history_records.push((history_key(&peer, entry_index), entry.clone()));
+                    added_view = Some(contact.message(entry_index, entry));
+                }
             }
             // Requeue any outbox messages sealed on the previous session so they re-encrypt
             // on the new PQ session instead of pushing old-session ciphertexts with the PQ initial.
@@ -4270,10 +4556,13 @@ impl Engine {
                     return Err(e);
                 }
             };
-            // H-2: Persist upgraded PQ session + requeued outbox BEFORE transmitting initial!
-            if let Err(e) = inner.save_with(&[], &requeued).await {
+            // H-2: Persist upgraded PQ session + Hello history + requeued outbox BEFORE transmitting!
+            if let Err(e) = inner.save_with(&history_records, &requeued).await {
                 inner.roll_back(&peer, snapshot)?;
                 return Err(describe(&e));
+            }
+            if let Some(view) = added_view {
+                self.show_new(inner, &peer, vec![view]);
             }
             if let Err(e) = inner.client.send_prepared_initiate_v2(&outgoing).await {
                 self.ui.log(format!(
@@ -4427,11 +4716,17 @@ impl Inner {
         outgoing: &[(String, Option<OutgoingRecord>)],
     ) -> crate::vault::Result<()> {
         let unsaved = self.unsaved.iter().map(|(_, record)| record);
+        let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
         self.vault
-            .save(&self.app_state(), unsaved.chain(entries), outgoing)
+            .save(
+                &self.app_state(),
+                unsaved.chain(entries),
+                unsaved_outbox.chain(outgoing),
+            )
             .await?;
         self.saved_late
             .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
+        self.unsaved_outbox.clear();
         Ok(())
     }
 
@@ -4740,7 +5035,7 @@ impl Inner {
     }
 
     /// Requeue any already-sealed outbox items for `peer` so they are re-encrypted onto a newly
-    /// established active session (e.g. after `upgrade_to_pq` or approving a replacement session).
+    /// established active session (e.g. after `upgrade_to_pq` or accepting a replacement session).
     async fn requeue_sealed(
         &mut self,
         peer: &PublicKey,
@@ -4758,13 +5053,10 @@ impl Inner {
         if sealed.is_empty() {
             return Ok(vec![]);
         }
-        for outgoing in &mut contact.state.outbox {
-            if outgoing.sealed {
-                (outgoing.sealed, outgoing.clock) = (false, 0);
-            }
-        }
+        // Read vault contents BEFORE mutating `contact.state.outbox` so a read error leaves
+        // in-memory outbox state untouched.
         let mut outbox_records = Vec::with_capacity(sealed.len());
-        for index in sealed {
+        for &index in &sealed {
             let entry = self
                 .vault
                 .entry(peer, index)
@@ -4784,6 +5076,13 @@ impl Inner {
                 delivery_hash: vec![],
             };
             outbox_records.push((outbox_key(peer, index), Some(record)));
+        }
+        if let Some(contact) = self.contact(peer) {
+            for outgoing in &mut contact.state.outbox {
+                if sealed.contains(&outgoing.history_index) {
+                    (outgoing.sealed, outgoing.clock) = (false, 0);
+                }
+            }
         }
         Ok(outbox_records)
     }
@@ -4811,8 +5110,11 @@ impl Inner {
         {
             Ok(outcome) => outcome,
             Err(e) => {
+                // `accept_initial_v2` only returns `DowngradeDetected` after AEAD sender
+                // authentication; as defense in depth, never poison a healthy active PQ chat.
                 if e.kind() == ErrorKind::DowngradeDetected
                     && let Some(contact) = self.contact(peer)
+                    && !contact.has_healthy_pq_session()
                 {
                     contact.session.peer_pq_state_mut().downgrade_detected = true;
                     contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
@@ -4836,11 +5138,15 @@ impl Inner {
                 security,
             } => {
                 let contact = self.contact(peer).ok_or("no such chat")?;
-                match contact.session.accept_replacement(session) {
-                    Ok(_) => {
+                let took_over = match contact.session.accept_replacement(session) {
+                    Ok(took_over) => {
                         if security.is_pq {
                             contact.clear_quarantine_and_alerts();
                         }
+                        if took_over {
+                            contact.state.sealed_events = None;
+                        }
+                        took_over
                     }
                     Err(e) => {
                         if e.kind() == ErrorKind::DowngradeDetected {
@@ -4850,7 +5156,7 @@ impl Inner {
                         }
                         return Ok((false, false));
                     }
-                }
+                };
                 let content = Content::from_bytes(&first_message);
                 let mut upgrade = false;
                 if let Some(Kind::Hello(ref hello)) = content.kind {
@@ -4864,8 +5170,24 @@ impl Inner {
                 }
                 let (index, entry) = contact.add_received(content, false);
                 let record = (history_key(peer, index), entry);
-                if let Err(e) = self.save(std::slice::from_ref(&record)).await {
+                let requeued = if took_over {
+                    match self.requeue_sealed(peer).await {
+                        Ok(requeued) => requeued,
+                        Err(e) => {
+                            self.unsaved.push((*peer, record));
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    vec![]
+                };
+                if let Err(e) = self
+                    .save_with(std::slice::from_ref(&record), &requeued)
+                    .await
+                {
                     self.unsaved.push((*peer, record));
+                    self.unsaved_outbox
+                        .extend(requeued.into_iter().map(|rec| (*peer, rec)));
                     return Err(describe(&e));
                 }
                 self.saved_late.push(*peer);
@@ -4906,8 +5228,11 @@ impl Inner {
             self.state.used_one_time_prekeys += 1;
         }
         let contact = self.contact(peer).ok_or("no such chat")?;
-        if contact.session.accept_replacement(session).is_err() {
+        let Ok(took_over) = contact.session.accept_replacement(session) else {
             return Ok((false, false));
+        };
+        if took_over {
+            contact.state.sealed_events = None;
         }
         let content = Content::from_bytes(&first);
         if let Some(Kind::Hello(ref hello)) = content.kind {
@@ -4915,9 +5240,25 @@ impl Inner {
         }
         let (index, entry) = contact.add_received(content, false);
         let record = (history_key(peer, index), entry);
-        if let Err(e) = self.save(std::slice::from_ref(&record)).await {
+        let requeued = if took_over {
+            match self.requeue_sealed(peer).await {
+                Ok(requeued) => requeued,
+                Err(e) => {
+                    self.unsaved.push((*peer, record));
+                    return Err(e);
+                }
+            }
+        } else {
+            vec![]
+        };
+        if let Err(e) = self
+            .save_with(std::slice::from_ref(&record), &requeued)
+            .await
+        {
             // Accepted, it cannot be again: it shows once saved.
             self.unsaved.push((*peer, record));
+            self.unsaved_outbox
+                .extend(requeued.into_iter().map(|rec| (*peer, rec)));
             return Err(describe(&e));
         }
         self.saved_late.push(*peer);
@@ -5045,6 +5386,91 @@ fn build_farewell(contact: &Contact, sealed: session::Sealed) -> Farewell {
     }
 }
 
+/// Pure helper: compute classical OPK and per-suite PQOPK refill batch counts bounded against the
+/// server's cumulative 100-key caps so repeated refills never exceed quota.
+///
+/// Returns `(classical_count, pq_per_suite_count)`.
+fn refill_batch_counts(
+    used_classical: u32,
+    used_pq: u32,
+    pq_suites_len: usize,
+    server_classical_known: Option<u32>,
+    server_pq_total_known: Option<u32>,
+) -> (usize, usize) {
+    let classical = if used_classical >= REFILL_USED {
+        let desired = (used_classical as usize).clamp(1, ONE_TIME_PREKEYS);
+        match server_classical_known {
+            Some(known) => {
+                let est_remaining = (known as usize).saturating_sub(used_classical as usize);
+                let headroom = SERVER_MAX_ONE_TIME_PREKEYS.saturating_sub(est_remaining);
+                desired.min(headroom)
+            }
+            None => desired.min(REFILL_USED as usize),
+        }
+    } else {
+        0
+    };
+    let pq_per_suite = if pq_suites_len > 0 && used_pq >= REFILL_USED {
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        let per_suite_target = (used_pq as usize / pq_suites_len).clamp(1, PQ_ONE_TIME_PREKEYS);
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        let per_suite_target = (used_pq as usize / pq_suites_len).max(1);
+        match server_pq_total_known {
+            Some(known) => {
+                let est_remaining = (known as usize).saturating_sub(used_pq as usize);
+                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                let cap = SERVER_MAX_PQ_ONE_TIME_PREKEYS;
+                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                let cap = SERVER_MAX_ONE_TIME_PREKEYS;
+                let headroom = cap.saturating_sub(est_remaining);
+                per_suite_target.min(headroom / pq_suites_len)
+            }
+            None => {
+                let cap_per_suite = (REFILL_USED as usize / pq_suites_len).max(1);
+                per_suite_target.min(cap_per_suite)
+            }
+        }
+    } else {
+        0
+    };
+    (classical, pq_per_suite)
+}
+
+/// Pure helper: unlock an inbound request after `upgrade_to_pq` succeeds, and record the outgoing
+/// `Hello` greeting in history if `history_len == 0` so the composer unlocks cleanly on a
+/// non-empty chat.
+#[cfg_attr(
+    not(any(feature = "ml-kem-1024", feature = "ml-kem-768", test)),
+    allow(dead_code)
+)]
+fn finalize_upgrade_to_pq_request_state(
+    state: &mut ContactState,
+    hello: Kind,
+    clock: u64,
+    at: u64,
+) -> Option<(u64, HistoryEntry)> {
+    state.request = false;
+    if state.history_len == 0 {
+        let entry = HistoryEntry {
+            outgoing: true,
+            at,
+            content: Some(Content {
+                clock,
+                kind: Some(hello),
+                events: None,
+            }),
+            delivery: Delivery::Sent.into(),
+            place: clock,
+            ..HistoryEntry::default()
+        };
+        state.history_len = 1;
+        state.last_activity = at;
+        Some((0, entry))
+    } else {
+        None
+    }
+}
+
 /// Pure quarantine helper: whether a contact's primary session itself is unapproved/quarantined.
 fn contact_state_is_new_quarantined(state: &ContactState) -> bool {
     state.quarantined && state.quarantined_primary
@@ -5088,6 +5514,12 @@ fn accept_contact_request_state(state: &mut ContactState, name: &str) -> Result<
 }
 
 impl Contact {
+    /// Whether this contact already has a healthy active post-quantum session.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    fn has_healthy_pq_session(&self) -> bool {
+        !self.session.needs_new_session() && self.session.security().is_some_and(|s| s.is_pq)
+    }
+
     /// Whether this contact is a brand-new inbound quarantined classical chat (not yet approved).
     fn is_new_quarantined(&self) -> bool {
         contact_state_is_new_quarantined(&self.state)
@@ -5732,5 +6164,84 @@ mod tests {
         let decoded = PushV2Request::decode(farewell.push_v2.as_slice()).expect("decode push_v2");
         assert_eq!(decoded.initial_message, Some(pq_initial));
         assert_eq!(decoded.client_message_id.as_ref(), &[0xAB; 16]);
+    }
+
+    #[test]
+    fn refill_batch_counts_stays_under_server_caps_across_many_rounds() {
+        // Simulate 100 consecutive refills with 2 PQ suites starting from initial publish (20
+        // classical + 40 PQOPKs). Cumulative server counts MUST NEVER exceed 100!
+        let mut server_classical: u32 = ONE_TIME_PREKEYS as u32;
+        let mut server_pq: u32 = (ONE_TIME_PREKEYS * 2) as u32;
+        for _ in 0..100 {
+            server_classical = server_classical.saturating_sub(REFILL_USED);
+            server_pq = server_pq.saturating_sub(REFILL_USED);
+            let (add_c, add_pq_per_suite) = refill_batch_counts(
+                REFILL_USED,
+                REFILL_USED,
+                2,
+                Some(server_classical + REFILL_USED),
+                Some(server_pq + REFILL_USED),
+            );
+            assert!(add_c > 0);
+            assert!(add_pq_per_suite > 0);
+            server_classical += add_c as u32;
+            server_pq += (add_pq_per_suite * 2) as u32;
+            assert!(
+                server_classical as usize <= SERVER_MAX_ONE_TIME_PREKEYS,
+                "classical exceeded cap: {server_classical}"
+            );
+            assert!(
+                server_pq as usize <= 100,
+                "pq exceeded cap: {server_pq}"
+            );
+        }
+
+        // Unknown server counts (e.g. right after reload) still keep net additions <= 0.
+        let (add_c, add_pq_2) = refill_batch_counts(REFILL_USED, REFILL_USED, 2, None, None);
+        assert_eq!(add_c, REFILL_USED as usize);
+        assert_eq!(add_pq_2 * 2, REFILL_USED as usize);
+        let (_, add_pq_1) = refill_batch_counts(0, REFILL_USED, 1, None, None);
+        assert_eq!(add_pq_1, REFILL_USED as usize);
+
+        // When server is already at cap (e.g. 100 remaining after burst or over-provisioned),
+        // headroom clamps additions so we never exceed 100.
+        let (add_c, add_pq) = refill_batch_counts(REFILL_USED, REFILL_USED, 2, Some(100), Some(100));
+        assert_eq!(add_c, 10);
+        assert_eq!(add_pq, 5);
+        let (add_c_full, add_pq_full) =
+            refill_batch_counts(REFILL_USED, REFILL_USED, 2, Some(115), Some(115));
+        assert_eq!(add_c_full, 0);
+        assert_eq!(add_pq_full, 0);
+    }
+
+    #[test]
+    fn upgrade_to_pq_unlocks_inbound_request_and_records_hello_when_history_empty() {
+        let mut state = ContactState {
+            peer: vec![0x77; 32],
+            request: true,
+            history_len: 0,
+            ..ContactState::default()
+        };
+        let hello = Kind::Hello(Hello {
+            name: "Alice".to_string(),
+            pq_capable: true,
+            ..Hello::default()
+        });
+        let added = finalize_upgrade_to_pq_request_state(&mut state, hello.clone(), 1, 9999);
+        assert!(!state.request, "upgrade_to_pq must clear request flag");
+        assert_eq!(state.history_len, 1);
+        assert_eq!(state.last_activity, 9999);
+        let (idx, entry) = added.expect("must record outgoing Hello when history was empty");
+        assert_eq!(idx, 0);
+        assert!(entry.outgoing);
+        assert_eq!(entry.place, 1);
+        assert_eq!(entry.delivery(), Delivery::Sent);
+
+        // When history is already non-empty, `request` is still cleared without duplicating Hello.
+        state.request = true;
+        let second = finalize_upgrade_to_pq_request_state(&mut state, hello, 2, 10000);
+        assert!(!state.request);
+        assert!(second.is_none());
+        assert_eq!(state.history_len, 1);
     }
 }

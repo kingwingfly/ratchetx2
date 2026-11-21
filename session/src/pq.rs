@@ -234,44 +234,95 @@ pub fn check_peer_hello(
     }
 }
 
-/// Derive the canonical expected server audience (`host` or `host:port`, lowercased, with default
-/// HTTP/HTTPS ports stripped) from a locally configured server URL or hostname.
+/// Derive the canonical expected server audience (`host` or `host:port`, lowercased, with IPv6
+/// addresses normalized and default HTTP/HTTPS ports stripped) from a locally configured server
+/// URL or hostname.
+///
+/// Matches `protocol::handshake_v2::normalize_audience` exactly:
+/// - trims surrounding whitespace
+/// - strips an optional `http://`, `https://`, `ws://`, or `wss://` scheme case-insensitively
+/// - strips any trailing path, query, or fragment
+/// - lowercases hostnames and canonicalizes bracketed IPv6 literals via [`std::net::Ipv6Addr`]
+/// - parses numeric ports (stripping leading zeros and empty trailing `:`)
+/// - drops default ports (`:443` for `https`/`wss`, `:80` for `http`/`ws`, and both `:80` and
+///   `:443` when no scheme was specified)
 ///
 /// Clients MUST derive their expected audience from the locally configured server origin/host
 /// rather than trusting `GetServerInfo.server_id`.
 pub fn expected_audience_from_url(url_or_host: &str) -> Result<String> {
     let trimmed = url_or_host.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
         return Err(ErrorKind::Protocol.into());
     }
-    let (scheme, rest) = if let Some(rest) = trimmed.strip_prefix("https://") {
-        (Some("https"), rest)
-    } else if let Some(rest) = trimmed.strip_prefix("http://") {
-        (Some("http"), rest)
-    } else if let Some(rest) = trimmed.strip_prefix("wss://") {
-        (Some("https"), rest)
-    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
-        (Some("http"), rest)
-    } else if trimmed.contains("://") {
-        return Err(ErrorKind::Protocol.into());
+    let (explicit_scheme, rest) = if let Some((scheme, after)) = trimmed.split_once("://") {
+        match scheme.to_ascii_lowercase().as_str() {
+            "https" | "wss" => (Some("https"), after),
+            "http" | "ws" => (Some("http"), after),
+            _ => return Err(ErrorKind::Protocol.into()),
+        }
     } else {
         (None, trimmed)
     };
+
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') || authority.chars().any(char::is_whitespace)
-    {
+    if authority.is_empty() || authority.contains('@') {
         return Err(ErrorKind::Protocol.into());
     }
-    let lower = authority.to_ascii_lowercase();
-    let normalized = match scheme {
-        Some("https") => lower.strip_suffix(":443").unwrap_or(&lower),
-        Some("http") => lower.strip_suffix(":80").unwrap_or(&lower),
-        _ => &lower,
+
+    let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix('[') {
+        let Some((ipv6_raw, tail)) = after_bracket.split_once(']') else {
+            return Err(ErrorKind::Protocol.into());
+        };
+        let ipv6: std::net::Ipv6Addr = ipv6_raw.parse().map_err(|_| ErrorKind::Protocol)?;
+        let port_str = if tail.is_empty() {
+            None
+        } else if let Some(p) = tail.strip_prefix(':') {
+            Some(p)
+        } else {
+            return Err(ErrorKind::Protocol.into());
+        };
+        (format!("[{ipv6}]"), port_str)
+    } else {
+        if authority.contains('[') || authority.contains(']') {
+            return Err(ErrorKind::Protocol.into());
+        }
+        let (host_raw, port_str) = match authority.split_once(':') {
+            Some((h, p)) => {
+                if p.contains(':') {
+                    return Err(ErrorKind::Protocol.into());
+                }
+                (h, Some(p))
+            }
+            None => (authority, None),
+        };
+        if host_raw.is_empty() || host_raw.bytes().any(|b| b.is_ascii_control()) {
+            return Err(ErrorKind::Protocol.into());
+        }
+        (host_raw.to_ascii_lowercase(), port_str)
     };
-    if normalized.is_empty() {
-        return Err(ErrorKind::Protocol.into());
-    }
-    Ok(normalized.to_string())
+
+    let port = match port_str {
+        None | Some("") => None,
+        Some(p) => {
+            if !p.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let parsed: u16 = p.parse().map_err(|_| ErrorKind::Protocol)?;
+            Some(parsed)
+        }
+    };
+
+    let port = match (explicit_scheme, port) {
+        (Some("https"), Some(443)) => None,
+        (Some("http"), Some(80)) => None,
+        (None, Some(80 | 443)) => None,
+        (_, other) => other,
+    };
+
+    Ok(match port {
+        Some(p) => format!("{host}:{p}"),
+        None => host,
+    })
 }
 
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -319,11 +370,24 @@ mod v2 {
     /// Maximum inbox message IDs acknowledged in one `AckInitialMessages` call.
     const MAX_ACK_BATCH: usize = 100;
 
+    /// Which transport path succeeded in [`Client::transmit_publish_v2_or_v1_fallback`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PublishV2Outcome {
+        /// Published post-quantum + classical prekeys and a PQ-enabled signed manifest via `PublishV2`.
+        V2Pq,
+        /// Published classical prekeys and a signed PQ-off manifest via `PublishV2` (either
+        /// because local PQ is disabled or because the server rejected PQ-ON with `Unimplemented`
+        /// under `PQ_ENABLED="false"`).
+        V2ClassicalOff,
+        /// Fell back to legacy v1 `Handshake::publish` (server does not implement `PublishV2`).
+        V1Fallback,
+    }
+
     /// A prepared v2 prekey + [`CapabilityManifest`] publish request.
     ///
     /// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish_v2`] (or
     /// [`Client::transmit_publish_v2_or_v1_fallback`]), then call [`Client::commit_publish_v2`]
-    /// on success or [`Client::rollback_publish_v2_on_refusal`] on `SignInRequired`.
+    /// on success or [`Client::rollback_publish_v2_on_refusal`] on definitive refusal.
     #[derive(Debug, Clone)]
     pub struct PreparedPublishV2 {
         /// The signed v2 publish request to transmit.
@@ -332,6 +396,8 @@ mod v2 {
         pub manifest_seq: u64,
         /// Prekey generation number assigned to this publish.
         pub generation: u64,
+        pub(crate) prev_manifest_seq: u64,
+        pub(crate) manifest_digest: [u8; 32],
         pub(crate) classical: PublishedPrekeys,
         pub(crate) extended: bool,
         pub(crate) pq_one_time_prekeys: Vec<PqPrekeyId>,
@@ -588,15 +654,13 @@ mod v2 {
             }
 
             let timestamp = self.next_timestamp()?;
-            let manifest_seq = self
-                .state
-                .manifest_seq
+            let prev_manifest_seq = self.state.manifest_seq;
+            let manifest_seq = prev_manifest_seq
                 .checked_add(1)
                 .filter(|&s| s <= protocol::MAX_SAFE_INTEGER)
                 .ok_or(ErrorKind::Protocol)?;
 
             let extended = self.state.publishing;
-            let mut preserved_existing_gen = extended;
             let (classical, pq_last_resort_wire, pq_one_time_wire, pq_opk_ids, generation) =
                 if pq_enabled {
                     let first_suite = offered[0];
@@ -645,11 +709,10 @@ mod v2 {
                     }
                     (first.classical, lr_wire, opk_wire, pq_opk_ids, generation)
                 } else {
-                    // PQ toggled OFF: preserve existing local generation (so in-flight PQ
-                    // handshakes still decrypt!) unless no generation exists yet.
-                    let had_gen = self.state.prekeys.generation_count() > 0;
-                    preserved_existing_gen |= had_gen;
-                    let classical = if had_gen {
+                    // PQ toggled OFF: rotate SPK cleanly on non-retry publishes (`KEPT_GENERATIONS
+                    // = 2` retains the prior PQ generation so in-flight PQ handshakes still
+                    // decrypt while avoiding dead OPK accumulation across repeated publishes).
+                    let classical = if extended {
                         self.state
                             .prekeys
                             .extend(&self.state.identity, one_time_count)
@@ -658,7 +721,7 @@ mod v2 {
                             .prekeys
                             .generate(&self.state.identity, one_time_count)
                     };
-                    let generation = if had_gen {
+                    let generation = if extended {
                         self.state.prekey_generation.max(1)
                     } else {
                         self.state
@@ -728,8 +791,10 @@ mod v2 {
                 request,
                 manifest_seq,
                 generation,
+                prev_manifest_seq,
+                manifest_digest: own_digest,
                 classical,
-                extended: preserved_existing_gen,
+                extended,
                 pq_one_time_prekeys: pq_opk_ids,
             })
         }
@@ -739,14 +804,19 @@ mod v2 {
             self.state.publishing = false;
         }
 
-        /// Retract newly added OPKs/PQOPKs from a prepared v2 publish that was definitively
-        /// refused before storage (e.g. `ErrorKind::SignInRequired`).
+        /// Retract newly added OPKs/PQOPKs and restore manifest sequence from a prepared v2
+        /// publish that was definitively refused before storage (e.g. `ErrorKind::SignInRequired`,
+        /// `ErrorKind::PqRequired`, or `ErrorKind::LimitExceeded`).
         pub fn rollback_publish_v2_on_refusal(&mut self, prepared: PreparedPublishV2) {
             if prepared.extended {
                 self.state.prekeys.retract_pq(
                     &prepared.classical.one_time_prekeys,
                     &prepared.pq_one_time_prekeys,
                 );
+            }
+            self.state.manifest_seq = prepared.prev_manifest_seq;
+            if self.state.recent_manifest_digests.last() == Some(&prepared.manifest_digest) {
+                self.state.recent_manifest_digests.pop();
             }
         }
 
@@ -840,18 +910,23 @@ mod v2 {
         /// (both `Ok` and `Err` outcomes) after persisting state so unaccepted/malformed entries
         /// cannot permanently fill the inbox.
         ///
-        /// - **PQXDH (version 2)**: verifies any supplied `manifest_digest` belongs to this
-        ///   client's recent signed manifests (when recorded), runs `accept_pq`, decrypts
-        ///   `first_message` (supporting both PQ-ratchet and classical-ratchet PQXDH sessions
-        ///   symmetrically), confirms prekey consumption, pins `peer_pq.pq_pinned = true`, and
-        ///   returns [`AcceptedInitial::Accepted`]. Works even after local PQ was toggled OFF so
-        ///   in-flight PQ handshakes still decrypt cleanly.
+        /// - **PQXDH (version 2)**: authenticates the sender first via `accept_pq` + `first_message`
+        ///   AEAD decryption (supporting both PQ-ratchet and classical-ratchet PQXDH sessions
+        ///   symmetrically, returning [`ErrorKind::InvalidInitialMessage`] on any unauthenticated
+        ///   forgery). Only after sender authentication succeeds does it check `manifest_digest`
+        ///   against this client's recent signed manifests (rejecting unrecognized digests, or
+        ///   missing digests when `strict_pq` is enabled, with [`ErrorKind::DowngradeDetected`]
+        ///   without confirming prekey consumption), then confirms prekey consumption, pins
+        ///   `peer_pq.pq_pinned = true`, and returns [`AcceptedInitial::Accepted`]. Works even
+        ///   after local PQ was toggled OFF so in-flight PQ handshakes still decrypt cleanly.
         /// - **Classical (version 1)**:
-        ///   - If local `strict_pq` is `true`: rejects with [`ErrorKind::PqRequired`] without
-        ///     consuming any prekeys.
-        ///   - Authenticates via classical X3DH + `first_message` decryption (rejecting forgeries
-        ///     with [`ErrorKind::InvalidInitialMessage`] without consuming prekeys).
-        ///   - If local `pq_enabled && (peer_state.pq_pinned || !peer_state.allow_classical_exception)`:
+        ///   - Authenticates via classical X3DH + `first_message` decryption first (rejecting
+        ///     unauthenticated forgeries with [`ErrorKind::InvalidInitialMessage`] without
+        ///     consuming prekeys).
+        ///   - If local `strict_pq` is `true`: rejects the authenticated classical initial with
+        ///     [`ErrorKind::PqRequired`] without calling `confirm()` (consuming no prekeys).
+        ///   - Otherwise confirms prekey consumption; if local
+        ///     `pq_enabled && (peer_state.pq_pinned || !peer_state.allow_classical_exception)`,
         ///     returns [`AcceptedInitial::Quarantined`] so the caller can prompt the user before
         ///     displaying `first_message`, merging the session, or replying.
         ///   - Otherwise returns [`AcceptedInitial::Accepted`] with [`SessionSecurity::classical`].
@@ -878,12 +953,6 @@ mod v2 {
                 } => {
                     if !pq_init.pq_suite.is_supported() {
                         return Err(ErrorKind::UnsupportedSuite.into());
-                    }
-                    if let Some(d) = digest
-                        && !self.state.recent_manifest_digests.is_empty()
-                        && !self.state.recent_manifest_digests.contains(d)
-                    {
-                        return Err(ErrorKind::DowngradeDetected.into());
                     }
                     let (agreement, signed_prekey) = self.state.prekeys.accept_pq(
                         &self.state.identity,
@@ -923,6 +992,20 @@ mod v2 {
                             }
                         }
                     };
+                    // Sender is now cryptographically authenticated via PQXDH + AEAD. Enforce
+                    // manifest-digest binding BEFORE confirming prekey consumption so unauthenticated
+                    // forgeries never surface sender-attributed `DowngradeDetected`.
+                    if !self.state.recent_manifest_digests.is_empty() {
+                        match digest {
+                            Some(d) if !self.state.recent_manifest_digests.contains(d) => {
+                                return Err(ErrorKind::DowngradeDetected.into());
+                            }
+                            None if strict_pq => {
+                                return Err(ErrorKind::DowngradeDetected.into());
+                            }
+                            _ => {}
+                        }
+                    }
                     self.state.prekeys.confirm_pq(pq_init)?;
                     let security = SessionSecurity::pq(agreement.suite, pq_ratchet);
                     let mut updated_peer_pq = peer_state.clone();
@@ -952,9 +1035,6 @@ mod v2 {
                     })
                 }
                 InitialMessageKind::Classical(classical) => {
-                    if strict_pq {
-                        return Err(ErrorKind::PqRequired.into());
-                    }
                     let (agreement, signed_prekey) = self.state.prekeys.accept(
                         &self.state.identity,
                         peer,
@@ -968,6 +1048,13 @@ mod v2 {
                     let content = party
                         .decrypt(&classical.first_message)
                         .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
+                    // Sender is now cryptographically authenticated via X3DH + AEAD. Enforce
+                    // strict-PQ policy BEFORE calling `confirm()` so unauthenticated forgeries
+                    // always return `InvalidInitialMessage` and strict-PQ rejections consume no
+                    // prekeys.
+                    if strict_pq {
+                        return Err(ErrorKind::PqRequired.into());
+                    }
                     self.state.prekeys.confirm(&classical.x3dh)?;
 
                     let security = SessionSecurity::classical();
@@ -1106,7 +1193,16 @@ mod v2 {
             let prepared = self.prepare_refill_v2(audience, one_time_count, pq_one_time_count)?;
             match self.transmit_refill_v2(&prepared).await {
                 Ok(response) => Ok(response),
-                Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::SignInRequired
+                            | ErrorKind::LimitExceeded
+                            | ErrorKind::Unimplemented
+                            | ErrorKind::NotFound
+                            | ErrorKind::Protocol
+                    ) =>
+                {
                     self.rollback_refill_v2_on_refusal(prepared);
                     Err(e)
                 }
@@ -1150,32 +1246,105 @@ mod v2 {
     }
 
     impl<H: LocalHandshake + LocalHandshakeV2> Client<H> {
-        /// Transmit a prepared v2 publish request, falling back to v1 `Handshake::publish` using
-        /// the exact same classical prekeys ONLY when the server returns `Unimplemented` and
-        /// `strict_pq` is `false`.
+        /// Transmit a prepared v2 publish request, falling back gracefully ONLY when the server
+        /// returns `Unimplemented` and `strict_pq` is `false`:
+        ///
+        /// 1. If `prepared` carried a PQ-enabled manifest and the server returned `Unimplemented`
+        ///    (e.g. a v2 server rolled back to `PQ_ENABLED="false"`), first publishes a signed
+        ///    `PQ-OFF` manifest via `PublishV2` using the exact same classical prekeys so existing
+        ///    v2 users are not locked out of `Identity::publish`.
+        /// 2. If `PublishV2` still returns `Unimplemented` (true legacy v1-only server), falls
+        ///    back to v1 `Handshake::publish` using the exact same classical prekeys.
         pub async fn transmit_publish_v2_or_v1_fallback(
             &mut self,
             prepared: &PreparedPublishV2,
-        ) -> Result<()> {
+        ) -> Result<PublishV2Outcome> {
+            let prepared_pq = prepared
+                .request
+                .manifest
+                .as_ref()
+                .is_some_and(|m| m.pq_enabled);
             match self.handshake.publish_v2(prepared.request.clone()).await {
-                Ok(_) => Ok(()),
+                Ok(_) => Ok(if prepared_pq {
+                    PublishV2Outcome::V2Pq
+                } else {
+                    PublishV2Outcome::V2ClassicalOff
+                }),
                 Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
                     if self.state.pq_config.strict_pq {
                         return Err(ErrorKind::PqRequired.into());
+                    }
+                    if prepared_pq
+                        && let Some(orig_manifest) = prepared.request.manifest.as_ref()
+                    {
+                        let timestamp = self.next_timestamp()?;
+                        let expires_at = timestamp
+                            .checked_add(DEFAULT_MANIFEST_TTL_MS)
+                            .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
+                            .ok_or(ErrorKind::Protocol)?;
+                        let mut off_manifest = CapabilityManifest {
+                            audience: orig_manifest.audience.clone(),
+                            identity_key: Bytes::new(),
+                            manifest_seq: prepared.manifest_seq,
+                            generation: prepared.generation,
+                            issued_at: timestamp,
+                            expires_at,
+                            pq_enabled: false,
+                            strict_pq: false,
+                            pq_ratchet_supported: false,
+                            offered_suites: vec![],
+                            signed_prekey: Bytes::copy_from_slice(
+                                &prepared.classical.signed_prekey,
+                            ),
+                            pq_last_resort: vec![],
+                            signature: Bytes::new(),
+                        };
+                        sign_manifest(&self.state.identity, &mut off_manifest)?;
+                        let off_req = PublishV2Request::sign(
+                            &self.state.identity,
+                            off_manifest,
+                            Some(prepared.classical.signed_prekey_signature),
+                            &prepared.classical.one_time_prekeys,
+                            vec![],
+                            vec![],
+                            timestamp,
+                        )?;
+                        match self.handshake.publish_v2(off_req).await {
+                            Ok(_) => {
+                                // PQOPKs were never uploaded under PQ_ENABLED=false; retract them
+                                // locally so unused ML-KEM keys do not accumulate.
+                                self.state
+                                    .prekeys
+                                    .retract_pq(&[], &prepared.pq_one_time_prekeys);
+                                return Ok(PublishV2Outcome::V2ClassicalOff);
+                            }
+                            Err(e2) if e2.kind() == protocol::ErrorKind::Unimplemented => {
+                                // True v1-only server; fall through to v1 Handshake::publish.
+                            }
+                            Err(e2) => return Err(e2.into()),
+                        }
                     }
                     let timestamp = self.next_timestamp()?;
                     let v1_req =
                         PublishRequest::sign(&self.state.identity, &prepared.classical, timestamp)?;
                     self.handshake.publish(v1_req).await?;
-                    Ok(())
+                    self.state
+                        .prekeys
+                        .retract_pq(&[], &prepared.pq_one_time_prekeys);
+                    self.state.manifest_seq = prepared.prev_manifest_seq;
+                    if self.state.recent_manifest_digests.last() == Some(&prepared.manifest_digest)
+                    {
+                        self.state.recent_manifest_digests.pop();
+                    }
+                    Ok(PublishV2Outcome::V1Fallback)
                 }
                 Err(e) => Err(e.into()),
             }
         }
 
         /// Generate and publish prekeys + signed [`CapabilityManifest`] via `HandshakeV2`, with
-        /// graceful fallback to v1 `Handshake::publish` ONLY when the server returns
-        /// `Unimplemented` and `strict_pq` is `false`.
+        /// graceful fallback to signed OFF `PublishV2` or v1 `Handshake::publish` ONLY when the
+        /// server returns `Unimplemented` and `strict_pq` is `false`.
         ///
         /// For persist-before-transmit flows, use [`Client::prepare_publish_v2`], persist
         /// [`Client::state`], then call [`Client::transmit_publish_v2_or_v1_fallback`] and
@@ -1189,11 +1358,18 @@ mod v2 {
             let prepared =
                 self.prepare_publish_v2(audience, one_time_count, pq_one_time_count)?;
             match self.transmit_publish_v2_or_v1_fallback(&prepared).await {
-                Ok(()) => {
+                Ok(_) => {
                     self.commit_publish_v2(prepared);
                     Ok(())
                 }
-                Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::SignInRequired
+                            | ErrorKind::PqRequired
+                            | ErrorKind::LimitExceeded
+                    ) =>
+                {
                     self.rollback_publish_v2_on_refusal(prepared);
                     Err(e)
                 }
@@ -2005,13 +2181,6 @@ mod v2 {
                     continue;
                 };
                 let decrypted = self.decrypt(message);
-                let mut initial_messages = mem::take(carried);
-                if let Some(im) = attached(&envelope)
-                    && initial_messages.len() < MAX_CARRIED_INITIALS
-                    && !initial_messages.contains(&im)
-                {
-                    initial_messages.push(im);
-                }
                 let stalls = decrypted.as_ref().is_err_and(|e| {
                     !matches!(
                         e.kind(),
@@ -2020,6 +2189,13 @@ mod v2 {
                 }) && envelope.sequence > self.state.skip_through;
                 if stalls {
                     self.state.stalled_through = last;
+                    let mut initial_messages = mem::take(carried);
+                    if let Some(im) = attached(&envelope)
+                        && initial_messages.len() < MAX_CARRIED_INITIALS
+                        && !initial_messages.contains(&im)
+                    {
+                        initial_messages.push(im);
+                    }
                     for im in envelopes.by_ref().filter_map(|env| attached(&env)) {
                         if initial_messages.len() >= MAX_CARRIED_INITIALS {
                             break;
@@ -2035,6 +2211,10 @@ mod v2 {
                     });
                     return Ok(Some(received));
                 }
+                // Keep expired-envelope carried initials in `carried` so they always flush at
+                // page end via the trailing `Err(ErrorKind::Expired)` entry instead of being
+                // attached to `Ok`/`DuplicateMessage`/`EvictedMessage` entries.
+                let initial_messages = attached(&envelope).into_iter().collect();
                 self.state.cursor = self.state.cursor.max(envelope.sequence);
                 let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
                 if let Ok((_, _, token)) = &decrypted {

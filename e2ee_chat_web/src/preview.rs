@@ -223,7 +223,6 @@ pub struct Table {
 
 impl Table {
     /// Human-readable truncation notice, if any limit was reached.
-    #[allow(dead_code)] // Exposed for table preview UI wiring.
     pub fn notice(&self) -> Option<String> {
         if !self.more {
             return None;
@@ -535,11 +534,9 @@ pub fn markdown(source: &str) -> String {
 
 /// A link to the web, to mail, or within the document; any other goes nowhere.
 fn safe_link(url: CowStr<'_>) -> CowStr<'_> {
-    if is_safe_href(&url) {
-        url.trim().to_string().into()
-    } else {
-        "#".into()
-    }
+    normalize_safe_href(&url)
+        .map(CowStr::from)
+        .unwrap_or_else(|| "#".into())
 }
 
 /// An image from a `data:image/` URL; any other shows none, rather than reach out.
@@ -551,17 +548,25 @@ fn safe_image(url: CowStr<'_>) -> CowStr<'_> {
     }
 }
 
-/// Whether `url` is an allowed link destination (`http:`, `https:`, `mailto:`, or `#` fragment)
-/// with no ASCII control characters.
-fn is_safe_href(url: &str) -> bool {
+/// Validate an allowed link destination (`http://`, `https://`, `mailto:`, or `#` fragment) with
+/// no ASCII control characters, returning the trimmed URL with any scheme prefix normalized to
+/// lowercase (preserving case-sensitive path/query/fragment components).
+fn normalize_safe_href(url: &str) -> Option<String> {
     let trimmed = url.trim_matches(|c: char| c.is_ascii_whitespace());
     if trimmed.is_empty() || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return false;
+        return None;
     }
-    let lower = trimmed.to_ascii_lowercase();
-    ["http://", "https://", "mailto:", "#"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    if trimmed.starts_with('#') {
+        return Some(trimmed.to_string());
+    }
+    for scheme in ["http://", "https://", "mailto:"] {
+        if let Some(prefix) = trimmed.get(..scheme.len())
+            && prefix.eq_ignore_ascii_case(scheme)
+        {
+            return Some(format!("{scheme}{}", &trimmed[scheme.len()..]));
+        }
+    }
+    None
 }
 
 /// Whether `url` is an allowed inline image `data:image/` URL with no ASCII control characters.
@@ -2355,18 +2360,17 @@ fn emit_sanitized_attrs(out: &mut String, tag: &'static str, attrs: &[(String, S
         let decoded = decode_entities(raw_value, true);
         let validated: Option<String> = match (tag, name.as_str()) {
             ("a", "href") => {
-                if is_safe_href(&decoded) {
-                    let trimmed = decoded.trim_matches(|c: char| c.is_ascii_whitespace());
-                    if let Some(fragment) = trimmed.strip_prefix('#') {
+                if let Some(normalized) = normalize_safe_href(&decoded) {
+                    if let Some(fragment) = normalized.strip_prefix('#') {
                         if fragment.is_empty() {
                             Some("#".to_string())
                         } else if fragment.starts_with("fn-") {
-                            Some(trimmed.to_string())
+                            Some(normalized)
                         } else {
                             Some(format!("#fn-{fragment}"))
                         }
                     } else {
-                        Some(trimmed.to_string())
+                        Some(normalized)
                     }
                 } else {
                     Some("#".to_string())
@@ -3441,5 +3445,26 @@ mod test {
         assert!(long_html.contains(&format!(r#"id="fn-{long_id}""#)));
         assert!(long_html.contains(&format!(r##"href="#fn-{long_id}""##)));
         assert_eq!(sanitize_html(&long_html), long_html);
+    }
+
+    #[test]
+    fn markdown_links_normalize_uppercase_schemes_preserving_path_case() {
+        let html = markdown(
+            "[secure](HTTPS://Example.COM/CasePath?Token=AbC) \
+             [plain](HTTP://example.com/Path) \
+             [mail](MAILTO:User@Example.COM) \
+             [bad](JAVASCRIPT:alert(1))",
+        );
+        assert!(
+            html.contains(r#"href="https://Example.COM/CasePath?Token=AbC""#),
+            "{html}"
+        );
+        assert!(html.contains(r#"href="http://example.com/Path""#), "{html}");
+        assert!(html.contains(r#"href="mailto:User@Example.COM""#), "{html}");
+        assert!(!html.to_ascii_lowercase().contains("javascript:"), "{html}");
+
+        // Direct HTML sanitization also lowercases uppercase schemes.
+        let sanitized = sanitize_html(r#"<a href="HTTPS://example.com/KeepCase">x</a>"#);
+        assert_eq!(sanitized, r#"<a href="https://example.com/KeepCase">x</a>"#);
     }
 }
