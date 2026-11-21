@@ -19,7 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     content,
     engine::{
-        Engine, MAX_FILE_SIZE, MEDIA_INLINE_MAX, NAME_MAX, Sending, StartChatError,
+        Engine, MAX_FILE_SIZE, MEDIA_INLINE_MAX, NAME_MAX, PqSaveOutcome, Sending, StartChatError,
         build_invitation_link, invitation, origin, same_server,
     },
     glue::copy,
@@ -29,7 +29,8 @@ use crate::{
     state::{
         Attachment, Body, ClassicalPrompt, ContactView, Delivery, Dialog, FileView, Link,
         LocalFile, Me, MessageView, PendingNewChat, Phase, RemoteFile, SecurityAlert,
-        ServerPqStatus, SignIn, SignInSuccessAction, Streamed, Ui, UploadState, UploadView,
+        ServerPqStatus, SignIn, SignInSuccessAction, Streamed, Ui, UnavailableReason, UploadState,
+        UploadView,
     },
     util::{clock, day, js_error, key_to_text, month, short, size, size_u64, sleep},
     workers,
@@ -96,8 +97,17 @@ pub fn App() -> impl IntoView {
                         <div class="locked-screen">
                             {move || match ui.phase.get() {
                                 Phase::Loading => "Loading…",
+                                Phase::Create => "Create a vault to get started.",
                                 Phase::Elsewhere => "The vault is open in another tab.",
-                                Phase::Unavailable(_) => "The browser's storage is not available.",
+                                Phase::Unavailable(UnavailableReason::InsecureContext, _) => {
+                                    "A secure context (HTTPS or localhost) is required."
+                                }
+                                Phase::Unavailable(UnavailableReason::LocksUnavailable, _) => {
+                                    "The Web Locks API is not available in this browser."
+                                }
+                                Phase::Unavailable(UnavailableReason::StorageUnavailable, _) => {
+                                    "The browser's storage is not available."
+                                }
                                 _ => "The vault is locked.",
                             }}
                         </div>
@@ -130,7 +140,13 @@ fn TopBar() -> impl IntoView {
         Phase::Create => "no vault yet".to_string(),
         Phase::Locked => "locked".to_string(),
         Phase::Elsewhere => "open in another tab".to_string(),
-        Phase::Unavailable(_) => "storage unavailable".to_string(),
+        Phase::Unavailable(UnavailableReason::InsecureContext, _) => "HTTPS required".to_string(),
+        Phase::Unavailable(UnavailableReason::LocksUnavailable, _) => {
+            "Web Locks unavailable".to_string()
+        }
+        Phase::Unavailable(UnavailableReason::StorageUnavailable, _) => {
+            "storage unavailable".to_string()
+        }
         Phase::Unlocked if ui.syncing.get() => "syncing…".to_string(),
         Phase::Unlocked => match ui.link.get() {
             Link::Connecting => "connecting".to_string(),
@@ -203,14 +219,24 @@ fn Sidebar() -> impl IntoView {
         <aside class="sidebar">
             <div class="sidebar-head">
                 <h2>"Chats"</h2>
-                <button
-                    class="btn icon small"
-                    title="New chat"
-                    aria-label="New chat"
-                    on:click=move |_| new_chat()
-                >
-                    {icon(Icon::Compose)}
-                </button>
+                <div class="sidebar-actions">
+                    <button
+                        class="btn icon small quiet mobile-activity"
+                        title="Activity log"
+                        aria-label="Activity log"
+                        on:click=move |_| ui.dialog.set(Some(Dialog::Activity))
+                    >
+                        {icon(Icon::Activity)}
+                    </button>
+                    <button
+                        class="btn icon small"
+                        title="New chat"
+                        aria-label="New chat"
+                        on:click=move |_| new_chat()
+                    >
+                        {icon(Icon::Compose)}
+                    </button>
+                </div>
             </div>
             <nav class="chats">
                 <For
@@ -265,6 +291,41 @@ fn Sidebar() -> impl IntoView {
     }
 }
 
+/// Compute `(is_request_accent, is_warn, is_downgrade, subtitle)` for a sidebar `ChatItem`.
+fn chat_item_meta(contact: &ContactView) -> (bool, bool, bool, String) {
+    let has_downgrade = contact.has_downgrade();
+    let is_quarantined = contact.is_quarantined();
+    let has_outbound_prompt = matches!(contact.classical_prompt, ClassicalPrompt::Outbound { .. });
+    let has_warn_alert = matches!(
+        contact.alert,
+        SecurityAlert::ManifestExpired | SecurityAlert::PqRequired
+    );
+    let warn = !has_downgrade && (is_quarantined || has_outbound_prompt || has_warn_alert);
+    let request_accent = contact.request && !has_downgrade && !warn;
+    let sub = if has_downgrade && is_quarantined {
+        "downgrade detected (quarantined)".to_string()
+    } else if has_downgrade {
+        "downgrade detected".to_string()
+    } else if is_quarantined {
+        if contact.request {
+            "classical request (quarantined)".to_string()
+        } else {
+            "classical chat (quarantined)".to_string()
+        }
+    } else if has_outbound_prompt {
+        "classical approval needed".to_string()
+    } else if contact.alert == SecurityAlert::ManifestExpired {
+        "peer PQ manifest expired".to_string()
+    } else if contact.alert == SecurityAlert::PqRequired {
+        "PQ required (paused)".to_string()
+    } else if contact.request {
+        "wants to chat".to_string()
+    } else {
+        short(&contact.peer)
+    };
+    (request_accent, warn, has_downgrade, sub)
+}
+
 #[component]
 fn ChatItem(contact: ContactView) -> impl IntoView {
     let ui = ui();
@@ -276,21 +337,14 @@ fn ChatItem(contact: ContactView) -> impl IntoView {
     } else {
         initials(&label)
     };
-    let sub = if contact.has_downgrade() {
-        "downgrade detected".to_string()
-    } else if contact.is_quarantined() {
-        "classical request (quarantined)".to_string()
-    } else if contact.request {
-        "wants to chat".to_string()
-    } else {
-        short(&peer)
-    };
+    let (request_accent, warn, has_downgrade, sub) = chat_item_meta(&contact);
     let when = (contact.last_activity > 0).then(|| clock(contact.last_activity));
     view! {
         <button
             class="chat-item"
-            class:request=contact.request
-            class:downgrade=contact.has_downgrade()
+            class:request=request_accent
+            class:warn=warn
+            class:downgrade=has_downgrade
             class:active=move || ui.open.get() == Some(peer)
             on:click=move |_| open_chat(Some(peer))
         >
@@ -307,6 +361,32 @@ fn ChatItem(contact: ContactView) -> impl IntoView {
     }
 }
 
+/// Recent activity log list shared by `Welcome` and the mobile `ActivityDialog`.
+#[component]
+fn ActivityList() -> impl IntoView {
+    let ui = ui();
+    view! {
+        <ul class="activity">
+            <For
+                each=move || ui.log.get().into_iter().enumerate()
+                // With the line too: once the oldest line goes, every index shifts.
+                key=|(index, line)| (*index, line.clone())
+                children=|(_, (at, text))| {
+                    view! {
+                        <li>
+                            <time>{clock(at)}</time>
+                            {text}
+                        </li>
+                    }
+                }
+            />
+            <Show when=move || ui.log.with(Vec::is_empty)>
+                <li>"No activity yet."</li>
+            </Show>
+        </ul>
+    }
+}
+
 /// With no chat open: this client's key, and what happened.
 #[component]
 fn Welcome() -> impl IntoView {
@@ -314,6 +394,11 @@ fn Welcome() -> impl IntoView {
     let key = move || {
         ui.me
             .with(|me| me.as_ref().map(|me| key_to_text(&me.key)).unwrap_or_default())
+    };
+    let handshake = if !PqConfig::compiled_suites().is_empty() {
+        "PQXDH / X3DH"
+    } else {
+        "X3DH"
     };
     view! {
         <section class="pane welcome">
@@ -323,10 +408,10 @@ fn Welcome() -> impl IntoView {
                     <h1>"Your keys stay in this browser"</h1>
                 </div>
                 <p>
-                    "Messages are encrypted here, with PQXDH / X3DH and a double ratchet, before "
-                    "they leave the page. The server, a Cloudflare Worker, only relays what it "
-                    "cannot read: prekeys and sealed messages in its Durable Objects, the large "
-                    "ones in R2."
+                    "Messages are encrypted here, with " {handshake} " and a double ratchet, "
+                    "before they leave the page. The server, a Cloudflare Worker, only relays "
+                    "what it cannot read: prekeys and sealed messages in its Durable Objects, the "
+                    "large ones in R2."
                 </p>
                 <div>
                     <div class="section-label">"Your identity key"</div>
@@ -345,24 +430,26 @@ fn Welcome() -> impl IntoView {
                 </div>
                 <div>
                     <div class="section-label">"Activity"</div>
-                    <ul class="activity">
-                        <For
-                            each=move || ui.log.get().into_iter().enumerate()
-                            // With the line too: once the oldest line goes, every index shifts.
-                            key=|(index, line)| (*index, line.clone())
-                            children=|(_, (at, text))| {
-                                view! {
-                                    <li>
-                                        <time>{clock(at)}</time>
-                                        {text}
-                                    </li>
-                                }
-                            }
-                        />
-                    </ul>
+                    <ActivityList />
                 </div>
             </div>
         </section>
+    }
+}
+
+#[component]
+fn ActivityDialog() -> impl IntoView {
+    view! {
+        <div>
+            <h2>"Activity"</h2>
+            <p>"Recent vault, sync, and encryption events in this browser session."</p>
+            <ActivityList />
+            <div class="actions">
+                <button type="button" class="btn primary" on:click=move |_| close_dialog()>
+                    "Close"
+                </button>
+            </div>
+        </div>
     }
 }
 
@@ -374,6 +461,17 @@ fn security_badge_parts(contact: &ContactView, detailed: bool) -> (&'static str,
             "sec-badge danger",
             "Downgrade detected".to_string(),
             "Post-quantum downgrade detected for this chat".to_string(),
+        )
+    } else if contact.is_quarantined() {
+        let label = if detailed {
+            "Classical chat quarantined — review before replying"
+        } else {
+            "Quarantined"
+        };
+        (
+            "sec-badge classical",
+            label.to_string(),
+            "Classical chat quarantined — review before replying".to_string(),
         )
     } else if !contact.has_active_session {
         if contact.pq_pinned {
@@ -441,12 +539,32 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
     let request = move || contact().is_some_and(|contact| contact.request);
     let quarantined = move || contact().is_some_and(|contact| contact.is_quarantined());
     let composer_disabled = move || request() || quarantined();
+    let composer_placeholder = move || {
+        if quarantined() {
+            "Allow classical or upgrade to PQ to write"
+        } else if request() {
+            "Accept the request to write"
+        } else {
+            "Write a message"
+        }
+    };
     let pq_available = move || {
         ui.me.with(|me| {
             me.as_ref().is_some_and(|me| {
                 me.pq_config.pq_enabled && !me.pq_config.offered_suites().is_empty()
             })
         })
+    };
+    let server_pq_disabled = move || {
+        ui.me.with(|me| {
+            me.as_ref()
+                .is_some_and(|me| me.server_pq == ServerPqStatus::Disabled)
+        })
+    };
+    let pq_retry_ready = move || pq_available() && !server_pq_disabled();
+    let upgrade_disabled_tip = move || {
+        server_pq_disabled()
+            .then_some("This server does not have post-quantum encryption enabled.")
     };
     let sec_busy = RwSignal::new(false);
     view! {
@@ -495,7 +613,9 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
             </header>
             {move || {
                 let c = contact()?;
-                if c.has_downgrade() {
+                // Suppress standalone downgrade banner when the merged quarantine banner is active
+                // so the user never sees two stacked "Upgrade to PQ" primary buttons.
+                if c.has_downgrade() && !c.is_quarantined() {
                     Some(
                         view! {
                             <div class="banner danger" role="alert">
@@ -507,7 +627,8 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         <button
                                             type="button"
                                             class="btn primary small"
-                                            disabled=move || sec_busy.get()
+                                            title=upgrade_disabled_tip
+                                            disabled=move || sec_busy.get() || server_pq_disabled()
                                             on:click=move |_| {
                                                 act_while(sec_busy, async move {
                                                     engine().upgrade_to_pq(peer).await
@@ -541,48 +662,59 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
             {move || {
                 let c = contact()?;
                 match c.classical_prompt {
-                    ClassicalPrompt::InboundQuarantined { peer_was_pq_pinned } => Some(
-                        view! {
-                            <div class="banner warn" role="alert">
-                                <span>
-                                    {if peer_was_pq_pinned {
-                                        "Classical session quarantined: this peer was previously pinned as post-quantum capable. Its incoming message is held until you explicitly allow classical encryption or upgrade to PQ."
-                                    } else {
-                                        "Classical chat request quarantined: this peer initiated without post-quantum encryption. Its message is held until you allow classical encryption."
-                                    }}
-                                </span>
-                                <div class="banner-actions">
-                                    <button
-                                        type="button"
-                                        class="btn small"
-                                        disabled=move || sec_busy.get()
-                                        on:click=move |_| {
-                                            act_while(sec_busy, async move {
-                                                engine().approve_classical(peer).await
-                                            });
-                                        }
-                                    >
-                                        "Allow classical"
-                                    </button>
-                                    <Show when=pq_available>
+                    ClassicalPrompt::InboundQuarantined { peer_was_pq_pinned } => {
+                        let downgrade = peer_was_pq_pinned || c.has_downgrade();
+                        let banner_class = if downgrade {
+                            "banner danger"
+                        } else {
+                            "banner warn"
+                        };
+                        Some(
+                            view! {
+                                <div class=banner_class role="alert">
+                                    <span>
+                                        {if downgrade {
+                                            "Downgrade detected — classical session quarantined: this peer was previously pinned as post-quantum capable. Its incoming message is held until you explicitly allow classical encryption or upgrade to PQ."
+                                        } else {
+                                            "Classical chat request quarantined: this peer initiated without post-quantum encryption. Its message is held until you allow classical encryption."
+                                        }}
+                                    </span>
+                                    <div class="banner-actions">
                                         <button
                                             type="button"
-                                            class="btn primary small"
+                                            class="btn small"
                                             disabled=move || sec_busy.get()
                                             on:click=move |_| {
                                                 act_while(sec_busy, async move {
-                                                    engine().upgrade_to_pq(peer).await
+                                                    engine().approve_classical(peer).await
                                                 });
                                             }
                                         >
-                                            "Upgrade to PQ"
+                                            "Allow classical"
                                         </button>
-                                    </Show>
+                                        <Show when=pq_available>
+                                            <button
+                                                type="button"
+                                                class="btn primary small"
+                                                title=upgrade_disabled_tip
+                                                disabled=move || {
+                                                    sec_busy.get() || server_pq_disabled()
+                                                }
+                                                on:click=move |_| {
+                                                    act_while(sec_busy, async move {
+                                                        engine().upgrade_to_pq(peer).await
+                                                    });
+                                                }
+                                            >
+                                                "Upgrade to PQ"
+                                            </button>
+                                        </Show>
+                                    </div>
                                 </div>
-                            </div>
-                        }
-                        .into_any(),
-                    ),
+                            }
+                            .into_any(),
+                        )
+                    }
                     ClassicalPrompt::Outbound { peer_signed_off } => Some(
                         view! {
                             <div class="banner warn" role="alert">
@@ -606,18 +738,20 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
                                     >
                                         "Allow classical"
                                     </button>
-                                    <button
-                                        type="button"
-                                        class="btn primary small"
-                                        disabled=move || sec_busy.get()
-                                        on:click=move |_| {
-                                            act_while(sec_busy, async move {
-                                                engine().retry_pq(peer).await
-                                            });
-                                        }
-                                    >
-                                        "Retry PQ"
-                                    </button>
+                                    <Show when=pq_retry_ready>
+                                        <button
+                                            type="button"
+                                            class="btn primary small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().retry_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Retry PQ"
+                                        </button>
+                                    </Show>
                                 </div>
                             </div>
                         }
@@ -636,18 +770,38 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
                                     "Peer's signed post-quantum capability manifest has expired (they may have been offline for a while)."
                                 </span>
                                 <div class="banner-actions">
-                                    <button
-                                        type="button"
-                                        class="btn small"
-                                        disabled=move || sec_busy.get()
-                                        on:click=move |_| {
-                                            act_while(sec_busy, async move {
-                                                engine().retry_pq(peer).await
-                                            });
+                                    <Show
+                                        when=pq_retry_ready
+                                        fallback=move || {
+                                            view! {
+                                                <button
+                                                    type="button"
+                                                    class="btn small"
+                                                    disabled=move || sec_busy.get()
+                                                    on:click=move |_| {
+                                                        act_while(sec_busy, async move {
+                                                            engine().dismiss_downgrade(peer).await
+                                                        });
+                                                    }
+                                                >
+                                                    "Dismiss"
+                                                </button>
+                                            }
                                         }
                                     >
-                                        "Retry"
-                                    </button>
+                                        <button
+                                            type="button"
+                                            class="btn small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().retry_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Retry"
+                                        </button>
+                                    </Show>
                                 </div>
                             </div>
                         }
@@ -660,18 +814,38 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
                                     "Require PQ (strict mode) is enabled, and a post-quantum session could not be established with this peer."
                                 </span>
                                 <div class="banner-actions">
-                                    <button
-                                        type="button"
-                                        class="btn small"
-                                        disabled=move || sec_busy.get()
-                                        on:click=move |_| {
-                                            act_while(sec_busy, async move {
-                                                engine().retry_pq(peer).await
-                                            });
+                                    <Show
+                                        when=pq_retry_ready
+                                        fallback=move || {
+                                            view! {
+                                                <button
+                                                    type="button"
+                                                    class="btn small"
+                                                    disabled=move || sec_busy.get()
+                                                    on:click=move |_| {
+                                                        act_while(sec_busy, async move {
+                                                            engine().dismiss_downgrade(peer).await
+                                                        });
+                                                    }
+                                                >
+                                                    "Dismiss"
+                                                </button>
+                                            }
                                         }
                                     >
-                                        "Retry"
-                                    </button>
+                                        <button
+                                            type="button"
+                                            class="btn small"
+                                            disabled=move || sec_busy.get()
+                                            on:click=move |_| {
+                                                act_while(sec_busy, async move {
+                                                    engine().retry_pq(peer).await
+                                                });
+                                            }
+                                        >
+                                            "Retry"
+                                        </button>
+                                    </Show>
                                 </div>
                             </div>
                         }
@@ -698,7 +872,11 @@ fn ChatPane(peer: PublicKey) -> impl IntoView {
             </Show>
             <Messages label=Signal::derive(label) />
             <Uploads peer />
-            <Composer peer disabled=Signal::derive(composer_disabled) />
+            <Composer
+                peer
+                disabled=Signal::derive(composer_disabled)
+                placeholder=Signal::derive(composer_placeholder)
+            />
         </section>
     }
 }
@@ -743,7 +921,7 @@ fn Messages(label: Signal<String>) -> impl IntoView {
         <div class="messages" node_ref=list aria-live="polite" on:scroll=scrolled>
             <For
                 each=move || ui.messages.get()
-                key=|message| (message.index, message.delivery)
+                key=|message| message.index
                 children=move |message| message_item(message, label)
             />
         </div>
@@ -752,20 +930,52 @@ fn Messages(label: Signal<String>) -> impl IntoView {
 
 /// A message, as a bubble, an image, a file or a note.
 /// The notes name the peer by `label`, which changes once a request is accepted.
+/// Delivery ticks and held-attachment pointer upgrades update reactively without remounting
+/// active `<InlineMedia>` players.
 fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
+    let ui = ui();
+    let index = message.index;
+    let outgoing = message.outgoing;
+    let initial_delivery = message.delivery;
     let time = clock(message.at);
     let content = match message.body {
         Body::Text(text) => view! { <div class="bubble">{text}</div> }.into_any(),
-        // Small media shows in place, other files as cards.
-        Body::File(_) | Body::Remote(_) => match inline_media(&message.body) {
+        // Small inline files keep stable identity; render directly so delivery ticks never remount them.
+        Body::File(_) => match inline_media(&message.body) {
             Some((source, sort)) => view! { <InlineMedia source sort /> }.into_any(),
             None => match Source::of(&message.body) {
                 Some(source) => file_card(source),
                 None => ().into_any(),
             },
         },
+        // Remote attachments track body updates via a fine-grained Memo so held attachments
+        // (empty pointer before sign-in) transition seamlessly to live cards/inline media once
+        // `start_waiting` populates their pointer, while ordinary delivery ticks never remount them.
+        Body::Remote(_) => {
+            let initial_body = message.body;
+            let body = Memo::new(move |_| {
+                ui.messages.with(|messages| {
+                    messages
+                        .iter()
+                        .find(|m| m.index == index)
+                        .map(|m| m.body.clone())
+                        .unwrap_or_else(|| initial_body.clone())
+                })
+            });
+            (move || {
+                let current = body.get();
+                match inline_media(&current) {
+                    Some((source, sort)) => view! { <InlineMedia source sort /> }.into_any(),
+                    None => match Source::of(&current) {
+                        Some(source) => file_card(source),
+                        None => ().into_any(),
+                    },
+                }
+            })
+            .into_any()
+        }
         Body::Hello(name) => {
-            let note = move || match (message.outgoing, name.is_empty()) {
+            let note = move || match (outgoing, name.is_empty()) {
                 (true, _) => format!("You started this chat · {time}"),
                 (false, true) => format!("{} started this chat · {time}", label.get()),
                 (false, false) => {
@@ -797,11 +1007,20 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
             return view! { <div class="note">{note}</div> }.into_any();
         }
     };
+    let delivery = Memo::new(move |_| {
+        ui.messages.with(|messages| {
+            messages
+                .iter()
+                .find(|m| m.index == index)
+                .map(|m| m.delivery)
+                .unwrap_or(initial_delivery)
+        })
+    });
     // How far it got, right of its time, as Telegram shows it: a clock while it waits, one tick
     // once the server has it, two once the peer read it, and three once it downloaded its
     // attachment; what that says, for its tooltip and screen readers; and whether the peer read
     // it.
-    let status = match message.delivery {
+    let status = move || match delivery.get() {
         Delivery::Received => None,
         Delivery::Pending => Some((Icon::Pending, "waiting to be sent", false)),
         Delivery::Failed => Some((Icon::Failed, "could not be sent", false)),
@@ -811,11 +1030,9 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
     };
     // Held until this browser signs in to the server, which keeps it only for those who do: it
     // can be cancelled, which lets what was sent after it go.
-    let index = message.index;
-    let held = message.outgoing.then(|| {
+    let held = outgoing.then(|| {
         let cancelling = RwSignal::new(false);
         move || {
-            let ui = ui();
             let peer = ui.open.get()?;
             ui.held.with(|held| held.contains(&(peer, index))).then(|| {
                 view! {
@@ -839,13 +1056,13 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
         }
     });
     view! {
-        <div class="message" class:me=message.outgoing>
+        <div class="message" class:me=outgoing>
             {content}
-            <span class="meta" class:failed=message.delivery == Delivery::Failed>
+            <span class="meta" class:failed=move || delivery.get() == Delivery::Failed>
                 {held}
                 {time}
-                {status
-                    .map(|(shown, title, read)| {
+                {move || {
+                    status().map(|(shown, title, read)| {
                         view! {
                             <span
                                 class="status"
@@ -858,7 +1075,8 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
                                 {icon(shown)}
                             </span>
                         }
-                    })}
+                    })
+                }}
             </span>
         </div>
     }
@@ -880,50 +1098,71 @@ fn Uploads(peer: PublicKey) -> impl IntoView {
     };
     view! {
         <div class="uploads">
-            <For each=uploads key=|upload| upload.clone() children=upload_row />
+            <For each=uploads key=|upload| (upload.peer, upload.id) children=upload_row />
         </div>
     }
 }
 
-fn upload_row(upload: UploadView) -> impl IntoView {
-    let percent = upload.done * 100 / upload.size.max(1);
-    let (status, paused) = match &upload.state {
-        UploadState::Running => (format!("uploading · {percent}%"), false),
-        UploadState::Retrying => (format!("{percent}% · waiting for the server"), false),
-        UploadState::Paused(reason) => (format!("{percent}% · {reason}"), true),
+fn upload_row(initial: UploadView) -> impl IntoView {
+    let ui = ui();
+    let (peer, id) = (initial.peer, initial.id);
+    let name = initial.name.clone();
+    let live = Memo::new(move |_| {
+        ui.uploads.with(|uploads| {
+            uploads
+                .iter()
+                .find(|u| u.peer == peer && u.id == id)
+                .cloned()
+                .unwrap_or_else(|| initial.clone())
+        })
+    });
+    let status = move || {
+        let upload = live.get();
+        let percent = upload.done * 100 / upload.size.max(1);
+        match &upload.state {
+            UploadState::Running => format!("uploading · {percent}%"),
+            UploadState::Checking => format!("{percent}% · checking the file…"),
+            UploadState::Retrying => format!("{percent}% · waiting for the server"),
+            UploadState::Paused(reason) => format!("{percent}% · {reason}"),
+        }
     };
-    let (peer, id) = (upload.peer, upload.id);
-    // Without the file, which went with the page that chose it, the file is chosen again.
+    let paused = move || matches!(live.get().state, UploadState::Paused(_));
+    let file_input = NodeRef::<html::Input>::new();
+    // Without the file, which went with the page that chose it, the file is chosen again via a
+    // declarative hidden `<input type="file">`.
     let resume = move |_| {
         if engine().has_file(&peer, &id) {
             act(async move { engine().resume_upload(peer, id, None).await });
-        } else {
-            choose_file(move |file| {
-                act(async move { engine().resume_upload(peer, id, Some(file)).await })
-            });
+        } else if let Some(input) = file_input.get_untracked() {
+            input.click();
         }
+    };
+    let on_file_change = move |event: ev::Event| {
+        let input: web_sys::HtmlInputElement = event_target(&event);
+        if let Some(file) = input.files().and_then(|files| files.get(0)) {
+            act(async move { engine().resume_upload(peer, id, Some(file)).await });
+        }
+        input.set_value("");
     };
     let cancel = move |_| act(async move { engine().cancel_upload(peer, id).await });
     view! {
         <div class="upload">
-            <span class="file-icon">{extension(&upload.name)}</span>
+            <span class="file-icon">{extension(&name)}</span>
             <span class="upload-text">
-                <strong>{upload.name.clone()}</strong>
+                <strong>{name}</strong>
                 <span>{status}</span>
             </span>
-            {paused
-                .then(|| {
-                    view! {
-                        <button
-                            class="btn icon small"
-                            title="Resume"
-                            aria-label="Resume"
-                            on:click=resume
-                        >
-                            {icon(Icon::Resume)}
-                        </button>
-                    }
-                })}
+            <input type="file" hidden node_ref=file_input on:change=on_file_change />
+            <Show when=paused>
+                <button
+                    class="btn icon small"
+                    title="Resume"
+                    aria-label="Resume"
+                    on:click=resume
+                >
+                    {icon(Icon::Resume)}
+                </button>
+            </Show>
             <button
                 class="btn icon small quiet"
                 title="Cancel the upload"
@@ -934,23 +1173,6 @@ fn upload_row(upload: UploadView) -> impl IntoView {
             </button>
         </div>
     }
-}
-
-/// Let the user choose a file, then call `chosen` with it.
-fn choose_file(chosen: impl FnOnce(web_sys::File) + 'static) {
-    let Ok(input) = document().create_element("input") else {
-        return;
-    };
-    let input: web_sys::HtmlInputElement = input.unchecked_into();
-    input.set_type("file");
-    let picked = input.clone();
-    let on_change = Closure::once_into_js(move || {
-        if let Some(file) = picked.files().and_then(|files| files.get(0)) {
-            chosen(file);
-        }
-    });
-    input.set_onchange(Some(on_change.unchecked_ref()));
-    input.click();
 }
 
 /// A file's extension, lowercase, for its card; `file` if it has none.
@@ -969,7 +1191,7 @@ fn open_attachment(remote: RemoteFile) {
         let sort = preview::sort(&remote.pointer.name, &remote.pointer.mime, &[]);
         if matches!(sort, Sort::Video | Sort::Audio)
             && let Some(url) = engine
-                .stream(remote.peer, &remote.pointer, remote.clock)
+                .stream(remote.peer, remote.index, &remote.pointer, remote.clock)
                 .await
         {
             ui.viewer.set(None);
@@ -979,7 +1201,7 @@ fn open_attachment(remote: RemoteFile) {
             return;
         }
         if let Err(e) = engine
-            .open_attachment(remote.peer, remote.pointer, remote.clock)
+            .open_attachment(remote.peer, remote.index, remote.pointer, remote.clock)
             .await
         {
             ui.notify(e);
@@ -990,12 +1212,11 @@ fn open_attachment(remote: RemoteFile) {
 /// How long a stream let go of still answers what its players asked for before they stopped.
 const STREAM_GRACE: Duration = Duration::from_secs(10);
 
-/// Let go of `url`, a blob URL or a stream's, as what showed it went. A stream's players on the
-/// page stop asking for it first, and what they asked for already is still answered for
+/// Let go of `url`, a blob URL or a stream's, as what showed it went. Players stop their own
+/// `NodeRef` elements in `on_cleanup`, and what they asked for already is still answered for
 /// [`STREAM_GRACE`], so that none fails.
 fn release(url: &str) {
     if url.starts_with("/media/") {
-        stop_players(url);
         let url = url.to_string();
         set_timeout(move || engine().end_stream(&url), STREAM_GRACE);
     } else {
@@ -1003,27 +1224,22 @@ fn release(url: &str) {
     }
 }
 
-/// Stop the players of the stream at `url` on the page, which cancels what they asked for.
-fn stop_players(url: &str) {
-    let selector = format!("video[src^=\"{url}\"], audio[src^=\"{url}\"]");
-    let Ok(players) = document().query_selector_all(&selector) else {
-        return;
-    };
-    for index in 0..players.length() {
-        if let Some(player) = players
-            .item(index)
-            .and_then(|player| player.dyn_into::<web_sys::HtmlMediaElement>().ok())
-        {
-            let _ = player.remove_attribute("src");
-            player.load();
-        }
-    }
+/// Stop a `<video>` or `<audio>` element directly via its `NodeRef`, cancelling in-flight range
+/// fetches even if the element has already been detached during cleanup.
+fn stop_media(player: &web_sys::HtmlMediaElement) {
+    let _ = player.remove_attribute("src");
+    player.load();
 }
 
 #[component]
-fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
+fn Composer(
+    peer: PublicKey,
+    disabled: Signal<bool>,
+    placeholder: Signal<&'static str>,
+) -> impl IntoView {
     let text = RwSignal::new(String::new());
     let textarea = NodeRef::<html::Textarea>::new();
+    let file_input = NodeRef::<html::Input>::new();
     // Typing goes to the composer when a chat opens.
     Effect::new(move || {
         if let Some(textarea) = textarea.get() {
@@ -1044,6 +1260,14 @@ fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
             submit();
         }
     };
+    let on_files_change = move |event: ev::Event| {
+        let input: web_sys::HtmlInputElement = event_target(&event);
+        if let Some(files) = input.files() {
+            send_files(files);
+        }
+        // So that picking the same file again sends it again.
+        input.set_value("");
+    };
     let rows = move || text.with(|text| text.split('\n').count().clamp(1, 6));
     view! {
         <div class="composer">
@@ -1052,16 +1276,18 @@ fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
                 title="Attach files, or drop them on the page"
                 aria-label="Attach files"
                 disabled=disabled
-                on:click=move |_| pick_files()
+                on:click=move |_| {
+                    if let Some(input) = file_input.get_untracked() {
+                        input.click();
+                    }
+                }
             >
                 {icon(Icon::Attach)}
             </button>
             <textarea
                 node_ref=textarea
                 rows=rows
-                placeholder=move || {
-                    if disabled.get() { "Accept the request to write" } else { "Write a message" }
-                }
+                placeholder=move || placeholder.get()
                 disabled=disabled
                 prop:value=move || text.get()
                 on:input=move |event| text.set(event_target_value(&event))
@@ -1076,7 +1302,7 @@ fn Composer(peer: PublicKey, disabled: Signal<bool>) -> impl IntoView {
             >
                 {icon(Icon::Send)}
             </button>
-            <FilePicker />
+            <input type="file" multiple hidden node_ref=file_input on:change=on_files_change />
         </div>
     }
 }
@@ -1151,7 +1377,13 @@ impl Source {
             },
             Self::Remote(remote) => {
                 engine()
-                    .media(remote.peer, remote.pointer.clone(), remote.clock, shows)
+                    .media(
+                        remote.peer,
+                        remote.index,
+                        remote.pointer.clone(),
+                        remote.clock,
+                        shows,
+                    )
                     .await
             }
         }
@@ -1210,16 +1442,27 @@ fn file_card(source: Source) -> AnyView {
 fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
     let ui = ui();
     let node = NodeRef::<html::Div>::new();
+    let video_ref = NodeRef::<html::Video>::new();
+    let audio_ref = NodeRef::<html::Audio>::new();
     // Its URL and MIME type, once read, and what the viewer shows of it.
     let shown = RwSignal::new(None::<(String, &'static str)>);
     let read = StoredValue::new(None::<Attachment>);
     let failed = RwSignal::new(false);
-    // Gone with the media, e.g. as the chat closed or the message's delivery changed: a read
-    // that ends after shows nothing, and a URL made then is let go at once.
+    // Gone with the media, e.g. as the chat closed: a read that ends after shows nothing, and a
+    // URL made then is let go at once.
     let here = StoredValue::new(());
+    let stop_active = move || {
+        if let Some(video) = video_ref.get_untracked() {
+            stop_media(&video);
+        }
+        if let Some(audio) = audio_ref.get_untracked() {
+            stop_media(&audio);
+        }
+    };
     let play = move |url: String, mime: &'static str| {
-        if let Some(Some((url, _))) = shown.try_set(Some((url, mime))) {
-            release(&url);
+        if let Some(Some((old_url, _))) = shown.try_set(Some((url, mime))) {
+            stop_active();
+            release(&old_url);
         }
     };
     let show = move |attachment: Attachment| {
@@ -1248,7 +1491,7 @@ fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
                 if let Source::Remote(remote) = &source
                     && sort != Sort::Image
                     && let Some(url) = engine()
-                        .stream(remote.peer, &remote.pointer, remote.clock)
+                        .stream(remote.peer, remote.index, &remote.pointer, remote.clock)
                         .await
                 {
                     play(
@@ -1277,6 +1520,7 @@ fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
         _ => when_shown(node, load),
     }
     on_cleanup(move || {
+        stop_active();
         if let Some(Some((url, _))) = shown.try_get_untracked() {
             release(&url);
         }
@@ -1310,6 +1554,7 @@ fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
                         view! {
                             <div class="clip">
                                 <video
+                                    node_ref=video_ref
                                     src=url
                                     controls
                                     preload="metadata"
@@ -1327,6 +1572,7 @@ fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
                         view! {
                             <div class="clip audio">
                                 <audio
+                                    node_ref=audio_ref
                                     src=url
                                     controls
                                     preload="metadata"
@@ -1413,13 +1659,20 @@ enum Preview {
 #[component]
 fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
     let node = NodeRef::<html::Div>::new();
+    let video_ref = NodeRef::<html::Video>::new();
     let preview = RwSignal::new(None::<Preview>);
     let length = RwSignal::new(None::<String>);
     // Gone with the preview: a read that ends after shows nothing, and a URL made then is let
     // go at once.
     let here = StoredValue::new(());
+    let stop_active = move || {
+        if let Some(video) = video_ref.get_untracked() {
+            stop_media(&video);
+        }
+    };
     let show = move |made: Preview| {
         if let Some(Some(Preview::Image(url) | Preview::Video(url))) = preview.try_set(Some(made)) {
+            stop_active();
             release(&url);
         }
     };
@@ -1432,7 +1685,7 @@ fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
                 if let Source::Remote(remote) = &source
                     && sort != Sort::Image
                     && let Some(url) = engine()
-                        .stream(remote.peer, &remote.pointer, remote.clock)
+                        .stream(remote.peer, remote.index, &remote.pointer, remote.clock)
                         .await
                 {
                     if sort == Sort::Video {
@@ -1470,6 +1723,7 @@ fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
         });
     }
     on_cleanup(move || {
+        stop_active();
         if let Some(Some(Preview::Image(url) | Preview::Video(url))) = preview.try_get_untracked() {
             release(&url);
         }
@@ -1494,6 +1748,7 @@ fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
                 Some(Preview::Video(url)) => {
                     view! {
                         <video
+                            node_ref=video_ref
                             src=format!("{url}#t=0.1")
                             muted
                             preload="metadata"
@@ -1655,36 +1910,13 @@ fn send_files(files: FileList) {
     }
 }
 
-/// Open the file picker.
-fn pick_files() {
-    if let Some(input) = document()
-        .get_element_by_id("file-picker")
-        .and_then(|input| input.dyn_into::<web_sys::HtmlInputElement>().ok())
-    {
-        input.click();
-    }
-}
-
-#[component]
-fn FilePicker() -> impl IntoView {
-    let on_change = move |event: ev::Event| {
-        let input: web_sys::HtmlInputElement = event_target(&event);
-        if let Some(files) = input.files() {
-            send_files(files);
-        }
-        // So that picking the same file again sends it again.
-        input.set_value("");
-    };
-    view! { <input id="file-picker" type="file" multiple hidden on:change=on_change /> }
-}
-
 /// The modal dialog: the vault's while it is locked, then the one the page asks for.
 #[component]
 fn VaultDialog() -> impl IntoView {
     let ui = ui();
     let dialog = NodeRef::<html::Dialog>::new();
     let shown = move || match ui.phase.get() {
-        Phase::Create | Phase::Locked | Phase::Elsewhere | Phase::Unavailable(_) => true,
+        Phase::Create | Phase::Locked | Phase::Elsewhere | Phase::Unavailable(_, _) => true,
         Phase::Unlocked => ui.dialog.get().is_some(),
         Phase::Loading => false,
     };
@@ -1732,7 +1964,9 @@ fn VaultDialog() -> impl IntoView {
                 (Phase::Create, _) => view! { <CreateVault /> }.into_any(),
                 (Phase::Locked, _) => view! { <UnlockVault /> }.into_any(),
                 (Phase::Elsewhere, _) => view! { <Elsewhere /> }.into_any(),
-                (Phase::Unavailable(error), _) => view! { <Unavailable error /> }.into_any(),
+                (Phase::Unavailable(reason, error), _) => {
+                    view! { <Unavailable reason error /> }.into_any()
+                }
                 (
                     Phase::Unlocked,
                     Some(Dialog::NewChat {
@@ -1751,6 +1985,9 @@ fn VaultDialog() -> impl IntoView {
                     view! { <FileBrowser peer /> }.into_any()
                 }
                 (Phase::Unlocked, Some(Dialog::SignIn)) => view! { <SignInDialog /> }.into_any(),
+                (Phase::Unlocked, Some(Dialog::Activity)) => {
+                    view! { <ActivityDialog /> }.into_any()
+                }
                 _ => ().into_any(),
             }}
             <Toast />
@@ -1779,7 +2016,15 @@ fn clear_secret(signal: RwSignal<String>) {
 #[component]
 fn SignInDialog() -> impl IntoView {
     let password = RwSignal::new(String::new());
+    let password_input = NodeRef::<html::Input>::new();
     on_cleanup(move || clear_secret(password));
+    // Focus explicitly on mount/swap inside the shared `<dialog>` (HTML `autofocus` only runs
+    // when the native dialog first opens).
+    Effect::new(move || {
+        if let Some(input) = password_input.get() {
+            let _ = input.focus();
+        }
+    });
     let progress = Progress::new();
     let pending_hint = engine()
         .pending_new_chat_hint()
@@ -1804,9 +2049,9 @@ fn SignInDialog() -> impl IntoView {
                     match engine.complete_sign_in_flow() {
                         SignInSuccessAction::Close => {
                             engine.close_dialog_if_sign_in();
-                            engine
-                                .ui()
-                                .notify(format!("Signed in until {until}: your files go now."));
+                            engine.ui().notify(format!(
+                                "Signed in until {until}: waiting messages and files go now."
+                            ));
                         }
                         SignInSuccessAction::ReopenNewChat(dialog) => {
                             engine.ui().dialog.set(Some(dialog));
@@ -1827,7 +2072,23 @@ fn SignInDialog() -> impl IntoView {
                                     engine.finish_auto_start_chat(None);
                                     engine.close_dialog_if_new_chat();
                                     engine.open(Some(peer)).await;
-                                    engine.ui().notify(format!("Signed in until {until}."));
+                                    // If sending the initial greeting hit a secondary
+                                    // `SignInRequired` after persisting the chat, `SignInDialog`
+                                    // intentionally stayed open — reset `progress` so buttons are
+                                    // usable again.
+                                    if engine
+                                        .ui()
+                                        .dialog
+                                        .with_untracked(|d| matches!(d, Some(Dialog::SignIn)))
+                                    {
+                                        progress.try_fail(
+                                            "Sign-in is still required by the server to send the \
+                                             greeting.",
+                                        );
+                                    } else {
+                                        progress.clear();
+                                        engine.ui().notify(format!("Signed in until {until}."));
+                                    }
                                 }
                                 Err(StartChatError::SignInRequired) => {
                                     engine.finish_auto_start_chat(Some(
@@ -1836,6 +2097,7 @@ fn SignInDialog() -> impl IntoView {
                                     progress.try_fail("Sign-in is still required by the server.");
                                 }
                                 Err(err) => {
+                                    progress.clear();
                                     engine.finish_auto_start_chat(Some(err));
                                     engine.ui().notify(format!("Signed in until {until}."));
                                 }
@@ -1860,6 +2122,7 @@ fn SignInDialog() -> impl IntoView {
             <label for="server-password">"The server's password"</label>
             <input
                 id="server-password"
+                node_ref=password_input
                 type="password"
                 autocomplete="current-password"
                 required
@@ -2065,6 +2328,16 @@ fn UnlockVault() -> impl IntoView {
         }
         if !confirm_reset.get_untracked() {
             confirm_reset.set(true);
+            set_timeout(
+                move || {
+                    if confirm_reset.try_get_untracked() == Some(true)
+                        && progress.working.try_get_untracked() == Some(false)
+                    {
+                        confirm_reset.set(false);
+                    }
+                },
+                ASKED_SHOWN,
+            );
             return;
         }
         progress.start("Deleting the vault…");
@@ -2131,14 +2404,28 @@ fn Elsewhere() -> impl IntoView {
 }
 
 #[component]
-fn Unavailable(error: String) -> impl IntoView {
+fn Unavailable(reason: UnavailableReason, error: String) -> impl IntoView {
+    let (heading, copy) = match reason {
+        UnavailableReason::InsecureContext => (
+            "Secure context required",
+            "Open this page over HTTPS (or localhost) so the browser provides the Web Locks API \
+             needed to keep concurrent tabs from corrupting your vault.",
+        ),
+        UnavailableReason::LocksUnavailable => (
+            "Web Locks unavailable",
+            "This browser does not provide the Web Locks API needed to prevent concurrent tabs \
+             from corrupting your vault. Try a modern browser or check site restrictions.",
+        ),
+        UnavailableReason::StorageUnavailable => (
+            "Storage unavailable",
+            "The browser would not open its storage, so whether a vault is here is unknown, and \
+             nothing was changed. Private windows and blocked site data can cause this.",
+        ),
+    };
     view! {
         <div>
-            <h2>"Storage unavailable"</h2>
-            <p>
-                "The browser would not open its storage, so whether a vault is here is unknown, "
-                "and nothing was changed. Private windows and blocked site data can cause this."
-            </p>
+            <h2>{heading}</h2>
+            <p>{copy}</p>
             <p class="error">{error}</p>
             <div class="actions">
                 <button class="btn primary" on:click=move |_| lock()>
@@ -2325,7 +2612,12 @@ fn NewChat(
             }}
             {progress.view()}
             <div class="actions">
-                <button type="button" class="btn" on:click=move |_| close_dialog()>
+                <button
+                    type="button"
+                    class="btn"
+                    disabled=move || progress.working.get()
+                    on:click=move |_| close_dialog()
+                >
                     "Cancel"
                 </button>
                 <button class="btn primary" type="submit" disabled=move || progress.working.get()>
@@ -2473,7 +2765,12 @@ fn Identity() -> impl IntoView {
                 >
                     "New prekeys"
                 </button>
-                <button type="button" class="btn" on:click=move |_| close_dialog()>
+                <button
+                    type="button"
+                    class="btn"
+                    disabled=move || busy.get()
+                    on:click=move |_| close_dialog()
+                >
                     "Cancel"
                 </button>
                 <button type="submit" class="btn primary" disabled=move || busy.get()>
@@ -2492,6 +2789,7 @@ fn Settings() -> impl IntoView {
         return ().into_any();
     };
     let server_url = me.server.clone();
+    let can_sign_in_here = same_server(&server_url, &origin());
     let compiled_suites = PqConfig::compiled_suites();
     let pq_compiled = !compiled_suites.is_empty();
     let initial_pq = me.pq_config.clone();
@@ -2504,45 +2802,54 @@ fn Settings() -> impl IntoView {
     let pq_ratchet_enabled = RwSignal::new(pq_compiled && initial_pq.pq_ratchet_enabled);
     let strict_pq = RwSignal::new(pq_compiled && initial_pq.pq_enabled && initial_pq.strict_pq);
     let advanced_open = pq_compiled && (initial_pq.strict_pq || !initial_pq.pq_ratchet_enabled);
+    let server_pq_disabled = Signal::derive(move || {
+        ui.me.with(|me| {
+            me.as_ref()
+                .is_some_and(|m| m.server_pq == ServerPqStatus::Disabled)
+        })
+    });
     // Saving settings or signing out, which its buttons wait for.
     let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
+        if !pq_compiled {
+            close_dialog();
+            return;
+        }
         let engine = engine();
         let next_pq = PqConfig {
-            pq_enabled: pq_compiled && pq_enabled.get_untracked(),
+            pq_enabled: pq_enabled.get_untracked(),
             preferred_suite: preferred_suite.get_untracked(),
-            pq_ratchet_enabled: pq_compiled && pq_ratchet_enabled.get_untracked(),
-            strict_pq: pq_compiled && pq_enabled.get_untracked() && strict_pq.get_untracked(),
+            pq_ratchet_enabled: pq_ratchet_enabled.get_untracked(),
+            strict_pq: pq_enabled.get_untracked() && strict_pq.get_untracked(),
         };
         act_while(busy, async move {
-            let pq_changed = pq_compiled
-                && engine
-                    .ui()
-                    .me
-                    .with_untracked(|me| me.as_ref().is_some_and(|me| me.pq_config != next_pq));
-            if pq_compiled {
-                // Always invoke `set_pq_config` when PQ is compiled: it compares against live
-                // vault state (avoiding stale mount-time snapshots after a failed publish) and
-                // no-ops cleanly when `previous == config && !needs_publish`.
-                engine.set_pq_config(next_pq).await?;
-            }
+            // Always invoke `set_pq_config`: it compares against live vault state, rolls back
+            // definitively refused configs, and reports durable local saves clearly.
+            let outcome = engine.set_pq_config(next_pq).await?;
             engine.ui().dialog.set(None);
-            if pq_changed {
-                engine
+            match outcome {
+                PqSaveOutcome::Published => engine
                     .ui()
-                    .notify("Saved settings and published updated prekeys.");
-            } else if pq_compiled {
-                engine.ui().notify("Settings saved.");
+                    .notify("Saved settings and published updated prekeys."),
+                PqSaveOutcome::Unchanged => engine.ui().notify("Settings saved."),
+                PqSaveOutcome::SavedLocallyNeedsSignIn => engine
+                    .ui()
+                    .notify("Saved locally; sign in to publish updated prekeys."),
+                PqSaveOutcome::SavedLocallyPendingPublish => engine
+                    .ui()
+                    .notify("Saved locally; prekeys will publish once connected."),
             }
             Ok(())
         });
     };
-    // Whether this browser is signed in to the server.
+    // Whether this browser is signed in to the server (only possible on the server's own origin).
     let signed_in = RwSignal::new(None::<Result<Option<SignIn>, String>>);
-    spawn_local(async move {
-        signed_in.try_set(Some(engine().signed_in().await));
-    });
+    if can_sign_in_here {
+        spawn_local(async move {
+            signed_in.try_set(Some(engine().signed_in().await));
+        });
+    }
     let sign_out = move |_| {
         let engine = engine();
         act_while(busy, async move {
@@ -2550,62 +2857,82 @@ fn Settings() -> impl IntoView {
             signed_in.try_set(Some(Ok(None)));
             engine
                 .ui()
-                .notify("Signed out: files wait for the next sign-in.");
+                .notify("Signed out: messages and files wait for the next sign-in.");
             Ok(())
         });
     };
     let pq_controls_disabled = Signal::derive(move || busy.get() || !pq_enabled.get());
-    let server_row = move || match signed_in.get() {
-        None => view! {
-            <div class="settings-server-row">
-                <div class="settings-copy">
-                    <span class="settings-muted">"Checking sign-in status…"</span>
+    let strict_pq_disabled = Signal::derive(move || {
+        pq_controls_disabled.get() || (server_pq_disabled.get() && !strict_pq.get())
+    });
+    let server_row = move || {
+        if !can_sign_in_here {
+            return view! {
+                <div class="settings-server-row">
+                    <div class="settings-copy">
+                        <strong>"Different server origin"</strong>
+                        <small>
+                            {format!(
+                                "Your vault uses {server_url}. Open that server's own page to sign in or out."
+                            )}
+                        </small>
+                    </div>
                 </div>
-            </div>
+            }
+            .into_any();
         }
-        .into_any(),
-        Some(Ok(Some(signed_in))) => view! {
-            <div class="settings-server-row">
-                <div class="settings-copy">
-                    <strong>{format!("Signed in until {}", day(signed_in.expires))}</strong>
-                    <small>{server_url.clone()}</small>
+        match signed_in.get() {
+            None => view! {
+                <div class="settings-server-row">
+                    <div class="settings-copy">
+                        <span class="settings-muted">"Checking sign-in status…"</span>
+                    </div>
                 </div>
-                <button
-                    type="button"
-                    class="btn small"
-                    disabled=move || busy.get()
-                    on:click=sign_out
-                >
-                    "Sign out"
-                </button>
-            </div>
-        }
-        .into_any(),
-        Some(Ok(None)) => view! {
-            <div class="settings-server-row">
-                <div class="settings-copy">
-                    <strong>"Not signed in"</strong>
-                    <small>"Sign in to send messages and files through this server."</small>
+            }
+            .into_any(),
+            Some(Ok(Some(signed_in))) => view! {
+                <div class="settings-server-row">
+                    <div class="settings-copy">
+                        <strong>{format!("Signed in until {}", day(signed_in.expires))}</strong>
+                        <small>{server_url.clone()}</small>
+                    </div>
+                    <button
+                        type="button"
+                        class="btn small"
+                        disabled=move || busy.get()
+                        on:click=sign_out
+                    >
+                        "Sign out"
+                    </button>
                 </div>
-                <button
-                    type="button"
-                    class="btn primary small"
-                    disabled=move || busy.get()
-                    on:click=move |_| ui.dialog.set(Some(Dialog::SignIn))
-                >
-                    "Sign in"
-                </button>
-            </div>
-        }
-        .into_any(),
-        Some(Err(e)) => view! {
-            <div class="settings-server-row">
-                <div class="settings-copy">
-                    <span class="settings-error">{format!("Cannot reach server: {e}")}</span>
+            }
+            .into_any(),
+            Some(Ok(None)) => view! {
+                <div class="settings-server-row">
+                    <div class="settings-copy">
+                        <strong>"Not signed in"</strong>
+                        <small>"Sign in to send messages and files through this server."</small>
+                    </div>
+                    <button
+                        type="button"
+                        class="btn primary small"
+                        disabled=move || busy.get()
+                        on:click=move |_| ui.dialog.set(Some(Dialog::SignIn))
+                    >
+                        "Sign in"
+                    </button>
                 </div>
-            </div>
+            }
+            .into_any(),
+            Some(Err(e)) => view! {
+                <div class="settings-server-row">
+                    <div class="settings-copy">
+                        <span class="settings-error">{format!("Cannot reach server: {e}")}</span>
+                    </div>
+                </div>
+            }
+            .into_any(),
         }
-        .into_any(),
     };
     let encryption_card = if pq_compiled {
         let suites_for_segments = compiled_suites.clone();
@@ -2625,7 +2952,9 @@ fn Settings() -> impl IntoView {
                     }
                 />
                 <div class="settings-block" class:disabled=move || pq_controls_disabled.get()>
-                    <div id="pq-strength-label" class="settings-sublabel">"Key strength"</div>
+                    <div id="pq-strength-label" class="settings-sublabel">
+                        "Preferred key strength"
+                    </div>
                     <div
                         class="segmented"
                         role="radiogroup"
@@ -2659,6 +2988,15 @@ fn Settings() -> impl IntoView {
                             .collect_view()}
                     </div>
                 </div>
+                <p class="settings-note">
+                    "Changes apply to new or re-keyed chats; existing chats keep their current encryption."
+                </p>
+                <Show when=move || server_pq_disabled.get()>
+                    <p class="settings-warn">
+                        "This server does not have post-quantum encryption enabled. New chats will \
+                         use classical encryption, and Require post-quantum cannot be turned on."
+                    </p>
+                </Show>
                 <details class="settings-advanced" open=advanced_open>
                     <summary>"Advanced"</summary>
                     <div class="settings-advanced-body">
@@ -2675,7 +3013,7 @@ fn Settings() -> impl IntoView {
                             title="Require post-quantum"
                             description="Block classical-only chats and refuse fallback."
                             checked=Signal::derive(move || strict_pq.get())
-                            disabled=pq_controls_disabled
+                            disabled=strict_pq_disabled
                             on_toggle=move |on| strict_pq.set(on)
                         />
                     </div>
@@ -2725,17 +3063,34 @@ fn Settings() -> impl IntoView {
                 <div class="settings-card">{server_row}</div>
             </section>
             <div class="actions">
-                <button
-                    type="button"
-                    class="btn"
-                    disabled=move || busy.get()
-                    on:click=move |_| close_dialog()
-                >
-                    "Cancel"
-                </button>
-                <button type="submit" class="btn primary" disabled=move || busy.get()>
-                    "Save"
-                </button>
+                {if pq_compiled {
+                    view! {
+                        <button
+                            type="button"
+                            class="btn"
+                            disabled=move || busy.get()
+                            on:click=move |_| close_dialog()
+                        >
+                            "Cancel"
+                        </button>
+                        <button type="submit" class="btn primary" disabled=move || busy.get()>
+                            "Save"
+                        </button>
+                    }
+                    .into_any()
+                } else {
+                    view! {
+                        <button
+                            type="button"
+                            class="btn primary"
+                            disabled=move || busy.get()
+                            on:click=move |_| close_dialog()
+                        >
+                            "Close"
+                        </button>
+                    }
+                    .into_any()
+                }}
             </div>
         </form>
     }
@@ -2789,13 +3144,13 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             Ok(())
         });
     };
-    let intro = if contact.request {
-        match contact.hello_name.as_str() {
+    let intro = move || match live_contact() {
+        Some(c) if c.request => match c.hello_name.as_str() {
             "" => format!("{} wants to chat.", short(&peer)),
             hello => format!("{} wants to chat, and goes by “{hello}”.", short(&peer)),
-        }
-    } else {
-        format!("Your chat with {}.", contact.label())
+        },
+        Some(c) => format!("Your chat with {}.", c.label()),
+        None => String::new(),
     };
     let pq_available = move || {
         ui.me.with(|me| {
@@ -2803,6 +3158,16 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                 me.pq_config.pq_enabled && !me.pq_config.offered_suites().is_empty()
             })
         })
+    };
+    let server_pq_disabled = move || {
+        ui.me.with(|me| {
+            me.as_ref()
+                .is_some_and(|me| me.server_pq == ServerPqStatus::Disabled)
+        })
+    };
+    let upgrade_disabled_tip = move || {
+        server_pq_disabled()
+            .then_some("This server does not have post-quantum encryption enabled.")
     };
     view! {
         <form on:submit=submit>
@@ -2851,7 +3216,10 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                                                 <button
                                                     type="button"
                                                     class="btn primary small"
-                                                    disabled=move || busy.get()
+                                                    title=upgrade_disabled_tip
+                                                    disabled=move || {
+                                                        busy.get() || server_pq_disabled()
+                                                    }
                                                     on:click=move |_| {
                                                         act_while(busy, async move {
                                                             engine().upgrade_to_pq(peer).await
@@ -2911,7 +3279,12 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                         (true, _) => "Delete it and its history?",
                     }}
                 </button>
-                <button type="button" class="btn" on:click=move |_| close_dialog()>
+                <button
+                    type="button"
+                    class="btn"
+                    disabled=move || busy.get()
+                    on:click=move |_| close_dialog()
+                >
                     "Cancel"
                 </button>
                 <Show when=move || !(is_request() && is_quarantined())>
@@ -3038,13 +3411,16 @@ fn FileBrowser(peer: PublicKey) -> impl IntoView {
                 .into_iter()
                 .map(|(month, files)| {
                     let files = if shelf == Shelf::Media {
-                        let tiles = files.into_iter().map(file_tile).collect_view();
+                        let tiles = files
+                            .into_iter()
+                            .map(|file| file_tile(peer, file, deleted))
+                            .collect_view();
                         view! { <div class="file-grid">{tiles}</div> }.into_any()
                     } else {
                         let from = from.clone();
                         let rows = files
                             .into_iter()
-                            .map(|file| file_row(file, &from, deleted))
+                            .map(|file| file_row(peer, file, &from, deleted))
                             .collect_view();
                         view! { <div class="file-list">{rows}</div> }.into_any()
                     };
@@ -3067,6 +3443,11 @@ fn FileBrowser(peer: PublicKey) -> impl IntoView {
                     "What you and {label} sent each other, newest first, sorted by what they are."
                 )}
             </p>
+            <p class="hint">
+                "Small files (up to 1 MB) are stored locally in your vault and removed from the \
+                 server upon delivery. Larger attachments stay on the server temporarily and can \
+                 be deleted from the server by either peer."
+            </p>
             <div class="shelves">{shelves}</div>
             <div class="file-months">
                 {move || months().unwrap_or_else(|| view! { <p class="empty">"Reading the chat…"</p> }.into_any())}
@@ -3080,44 +3461,139 @@ fn FileBrowser(peer: PublicKey) -> impl IntoView {
     }
 }
 
+/// Compute the concise lifecycle status suffix for a file in `FileBrowser` (list row and tile).
+fn file_status_suffix(
+    is_local: bool,
+    gone: bool,
+    failed: bool,
+    deletable: bool,
+    outgoing: bool,
+) -> Option<&'static str> {
+    if is_local {
+        Some(if failed { "not sent" } else { "stored locally" })
+    } else if gone {
+        Some("no longer on the server")
+    } else if failed {
+        Some("upload cancelled")
+    } else if deletable {
+        Some("on server")
+    } else if outgoing {
+        Some("waiting to upload")
+    } else {
+        None
+    }
+}
+
 /// `file` as a tile of the file browser's grid of media: its preview, which for audio, which may
-/// have no cover, goes with its name. It opens in the viewer.
-fn file_tile(file: FileView) -> AnyView {
+/// have no cover, goes with its name, plus gone/cancelled status and server-delete action matching
+/// list rows.
+fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -> AnyView {
     let Some(source) = Source::of(&file.body) else {
         return ().into_any();
     };
+    let ui = ui();
     let shown = inline_media(&file.body).map(|(source, _)| source);
-    let title = file.name.clone();
+    let (index, listed_gone, failed, deletable, outgoing) = (
+        file.index,
+        file.gone,
+        file.failed,
+        file.deletable,
+        file.outgoing,
+    );
+    let is_local = matches!(file.body, Body::File(_));
+    let gone = move || {
+        listed_gone
+            || deleted.with(|deleted| deleted.contains(&index))
+            || ui.gone.with(|gone| gone.contains(&(peer, index)))
+    };
+    let base_name = file.name.clone();
+    let title = move || match file_status_suffix(is_local, gone(), failed, deletable, outgoing) {
+        Some(status) => format!("{base_name} ({status})"),
+        None => base_name.clone(),
+    };
+    let delete = match &file.body {
+        Body::Remote(remote) if file.deletable => {
+            let (remote_peer, pointer) = (remote.peer, remote.pointer.clone());
+            Some(move || {
+                (!gone()).then(|| {
+                    view! { <DeleteFromServer peer=remote_peer index pointer=pointer.clone() deleted /> }
+                })
+            })
+        }
+        _ => None,
+    };
     view! {
-        <button class="tile" title=title on:click=move |_| source.open()>
-            <MediaThumb source=shown sort=file.sort />
-            {(file.sort == Sort::Audio).then(|| view! { <span class="tile-name">{file.name}</span> })}
-        </button>
+        <div class="tile" class:gone=move || gone() || failed>
+            <button
+                type="button"
+                class="tile-open"
+                title=title
+                on:click=move |_| source.open()
+            >
+                <MediaThumb source=shown sort=file.sort />
+                {(file.sort == Sort::Audio).then(|| view! { <span class="tile-name">{file.name}</span> })}
+            </button>
+            {move || {
+                if gone() {
+                    Some(
+                        view! {
+                            <span class="tile-status" title="No longer on the server">"Off server"</span>
+                        }
+                        .into_any(),
+                    )
+                } else if failed {
+                    Some(
+                        view! {
+                            <span class="tile-status" title="Upload cancelled or failed">
+                                {if is_local { "Not sent" } else { "Cancelled" }}
+                            </span>
+                        }
+                        .into_any(),
+                    )
+                } else {
+                    None
+                }
+            }}
+            {delete}
+        </div>
     }
     .into_any()
 }
 
 /// `file` as a row of the file browser's list: its extension, name, size and day, and who sent
-/// it, the peer being `from`; and whether it is on the server, unless gone, as it expired, or it
-/// is among those `deleted` since it was listed.
-fn file_row(file: FileView, from: &str, deleted: RwSignal<HashSet<u64>>) -> AnyView {
+/// it, the peer being `from`; whether it is stored locally or on the server (or gone/cancelled).
+fn file_row(
+    peer: PublicKey,
+    file: FileView,
+    from: &str,
+    deleted: RwSignal<HashSet<u64>>,
+) -> AnyView {
     let Some(source) = Source::of(&file.body) else {
         return ().into_any();
     };
+    let ui = ui();
     let sender = if file.outgoing {
         "sent by you".to_string()
     } else {
         format!("from {from}")
     };
-    let (index, listed_gone) = (file.index, file.gone);
-    let gone = move || listed_gone || deleted.with(|deleted| deleted.contains(&index));
+    let (index, listed_gone, failed, deletable, outgoing) = (
+        file.index,
+        file.gone,
+        file.failed,
+        file.deletable,
+        file.outgoing,
+    );
+    let is_local = matches!(file.body, Body::File(_));
+    let gone = move || {
+        listed_gone
+            || deleted.with(|deleted| deleted.contains(&index))
+            || ui.gone.with(|gone| gone.contains(&(peer, index)))
+    };
     let details = format!("{} · {} · {sender}", size_u64(file.size), day(file.at));
-    let details = move || {
-        if gone() {
-            format!("{details} · no longer on the server")
-        } else {
-            details.clone()
-        }
+    let details = move || match file_status_suffix(is_local, gone(), failed, deletable, outgoing) {
+        Some(status) => format!("{details} · {status}"),
+        None => details.clone(),
     };
     // Media shows its preview, the rest its extension.
     let mark = match file.sort {
@@ -3286,10 +3762,6 @@ fn Viewer() -> impl IntoView {
         })
     };
     let close = move || {
-        // Its player stops before it goes.
-        if let Some(streamed) = ui.streaming.get_untracked() {
-            stop_players(&streamed.url);
-        }
         ui.viewer.set(None);
         ui.opening.set(None);
         ui.streaming.set(None);
@@ -3331,7 +3803,7 @@ fn Viewer() -> impl IntoView {
         let Some(attachment) = ui.viewer.get() else {
             searchable.set(false);
             if let Some(streamed) = ui.streaming.get() {
-                return Some(streamed_view(streamed));
+                return Some(view! { <StreamedView streamed /> }.into_any());
             }
             return waiting.get().then(opening_view);
         };
@@ -3360,12 +3832,7 @@ fn Viewer() -> impl IntoView {
                 None => no_preview(),
             },
             Kind::Video(mime) => match shown(blob_url(&attachment.data, mime)) {
-                Some(url) => view! {
-                    <div class="media">
-                        <video src=url controls></video>
-                    </div>
-                }
-                .into_any(),
+                Some(url) => view! { <VideoView url /> }.into_any(),
                 None => no_preview(),
             },
             Kind::Audio(mime) => match shown(blob_url(&attachment.data, mime)) {
@@ -3459,10 +3926,33 @@ fn Viewer() -> impl IntoView {
     }
 }
 
+/// A video shown in the viewer, stopping playback via its own `NodeRef` on cleanup.
+#[component]
+fn VideoView(url: String) -> impl IntoView {
+    let video_ref = NodeRef::<html::Video>::new();
+    on_cleanup(move || {
+        if let Some(video) = video_ref.get_untracked() {
+            stop_media(&video);
+        }
+    });
+    view! {
+        <div class="media">
+            <video node_ref=video_ref src=url controls></video>
+        </div>
+    }
+}
+
 /// A video or audio attachment playing as it is fetched, see [`Streamed`]. One that turns out
 /// not to play, e.g. as its name said video but no browser plays it, is fetched whole, to show
 /// as its bytes say, as one that does not stream.
-fn streamed_view(streamed: Streamed) -> AnyView {
+#[component]
+fn StreamedView(streamed: Streamed) -> impl IntoView {
+    let video_ref = NodeRef::<html::Video>::new();
+    on_cleanup(move || {
+        if let Some(video) = video_ref.get_untracked() {
+            stop_media(&video);
+        }
+    });
     let unplayable = {
         let (url, remote) = (streamed.url.clone(), streamed.remote.clone());
         move |_: ev::ErrorEvent| {
@@ -3474,7 +3964,7 @@ fn streamed_view(streamed: Streamed) -> AnyView {
                 let remote = remote.clone();
                 act(async move {
                     engine()
-                        .open_attachment(remote.peer, remote.pointer, remote.clock)
+                        .open_attachment(remote.peer, remote.index, remote.pointer, remote.clock)
                         .await
                 });
             }
@@ -3483,7 +3973,7 @@ fn streamed_view(streamed: Streamed) -> AnyView {
     if streamed.video {
         view! {
             <div class="media">
-                <video src=streamed.url controls on:error=unplayable></video>
+                <video node_ref=video_ref src=streamed.url controls on:error=unplayable></video>
             </div>
         }
         .into_any()
@@ -3508,7 +3998,13 @@ fn download_whole(remote: RemoteFile, downloading: RwSignal<HashSet<Vec<u8>>>) {
     act(async move {
         ui.notify(format!("Downloading {}…", remote.pointer.name));
         let fetched = engine()
-            .media(remote.peer, remote.pointer, remote.clock, &|| true)
+            .media(
+                remote.peer,
+                remote.index,
+                remote.pointer,
+                remote.clock,
+                &|| true,
+            )
             .await;
         downloading.update(|downloading| {
             downloading.remove(&id);
@@ -3533,6 +4029,12 @@ fn AudioView(
     #[prop(optional)]
     on_error: Option<UnsyncCallback<ev::ErrorEvent>>,
 ) -> impl IntoView {
+    let audio_ref = NodeRef::<html::Audio>::new();
+    on_cleanup(move || {
+        if let Some(audio) = audio_ref.get_untracked() {
+            stop_media(&audio);
+        }
+    });
     let tags = RwSignal::new(None::<preview::Tags>);
     let stream = url.clone();
     spawn_local(async move {
@@ -3572,6 +4074,7 @@ fn AudioView(
             <div class="track">
                 {shown}
                 <audio
+                    node_ref=audio_ref
                     src=url
                     controls
                     on:error=move |event| {
@@ -3585,8 +4088,8 @@ fn AudioView(
     }
 }
 
-/// How far opening an attachment got: how much of it is decrypted, on a bar, and whether it
-/// waits for its sender to upload the rest.
+/// How far opening an attachment got: how much of it is decrypted, on a native `<progress>` bar,
+/// and whether it waits for its sender to upload the rest.
 fn opening_view() -> AnyView {
     let ui = ui();
     let fraction = move || {
@@ -3611,10 +4114,9 @@ fn opening_view() -> AnyView {
     };
     view! {
         <div class="media">
-            <div class="opening" role="progressbar" aria-valuemin="0" aria-valuemax="100"
-                aria-valuenow=move || (fraction() * 100.0).round().to_string()>
-                <div class="bar">
-                    <div class="bar-fill" style:transform=move || format!("scaleX({})", fraction())></div>
+            <div class="opening">
+                <div class="opening-bar">
+                    <progress class="bar" max="1" prop:value=fraction></progress>
                 </div>
                 <span class="opening-note">{note}</span>
             </div>
@@ -3658,20 +4160,19 @@ fn select(element: &web_sys::Element, selector: &str) -> Vec<web_sys::Element> {
         .collect()
 }
 
-/// Make the links in `element` leave in a tab of their own, telling nothing of this page;
-/// highlight its code blocks, `pre > code[data-lang]`, and draw its Mermaid ones, as images.
-/// Blocks that fail stay as they are, saying why in `data-error`.
+/// Highlight `pre > code[data-lang]` blocks and draw Mermaid diagrams as images. Blocks that fail
+/// stay as they are, saying why in `data-error`. External links already receive
+/// `target="_blank" rel="noopener noreferrer"` during sanitization in `preview::sanitize_html`.
 fn enhance(element: &web_sys::Element) {
-    for link in select(element, "a[href^='http' i]") {
-        let _ = link.set_attribute("target", "_blank");
-        let _ = link.set_attribute("rel", "noopener noreferrer");
-    }
     for code in select(element, "pre > code[data-lang]") {
         spawn_local(async move {
             let info = code.get_attribute("data-lang").unwrap_or_default();
             let text = code.text_content().unwrap_or_default();
             let shown = if info.eq_ignore_ascii_case("mermaid") {
                 workers::diagram(&text).await.and_then(|svg| {
+                    if !code.is_connected() {
+                        return Ok(());
+                    }
                     // A data: URL, not a blob: one of this origin, which would open as a page.
                     let image = document().create_element("img").map_err(js_error)?;
                     image.set_class_name("diagram");
@@ -3684,13 +4185,15 @@ fn enhance(element: &web_sys::Element) {
                     Ok(())
                 })
             } else if let Some(language) = language::of_block(&info) {
-                workers::highlight(language, &text)
-                    .await
-                    .map(|html| code.set_inner_html(&html))
+                workers::highlight(language, &text).await.map(|html| {
+                    if code.is_connected() {
+                        code.set_inner_html(&html);
+                    }
+                })
             } else {
                 Ok(())
             };
-            if let (Err(e), Some(block)) = (shown, code.parent_element()) {
+            if let (Err(e), true, Some(block)) = (shown, code.is_connected(), code.parent_element()) {
                 let _ = block.set_attribute("data-error", &e);
             }
         });
@@ -3768,12 +4271,9 @@ fn Slides(source: String) -> impl IntoView {
     let changes = window_event_listener_untyped("fullscreenchange", move |_| {
         full.set(slides_full_screen());
     });
-    // Scaled to fit the screen, as it changes.
+    // Scaled to fit the screen declaratively via `--scale` CSS custom property, as it changes.
+    let scale = RwSignal::new(None::<String>);
     let fit = move || {
-        let Some(slides) = node.get_untracked() else {
-            return;
-        };
-        let style = web_sys::HtmlElement::style(&slides);
         if full.get_untracked() {
             let window = window();
             let size = |size: Result<JsValue, JsValue>| size.ok()?.as_f64();
@@ -3782,10 +4282,10 @@ fn Slides(source: String) -> impl IntoView {
             else {
                 return;
             };
-            let scale = (width / SLIDE_SIZE.0).min((height - SLIDES_BAR) / SLIDE_SIZE.1);
-            let _ = style.set_property("--scale", &scale.max(0.1).to_string());
+            let ratio = (width / SLIDE_SIZE.0).min((height - SLIDES_BAR) / SLIDE_SIZE.1);
+            scale.set(Some(ratio.max(0.1).to_string()));
         } else {
-            let _ = style.remove_property("--scale");
+            scale.set(None);
         }
     };
     Effect::new(move || {
@@ -3872,7 +4372,12 @@ fn Slides(source: String) -> impl IntoView {
         })
     };
     view! {
-        <div class="slides" class:full=move || full.get() node_ref=node>
+        <div
+            class="slides"
+            class:full=move || full.get()
+            style:--scale=move || scale.get()
+            node_ref=node
+        >
             {move || {
                 // Read here, where it is tracked: a component's children are built untracked.
                 let html = slide();
@@ -3933,124 +4438,154 @@ fn Slides(source: String) -> impl IntoView {
     }
 }
 
-/// A PDF, its pages drawn by a worker, each as it scrolls into view.
+/// A PDF, its pages declared via `<For>` and drawn by a worker once each canvas scrolls into view.
 #[component]
 fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
-    let node = NodeRef::<html::Div>::new();
-    // The document, and what draws its pages, until the view goes.
-    let shown = StoredValue::new_local(None::<(workers::Pdf, Drawing)>);
+    let container = NodeRef::<html::Div>::new();
+    let pdf_handle = StoredValue::new_local(None::<workers::Pdf>);
+    let pages = RwSignal::new(Vec::<(usize, f64, f64)>::new());
     let failed = RwSignal::new(None::<String>);
-    Effect::new(move || {
-        let Some(container) = node.get() else {
-            return;
-        };
-        let data = data.clone();
-        spawn_local(async move {
-            match workers::open_pdf(&data).await {
-                Ok((pdf, pages)) => {
-                    let container: web_sys::Element = container.into();
-                    match draw_pages(&container, pdf, &pages) {
-                        // Unless the view went meanwhile.
-                        Ok(drawing) => {
-                            if let Some(Some((pdf, drawing))) =
-                                shown.try_set_value(Some((pdf, drawing)))
-                            {
-                                drawing.observer.disconnect();
-                                workers::close_pdf(pdf);
-                            }
-                        }
-                        Err(e) => {
-                            workers::close_pdf(pdf);
-                            failed.try_set(Some(e));
-                        }
-                    }
+    let here = StoredValue::new(());
+    spawn_local(async move {
+        match workers::open_pdf(&data).await {
+            Ok((pdf, dims)) => {
+                if here.try_get_value().is_none() {
+                    workers::close_pdf(pdf);
+                    return;
                 }
-                Err(e) => {
-                    failed.try_set(Some(e));
+                if let Some(Some(previous)) = pdf_handle.try_set_value(Some(pdf)) {
+                    workers::close_pdf(previous);
                 }
+                let _ = pages.try_set(
+                    dims.into_iter()
+                        .enumerate()
+                        .map(|(index, (width, height))| (index, width, height))
+                        .collect(),
+                );
             }
-        });
+            Err(e) => {
+                let _ = failed.try_set(Some(e));
+            }
+        }
     });
     on_cleanup(move || {
-        if let Some(Some((pdf, drawing))) = shown.try_update_value(Option::take) {
-            drawing.observer.disconnect();
+        if let Some(Some(pdf)) = pdf_handle.try_update_value(Option::take) {
             workers::close_pdf(pdf);
         }
     });
     view! {
-        <div class="pdf" node_ref=node></div>
+        <div class="pdf" node_ref=container>
+            <For
+                each=move || pages.get()
+                key=|(index, _, _)| *index
+                children=move |(index, width, height)| {
+                    let pdf = pdf_handle.get_value();
+                    view! { <PdfPage pdf index width height container /> }
+                }
+            />
+        </div>
         {move || {
             failed.get().map(|e| view! { <p class="no-preview">{format!("The PDF does not show: {e}")}</p> })
         }}
     }
 }
 
-/// What draws a PDF's pages as they are about to show: an observer of their canvases, and what it
-/// calls, which must live as long as it observes.
-struct Drawing {
-    observer: IntersectionObserver,
-    _draw: Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
-}
-
-/// Put a canvas a page of `pdf`, whose sizes are `pages`, in `container`, sized before it is
-/// drawn, so that the pages after it are where they will be; each is drawn once it is about to
-/// show.
-fn draw_pages(
-    container: &web_sys::Element,
-    pdf: workers::Pdf,
-    pages: &[(f64, f64)],
-) -> Result<Drawing, String> {
-    let draw = Closure::<dyn FnMut(js_sys::Array, IntersectionObserver)>::new(
-        move |entries: js_sys::Array, observer: IntersectionObserver| {
-            for entry in entries.iter() {
-                let entry: IntersectionObserverEntry = entry.unchecked_into();
-                let Ok(canvas) = entry.target().dyn_into::<HtmlCanvasElement>() else {
-                    continue;
-                };
-                if !entry.is_intersecting() {
-                    continue;
+/// One declaratively mounted canvas page of a PDF, observed with `IntersectionObserver` via its
+/// `NodeRef` so it draws only once about to scroll into view.
+#[component]
+fn PdfPage(
+    pdf: Option<workers::Pdf>,
+    index: usize,
+    width: f64,
+    height: f64,
+    container: NodeRef<html::Div>,
+) -> impl IntoView {
+    let canvas = NodeRef::<html::Canvas>::new();
+    let drawn = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let watching = StoredValue::new_local(
+        None::<(
+            IntersectionObserver,
+            Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
+        )>,
+    );
+    Effect::new(move || {
+        let (Some(pdf), Some(canvas_el)) = (pdf, canvas.get()) else {
+            return;
+        };
+        let target: HtmlCanvasElement = canvas_el;
+        let target_for_cb = target.clone();
+        let draw = Closure::<dyn FnMut(js_sys::Array, IntersectionObserver)>::new(
+            move |entries: js_sys::Array, observer: IntersectionObserver| {
+                let visible = entries.iter().any(|entry| {
+                    entry
+                        .unchecked_into::<IntersectionObserverEntry>()
+                        .is_intersecting()
+                });
+                if !visible {
+                    return;
                 }
-                observer.unobserve(&canvas);
+                observer.disconnect();
+                let canvas_el = target_for_cb.clone();
                 spawn_local(async move {
-                    if let Err(e) = draw_page(pdf, &canvas).await {
-                        let _ = canvas.set_attribute("data-error", &e);
+                    match draw_page(pdf, index, &canvas_el).await {
+                        Ok(()) => {
+                            let _ = drawn.try_set(true);
+                        }
+                        Err(e) => {
+                            let _ = error.try_set(Some(e));
+                        }
                     }
                 });
-            }
-        },
-    );
-    let options = IntersectionObserverInit::new();
-    options.set_root(container.closest(".viewer-content").ok().flatten().as_ref());
-    options.set_root_margin("200px");
-    let observer = IntersectionObserver::new_with_options(draw.as_ref().unchecked_ref(), &options)
-        .map_err(js_error)?;
-    for (index, (width, height)) in pages.iter().enumerate() {
-        let canvas = document().create_element("canvas").map_err(js_error)?;
-        canvas.set_class_name("pdf-page");
-        let _ = canvas.set_attribute("data-page", &index.to_string());
-        let style = canvas.unchecked_ref::<web_sys::HtmlElement>().style();
-        let _ = style.set_property("aspect-ratio", &format!("{width} / {height}"));
-        container.append_child(&canvas).map_err(js_error)?;
-        observer.observe(&canvas);
+            },
+        );
+        let options = IntersectionObserverInit::new();
+        let root = container
+            .get_untracked()
+            .and_then(|c| c.closest(".viewer-content").ok().flatten());
+        options.set_root(root.as_ref());
+        options.set_root_margin("200px");
+        let Ok(observer) =
+            IntersectionObserver::new_with_options(draw.as_ref().unchecked_ref(), &options)
+        else {
+            return;
+        };
+        observer.observe(&target);
+        watching.set_value(Some((observer, draw)));
+    });
+    on_cleanup(move || {
+        if let Some(Some((observer, _))) = watching.try_update_value(Option::take) {
+            observer.disconnect();
+        }
+    });
+    let aspect = format!("{width} / {height}");
+    view! {
+        <canvas
+            class="pdf-page"
+            node_ref=canvas
+            style:aspect-ratio=aspect
+            data-page=index.to_string()
+            data-drawn=move || drawn.get().then_some("yes")
+            data-error=move || error.get()
+        ></canvas>
     }
-    Ok(Drawing {
-        observer,
-        _draw: draw,
-    })
 }
 
-/// Draw the page of `pdf` that `canvas` shows, as sharp as the screen shows it, at most twice
-/// as sharp as CSS pixels.
-async fn draw_page(pdf: workers::Pdf, canvas: &HtmlCanvasElement) -> Result<(), String> {
-    let index: usize = canvas
-        .get_attribute("data-page")
-        .and_then(|page| page.parse().ok())
-        .ok_or("no page")?;
+/// Draw page `index` of `pdf` onto `canvas`, as sharp as the screen shows it, at most twice as
+/// sharp as CSS pixels.
+async fn draw_page(
+    pdf: workers::Pdf,
+    index: usize,
+    canvas: &HtmlCanvasElement,
+) -> Result<(), String> {
     let ratio = web_sys::window()
         .map_or(1.0, |window| window.device_pixel_ratio())
         .min(2.0);
     let width = (f64::from(canvas.client_width()) * ratio).round().max(1.0) as u32;
     let image = workers::render_pdf(pdf, index, width).await?;
+    if !canvas.is_connected() {
+        return Ok(());
+    }
     canvas.set_width(image.width());
     canvas.set_height(image.height());
     let context: CanvasRenderingContext2d = canvas
@@ -4059,7 +4594,6 @@ async fn draw_page(pdf: workers::Pdf, canvas: &HtmlCanvasElement) -> Result<(), 
         .ok_or("no 2D context")?
         .unchecked_into();
     context.put_image_data(&image, 0.0, 0.0).map_err(js_error)?;
-    let _ = canvas.set_attribute("data-drawn", "yes");
     Ok(())
 }
 
@@ -4217,27 +4751,42 @@ fn Toast() -> impl IntoView {
     }
 }
 
-/// Files dropped anywhere on the page go to the open chat.
+/// Whether a drag event carries files (ignoring text selections or dragged page elements).
+fn drag_has_files(event: &ev::DragEvent) -> bool {
+    event
+        .data_transfer()
+        .is_some_and(|transfer| transfer.types().includes(&JsValue::from_str("Files"), 0))
+}
+
+/// Files dropped anywhere on the page go to the open chat (only when unlocked with no modal or
+/// viewer open).
 #[component]
 fn Dropzone() -> impl IntoView {
     let ui = ui();
     // dragenter and dragleave come for every element passed over; the count says when the
     // drag leaves the page.
     let depth = RwSignal::new(0i32);
-    let accepts = move || {
-        ui.open
-            .get_untracked()
-            .and_then(|peer| ui.contact(&peer))
-            .is_some_and(|contact| !contact.request && !contact.is_quarantined())
+    let accepts = move |event: &ev::DragEvent| {
+        drag_has_files(event)
+            && ui.phase.get_untracked() == Phase::Unlocked
+            && ui.dialog.with_untracked(Option::is_none)
+            && ui.viewer.with_untracked(Option::is_none)
+            && ui.opening.with_untracked(Option::is_none)
+            && ui.streaming.with_untracked(Option::is_none)
+            && ui
+                .open
+                .get_untracked()
+                .and_then(|peer| ui.contact(&peer))
+                .is_some_and(|contact| !contact.request && !contact.is_quarantined())
     };
     let _ = window_event_listener(ev::dragenter, move |event| {
-        if accepts() {
+        if accepts(&event) {
             event.prevent_default();
             depth.update(|depth| *depth += 1);
         }
     });
     let _ = window_event_listener(ev::dragover, move |event| {
-        if accepts() {
+        if accepts(&event) {
             event.prevent_default();
         }
     });
@@ -4246,13 +4795,21 @@ fn Dropzone() -> impl IntoView {
     });
     let _ = window_event_listener(ev::drop, move |event| {
         depth.set(0);
-        if accepts() {
+        if accepts(&event) {
             event.prevent_default();
             if let Some(files) = event.data_transfer().and_then(|transfer| transfer.files()) {
                 send_files(files);
             }
         }
     });
+    let hidden = move || {
+        depth.get() == 0
+            || ui.phase.get() != Phase::Unlocked
+            || ui.dialog.with(Option::is_some)
+            || ui.viewer.with(Option::is_some)
+            || ui.opening.with(Option::is_some)
+            || ui.streaming.with(Option::is_some)
+    };
     let to = move || {
         let name = ui
             .open
@@ -4263,7 +4820,7 @@ fn Dropzone() -> impl IntoView {
         format!("to {name} · up to {} each", size_u64(MAX_FILE_SIZE as u64))
     };
     view! {
-        <div class="dropzone" hidden=move || depth.get() == 0>
+        <div class="dropzone" hidden=hidden>
             "Drop to encrypt and send"
             <span>{to}</span>
         </div>
@@ -4380,9 +4937,116 @@ mod tests {
         assert!(!contact_can_upgrade_to_pq(&pq));
 
         let mut quarantined = sample_contact();
+        quarantined.has_active_session = true;
         quarantined.classical_prompt = ClassicalPrompt::InboundQuarantined {
             peer_was_pq_pinned: false,
         };
         assert!(contact_can_upgrade_to_pq(&quarantined));
+        let (class, compact, title) = security_badge_parts(&quarantined, false);
+        assert_eq!(class, "sec-badge classical");
+        assert_eq!(compact, "Quarantined");
+        assert_eq!(title, "Classical chat quarantined — review before replying");
+        let (class, detailed, _) = security_badge_parts(&quarantined, true);
+        assert_eq!(class, "sec-badge classical");
+        assert_eq!(
+            detailed,
+            "Classical chat quarantined — review before replying"
+        );
+    }
+
+    #[test]
+    fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
+        // Accepted quarantined chat -> warn style + "classical chat (quarantined)".
+        let mut accepted_q = sample_contact();
+        accepted_q.request = false;
+        accepted_q.classical_prompt = ClassicalPrompt::InboundQuarantined {
+            peer_was_pq_pinned: false,
+        };
+        assert_eq!(
+            chat_item_meta(&accepted_q),
+            (false, true, false, "classical chat (quarantined)".to_string())
+        );
+
+        // Unaccepted quarantined request -> warn style + "classical request (quarantined)".
+        let mut request_q = accepted_q.clone();
+        request_q.request = true;
+        assert_eq!(
+            chat_item_meta(&request_q),
+            (
+                false,
+                true,
+                false,
+                "classical request (quarantined)".to_string()
+            )
+        );
+
+        // Downgraded + quarantined -> danger style.
+        let mut downgrade_q = accepted_q;
+        downgrade_q.downgrade_detected = true;
+        assert_eq!(
+            chat_item_meta(&downgrade_q),
+            (
+                false,
+                false,
+                true,
+                "downgrade detected (quarantined)".to_string()
+            )
+        );
+
+        // Outbound classical approval prompt -> warn style.
+        let mut outbound = sample_contact();
+        outbound.classical_prompt = ClassicalPrompt::Outbound {
+            peer_signed_off: true,
+        };
+        assert_eq!(
+            chat_item_meta(&outbound),
+            (false, true, false, "classical approval needed".to_string())
+        );
+
+        // Security alerts -> warn style.
+        let mut expired = sample_contact();
+        expired.alert = SecurityAlert::ManifestExpired;
+        assert_eq!(
+            chat_item_meta(&expired),
+            (false, true, false, "peer PQ manifest expired".to_string())
+        );
+        let mut strict = sample_contact();
+        strict.alert = SecurityAlert::PqRequired;
+        assert_eq!(
+            chat_item_meta(&strict),
+            (false, true, false, "PQ required (paused)".to_string())
+        );
+    }
+
+    #[test]
+    fn file_status_suffix_distinguishes_local_cancelled_waiting_and_malformed() {
+        assert_eq!(
+            file_status_suffix(true, false, false, false, true),
+            Some("stored locally")
+        );
+        assert_eq!(
+            file_status_suffix(true, false, true, false, true),
+            Some("not sent")
+        );
+        assert_eq!(
+            file_status_suffix(false, true, false, false, true),
+            Some("no longer on the server")
+        );
+        // Cancelled / failed sign-in-held upload must NOT show "waiting to upload".
+        assert_eq!(
+            file_status_suffix(false, false, true, false, true),
+            Some("upload cancelled")
+        );
+        assert_eq!(
+            file_status_suffix(false, false, false, true, true),
+            Some("on server")
+        );
+        // Outgoing unuploaded non-failed attachment -> waiting to upload.
+        assert_eq!(
+            file_status_suffix(false, false, false, false, true),
+            Some("waiting to upload")
+        );
+        // Malformed incoming remote pointer -> no misleading "waiting to upload".
+        assert_eq!(file_status_suffix(false, false, false, false, false), None);
     }
 }
