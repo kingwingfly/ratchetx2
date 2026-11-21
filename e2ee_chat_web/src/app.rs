@@ -245,6 +245,14 @@ fn Sidebar() -> impl IntoView {
                     {icon(Icon::Key)}
                 </button>
                 <button
+                    class="btn icon small"
+                    title="Settings"
+                    aria-label="Settings"
+                    on:click=move |_| ui.dialog.set(Some(Dialog::Settings))
+                >
+                    {icon(Icon::Settings)}
+                </button>
+                <button
                     class="btn icon small quiet"
                     title="Lock the vault"
                     aria-label="Lock the vault"
@@ -358,14 +366,39 @@ fn Welcome() -> impl IntoView {
     }
 }
 
-/// Render a security status badge for `contact` (`detailed` shows the full label in `ContactInfo`).
-fn security_badge(contact: &ContactView, detailed: bool) -> AnyView {
-    let (class, label, title) = if contact.has_downgrade() {
+/// Compute `(css_class, label, tooltip)` for a contact's security badge (`detailed` shows the full
+/// label in `ContactInfo`).
+fn security_badge_parts(contact: &ContactView, detailed: bool) -> (&'static str, String, String) {
+    if contact.has_downgrade() {
         (
             "sec-badge danger",
             "Downgrade detected".to_string(),
             "Post-quantum downgrade detected for this chat".to_string(),
         )
+    } else if !contact.has_active_session {
+        if contact.pq_pinned {
+            let label = if detailed {
+                "Session ended — next message starts a new post-quantum session"
+            } else {
+                "PQ · Session ended"
+            };
+            (
+                "sec-badge neutral",
+                label.to_string(),
+                "Session ended; post-quantum encryption is pinned for the next session".to_string(),
+            )
+        } else {
+            let label = if detailed {
+                "No active session — next message starts a new session"
+            } else {
+                "Session ended"
+            };
+            (
+                "sec-badge neutral",
+                label.to_string(),
+                "No active session — next message starts a new session".to_string(),
+            )
+        }
     } else if contact.security.is_pq {
         let text = if detailed {
             contact.security.detail_label()
@@ -379,7 +412,19 @@ fn security_badge(contact: &ContactView, detailed: bool) -> AnyView {
             "Classical only".to_string(),
             contact.security.detail_label(),
         )
-    };
+    }
+}
+
+/// Whether `ContactInfo` should offer `"Upgrade to PQ"` for `contact` when local PQ is available.
+fn contact_can_upgrade_to_pq(contact: &ContactView) -> bool {
+    contact.has_downgrade()
+        || contact.is_quarantined()
+        || (contact.has_active_session && !contact.security.is_pq)
+}
+
+/// Render a security status badge for `contact` (`detailed` shows the full label in `ContactInfo`).
+fn security_badge(contact: &ContactView, detailed: bool) -> AnyView {
+    let (class, label, title) = security_badge_parts(contact, detailed);
     view! {
         <span class=class title=title>
             {label}
@@ -1698,6 +1743,7 @@ fn VaultDialog() -> impl IntoView {
                     }),
                 ) => view! { <NewChat key name server pq_pinned /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Identity)) => view! { <Identity /> }.into_any(),
+                (Phase::Unlocked, Some(Dialog::Settings)) => view! { <Settings /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Contact(peer))) => {
                     view! { <ContactInfo peer /> }.into_any()
                 }
@@ -1973,21 +2019,16 @@ fn CreateVault() -> impl IntoView {
                 })}
             {pq_compiled.then(|| {
                 view! {
-                    <label class="toggle-row" for="create-pq">
-                        <input
+                    <div class="settings-card create-pq">
+                        <ToggleSwitch
                             id="create-pq"
-                            type="checkbox"
-                            prop:checked=move || pq_enabled.get()
-                            on:change=move |ev: ev::Event| {
-                                let input: web_sys::HtmlInputElement = event_target(&ev);
-                                pq_enabled.set(input.checked());
-                            }
+                            title="Post-quantum encryption"
+                            description="Protects new chats against future quantum computers."
+                            checked=Signal::derive(move || pq_enabled.get())
+                            disabled=Signal::derive(move || progress.working.get())
+                            on_toggle=move |on| pq_enabled.set(on)
                         />
-                        <span>
-                            <strong>"Post-quantum encryption"</strong>
-                            <small>"Enabled by default (PQXDH + PQ Ratchet)."</small>
-                        </span>
-                    </label>
+                    </div>
                 }
             })}
             {progress.view()}
@@ -2295,16 +2336,51 @@ fn NewChat(
     }
 }
 
-/// Human-readable label for an ML-KEM suite in the UI.
-fn pq_suite_label(suite: PqSuite) -> &'static str {
-    match suite {
-        PqSuite::MlKem1024 => "ML-KEM-1024 (default, NIST Level 5)",
-        PqSuite::MlKem768 => "ML-KEM-768 (NIST Level 3)",
+/// Accessible custom CSS pill toggle switch row.
+#[component]
+fn ToggleSwitch(
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    checked: Signal<bool>,
+    disabled: Signal<bool>,
+    on_toggle: impl Fn(bool) + 'static,
+) -> impl IntoView {
+    view! {
+        <label class="switch-row" class:disabled=move || disabled.get() for=id>
+            <span class="switch-copy">
+                <strong>{title}</strong>
+                <small>{description}</small>
+            </span>
+            <span class="switch">
+                <input
+                    id=id
+                    type="checkbox"
+                    role="switch"
+                    disabled=move || disabled.get()
+                    prop:checked=move || checked.get()
+                    on:change=move |ev: ev::Event| {
+                        on_toggle(event_target_checked(&ev));
+                    }
+                />
+                <span class="switch-track" aria-hidden="true">
+                    <span class="switch-thumb"></span>
+                </span>
+            </span>
+        </label>
     }
 }
 
-/// Short description of the server's advertised PQ support.
-fn server_pq_summary(status: &ServerPqStatus) -> String {
+/// Display label and concise hint for an ML-KEM suite in the segmented control.
+fn pq_suite_option(suite: PqSuite) -> (&'static str, &'static str) {
+    match suite {
+        PqSuite::MlKem1024 => ("ML-KEM-1024", "Stronger"),
+        PqSuite::MlKem768 => ("ML-KEM-768", "Smaller"),
+    }
+}
+
+/// Compact pill `(css_class, label, tooltip)` for the server's advertised PQ support.
+fn server_pq_pill(status: &ServerPqStatus) -> (&'static str, &'static str, String) {
     match status {
         ServerPqStatus::Enabled { suites, pq_ratchet } => {
             let names: Vec<_> = suites
@@ -2319,21 +2395,28 @@ fn server_pq_summary(status: &ServerPqStatus) -> String {
             } else {
                 names.join(", ")
             };
-            if *pq_ratchet {
-                format!("Server PQ status: enabled ({list}, PQ Ratchet supported).")
+            let title = if *pq_ratchet {
+                format!("Server supports post-quantum encryption ({list}, continuous re-keying).")
             } else {
-                format!("Server PQ status: enabled ({list}).")
-            }
+                format!("Server supports post-quantum encryption ({list}).")
+            };
+            ("sec-badge pq", "Server: PQ ready", title)
         }
-        ServerPqStatus::Disabled => {
-            "Server PQ status: disabled on this server. Classical mode will be used unless Require PQ is enabled."
-                .to_string()
-        }
-        ServerPqStatus::AudienceMismatch => {
-            "Server PQ status: server ID did not match this server's expected audience."
-                .to_string()
-        }
-        ServerPqStatus::Unknown => "Server PQ status: checking…".to_string(),
+        ServerPqStatus::Disabled => (
+            "sec-badge classical",
+            "Server: Classical only",
+            "This server does not have post-quantum encryption enabled.".to_string(),
+        ),
+        ServerPqStatus::AudienceMismatch => (
+            "sec-badge danger",
+            "Server: ID mismatch",
+            "Server ID did not match this server's expected audience.".to_string(),
+        ),
+        ServerPqStatus::Unknown => (
+            "sec-badge neutral",
+            "Server: Checking…",
+            "Checking server post-quantum support…".to_string(),
+        ),
     }
 }
 
@@ -2344,48 +2427,15 @@ fn Identity() -> impl IntoView {
         return ().into_any();
     };
     let name = RwSignal::new(me.name.clone());
-    let compiled_suites = PqConfig::compiled_suites();
-    let pq_compiled = !compiled_suites.is_empty();
-    let initial_pq = me.pq_config.clone();
-    let pq_enabled = RwSignal::new(pq_compiled && initial_pq.pq_enabled);
-    let preferred_suite = RwSignal::new(if compiled_suites.contains(&initial_pq.preferred_suite) {
-        initial_pq.preferred_suite
-    } else {
-        PqConfig::default_suite()
-    });
-    let pq_ratchet_enabled = RwSignal::new(pq_compiled && initial_pq.pq_ratchet_enabled);
-    let strict_pq = RwSignal::new(pq_compiled && initial_pq.pq_enabled && initial_pq.strict_pq);
-    // Saving, publishing or signing out, which its buttons wait for.
+    // Saving or publishing prekeys, which its buttons wait for.
     let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         let engine = engine();
-        let next_pq = PqConfig {
-            pq_enabled: pq_compiled && pq_enabled.get_untracked(),
-            preferred_suite: preferred_suite.get_untracked(),
-            pq_ratchet_enabled: pq_compiled && pq_ratchet_enabled.get_untracked(),
-            strict_pq: pq_compiled && pq_enabled.get_untracked() && strict_pq.get_untracked(),
-        };
         let next_name = name.get_untracked();
         act_while(busy, async move {
             engine.set_name(next_name).await?;
-            let pq_changed = pq_compiled
-                && engine
-                    .ui()
-                    .me
-                    .with_untracked(|me| me.as_ref().is_some_and(|me| me.pq_config != next_pq));
-            if pq_compiled {
-                // Always invoke `set_pq_config` when PQ is compiled: it compares against live
-                // vault state (avoiding stale mount-time snapshots after a failed publish) and
-                // no-ops cleanly when `previous == config && !needs_publish`.
-                engine.set_pq_config(next_pq).await?;
-            }
             engine.ui().dialog.set(None);
-            engine.ui().notify(if pq_changed {
-                "Saved settings and published updated prekeys."
-            } else {
-                "Saved your identity settings."
-            });
             Ok(())
         });
     };
@@ -2396,163 +2446,6 @@ fn Identity() -> impl IntoView {
             engine.ui().notify("Published new prekeys.");
             Ok(())
         });
-    };
-    // Whether the server keeps this browser's files, as it is signed in to it.
-    let signed_in = RwSignal::new(None::<Result<Option<SignIn>, String>>);
-    spawn_local(async move {
-        signed_in.try_set(Some(engine().signed_in().await));
-    });
-    let sign_out = move |_| {
-        let engine = engine();
-        act_while(busy, async move {
-            engine.sign_out().await?;
-            signed_in.try_set(Some(Ok(None)));
-            engine
-                .ui()
-                .notify("Signed out: files wait for the next sign-in.");
-            Ok(())
-        });
-    };
-    let files = move || match signed_in.get() {
-        None => view! { <p class="hint">"Asking the server…"</p> }.into_any(),
-        Some(Ok(Some(signed_in))) => view! {
-            <p class="hint">
-                {format!(
-                    "Signed in to the server until {}.",
-                    day(signed_in.expires),
-                )}
-                " "
-                <button
-                    type="button"
-                    class="link"
-                    disabled=move || busy.get()
-                    on:click=sign_out
-                >
-                    "Sign out"
-                </button>
-            </p>
-        }
-        .into_any(),
-        Some(Ok(None)) => view! {
-            <p class="hint">
-                "The server is only for those signed in to it: until then, nothing goes. "
-                <button
-                    type="button"
-                    class="link"
-                    on:click=move |_| ui.dialog.set(Some(Dialog::SignIn))
-                >
-                    "Sign in"
-                </button>
-            </p>
-        }
-        .into_any(),
-        Some(Err(e)) => {
-            view! { <p class="hint">{format!("Cannot ask the server: {e}")}</p> }.into_any()
-        }
-    };
-    let pq_section = if pq_compiled {
-        let suites_for_select = compiled_suites.clone();
-        view! {
-            <div class="pq-settings">
-                <label class="toggle-row" for="pq-enabled">
-                    <input
-                        id="pq-enabled"
-                        type="checkbox"
-                        disabled=move || busy.get()
-                        prop:checked=move || pq_enabled.get()
-                        on:change=move |ev: ev::Event| {
-                            let input: web_sys::HtmlInputElement = event_target(&ev);
-                            let on = input.checked();
-                            pq_enabled.set(on);
-                            if !on {
-                                strict_pq.set(false);
-                            }
-                        }
-                    />
-                    <span>
-                        <strong>"Post-quantum encryption"</strong>
-                        <small>"Publish ML-KEM prekeys and signed capability manifest (ON by default)."</small>
-                    </span>
-                </label>
-                <label for="pq-suite">"Preferred KEM suite"</label>
-                <select
-                    id="pq-suite"
-                    disabled=move || busy.get() || !pq_enabled.get()
-                    prop:value=move || preferred_suite.get().as_u8().to_string()
-                    on:change=move |ev: ev::Event| {
-                        let select: web_sys::HtmlSelectElement = event_target(&ev);
-                        if let Some(suite) = select.value().parse::<u8>().ok().and_then(PqSuite::from_u8) {
-                            preferred_suite.set(suite);
-                        }
-                    }
-                >
-                    {suites_for_select
-                        .into_iter()
-                        .map(|suite| {
-                            let val = suite.as_u8().to_string();
-                            view! {
-                                <option value=val selected=move || preferred_suite.get() == suite>
-                                    {pq_suite_label(suite)}
-                                </option>
-                            }
-                        })
-                        .collect_view()}
-                </select>
-                <label class="toggle-row" for="pq-ratchet">
-                    <input
-                        id="pq-ratchet"
-                        type="checkbox"
-                        disabled=move || busy.get() || !pq_enabled.get()
-                        prop:checked=move || pq_ratchet_enabled.get()
-                        on:change=move |ev: ev::Event| {
-                            let input: web_sys::HtmlInputElement = event_target(&ev);
-                            pq_ratchet_enabled.set(input.checked());
-                        }
-                    />
-                    <span>
-                        <strong>"PQ Ratchet (PQ-PCS)"</strong>
-                        <small>"Periodically re-key sessions with fresh ML-KEM encapsulations."</small>
-                    </span>
-                </label>
-                <label class="toggle-row" for="pq-strict">
-                    <input
-                        id="pq-strict"
-                        type="checkbox"
-                        disabled=move || busy.get() || !pq_enabled.get()
-                        prop:checked=move || strict_pq.get()
-                        on:change=move |ev: ev::Event| {
-                            let input: web_sys::HtmlInputElement = event_target(&ev);
-                            strict_pq.set(input.checked());
-                        }
-                    />
-                    <span>
-                        <strong>"Require PQ (strict mode)"</strong>
-                        <small>"Refuse classical fallback and omit legacy raw SPK signatures."</small>
-                    </span>
-                </label>
-                <p class="hint">
-                    {move || {
-                        ui.me
-                            .with(|me| {
-                                me.as_ref()
-                                    .map(|m| server_pq_summary(&m.server_pq))
-                                    .unwrap_or_default()
-                            })
-                    }}
-                </p>
-            </div>
-        }
-        .into_any()
-    } else {
-        view! {
-            <div class="pq-settings">
-                <span class="sec-badge classical">"Classical-only build"</span>
-                <p class="hint">
-                    "This client was built without post-quantum cryptography (classical X3DH + Double Ratchet only)."
-                </p>
-            </div>
-        }
-        .into_any()
     };
     view! {
         <form on:submit=submit>
@@ -2570,10 +2463,6 @@ fn Identity() -> impl IntoView {
             }}
             <label for="my-name">"Your name, which new chats see"</label>
             <input id="my-name" autocomplete="nickname" maxlength=NAME_MAX bind:value=name />
-            <label>"Post-quantum security"</label>
-            {pq_section}
-            <label>"Server"</label>
-            {files}
             <div class="actions">
                 <button
                     type="button"
@@ -2585,6 +2474,263 @@ fn Identity() -> impl IntoView {
                     "New prekeys"
                 </button>
                 <button type="button" class="btn" on:click=move |_| close_dialog()>
+                    "Cancel"
+                </button>
+                <button type="submit" class="btn primary" disabled=move || busy.get()>
+                    "Save"
+                </button>
+            </div>
+        </form>
+    }
+    .into_any()
+}
+
+#[component]
+fn Settings() -> impl IntoView {
+    let ui = ui();
+    let Some(me) = ui.me.get_untracked() else {
+        return ().into_any();
+    };
+    let server_url = me.server.clone();
+    let compiled_suites = PqConfig::compiled_suites();
+    let pq_compiled = !compiled_suites.is_empty();
+    let initial_pq = me.pq_config.clone();
+    let pq_enabled = RwSignal::new(pq_compiled && initial_pq.pq_enabled);
+    let preferred_suite = RwSignal::new(if compiled_suites.contains(&initial_pq.preferred_suite) {
+        initial_pq.preferred_suite
+    } else {
+        PqConfig::default_suite()
+    });
+    let pq_ratchet_enabled = RwSignal::new(pq_compiled && initial_pq.pq_ratchet_enabled);
+    let strict_pq = RwSignal::new(pq_compiled && initial_pq.pq_enabled && initial_pq.strict_pq);
+    let advanced_open = pq_compiled && (initial_pq.strict_pq || !initial_pq.pq_ratchet_enabled);
+    // Saving settings or signing out, which its buttons wait for.
+    let busy = RwSignal::new(false);
+    let submit = move |event: ev::SubmitEvent| {
+        event.prevent_default();
+        let engine = engine();
+        let next_pq = PqConfig {
+            pq_enabled: pq_compiled && pq_enabled.get_untracked(),
+            preferred_suite: preferred_suite.get_untracked(),
+            pq_ratchet_enabled: pq_compiled && pq_ratchet_enabled.get_untracked(),
+            strict_pq: pq_compiled && pq_enabled.get_untracked() && strict_pq.get_untracked(),
+        };
+        act_while(busy, async move {
+            let pq_changed = pq_compiled
+                && engine
+                    .ui()
+                    .me
+                    .with_untracked(|me| me.as_ref().is_some_and(|me| me.pq_config != next_pq));
+            if pq_compiled {
+                // Always invoke `set_pq_config` when PQ is compiled: it compares against live
+                // vault state (avoiding stale mount-time snapshots after a failed publish) and
+                // no-ops cleanly when `previous == config && !needs_publish`.
+                engine.set_pq_config(next_pq).await?;
+            }
+            engine.ui().dialog.set(None);
+            if pq_changed {
+                engine
+                    .ui()
+                    .notify("Saved settings and published updated prekeys.");
+            } else if pq_compiled {
+                engine.ui().notify("Settings saved.");
+            }
+            Ok(())
+        });
+    };
+    // Whether this browser is signed in to the server.
+    let signed_in = RwSignal::new(None::<Result<Option<SignIn>, String>>);
+    spawn_local(async move {
+        signed_in.try_set(Some(engine().signed_in().await));
+    });
+    let sign_out = move |_| {
+        let engine = engine();
+        act_while(busy, async move {
+            engine.sign_out().await?;
+            signed_in.try_set(Some(Ok(None)));
+            engine
+                .ui()
+                .notify("Signed out: files wait for the next sign-in.");
+            Ok(())
+        });
+    };
+    let pq_controls_disabled = Signal::derive(move || busy.get() || !pq_enabled.get());
+    let server_row = move || match signed_in.get() {
+        None => view! {
+            <div class="settings-server-row">
+                <div class="settings-copy">
+                    <span class="settings-muted">"Checking sign-in status…"</span>
+                </div>
+            </div>
+        }
+        .into_any(),
+        Some(Ok(Some(signed_in))) => view! {
+            <div class="settings-server-row">
+                <div class="settings-copy">
+                    <strong>{format!("Signed in until {}", day(signed_in.expires))}</strong>
+                    <small>{server_url.clone()}</small>
+                </div>
+                <button
+                    type="button"
+                    class="btn small"
+                    disabled=move || busy.get()
+                    on:click=sign_out
+                >
+                    "Sign out"
+                </button>
+            </div>
+        }
+        .into_any(),
+        Some(Ok(None)) => view! {
+            <div class="settings-server-row">
+                <div class="settings-copy">
+                    <strong>"Not signed in"</strong>
+                    <small>"Sign in to send messages and files through this server."</small>
+                </div>
+                <button
+                    type="button"
+                    class="btn primary small"
+                    disabled=move || busy.get()
+                    on:click=move |_| ui.dialog.set(Some(Dialog::SignIn))
+                >
+                    "Sign in"
+                </button>
+            </div>
+        }
+        .into_any(),
+        Some(Err(e)) => view! {
+            <div class="settings-server-row">
+                <div class="settings-copy">
+                    <span class="settings-error">{format!("Cannot reach server: {e}")}</span>
+                </div>
+            </div>
+        }
+        .into_any(),
+    };
+    let encryption_card = if pq_compiled {
+        let suites_for_segments = compiled_suites.clone();
+        view! {
+            <div class="settings-card">
+                <ToggleSwitch
+                    id="pq-enabled"
+                    title="Post-quantum encryption"
+                    description="Protects new chats against future quantum computers."
+                    checked=Signal::derive(move || pq_enabled.get())
+                    disabled=Signal::derive(move || busy.get())
+                    on_toggle=move |on| {
+                        pq_enabled.set(on);
+                        if !on {
+                            strict_pq.set(false);
+                        }
+                    }
+                />
+                <div class="settings-block" class:disabled=move || pq_controls_disabled.get()>
+                    <div id="pq-strength-label" class="settings-sublabel">"Key strength"</div>
+                    <div
+                        class="segmented"
+                        role="radiogroup"
+                        aria-labelledby="pq-strength-label"
+                    >
+                        {suites_for_segments
+                            .into_iter()
+                            .map(|suite| {
+                                let (label, hint) = pq_suite_option(suite);
+                                view! {
+                                    <button
+                                        type="button"
+                                        class="segment"
+                                        class:active=move || preferred_suite.get() == suite
+                                        role="radio"
+                                        aria-checked=move || {
+                                            if preferred_suite.get() == suite {
+                                                "true"
+                                            } else {
+                                                "false"
+                                            }
+                                        }
+                                        disabled=move || pq_controls_disabled.get()
+                                        on:click=move |_| preferred_suite.set(suite)
+                                    >
+                                        <span class="segment-title">{label}</span>
+                                        <span class="segment-hint">{hint}</span>
+                                    </button>
+                                }
+                            })
+                            .collect_view()}
+                    </div>
+                </div>
+                <details class="settings-advanced" open=advanced_open>
+                    <summary>"Advanced"</summary>
+                    <div class="settings-advanced-body">
+                        <ToggleSwitch
+                            id="pq-ratchet"
+                            title="Continuous PQ re-keying"
+                            description="Refresh quantum-resistant keys during long chats so sessions recover if a device is ever compromised."
+                            checked=Signal::derive(move || pq_ratchet_enabled.get())
+                            disabled=pq_controls_disabled
+                            on_toggle=move |on| pq_ratchet_enabled.set(on)
+                        />
+                        <ToggleSwitch
+                            id="pq-strict"
+                            title="Require post-quantum"
+                            description="Block classical-only chats and refuse fallback."
+                            checked=Signal::derive(move || strict_pq.get())
+                            disabled=pq_controls_disabled
+                            on_toggle=move |on| strict_pq.set(on)
+                        />
+                    </div>
+                </details>
+            </div>
+        }
+        .into_any()
+    } else {
+        view! {
+            <div class="settings-card">
+                <div class="settings-status-row">
+                    <div class="settings-copy">
+                        <strong>"Classical encryption only"</strong>
+                        <small>"This client was built without post-quantum cryptography."</small>
+                    </div>
+                    <span class="sec-badge classical">"Classical"</span>
+                </div>
+            </div>
+        }
+        .into_any()
+    };
+    view! {
+        <form class="settings-form" on:submit=submit>
+            <h2>"Settings"</h2>
+            <section class="settings-section">
+                <div class="settings-section-head">
+                    <h3>"Encryption"</h3>
+                    {pq_compiled.then_some(move || {
+                        ui.me.with(|me| {
+                            me.as_ref().map(|m| {
+                                let (class, label, title) = server_pq_pill(&m.server_pq);
+                                view! {
+                                    <span class=class title=title>
+                                        {label}
+                                    </span>
+                                }
+                            })
+                        })
+                    })}
+                </div>
+                {encryption_card}
+            </section>
+            <section class="settings-section">
+                <div class="settings-section-head">
+                    <h3>"Server"</h3>
+                </div>
+                <div class="settings-card">{server_row}</div>
+            </section>
+            <div class="actions">
+                <button
+                    type="button"
+                    class="btn"
+                    disabled=move || busy.get()
+                    on:click=move |_| close_dialog()
+                >
                     "Cancel"
                 </button>
                 <button type="submit" class="btn primary" disabled=move || busy.get()>
@@ -2670,8 +2816,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             {move || {
                 live_contact().map(|c| {
                     let show_allow = c.classical_prompt != ClassicalPrompt::None;
-                    let show_upgrade = pq_available()
-                        && (c.has_downgrade() || c.is_quarantined() || !c.security.is_pq);
+                    let show_upgrade = pq_available() && contact_can_upgrade_to_pq(&c);
                     let show_dismiss = c.has_downgrade();
                     view! {
                         <div class="contact-security">
@@ -4122,5 +4267,122 @@ fn Dropzone() -> impl IntoView {
             "Drop to encrypt and send"
             <span>{to}</span>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::SecurityView;
+
+    fn sample_contact() -> ContactView {
+        ContactView {
+            peer: [7; 32],
+            name: "Alice".to_string(),
+            request: false,
+            hello_name: String::new(),
+            unread: 0,
+            last_activity: 0,
+            security: SecurityView::default(),
+            has_active_session: false,
+            pq_pinned: false,
+            peer_pq_capable: false,
+            allow_classical_exception: false,
+            downgrade_detected: false,
+            alert: SecurityAlert::None,
+            classical_prompt: ClassicalPrompt::None,
+        }
+    }
+
+    #[test]
+    fn retired_pq_pinned_session_shows_neutral_ended_badge_and_not_classical() {
+        let mut contact = sample_contact();
+        contact.pq_pinned = true;
+        contact.has_active_session = false;
+        contact.security = SecurityView::default();
+
+        let (class, compact, title) = security_badge_parts(&contact, false);
+        assert_eq!(class, "sec-badge neutral");
+        assert_eq!(compact, "PQ · Session ended");
+        assert_eq!(
+            title,
+            "Session ended; post-quantum encryption is pinned for the next session"
+        );
+
+        let (class, detailed, _) = security_badge_parts(&contact, true);
+        assert_eq!(class, "sec-badge neutral");
+        assert_eq!(
+            detailed,
+            "Session ended — next message starts a new post-quantum session"
+        );
+        assert!(
+            !contact_can_upgrade_to_pq(&contact),
+            "retired pq_pinned session must not offer Upgrade to PQ as if it were classical"
+        );
+    }
+
+    #[test]
+    fn retired_unpinned_session_shows_neutral_ended_badge() {
+        let contact = sample_contact();
+
+        let (class, compact, title) = security_badge_parts(&contact, false);
+        assert_eq!(class, "sec-badge neutral");
+        assert_eq!(compact, "Session ended");
+        assert_eq!(
+            title,
+            "No active session — next message starts a new session"
+        );
+
+        let (class, detailed, _) = security_badge_parts(&contact, true);
+        assert_eq!(class, "sec-badge neutral");
+        assert_eq!(
+            detailed,
+            "No active session — next message starts a new session"
+        );
+        assert!(!contact_can_upgrade_to_pq(&contact));
+    }
+
+    #[test]
+    fn downgrade_takes_precedence_even_without_active_session() {
+        let mut contact = sample_contact();
+        contact.pq_pinned = true;
+        contact.downgrade_detected = true;
+
+        let (class, label, _) = security_badge_parts(&contact, false);
+        assert_eq!(class, "sec-badge danger");
+        assert_eq!(label, "Downgrade detected");
+        assert!(contact_can_upgrade_to_pq(&contact));
+    }
+
+    #[test]
+    fn active_sessions_show_pq_or_classical_badges_and_upgrade_rules() {
+        let mut classical = sample_contact();
+        classical.has_active_session = true;
+        let (class, label, _) = security_badge_parts(&classical, false);
+        assert_eq!(class, "sec-badge classical");
+        assert_eq!(label, "Classical only");
+        assert!(contact_can_upgrade_to_pq(&classical));
+
+        let mut pq = sample_contact();
+        pq.has_active_session = true;
+        pq.pq_pinned = true;
+        pq.security = SecurityView {
+            is_pq: true,
+            suite: Some(PqSuite::MlKem1024.as_u8()),
+            pq_ratchet: true,
+        };
+        let (class, compact, _) = security_badge_parts(&pq, false);
+        assert_eq!(class, "sec-badge pq");
+        assert_eq!(compact, "PQ · ML-KEM-1024 + Ratchet");
+        let (class, detailed, _) = security_badge_parts(&pq, true);
+        assert_eq!(class, "sec-badge pq");
+        assert_eq!(detailed, "Quantum-resistant · ML-KEM-1024 + PQ Ratchet");
+        assert!(!contact_can_upgrade_to_pq(&pq));
+
+        let mut quarantined = sample_contact();
+        quarantined.classical_prompt = ClassicalPrompt::InboundQuarantined {
+            peer_was_pq_pinned: false,
+        };
+        assert!(contact_can_upgrade_to_pq(&quarantined));
     }
 }
