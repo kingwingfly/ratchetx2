@@ -30,6 +30,8 @@ pub(super) struct Contact {
     pub(super) session: Session<Connect>,
     /// Everything but the session, which is in `session`.
     pub(super) state: ContactState,
+    /// Length of the pending carried queue's prefix deferred by this unlocked build.
+    pub(super) deferred_carried: usize,
 }
 
 /// The place in the chat of the peer's message whose clock is `clock`, as the chat is `state`,
@@ -479,6 +481,7 @@ pub(super) fn restore_contacts(
                     peer,
                     session: Session::restore(Fetch::client(address), session),
                     state,
+                    deferred_carried: 0,
                 });
             }
             Err(reason) => {

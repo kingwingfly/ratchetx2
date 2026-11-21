@@ -3,8 +3,8 @@ use super::contact::{
     record_quarantined_initial_state, restore_contacts, stored_contacts,
 };
 use super::handshake::{
-    Inbox, Incoming, InitialBatch, PublishError, prune_invalid_inbox_acks, refill_batch_counts,
-    should_ack_initial_error, stage_carried_initials, stage_inbox_ack,
+    Incoming, InitialBatch, PublishError, prune_invalid_inbox_acks, refill_batch_counts,
+    stage_carried_initials, stage_inbox_ack,
 };
 use super::settings::{
     describe_upgrade_pq_error, finalize_upgrade_to_pq_request_state, validate_pq_config_for_server,
@@ -35,8 +35,8 @@ use session::protocol::{
     mailbox_v2::PushV2Request,
 };
 use session::{
-    AcceptedInitial, Client, ClientState, ErrorKind, PqConfig, PqSuite, PublicKey, Session,
-    SessionState, proto,
+    AcceptedInitial, Client, ClientState, ErrorKind, ListedInitialMessages, PqConfig, PqSuite,
+    PublicKey, Session, SessionState, proto,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
@@ -1803,34 +1803,39 @@ fn update_required_banner_handles_unimplemented_and_normalizes_reason() {
     );
     assert!(ui.update_required.get_untracked().is_none());
 
-    // Confirmed Unimplemented on attachment RPCs (e.g. HTTP 404 on /attachment.v1.*) must NOT
-    // trigger the global update banner or slow foreground polling.
-    struct NotFound404;
-    impl LocalPost for NotFound404 {
+    #[derive(Clone)]
+    struct HttpError(u16, Vec<u8>);
+    impl LocalPost for HttpError {
         async fn post(&self, _path: &str, _body: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
-            Ok((404, b"not found".to_vec()))
+            Ok((self.0, self.1.clone()))
         }
     }
-    futures::executor::block_on(async {
-        let client = Client::new(ConnectClient::new(NotFound404));
-        let err = client
-            .start_upload(&ConnectClient::new(NotFound404), 16)
+    let core_unimpl = futures::executor::block_on(async {
+        let proxy = ConnectClient::new(HttpError(404, b"<html>Not Found</html>".to_vec()));
+        let proxy_client = Client::new(proxy);
+        let err = proxy_client
+            .check_server_info("chat.example")
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Unimplemented);
         assert!(err.is_server_refusal());
-        assert!(!should_require_update_for_rpc(
-            ProtocolRpcScope::Attachment,
-            &err
-        ));
+        assert!(!err.is_connect_error());
+        engine.check_protocol_error(ProtocolRpcScope::CoreV2, &err);
+        assert!(ui.update_required.get_untracked().is_none());
+
+        let worker =
+            protocol::connect::error(protocol::ErrorKind::Unimplemented, "upgrade required");
+        let relay = ConnectClient::new(HttpError(worker.status, worker.body));
+        let client = Client::new(relay.clone());
+        let err = client.start_upload(&relay, 16).await.unwrap_err();
+        assert!(err.is_connect_error());
         engine.check_protocol_error(ProtocolRpcScope::Attachment, &err);
         assert!(ui.update_required.get_untracked().is_none());
+
+        client.check_server_info("chat.example").await.unwrap_err()
     });
 
-    // Confirmed Unimplemented on core handshake.v2 / mailbox.v2 triggers the update banner,
-    // toast notice, and a single activity log entry.
-    let core_unimpl =
-        session::Error::from(protocol::Error::from(protocol::ErrorKind::Unimplemented));
+    assert!(core_unimpl.is_connect_error());
     assert!(should_require_update_for_rpc(
         ProtocolRpcScope::CoreV2,
         &core_unimpl
@@ -1839,7 +1844,7 @@ fn update_required_banner_handles_unimplemented_and_normalizes_reason() {
     assert!(
         ui.update_required
             .get_untracked()
-            .is_some_and(|msg| msg.contains("Refresh the page"))
+            .is_some_and(|msg| msg.contains("upgrade required"))
     );
     assert_eq!(ui.log.get_untracked().len(), 1);
     // Repeated calls do not spam duplicate activity log entries.
@@ -1852,71 +1857,254 @@ fn update_required_banner_handles_unimplemented_and_normalizes_reason() {
 }
 
 #[test]
-fn unsupported_suite_initial_leaves_inbox_id_unacknowledged() {
-    assert!(!should_ack_initial_error(ErrorKind::UnsupportedSuite));
-    for permanent in [
-        ErrorKind::InvalidInitialMessage,
-        ErrorKind::InvalidKeys,
-        ErrorKind::UnexpectedPeer,
-        ErrorKind::PqRequired,
-        ErrorKind::DowngradeDetected,
-    ] {
-        assert!(should_ack_initial_error(permanent));
-    }
-
+fn permanently_invalid_classical_initial_is_staged_for_ack() {
     let engine = Engine::new(Ui::new());
-    let (mut inner, peer) = unlocked_client();
-
-    // Permanently invalid classical initial IS staged for acknowledgement.
-    let bogus_classical =
-        Incoming::try_from(&WireInitialMessageV2::from(&legacy_wire_initial(9))).unwrap();
+    let (mut inner, _) = unlocked_client();
+    let wire = WireInitialMessageV2 {
+        id: 41,
+        ..WireInitialMessageV2::from(&legacy_wire_initial(9))
+    };
     let mut batch = InitialBatch::default();
     engine.process_inbox_messages(
         &mut inner,
-        Inbox {
-            messages: vec![(peer, 41, bogus_classical)],
+        ListedInitialMessages {
+            messages: vec![Incoming::try_from(&wire).unwrap()],
             malformed_ids: vec![],
         },
         None,
         &mut batch,
     );
     assert_eq!(inner.state.pending_inbox_acks, vec![41]);
+    assert!(inner.state.deferred_initials.is_empty());
+}
 
-    // In a classical-only build (no ML-KEM suites compiled in), a queued PQ initial returns
-    // `ErrorKind::UnsupportedSuite` and MUST stay unacknowledged in `pending_inbox_acks`.
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    {
-        inner.state.pending_inbox_acks.clear();
-        let pq_wire = WireInitialMessageV2 {
-            id: 77,
-            version: 2,
-            identity_key: Bytes::copy_from_slice(&peer),
-            ephemeral_key: Bytes::from_static(&[0x55; 32]),
-            signed_prekey: Bytes::from_static(&[0x66; 32]),
-            one_time_prekey: None,
-            first_message: Some(Default::default()),
-            pq_suite: 1,
-            pq_last_resort: true,
-            pq_prekey_id: Bytes::from_static(&[0x77; 32]),
-            pq_ciphertext: Bytes::from(vec![0x88; 1568]),
-            manifest_digest: Bytes::new(),
-        };
-        let pq_initial = Incoming::try_from(&pq_wire).unwrap();
-        let mut pq_batch = InitialBatch::default();
+#[cfg(not(feature = "ml-kem-1024"))]
+fn unsupported_wire_initial(peer: PublicKey, id: u64) -> WireInitialMessageV2 {
+    WireInitialMessageV2 {
+        id,
+        version: 2,
+        identity_key: Bytes::copy_from_slice(&peer),
+        ephemeral_key: Bytes::from_static(&[0x55; 32]),
+        signed_prekey: Bytes::from_static(&[0x66; 32]),
+        one_time_prekey: Some(Bytes::from_static(&[0x22; 32])),
+        first_message: Some(party::EncryptedMessage {
+            header: Bytes::from_static(b"header"),
+            content: Bytes::copy_from_slice(&id.to_be_bytes()),
+        }),
+        pq_suite: PqSuite::MlKem1024.as_u8().into(),
+        pq_last_resort: true,
+        pq_prekey_id: Bytes::from_static(&[0x77; 32]),
+        pq_ciphertext: Bytes::from(vec![0x88; PqSuite::MlKem1024.ct_len()]),
+        manifest_digest: Bytes::from_static(&[0x99; 32]),
+    }
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn unsupported_carried_initial_survives_reload_and_allows_later_joins() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let mut client = Client::new(Fetch::client(TEST_SERVER));
+        let (peer, supported) = carried_initial(&mut client).await;
+        let mut inner = load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
+        let wire = unsupported_wire_initial(peer, 0);
+        let deferred = Incoming::try_from(&wire).unwrap();
+        stage_carried_initials(&mut inner.contacts[0].state, [&deferred, &supported]).unwrap();
+        inner.save(&[]).await.unwrap();
+
+        engine.join_carried(&mut inner, &peer).await.unwrap();
+        let expected = [protocol::mailbox_v2::encode_carried_initial(&wire)
+            .unwrap()
+            .to_vec()];
+        assert_eq!(
+            inner.vault.state.borrow().contacts[0].pending_carried_initials,
+            expected
+        );
+        assert_eq!(inner.vault.entries.borrow().len(), 1);
+        let logged = engine.ui.log.get_untracked().len();
+        inner.vault.fail_save.set(true);
+        engine.join_carried(&mut inner, &peer).await.unwrap();
+        assert_eq!(engine.ui.log.get_untracked().len(), logged);
+
+        let mut inner = reload(inner.vault);
+        assert_eq!(inner.contacts[0].state.pending_carried_initials, expected);
+        engine.join_carried(&mut inner, &peer).await.unwrap();
+        assert_eq!(engine.ui.log.get_untracked().len(), logged + 1);
+        assert_eq!(inner.contacts[0].state.pending_carried_initials, expected);
+    });
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn deferred_inbox_ack_waits_for_durable_ciphertext_and_survives_restart() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let (mut inner, peer) = unlocked_client();
+        inner.save(&[]).await.unwrap();
+        let wire = unsupported_wire_initial(peer, 77);
+        let message = Incoming::try_from(&wire).unwrap();
+        let mut batch = InitialBatch::default();
         engine.process_inbox_messages(
             &mut inner,
-            Inbox {
-                messages: vec![(peer, 77, pq_initial)],
+            ListedInitialMessages {
+                messages: vec![message.clone(), message],
                 malformed_ids: vec![],
             },
             None,
-            &mut pq_batch,
+            &mut batch,
         );
+        assert!(inner.needs_save());
+        assert!(inner.state.pending_inbox_acks.is_empty());
+        inner.vault.fail_save.set(true);
+        assert!(engine.save_initial_batch(&mut inner, batch).await.is_err());
+        inner
+            .ack_persisted_inbox(async |_, _, _| panic!("ack before commit"))
+            .await
+            .unwrap();
+        assert!(inner.state.pending_inbox_acks.is_empty());
+        assert!(inner.vault.state.borrow().deferred_initials.is_empty());
+        assert!(inner.vault.state.borrow().pending_inbox_acks.is_empty());
+
+        inner.vault.fail_save.set(false);
+        inner.save(&[]).await.unwrap();
+        let mut inner = reload(inner.vault);
+        assert_eq!(
+            inner.state.deferred_initials.as_slice(),
+            std::slice::from_ref(&wire)
+        );
+        assert_eq!(inner.state.pending_inbox_acks, [77]);
         assert!(
-            inner.state.pending_inbox_acks.is_empty(),
-            "UnsupportedSuite PQ initial must NOT be staged for server ack/deletion"
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .unwrap()
+                .is_none()
         );
-    }
+        let mut sent = vec![];
+        inner
+            .ack_persisted_inbox(async |_, _, ids| {
+                sent.extend(ids);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(sent, [77]);
+        assert!(inner.vault.state.borrow().pending_inbox_acks.is_empty());
+        assert_eq!(inner.vault.state.borrow().deferred_initials, [wire]);
+    });
+}
+
+#[cfg(not(feature = "ml-kem-1024"))]
+#[test]
+fn full_deferred_inbox_leaves_new_ciphertext_on_the_server() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let (mut inner, peer) = unlocked_client();
+        let listed = |ids: std::ops::RangeInclusive<u64>| ListedInitialMessages {
+            messages: ids
+                .map(|id| Incoming::try_from(&unsupported_wire_initial(peer, id)).unwrap())
+                .collect(),
+            malformed_ids: vec![],
+        };
+        let mut batch = InitialBatch::default();
+        engine.process_inbox_messages(&mut inner, listed(1..=100), None, &mut batch);
+        engine.save_initial_batch(&mut inner, batch).await.unwrap();
+        inner
+            .ack_persisted_inbox(async |_, _, ids| {
+                assert_eq!(ids, (1..=100).collect::<Vec<_>>());
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // A redelivery already has a durable copy. Only the new initial needs another slot.
+        let mut batch = InitialBatch::default();
+        engine.process_inbox_messages(&mut inner, listed(100..=101), None, &mut batch);
+        engine.save_initial_batch(&mut inner, batch).await.unwrap();
+        let saved = inner.vault.state.borrow();
+        assert_eq!(saved.pending_inbox_acks, [100]);
+        assert_eq!(
+            saved
+                .deferred_initials
+                .iter()
+                .map(|m| m.id)
+                .collect::<Vec<_>>(),
+            (1..=100).collect::<Vec<_>>()
+        );
+    });
+}
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[test]
+fn pq_build_replays_deferred_inbox_ciphertext_once_after_reload() {
+    futures::executor::block_on(async {
+        let engine = Engine::new(Ui::new());
+        let mut client = Client::new(Fetch::client(TEST_SERVER));
+        let (peer, mut message) = carried_initial(&mut client).await;
+        message.id = 77;
+        client
+            .set_pq_config(PqConfig {
+                pq_enabled: false,
+                pq_ratchet_enabled: false,
+                ..client.pq_config().clone()
+            })
+            .unwrap();
+        let mut inner = load_contacts(&client, vec![]);
+        // Save the same encrypted wire record and ack as the build lacking this suite.
+        assert!(inner.defer_inbox_initial(&message));
+        inner.save(&[]).await.unwrap();
+        inner
+            .ack_persisted_inbox(async |_, _, ids| {
+                assert_eq!(ids, [77]);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        let mut inner = reload(inner.vault);
+        inner.vault.fail_save.set(true);
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(inner.vault.state.borrow().deferred_initials.len(), 1);
+        assert!(inner.vault.entries.borrow().is_empty());
+
+        inner.vault.fail_save.set(false);
+        let mut inner = reload(inner.vault);
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut inner = reload(inner.vault);
+        assert!(
+            engine
+                .replay_deferred_initials(&mut inner, None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(inner.state.deferred_initials.is_empty());
+        assert!(inner.state.pending_inbox_acks.is_empty());
+        assert_eq!(inner.state.used_one_time_prekeys, 1);
+        assert_eq!(inner.state.used_pq_one_time_prekeys, 1);
+        assert!(inner.contact(&peer).unwrap().has_healthy_pq_session());
+        let entries = inner.vault.entries.borrow();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[&history_key(&peer, 0)]
+                .content
+                .as_ref()
+                .unwrap()
+                .kind,
+            Some(Kind::Text("first message".into()))
+        );
+    });
 }
 
 #[test]

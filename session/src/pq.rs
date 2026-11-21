@@ -886,10 +886,9 @@ mod v2 {
         /// (`InvalidInitialMessage`, `InvalidKeys`, `UnexpectedPeer`, `PqRequired`,
         /// `DowngradeDetected`, `MalformedState`, etc.) should be acknowledged in a manual
         /// `list_initial_messages_v2` -> `accept_initial_v2` -> persist -> `ack_initial_messages_v2`
-        /// loop so unaccepted/malformed entries cannot permanently fill the inbox. By contrast,
-        /// [`ErrorKind::UnsupportedSuite`] (e.g. a classical-only or single-suite build seeing a
-        /// queued PQ initial message for a suite it cannot decrypt) MUST NOT be acknowledged so the
-        /// encrypted initial remains queued on the server until a capable build processes it.
+        /// loop so unaccepted/malformed entries cannot permanently fill the inbox. For
+        /// [`ErrorKind::UnsupportedSuite`], acknowledge only after durably storing the encrypted
+        /// initial for replay by a capable build. Otherwise leave it in the server inbox.
         ///
         /// - **PQXDH (version 2)**: authenticates the sender first via `accept_pq` + `first_message`
         ///   AEAD decryption (supporting both PQ-ratchet and classical-ratchet PQXDH sessions
@@ -1314,8 +1313,9 @@ mod v2 {
         /// Include EVERY listed ID whose local `accept_initial_v2` finished permanently — both
         /// accepted / quarantined AND permanent rejection IDs (such as `InvalidKeys`,
         /// `InvalidInitialMessage`, `PqRequired`, `DowngradeDetected`, or `malformed_ids`) — so
-        /// invalid entries cannot permanently clog the inbox. Omit IDs that returned
-        /// [`ErrorKind::UnsupportedSuite`] so a capable build can decrypt them later.
+        /// invalid entries cannot permanently clog the inbox. An ID that returned
+        /// [`ErrorKind::UnsupportedSuite`] can be acknowledged once its encrypted initial is
+        /// durably stored for later replay.
         pub async fn ack_initial_messages_v2(
             &mut self,
             audience: &str,

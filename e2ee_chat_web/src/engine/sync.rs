@@ -322,17 +322,26 @@ impl Engine {
                 self.show_history(inner, &open).await;
             }
         }
+        let open_peer = self
+            .ui
+            .open
+            .get_untracked()
+            .filter(|_| !document().hidden());
+        let replayed = self.replay_deferred_initials(inner, open_peer).await?;
         let pending: Vec<_> = inner
             .contacts
             .iter()
-            .filter(|c| !c.state.pending_carried_initials.is_empty() && !c.is_new_quarantined())
+            .filter(|c| {
+                c.deferred_carried < c.state.pending_carried_initials.len()
+                    && !c.is_new_quarantined()
+            })
             .map(|c| c.peer)
             .collect();
-        let recovered = !pending.is_empty();
-        let mut upgrades = vec![];
+        let recovered = replayed.is_some() || !pending.is_empty();
+        let mut upgrades = replayed.unwrap_or_default();
         for peer in pending {
             if self.join_carried(inner, &peer).await? {
-                upgrades.push(peer);
+                upgrades.insert(peer);
             }
         }
         drop(guard);

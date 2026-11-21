@@ -242,6 +242,8 @@ struct Inner<V = Vault> {
     isolated_peers: HashSet<PublicKey>,
     /// A non-rollbackable state change still needs a successful transaction.
     unsaved_state: bool,
+    /// Inbox IDs to commit with their deferred ciphertext before they become eligible for ack.
+    deferred_acks_after_save: Vec<u64>,
     /// A later transaction committed that change. Refresh contact and identity views on sync.
     contacts_dirty_late: bool,
     /// History records that a save failed to write after what they record could not be undone:
@@ -271,16 +273,16 @@ pub(super) enum ProtocolRpcScope {
 /// Whether `error` on an RPC in `scope` should trip the global `Ui::update_required` banner
 /// (and slow foreground polling to `POLL_LIVE`).
 ///
-/// Only confirmed `ErrorKind::Unimplemented` on core required `handshake.v2` / `mailbox.v2` RPCs
-/// triggers the global banner here; explicit `x-e2ee-deprecated` headers are handled by
-/// `transport.rs`, and WebSocket close code `4010` is handled by `notify.rs` / `sync.rs`.
-/// Attachment HTTP 404 / `Unimplemented` failures remain local to the affected attachment action.
+/// The core v2 handler must report `Unimplemented`, either directly or in a Connect error body.
+/// The transport handles explicit `x-e2ee-deprecated` headers and sync handles WebSocket close
+/// code `4010` independently.
 pub(super) fn should_require_update_for_rpc(
     scope: ProtocolRpcScope,
     error: &session::Error,
 ) -> bool {
     scope == ProtocolRpcScope::CoreV2
         && error.is_server_refusal()
+        && error.is_connect_error()
         && error.kind() == ErrorKind::Unimplemented
 }
 
@@ -1092,7 +1094,7 @@ impl Engine {
         let was_isolated = inner.is_isolated_peer(&peer);
         inner.contacts.retain(|contact| contact.peer != peer);
         inner.forget_isolated_peer(&peer);
-        inner.contacts_dirty_late |= std::mem::take(&mut inner.unsaved_state);
+        inner.finish_state_save(state.pending_inbox_acks);
         // The other chats' records left unsaved were saved with it, and show at the next sync.
         inner.saved_late.extend(
             inner
@@ -1249,6 +1251,7 @@ impl<V: HistoryStore> Inner<V> {
             last_server_classical_opks: None,
             last_server_pq_opks: None,
             unsaved_state: false,
+            deferred_acks_after_save: vec![],
             contacts_dirty_late: false,
             unsaved: vec![],
             unsaved_outbox: vec![],
@@ -1258,11 +1261,21 @@ impl<V: HistoryStore> Inner<V> {
 
     /// What the vault keeps.
     fn app_state(&self) -> AppState {
-        AppState {
+        let mut state = AppState {
             client: Some(self.client.state().into()),
             contacts: stored_contacts(&self.contacts, &self.isolated_contacts),
             ..self.state.clone()
+        };
+        for &id in &self.deferred_acks_after_save {
+            handshake::stage_inbox_ack(&mut state.pending_inbox_acks, id);
         }
+        state
+    }
+
+    fn finish_state_save(&mut self, committed_acks: Vec<u64>) {
+        self.state.pending_inbox_acks = committed_acks;
+        self.deferred_acks_after_save.clear();
+        self.contacts_dirty_late |= std::mem::take(&mut self.unsaved_state);
     }
 
     fn local_pq_enabled(&self) -> bool {
@@ -1272,7 +1285,10 @@ impl<V: HistoryStore> Inner<V> {
     }
 
     fn needs_save(&self) -> bool {
-        self.unsaved_state || !self.unsaved.is_empty() || !self.unsaved_outbox.is_empty()
+        self.unsaved_state
+            || !self.deferred_acks_after_save.is_empty()
+            || !self.unsaved.is_empty()
+            || !self.unsaved_outbox.is_empty()
     }
 
     /// Save a state-only mutation that remains in memory even if storage is unavailable.
@@ -1298,14 +1314,15 @@ impl<V: HistoryStore> Inner<V> {
     ) -> crate::vault::Result<()> {
         let unsaved = self.unsaved.iter().map(|(_, record)| record);
         let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
+        let state = self.app_state();
         self.vault
             .save(
-                &self.app_state(),
+                &state,
                 unsaved.chain(entries),
                 unsaved_outbox.chain(outgoing),
             )
             .await?;
-        self.contacts_dirty_late |= std::mem::take(&mut self.unsaved_state);
+        self.finish_state_save(state.pending_inbox_acks);
         self.saved_late
             .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
         self.unsaved_outbox.clear();

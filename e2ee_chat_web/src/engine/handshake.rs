@@ -17,43 +17,40 @@ use crate::vault::{
 };
 use leptos::prelude::*;
 use prost::Message as _;
+use session::protocol::handshake_v2::InitialMessageV2 as WireInitial;
 use session::{
-    AcceptedInitial, ErrorKind, InitialMessageKind, InitialMessageV2, PeerPqState, PublicKey,
-    PublishV2Outcome, Session,
+    AcceptedInitial, ErrorKind, InitialMessageKind, InitialMessageV2, ListedInitialMessages,
+    PeerPqState, PqSuite, PublicKey, PublishV2Outcome, Session,
 };
+use std::collections::BTreeSet;
 
 pub(super) type Incoming = InitialMessageV2;
 
 // A page can include 64 initials from retrying a previous stall and another 64
 // surfaced together at its expired or newly stalled tail.
 const MAX_PENDING_CARRIED_INITIALS: usize = 2 * 64;
+const MAX_DEFERRED_INITIALS: usize = 100;
 
-fn encode_carried_initial(message: &Incoming) -> session::Result<Vec<u8>> {
-    use session::protocol::handshake_v2::InitialMessageV2 as Wire;
-    let wire = match &message.kind {
-        InitialMessageKind::Classical(m) => Wire {
+fn initial_payload(kind: &InitialMessageKind) -> WireInitial {
+    match kind {
+        InitialMessageKind::Classical(m) => WireInitial {
             first_message: Some(m.first_message.clone()),
-            ..Wire::from(&m.x3dh)
+            ..WireInitial::from(&m.x3dh)
         },
         InitialMessageKind::Pq {
             x3dh,
             first_message,
             manifest_digest,
-        } => Wire {
+        } => WireInitial {
             first_message: Some(first_message.clone()),
             manifest_digest: manifest_digest
                 .as_ref()
                 .map_or_else(bytes::Bytes::new, |digest| {
                     bytes::Bytes::copy_from_slice(digest)
                 }),
-            ..Wire::from(x3dh)
+            ..WireInitial::from(x3dh)
         },
-    };
-    Ok(session::protocol::mailbox_v2::encode_carried_initial(&wire)?.to_vec())
-}
-
-fn decode_carried_initial(bytes: &[u8]) -> Option<Incoming> {
-    InitialMessageV2::decode_carried(bytes)
+    }
 }
 
 pub(super) fn stage_carried_initials<'a>(
@@ -62,7 +59,10 @@ pub(super) fn stage_carried_initials<'a>(
 ) -> Result<(), String> {
     let pending = &mut state.pending_carried_initials;
     for message in initials {
-        let bytes = encode_carried_initial(message).map_err(|e| describe(&e))?;
+        let bytes =
+            session::protocol::mailbox_v2::encode_carried_initial(&initial_payload(&message.kind))
+                .map_err(|e| describe(&e))?
+                .to_vec();
         if !pending.contains(&bytes) {
             if pending.len() >= MAX_PENDING_CARRIED_INITIALS {
                 return Err("Too many pending carried initial messages for this chat.".into());
@@ -73,25 +73,13 @@ pub(super) fn stage_carried_initials<'a>(
     Ok(())
 }
 
-pub(super) struct Inbox {
-    pub(super) messages: Vec<(PublicKey, u64, Incoming)>,
-    pub(super) malformed_ids: Vec<u64>,
-}
-
-/// Whether a processed inbox initial message should be acknowledged on the server or deferred.
+/// Whether local processing has finished for this initial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum InitialOutcome {
     /// Accepted, quarantined, or permanently rejected — safe to acknowledge after local save.
     Ack,
-    /// Undecryptable by this build due to an unsupported suite — keep queued on the server.
+    /// Keep the ciphertext so a build with the required suite can process it.
     DeferUnsupportedSuite,
-}
-
-/// Whether an `accept_initial_v2` failure kind is permanent and safe to acknowledge/delete from
-/// the server inbox. [`ErrorKind::UnsupportedSuite`] MUST NOT be acknowledged so a capable build
-/// (e.g. with ML-KEM compiled in) can decrypt the queued PQ initial later.
-pub(super) fn should_ack_initial_error(kind: ErrorKind) -> bool {
-    kind != ErrorKind::UnsupportedSuite
 }
 
 struct OpenedInitial {
@@ -106,8 +94,8 @@ pub(super) struct InitialBatch {
     dirty: bool,
     records: Vec<(PublicKey, (String, HistoryEntry))>,
     views: Vec<(PublicKey, MessageView)>,
-    requeue: std::collections::BTreeSet<PublicKey>,
-    upgrades: std::collections::BTreeSet<PublicKey>,
+    requeue: BTreeSet<PublicKey>,
+    upgrades: BTreeSet<PublicKey>,
 }
 
 fn is_valid_inbox_ack_id(id: u64) -> bool {
@@ -131,6 +119,21 @@ pub(super) fn prune_invalid_inbox_acks(pending: &mut Vec<u64>) -> usize {
 }
 
 impl<V: HistoryStore> Inner<V> {
+    /// Reserve a local copy and include its ack ID in the same vault transaction.
+    pub(super) fn defer_inbox_initial(&mut self, message: &Incoming) -> bool {
+        let wire = WireInitial {
+            id: message.id,
+            ..initial_payload(&message.kind)
+        };
+        if !self.state.deferred_initials.contains(&wire) {
+            if self.state.deferred_initials.len() >= MAX_DEFERRED_INITIALS {
+                return false;
+            }
+            self.state.deferred_initials.push(wire);
+        }
+        stage_inbox_ack(&mut self.deferred_acks_after_save, message.id)
+    }
+
     pub(super) fn check_outgoing_peer(&self, peer: &PublicKey) -> Result<(), StartChatError> {
         if *peer == self.client.identity_key() {
             return Err(StartChatError::Other(
@@ -146,21 +149,6 @@ impl<V: HistoryStore> Inner<V> {
         self.state.needs_publish = false;
         self.state.pending_pq_rollback = None;
         self.save_state().await
-    }
-
-    async fn list_inbox(&mut self) -> session::Result<Inbox> {
-        let listed = self
-            .client
-            .list_initial_messages_v2(&self.audience, 100)
-            .await?;
-        Ok(Inbox {
-            messages: listed
-                .messages
-                .into_iter()
-                .map(|m| (m.sender, m.id, m))
-                .collect(),
-            malformed_ids: listed.malformed_ids,
-        })
     }
 
     fn open_initial(
@@ -361,23 +349,31 @@ impl Engine {
     pub(super) fn process_inbox_messages(
         &self,
         inner: &mut Inner<impl HistoryStore>,
-        inbox: Inbox,
+        inbox: ListedInitialMessages,
         open_peer: Option<PublicKey>,
         batch: &mut InitialBatch,
     ) {
-        for (peer, id, message) in inbox.messages {
+        for message in inbox.messages {
+            let (peer, id) = (message.sender, message.id);
             if !is_valid_inbox_ack_id(id) {
                 self.ui.log(format!(
                     "Skipped initial message with out-of-range inbox ID {id}."
                 ));
                 continue;
             }
-            if inner.state.pending_inbox_acks.contains(&id) {
+            if inner.state.pending_inbox_acks.contains(&id)
+                || inner.deferred_acks_after_save.contains(&id)
+            {
                 continue;
             }
             let read = open_peer == Some(peer);
-            if self.process_initial(inner, &peer, &message, read, batch) == InitialOutcome::Ack {
-                batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
+            match self.process_initial(inner, &peer, &message, read, batch) {
+                InitialOutcome::Ack => {
+                    batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
+                }
+                InitialOutcome::DeferUnsupportedSuite => {
+                    batch.dirty |= inner.defer_inbox_initial(&message)
+                }
             }
         }
         for id in inbox.malformed_ids {
@@ -400,7 +396,11 @@ impl Engine {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
         self.ack_pending_inbox_v2(inner).await?;
-        let inbox = match inner.list_inbox().await {
+        let inbox = match inner
+            .client
+            .list_initial_messages_v2(&inner.audience, 100)
+            .await
+        {
             Ok(inbox) => inbox,
             Err(e) => {
                 self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
@@ -415,8 +415,7 @@ impl Engine {
         if !batch.dirty {
             return Ok(false);
         }
-        let upgrades = std::mem::take(&mut batch.upgrades);
-        self.save_initial_batch(inner, batch).await?;
+        let upgrades = self.save_initial_batch(inner, batch).await?;
         let ack = self.ack_pending_inbox_v2(inner).await;
         drop(guard);
         for peer in upgrades {
@@ -426,7 +425,55 @@ impl Engine {
         Ok(true)
     }
 
-    /// Drain the peer's durable queue. Each removal commits with its prekeys, session and history.
+    /// Commit replayed initials with their history and consumed prekeys. Return the peers to
+    /// upgrade after releasing the lock, or `None` if the queue made no progress.
+    pub(super) async fn replay_deferred_initials(
+        &self,
+        inner: &mut Inner<impl HistoryStore>,
+        open_peer: Option<PublicKey>,
+    ) -> Result<Option<BTreeSet<PublicKey>>, String> {
+        let supported: Vec<_> = inner
+            .state
+            .deferred_initials
+            .extract_if(.., |wire| {
+                u8::try_from(wire.pq_suite)
+                    .ok()
+                    .and_then(PqSuite::from_u8)
+                    .is_some_and(PqSuite::is_supported)
+            })
+            .collect();
+        let mut batch = InitialBatch::default();
+        for wire in supported {
+            match Incoming::try_from(&wire) {
+                Ok(message) => {
+                    let peer = message.sender;
+                    if self.process_initial(
+                        inner,
+                        &peer,
+                        &message,
+                        open_peer == Some(peer),
+                        &mut batch,
+                    ) == InitialOutcome::DeferUnsupportedSuite
+                    {
+                        inner.state.deferred_initials.push(wire);
+                        continue;
+                    }
+                }
+                Err(e) => self.ui.log(format!(
+                    "Discarded an unreadable deferred initial message: {}",
+                    describe(&e)
+                )),
+            }
+            batch.dirty = true;
+        }
+        if batch.dirty {
+            Ok(Some(self.save_initial_batch(inner, batch).await?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Join the peer's pending carried initials. Each removal commits with its prekeys, session and history.
     pub(super) async fn join_carried(
         &self,
         inner: &mut Inner<impl HistoryStore>,
@@ -444,33 +491,38 @@ impl Engine {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
         let mut upgrade = false;
-        while !inner.contacts[index]
-            .state
-            .pending_carried_initials
-            .is_empty()
-        {
-            let bytes = inner.contacts[index]
-                .state
-                .pending_carried_initials
-                .remove(0);
+        loop {
+            let contact = &inner.contacts[index];
+            let next = contact.deferred_carried;
+            let Some(bytes) = contact.state.pending_carried_initials.get(next) else {
+                break;
+            };
             let mut batch = InitialBatch::default();
-            if let Some(message) = decode_carried_initial(&bytes) {
-                self.process_initial(inner, peer, &message, false, &mut batch);
+            if let Some(message) = Incoming::decode_carried(bytes) {
+                if self.process_initial(inner, peer, &message, false, &mut batch)
+                    == InitialOutcome::DeferUnsupportedSuite
+                {
+                    inner.contacts[index].deferred_carried += 1;
+                    continue;
+                }
             } else {
                 self.ui.log(format!(
                     "Discarded an unreadable carried initial message for {}.",
                     short(peer)
                 ));
             }
-            upgrade |= batch.upgrades.contains(peer);
+            let bytes = inner.contacts[index]
+                .state
+                .pending_carried_initials
+                .remove(next);
             if batch.dirty {
-                self.save_initial_batch(inner, batch).await?;
+                upgrade |= self.save_initial_batch(inner, batch).await?.contains(peer);
             } else if let Err(e) = inner.save_state().await {
                 // Nothing consumed a prekey. Retry the original entry if storage recovers.
                 inner.contacts[index]
                     .state
                     .pending_carried_initials
-                    .insert(0, bytes);
+                    .insert(next, bytes);
                 return Err(describe(&e));
             }
         }
@@ -497,9 +549,9 @@ impl Engine {
         let opened = match inner.open_initial(peer, message) {
             Ok(opened) => opened,
             Err(e) => {
-                if !should_ack_initial_error(e.kind()) {
+                if e.kind() == ErrorKind::UnsupportedSuite {
                     self.ui.log(format!(
-                        "kept initial message from {} queued on server (unsupported post-quantum suite): {}",
+                        "Deferred initial message from {}: {}",
                         short(peer),
                         describe(&e)
                     ));
@@ -569,6 +621,7 @@ impl Engine {
                 let mut contact = Contact {
                     peer: *peer,
                     session,
+                    deferred_carried: 0,
                     state: ContactState {
                         peer: peer.to_vec(),
                         request: true,
@@ -624,11 +677,11 @@ impl Engine {
         InitialOutcome::Ack
     }
 
-    async fn save_initial_batch(
+    pub(super) async fn save_initial_batch(
         &self,
         inner: &mut Inner<impl HistoryStore>,
         mut batch: InitialBatch,
-    ) -> Result<(), String> {
+    ) -> Result<BTreeSet<PublicKey>, String> {
         let mut outgoing = vec![];
         let mut changed = vec![];
         for peer in batch.requeue {
@@ -663,7 +716,7 @@ impl Engine {
             self.show_new(inner, &open, views);
         }
         self.ui.contacts.set(inner.views());
-        Ok(())
+        Ok(batch.upgrades)
     }
 
     /// Execute a full signed-prekey + manifest publish under the held `inner` lock, preserving the
@@ -832,7 +885,7 @@ impl Engine {
                         }
                     }
                     ErrorKind::Unimplemented => {
-                        self.require_update(describe(&e));
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                         Err(describe(&e))
                     }
                     ErrorKind::NotFound | ErrorKind::Protocol => {
@@ -1071,6 +1124,7 @@ impl Engine {
         inner.contacts.push(Contact {
             peer,
             session,
+            deferred_carried: 0,
             state: ContactState {
                 peer: peer.to_vec(),
                 name,

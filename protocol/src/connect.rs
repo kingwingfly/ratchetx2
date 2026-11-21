@@ -480,24 +480,22 @@ impl<P: LocalPost> ConnectClient<P> {
             return T::decode(body.as_slice())
                 .map_err(|e| Error::ambiguous_response(ErrorKind::InvalidResponse, e));
         }
-        let error = match serde_json::from_slice::<CallError>(&body) {
-            Ok(error) => error,
-            // Without a valid error body, the status tells the code. A sign-in is asked for only
-            // by the server's own error, as a 403 without one comes from something in front of
-            // it, e.g. a firewall's rule, which signing in does not get past.
-            Err(_) => {
-                let code = match Code::from_status(status) {
-                    Code::PermissionDenied => Code::Unknown,
-                    code => code,
-                };
-                CallError {
-                    code: code.name().to_string(),
-                    message: format!("HTTP status {status}"),
-                }
-            }
+        if let Ok(error) = serde_json::from_slice::<CallError>(&body) {
+            let kind = Code::from_name(&error.code).map_or(ErrorKind::Server, ErrorKind::from);
+            return Err(Error::new(kind, error));
+        }
+        // A proxy can generate this status. Only the server's own 403 asks for sign-in.
+        let code = match Code::from_status(status) {
+            Code::PermissionDenied => Code::Unknown,
+            code => code,
         };
-        let kind = Code::from_name(&error.code).map_or(ErrorKind::Server, ErrorKind::from);
-        Err(Error::new(kind, error))
+        Err(Error::from_http_status(
+            code.into(),
+            CallError {
+                code: code.name().to_string(),
+                message: format!("HTTP status {status}"),
+            },
+        ))
     }
 
     /// Call `procedure` with `request`.
@@ -862,6 +860,27 @@ mod test {
         }
     }
 
+    #[cfg(feature = "pq")]
+    #[tokio::test]
+    async fn unimplemented_distinguishes_connect_errors_from_proxy_statuses() {
+        for (body, is_connect) in [
+            (&b"<html>404 Not Found</html>"[..], false),
+            (
+                &br#"{"code":"unimplemented","message":"upgrade required"}"#[..],
+                true,
+            ),
+        ] {
+            let error = ConnectClient::new(Answering(404, body))
+                .get_server_info(GetServerInfoRequest {})
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unimplemented);
+            assert!(error.is_server_refusal());
+            assert_eq!(error.is_connect_error(), is_connect);
+        }
+        assert!(Error::from(ErrorKind::Unimplemented).is_connect_error());
+    }
+
     #[tokio::test]
     async fn only_the_servers_own_refusal_asks_to_sign_in() {
         let request = || PushRequest::default();
@@ -921,6 +940,7 @@ mod test {
                 }
             );
             assert!(!error.is_server_refusal());
+            assert!(!error.is_connect_error());
             assert!(!Error::ambiguous_response(kind, "response read failed").is_server_refusal());
         }
         let error = ConnectClient::new(Answering(200, &[0xff]))

@@ -300,6 +300,9 @@ pub struct AppState {
     /// Preferences to restore if the relay refuses a pending settings change.
     #[prost(message, optional, tag = "11")]
     pub pending_pq_rollback: Option<PendingPqRollback>,
+    /// Encrypted inbox initials retained for a build that supports their ML-KEM suite.
+    #[prost(message, repeated, tag = "12")]
+    pub deferred_initials: Vec<session::protocol::handshake_v2::InitialMessageV2>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
