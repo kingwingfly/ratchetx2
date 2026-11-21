@@ -11,12 +11,6 @@ use std::time::Duration;
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
 use prost::{Message, bytes::Bytes};
-#[cfg(feature = "pq")]
-use protocol::{
-    connect::ProcedureV2,
-    handshake_v2::{HandshakeV2Server, ServerInfoConfig},
-    mailbox_v2::MailboxV2Server,
-};
 use protocol::{
     ErrorKind,
     attachment::{AttachmentLimits, AttachmentServer},
@@ -25,6 +19,12 @@ use protocol::{
     mailbox::{MailboxLimits, MailboxServer},
     notify::SubscribeRequest,
 };
+#[cfg(feature = "pq")]
+use protocol::{
+    connect::ProcedureV2,
+    handshake_v2::{HandshakeV2Server, ServerInfoConfig},
+    mailbox_v2::MailboxV2Server,
+};
 use worker::{
     Context, Cors, Date, Env, Headers, Method, Request, RequestInit, Response, Result, event,
 };
@@ -32,7 +32,7 @@ use xeddsa::XEdDSAPublicKey;
 
 pub use crate::objects::{Attachment, Identity};
 use crate::store::Store;
-pub(crate) use crate::store::hex;
+pub(crate) use crate::store::{decode_hex_fixed, hex};
 
 /// Where a client opens the WebSocket of its notifications.
 const NOTIFICATIONS_PATH: &str = "/notifications";
@@ -214,8 +214,14 @@ async fn call_v2(mut request: Request, env: &Env, procedure: ProcedureV2) -> Res
                 .allow_pq_drain(true)
                 .limits(limits)
                 .build();
-            connect::handle_v2(&handshake, &mailbox, procedure, content_type.as_deref(), &body)
-                .await
+            connect::handle_v2(
+                &handshake,
+                &mailbox,
+                procedure,
+                content_type.as_deref(),
+                &body,
+            )
+            .await
         }
         None => connect::error(ErrorKind::LimitExceeded, "request too large"),
     };
@@ -318,43 +324,77 @@ fn pq_runtime_enabled(env: &Env) -> bool {
 }
 
 /// Whether legacy v1 handshake/mailbox routes are enabled (default `"true"` for TUI compat).
-fn legacy_v1_enabled(env: &Env) -> bool {
+pub(crate) fn legacy_v1_enabled(env: &Env) -> bool {
     env_bool(env, "LEGACY_V1", true)
 }
 
-/// Whether unsigned v1 `Mailbox::Fetch` is permitted (default `"true"` for TUI transition).
+/// Unsigned v1 mailbox fetches default to `"false"`. Legacy v1 and archived TUI clients need `"true"`.
 fn allow_unsigned_fetch(env: &Env) -> bool {
-    env_bool(env, "ALLOW_UNSIGNED_FETCH", true)
+    env_bool(env, "ALLOW_UNSIGNED_FETCH", false)
 }
 
-/// Canonical server audience identifier: normalized `SERVER_ID` env var (`host[:port]`) if
-/// non-empty, else request URL's canonical `host[:port]`.
-#[cfg(feature = "pq")]
+/// The configured relay audience, falling back to the request's origin.
 fn server_id(env: &Env, request: &Request) -> Result<String> {
-    if let Ok(var) = env.var("SERVER_ID") {
-        let raw = var.to_string();
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return protocol::handshake_v2::normalize_audience(trimmed)
-                .map_err(|_| worker::Error::RustError("invalid SERVER_ID".into()));
-        }
+    let configured = env.var("SERVER_ID").ok().map(|v| v.to_string());
+    normalize_server_id(configured.as_deref(), &request.url()?)
+}
+
+fn normalize_server_id(configured: Option<&str>, request_url: &worker::Url) -> Result<String> {
+    if let Some(id) = configured.map(str::trim).filter(|id| !id.is_empty()) {
+        return protocol::normalize_audience(id)
+            .map_err(|_| worker::Error::RustError("invalid SERVER_ID".into()));
     }
-    let url = request.url()?;
-    let host = url.host_str().unwrap_or("localhost");
-    Ok(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host.to_string(),
-    })
+    if !matches!(request_url.scheme(), "http" | "https" | "ws" | "wss")
+        || !request_url.username().is_empty()
+        || request_url.password().is_some()
+    {
+        return Err(worker::Error::RustError(
+            "invalid request URL audience".into(),
+        ));
+    }
+    protocol::normalize_audience(&request_url.origin().ascii_serialization())
+        .map_err(|_| worker::Error::RustError("invalid request URL audience".into()))
+}
+
+/// Keep a canonical authority unambiguous when the subscription verifier normalizes it again.
+/// A bare authority would lose an explicit HTTP port 443 or HTTPS port 80.
+fn subscribe_audience(authority: String) -> String {
+    if authority.contains("://") {
+        authority
+    } else if authority.ends_with(":443") {
+        format!("http://{authority}")
+    } else if authority.ends_with(":80") {
+        format!("https://{authority}")
+    } else {
+        authority
+    }
+}
+
+pub(crate) fn verify_subscribe_request(
+    subscription: &SubscribeRequest,
+    audience: &str,
+    legacy_v1: bool,
+    now_ms: u64,
+) -> protocol::Result<[u8; 32]> {
+    if subscription.is_audience_bound() {
+        subscription.verify_for_audience(audience, now_ms)
+    } else if legacy_v1 {
+        subscription.verify(now_ms)
+    } else {
+        Err(ErrorKind::InvalidSignature.into())
+    }
 }
 
 fn env_bool(env: &Env, name: &str, default: bool) -> bool {
     env.var(name)
         .ok()
-        .and_then(|v| match v.to_string().trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Some(true),
-            "0" | "false" | "no" | "off" => Some(false),
-            _ => None,
-        })
+        .and_then(
+            |v| match v.to_string().trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            },
+        )
         .unwrap_or(default)
 }
 
@@ -392,13 +432,14 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         if lower == objects::HEADER_SUBSCRIBE_SIG
             || lower == objects::HEADER_SUBSCRIBE_TS
             || lower == objects::HEADER_PENDING_IDENTITY
+            || lower == objects::HEADER_SUBSCRIBE_AUDIENCE
         {
             continue;
         }
         forward_headers.set(&name, &value)?;
     }
 
-    if let Some(encoded) = query_request {
+    let identity_key = if let Some(encoded) = query_request {
         let subscription = BASE64_URL_SAFE_NO_PAD
             .decode(encoded.as_bytes())
             .ok()
@@ -406,7 +447,14 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         let Some(subscription) = subscription else {
             return Response::error("malformed subscription", 400);
         };
-        let identity_key = match subscription.verify(Date::now().as_millis()) {
+        let audience = subscribe_audience(server_id(env, &request)?);
+        let legacy_v1 = legacy_v1_enabled(env);
+        let identity_key = match verify_subscribe_request(
+            &subscription,
+            &audience,
+            legacy_v1,
+            Date::now().as_millis(),
+        ) {
             Ok(key) => key,
             Err(e) => return Response::error(e.to_string(), 403),
         };
@@ -415,15 +463,7 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
             objects::HEADER_SUBSCRIBE_TS,
             &subscription.timestamp.to_string(),
         )?;
-        let forwarded = Request::new_with_init(
-            url.as_str(),
-            RequestInit::new()
-                .with_method(Method::Get)
-                .with_headers(forward_headers),
-        )?;
-        objects::identity(env, &identity_key)?
-            .fetch_with_request(forwarded)
-            .await
+        identity_key
     } else if let Some(identity_hex) = query_identity {
         // Require a valid sign-in cookie before upgrading unauthenticated first-frame WS sockets
         // whenever server PASSWORD authentication is configured, preventing unauthenticated
@@ -431,41 +471,28 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         if auth::password_configured(env) && auth::signed_in(&request, env).is_none() {
             return Response::error("sign in to this server to use it", 403);
         }
-        let Some(identity_key) = decode_hex_32(&identity_hex) else {
+        let Some(identity_key) = crate::decode_hex_fixed::<32>(&identity_hex) else {
             return Response::error("malformed identity", 400);
         };
         if XEdDSAPublicKey::new(&identity_key).is_err() {
             return Response::error("invalid identity key", 400);
         }
         forward_headers.set(objects::HEADER_PENDING_IDENTITY, &hex(&identity_key))?;
-        let forwarded = Request::new_with_init(
-            url.as_str(),
-            RequestInit::new()
-                .with_method(Method::Get)
-                .with_headers(forward_headers),
-        )?;
-        objects::identity(env, &identity_key)?
-            .fetch_with_request(forwarded)
-            .await
+        let audience = server_id(env, &request)?;
+        forward_headers.set(objects::HEADER_SUBSCRIBE_AUDIENCE, &audience)?;
+        identity_key
     } else {
-        Response::error("malformed subscription", 400)
-    }
-}
-
-fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    let (chunks, remainder) = hex.as_bytes().as_chunks::<2>();
-    if !remainder.is_empty() {
-        return None;
-    }
-    for (i, chunk) in chunks.iter().enumerate() {
-        let s = core::str::from_utf8(chunk).ok()?;
-        out[i] = u8::from_str_radix(s, 16).ok()?;
-    }
-    Some(out)
+        return Response::error("malformed subscription", 400);
+    };
+    let forwarded = Request::new_with_init(
+        url.as_str(),
+        RequestInit::new()
+            .with_method(Method::Get)
+            .with_headers(forward_headers),
+    )?;
+    objects::identity(env, &identity_key)?
+        .fetch_with_request(forwarded)
+        .await
 }
 
 /// The body of `request`; `None` once it grows past `limit` bytes, which stops reading it, so a
@@ -501,4 +528,108 @@ pub(crate) fn period(env: &Env, name: &str, default: u64) -> Duration {
 /// `period` in milliseconds, as the runtime's clock counts.
 pub(crate) fn millis(period: Duration) -> u64 {
     u64::try_from(period.as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use worker::Url;
+    use xeddsa::XEdDSAPrivateKey;
+
+    #[test]
+    fn subscribe_verifies_only_the_signed_audience_and_version() {
+        let identity = XEdDSAPrivateKey::generate();
+        let key = identity.compute_public_key().to_bytes();
+        let now = 1_000_000;
+        let bound =
+            SubscribeRequest::sign_for_audience(&identity, "https://Relay.Example", now).unwrap();
+        let legacy = SubscribeRequest::sign(&identity, now);
+        let mut mislabeled = legacy.clone();
+        mislabeled.audience = "relay.example".into();
+
+        for allow_legacy in [false, true] {
+            assert_eq!(
+                verify_subscribe_request(&bound, "relay.example", allow_legacy, now).unwrap(),
+                key
+            );
+            assert_eq!(
+                verify_subscribe_request(&bound, "other.example", allow_legacy, now)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidSignature
+            );
+            assert_eq!(
+                verify_subscribe_request(&mislabeled, "relay.example", allow_legacy, now)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidSignature
+            );
+        }
+        assert_eq!(
+            verify_subscribe_request(&legacy, "relay.example", true, now).unwrap(),
+            key
+        );
+        assert_eq!(
+            verify_subscribe_request(&legacy, "relay.example", false, now)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidSignature
+        );
+    }
+
+    #[test]
+    fn server_id_normalizes_configured_and_request_authorities() {
+        for (url, expected) in [
+            (
+                "https://BÜCHER.example:443/path?q=a#f",
+                "xn--bcher-kva.example",
+            ),
+            (
+                "http://[2001:0DB8:0:0:0:0:0:1]:80/notifications",
+                "[2001:db8::1]",
+            ),
+            ("wss://[2001:0DB8::1]:8443/ws", "[2001:db8::1]:8443"),
+            ("https://Example.com:80", "example.com:80"),
+            ("http://Example.com:443", "example.com:443"),
+            ("ws://Example.com:80", "example.com"),
+        ] {
+            assert_eq!(
+                normalize_server_id(Some("  "), &Url::parse(url).unwrap()).unwrap(),
+                expected
+            );
+            let other = Url::parse("https://other.example").unwrap();
+            assert_eq!(normalize_server_id(Some(url), &other).unwrap(), expected);
+        }
+        let other = Url::parse("https://other.example").unwrap();
+        assert_eq!(
+            normalize_server_id(Some(" BÜCHER.example:443 "), &other).unwrap(),
+            "xn--bcher-kva.example"
+        );
+        assert!(normalize_server_id(Some("https://user@relay.example"), &other).is_err());
+        for url in [
+            "data:text/plain,hello",
+            "ftp://relay.example",
+            "https://user@relay.example",
+        ] {
+            assert!(normalize_server_id(None, &Url::parse(url).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn subscriptions_preserve_nondefault_ports_across_forwarding() {
+        let identity = XEdDSAPrivateKey::generate();
+        let now = 1_000_000;
+        let plain_host =
+            SubscribeRequest::sign_for_audience(&identity, "relay.example", now).unwrap();
+        for url in ["https://relay.example:80", "http://relay.example:443"] {
+            let signed = SubscribeRequest::sign_for_audience(&identity, url, now).unwrap();
+            let authority = normalize_server_id(None, &Url::parse(url).unwrap()).unwrap();
+            let query_audience = subscribe_audience(authority.clone());
+            let attachment = protocol::normalize_audience(&subscribe_audience(authority)).unwrap();
+            for audience in [query_audience, subscribe_audience(attachment)] {
+                assert!(verify_subscribe_request(&signed, &audience, true, now).is_ok());
+                assert!(verify_subscribe_request(&plain_host, &audience, true, now).is_err());
+            }
+        }
+    }
 }

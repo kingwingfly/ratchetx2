@@ -9,27 +9,27 @@
 
 use futures_util::future::try_join_all;
 use serde::de::DeserializeOwned;
+use storage::{
+    AttachmentId, Bundle, Bytes, Error, ErrorKind, LocalAttachmentStore, LocalHandshakeStore,
+    LocalMailboxStore, MAX_SAFE_INTEGER, PublicKey, Result, StoredAttachment, StoredInitialMessage,
+    StoredMessage,
+};
 #[cfg(feature = "pq")]
 use storage::{
     ClaimedPqBundle, LocalIdempotentMailboxStore, LocalPqHandshakeStore, PqLastResortCommitment,
     PqStorageSnapshot, PublishV2Record, PublishV2Status, RefillPrekeysRecord, RefillStatus,
     StoredCapabilityManifest, StoredInitialMessageV2, StoredPqPrekey,
 };
-use storage::{
-    AttachmentId, Bundle, Bytes, Error, ErrorKind, LocalAttachmentStore, LocalHandshakeStore,
-    LocalMailboxStore, MAX_SAFE_INTEGER, PublicKey, Result, StoredAttachment, StoredInitialMessage,
-    StoredMessage,
-};
 use worker::{Bucket, Conditional, Env, console_error};
 
+use crate::objects::{
+    self, AppendOutcome, AttachmentCall, AttachmentRow, Content, IdentityCall, InitialMessage,
+    StoredRow, TakenBundle,
+};
 #[cfg(feature = "pq")]
 use crate::objects::{
     ClaimedBundleWire, InitialMessageV2Wire, ManifestWire, PqCommitmentWire, PqPrekeyWire,
     PqSnapshotWire, PublishV2Outcome, RefillOutcome,
-};
-use crate::objects::{
-    self, AppendOutcome, AttachmentCall, AttachmentRow, Content, IdentityCall, InitialMessage,
-    StoredRow, TakenBundle,
 };
 
 /// Contents larger than this go to R2; smaller ones stay in their object's row.
@@ -119,11 +119,7 @@ impl Store {
         }
     }
 
-    async fn finish_append(
-        &self,
-        outcome: Result<AppendOutcome>,
-        staged: &Content,
-    ) -> Result<u64> {
+    async fn finish_append(&self, outcome: Result<AppendOutcome>, staged: &Content) -> Result<u64> {
         match outcome {
             Ok(AppendOutcome::Appended(seq)) => Ok(seq),
             #[cfg(feature = "pq")]
@@ -327,7 +323,11 @@ impl LocalPqHandshakeStore for Store {
             manifest: manifest_to_wire(&record.manifest),
             signed_prekey_signature: record.signed_prekey_signature.map(|s| s.to_vec()),
             one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
-            pq_last_resort: record.pq_last_resort.iter().map(pq_prekey_to_wire).collect(),
+            pq_last_resort: record
+                .pq_last_resort
+                .iter()
+                .map(pq_prekey_to_wire)
+                .collect(),
             pq_one_time_prekeys: record
                 .pq_one_time_prekeys
                 .iter()
@@ -704,6 +704,20 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+pub(crate) fn decode_hex_fixed<const N: usize>(hex: &str) -> Option<[u8; N]> {
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    if pairs.len() != N || !remainder.is_empty() {
+        return None;
+    }
+    let mut out = [0; N];
+    for (byte, &[hi, lo]) in out.iter_mut().zip(pairs) {
+        let hi = char::from(hi).to_digit(16)?;
+        let lo = char::from(lo).to_digit(16)?;
+        *byte = (hi << 4 | lo) as u8;
+    }
+    Some(out)
+}
+
 /// A random name, for an R2 object.
 fn random_id() -> String {
     let mut bytes = [0; 16];
@@ -724,4 +738,26 @@ fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
 fn unavailable(error: worker::Error) -> Error {
     console_error!("storage failed: {error}");
     Error::new(ErrorKind::Unavailable, error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_hex_fixed, hex};
+
+    #[test]
+    fn fixed_hex_decodes_keys_and_signatures() {
+        let key = std::array::from_fn(|i| i as u8);
+        assert_eq!(decode_hex_fixed::<32>(&hex(&key)), Some(key));
+        assert_eq!(decode_hex_fixed::<64>(&"aB".repeat(64)), Some([0xab; 64]));
+    }
+
+    #[test]
+    fn fixed_hex_rejects_wrong_lengths_and_invalid_digits() {
+        for len in [0, 63, 65, 128] {
+            assert!(decode_hex_fixed::<32>(&"0".repeat(len)).is_none());
+        }
+        for pair in ["+1", "zz", "é"] {
+            assert!(decode_hex_fixed::<32>(&pair.repeat(32)).is_none());
+        }
+    }
 }
