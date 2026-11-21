@@ -2,13 +2,15 @@
 
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "pq")]
-use std::{
-    collections::HashSet,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, time::Duration};
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+// The memory feature enables the clock dependency in both builds. Only PQ keeps tombstones.
+#[cfg(not(feature = "pq"))]
+use web_time as _;
+#[cfg(feature = "pq")]
+use web_time::Instant;
 
 use crate::{
     AttachmentId, AttachmentStore, Bundle, ErrorKind, HandshakeStore, MAX_QUEUE_BYTES,
@@ -28,6 +30,9 @@ pub const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum retained client-message IDs per sender and recipient.
 #[cfg(feature = "pq")]
 pub const DEFAULT_MAX_DEDUP_TOMBSTONES: usize = 4096;
+
+#[cfg(feature = "pq")]
+const DEDUP_SWEEP_BUDGET: usize = 8;
 
 #[cfg(feature = "pq")]
 #[derive(Debug)]
@@ -52,6 +57,13 @@ struct Tombstone {
     id: [u8; 16],
     sequence: u64,
     inserted: Instant,
+}
+
+#[cfg(feature = "pq")]
+#[derive(Debug)]
+struct DedupBucket {
+    entries: VecDeque<Tombstone>,
+    sweep_index: usize,
 }
 
 /// Keeps everything in memory until dropped. Implements [`HandshakeStore`], [`MailboxStore`],
@@ -105,7 +117,11 @@ struct Inner {
     pq_one_time: HashMap<PublicKey, VecDeque<StoredPqPrekey>>,
     /// Tombstones in insertion order for each queue, independent of queued message rows.
     #[cfg(feature = "pq")]
-    mailbox_dedup: HashMap<(PublicKey, PublicKey), VecDeque<Tombstone>>,
+    mailbox_dedup: HashMap<(PublicKey, PublicKey), DedupBucket>,
+    #[cfg(feature = "pq")]
+    dedup_keys: Vec<(PublicKey, PublicKey)>,
+    #[cfg(feature = "pq")]
+    dedup_sweep_cursor: usize,
 }
 
 /// A message of a queue, with SHA-256 of its delivery token, if any.
@@ -771,6 +787,46 @@ impl MailboxStore for MemoryStore {
 }
 
 #[cfg(feature = "pq")]
+impl Inner {
+    /// Expire the oldest tombstones. Return true if this removed the bucket.
+    fn prune_dedup(&mut self, key: &(PublicKey, PublicKey), now: Instant, ttl: Duration) -> bool {
+        let Some(bucket) = self.mailbox_dedup.get_mut(key) else {
+            return false;
+        };
+        while bucket
+            .entries
+            .front()
+            .is_some_and(|entry| now.duration_since(entry.inserted) >= ttl)
+        {
+            bucket.entries.pop_front();
+        }
+        if !bucket.entries.is_empty() {
+            return false;
+        }
+        let index = bucket.sweep_index;
+        self.mailbox_dedup.remove(key);
+        self.dedup_keys.swap_remove(index);
+        if let Some(moved) = self.dedup_keys.get(index) {
+            self.mailbox_dedup.get_mut(moved).unwrap().sweep_index = index;
+        }
+        true
+    }
+
+    fn sweep_dedup(&mut self, now: Instant, ttl: Duration) {
+        for _ in 0..DEDUP_SWEEP_BUDGET.min(self.dedup_keys.len()) {
+            if self.dedup_sweep_cursor >= self.dedup_keys.len() {
+                self.dedup_sweep_cursor = 0;
+            }
+            let key = self.dedup_keys[self.dedup_sweep_cursor];
+            // A swap removal leaves a different bucket at the cursor to visit next.
+            if !self.prune_dedup(&key, now, ttl) {
+                self.dedup_sweep_cursor += 1;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "pq")]
 impl IdempotentMailboxStore for MemoryStore {
     async fn append_idempotent(
         &self,
@@ -783,20 +839,26 @@ impl IdempotentMailboxStore for MemoryStore {
         client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
         let mut inner = self.inner.lock();
+        let dedup_enabled = !self.dedup.ttl.is_zero() && self.dedup.max_per_queue > 0;
+        if !dedup_enabled {
+            return inner.append_inner(
+                sender,
+                recipient,
+                header,
+                content,
+                initial_message,
+                delivery_hash,
+            );
+        }
         let key = (*sender, *recipient);
         let now = Instant::now();
-        if let Some(entries) = inner.mailbox_dedup.get_mut(&key) {
-            while entries
-                .front()
-                .is_some_and(|entry| now.duration_since(entry.inserted) >= self.dedup.ttl)
-            {
-                entries.pop_front();
-            }
-            if let Some(id) = client_message_id
-                && let Some(entry) = entries.iter().find(|entry| entry.id == id)
-            {
-                return Ok(entry.sequence);
-            }
+        inner.sweep_dedup(now, self.dedup.ttl);
+        inner.prune_dedup(&key, now, self.dedup.ttl);
+        if let Some(id) = client_message_id
+            && let Some(bucket) = inner.mailbox_dedup.get(&key)
+            && let Some(entry) = bucket.entries.iter().find(|entry| entry.id == id)
+        {
+            return Ok(entry.sequence);
         }
         let seq = inner.append_inner(
             sender,
@@ -806,16 +868,22 @@ impl IdempotentMailboxStore for MemoryStore {
             initial_message,
             delivery_hash,
         )?;
-        if let Some(id) = client_message_id
-            && self.dedup.max_per_queue > 0
-            && !self.dedup.ttl.is_zero()
-        {
+        if let Some(id) = client_message_id {
             let Inner {
                 mailbox_dedup,
+                dedup_keys,
                 queues,
                 ..
             } = &mut *inner;
-            let entries = mailbox_dedup.entry(key).or_default();
+            let bucket = mailbox_dedup.entry(key).or_insert_with(|| {
+                let sweep_index = dedup_keys.len();
+                dedup_keys.push(key);
+                DedupBucket {
+                    entries: VecDeque::new(),
+                    sweep_index,
+                }
+            });
+            let entries = &mut bucket.entries;
             if entries.len() == self.dedup.max_per_queue {
                 // Prefer the oldest delivered message. Queue rows are sorted by sequence.
                 let queue = &queues[&key];
@@ -916,6 +984,104 @@ mod test {
     }
 
     #[cfg(feature = "pq")]
+    async fn append_id(store: &MemoryStore, key: &(PublicKey, PublicKey), id: Option<u8>) -> u64 {
+        store
+            .append_idempotent(
+                &key.0,
+                &key.1,
+                Bytes::new(),
+                Bytes::new(),
+                None,
+                None,
+                id.map(|n| [n; 16]),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn disabled_dedup_keeps_no_tombstones() {
+        futures::executor::block_on(async {
+            let key = ([1; 32], [2; 32]);
+            for (ttl, cap) in [(Duration::ZERO, 4), (DEFAULT_DEDUP_TTL, 0)] {
+                let store = MemoryStore::with_dedup_limits(ttl, cap);
+                assert_eq!(append_id(&store, &key, Some(1)).await, 1);
+                assert_eq!(append_id(&store, &key, Some(1)).await, 2);
+                let inner = store.inner.lock();
+                assert!(inner.mailbox_dedup.is_empty());
+                assert!(inner.dedup_keys.is_empty());
+            }
+        });
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn idle_dedup_buckets_expire_with_bounded_sweeps() {
+        futures::executor::block_on(async {
+            let ttl = Duration::from_secs(60);
+            let store = MemoryStore::with_dedup_limits(ttl, 4);
+            let active = ([1; 32], [255; 32]);
+            let idle: Vec<_> = (0..2 * DEDUP_SWEEP_BUDGET + 1)
+                .map(|i| ([1; 32], [i as u8; 32]))
+                .collect();
+            for key in &idle {
+                append_id(&store, key, Some(1)).await;
+                append_id(&store, key, Some(2)).await;
+            }
+            append_id(&store, &active, Some(3)).await;
+            {
+                let mut inner = store.inner.lock();
+                for key in &idle {
+                    for entry in &mut inner.mailbox_dedup.get_mut(key).unwrap().entries {
+                        entry.inserted -= ttl;
+                    }
+                }
+            }
+            for pass in 0..4 {
+                assert_eq!(append_id(&store, &active, Some(3)).await, 1);
+                let inner = store.inner.lock();
+                assert_eq!(inner.dedup_keys.len(), inner.mailbox_dedup.len());
+                for (i, key) in inner.dedup_keys.iter().enumerate() {
+                    assert_eq!(inner.mailbox_dedup[key].sweep_index, i);
+                }
+                if pass == 0 {
+                    assert!(inner.dedup_keys.len() >= idle.len() + 1 - DEDUP_SWEEP_BUDGET);
+                }
+            }
+            let inner = store.inner.lock();
+            assert_eq!(inner.dedup_keys, [active]);
+            assert!(
+                idle.iter()
+                    .all(|key| !inner.mailbox_dedup.contains_key(key))
+            );
+        });
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn append_without_an_id_removes_an_expired_active_bucket_outside_the_sweep() {
+        futures::executor::block_on(async {
+            let ttl = Duration::from_secs(60);
+            let store = MemoryStore::with_dedup_limits(ttl, 4);
+            for i in 0..=DEDUP_SWEEP_BUDGET {
+                append_id(&store, &([1; 32], [i as u8; 32]), Some(1)).await;
+            }
+            let key = {
+                let mut inner = store.inner.lock();
+                let key = inner.dedup_keys
+                    [(inner.dedup_sweep_cursor + DEDUP_SWEEP_BUDGET) % inner.dedup_keys.len()];
+                inner.mailbox_dedup.get_mut(&key).unwrap().entries[0].inserted -= ttl;
+                key
+            };
+            assert_eq!(append_id(&store, &key, None).await, 2);
+            let inner = store.inner.lock();
+            assert!(!inner.mailbox_dedup.contains_key(&key));
+            assert_eq!(inner.dedup_keys.len(), inner.mailbox_dedup.len());
+        });
+    }
+
+    #[cfg(feature = "pq")]
     #[test]
     fn tombstones_expire_at_the_configured_age() {
         futures::executor::block_on(async {
@@ -945,10 +1111,16 @@ mod test {
                 .lock()
                 .mailbox_dedup
                 .get_mut(&(alice, bob))
-                .unwrap()[0]
+                .unwrap()
+                .entries[0]
                 .inserted -= ttl;
             assert_eq!(append().await.unwrap(), seq + 1);
-            assert_eq!(store.inner.lock().mailbox_dedup[&(alice, bob)].len(), 1);
+            assert_eq!(
+                store.inner.lock().mailbox_dedup[&(alice, bob)]
+                    .entries
+                    .len(),
+                1
+            );
         });
     }
 
@@ -981,7 +1153,12 @@ mod test {
                     .await
                     .unwrap();
                 assert_eq!(append(&bob, id).await, u64::from(id));
-                assert_eq!(store.inner.lock().mailbox_dedup[&(alice, bob)].len(), 2);
+                assert_eq!(
+                    store.inner.lock().mailbox_dedup[&(alice, bob)]
+                        .entries
+                        .len(),
+                    2
+                );
             }
             assert_eq!(append(&bob, 1).await, 1);
             assert_eq!(append(&carol, 1).await, 1);

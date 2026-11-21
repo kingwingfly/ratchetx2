@@ -3,6 +3,11 @@
 mod skipped;
 #[cfg(feature = "serde")]
 mod wire;
+#[cfg(all(
+    feature = "serde",
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+pub use wire::LegacyPartyPqV1;
 #[cfg(feature = "serde")]
 pub use wire::{LegacyPartyV0, LegacyPartyV1};
 
@@ -52,8 +57,18 @@ pub const MAX_SKIPPED_CHAINS: usize = 5;
 /// classical party, 1 identifies ML-KEM-1024, and 2 identifies ML-KEM-768. The final
 /// field is the KEM state option in every build.
 #[cfg_attr(
-    feature = "serde",
+    all(
+        feature = "serde",
+        not(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
+    ),
     doc = "For unversioned positional records, select [`LegacyPartyV0`] or [`LegacyPartyV1`] using the enclosing storage format."
+)]
+#[cfg_attr(
+    all(
+        feature = "serde",
+        any(feature = "ml-kem-1024", feature = "ml-kem-768")
+    ),
+    doc = "For unversioned positional records, select [`LegacyPartyV0`], [`LegacyPartyV1`], or [`LegacyPartyPqV1`] using the enclosing storage format."
 )]
 #[cfg_attr(
     feature = "rkyv",

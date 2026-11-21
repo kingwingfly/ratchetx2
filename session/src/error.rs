@@ -29,9 +29,16 @@ impl Error {
     }
 
     /// Whether the server definitively refused the request. Only this outcome permits
-    /// rolling back private prekeys prepared for a refill.
+    /// rolling back private prekeys prepared for publication.
     pub fn is_server_refusal(&self) -> bool {
         self.server_refusal
+    }
+
+    pub(crate) fn from_protocol_with_kind(kind: ErrorKind, error: protocol::Error) -> Self {
+        Self {
+            server_refusal: error.is_server_refusal(),
+            ..Self::new(kind, error)
+        }
     }
 }
 
@@ -57,10 +64,7 @@ impl From<protocol::Error> for Error {
             Kind::Malformed | Kind::InvalidSignature | Kind::StaleTimestamp => ErrorKind::Protocol,
             _ => ErrorKind::Server,
         };
-        Self {
-            server_refusal: error.is_server_refusal(),
-            ..Self::new(kind, error)
-        }
+        Self::from_protocol_with_kind(kind, error)
     }
 }
 

@@ -29,6 +29,110 @@ use session::{
 use session::{PqConfig, PqSuite};
 use storage::MemoryStore;
 
+/// Each expected RPC fails with its supplied error. An extra fallback fails the test.
+struct RpcErrors(std::cell::RefCell<std::collections::VecDeque<(&'static str, protocol::Error)>>);
+
+impl RpcErrors {
+    fn new<const N: usize>(calls: [(&'static str, protocol::Error); N]) -> Self {
+        Self(std::cell::RefCell::new(calls.into()))
+    }
+
+    fn fail<T>(&self, call: &str) -> protocol::Result<T> {
+        let (expected, error) = self.0.borrow_mut().pop_front().expect("unexpected RPC");
+        assert_eq!(call, expected);
+        Err(error)
+    }
+}
+
+impl LocalHandshake for &RpcErrors {
+    async fn publish(&self, _: PublishRequest) -> protocol::Result<PublishResponse> {
+        self.fail("publish")
+    }
+    async fn fetch_bundle(&self, _: FetchBundleRequest) -> protocol::Result<FetchBundleResponse> {
+        self.fail("fetch_bundle")
+    }
+    async fn send_initial_message(
+        &self,
+        _: SendInitialMessageRequest,
+    ) -> protocol::Result<SendInitialMessageResponse> {
+        self.fail("send_initial_message")
+    }
+    async fn take_initial_messages(
+        &self,
+        _: TakeInitialMessagesRequest,
+    ) -> protocol::Result<TakeInitialMessagesResponse> {
+        self.fail("take_initial_messages")
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LostReply {
+    CorruptBody,
+    Transport,
+}
+
+impl protocol::connect::LocalPost for LostReply {
+    async fn post(&self, _: &str, _: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
+        match self {
+            Self::CorruptBody => Ok((200, vec![0xff])),
+            Self::Transport => Err(protocol::ErrorKind::Connect.into()),
+        }
+    }
+}
+
+async fn check_classical_publish_error(
+    handshake: impl LocalHandshake,
+    extend: bool,
+    expected: ErrorKind,
+    refused: bool,
+    kept: usize,
+) {
+    let mut client = Client::new(handshake);
+    // A retry extends the pending generation. Its original key must survive every outcome.
+    client.prepare_publish(1).unwrap();
+    let result = if extend {
+        client.extend_keys(1).await
+    } else {
+        client.publish_keys(1).await
+    };
+    let error = result.unwrap_err();
+    assert_eq!(error.kind(), expected);
+    assert_eq!(error.is_server_refusal(), refused);
+    assert_eq!(client.current_one_time_count(), kept);
+}
+
+#[tokio::test]
+async fn classical_publish_and_extend_check_refusal_provenance() {
+    use protocol::{ErrorKind as Kind, connect::ConnectClient};
+    for extend in [false, true] {
+        for (kind, expected) in [
+            (Kind::SignInRequired, ErrorKind::SignInRequired),
+            (Kind::LimitExceeded, ErrorKind::LimitExceeded),
+            (Kind::Malformed, ErrorKind::Protocol),
+        ] {
+            let confirmed = RpcErrors::new([("publish", kind.into())]);
+            let kept = if extend || kind == Kind::SignInRequired {
+                1
+            } else {
+                2
+            };
+            check_classical_publish_error(&confirmed, extend, expected, true, kept).await;
+            let ambiguous = RpcErrors::new([(
+                "publish",
+                protocol::Error::ambiguous_response(kind, "lost reply"),
+            )]);
+            check_classical_publish_error(&ambiguous, extend, expected, false, 2).await;
+        }
+        for (reply, expected) in [
+            (LostReply::CorruptBody, ErrorKind::InvalidResponse),
+            (LostReply::Transport, ErrorKind::Server),
+        ] {
+            check_classical_publish_error(ConnectClient::new(reply), extend, expected, false, 2)
+                .await;
+        }
+    }
+}
+
 /// Shared `Arc<MemoryStore>` implementing both v1 and (when PQ is enabled) v2 storage traits.
 #[derive(Debug, Clone, Default)]
 struct SharedStore(Arc<MemoryStore>);
@@ -834,6 +938,7 @@ async fn infinite_expired_pages_relay_terminates_cleanly() {
         }
 
         async fn fetch(&self, request: FetchRequest) -> protocol::Result<FetchResponse> {
+            assert_eq!(request.limit, 100);
             self.fetches.fetch_add(1, Ordering::Relaxed);
             Ok(FetchResponse {
                 messages: vec![protocol::mailbox::Envelope {
@@ -1016,6 +1121,230 @@ mod pq_e2e {
     use session::{AcceptedInitial, InitialMessageV2};
 
     const AUDIENCE: &str = "relay.example";
+
+    impl LocalHandshakeV2 for &RpcErrors {
+        async fn publish_v2(
+            &self,
+            request: PublishV2Request,
+        ) -> protocol::Result<PublishV2Response> {
+            self.fail(if request.manifest.unwrap().pq_enabled {
+                "publish_on"
+            } else {
+                "publish_off"
+            })
+        }
+        async fn get_server_info(
+            &self,
+            _: GetServerInfoRequest,
+        ) -> protocol::Result<GetServerInfoResponse> {
+            self.fail("get_server_info")
+        }
+        async fn refill_prekeys(
+            &self,
+            _: RefillPrekeysRequest,
+        ) -> protocol::Result<RefillPrekeysResponse> {
+            self.fail("refill_prekeys")
+        }
+        async fn get_manifest(
+            &self,
+            _: GetManifestRequest,
+        ) -> protocol::Result<GetManifestResponse> {
+            self.fail("get_manifest")
+        }
+        async fn claim_bundle(
+            &self,
+            _: ClaimBundleRequest,
+        ) -> protocol::Result<ClaimBundleResponse> {
+            self.fail("claim_bundle")
+        }
+        async fn send_initial_v2(
+            &self,
+            _: SendInitialV2Request,
+        ) -> protocol::Result<SendInitialV2Response> {
+            self.fail("send_initial_v2")
+        }
+        async fn list_initial_messages(
+            &self,
+            _: ListInitialMessagesRequest,
+        ) -> protocol::Result<ListInitialMessagesResponse> {
+            self.fail("list_initial_messages")
+        }
+        async fn ack_initial_messages(
+            &self,
+            _: AckInitialMessagesRequest,
+        ) -> protocol::Result<AckInitialMessagesResponse> {
+            self.fail("ack_initial_messages")
+        }
+    }
+
+    impl LocalMailbox for &RpcErrors {
+        async fn push(&self, _: PushRequest) -> protocol::Result<PushResponse> {
+            self.fail("push")
+        }
+        async fn fetch(&self, _: FetchRequest) -> protocol::Result<FetchResponse> {
+            self.fail("fetch")
+        }
+    }
+
+    impl LocalMailboxV2 for &RpcErrors {
+        async fn push_v2(&self, _: PushV2Request) -> protocol::Result<PushV2Response> {
+            self.fail("push_v2")
+        }
+        async fn fetch_signed(
+            &self,
+            _: FetchSignedRequest,
+        ) -> protocol::Result<FetchSignedResponse> {
+            self.fail("fetch_signed")
+        }
+    }
+
+    async fn check_publish_v2_error(
+        handshake: impl LocalHandshake + LocalHandshakeV2,
+        strict: bool,
+        expected: ErrorKind,
+        refused: bool,
+    ) {
+        let mut client = Client::new(handshake)
+            .with_pq_config(PqConfig {
+                strict_pq: strict,
+                ..Default::default()
+            })
+            .unwrap();
+        client.prepare_publish_v2(AUDIENCE, 1, 1).unwrap();
+        let error = client.publish_v2(AUDIENCE, 1, 1).await.unwrap_err();
+        assert_eq!(error.kind(), expected);
+        assert_eq!(error.is_server_refusal(), refused);
+        let kept = if refused { 1 } else { 2 };
+        assert_eq!(client.manifest_seq(), kept as u64);
+        assert_eq!(client.current_one_time_count(), kept);
+        for suite in client.pq_config().offered_suites() {
+            assert_eq!(client.current_pq_one_time_count(suite), kept);
+        }
+    }
+
+    #[tokio::test]
+    async fn pq_publish_rolls_back_only_confirmed_refusals() {
+        use protocol::{ErrorKind as Kind, connect::ConnectClient};
+        for (kind, expected) in [
+            (Kind::SignInRequired, ErrorKind::SignInRequired),
+            (Kind::LimitExceeded, ErrorKind::LimitExceeded),
+            (Kind::Malformed, ErrorKind::Protocol),
+            (Kind::InvalidSignature, ErrorKind::Protocol),
+            (Kind::StaleTimestamp, ErrorKind::Protocol),
+        ] {
+            let confirmed = RpcErrors::new([("publish_on", kind.into())]);
+            check_publish_v2_error(&confirmed, false, expected, true).await;
+            let ambiguous = RpcErrors::new([(
+                "publish_on",
+                protocol::Error::ambiguous_response(kind, "lost reply"),
+            )]);
+            check_publish_v2_error(&ambiguous, false, expected, false).await;
+        }
+        let strict = RpcErrors::new([("publish_on", Kind::Unimplemented.into())]);
+        check_publish_v2_error(&strict, true, ErrorKind::PqRequired, true).await;
+        for (reply, expected) in [
+            (LostReply::CorruptBody, ErrorKind::InvalidResponse),
+            (LostReply::Transport, ErrorKind::Server),
+        ] {
+            check_publish_v2_error(ConnectClient::new(reply), false, expected, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_unimplemented_stops_at_the_current_publish_attempt() {
+        use protocol::ErrorKind::Unimplemented;
+        let ambiguous = || protocol::Error::ambiguous_response(Unimplemented, "lost reply");
+        for (calls, strict) in [
+            (RpcErrors::new([("publish_on", ambiguous())]), false),
+            (RpcErrors::new([("publish_on", ambiguous())]), true),
+            (
+                RpcErrors::new([
+                    ("publish_on", Unimplemented.into()),
+                    ("publish_off", ambiguous()),
+                ]),
+                false,
+            ),
+        ] {
+            check_publish_v2_error(&calls, strict, ErrorKind::Unimplemented, false).await;
+            assert!(calls.0.borrow().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn v2_handshake_and_mailbox_fallbacks_check_refusal_provenance() {
+        use protocol::ErrorKind::Unimplemented;
+        let hs = DualHandshake::new(SharedStore::default(), AUDIENCE);
+        let mut peer = Client::new(hs.clone());
+        peer.publish_v2(AUDIENCE, 0, 0).await.unwrap();
+        for (strict, confirmed) in [(false, false), (true, false), (true, true)] {
+            let ambiguous = || protocol::Error::ambiguous_response(Unimplemented, "lost reply");
+            let failure = || {
+                if confirmed {
+                    Unimplemented.into()
+                } else {
+                    ambiguous()
+                }
+            };
+            let calls = RpcErrors::new([
+                ("claim_bundle", failure()),
+                ("list_initial_messages", failure()),
+                ("push_v2", ambiguous()),
+                ("fetch_signed", failure()),
+            ]);
+            let check = |error: session::Error| {
+                assert_eq!(
+                    error.kind(),
+                    if confirmed {
+                        ErrorKind::PqRequired
+                    } else {
+                        ErrorKind::Unimplemented
+                    }
+                );
+                assert_eq!(error.is_server_refusal(), confirmed);
+            };
+            let config = PqConfig {
+                strict_pq: strict,
+                ..Default::default()
+            };
+            let mut client = Client::new(&calls).with_pq_config(config.clone()).unwrap();
+            check(
+                client
+                    .prepare_initiate_v2(
+                        AUDIENCE,
+                        &peer.identity_key(),
+                        &PeerPqState::default(),
+                        b"first",
+                        (),
+                    )
+                    .await
+                    .unwrap_err(),
+            );
+            check(
+                client
+                    .list_initial_messages_v2(AUDIENCE, 10)
+                    .await
+                    .unwrap_err(),
+            );
+
+            let mut sender = Client::new(hs.clone()).with_pq_config(config).unwrap();
+            let mut chat = sender
+                .prepare_initiate_v2(
+                    AUDIENCE,
+                    &peer.identity_key(),
+                    &PeerPqState::default(),
+                    b"first",
+                    &calls,
+                )
+                .await
+                .unwrap()
+                .session;
+            let error = chat.send_v2(b"next").await.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Unimplemented);
+            assert!(!error.is_server_refusal());
+            check(chat.receive_v2(&sender, AUDIENCE).await.unwrap_err());
+            assert!(calls.0.borrow().is_empty());
+        }
+    }
 
     impl storage::LocalPqHandshakeStore for SharedStore {
         async fn publish_v2(
@@ -1256,6 +1585,7 @@ mod pq_e2e {
         StripPqPrekeys,
         StripManifest,
         ReplayBundle(Box<ClaimBundleResponse>),
+        MixedInboxIds,
         #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         DowngradeSuiteTo768,
     }
@@ -1328,6 +1658,7 @@ mod pq_e2e {
                     Ok(resp)
                 }
                 AttackMode::ReplayBundle(captured) => Ok((**captured).clone()),
+                AttackMode::MixedInboxIds => self.inner.claim_bundle(request).await,
                 #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                 AttackMode::DowngradeSuiteTo768 => {
                     let mut request = request;
@@ -1346,14 +1677,105 @@ mod pq_e2e {
             &self,
             request: ListInitialMessagesRequest,
         ) -> protocol::Result<ListInitialMessagesResponse> {
-            self.inner.list_initial_messages(request).await
+            let mut response = self.inner.list_initial_messages(request).await?;
+            if let AttackMode::MixedInboxIds = self.attack
+                && let Some(first) = response.messages.first().cloned()
+            {
+                assert_eq!(first.id, 1);
+                let malformed = protocol::handshake_v2::InitialMessageV2 {
+                    id: 2,
+                    first_message: None,
+                    ..first.clone()
+                };
+                response.messages.extend([
+                    malformed.clone(),
+                    protocol::handshake_v2::InitialMessageV2 {
+                        id: protocol::MAX_SAFE_INTEGER + 1,
+                        ..malformed
+                    },
+                    protocol::handshake_v2::InitialMessageV2 {
+                        id: u64::MAX,
+                        ..first
+                    },
+                ]);
+            }
+            Ok(response)
         }
         async fn ack_initial_messages(
             &self,
             request: AckInitialMessagesRequest,
         ) -> protocol::Result<AckInitialMessagesResponse> {
+            if let AttackMode::MixedInboxIds = self.attack {
+                assert_eq!(request.ids, [2, 1]);
+            }
             self.inner.ack_initial_messages(request).await
         }
+    }
+
+    #[tokio::test]
+    async fn unsafe_inbox_ids_are_omitted_before_acceptance_and_signed_ack() {
+        let store = SharedStore::default();
+        let hs = DualHandshake::new(store, AUDIENCE);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(AttackingHandshake {
+            inner: hs,
+            attack: AttackMode::MixedInboxIds,
+        });
+        bob.publish_v2(AUDIENCE, 1, 1).await.unwrap();
+        let initial = alice
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"first",
+                (),
+            )
+            .await
+            .unwrap();
+        alice
+            .send_prepared_initiate_v2(&initial.request)
+            .await
+            .unwrap();
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        assert_eq!(
+            listed.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+            [1]
+        );
+        assert_eq!(listed.malformed_ids, [2]);
+        let session::OutgoingInitialMessage::V2(request) = initial.request else {
+            panic!("expected a v2 request");
+        };
+        let mut wire = request.message.unwrap();
+        for id in [0, protocol::MAX_SAFE_INTEGER] {
+            wire.id = id;
+            assert_eq!(InitialMessageV2::try_from(&wire).unwrap().id, id);
+        }
+        for id in [protocol::MAX_SAFE_INTEGER + 1, u64::MAX] {
+            wire.id = id;
+            assert_eq!(
+                InitialMessageV2::try_from(&wire).unwrap_err().kind(),
+                ErrorKind::InvalidInitialMessage
+            );
+        }
+        let outcome = bob
+            .list_and_accept_v2(AUDIENCE, 10, (), |_| PeerPqState::default())
+            .await
+            .unwrap();
+        assert!(outcome.ack_error.is_none());
+        assert!(outcome.unacked_ids.is_empty());
+        let [(peer, AcceptedInitial::Accepted { first_message, .. })] = outcome.outcomes.as_slice()
+        else {
+            panic!("expected one accepted initial");
+        };
+        assert_eq!(peer, &alice.identity_key());
+        assert_eq!(first_message, b"first");
+        assert!(
+            bob.list_initial_messages_v2(AUDIENCE, 10)
+                .await
+                .unwrap()
+                .messages
+                .is_empty()
+        );
     }
 
     /// A legacy v1-only server returning `Unimplemented` for all v2 procedures.
@@ -3868,6 +4290,7 @@ mod pq_e2e {
                 &self,
                 request: FetchSignedRequest,
             ) -> protocol::Result<FetchSignedResponse> {
+                assert_eq!(request.limit, 100);
                 self.fetches.fetch_add(1, Ordering::Relaxed);
                 Ok(FetchSignedResponse {
                     messages: vec![protocol::mailbox_v2::EnvelopeV2 {
