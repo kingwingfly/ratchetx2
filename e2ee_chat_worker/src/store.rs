@@ -1,5 +1,5 @@
-//! The handshake, mailbox and attachment stores over the Worker's Durable Objects, with large
-//! message contents and attachments' chunks in R2.
+//! The v2 handshake, idempotent mailbox, and attachment stores over the Worker's Durable Objects,
+//! with large message contents and attachments' chunks in R2.
 //!
 //! Each store method is one call of one object, which serves it whole, so it is atomic, as the
 //! storage traits require. Large contents go to R2 before the DO append call; on an ambiguous DO
@@ -10,26 +10,18 @@
 use futures_util::future::try_join_all;
 use serde::de::DeserializeOwned;
 use storage::{
-    AttachmentId, Bundle, Bytes, Error, ErrorKind, LocalAttachmentStore, LocalHandshakeStore,
-    LocalMailboxStore, MAX_SAFE_INTEGER, PublicKey, Result, StoredAttachment, StoredInitialMessage,
-    StoredMessage,
-};
-#[cfg(feature = "pq")]
-use storage::{
-    ClaimedPqBundle, LocalIdempotentMailboxStore, LocalPqHandshakeStore, PqLastResortCommitment,
-    PqStorageSnapshot, PublishV2Record, PublishV2Status, RefillPrekeysRecord, RefillStatus,
-    StoredCapabilityManifest, StoredInitialMessageV2, StoredPqPrekey,
+    AttachmentId, Bytes, ClaimedPqBundle, Error, ErrorKind, LocalAttachmentStore,
+    LocalIdempotentMailboxStore, LocalPqHandshakeStore, MAX_SAFE_INTEGER, PqLastResortCommitment,
+    PqStorageSnapshot, PublicKey, PublishV2Record, PublishV2Status, RefillPrekeysRecord,
+    RefillStatus, Result, StoredAttachment, StoredCapabilityManifest, StoredInitialMessageV2,
+    StoredMessage, StoredPqPrekey,
 };
 use worker::{Bucket, Conditional, Env, console_error};
 
 use crate::objects::{
-    self, AppendOutcome, AttachmentCall, AttachmentRow, Content, IdentityCall, InitialMessage,
-    StoredRow, TakenBundle,
-};
-#[cfg(feature = "pq")]
-use crate::objects::{
-    ClaimedBundleWire, InitialMessageV2Wire, ManifestWire, PqCommitmentWire, PqPrekeyWire,
-    PqSnapshotWire, PublishV2Outcome, RefillOutcome,
+    self, AppendOutcome, AttachmentCall, AttachmentRow, ClaimedBundleWire, Content, IdentityCall,
+    InitialMessageV2Wire, ManifestWire, PqCommitmentWire, PqPrekeyWire, PqSnapshotWire,
+    PublishV2Outcome, RefillOutcome, StoredRow,
 };
 
 /// Contents larger than this go to R2; smaller ones stay in their object's row.
@@ -122,7 +114,6 @@ impl Store {
     async fn finish_append(&self, outcome: Result<AppendOutcome>, staged: &Content) -> Result<u64> {
         match outcome {
             Ok(AppendOutcome::Appended(seq)) => Ok(seq),
-            #[cfg(feature = "pq")]
             Ok(AppendOutcome::Deduplicated(seq)) => {
                 // Retry hit existing dedup row; newly staged R2 object is not referenced.
                 if let Content::Object(object) = staged
@@ -155,88 +146,6 @@ fn check_safe(value: u64) -> Result<()> {
     Ok(())
 }
 
-impl LocalHandshakeStore for Store {
-    async fn publish(&self, bundle: Bundle, one_time_prekeys: Vec<PublicKey>) -> Result<bool> {
-        check_safe(bundle.timestamp)?;
-        let call = IdentityCall::Publish {
-            signed_prekey: bundle.signed_prekey.to_vec(),
-            signature: bundle.signed_prekey_signature.to_vec(),
-            timestamp: bundle.timestamp,
-            one_time_prekeys: one_time_prekeys.iter().map(|key| key.to_vec()).collect(),
-        };
-        self.identity(&bundle.identity_key, &call).await
-    }
-
-    async fn take_bundle(
-        &self,
-        identity_key: &PublicKey,
-    ) -> Result<Option<(Bundle, Option<PublicKey>)>> {
-        let taken: Option<TakenBundle> = self
-            .identity(identity_key, &IdentityCall::TakeBundle)
-            .await?;
-        let Some(taken) = taken else {
-            return Ok(None);
-        };
-        let bundle = Bundle {
-            identity_key: *identity_key,
-            signed_prekey: fixed(&taken.signed_prekey)?,
-            signed_prekey_signature: fixed(&taken.signature)?,
-            timestamp: taken.timestamp,
-        };
-        let one_time_prekey = taken.one_time_prekey.as_deref().map(fixed).transpose()?;
-        Ok(Some((bundle, one_time_prekey)))
-    }
-
-    async fn add_initial_message(
-        &self,
-        initial_message: StoredInitialMessage,
-        limit: usize,
-    ) -> Result<bool> {
-        let call = IdentityCall::AddInitialMessage {
-            message: InitialMessage {
-                sender: initial_message.sender.to_vec(),
-                ephemeral_key: initial_message.ephemeral_key.to_vec(),
-                signed_prekey: initial_message.signed_prekey.to_vec(),
-                one_time_prekey: initial_message.one_time_prekey.map(|key| key.to_vec()),
-                header: initial_message.header.to_vec(),
-                content: initial_message.content.to_vec(),
-            },
-            limit: limit as u64,
-        };
-        self.identity(&initial_message.recipient, &call).await
-    }
-
-    async fn take_initial_messages(
-        &self,
-        recipient: &PublicKey,
-        timestamp: u64,
-    ) -> Result<Option<Vec<StoredInitialMessage>>> {
-        check_safe(timestamp)?;
-        let taken: Option<Vec<InitialMessage>> = self
-            .identity(recipient, &IdentityCall::TakeInitialMessages { timestamp })
-            .await?;
-        let Some(taken) = taken else {
-            return Ok(None);
-        };
-        taken
-            .into_iter()
-            .map(|message| {
-                Ok(StoredInitialMessage {
-                    sender: fixed(&message.sender)?,
-                    recipient: *recipient,
-                    ephemeral_key: fixed(&message.ephemeral_key)?,
-                    signed_prekey: fixed(&message.signed_prekey)?,
-                    one_time_prekey: message.one_time_prekey.as_deref().map(fixed).transpose()?,
-                    header: Bytes::from(message.header),
-                    content: Bytes::from(message.content),
-                })
-            })
-            .collect::<Result<_>>()
-            .map(Some)
-    }
-}
-
-#[cfg(feature = "pq")]
 fn manifest_to_wire(manifest: &StoredCapabilityManifest) -> ManifestWire {
     ManifestWire {
         audience: manifest.audience.clone(),
@@ -262,7 +171,6 @@ fn manifest_to_wire(manifest: &StoredCapabilityManifest) -> ManifestWire {
     }
 }
 
-#[cfg(feature = "pq")]
 fn manifest_from_wire(wire: ManifestWire) -> Result<StoredCapabilityManifest> {
     let pq_last_resort = wire
         .pq_last_resort
@@ -291,7 +199,6 @@ fn manifest_from_wire(wire: ManifestWire) -> Result<StoredCapabilityManifest> {
     })
 }
 
-#[cfg(feature = "pq")]
 fn pq_prekey_to_wire(key: &StoredPqPrekey) -> PqPrekeyWire {
     PqPrekeyWire {
         suite: key.suite,
@@ -301,7 +208,6 @@ fn pq_prekey_to_wire(key: &StoredPqPrekey) -> PqPrekeyWire {
     }
 }
 
-#[cfg(feature = "pq")]
 fn pq_prekey_from_wire(wire: PqPrekeyWire) -> Result<StoredPqPrekey> {
     Ok(StoredPqPrekey {
         suite: wire.suite,
@@ -311,7 +217,6 @@ fn pq_prekey_from_wire(wire: PqPrekeyWire) -> Result<StoredPqPrekey> {
     })
 }
 
-#[cfg(feature = "pq")]
 impl LocalPqHandshakeStore for Store {
     async fn publish_v2(&self, record: PublishV2Record) -> Result<PublishV2Status> {
         check_safe(record.timestamp)?;
@@ -515,11 +420,8 @@ impl LocalPqHandshakeStore for Store {
     }
 }
 
-impl LocalMailboxStore for Store {
-    /// Stages large content in R2 before appending to the DO. Only deletes the R2 object on a
-    /// definitive pre-commit rejection (`AppendOutcome::LimitExceeded`), never on an ambiguous DO
-    /// RPC failure.
-    async fn append(
+impl LocalIdempotentMailboxStore for Store {
+    async fn append_idempotent(
         &self,
         sender: &PublicKey,
         recipient: &PublicKey,
@@ -527,49 +429,20 @@ impl LocalMailboxStore for Store {
         content: Bytes,
         initial_message: Option<Bytes>,
         delivery_hash: Option<[u8; 32]>,
+        client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
         let (staged, size) = self.stage_content(sender, recipient, content).await?;
-        let call = IdentityCall::Append {
+        let call = IdentityCall::AppendIdempotent {
             sender: sender.to_vec(),
             header: header.to_vec(),
             content: staged.clone(),
             size,
             initial_message: initial_message.map(|bytes| bytes.to_vec()),
             delivery_hash: delivery_hash.map(Vec::from),
+            client_message_id: client_message_id.map(Vec::from),
         };
         let outcome = self.identity(recipient, &call).await;
         self.finish_append(outcome, &staged).await
-    }
-
-    async fn read(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        after: u64,
-        limit: u32,
-    ) -> Result<Vec<StoredMessage>> {
-        let call = IdentityCall::Read {
-            sender: sender.to_vec(),
-            after,
-            limit,
-            max_size: self.max_read_size as u64,
-        };
-        let rows: Vec<StoredRow> = self.identity(recipient, &call).await?;
-        try_join_all(rows.into_iter().map(|row| async move {
-            let content = match row.content {
-                Content::Inline(content) => Some(Bytes::from(content)),
-                Content::Object(object) => self.object(&object).await?,
-            };
-            Ok(StoredMessage {
-                sender: *sender,
-                recipient: *recipient,
-                sequence: row.sequence,
-                header: Bytes::from(row.header),
-                content,
-                initial_message: row.initial_message.map(Bytes::from),
-            })
-        }))
-        .await
     }
 
     async fn delete_delivered(
@@ -601,32 +474,36 @@ impl LocalMailboxStore for Store {
         };
         self.identity(recipient, &call).await
     }
-}
 
-#[cfg(feature = "pq")]
-impl LocalIdempotentMailboxStore for Store {
-    async fn append_idempotent(
+    async fn read(
         &self,
         sender: &PublicKey,
         recipient: &PublicKey,
-        header: Bytes,
-        content: Bytes,
-        initial_message: Option<Bytes>,
-        delivery_hash: Option<[u8; 32]>,
-        client_message_id: Option<[u8; 16]>,
-    ) -> Result<u64> {
-        let (staged, size) = self.stage_content(sender, recipient, content).await?;
-        let call = IdentityCall::AppendIdempotent {
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredMessage>> {
+        let call = IdentityCall::Read {
             sender: sender.to_vec(),
-            header: header.to_vec(),
-            content: staged.clone(),
-            size,
-            initial_message: initial_message.map(|bytes| bytes.to_vec()),
-            delivery_hash: delivery_hash.map(Vec::from),
-            client_message_id: client_message_id.map(Vec::from),
+            after,
+            limit,
+            max_size: self.max_read_size as u64,
         };
-        let outcome = self.identity(recipient, &call).await;
-        self.finish_append(outcome, &staged).await
+        let rows: Vec<StoredRow> = self.identity(recipient, &call).await?;
+        try_join_all(rows.into_iter().map(|row| async move {
+            let content = match row.content {
+                Content::Inline(content) => Some(Bytes::from(content)),
+                Content::Object(object) => self.object(&object).await?,
+            };
+            Ok(StoredMessage {
+                sender: *sender,
+                recipient: *recipient,
+                sequence: row.sequence,
+                header: Bytes::from(row.header),
+                content,
+                initial_message: row.initial_message.map(Bytes::from),
+            })
+        }))
+        .await
     }
 }
 

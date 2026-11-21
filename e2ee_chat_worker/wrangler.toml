@@ -43,18 +43,16 @@ RETENTION_DAYS = "30"
 FILE_RETENTION_DAYS = "90"
 # How long a sign-in lasts.
 SESSION_DAYS = "30"
-# Runtime post-quantum & compatibility toggles:
+# Runtime post-quantum toggle:
 # - PQ_ENABLED = "false" disables GetManifest and advertises pq_enabled: false, x-e2ee-pq: 0,
 #   and empty supported_suites. PublishV2 accepts signed OFF manifests and ClaimBundle offers
 #   classical fallback. ListInitialMessages, AckInitialMessages, PushV2, and FetchSigned stay
 #   active so clients can drain in-flight handshakes and messages and continue signed reads.
-# - LEGACY_V1: "true" keeps legacy handshake.v1/mailbox.v1 routes enabled for archived TUI clients.
-# - ALLOW_UNSIGNED_FETCH defaults to "false", requiring signed mailbox.v2 FetchSigned reads.
-#   Set it to "true" to enable unsigned mailbox.v1 Fetch for legacy v1 or archived TUI clients.
+# Legacy v1 (`handshake.v1`, `mailbox.v1`, unsigned `Fetch`, and query-param / unbound
+# `/notifications`) has been deprecated and removed; the last legacy-v1-compatible version is
+# tagged `archive/legacy-v1`.
 # Optional SERVER_ID sets the canonical audience string as host[:port] (defaults to the request URL host[:port]).
 PQ_ENABLED = "true"
-LEGACY_V1 = "true"
-ALLOW_UNSIGNED_FETCH = "false"
 
 # The secrets PASSWORD, which clients sign in with, as every write takes it, and AUTH_KEY, which
 # signs their sign-ins' cookies: set with `npx wrangler secret put`, or in .dev.vars for

@@ -1,11 +1,9 @@
-//! The object of an identity key: its published bundle and one-time prekeys, optional v2 PQ
-//! capability manifest and PQ prekeys, its inbox of initial messages, the queues of messages to
-//! it, one per sender, and the WebSockets its client subscribed with, which hear at once of what
-//! arrives.
+//! The object of an identity key: its v2 capability manifest, classical and post-quantum prekeys,
+//! its inbox of initial messages, the queues of messages to it, one per sender, and the WebSockets
+//! its client subscribed with, which hear at once of what arrives.
 //!
-//! Reads of an unknown identity leave the core tables unallocated. On a password-protected server,
-//! a cookie-free signed query subscription can create its replay table only if the core tables
-//! already exist. V2 handshakes use side tables and share the mailbox message queues with v1.
+//! Reads of an unknown identity leave the core tables unallocated. Existing deployed v1/v2 SQLite
+//! Durable Objects auto-migrate in place to v3 without losing stored rows.
 
 mod handshake;
 mod mailbox;
@@ -13,8 +11,9 @@ mod rows;
 mod schema;
 mod ws;
 
-use protocol::notify::Notification;
 use std::cell::Cell;
+
+use protocol::notify::Notification;
 use storage::MAX_SAFE_INTEGER;
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use worker::{
@@ -23,17 +22,12 @@ use worker::{
     durable_object,
 };
 
-#[cfg(feature = "pq")]
-use super::RefillOutcome;
 use super::{
-    AppendOutcome, IdentityCall, InitialMessage, RETRY_ALARM, alarm_at, answer, blob,
+    AppendOutcome, IdentityCall, RETRY_ALARM, RefillOutcome, alarm_at, answer, blob,
     checked_integer, decode, has_table,
 };
 use rows::{ExpiredObjectRow, OldestRow};
-pub use ws::{
-    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE,
-    HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS,
-};
+pub use ws::{HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY};
 
 /// Maximum expired R2 objects deleted in a single alarm tick.
 const ALARM_R2_BATCH: u64 = 500;
@@ -232,69 +226,6 @@ impl Identity {
     /// storage alarm scheduling), preserving atomicity.
     async fn serve(&self, call: IdentityCall) -> Result<Response> {
         match call {
-            IdentityCall::Publish {
-                signed_prekey,
-                signature,
-                timestamp,
-                one_time_prekeys,
-            } => {
-                if timestamp > MAX_SAFE_INTEGER {
-                    return Err(Error::RustError(
-                        "timestamp exceeds MAX_SAFE_INTEGER".into(),
-                    ));
-                }
-                self.create_tables()?;
-                answer(self.publish(&signed_prekey, &signature, timestamp, &one_time_prekeys))
-            }
-            IdentityCall::TakeBundle => answer(self.take_bundle()),
-            IdentityCall::AddInitialMessage { message, limit } => {
-                self.create_tables()?;
-                self.schedule_message_expiry(false).await?;
-                let added = self.add_initial_message(&message, limit);
-                if matches!(added, Ok(true)) {
-                    self.notify(&Notification::initial_message());
-                }
-                answer(added)
-            }
-            IdentityCall::TakeInitialMessages { timestamp } => {
-                // Check `has_tables()` FIRST so passwordless calls for arbitrary unknown keys
-                // NEVER allocate SQLite tables or insert `inbox.last_take`!
-                if timestamp > MAX_SAFE_INTEGER {
-                    return Err(Error::RustError(
-                        "timestamp exceeds MAX_SAFE_INTEGER".into(),
-                    ));
-                }
-                if !self.has_tables()? {
-                    return answer(Ok(Some(Vec::<InitialMessage>::new())));
-                }
-                answer(self.take_initial_messages(timestamp))
-            }
-            IdentityCall::Append {
-                sender,
-                header,
-                content,
-                size,
-                initial_message,
-                delivery_hash,
-            } => {
-                self.create_tables()?;
-                self.schedule_message_expiry(false).await?;
-                let appended = self.append(
-                    &sender,
-                    &header,
-                    &content,
-                    size,
-                    initial_message.as_deref(),
-                    delivery_hash.as_deref(),
-                    None,
-                );
-                if matches!(appended, Ok(AppendOutcome::Appended(_)))
-                    && let Ok(sender) = <[u8; 32]>::try_from(sender.as_slice())
-                {
-                    self.notify(&Notification::message_from(&sender));
-                }
-                answer(appended)
-            }
             IdentityCall::Read {
                 sender,
                 after,
@@ -309,7 +240,6 @@ impl Identity {
                 hashes,
                 objects,
             } => answer(self.delete_delivered(&sender, &hashes, &objects)),
-            #[cfg(feature = "pq")]
             IdentityCall::PublishV2 {
                 manifest,
                 signed_prekey_signature,
@@ -328,7 +258,6 @@ impl Identity {
                     timestamp,
                 ))
             }
-            #[cfg(feature = "pq")]
             IdentityCall::RefillPrekeys {
                 generation,
                 one_time_prekeys,
@@ -350,13 +279,10 @@ impl Identity {
                     timestamp,
                 ))
             }
-            #[cfg(feature = "pq")]
             IdentityCall::GetManifest => answer(self.get_manifest()),
-            #[cfg(feature = "pq")]
             IdentityCall::ClaimBundle { preferred_suites } => {
                 answer(self.claim_bundle(&preferred_suites))
             }
-            #[cfg(feature = "pq")]
             IdentityCall::AddInitialMessageV2 { message, limit } => {
                 self.ensure_v2_tables()?;
                 self.schedule_message_expiry(false).await?;
@@ -366,15 +292,11 @@ impl Identity {
                 }
                 answer(added)
             }
-            #[cfg(feature = "pq")]
             IdentityCall::ListInitialMessages { limit } => {
                 answer(self.list_initial_messages(limit))
             }
-            #[cfg(feature = "pq")]
             IdentityCall::AckInitialMessages { ids } => answer(self.ack_initial_messages(&ids)),
-            #[cfg(feature = "pq")]
             IdentityCall::PqSnapshot => answer(self.pq_snapshot()),
-            #[cfg(feature = "pq")]
             IdentityCall::AppendIdempotent {
                 sender,
                 header,
