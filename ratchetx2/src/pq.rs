@@ -7,13 +7,11 @@
 use core::fmt;
 use std::collections::VecDeque;
 
-use ml_kem::{
-    B32, Decapsulate, DecapsulationKey, EncapsulationKey, KeyExport, Seed,
-};
 #[cfg(feature = "ml-kem-768")]
 use ml_kem::MlKem768;
 #[cfg(feature = "ml-kem-1024")]
 use ml_kem::MlKem1024;
+use ml_kem::{B32, Decapsulate, DecapsulationKey, EncapsulationKey, KeyExport, Seed};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -45,7 +43,6 @@ const KEM_ID_DOMAIN: &[u8] = b"ratchetx2.pq.v1/id\0";
 #[non_exhaustive]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
@@ -104,6 +101,54 @@ impl PqSuite {
     /// Seed length in bytes (always 64 for FIPS 203 `(d, z)` seeds).
     pub const fn seed_len(self) -> usize {
         KEM_SEED_LENGTH
+    }
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for PqSuite {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_u8(self.id())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for PqSuite {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SuiteVisitor;
+
+        impl serde::de::Visitor<'_> for SuiteVisitor {
+            type Value = PqSuite;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an enabled ML-KEM suite identifier")
+            }
+
+            fn visit_u8<E: serde::de::Error>(self, id: u8) -> Result<PqSuite, E> {
+                PqSuite::from_id(id).ok_or_else(|| E::custom("unknown or disabled ML-KEM suite"))
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, id: u64) -> Result<PqSuite, E> {
+                self.visit_u8(u8::try_from(id).map_err(E::custom)?)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, id: i64) -> Result<PqSuite, E> {
+                self.visit_u8(u8::try_from(id).map_err(E::custom)?)
+            }
+
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<PqSuite, E> {
+                match name {
+                    "MlKem1024" => self.visit_u8(1),
+                    "MlKem768" => self.visit_u8(2),
+                    _ => Err(E::unknown_variant(name, &["MlKem1024", "MlKem768"])),
+                }
+            }
+        }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(SuiteVisitor)
+        } else {
+            deserializer.deserialize_u8(SuiteVisitor)
+        }
     }
 }
 
@@ -250,10 +295,7 @@ impl<'de> serde::Deserialize<'de> for KemSeed {
                         .ok_or_else(|| serde::de::Error::invalid_length(i, &self))?;
                 }
                 if seq.next_element::<u8>()?.is_some() {
-                    return Err(serde::de::Error::invalid_length(
-                        KEM_SEED_LENGTH + 1,
-                        &self,
-                    ));
+                    return Err(serde::de::Error::invalid_length(KEM_SEED_LENGTH + 1, &self));
                 }
                 Ok(KemSeed(*bytes))
             }
@@ -600,7 +642,8 @@ impl KemRatchet {
         if self.initial_offer_needed {
             return true;
         }
-        if self.rekey_turns > 0 && (self.rekey_turns == 1 || self.turns_since_rekey >= self.rekey_turns)
+        if self.rekey_turns > 0
+            && (self.rekey_turns == 1 || self.turns_since_rekey >= self.rekey_turns)
         {
             return true;
         }
@@ -882,6 +925,14 @@ impl TryFrom<KemRatchetUnchecked> for KemRatchet {
 }
 
 #[cfg(feature = "rkyv")]
+impl ArchivedKemRatchet {
+    /// The ML-KEM parameter suite used by this archived ratchet.
+    pub fn suite(&self) -> PqSuite {
+        self.suite.to_suite()
+    }
+}
+
+#[cfg(feature = "rkyv")]
 unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedKemRatchet
 where
     C: rkyv::rancor::Fallible + ?Sized,
@@ -889,9 +940,8 @@ where
 {
     fn verify(&self, _context: &mut C) -> Result<(), C::Error> {
         use rkyv::rancor::Source;
-        let suite = self.suite.to_suite();
         validate_kem_ratchet_state(
-            suite,
+            self.suite(),
             self.pending_offers
                 .iter()
                 .map(|offer| (offer.id, &offer.seed.0)),
@@ -923,23 +973,19 @@ impl From<&KemRatchet> for crate::proto::KemRatchet {
                     seed: offer.seed.as_bytes().to_vec(),
                 })
                 .collect(),
-            active_offer_id: kem
-                .active_offer_id
-                .map_or_else(Vec::new, |id| id.to_vec()),
-            active_send_ct: kem
-                .active_send_ct
-                .as_ref()
-                .map(|active| crate::proto::KemActiveSendCt {
+            active_offer_id: kem.active_offer_id.map_or_else(Vec::new, |id| id.to_vec()),
+            active_send_ct: kem.active_send_ct.as_ref().map(|active| {
+                crate::proto::KemActiveSendCt {
                     ek_id: active.ek_id.to_vec(),
                     ciphertext: active.ct.clone(),
-                }),
-            peer_pending_ek: kem
-                .peer_pending_ek
-                .as_ref()
-                .map(|peer| crate::proto::KemPeerPendingEk {
+                }
+            }),
+            peer_pending_ek: kem.peer_pending_ek.as_ref().map(|peer| {
+                crate::proto::KemPeerPendingEk {
                     ek_id: peer.ek_id.to_vec(),
                     encapsulation_key: peer.ek.clone(),
-                }),
+                }
+            }),
             encapsulated_ek_ids: kem
                 .encapsulated_ek_ids
                 .iter()
@@ -1031,6 +1077,54 @@ mod test {
             #[cfg(feature = "ml-kem-768")]
             PqSuite::MlKem768,
         ]
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn suite_serde_ids_are_stable_across_builds() {
+        for (id, name, compiled) in [
+            (1, "MlKem1024", cfg!(feature = "ml-kem-1024")),
+            (2, "MlKem768", cfg!(feature = "ml-kem-768")),
+        ] {
+            let suite = postcard::from_bytes::<PqSuite>(&[id]).ok();
+            assert_eq!(suite.is_some(), compiled);
+            assert_eq!(serde_json::from_str::<PqSuite>(&id.to_string()).ok(), suite);
+            assert_eq!(
+                serde_json::from_value::<PqSuite>(serde_json::json!(name)).ok(),
+                suite
+            );
+            if let Some(suite) = suite {
+                assert_eq!(suite.id(), id);
+                assert_eq!(postcard::to_allocvec(&suite).unwrap(), [id]);
+                assert_eq!(serde_json::to_string(&suite).unwrap(), id.to_string());
+            }
+        }
+        #[cfg(feature = "ml-kem-1024")]
+        assert_eq!(postcard::to_allocvec(&PqSuite::MlKem1024).unwrap(), [1]);
+        #[cfg(feature = "ml-kem-768")]
+        assert_eq!(postcard::to_allocvec(&PqSuite::MlKem768).unwrap(), [2]);
+
+        for id in [0, 3, 255] {
+            assert!(postcard::from_bytes::<PqSuite>(&[id]).is_err());
+            assert!(serde_json::from_str::<PqSuite>(&id.to_string()).is_err());
+        }
+        for invalid in ["-255", "257", "1.0", r#""Other""#] {
+            assert!(serde_json::from_str::<PqSuite>(invalid).is_err());
+        }
+    }
+
+    #[cfg(all(feature = "serde", feature = "ml-kem-768"))]
+    #[test]
+    fn ml_kem_768_ratchet_postcard_fixture() {
+        let bytes = [2, 20, 4, 0, 0, 0, 0, 0, 0, 0, 1];
+        assert_eq!(
+            postcard::to_allocvec(&KemRatchet::new(PqSuite::MlKem768)).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            postcard::from_bytes::<KemRatchet>(&bytes).unwrap().suite(),
+            PqSuite::MlKem768
+        );
     }
 
     #[test]
@@ -1205,7 +1299,10 @@ mod test {
                 // Unknown suite -> must fail validation.
                 let mut bad_suite = proto.clone();
                 bad_suite.suite = 99;
-                assert_eq!(KemRatchet::try_from(&bad_suite).unwrap_err(), MalformedState);
+                assert_eq!(
+                    KemRatchet::try_from(&bad_suite).unwrap_err(),
+                    MalformedState
+                );
             }
         }
     }

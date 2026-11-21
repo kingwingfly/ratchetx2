@@ -54,6 +54,8 @@ pub mod proto {
 }
 
 pub use party::Party;
+#[cfg(feature = "serde")]
+pub use party::{LegacyPartyV0, LegacyPartyV1};
 pub use proto::EncryptedMessage;
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 pub use ratchetx2::pq::{KemRatchet, KemRatchetConfig, PqSuite};

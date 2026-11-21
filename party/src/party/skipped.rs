@@ -36,11 +36,6 @@ pub(super) struct EvictedSet {
 }
 
 impl EvictedSet {
-    /// Whether no evicted message numbers are recorded.
-    pub(super) fn is_empty(&self) -> bool {
-        self.collapsed_below == 0 && self.ranges.is_empty()
-    }
-
     /// Clear all recorded evicted message numbers.
     pub(super) fn clear(&mut self) {
         self.ranges.clear();
@@ -101,17 +96,6 @@ impl EvictedSet {
             .is_ok()
     }
 
-    /// Validate structural invariants (and optionally an exclusive upper bound on message numbers).
-    #[cfg(any(feature = "serde", feature = "prost", test))]
-    pub(super) fn validate(&self, exclusive_upper_bound: Option<u64>) -> Result<()> {
-        validate_evicted_ranges(
-            self.ranges.iter().copied(),
-            self.ranges.len(),
-            self.collapsed_below,
-            exclusive_upper_bound,
-        )
-    }
-
     fn normalize(&mut self) {
         self.ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.ranges.len());
@@ -139,39 +123,55 @@ impl EvictedSet {
     }
 }
 
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost", test))]
-fn validate_evicted_ranges(
-    ranges: impl Iterator<Item = (u64, u64)>,
-    len: usize,
-    collapsed_below: u64,
-    exclusive_upper_bound: Option<u64>,
-) -> Result<()> {
-    if len > MAX_EVICTED_RANGES {
-        return Err(ErrorKind::MalformedState.into());
+pub(super) trait EvictionState {
+    fn ranges(&self) -> impl ExactSizeIterator<Item = (u64, u64)>;
+    fn collapsed_below(&self) -> u64;
+
+    fn is_empty(&self) -> bool {
+        self.collapsed_below() == 0 && self.ranges().len() == 0
     }
-    if let Some(bound) = exclusive_upper_bound
-        && collapsed_below > bound
-    {
-        return Err(ErrorKind::MalformedState.into());
-    }
-    let mut prev_end: Option<u64> = None;
-    for (start, end) in ranges {
-        if start > end || start < collapsed_below {
-            return Err(ErrorKind::MalformedState.into());
-        }
-        if let Some(prev) = prev_end
-            && start <= prev
-        {
+
+    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost", test))]
+    fn validate(&self, exclusive_upper_bound: Option<u64>) -> Result<()> {
+        let ranges = self.ranges();
+        let collapsed_below = self.collapsed_below();
+        if ranges.len() > MAX_EVICTED_RANGES {
             return Err(ErrorKind::MalformedState.into());
         }
         if let Some(bound) = exclusive_upper_bound
-            && end >= bound
+            && collapsed_below > bound
         {
             return Err(ErrorKind::MalformedState.into());
         }
-        prev_end = Some(end);
+        let mut prev_end: Option<u64> = None;
+        for (start, end) in ranges {
+            if start > end || start < collapsed_below {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if let Some(prev) = prev_end
+                && start <= prev
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            if let Some(bound) = exclusive_upper_bound
+                && end >= bound
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            prev_end = Some(end);
+        }
+        Ok(())
     }
-    Ok(())
+}
+
+impl EvictionState for EvictedSet {
+    fn ranges(&self) -> impl ExactSizeIterator<Item = (u64, u64)> {
+        self.ranges.iter().copied()
+    }
+
+    fn collapsed_below(&self) -> u64 {
+        self.collapsed_below
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -197,20 +197,15 @@ impl TryFrom<EvictedSetUnchecked> for EvictedSet {
 }
 
 #[cfg(feature = "rkyv")]
-impl ArchivedEvictedSet {
-    pub(super) fn is_empty(&self) -> bool {
-        self.collapsed_below.to_native() == 0 && self.ranges.is_empty()
+impl EvictionState for ArchivedEvictedSet {
+    fn ranges(&self) -> impl ExactSizeIterator<Item = (u64, u64)> {
+        self.ranges
+            .iter()
+            .map(|r| (r.0.to_native(), r.1.to_native()))
     }
 
-    pub(super) fn validate_with_bound(&self, exclusive_upper_bound: Option<u64>) -> Result<()> {
-        validate_evicted_ranges(
-            self.ranges
-                .iter()
-                .map(|pair| (pair.0.to_native(), pair.1.to_native())),
-            self.ranges.len(),
-            self.collapsed_below.to_native(),
-            exclusive_upper_bound,
-        )
+    fn collapsed_below(&self) -> u64 {
+        self.collapsed_below.to_native()
     }
 }
 
@@ -222,7 +217,7 @@ where
 {
     fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
         use rkyv::rancor::Source;
-        self.validate_with_bound(None).map_err(C::Error::new)
+        self.validate(None).map_err(C::Error::new)
     }
 }
 
@@ -332,12 +327,6 @@ impl SkippedKeys {
             .sum()
     }
 
-    /// Whether no skipped keys are currently stored.
-    #[cfg(any(feature = "serde", feature = "prost"))]
-    pub(super) fn is_empty(&self) -> bool {
-        self.chains.is_empty()
-    }
-
     /// The header keys of the chains with keys left.
     pub(super) fn header_keys(&self) -> impl Iterator<Item = HeaderKey> + '_ {
         self.chains.iter().map(|chain| chain.header_key)
@@ -353,11 +342,7 @@ impl SkippedKeys {
             .chains
             .iter()
             .find(|chain| bool::from(chain.header_key.ct_eq(header_key)))?;
-        chain
-            .keys
-            .get(&message_number)
-            .copied()
-            .map(Zeroizing::new)
+        chain.keys.get(&message_number).copied().map(Zeroizing::new)
     }
 
     /// Whether `message_number` in the skipped chain of `header_key` was previously evicted.
@@ -463,73 +448,104 @@ impl SkippedKeys {
             }
         }
     }
+}
 
-    /// Validate all structural invariants on [`SkippedKeys`].
-    #[cfg(any(feature = "serde", feature = "prost"))]
-    pub(super) fn validate(&self) -> Result<()> {
-        if self.chains.len() > MAX_SKIPPED_CHAINS {
+#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+pub(super) trait SkippedState {
+    fn is_empty(&self) -> bool;
+    fn validate(&self, current_receiver: Option<(&HeaderKey, u64)>) -> Result<()>;
+}
+
+// Borrow keys in place so validation never needs to copy secret key material.
+#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+struct ChainView<'a, N, E> {
+    header_key: &'a HeaderKey,
+    age: usize,
+    numbers: N,
+    evicted: &'a E,
+}
+
+#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+fn validate_chains<'a, N: ExactSizeIterator<Item = u64>, E: EvictionState + 'a>(
+    chains: impl ExactSizeIterator<Item = ChainView<'a, N, E>>,
+    current_receiver: Option<(&HeaderKey, u64)>,
+) -> Result<()> {
+    if chains.len() > MAX_SKIPPED_CHAINS {
+        return Err(ErrorKind::MalformedState.into());
+    }
+    let mut seen: Vec<&HeaderKey> = Vec::with_capacity(chains.len());
+    let mut previous_age = MAX_SKIPPED_CHAINS;
+    let mut remaining = SKIP_MAX;
+    for mut chain in chains {
+        let count = chain.numbers.len() as u64;
+        if count == 0
+            || count > remaining
+            || chain.age >= MAX_SKIPPED_CHAINS
+            || chain.age > previous_age
+            || seen
+                .iter()
+                .any(|key| bool::from(key.ct_eq(chain.header_key)))
+        {
             return Err(ErrorKind::MalformedState.into());
         }
-        let mut total_keys: u64 = 0;
-        let mut prev_age: Option<usize> = None;
-        let mut seen_header_keys: Vec<HeaderKey> = Vec::with_capacity(self.chains.len());
-        for chain in &self.chains {
-            if chain.keys.is_empty() || chain.age >= MAX_SKIPPED_CHAINS {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if let Some(pa) = prev_age
-                && chain.age > pa
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            prev_age = Some(chain.age);
-            if seen_header_keys
-                .iter()
-                .any(|seen| bool::from(seen.ct_eq(&chain.header_key)))
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            seen_header_keys.push(chain.header_key);
-            chain.evicted.validate(None)?;
-            total_keys = total_keys
-                .checked_add(chain.keys.len() as u64)
-                .ok_or(ErrorKind::MalformedState)?;
-            if total_keys > SKIP_MAX {
-                return Err(ErrorKind::MalformedState.into());
-            }
+        seen.push(chain.header_key);
+        previous_age = chain.age;
+        remaining -= count;
+
+        let bound = current_receiver
+            .filter(|(key, _)| bool::from(key.ct_eq(chain.header_key)))
+            .map(|(_, next)| next);
+        if let Some(next) = bound
+            && (chain.age != 0 || chain.numbers.any(|number| number >= next))
+        {
+            return Err(ErrorKind::MalformedState.into());
         }
-        for key in &mut seen_header_keys {
-            key.zeroize();
-        }
-        Ok(())
+        chain.evicted.validate(bound)?;
+    }
+    Ok(())
+}
+
+#[cfg(any(feature = "serde", feature = "prost"))]
+impl SkippedState for SkippedKeys {
+    fn is_empty(&self) -> bool {
+        self.chains.is_empty()
     }
 
-    /// Validate that if the current receiving chain is present among skipped chains, it has
-    /// `age == 0` and all its skipped/evicted numbers are strictly below `message_number_receiver`.
-    #[cfg(any(feature = "serde", feature = "prost"))]
-    pub(super) fn validate_for_current_receiver(
-        &self,
-        current_receiver_hk: &HeaderKey,
-        message_number_receiver: u64,
-    ) -> Result<()> {
-        if let Some(chain) = self
-            .chains
-            .iter()
-            .find(|c| bool::from(c.header_key.ct_eq(current_receiver_hk)))
-        {
-            if chain.age != 0 {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if chain
-                .keys
-                .last_key_value()
-                .is_some_and(|(&max_num, _)| max_num >= message_number_receiver)
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            chain.evicted.validate(Some(message_number_receiver))?;
+    fn validate(&self, current_receiver: Option<(&HeaderKey, u64)>) -> Result<()> {
+        validate_chains(
+            self.chains.iter().map(|c| ChainView {
+                header_key: &c.header_key,
+                age: c.age,
+                numbers: c.keys.keys().copied(),
+                evicted: &c.evicted,
+            }),
+            current_receiver,
+        )
+    }
+}
+
+// Before eviction tracking, each skipped chain had exactly three positional fields.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+pub(super) struct LegacySkippedKeys {
+    chains: VecDeque<(HeaderKey, BTreeMap<u64, MessageKey>, usize)>,
+}
+
+#[cfg(feature = "serde")]
+impl From<LegacySkippedKeys> for SkippedKeys {
+    fn from(old: LegacySkippedKeys) -> Self {
+        Self {
+            chains: old
+                .chains
+                .into_iter()
+                .map(|(header_key, keys, age)| SkippedChain {
+                    header_key,
+                    keys,
+                    age,
+                    evicted: EvictedSet::default(),
+                })
+                .collect(),
         }
-        Ok(())
     }
 }
 
@@ -546,40 +562,27 @@ impl TryFrom<SkippedKeysUnchecked> for SkippedKeys {
 
     fn try_from(raw: SkippedKeysUnchecked) -> Result<Self> {
         let skipped = Self { chains: raw.chains };
-        skipped.validate()?;
+        skipped.validate(None)?;
         Ok(skipped)
     }
 }
 
 #[cfg(feature = "rkyv")]
-impl ArchivedSkippedKeys {
-    pub(super) fn is_empty(&self) -> bool {
+impl SkippedState for ArchivedSkippedKeys {
+    fn is_empty(&self) -> bool {
         self.chains.is_empty()
     }
 
-    pub(super) fn validate_for_current_receiver(
-        &self,
-        current_receiver_hk: &HeaderKey,
-        message_number_receiver: u64,
-    ) -> Result<()> {
-        for chain in self.chains.iter() {
-            if bool::from(chain.header_key.ct_eq(current_receiver_hk)) {
-                if chain.age.to_native() != 0 {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if chain
-                    .keys
-                    .iter()
-                    .any(|(num, _)| num.to_native() >= message_number_receiver)
-                {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                chain
-                    .evicted
-                    .validate_with_bound(Some(message_number_receiver))?;
-            }
-        }
-        Ok(())
+    fn validate(&self, current_receiver: Option<(&HeaderKey, u64)>) -> Result<()> {
+        validate_chains(
+            self.chains.iter().map(|c| ChainView {
+                header_key: &c.header_key,
+                age: c.age.to_native() as usize,
+                numbers: c.keys.keys().map(|n| n.to_native()),
+                evicted: &c.evicted,
+            }),
+            current_receiver,
+        )
     }
 }
 
@@ -591,45 +594,7 @@ where
 {
     fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
         use rkyv::rancor::Source;
-        let check = || -> Result<()> {
-            if self.chains.len() > MAX_SKIPPED_CHAINS {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            let mut total_keys: u64 = 0;
-            let mut prev_age: Option<usize> = None;
-            let mut seen_header_keys: Vec<HeaderKey> = Vec::with_capacity(self.chains.len());
-            for chain in self.chains.iter() {
-                let age = chain.age.to_native() as usize;
-                if chain.keys.is_empty() || age >= MAX_SKIPPED_CHAINS {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if let Some(pa) = prev_age
-                    && age > pa
-                {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                prev_age = Some(age);
-                if seen_header_keys
-                    .iter()
-                    .any(|seen| bool::from(seen.ct_eq(&chain.header_key)))
-                {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                seen_header_keys.push(chain.header_key);
-                chain.evicted.validate_with_bound(None)?;
-                total_keys = total_keys
-                    .checked_add(chain.keys.len() as u64)
-                    .ok_or(ErrorKind::MalformedState)?;
-                if total_keys > SKIP_MAX {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-            }
-            for key in &mut seen_header_keys {
-                key.zeroize();
-            }
-            Ok(())
-        };
-        check().map_err(C::Error::new)
+        self.validate(None).map_err(C::Error::new)
     }
 }
 
@@ -640,7 +605,9 @@ mod state {
 
     use ratchetx2::key::KEY_LENGTH;
 
-    use super::{EvictedSet, MAX_EVICTED_RANGES, SkippedChain, SkippedKeys};
+    use super::{
+        EvictedSet, EvictionState, MAX_EVICTED_RANGES, SkippedChain, SkippedKeys, SkippedState,
+    };
     use crate::{
         error::{ErrorKind, Result},
         party::{MAX_SKIPPED_CHAINS, SKIP_MAX},
@@ -740,7 +707,7 @@ mod state {
                 });
             }
             let skipped = Self { chains: decoded };
-            skipped.validate()?;
+            skipped.validate(None)?;
             Ok(skipped)
         }
     }

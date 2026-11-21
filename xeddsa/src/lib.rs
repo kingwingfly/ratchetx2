@@ -71,6 +71,11 @@ pub enum Error {
     Signature,
 }
 
+/// A zero scalar cannot be used as an XEdDSA private key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("invalid private key scalar (zero)")]
+pub struct InvalidPrivateKey;
+
 /// Result type with [`Error`](enum@Error).
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -99,15 +104,10 @@ struct RawXEdDSAPrivateKey {
 
 #[cfg(feature = "serde")]
 impl TryFrom<RawXEdDSAPrivateKey> for XEdDSAPrivateKey {
-    type Error = &'static str;
+    type Error = InvalidPrivateKey;
 
     fn try_from(raw: RawXEdDSAPrivateKey) -> core::result::Result<Self, Self::Error> {
-        if raw.private_key == Scalar::ZERO {
-            return Err("XEdDSA private key scalar must be non-zero");
-        }
-        Ok(Self {
-            private_key: raw.private_key,
-        })
+        Self::try_from(raw.private_key)
     }
 }
 
@@ -155,10 +155,15 @@ impl fmt::Debug for XEdDSAPrivateKey {
     }
 }
 
-impl From<Scalar> for XEdDSAPrivateKey {
-    /// New a XEdDSAPrivateKey with give Scalar (private key).
-    fn from(private_key: Scalar) -> Self {
-        XEdDSAPrivateKey { private_key }
+impl TryFrom<Scalar> for XEdDSAPrivateKey {
+    type Error = InvalidPrivateKey;
+
+    /// Constructs a private key from a non-zero scalar.
+    fn try_from(private_key: Scalar) -> core::result::Result<Self, InvalidPrivateKey> {
+        if private_key == Scalar::ZERO {
+            return Err(InvalidPrivateKey);
+        }
+        Ok(Self { private_key })
     }
 }
 
@@ -186,10 +191,7 @@ impl XEdDSAPrivateKey {
     /// canonical, non-zero scalar encoding.
     pub fn from_bytes(bytes: [u8; PRIVATE_KEY_LENGTH]) -> Option<Self> {
         let private_key = Scalar::from_canonical_bytes(bytes).into_option()?;
-        if private_key == Scalar::ZERO {
-            return None;
-        }
-        Some(Self { private_key })
+        Self::try_from(private_key).ok()
     }
 
     /// The XEdDSA public key for the key pair.
@@ -308,10 +310,7 @@ impl AsRef<[u8]> for XEdDSAPublicKey {
 
 #[cfg(test)]
 mod test {
-    use curve25519_dalek::{
-        constants::ED25519_BASEPOINT_POINT,
-        edwards::CompressedEdwardsY,
-    };
+    use curve25519_dalek::{constants::ED25519_BASEPOINT_POINT, edwards::CompressedEdwardsY};
 
     use super::*;
 
@@ -338,8 +337,8 @@ mod test {
 
     #[test]
     fn diffie_hellman_known_answer() {
-        let alice = XEdDSAPrivateKey::from(Scalar::from_bytes_mod_order([11; 32]));
-        let bob = XEdDSAPrivateKey::from(Scalar::from_bytes_mod_order([13; 32]));
+        let alice = XEdDSAPrivateKey::try_from(Scalar::from_bytes_mod_order([11; 32])).unwrap();
+        let bob = XEdDSAPrivateKey::try_from(Scalar::from_bytes_mod_order([13; 32])).unwrap();
         let shared = alice
             .diffie_hellman(bob.compute_public_key().as_ref())
             .unwrap();
@@ -352,9 +351,11 @@ mod test {
     fn signs_whatever_the_edwards_sign_bit() {
         // k and -k share a public key, and their Edwards public keys have opposite sign bits.
         let key = Scalar::from_bytes_mod_order([7; 32]);
-        let public_key = XEdDSAPrivateKey::from(key).compute_public_key();
+        let public_key = XEdDSAPrivateKey::try_from(key)
+            .unwrap()
+            .compute_public_key();
         for key in [key, -key] {
-            let key = XEdDSAPrivateKey::from(key);
+            let key = XEdDSAPrivateKey::try_from(key).unwrap();
             assert_eq!(key.compute_public_key().to_bytes(), public_key.to_bytes());
             public_key.verify("hello", &key.sign("hello")).unwrap();
         }
@@ -418,7 +419,9 @@ mod test {
             montgomery_public_key: MontgomeryPoint([0; 32]),
         };
         assert_eq!(
-            raw_zero_pk.verify(b"forged message", &forged_sig).unwrap_err(),
+            raw_zero_pk
+                .verify(b"forged message", &forged_sig)
+                .unwrap_err(),
             Error::InvalidPublicKey
         );
 
@@ -463,7 +466,7 @@ mod test {
         );
 
         // 2. u + p for valid basepoint u = 9 (9 + (2^255 - 19) = 2^255 - 10).
-        let base_priv = XEdDSAPrivateKey::from(Scalar::ONE);
+        let base_priv = XEdDSAPrivateKey::try_from(Scalar::ONE).unwrap();
         let base_pub = base_priv.compute_public_key();
         assert_eq!(base_pub.to_bytes()[0], 9);
         let base_sig = base_priv.sign(b"basepoint");
@@ -519,12 +522,7 @@ mod test {
         let mut u_one = [0u8; 32];
         u_one[0] = 1;
 
-        for bad in [
-            [0u8; 32],
-            u_one,
-            order_8_m.to_bytes(),
-            mixed.to_bytes(),
-        ] {
+        for bad in [[0u8; 32], u_one, order_8_m.to_bytes(), mixed.to_bytes()] {
             assert_eq!(
                 XEdDSAPublicKey::new(&bad).unwrap_err(),
                 Error::InvalidPublicKey
@@ -563,8 +561,16 @@ mod test {
             round_trip.compute_public_key().to_bytes()
         );
 
-        // Zero scalar constructed via From<Scalar> still cannot perform DH or forge signatures.
-        let zero_priv = XEdDSAPrivateKey::from(Scalar::ZERO);
+        assert_eq!(
+            XEdDSAPrivateKey::try_from(Scalar::ZERO).unwrap_err(),
+            InvalidPrivateKey
+        );
+        assert!(XEdDSAPrivateKey::try_from(Scalar::ONE).is_ok());
+
+        // Exercise the DH and verification checks even if an internal caller bypasses construction.
+        let zero_priv = XEdDSAPrivateKey {
+            private_key: Scalar::ZERO,
+        };
         assert_eq!(
             zero_priv
                 .diffie_hellman(valid.compute_public_key().as_ref())
