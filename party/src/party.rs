@@ -159,6 +159,11 @@ impl Party {
         self.kem_ratchet.as_ref().map(KemRatchet::suite)
     }
 
+    /// Associated data bound to every header and message in this session.
+    pub fn associated_data(&self) -> &[u8] {
+        &self.associated_data
+    }
+
     /// Whether post-quantum KEM ratcheting is active on this party.
     pub fn is_pq_ratchet_active(&self) -> bool {
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -566,8 +571,12 @@ fn kem_header_from_proto(header: &Header) -> Result<KemHeader> {
     })
 }
 
-#[cfg(feature = "serde")]
+#[cfg(all(
+    feature = "serde",
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
 #[derive(serde::Deserialize)]
+#[serde(rename = "Party")]
 struct PartyUnchecked {
     ratchet: Ratchet,
     skipped_message_keys: SkippedKeys,
@@ -577,12 +586,270 @@ struct PartyUnchecked {
     associated_data: Vec<u8>,
     #[serde(default)]
     current_chain_evicted: EvictedSet,
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     #[serde(default)]
     kem_ratchet: Option<KemRatchet>,
-    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-    #[serde(default)]
+}
+
+#[cfg(all(
+    feature = "serde",
+    not(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
+))]
+struct PartyUnchecked {
+    ratchet: Ratchet,
+    skipped_message_keys: SkippedKeys,
+    previous_chain_length: u64,
+    message_number_sender: u64,
+    message_number_receiver: u64,
+    associated_data: Vec<u8>,
+    current_chain_evicted: EvictedSet,
     kem_ratchet: Option<serde::de::IgnoredAny>,
+}
+
+#[cfg(all(
+    feature = "serde",
+    not(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
+))]
+impl<'de> serde::Deserialize<'de> for PartyUnchecked {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "ratchet",
+            "skipped_message_keys",
+            "previous_chain_length",
+            "message_number_sender",
+            "message_number_receiver",
+            "associated_data",
+            "current_chain_evicted",
+        ];
+
+        enum Field {
+            Ratchet,
+            SkippedMessageKeys,
+            PreviousChainLength,
+            MessageNumberSender,
+            MessageNumberReceiver,
+            AssociatedData,
+            CurrentChainEvicted,
+            KemRatchet,
+            Ignore,
+        }
+
+        impl<'de> serde::Deserialize<'de> for Field {
+            fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct FieldVisitor;
+
+                impl serde::de::Visitor<'_> for FieldVisitor {
+                    type Value = Field;
+
+                    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        f.write_str("field identifier")
+                    }
+
+                    fn visit_u64<E>(self, v: u64) -> core::result::Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(match v {
+                            0 => Field::Ratchet,
+                            1 => Field::SkippedMessageKeys,
+                            2 => Field::PreviousChainLength,
+                            3 => Field::MessageNumberSender,
+                            4 => Field::MessageNumberReceiver,
+                            5 => Field::AssociatedData,
+                            6 => Field::CurrentChainEvicted,
+                            7 => Field::KemRatchet,
+                            _ => Field::Ignore,
+                        })
+                    }
+
+                    fn visit_str<E>(self, v: &str) -> core::result::Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(match v {
+                            "ratchet" => Field::Ratchet,
+                            "skipped_message_keys" => Field::SkippedMessageKeys,
+                            "previous_chain_length" => Field::PreviousChainLength,
+                            "message_number_sender" => Field::MessageNumberSender,
+                            "message_number_receiver" => Field::MessageNumberReceiver,
+                            "associated_data" => Field::AssociatedData,
+                            "current_chain_evicted" => Field::CurrentChainEvicted,
+                            "kem_ratchet" => Field::KemRatchet,
+                            _ => Field::Ignore,
+                        })
+                    }
+
+                    fn visit_bytes<E>(self, v: &[u8]) -> core::result::Result<Self::Value, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        Ok(match v {
+                            b"ratchet" => Field::Ratchet,
+                            b"skipped_message_keys" => Field::SkippedMessageKeys,
+                            b"previous_chain_length" => Field::PreviousChainLength,
+                            b"message_number_sender" => Field::MessageNumberSender,
+                            b"message_number_receiver" => Field::MessageNumberReceiver,
+                            b"associated_data" => Field::AssociatedData,
+                            b"current_chain_evicted" => Field::CurrentChainEvicted,
+                            b"kem_ratchet" => Field::KemRatchet,
+                            _ => Field::Ignore,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_identifier(FieldVisitor)
+            }
+        }
+
+        struct PartyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for PartyVisitor {
+            type Value = PartyUnchecked;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("struct Party")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let ratchet = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(0, &"struct Party with 7 elements")
+                })?;
+                let skipped_message_keys = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(1, &"struct Party with 7 elements")
+                })?;
+                let previous_chain_length = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(2, &"struct Party with 7 elements")
+                })?;
+                let message_number_sender = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(3, &"struct Party with 7 elements")
+                })?;
+                let message_number_receiver = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(4, &"struct Party with 7 elements")
+                })?;
+                let associated_data = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(5, &"struct Party with 7 elements")
+                })?;
+                let current_chain_evicted = seq.next_element()?.unwrap_or_default();
+                Ok(PartyUnchecked {
+                    ratchet,
+                    skipped_message_keys,
+                    previous_chain_length,
+                    message_number_sender,
+                    message_number_receiver,
+                    associated_data,
+                    current_chain_evicted,
+                    kem_ratchet: None,
+                })
+            }
+
+            fn visit_map<A>(self, mut map: A) -> core::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut ratchet = None;
+                let mut skipped_message_keys = None;
+                let mut previous_chain_length = None;
+                let mut message_number_sender = None;
+                let mut message_number_receiver = None;
+                let mut associated_data = None;
+                let mut current_chain_evicted = None;
+                let mut kem_ratchet: Option<Option<serde::de::IgnoredAny>> = None;
+
+                while let Some(key) = map.next_key::<Field>()? {
+                    match key {
+                        Field::Ratchet => {
+                            if ratchet.is_some() {
+                                return Err(serde::de::Error::duplicate_field("ratchet"));
+                            }
+                            ratchet = Some(map.next_value()?);
+                        }
+                        Field::SkippedMessageKeys => {
+                            if skipped_message_keys.is_some() {
+                                return Err(serde::de::Error::duplicate_field(
+                                    "skipped_message_keys",
+                                ));
+                            }
+                            skipped_message_keys = Some(map.next_value()?);
+                        }
+                        Field::PreviousChainLength => {
+                            if previous_chain_length.is_some() {
+                                return Err(serde::de::Error::duplicate_field(
+                                    "previous_chain_length",
+                                ));
+                            }
+                            previous_chain_length = Some(map.next_value()?);
+                        }
+                        Field::MessageNumberSender => {
+                            if message_number_sender.is_some() {
+                                return Err(serde::de::Error::duplicate_field(
+                                    "message_number_sender",
+                                ));
+                            }
+                            message_number_sender = Some(map.next_value()?);
+                        }
+                        Field::MessageNumberReceiver => {
+                            if message_number_receiver.is_some() {
+                                return Err(serde::de::Error::duplicate_field(
+                                    "message_number_receiver",
+                                ));
+                            }
+                            message_number_receiver = Some(map.next_value()?);
+                        }
+                        Field::AssociatedData => {
+                            if associated_data.is_some() {
+                                return Err(serde::de::Error::duplicate_field("associated_data"));
+                            }
+                            associated_data = Some(map.next_value()?);
+                        }
+                        Field::CurrentChainEvicted => {
+                            if current_chain_evicted.is_some() {
+                                return Err(serde::de::Error::duplicate_field(
+                                    "current_chain_evicted",
+                                ));
+                            }
+                            current_chain_evicted = Some(map.next_value()?);
+                        }
+                        Field::KemRatchet => {
+                            if kem_ratchet.is_some() {
+                                return Err(serde::de::Error::duplicate_field("kem_ratchet"));
+                            }
+                            kem_ratchet = Some(map.next_value()?);
+                        }
+                        Field::Ignore => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+
+                Ok(PartyUnchecked {
+                    ratchet: ratchet.ok_or_else(|| serde::de::Error::missing_field("ratchet"))?,
+                    skipped_message_keys: skipped_message_keys
+                        .ok_or_else(|| serde::de::Error::missing_field("skipped_message_keys"))?,
+                    previous_chain_length: previous_chain_length
+                        .ok_or_else(|| serde::de::Error::missing_field("previous_chain_length"))?,
+                    message_number_sender: message_number_sender
+                        .ok_or_else(|| serde::de::Error::missing_field("message_number_sender"))?,
+                    message_number_receiver: message_number_receiver.ok_or_else(|| {
+                        serde::de::Error::missing_field("message_number_receiver")
+                    })?,
+                    associated_data: associated_data
+                        .ok_or_else(|| serde::de::Error::missing_field("associated_data"))?,
+                    current_chain_evicted: current_chain_evicted.unwrap_or_default(),
+                    kem_ratchet: kem_ratchet.flatten(),
+                })
+            }
+        }
+
+        deserializer.deserialize_struct("Party", FIELDS, PartyVisitor)
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -608,6 +875,14 @@ impl TryFrom<PartyUnchecked> for Party {
         };
         party.validate()?;
         Ok(party)
+    }
+}
+
+#[cfg(feature = "rkyv")]
+impl ArchivedParty {
+    /// Associated data bound to every header and message in this archived session.
+    pub fn associated_data(&self) -> &[u8] {
+        self.associated_data.as_slice()
     }
 }
 
@@ -1347,6 +1622,570 @@ mod test {
         }
     }
 
+    #[test]
+    fn associated_data_accessor_matches_input() {
+        let (alice, bob) = session();
+        assert_eq!(alice.associated_data(), b"AD");
+        assert_eq!(bob.associated_data(), b"AD");
+
+        let keys = SharedKeys {
+            secret_key: [4; 32],
+            header_key_alice: [5; 32],
+            header_key_bob: [6; 32],
+        };
+        let custom_ad = [0xABu8; 96];
+        let custom_bob = Party::new(Ratchet::bob(&keys, DhPrivateKey::generate()), custom_ad);
+        assert_eq!(custom_bob.associated_data(), &custom_ad);
+
+        #[cfg(feature = "rkyv")]
+        {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&custom_bob).unwrap();
+            let archived = rkyv::access::<ArchivedParty, rkyv::rancor::Error>(&bytes).unwrap();
+            assert_eq!(archived.associated_data(), &custom_ad);
+        }
+    }
+
+    #[test]
+    #[cfg(all(
+        feature = "serde",
+        not(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
+    ))]
+    fn non_pq_positional_serde_roundtrip_and_json_kem_ratchet_fail_closed() {
+        use serde::{Deserialize, Serialize};
+
+        #[derive(Debug)]
+        struct PosError(String);
+
+        impl fmt::Display for PosError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl std::error::Error for PosError {}
+
+        impl serde::ser::Error for PosError {
+            fn custom<T: fmt::Display>(msg: T) -> Self {
+                Self(msg.to_string())
+            }
+        }
+
+        impl serde::de::Error for PosError {
+            fn custom<T: fmt::Display>(msg: T) -> Self {
+                Self(msg.to_string())
+            }
+        }
+
+        struct PosSer {
+            out: Vec<u8>,
+            struct_names: Vec<&'static str>,
+        }
+
+        impl PosSer {
+            fn new() -> Self {
+                Self {
+                    out: Vec::new(),
+                    struct_names: Vec::new(),
+                }
+            }
+        }
+
+        impl serde::Serializer for &mut PosSer {
+            type Ok = ();
+            type Error = PosError;
+            type SerializeSeq = Self;
+            type SerializeTuple = Self;
+            type SerializeTupleStruct = serde::ser::Impossible<(), PosError>;
+            type SerializeTupleVariant = serde::ser::Impossible<(), PosError>;
+            type SerializeMap = Self;
+            type SerializeStruct = Self;
+            type SerializeStructVariant = serde::ser::Impossible<(), PosError>;
+
+            fn serialize_bool(self, v: bool) -> core::result::Result<(), PosError> {
+                self.out.push(u8::from(v));
+                Ok(())
+            }
+            fn serialize_i8(self, _: i8) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_i16(self, _: i16) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_i32(self, _: i32) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_i64(self, _: i64) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_u8(self, v: u8) -> core::result::Result<(), PosError> {
+                self.out.push(v);
+                Ok(())
+            }
+            fn serialize_u16(self, _: u16) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_u32(self, v: u32) -> core::result::Result<(), PosError> {
+                self.out.extend_from_slice(&v.to_le_bytes());
+                Ok(())
+            }
+            fn serialize_u64(self, v: u64) -> core::result::Result<(), PosError> {
+                self.out.extend_from_slice(&v.to_le_bytes());
+                Ok(())
+            }
+            fn serialize_f32(self, _: f32) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_f64(self, _: f64) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_char(self, _: char) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_str(self, _: &str) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_bytes(self, _: &[u8]) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_none(self) -> core::result::Result<(), PosError> {
+                self.out.push(0);
+                Ok(())
+            }
+            fn serialize_some<T: ?Sized + Serialize>(
+                self,
+                value: &T,
+            ) -> core::result::Result<(), PosError> {
+                self.out.push(1);
+                value.serialize(self)
+            }
+            fn serialize_unit(self) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_unit_struct(self, _: &'static str) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_unit_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+            ) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                value: &T,
+            ) -> core::result::Result<(), PosError> {
+                value.serialize(self)
+            }
+            fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: &T,
+            ) -> core::result::Result<(), PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_seq(
+                self,
+                len: Option<usize>,
+            ) -> core::result::Result<Self::SerializeSeq, PosError> {
+                let len = len.ok_or_else(|| PosError("seq len required".into()))?;
+                self.out.extend_from_slice(&(len as u64).to_le_bytes());
+                Ok(self)
+            }
+            fn serialize_tuple(
+                self,
+                _: usize,
+            ) -> core::result::Result<Self::SerializeTuple, PosError> {
+                Ok(self)
+            }
+            fn serialize_tuple_struct(
+                self,
+                _: &'static str,
+                _: usize,
+            ) -> core::result::Result<Self::SerializeTupleStruct, PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_tuple_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> core::result::Result<Self::SerializeTupleVariant, PosError> {
+                Err(PosError("unsupported".into()))
+            }
+            fn serialize_map(
+                self,
+                len: Option<usize>,
+            ) -> core::result::Result<Self::SerializeMap, PosError> {
+                let len = len.ok_or_else(|| PosError("map len required".into()))?;
+                self.out.extend_from_slice(&(len as u64).to_le_bytes());
+                Ok(self)
+            }
+            fn serialize_struct(
+                self,
+                name: &'static str,
+                _: usize,
+            ) -> core::result::Result<Self::SerializeStruct, PosError> {
+                self.struct_names.push(name);
+                Ok(self)
+            }
+            fn serialize_struct_variant(
+                self,
+                _: &'static str,
+                _: u32,
+                _: &'static str,
+                _: usize,
+            ) -> core::result::Result<Self::SerializeStructVariant, PosError> {
+                Err(PosError("unsupported".into()))
+            }
+        }
+
+        impl serde::ser::SerializeSeq for &mut PosSer {
+            type Ok = ();
+            type Error = PosError;
+            fn serialize_element<T: ?Sized + Serialize>(
+                &mut self,
+                value: &T,
+            ) -> core::result::Result<(), PosError> {
+                value.serialize(&mut **self)
+            }
+            fn end(self) -> core::result::Result<(), PosError> {
+                Ok(())
+            }
+        }
+
+        impl serde::ser::SerializeTuple for &mut PosSer {
+            type Ok = ();
+            type Error = PosError;
+            fn serialize_element<T: ?Sized + Serialize>(
+                &mut self,
+                value: &T,
+            ) -> core::result::Result<(), PosError> {
+                value.serialize(&mut **self)
+            }
+            fn end(self) -> core::result::Result<(), PosError> {
+                Ok(())
+            }
+        }
+
+        impl serde::ser::SerializeMap for &mut PosSer {
+            type Ok = ();
+            type Error = PosError;
+            fn serialize_key<T: ?Sized + Serialize>(
+                &mut self,
+                key: &T,
+            ) -> core::result::Result<(), PosError> {
+                key.serialize(&mut **self)
+            }
+            fn serialize_value<T: ?Sized + Serialize>(
+                &mut self,
+                value: &T,
+            ) -> core::result::Result<(), PosError> {
+                value.serialize(&mut **self)
+            }
+            fn end(self) -> core::result::Result<(), PosError> {
+                Ok(())
+            }
+        }
+
+        impl serde::ser::SerializeStruct for &mut PosSer {
+            type Ok = ();
+            type Error = PosError;
+            fn serialize_field<T: ?Sized + Serialize>(
+                &mut self,
+                _: &'static str,
+                value: &T,
+            ) -> core::result::Result<(), PosError> {
+                value.serialize(&mut **self)
+            }
+            fn end(self) -> core::result::Result<(), PosError> {
+                Ok(())
+            }
+        }
+
+        struct PosDe<'de> {
+            input: &'de [u8],
+            struct_names: Vec<&'static str>,
+        }
+
+        impl<'de> PosDe<'de> {
+            fn new(input: &'de [u8]) -> Self {
+                Self {
+                    input,
+                    struct_names: Vec::new(),
+                }
+            }
+
+            fn take(&mut self, n: usize) -> core::result::Result<&'de [u8], PosError> {
+                if self.input.len() < n {
+                    return Err(PosError("unexpected eof".into()));
+                }
+                let (head, tail) = self.input.split_at(n);
+                self.input = tail;
+                Ok(head)
+            }
+
+            fn read_u8(&mut self) -> core::result::Result<u8, PosError> {
+                Ok(self.take(1)?[0])
+            }
+
+            fn read_u32(&mut self) -> core::result::Result<u32, PosError> {
+                Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+            }
+
+            fn read_u64(&mut self) -> core::result::Result<u64, PosError> {
+                Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+            }
+        }
+
+        struct FixedSeq<'a, 'de> {
+            de: &'a mut PosDe<'de>,
+            remaining: usize,
+        }
+
+        impl<'de> serde::de::SeqAccess<'de> for FixedSeq<'_, 'de> {
+            type Error = PosError;
+
+            fn next_element_seed<T: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: T,
+            ) -> core::result::Result<Option<T::Value>, PosError> {
+                if self.remaining == 0 {
+                    return Ok(None);
+                }
+                self.remaining -= 1;
+                seed.deserialize(&mut *self.de).map(Some)
+            }
+        }
+
+        struct FixedMap<'a, 'de> {
+            de: &'a mut PosDe<'de>,
+            remaining: usize,
+        }
+
+        impl<'de> serde::de::MapAccess<'de> for FixedMap<'_, 'de> {
+            type Error = PosError;
+
+            fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: K,
+            ) -> core::result::Result<Option<K::Value>, PosError> {
+                if self.remaining == 0 {
+                    return Ok(None);
+                }
+                self.remaining -= 1;
+                seed.deserialize(&mut *self.de).map(Some)
+            }
+
+            fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                seed.deserialize(&mut *self.de)
+            }
+        }
+
+        impl<'de> serde::Deserializer<'de> for &mut PosDe<'de> {
+            type Error = PosError;
+
+            fn deserialize_any<V: serde::de::Visitor<'de>>(
+                self,
+                _: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                Err(PosError("non-self-describing positional format".into()))
+            }
+
+            fn deserialize_bool<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                match self.read_u8()? {
+                    0 => visitor.visit_bool(false),
+                    1 => visitor.visit_bool(true),
+                    v => Err(PosError(format!("invalid bool tag {v}"))),
+                }
+            }
+
+            fn deserialize_u8<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                visitor.visit_u8(self.read_u8()?)
+            }
+
+            fn deserialize_u32<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                visitor.visit_u32(self.read_u32()?)
+            }
+
+            fn deserialize_u64<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                visitor.visit_u64(self.read_u64()?)
+            }
+
+            fn deserialize_option<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                match self.read_u8()? {
+                    0 => visitor.visit_none(),
+                    1 => visitor.visit_some(self),
+                    v => Err(PosError(format!("invalid option tag {v}"))),
+                }
+            }
+
+            fn deserialize_newtype_struct<V: serde::de::Visitor<'de>>(
+                self,
+                _: &'static str,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                visitor.visit_newtype_struct(self)
+            }
+
+            fn deserialize_seq<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                let len = usize::try_from(self.read_u64()?)
+                    .map_err(|_| PosError("seq len overflow".into()))?;
+                visitor.visit_seq(FixedSeq {
+                    de: self,
+                    remaining: len,
+                })
+            }
+
+            fn deserialize_tuple<V: serde::de::Visitor<'de>>(
+                self,
+                len: usize,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                visitor.visit_seq(FixedSeq {
+                    de: self,
+                    remaining: len,
+                })
+            }
+
+            fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                self,
+                name: &'static str,
+                fields: &'static [&'static str],
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                self.struct_names.push(name);
+                // Matches bincode/postcard: positional structs deserialize `fields.len()` elements.
+                self.deserialize_tuple(fields.len(), visitor)
+            }
+
+            fn deserialize_map<V: serde::de::Visitor<'de>>(
+                self,
+                visitor: V,
+            ) -> core::result::Result<V::Value, PosError> {
+                let len = usize::try_from(self.read_u64()?)
+                    .map_err(|_| PosError("map len overflow".into()))?;
+                visitor.visit_map(FixedMap {
+                    de: self,
+                    remaining: len,
+                })
+            }
+
+            serde::forward_to_deserialize_any! {
+                i8 i16 i32 i64 i128 u16 u128 f32 f64 char str string bytes byte_buf
+                unit unit_struct tuple_struct enum identifier ignored_any
+            }
+        }
+
+        fn roundtrip<S: Serialize, D: for<'de> Deserialize<'de>>(value: &S) -> D {
+            let mut ser = PosSer::new();
+            value.serialize(&mut ser).unwrap();
+            let mut de = PosDe::new(&ser.out);
+            let out = D::deserialize(&mut de).unwrap();
+            assert!(
+                de.input.is_empty(),
+                "trailing unconsumed bytes: {}",
+                de.input.len()
+            );
+            assert_eq!(ser.struct_names, de.struct_names);
+            out
+        }
+
+        // Populate skipped keys AND current-chain evictions so every nested struct is exercised.
+        let (mut alice, mut bob) = session();
+        let evicted_msg = alice.encrypt(b"evicted-0").unwrap();
+        for i in 1..SKIP_MAX {
+            alice.encrypt(format!("lost-{i}").as_bytes()).unwrap();
+        }
+        let pivot = alice.encrypt(b"pivot").unwrap();
+        assert_eq!(bob.decrypt(&pivot).unwrap(), b"pivot");
+        let delayed = alice.encrypt(b"delayed").unwrap();
+        let after = alice.encrypt(b"after").unwrap();
+        assert_eq!(bob.decrypt(&after).unwrap(), b"after");
+
+        // Standalone positional roundtrip.
+        let before = state(&bob);
+        let mut bob_restored: Party = roundtrip(&bob);
+        assert_eq!(state(&bob_restored), before);
+        assert_eq!(bob_restored.decrypt(&delayed).unwrap(), b"delayed");
+        assert_eq!(
+            bob_restored.decrypt(&evicted_msg).unwrap_err().kind(),
+            ErrorKind::EvictedMessage
+        );
+        let follow_up = alice.encrypt(b"follow-up").unwrap();
+        assert_eq!(bob_restored.decrypt(&follow_up).unwrap(), b"follow-up");
+
+        // Nested positional roundtrip `(Party, u8)` mimicking `SessionState::Active { party, id, .. }`
+        // across tags 0 (Option::None), 1 (Option::Some), 2 and 0xFF (invalid Option discriminants).
+        for trailing_tag in [0u8, 1u8, 2u8, 0xFFu8] {
+            let (restored_party, restored_tag): (Party, u8) = roundtrip(&(&bob, trailing_tag));
+            assert_eq!(restored_tag, trailing_tag);
+            assert_eq!(state(&restored_party), before);
+        }
+
+        // JSON map path: fail closed on any non-null `kem_ratchet`, accept `null` or omitted,
+        // accept omitted `current_chain_evicted`, ignore unknown fields, reject duplicate key.
+        let base_json = serde_json::to_string(&bob).unwrap();
+        for bad_val in [
+            serde_json::json!({"suite": "MlKem1024"}),
+            serde_json::json!(1),
+            serde_json::json!(false),
+        ] {
+            let mut val: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+            val["kem_ratchet"] = bad_val;
+            let err = serde_json::from_value::<Party>(val).unwrap_err();
+            assert!(
+                err.to_string().contains("malformed"),
+                "expected MalformedState error, got: {err}"
+            );
+        }
+
+        let mut with_null: serde_json::Value = serde_json::from_str(&base_json).unwrap();
+        with_null["kem_ratchet"] = serde_json::Value::Null;
+        with_null["unknown_future_field"] = serde_json::json!({"ignored": true});
+        assert_eq!(state(&serde_json::from_value::<Party>(with_null).unwrap()), before);
+
+        // Legacy JSON without `current_chain_evicted` defaults cleanly.
+        let (_a2, fresh_bob) = session();
+        let mut legacy: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&fresh_bob).unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("current_chain_evicted");
+        assert!(serde_json::from_value::<Party>(legacy).is_ok());
+
+        // Duplicate `kem_ratchet` key in raw JSON is rejected.
+        let dup_json = format!(
+            "{},\"kem_ratchet\":null,\"kem_ratchet\":null}}",
+            base_json.trim_end_matches('}')
+        );
+        assert!(serde_json::from_str::<Party>(&dup_json).is_err());
+    }
+
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     mod pq_tests {
         use super::*;
@@ -1513,6 +2352,7 @@ mod test {
                     let other = match suite {
                         PqSuite::MlKem1024 => PqSuite::MlKem768,
                         PqSuite::MlKem768 => PqSuite::MlKem1024,
+                        _ => unreachable!(),
                     };
                     assert_eq!(
                         alice.enable_pq_ratchet(other).unwrap_err().kind(),
