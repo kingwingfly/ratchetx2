@@ -368,8 +368,10 @@ pub enum Dialog {
         server: Option<String>,
         pq_pinned: bool,
     },
-    /// This client's key, name, and post-quantum security settings.
+    /// This client's identity key, invitation link, and name.
     Identity,
+    /// Post-quantum encryption preferences and server sign-in status.
+    Settings,
     /// A contact's name, key, security level, and safety number; for a request, accept or delete it.
     Contact(PublicKey),
     /// The files of the chat with a peer.
@@ -548,7 +550,9 @@ impl SignInFlow {
                 }
                 Some(Dialog::SignIn)
             }
-            Some(Dialog::Identity | Dialog::Contact(_) | Dialog::Files(_)) => None,
+            Some(Dialog::Identity | Dialog::Settings | Dialog::Contact(_) | Dialog::Files(_)) => {
+                None
+            }
         }
     }
 
@@ -956,8 +960,9 @@ mod tests {
             })
         );
 
-        // Other dialogs (Identity, Contact, Files) are never hijacked by background refusals.
+        // Other dialogs (Identity, Settings, Contact, Files) are never hijacked by background refusals.
         assert_eq!(flow.on_ask_sign_in(Some(&Dialog::Identity), true, true), None);
+        assert_eq!(flow.on_ask_sign_in(Some(&Dialog::Settings), true, true), None);
         // Cross-origin vaults never show SignInDialog.
         assert_eq!(flow.on_ask_sign_in(Some(&initial), false, true), None);
     }
