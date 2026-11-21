@@ -52,8 +52,9 @@ use crate::{
     preview::{self, Sort},
     state::{
         Attachment, Body, ClassicalPrompt, ContactView, Delivery, Dialog, FileView, Link,
-        LocalFile, Me, MessageView, Opening, Phase, RemoteFile, SecurityAlert, SecurityView,
-        ServerPqStatus, SignIn, Step, Ui, UploadState, UploadView, order,
+        LocalFile, Me, MessageView, Opening, PendingNewChat, Phase, RemoteFile, SecurityAlert,
+        SecurityView, ServerPqStatus, SignIn, SignInFlow, SignInSuccessAction, Step, Ui,
+        UploadState, UploadView, order,
     },
     transport::{self, Connect, Fetch, Progress},
     util::{
@@ -96,12 +97,16 @@ const REPUBLISH_AGE: u64 = 7 * 24 * 60 * 60 * 1000;
     allow(dead_code)
 )]
 pub enum StartChatError {
+    /// The server requires sign-in on this page's origin before fetching prekeys / starting a chat.
+    SignInRequired,
     ClassicalApprovalRequired { peer_signed_off: bool },
     DowngradeDetected,
     PeerManifestExpired,
     PqRequired,
     Other(String),
 }
+/// Maximum milliseconds to wait for a proactive `/auth` check when unlocking via an invitation link.
+const AUTH_CHECK_TIMEOUT: i32 = 1_500;
 /// Files up to this many bytes go in their message; larger ones go as attachments.
 pub const INLINE_FILE_MAX: usize = 1 << 20;
 /// Attachments up to this many bytes that are images, videos or audio show in the chat, fetched
@@ -201,9 +206,14 @@ pub struct Engine {
     /// the chat's messages stay in its outbox, in order. An attachment waits so too, by its
     /// message's [`awaits_upload`](Outgoing::awaits_upload).
     waits_sign_in: RefCell<HashSet<PublicKey>>,
-    /// Whether the user put off signing in, so that what the server refuses meanwhile, as it
-    /// syncs, does not ask again; what the user sends does.
-    declined_sign_in: Cell<bool>,
+    /// Whether this page can sign in to the unlocked vault's server (same origin).
+    can_sign_in_here: Cell<bool>,
+    /// Coordinates sign-in dialogs with invitation / `NewChat` drafts so signing in or dismissing
+    /// never discards a parsed invitation or user edits.
+    sign_in_flow: RefCell<SignInFlow>,
+    /// Actionable feedback (e.g. classical fallback prompt or error) to display when `NewChat`
+    /// reopens after an automatic post-sign-in `start_chat` attempt needs user attention.
+    new_chat_feedback: RefCell<Option<StartChatError>>,
     /// Whether publishing the prekeys was refused for the sign-in: it waits for one, rather than
     /// tries every round.
     publish_waits_sign_in: Cell<bool>,
@@ -320,7 +330,9 @@ impl Engine {
             decrypted: RefCell::default(),
             loading: RefCell::default(),
             waits_sign_in: RefCell::default(),
-            declined_sign_in: Cell::default(),
+            can_sign_in_here: Cell::new(false),
+            sign_in_flow: RefCell::default(),
+            new_chat_feedback: RefCell::default(),
             publish_waits_sign_in: Cell::default(),
         });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
@@ -464,7 +476,7 @@ impl Engine {
             "This browser kept no sign-in for the server: it may block the server's cookies.",
         )?;
         self.waits_sign_in.borrow_mut().clear();
-        self.declined_sign_in.set(false);
+        self.sign_in_flow.borrow_mut().reset_declined();
         self.publish_waits_sign_in.set(false);
         self.start_waiting_uploads().await;
         self.wake();
@@ -481,25 +493,155 @@ impl Engine {
         }
     }
 
-    /// Ask the user to sign in to the server, as what was sent waits for it, unless a dialog is
-    /// open.
+    /// Ask the user to sign in to the server, as what was sent waits for it. If `NewChat` is
+    /// currently open, preserves its invitation/draft so it can resume seamlessly after sign-in.
     fn ask_sign_in(&self) {
-        if self.ui.dialog.with_untracked(Option::is_none) {
-            self.ui.dialog.set(Some(Dialog::SignIn));
+        let next = self.ui.dialog.with_untracked(|current| {
+            self.sign_in_flow.borrow_mut().on_ask_sign_in(
+                current.as_ref(),
+                self.can_sign_in_here.get(),
+                false,
+            )
+        });
+        if let Some(dialog) = next {
+            self.ui.dialog.set(Some(dialog));
         }
     }
 
     /// The server refused a call, whichever, as this browser is not signed in to it, which every
     /// write takes: ask, unless the user put it off.
     fn refused_for_sign_in(&self) {
-        if !self.declined_sign_in.get() {
-            self.ask_sign_in();
+        let next = self.ui.dialog.with_untracked(|current| {
+            self.sign_in_flow.borrow_mut().on_ask_sign_in(
+                current.as_ref(),
+                self.can_sign_in_here.get(),
+                true,
+            )
+        });
+        if let Some(dialog) = next {
+            self.ui.dialog.set(Some(dialog));
         }
     }
 
-    /// The user put off signing in: what syncing finds refused does not ask again until then.
-    pub fn decline_sign_in(&self) {
-        self.declined_sign_in.set(true);
+    /// The user dismissed `SignInDialog` ("Not now" or Escape): suppress background sign-in
+    /// prompts, restore any preserved `NewChat` / invitation draft, and return `true` if a
+    /// dialog was restored (so a native `<dialog>` cancel event keeps the modal open).
+    pub fn dismiss_sign_in(&self) -> bool {
+        match self.sign_in_flow.borrow_mut().on_dismiss_sign_in() {
+            Some(restored) => {
+                self.ui.dialog.set(Some(restored));
+                true
+            }
+            None => {
+                self.close_dialog_if_sign_in();
+                false
+            }
+        }
+    }
+
+    /// Record the currently mounted `NewChat` dialog's fields so a background sign-in prompt
+    /// preserves any invitation or edits.
+    pub fn new_chat_mounted(
+        &self,
+        key: String,
+        name: String,
+        server: Option<String>,
+        pq_pinned: bool,
+    ) {
+        self.sign_in_flow
+            .borrow_mut()
+            .on_new_chat_mounted(key, name, server, pq_pinned);
+    }
+
+    /// Update the live `NewChat` draft as the user edits key or name.
+    pub fn new_chat_edited(&self, key: String, name: String) {
+        self.sign_in_flow
+            .borrow_mut()
+            .on_new_chat_edited(key, name);
+    }
+
+    /// Clear the live `NewChat` draft tracker when `NewChat` unmounts.
+    pub fn new_chat_unmounted(&self) {
+        self.sign_in_flow.borrow_mut().on_new_chat_unmounted();
+    }
+
+    /// Mark that `NewChat` has an in-flight `start_chat` submission.
+    pub fn begin_new_chat_submit(&self, draft: PendingNewChat) {
+        self.sign_in_flow.borrow_mut().begin_new_chat_submit(draft);
+    }
+
+    /// Clear the in-flight `NewChat` submission marker.
+    pub fn end_new_chat_submit(&self) {
+        self.sign_in_flow.borrow_mut().end_new_chat_submit();
+    }
+
+    /// Preserve a submitted `NewChat` draft (with `auto_start: true`) and immediately present
+    /// `SignInDialog` cleanly when `start_chat` hits `SignInRequired`.
+    pub fn require_sign_in_for_new_chat(&self, draft: PendingNewChat) {
+        let dialog = self
+            .sign_in_flow
+            .borrow_mut()
+            .on_start_chat_sign_in_required(draft);
+        self.ui.dialog.set(Some(dialog));
+    }
+
+    /// Hint for `SignInDialog` when a `NewChat` / invitation draft is waiting:
+    /// `Some((auto_start, has_key))`.
+    pub fn pending_new_chat_hint(&self) -> Option<(bool, bool)> {
+        self.sign_in_flow.borrow().pending_new_chat_hint()
+    }
+
+    /// Close the dialog only if `NewChat` is still the active dialog (avoiding clobbering
+    /// `SignInDialog` if sending the greeting hit `SignInRequired` right after persisting).
+    pub fn close_dialog_if_new_chat(&self) {
+        if self
+            .ui
+            .dialog
+            .with_untracked(|dialog| matches!(dialog, Some(Dialog::NewChat { .. })))
+        {
+            self.ui.dialog.set(None);
+        }
+    }
+
+    /// Close the dialog only if `SignIn` is still the active dialog.
+    pub fn close_dialog_if_sign_in(&self) {
+        if self
+            .ui
+            .dialog
+            .with_untracked(|dialog| matches!(dialog, Some(Dialog::SignIn)))
+        {
+            self.ui.dialog.set(None);
+        }
+    }
+
+    /// Determine what `SignInDialog` should do right after `Engine::sign_in` succeeds.
+    pub fn complete_sign_in_flow(&self) -> SignInSuccessAction {
+        self.sign_in_flow.borrow_mut().on_sign_in_succeeded()
+    }
+
+    /// Complete an automatic post-sign-in `start_chat` attempt, closing `SignInDialog` on success
+    /// or reopening `NewChat` prefilled with `err` when user attention is required.
+    pub fn finish_auto_start_chat(&self, err: Option<StartChatError>) {
+        let (succeeded, still_needs_sign_in) = match &err {
+            None => (true, false),
+            Some(StartChatError::SignInRequired) => (false, true),
+            Some(_) => (false, false),
+        };
+        let (close_sign_in, reopened) = self
+            .sign_in_flow
+            .borrow_mut()
+            .on_auto_start_finished(succeeded, still_needs_sign_in);
+        if close_sign_in {
+            self.close_dialog_if_sign_in();
+        } else if let Some(dialog) = reopened {
+            *self.new_chat_feedback.borrow_mut() = err;
+            self.ui.dialog.set(Some(dialog));
+        }
+    }
+
+    /// Take any deferred feedback queued for a newly mounted `NewChat` dialog.
+    pub fn take_new_chat_feedback(&self) -> Option<StartChatError> {
+        self.new_chat_feedback.borrow_mut().take()
     }
 
     /// The server's address.
@@ -657,6 +799,8 @@ impl Engine {
     }
 
     async fn unlocked(self: &Rc<Self>, inner: Inner) {
+        let can_sign_in_here = same_server(&inner.server, &origin());
+        self.can_sign_in_here.set(can_sign_in_here);
         self.ui.me.set(Some(inner.me()));
         self.ui.contacts.set(inner.views());
         // Uploads the page left: their files are gone with it.
@@ -682,12 +826,34 @@ impl Engine {
             Err(e) => self.ui.notify(describe(&e)),
         }
         *self.inner.lock().await = Some(inner);
-        self.ui.phase.set(Phase::Unlocked);
-        self.ui.log("vault unlocked");
         if let Some(dialog) = invitation() {
             forget_invitation();
-            self.ui.dialog.set(Some(dialog));
+            // Proactively check `/auth` (bounded by a short timeout so offline unlock never hangs)
+            // so first-time invitees see SignInDialog directly without flashing NewChat or losing
+            // the invitation link.
+            let signed_in = if can_sign_in_here {
+                match select(
+                    Box::pin(self.signed_in()),
+                    Box::pin(sleep(AUTH_CHECK_TIMEOUT)),
+                )
+                .await
+                {
+                    Either::Left((Ok(Some(_)), _)) => Some(true),
+                    Either::Left((Ok(None), _)) => Some(false),
+                    Either::Left((Err(_), _)) | Either::Right(_) => None,
+                }
+            } else {
+                None
+            };
+            let initial = self.sign_in_flow.borrow_mut().on_unlock_with_invitation(
+                dialog,
+                can_sign_in_here,
+                signed_in,
+            );
+            self.ui.dialog.set(Some(initial));
         }
+        self.ui.phase.set(Phase::Unlocked);
+        self.ui.log("vault unlocked");
         self.clone().run();
         self.clone().listen();
         let engine = self.clone();
@@ -3867,6 +4033,7 @@ impl Engine {
         // The chat's first message, at its first place.
         let mut greeting = hello.to_bytes();
         stamp(&mut greeting, 1);
+        let signs_in_here = same_server(&inner.server, &origin());
 
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         let (session, outgoing_request) = {
@@ -3881,6 +4048,10 @@ impl Engine {
                 )
                 .await
                 .map_err(|e| match e.kind() {
+                    ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
+                    ErrorKind::SignInRequired => {
+                        StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
+                    }
                     ErrorKind::ClassicalApprovalRequired { peer_signed_off } => {
                         StartChatError::ClassicalApprovalRequired { peer_signed_off }
                     }
@@ -3902,6 +4073,10 @@ impl Engine {
                 .prepare_initiate(&peer, &greeting, Fetch::client(&inner.server))
                 .await
                 .map_err(|e| match e.kind() {
+                    ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
+                    ErrorKind::SignInRequired => {
+                        StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
+                    }
                     ErrorKind::NotFound => StartChatError::Other(
                         "nobody published keys for that key on this server".to_string(),
                     ),
@@ -3950,6 +4125,8 @@ impl Engine {
             inner.state.farewells = saved_farewells;
             return Err(StartChatError::Other(describe(&e)));
         }
+        // The contact is now durably persisted; no longer treat a greeting 403 as a pending draft.
+        self.end_new_chat_submit();
 
         // Transmit the prepared initial message after durable local persistence.
         let send_res: session::Result<()> = {
@@ -3963,8 +4140,12 @@ impl Engine {
             }
         };
         if let Err(e) = send_res {
-            if e.kind() == ErrorKind::SignInRequired && same_server(&inner.server, &origin()) {
-                self.ask_sign_in();
+            if e.kind() == ErrorKind::SignInRequired && signs_in_here {
+                let dialog = self
+                    .sign_in_flow
+                    .borrow_mut()
+                    .on_chat_created_greeting_needs_sign_in();
+                self.ui.dialog.set(Some(dialog));
             }
             self.ui.log(format!(
                 "saved chat with {}, but could not send its initial greeting yet (it will carry on the first message): {}",
