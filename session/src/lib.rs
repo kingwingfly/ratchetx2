@@ -1039,20 +1039,26 @@ pub struct Sealed {
 }
 
 impl Sealed {
-    /// Deterministic 16-byte client idempotency identifier derived from this sealed ciphertext
+    /// Deterministic 16-byte client idempotency identifier derived from an encrypted message
     /// (`SHA-256("session.v2/client-message-id\0" || len(header) || header || len(content) || content)[..16]`),
     /// stable across retries and restarts without leaking plaintext or keys.
-    pub fn client_message_id(&self) -> [u8; 16] {
+    pub fn client_message_id_for(message: &EncryptedMessage) -> [u8; 16] {
         let mut hasher = Sha256::new();
         hasher.update(b"session.v2/client-message-id\0");
-        hasher.update((self.message.header.len() as u64).to_be_bytes());
-        hasher.update(&self.message.header);
-        hasher.update((self.message.content.len() as u64).to_be_bytes());
-        hasher.update(&self.message.content);
+        hasher.update((message.header.len() as u64).to_be_bytes());
+        hasher.update(&message.header);
+        hasher.update((message.content.len() as u64).to_be_bytes());
+        hasher.update(&message.content);
         let digest = hasher.finalize();
         let mut id = [0u8; 16];
         id.copy_from_slice(&digest[..16]);
         id
+    }
+
+    /// Deterministic 16-byte client idempotency identifier derived from this sealed ciphertext
+    /// via [`Sealed::client_message_id_for`].
+    pub fn client_message_id(&self) -> [u8; 16] {
+        Self::client_message_id_for(&self.message)
     }
 }
 

@@ -257,6 +257,33 @@ struct Inner<V = Vault> {
     saved_late: Vec<PublicKey>,
 }
 
+/// Which server RPC surface produced a protocol error, controlling whether `Unimplemented`
+/// should trip the global `Ui::update_required` banner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProtocolRpcScope {
+    /// Required core `handshake.v2` / `mailbox.v2` RPCs.
+    CoreV2,
+    /// Optional `attachment.v1` upload/download/delete RPCs.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Attachment,
+}
+
+/// Whether `error` on an RPC in `scope` should trip the global `Ui::update_required` banner
+/// (and slow foreground polling to `POLL_LIVE`).
+///
+/// Only confirmed `ErrorKind::Unimplemented` on core required `handshake.v2` / `mailbox.v2` RPCs
+/// triggers the global banner here; explicit `x-e2ee-deprecated` headers are handled by
+/// `transport.rs`, and WebSocket close code `4010` is handled by `notify.rs` / `sync.rs`.
+/// Attachment HTTP 404 / `Unimplemented` failures remain local to the affected attachment action.
+pub(super) fn should_require_update_for_rpc(
+    scope: ProtocolRpcScope,
+    error: &session::Error,
+) -> bool {
+    scope == ProtocolRpcScope::CoreV2
+        && error.is_server_refusal()
+        && error.kind() == ErrorKind::Unimplemented
+}
+
 impl Engine {
     pub fn new(ui: Ui) -> Rc<Self> {
         let engine = Rc::new(Self {
@@ -307,10 +334,11 @@ impl Engine {
         self.ui.update_required.set(Some(message));
     }
 
-    /// If `error` indicates a server protocol rejection (`ErrorKind::Unimplemented`) on a core
-    /// v2 procedure, prompt the user to refresh/upgrade the page.
-    pub(super) fn check_protocol_error(&self, error: &session::Error) {
-        if error.kind() == ErrorKind::Unimplemented {
+    /// If `error` is a confirmed `ErrorKind::Unimplemented` server refusal on a core v2
+    /// procedure (`handshake.v2` / `mailbox.v2`), prompt the user to refresh/upgrade the page.
+    /// Attachment errors (`ProtocolRpcScope::Attachment`) never trigger the global update banner.
+    pub(super) fn check_protocol_error(&self, scope: ProtocolRpcScope, error: &session::Error) {
+        if should_require_update_for_rpc(scope, error) {
             self.require_update(describe(error));
         }
     }

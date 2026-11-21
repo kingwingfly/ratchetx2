@@ -23,6 +23,17 @@ use crate::objects::checked_integer;
 pub const HEADER_DEPLOYMENT_AUTH: &str = "x-e2ee-deployment-auth";
 /// Internal header carrying the hex-encoded expected identity key for first-frame WS auth.
 pub const HEADER_PENDING_IDENTITY: &str = "x-e2ee-pending-identity";
+/// Internal header carrying the canonical relay audience for first-frame WS auth.
+/// Forwarded by the Worker so older Durable Object instances during rolling deploys continue
+/// accepting v2 subscribers seamlessly.
+pub const HEADER_SUBSCRIBE_AUDIENCE: &str = "x-e2ee-subscribe-audience";
+/// Retired internal header once used for query-param verified `SubscribeRequest` signatures.
+/// Kept as a constant so the Worker strips any client-spoofed header before forwarding to an
+/// older Durable Object instance during a rolling deploy.
+pub const HEADER_SUBSCRIBE_SIG: &str = "x-e2ee-subscribe-sig";
+/// Retired internal header once used for query-param verified `SubscribeRequest` timestamps.
+/// Stripped at Worker ingress for rolling-deploy safety alongside [`HEADER_SUBSCRIBE_SIG`].
+pub const HEADER_SUBSCRIBE_TS: &str = "x-e2ee-subscribe-ts";
 
 /// What a client sends to keep its WebSocket open, and the answer, given without waking the
 /// object.

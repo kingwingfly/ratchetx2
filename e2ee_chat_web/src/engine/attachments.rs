@@ -103,7 +103,7 @@ impl Engine {
                 ));
             }
             Err(e) => {
-                self.check_protocol_error(&e);
+                // Report attachment 404/Unimplemented locally without tripping global update_required.
                 return Err(describe(&e));
             }
         };
@@ -283,7 +283,7 @@ impl Engine {
                 return Ok(());
             }
             Err(e) => {
-                self.check_protocol_error(&e);
+                // Report attachment 404/Unimplemented locally without tripping global update_required.
                 return Err(describe(&e));
             }
         };
@@ -803,7 +803,7 @@ impl Engine {
             Ok(()) => {}
             Err(e) if e.kind() == ErrorKind::NotFound => {}
             Err(e) => {
-                self.check_protocol_error(&e);
+                // Report attachment 404/Unimplemented locally without tripping global update_required.
                 return Err(describe(&e));
             }
         }

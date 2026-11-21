@@ -4,24 +4,26 @@ use super::handshake::{Incoming, stage_carried_initials};
 use super::outbox::{RequeueOutcome, needs_new_session};
 use super::{
     AWAY_CHECK, Engine, HIDDEN_GRACE, HistoryStore, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE,
-    POLL_SLOW, POLL_STEP, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE, origin, records,
-    same_server,
+    POLL_SLOW, POLL_STEP, ProtocolRpcScope, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE,
+    origin, records, same_server, should_require_update_for_rpc,
 };
 use crate::content::{Content, Kind};
 use crate::notify::{Event, Subscription};
 use crate::state::{Link, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, monotonic_now_ms, now, sleep};
-use crate::vault::{ContactState, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE};
+use crate::vault::{
+    ContactState, Farewell, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
+};
 use bytes::Bytes;
 use futures::future::{Either, select};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use prost::Message as _;
 use session::protocol::handshake_v2::InitialMessageV2 as WireInitialMessageV2;
-use session::protocol::mailbox_v2::{LocalMailboxV2, PushV2Request};
+use session::protocol::mailbox_v2::{CLIENT_MESSAGE_ID_LENGTH, LocalMailboxV2, PushV2Request};
 use session::protocol::notify::{self, Notification};
-use session::{Client, ErrorKind, PqSuite, PublicKey, Session, proto};
+use session::{Client, ErrorKind, PqSuite, PublicKey, Sealed, Session, proto};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -221,7 +223,7 @@ impl Engine {
                 }
             }
             Ok(_) => ServerPqStatus::Disabled,
-            Err(e) if e.kind() == ErrorKind::Unimplemented => {
+            Err(e) if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) => {
                 self.require_update(describe(&e));
                 return;
             }
@@ -349,34 +351,7 @@ impl Engine {
         };
         let signs_in_here = same_server(&inner.server, &origin());
         while let Some(farewell) = inner.state.farewells.first().cloned() {
-            let push_req = farewell.push.unwrap_or_default();
-            let v2_req = if !farewell.push_v2.is_empty() {
-                PushV2Request::decode(farewell.push_v2.as_slice()).unwrap_or_else(|_| {
-                    PushV2Request {
-                        sender: push_req.sender.clone(),
-                        recipient: push_req.recipient.clone(),
-                        message: push_req.message.clone(),
-                        initial_message: push_req
-                            .initial_message
-                            .as_ref()
-                            .map(WireInitialMessageV2::from),
-                        delivery_hash: push_req.delivery_hash.clone(),
-                        client_message_id: Bytes::from(farewell.client_message_id.clone()),
-                    }
-                })
-            } else {
-                PushV2Request {
-                    sender: push_req.sender.clone(),
-                    recipient: push_req.recipient.clone(),
-                    message: push_req.message.clone(),
-                    initial_message: push_req
-                        .initial_message
-                        .as_ref()
-                        .map(WireInitialMessageV2::from),
-                    delivery_hash: push_req.delivery_hash.clone(),
-                    client_message_id: Bytes::from(farewell.client_message_id.clone()),
-                }
-            };
+            let v2_req = farewell_push_v2_request(&farewell);
             let pushed: session::Result<()> = Fetch::client(&inner.server)
                 .push_v2(v2_req)
                 .await
@@ -403,7 +378,7 @@ impl Engine {
                     ));
                 }
                 Err(e) => {
-                    self.check_protocol_error(&e);
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                     return Err(describe(&e));
                 }
             }
@@ -444,7 +419,7 @@ impl Engine {
                 .fetch_page(index, async |session, client, audience| {
                     let res = session.fetch_v2(client, audience).await;
                     if let Err(ref e) = res {
-                        self.check_protocol_error(e);
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, e);
                     }
                     res
                 })
@@ -613,6 +588,38 @@ impl Engine {
         }
         Ok(received)
     }
+}
+
+/// Build a [`PushV2Request`] for a persisted [`Farewell`], deterministically deriving a 16-byte
+/// `client_message_id` from the encrypted message whenever a legacy vaulted farewell has an empty
+/// `client_message_id` so retries remain idempotent.
+pub(super) fn farewell_push_v2_request(farewell: &Farewell) -> PushV2Request {
+    let mut req = if !farewell.push_v2.is_empty()
+        && let Ok(decoded) = PushV2Request::decode(farewell.push_v2.as_slice())
+    {
+        decoded
+    } else {
+        let push_req = farewell.push.clone().unwrap_or_default();
+        PushV2Request {
+            sender: push_req.sender,
+            recipient: push_req.recipient,
+            message: push_req.message,
+            initial_message: push_req
+                .initial_message
+                .as_ref()
+                .map(WireInitialMessageV2::from),
+            delivery_hash: push_req.delivery_hash,
+            client_message_id: Bytes::copy_from_slice(&farewell.client_message_id),
+        }
+    };
+    if req.client_message_id.is_empty() {
+        if farewell.client_message_id.len() == CLIENT_MESSAGE_ID_LENGTH {
+            req.client_message_id = Bytes::copy_from_slice(&farewell.client_message_id);
+        } else if let Some(message) = req.message.as_ref() {
+            req.client_message_id = Bytes::copy_from_slice(&Sealed::client_message_id_for(message));
+        }
+    }
+    req
 }
 
 impl<V: HistoryStore> Inner<V> {

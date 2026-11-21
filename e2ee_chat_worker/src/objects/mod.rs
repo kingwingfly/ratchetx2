@@ -16,7 +16,10 @@ use worker::{
 };
 
 pub use attachment::{Attachment, DEFAULT_FILE_RETENTION_DAYS};
-pub use identity::{HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, Identity};
+pub use identity::{
+    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE,
+    HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS, Identity,
+};
 
 /// The binding of the identities' namespace.
 const IDENTITIES: &str = "IDENTITIES";
@@ -59,8 +62,27 @@ pub enum AppendOutcome {
 
 /// What the Worker asks of an [`Identity`], about its identity's keys, inbox and the queues of
 /// messages to it.
+///
+/// The five retired legacy v1 slots at tags `0..=4` are intentionally reserved so every surviving
+/// variant keeps its exact original postcard wire tag index (`5..=16`) during rolling deploys
+/// between older and newer Worker / Durable Object versions.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IdentityCall {
+    /// Retired legacy v1 `Publish` slot (tag `0`), preserved for rolling-deploy wire compatibility.
+    #[allow(dead_code)]
+    RetiredPublishV1,
+    /// Retired legacy v1 `TakeBundle` slot (tag `1`), preserved for rolling-deploy wire compatibility.
+    #[allow(dead_code)]
+    RetiredTakeBundleV1,
+    /// Retired legacy v1 `AddInitialMessage` slot (tag `2`), preserved for rolling-deploy wire compatibility.
+    #[allow(dead_code)]
+    RetiredAddInitialMessageV1,
+    /// Retired legacy v1 `TakeInitialMessages` slot (tag `3`), preserved for rolling-deploy wire compatibility.
+    #[allow(dead_code)]
+    RetiredTakeInitialMessagesV1,
+    /// Retired legacy v1 `Append` slot (tag `4`), preserved for rolling-deploy wire compatibility.
+    #[allow(dead_code)]
+    RetiredAppendV1,
     /// The messages of the queue from `sender` after `after`, at most `limit`, and at most
     /// `max_size` bytes (header + initial_message + content) but for the first.
     Read {
@@ -330,4 +352,166 @@ fn has_table(sql: &SqlStorage, name: &str) -> Result<bool> {
 #[derive(Deserialize)]
 struct TablesRow {
     tables: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tag_byte(value: &impl Serialize) -> u8 {
+        let bytes = postcard::to_allocvec(value).expect("postcard encode");
+        assert!(!bytes.is_empty());
+        bytes[0]
+    }
+
+    #[test]
+    fn identity_call_postcard_tags_match_legacy_v1_wire_indices() {
+        let dummy_manifest = ManifestWire {
+            audience: "relay.example".into(),
+            identity_key: vec![1; 32],
+            manifest_seq: 1,
+            generation: 1,
+            issued_at: 1,
+            expires_at: 2,
+            pq_enabled: false,
+            strict_pq: false,
+            pq_ratchet_supported: false,
+            offered_suites: vec![],
+            signed_prekey: vec![2; 32],
+            pq_last_resort: vec![],
+            signature: vec![3; 64],
+        };
+        let dummy_initial = InitialMessageV2Wire {
+            id: 0,
+            version: 1,
+            sender: vec![1; 32],
+            ephemeral_key: vec![2; 32],
+            signed_prekey: vec![3; 32],
+            one_time_prekey: None,
+            header: vec![],
+            content: vec![],
+            pq_suite: None,
+            pq_last_resort: false,
+            pq_prekey_id: None,
+            pq_ciphertext: None,
+            manifest_digest: None,
+        };
+
+        let expected_tags: &[(IdentityCall, u8)] = &[
+            (IdentityCall::RetiredPublishV1, 0),
+            (IdentityCall::RetiredTakeBundleV1, 1),
+            (IdentityCall::RetiredAddInitialMessageV1, 2),
+            (IdentityCall::RetiredTakeInitialMessagesV1, 3),
+            (IdentityCall::RetiredAppendV1, 4),
+            (
+                IdentityCall::Read {
+                    sender: vec![1; 32],
+                    after: 0,
+                    limit: 10,
+                    max_size: 1024,
+                },
+                5,
+            ),
+            (
+                IdentityCall::DeliveredObjects {
+                    sender: vec![1; 32],
+                    hashes: vec![],
+                },
+                6,
+            ),
+            (
+                IdentityCall::DeleteDelivered {
+                    sender: vec![1; 32],
+                    hashes: vec![],
+                    objects: vec![],
+                },
+                7,
+            ),
+            (
+                IdentityCall::PublishV2 {
+                    manifest: dummy_manifest,
+                    signed_prekey_signature: None,
+                    one_time_prekeys: vec![],
+                    pq_last_resort: vec![],
+                    pq_one_time_prekeys: vec![],
+                    timestamp: 1,
+                },
+                8,
+            ),
+            (
+                IdentityCall::RefillPrekeys {
+                    generation: 1,
+                    one_time_prekeys: vec![],
+                    pq_one_time_prekeys: vec![],
+                    max_one_time_prekeys: 100,
+                    max_pq_one_time_prekeys: 100,
+                    timestamp: 1,
+                },
+                9,
+            ),
+            (IdentityCall::GetManifest, 10),
+            (
+                IdentityCall::ClaimBundle {
+                    preferred_suites: vec![1],
+                },
+                11,
+            ),
+            (
+                IdentityCall::AddInitialMessageV2 {
+                    message: dummy_initial,
+                    limit: 10,
+                },
+                12,
+            ),
+            (IdentityCall::ListInitialMessages { limit: 10 }, 13),
+            (IdentityCall::AckInitialMessages { ids: vec![1] }, 14),
+            (IdentityCall::PqSnapshot, 15),
+            (
+                IdentityCall::AppendIdempotent {
+                    sender: vec![1; 32],
+                    header: vec![],
+                    content: Content::Inline(vec![]),
+                    size: 0,
+                    initial_message: None,
+                    delivery_hash: None,
+                    client_message_id: None,
+                },
+                16,
+            ),
+        ];
+
+        for (call, expected_tag) in expected_tags {
+            assert_eq!(tag_byte(call), *expected_tag, "tag mismatch for {call:?}");
+        }
+
+        // Retired legacy v1 payloads from an older Worker (tag byte + legacy fields) decode cleanly
+        // into the corresponding retired variants so the DO answers 501 instead of misdispatching.
+        for (wire, expected_discriminant) in [
+            (vec![0, 0xaa, 0xbb, 0xcc], 0u8),
+            (vec![1], 1u8),
+            (vec![2, 0xde, 0xad], 2u8),
+            (vec![3, 0x01, 0x02], 3u8),
+            (vec![4, 0xff, 0x00, 0x11], 4u8),
+        ] {
+            let decoded: IdentityCall = postcard::from_bytes(&wire).expect("decode retired slot");
+            assert_eq!(tag_byte(&decoded), expected_discriminant);
+        }
+
+        // Verify AppendOutcome and AttachmentCall tags also match archive/legacy-v1.
+        assert_eq!(tag_byte(&AppendOutcome::Appended(1)), 0);
+        assert_eq!(tag_byte(&AppendOutcome::Deduplicated(1)), 1);
+        assert_eq!(tag_byte(&AppendOutcome::LimitExceeded), 2);
+        assert_eq!(
+            tag_byte(&AttachmentCall::Add {
+                id: vec![],
+                chunks: 1,
+                token_hash: vec![],
+                delete_hash: vec![],
+            }),
+            0
+        );
+        assert_eq!(tag_byte(&AttachmentCall::Get), 1);
+        assert_eq!(tag_byte(&AttachmentCall::Note { index: 0 }), 2);
+        assert_eq!(tag_byte(&AttachmentCall::Delete), 3);
+    }
 }

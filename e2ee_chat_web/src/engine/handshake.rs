@@ -3,8 +3,9 @@
 use super::contact::Contact;
 use super::{
     Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS,
-    REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS, SERVER_MAX_PQ_ONE_TIME_PREKEYS,
-    StartChatError, origin, records, same_server,
+    ProtocolRpcScope, REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS,
+    SERVER_MAX_PQ_ONE_TIME_PREKEYS, StartChatError, origin, records, same_server,
+    should_require_update_for_rpc,
 };
 use crate::content::{Content, Kind, stamp};
 use crate::state::{Delivery, MessageView, ServerPqStatus};
@@ -72,9 +73,25 @@ pub(super) fn stage_carried_initials<'a>(
     Ok(())
 }
 
-struct Inbox {
-    messages: Vec<(PublicKey, u64, Incoming)>,
-    malformed_ids: Vec<u64>,
+pub(super) struct Inbox {
+    pub(super) messages: Vec<(PublicKey, u64, Incoming)>,
+    pub(super) malformed_ids: Vec<u64>,
+}
+
+/// Whether a processed inbox initial message should be acknowledged on the server or deferred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum InitialOutcome {
+    /// Accepted, quarantined, or permanently rejected — safe to acknowledge after local save.
+    Ack,
+    /// Undecryptable by this build due to an unsupported suite — keep queued on the server.
+    DeferUnsupportedSuite,
+}
+
+/// Whether an `accept_initial_v2` failure kind is permanent and safe to acknowledge/delete from
+/// the server inbox. [`ErrorKind::UnsupportedSuite`] MUST NOT be acknowledged so a capable build
+/// (e.g. with ML-KEM compiled in) can decrypt the queued PQ initial later.
+pub(super) fn should_ack_initial_error(kind: ErrorKind) -> bool {
+    kind != ErrorKind::UnsupportedSuite
 }
 
 struct OpenedInitial {
@@ -334,11 +351,44 @@ impl Engine {
                     .await
                     .map(drop)
                     .map_err(|e| {
-                        self.check_protocol_error(&e);
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                         describe(&e)
                     })
             })
             .await
+    }
+
+    pub(super) fn process_inbox_messages(
+        &self,
+        inner: &mut Inner<impl HistoryStore>,
+        inbox: Inbox,
+        open_peer: Option<PublicKey>,
+        batch: &mut InitialBatch,
+    ) {
+        for (peer, id, message) in inbox.messages {
+            if !is_valid_inbox_ack_id(id) {
+                self.ui.log(format!(
+                    "Skipped initial message with out-of-range inbox ID {id}."
+                ));
+                continue;
+            }
+            if inner.state.pending_inbox_acks.contains(&id) {
+                continue;
+            }
+            let read = open_peer == Some(peer);
+            if self.process_initial(inner, &peer, &message, read, batch) == InitialOutcome::Ack {
+                batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
+            }
+        }
+        for id in inbox.malformed_ids {
+            if !is_valid_inbox_ack_id(id) {
+                self.ui.log(format!(
+                    "Skipped malformed initial message with out-of-range inbox ID {id}."
+                ));
+                continue;
+            }
+            batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
+        }
     }
 
     pub(super) async fn take_initial_messages(&self) -> Result<bool, String> {
@@ -353,34 +403,15 @@ impl Engine {
         let inbox = match inner.list_inbox().await {
             Ok(inbox) => inbox,
             Err(e) => {
-                self.check_protocol_error(&e);
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 return Err(describe(&e));
             }
         };
         let mut batch = InitialBatch::default();
-        for (peer, id, message) in inbox.messages {
-            if !is_valid_inbox_ack_id(id) {
-                self.ui.log(format!(
-                    "Skipped initial message with out-of-range inbox ID {id}."
-                ));
-                continue;
-            }
-            if !stage_inbox_ack(&mut inner.state.pending_inbox_acks, id) {
-                continue;
-            }
-            batch.dirty = true;
-            let read = self.ui.open.get_untracked() == Some(peer) && !document().hidden();
-            self.process_initial(inner, &peer, &message, read, &mut batch);
-        }
-        for id in inbox.malformed_ids {
-            if !is_valid_inbox_ack_id(id) {
-                self.ui.log(format!(
-                    "Skipped malformed initial message with out-of-range inbox ID {id}."
-                ));
-                continue;
-            }
-            batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
-        }
+        let open_peer = (!document().hidden())
+            .then(|| self.ui.open.get_untracked())
+            .flatten();
+        self.process_inbox_messages(inner, inbox, open_peer, &mut batch);
         if !batch.dirty {
             return Ok(false);
         }
@@ -453,19 +484,27 @@ impl Engine {
         message: &Incoming,
         read: bool,
         batch: &mut InitialBatch,
-    ) {
+    ) -> InitialOutcome {
         if *peer == inner.client.identity_key() {
             self.ui
                 .log("dropped an initial message claiming to be from your own key");
-            return;
+            return InitialOutcome::Ack;
         }
         if let Err(reason) = inner.check_isolation(peer) {
             self.ui.log(reason);
-            return;
+            return InitialOutcome::Ack;
         }
         let opened = match inner.open_initial(peer, message) {
             Ok(opened) => opened,
             Err(e) => {
+                if !should_ack_initial_error(e.kind()) {
+                    self.ui.log(format!(
+                        "kept initial message from {} queued on server (unsupported post-quantum suite): {}",
+                        short(peer),
+                        describe(&e)
+                    ));
+                    return InitialOutcome::DeferUnsupportedSuite;
+                }
                 self.ui.log(format!(
                     "dropped an initial message claiming to be from {}: {}",
                     short(peer),
@@ -477,7 +516,7 @@ impl Engine {
                 {
                     batch.dirty |= contact.record_policy_error(e.kind());
                 }
-                return;
+                return InitialOutcome::Ack;
             }
         };
         batch.dirty = true; // Accepting also commits prekey consumption, even if the merge is rejected.
@@ -502,7 +541,7 @@ impl Engine {
                         "quarantined classical session request from {} pending approval",
                         short(peer)
                     ));
-                    return;
+                    return InitialOutcome::Ack;
                 }
                 let is_pq = session.security().is_some_and(|security| security.is_pq);
                 match contact.replace_session(session, local_pq) {
@@ -521,7 +560,7 @@ impl Engine {
                             describe(&e)
                         ));
                         contact.record_policy_error(e.kind());
-                        return;
+                        return InitialOutcome::Ack;
                     }
                 }
                 contact
@@ -544,7 +583,7 @@ impl Engine {
                         "quarantined classical chat request from {} pending approval",
                         short(peer)
                     ));
-                    return;
+                    return InitialOutcome::Ack;
                 }
                 self.ui.log(format!("chat request from {}", short(peer)));
                 inner.contacts.push(contact);
@@ -571,7 +610,7 @@ impl Engine {
                     "Skipped initial message history entry for {}. {reason}",
                     short(peer)
                 ));
-                return;
+                return InitialOutcome::Ack;
             }
         };
         if self.ui.open.get_untracked() == Some(*peer) {
@@ -582,6 +621,7 @@ impl Engine {
         batch
             .records
             .push((*peer, (history_key(peer, index), entry)));
+        InitialOutcome::Ack
     }
 
     async fn save_initial_batch(
@@ -675,7 +715,7 @@ impl Engine {
                 Ok(())
             }
             Err(e) => {
-                self.check_protocol_error(&e);
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 let error = PublishError::transmitted(e);
                 if error.rejects_settings() || error.needs_sign_in() || error.is_unimplemented() {
                     inner.client.rollback_publish_v2_on_refusal(prepared);
@@ -986,7 +1026,7 @@ impl Engine {
             )
             .await
             .map_err(|e| {
-                if e.kind() == ErrorKind::Unimplemented && !local_pq {
+                if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !local_pq {
                     self.require_update(describe(&e));
                 }
                 match e.kind() {
@@ -1060,7 +1100,7 @@ impl Engine {
                 .message
                 .as_ref()
                 .is_some_and(|m| m.version >= 2);
-            if e.kind() == ErrorKind::Unimplemented && !outgoing_is_pq {
+            if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !outgoing_is_pq {
                 self.require_update(describe(&e));
             }
             if e.kind() == ErrorKind::SignInRequired && signs_in_here {

@@ -35,8 +35,7 @@ const DEPRECATED_HEADER: &str = "x-e2ee-deprecated";
 /// Value of [`DEPRECATED_HEADER`] for rejected legacy v1 requests.
 const DEPRECATED_V1_VALUE: &str = "v1";
 /// Error message returned on deprecated legacy v1 handshake/mailbox Connect requests.
-const LEGACY_V1_CONNECT_MESSAGE: &str =
-    "Legacy v1 protocol is deprecated and removed. Please refresh or upgrade the app to continue.";
+const LEGACY_V1_CONNECT_MESSAGE: &str = "Legacy v1 protocol is deprecated and removed. Refresh the web app, or switch from an archived v1/TUI client to the web app.";
 /// Body returned on deprecated legacy query-param `/notifications?request=...` requests.
 const LEGACY_V1_NOTIFICATIONS_MESSAGE: &str = "Legacy v1 notifications are deprecated and removed. Please refresh or upgrade the app to continue.";
 /// The binding of the R2 bucket.
@@ -241,14 +240,21 @@ fn server_info_config(server_id: String, pq_enabled: bool) -> ServerInfoConfig {
 
 /// Adds `Date`, `x-e2ee-pq`, and Connect CORS headers (exposing `x-e2ee-deprecated`).
 fn with_cors(response: Response, pq_enabled: bool) -> Result<Response> {
-    with_metadata(response, pq_enabled)?.with_cors(
-        &Cors::new()
-            .with_origins(["*"])
-            .with_methods([Method::Post, Method::Options])
-            .with_allowed_headers(["content-type", PROTOCOL_VERSION_HEADER])
-            .with_exposed_headers(["date", PQ_HEADER, DEPRECATED_HEADER])
-            .with_max_age(86400),
-    )
+    with_metadata(response, pq_enabled)?.with_cors(&cors_policy([Method::Post, Method::Options]))
+}
+
+/// Adds `Date`, `x-e2ee-pq`, and `/notifications` CORS headers (exposing `x-e2ee-deprecated`).
+fn with_notifications_cors(response: Response, pq_enabled: bool) -> Result<Response> {
+    with_metadata(response, pq_enabled)?.with_cors(&cors_policy([Method::Get, Method::Options]))
+}
+
+fn cors_policy(methods: impl IntoIterator<Item = Method>) -> Cors {
+    Cors::new()
+        .with_origins(["*"])
+        .with_methods(methods)
+        .with_allowed_headers(["content-type", PROTOCOL_VERSION_HEADER])
+        .with_exposed_headers(["date", PQ_HEADER, DEPRECATED_HEADER])
+        .with_max_age(86400)
 }
 
 /// Adds `Date` and `x-e2ee-pq` response headers.
@@ -367,9 +373,37 @@ fn is_internal_subscribe_header(name: &str) -> bool {
     [
         objects::HEADER_DEPLOYMENT_AUTH,
         objects::HEADER_PENDING_IDENTITY,
+        objects::HEADER_SUBSCRIBE_AUDIENCE,
+        objects::HEADER_SUBSCRIBE_SIG,
+        objects::HEADER_SUBSCRIBE_TS,
     ]
     .iter()
     .any(|header| name.eq_ignore_ascii_case(header))
+}
+
+/// Strip all 5 historical internal subscribe headers case-insensitively and append the trusted
+/// Worker-computed auth, pending identity, and canonical audience headers for forwarding to the
+/// Identity Durable Object (safe across rolling deploys with older DO instances).
+fn forwarded_subscribe_headers<'a>(
+    incoming: impl IntoIterator<Item = (&'a str, &'a str)>,
+    identity_key: &[u8; 32],
+    audience: &str,
+) -> Vec<(String, String)> {
+    let mut forwarded: Vec<(String, String)> = incoming
+        .into_iter()
+        .filter(|(name, _)| !is_internal_subscribe_header(name))
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+    forwarded.push((objects::HEADER_DEPLOYMENT_AUTH.to_owned(), "1".to_owned()));
+    forwarded.push((
+        objects::HEADER_PENDING_IDENTITY.to_owned(),
+        hex(identity_key),
+    ));
+    forwarded.push((
+        objects::HEADER_SUBSCRIBE_AUDIENCE.to_owned(),
+        audience.to_owned(),
+    ));
+    forwarded
 }
 
 fn deployment_auth_satisfied(password_configured: bool, signed_in: bool) -> bool {
@@ -383,10 +417,17 @@ fn deployment_auth_satisfied(password_configured: bool, signed_in: bool) -> bool
 /// base64url text frame carrying an audience-bound v2 `SubscribeRequest`.
 /// Legacy query-param requests (`GET /notifications?request=...`) return HTTP `410 Gone`.
 async fn subscribe(request: Request, env: &Env) -> Result<Response> {
+    let pq_enabled = pq_runtime_enabled(env);
+    if request.method() == Method::Options {
+        return with_notifications_cors(Response::empty()?, pq_enabled);
+    }
     if request.method() != Method::Get {
         let headers = Headers::new();
-        headers.set("allow", "GET")?;
-        return Ok(Response::error("method not allowed", 405)?.with_headers(headers));
+        headers.set("allow", "GET, OPTIONS")?;
+        return with_notifications_cors(
+            Response::error("method not allowed", 405)?.with_headers(headers),
+            pq_enabled,
+        );
     }
     let url = request.url()?;
     let identity_hex = match parse_subscribe_query(&url) {
@@ -395,7 +436,7 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
             response
                 .headers_mut()
                 .set(DEPRECATED_HEADER, DEPRECATED_V1_VALUE)?;
-            return with_metadata(response, pq_runtime_enabled(env));
+            return with_notifications_cors(response, pq_enabled);
         }
         SubscribeQuery::Identity(identity_hex) => identity_hex,
         SubscribeQuery::Missing => {
@@ -427,18 +468,23 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
     if XEdDSAPublicKey::new(&identity_key).is_err() {
         return Response::error("invalid identity key", 400);
     }
-    // Validate the relay audience before forwarding to the Durable Object.
-    let _ = server_id(env, &request)?;
+    // Validate and normalize the relay audience before forwarding to the Durable Object.
+    let audience = server_id(env, &request)?;
 
-    // Clone incoming headers and strip any client-supplied internal auth headers.
+    // Clone incoming headers, stripping all 5 historical internal auth headers so a client can
+    // never spoof a retired header toward an older DO instance during rolling deploys, and attach
+    // the canonical audience header so older DO instances continue accepting v2 subscribers.
+    let incoming_headers: Vec<(String, String)> = request.headers().entries().collect();
     let forward_headers = Headers::new();
-    for (name, value) in request.headers().entries() {
-        if !is_internal_subscribe_header(&name) {
-            forward_headers.set(&name, &value)?;
-        }
+    for (name, value) in forwarded_subscribe_headers(
+        incoming_headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str())),
+        &identity_key,
+        &audience,
+    ) {
+        forward_headers.set(&name, &value)?;
     }
-    forward_headers.set(objects::HEADER_DEPLOYMENT_AUTH, "1")?;
-    forward_headers.set(objects::HEADER_PENDING_IDENTITY, &hex(&identity_key))?;
 
     let forwarded = Request::new_with_init(
         url.as_str(),
@@ -846,13 +892,65 @@ mod tests {
         for header in [
             objects::HEADER_DEPLOYMENT_AUTH,
             objects::HEADER_PENDING_IDENTITY,
+            objects::HEADER_SUBSCRIBE_AUDIENCE,
+            objects::HEADER_SUBSCRIBE_SIG,
+            objects::HEADER_SUBSCRIBE_TS,
         ] {
             assert!(is_internal_subscribe_header(header));
             assert!(is_internal_subscribe_header(&header.to_ascii_uppercase()));
         }
         assert!(is_internal_subscribe_header("X-E2EE-Deployment-Auth"));
+        assert!(is_internal_subscribe_header("X-E2EE-Pending-Identity"));
+        assert!(is_internal_subscribe_header("X-E2EE-Subscribe-Audience"));
+        assert!(is_internal_subscribe_header("X-E2EE-Subscribe-Sig"));
+        assert!(is_internal_subscribe_header("X-E2EE-Subscribe-Ts"));
         assert!(!is_internal_subscribe_header("upgrade"));
         assert!(!is_internal_subscribe_header("cookie"));
+
+        let id = [0x42u8; 32];
+        let forwarded = forwarded_subscribe_headers(
+            [
+                ("upgrade", "websocket"),
+                ("cookie", "session=abc"),
+                ("X-E2EE-Deployment-Auth", "0"),
+                ("x-e2ee-pending-identity", "00"),
+                ("X-E2EE-Subscribe-Sig", "deadbeef"),
+                ("x-e2ee-subscribe-ts", "9999999999"),
+                ("X-E2EE-Subscribe-Audience", "evil.example"),
+            ],
+            &id,
+            "relay.example:443",
+        );
+        assert!(forwarded.contains(&("upgrade".into(), "websocket".into())));
+        assert!(forwarded.contains(&("cookie".into(), "session=abc".into())));
+        assert!(!forwarded.iter().any(
+            |(k, _)| k.eq_ignore_ascii_case(objects::HEADER_SUBSCRIBE_SIG)
+                || k.eq_ignore_ascii_case(objects::HEADER_SUBSCRIBE_TS)
+        ));
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_DEPLOYMENT_AUTH))
+                .collect::<Vec<_>>(),
+            vec![&(objects::HEADER_DEPLOYMENT_AUTH.to_string(), "1".to_string())]
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_PENDING_IDENTITY))
+                .collect::<Vec<_>>(),
+            vec![&(objects::HEADER_PENDING_IDENTITY.to_string(), hex(&id))]
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_SUBSCRIBE_AUDIENCE))
+                .collect::<Vec<_>>(),
+            vec![&(
+                objects::HEADER_SUBSCRIBE_AUDIENCE.to_string(),
+                "relay.example:443".to_string()
+            )]
+        );
     }
 
     #[test]

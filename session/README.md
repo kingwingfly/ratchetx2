@@ -29,7 +29,7 @@ On `wasm32-unknown-unknown`, enable getrandom's `wasm_js` feature in the final a
 Over Connect, with the `connect` feature:
 
 ```rust,no_run
-use session::Client;
+use session::{AcceptedInitial, Client, PeerPqState};
 use session::protocol::connect::{ConnectClient, Post};
 
 /// Posts the calls with the HTTP client of your choice, e.g. reqwest, or `fetch` in a browser.
@@ -39,7 +39,7 @@ struct Http;
 impl Post for Http {
     async fn post(&self, path: &str, body: Vec<u8>) -> session::protocol::Result<(u16, Vec<u8>)> {
         // POST `body` to the server's address and `path`, e.g.
-        // https://chat.example.com/mailbox.v1.MailboxService/Push, with the headers
+        // https://chat.example.com/mailbox.v2.MailboxService/PushV2, with the headers
         // `Content-Type: application/proto` and `Connect-Protocol-Version: 1`, and return the
         // response's status and body.
 #       unimplemented!()
@@ -47,25 +47,41 @@ impl Post for Http {
 }
 
 # async fn run() -> session::Result<()> {
+let audience = "chat.example.com";
 let server = ConnectClient::new(Http);
 let mut alice = Client::new(server.clone());
 let mut bob = Client::new(server.clone());
 
-// Bob publishes his prekeys; Alice starts a session, saying hi, and sends a message.
-bob.publish_keys(10).await?;
+// Bob publishes his v2 prekeys and signed capability manifest; Alice starts a session, saying hi,
+// and pushes a message.
+bob.publish_v2(audience, 10, 10).await?;
 let mut alice_session = alice
-    .initiate(&bob.identity_key(), b"Hi Bob", server.clone())
+    .initiate_v2(
+        audience,
+        &bob.identity_key(),
+        &PeerPqState::default(),
+        b"Hi Bob",
+        server.clone(),
+    )
     .await?;
-alice_session.send(b"How are you?").await?;
+let question = alice_session.encrypt(b"How are you?")?;
+alice_session.push_v2(question).await?;
 
-// Bob accepts it, expecting it from Alice, as its first message shows; then they can talk.
-let initial_messages = bob.take_initial_messages().await?;
-let (mut bob_session, hi) = bob.accept(&alice.identity_key(), &initial_messages[0], server)?;
+// Bob lists and accepts pending initial messages, then receives and replies over v2.
+let accepted = bob
+    .list_and_accept_v2(audience, 10, server, |_| PeerPqState::default())
+    .await?;
+let (_, AcceptedInitial::Accepted { session: mut bob_session, first_message: hi, .. }) =
+    accepted.outcomes.into_iter().next().expect("initial message")
+else {
+    unreachable!()
+};
 println!("{}", String::from_utf8_lossy(&hi));
-for received in bob_session.receive().await? {
+for received in bob_session.receive_v2(&bob, audience).await? {
     println!("{}", String::from_utf8_lossy(&received.content?));
 }
-bob_session.send(b"Hi Alice").await?;
+let reply = bob_session.encrypt(b"Hi Alice")?;
+bob_session.push_v2(reply).await?;
 # Ok(())
 # }
 ```

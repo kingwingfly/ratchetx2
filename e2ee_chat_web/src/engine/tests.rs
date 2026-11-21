@@ -3,16 +3,18 @@ use super::contact::{
     record_quarantined_initial_state, restore_contacts, stored_contacts,
 };
 use super::handshake::{
-    Incoming, InitialBatch, PublishError, prune_invalid_inbox_acks, refill_batch_counts,
-    stage_carried_initials, stage_inbox_ack,
+    Inbox, Incoming, InitialBatch, PublishError, prune_invalid_inbox_acks, refill_batch_counts,
+    should_ack_initial_error, stage_carried_initials, stage_inbox_ack,
 };
 use super::settings::{
     describe_upgrade_pq_error, finalize_upgrade_to_pq_request_state, validate_pq_config_for_server,
 };
+use super::sync::farewell_push_v2_request;
 use super::{
-    AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, REFILL_USED,
-    SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash, build_invitation_link, checked_name,
-    normalize_update_reason, parse_invitation_hash,
+    AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS,
+    ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash,
+    build_invitation_link, checked_name, normalize_update_reason, parse_invitation_hash,
+    should_require_update_for_rpc,
 };
 use crate::content::{Content, Kind};
 use crate::state::{Delivery, Dialog, Me, ServerPqStatus, Ui};
@@ -1785,11 +1787,55 @@ fn update_required_banner_handles_unimplemented_and_normalizes_reason() {
     assert!(ui.update_required.get_untracked().is_none());
 
     // Non-Unimplemented errors do not trigger the update banner.
-    engine.check_protocol_error(&session::Error::from(ErrorKind::Server));
+    engine.check_protocol_error(
+        ProtocolRpcScope::CoreV2,
+        &session::Error::from(ErrorKind::Server),
+    );
     assert!(ui.update_required.get_untracked().is_none());
 
-    // Unimplemented triggers the update banner, toast notice, and single activity log entry.
-    engine.check_protocol_error(&session::Error::from(ErrorKind::Unimplemented));
+    // Unconfirmed / ambiguous Unimplemented does not trigger the update banner.
+    engine.check_protocol_error(
+        ProtocolRpcScope::CoreV2,
+        &session::Error::from(protocol::Error::ambiguous_response(
+            protocol::ErrorKind::Unimplemented,
+            "ambiguous",
+        )),
+    );
+    assert!(ui.update_required.get_untracked().is_none());
+
+    // Confirmed Unimplemented on attachment RPCs (e.g. HTTP 404 on /attachment.v1.*) must NOT
+    // trigger the global update banner or slow foreground polling.
+    struct NotFound404;
+    impl LocalPost for NotFound404 {
+        async fn post(&self, _path: &str, _body: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
+            Ok((404, b"not found".to_vec()))
+        }
+    }
+    futures::executor::block_on(async {
+        let client = Client::new(ConnectClient::new(NotFound404));
+        let err = client
+            .start_upload(&ConnectClient::new(NotFound404), 16)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unimplemented);
+        assert!(err.is_server_refusal());
+        assert!(!should_require_update_for_rpc(
+            ProtocolRpcScope::Attachment,
+            &err
+        ));
+        engine.check_protocol_error(ProtocolRpcScope::Attachment, &err);
+        assert!(ui.update_required.get_untracked().is_none());
+    });
+
+    // Confirmed Unimplemented on core handshake.v2 / mailbox.v2 triggers the update banner,
+    // toast notice, and a single activity log entry.
+    let core_unimpl =
+        session::Error::from(protocol::Error::from(protocol::ErrorKind::Unimplemented));
+    assert!(should_require_update_for_rpc(
+        ProtocolRpcScope::CoreV2,
+        &core_unimpl
+    ));
+    engine.check_protocol_error(ProtocolRpcScope::CoreV2, &core_unimpl);
     assert!(
         ui.update_required
             .get_untracked()
@@ -1802,5 +1848,136 @@ fn update_required_banner_handles_unimplemented_and_normalizes_reason() {
     assert_eq!(
         ui.update_required.get_untracked().as_deref(),
         Some("Please refresh to continue.")
+    );
+}
+
+#[test]
+fn unsupported_suite_initial_leaves_inbox_id_unacknowledged() {
+    assert!(!should_ack_initial_error(ErrorKind::UnsupportedSuite));
+    for permanent in [
+        ErrorKind::InvalidInitialMessage,
+        ErrorKind::InvalidKeys,
+        ErrorKind::UnexpectedPeer,
+        ErrorKind::PqRequired,
+        ErrorKind::DowngradeDetected,
+    ] {
+        assert!(should_ack_initial_error(permanent));
+    }
+
+    let engine = Engine::new(Ui::new());
+    let (mut inner, peer) = unlocked_client();
+
+    // Permanently invalid classical initial IS staged for acknowledgement.
+    let bogus_classical =
+        Incoming::try_from(&WireInitialMessageV2::from(&legacy_wire_initial(9))).unwrap();
+    let mut batch = InitialBatch::default();
+    engine.process_inbox_messages(
+        &mut inner,
+        Inbox {
+            messages: vec![(peer, 41, bogus_classical)],
+            malformed_ids: vec![],
+        },
+        None,
+        &mut batch,
+    );
+    assert_eq!(inner.state.pending_inbox_acks, vec![41]);
+
+    // In a classical-only build (no ML-KEM suites compiled in), a queued PQ initial returns
+    // `ErrorKind::UnsupportedSuite` and MUST stay unacknowledged in `pending_inbox_acks`.
+    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+    {
+        inner.state.pending_inbox_acks.clear();
+        let pq_wire = WireInitialMessageV2 {
+            id: 77,
+            version: 2,
+            identity_key: Bytes::copy_from_slice(&peer),
+            ephemeral_key: Bytes::from_static(&[0x55; 32]),
+            signed_prekey: Bytes::from_static(&[0x66; 32]),
+            one_time_prekey: None,
+            first_message: Some(Default::default()),
+            pq_suite: 1,
+            pq_last_resort: true,
+            pq_prekey_id: Bytes::from_static(&[0x77; 32]),
+            pq_ciphertext: Bytes::from(vec![0x88; 1568]),
+            manifest_digest: Bytes::new(),
+        };
+        let pq_initial = Incoming::try_from(&pq_wire).unwrap();
+        let mut pq_batch = InitialBatch::default();
+        engine.process_inbox_messages(
+            &mut inner,
+            Inbox {
+                messages: vec![(peer, 77, pq_initial)],
+                malformed_ids: vec![],
+            },
+            None,
+            &mut pq_batch,
+        );
+        assert!(
+            inner.state.pending_inbox_acks.is_empty(),
+            "UnsupportedSuite PQ initial must NOT be staged for server ack/deletion"
+        );
+    }
+}
+
+#[test]
+fn legacy_farewell_without_client_message_id_derives_deterministic_id() {
+    let encrypted = party::EncryptedMessage {
+        header: Bytes::from_static(b"ratchet-header"),
+        content: Bytes::from_static(b"encrypted-farewell-body"),
+    };
+    let expected_id = session::Sealed::client_message_id_for(&encrypted);
+    assert_eq!(expected_id.len(), 16);
+
+    let legacy_farewell = Farewell {
+        push: Some(session::protocol::mailbox::PushRequest {
+            sender: Bytes::from_static(&[0x11; 32]),
+            recipient: Bytes::from_static(&[0x22; 32]),
+            message: Some(encrypted.clone()),
+            initial_message: None,
+            delivery_hash: Bytes::from_static(&[0x33; 32]),
+        }),
+        client_message_id: vec![],
+        push_v2: vec![],
+    };
+
+    let first = farewell_push_v2_request(&legacy_farewell);
+    let retry = farewell_push_v2_request(&legacy_farewell);
+    assert_eq!(first.client_message_id.as_ref(), &expected_id);
+    assert_eq!(
+        first, retry,
+        "retries must derive identical client_message_id"
+    );
+
+    // Existing explicit 16-byte client_message_id is preserved verbatim.
+    let explicit_farewell = Farewell {
+        client_message_id: vec![0xAB; 16],
+        ..legacy_farewell.clone()
+    };
+    assert_eq!(
+        farewell_push_v2_request(&explicit_farewell)
+            .client_message_id
+            .as_ref(),
+        &[0xAB; 16]
+    );
+
+    // A push_v2 farewell with empty client_message_id also backfills the deterministic ID.
+    let v2_without_cid = PushV2Request {
+        sender: Bytes::from_static(&[0x11; 32]),
+        recipient: Bytes::from_static(&[0x22; 32]),
+        message: Some(encrypted),
+        initial_message: None,
+        delivery_hash: Bytes::new(),
+        client_message_id: Bytes::new(),
+    };
+    let v2_farewell = Farewell {
+        push: None,
+        client_message_id: vec![],
+        push_v2: v2_without_cid.encode_to_vec(),
+    };
+    assert_eq!(
+        farewell_push_v2_request(&v2_farewell)
+            .client_message_id
+            .as_ref(),
+        &expected_id
     );
 }

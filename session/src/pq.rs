@@ -882,13 +882,14 @@ mod v2 {
         /// Accept an inbound v1 or v2 initial message from `peer`, applying local PQ and
         /// inbound classical quarantine policies.
         ///
-        /// **Two-phase ack rule**: this method is purely local and has no transient errors — any
-        /// `Err` (`InvalidInitialMessage`, `InvalidKeys`, `UnexpectedPeer`, `PqRequired`,
-        /// `UnsupportedSuite`, `DowngradeDetected`, `MalformedState`, etc.) is permanent for that
-        /// inbox entry. In a manual `list_initial_messages_v2` -> `accept_initial_v2` -> persist
-        /// -> `ack_initial_messages_v2` loop, callers MUST acknowledge every processed `msg.id`
-        /// (both `Ok` and `Err` outcomes) after persisting state so unaccepted/malformed entries
-        /// cannot permanently fill the inbox.
+        /// **Two-phase ack rule**: this method is purely local — permanent failures
+        /// (`InvalidInitialMessage`, `InvalidKeys`, `UnexpectedPeer`, `PqRequired`,
+        /// `DowngradeDetected`, `MalformedState`, etc.) should be acknowledged in a manual
+        /// `list_initial_messages_v2` -> `accept_initial_v2` -> persist -> `ack_initial_messages_v2`
+        /// loop so unaccepted/malformed entries cannot permanently fill the inbox. By contrast,
+        /// [`ErrorKind::UnsupportedSuite`] (e.g. a classical-only or single-suite build seeing a
+        /// queued PQ initial message for a suite it cannot decrypt) MUST NOT be acknowledged so the
+        /// encrypted initial remains queued on the server until a capable build processes it.
         ///
         /// - **PQXDH (version 2)**: authenticates the sender first via `accept_pq` + `first_message`
         ///   AEAD decryption (supporting both PQ-ratchet and classical-ratchet PQXDH sessions
@@ -1310,10 +1311,11 @@ mod v2 {
         /// Explicitly acknowledge and delete pending inbox initial messages by their stable
         /// server-assigned IDs (call ONLY after persisting accepted sessions locally).
         ///
-        /// Include EVERY listed ID whose local `accept_initial_v2` finished — both accepted /
-        /// quarantined AND permanently rejected IDs (such as `InvalidKeys`, `InvalidInitialMessage`,
-        /// `PqRequired`, `UnsupportedSuite`, `DowngradeDetected`, or `malformed_ids`) — so
-        /// invalid entries cannot permanently clog the inbox.
+        /// Include EVERY listed ID whose local `accept_initial_v2` finished permanently — both
+        /// accepted / quarantined AND permanent rejection IDs (such as `InvalidKeys`,
+        /// `InvalidInitialMessage`, `PqRequired`, `DowngradeDetected`, or `malformed_ids`) — so
+        /// invalid entries cannot permanently clog the inbox. Omit IDs that returned
+        /// [`ErrorKind::UnsupportedSuite`] so a capable build can decrypt them later.
         pub async fn ack_initial_messages_v2(
             &mut self,
             audience: &str,
@@ -1378,6 +1380,7 @@ mod v2 {
                 vec![]
             };
 
+            let mut server_pq_disabled_fallback = false;
             let response = match self
                 .handshake
                 .claim_bundle(ClaimBundleRequest {
@@ -1389,6 +1392,38 @@ mod v2 {
                 Ok(resp) => resp,
                 Err(e) if unimplemented_refusal(&e) && strict_pq => {
                     return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
+                }
+                Err(e) if unimplemented_refusal(&e) && local_pq_enabled => {
+                    // When the relay rolled back to `PQ_ENABLED="false"` while `peer`'s stored
+                    // manifest still advertises PQ, `ClaimBundle` with non-empty `preferred_suites`
+                    // returns `Unimplemented` before popping an OPK. Verify `GetServerInfo` to
+                    // distinguish a genuine PQ-off v2 relay from a server lacking v2, enforce
+                    // existing PQ pins, prompt for explicit classical approval if unapproved, and
+                    // retry with empty `preferred_suites` once explicitly approved.
+                    match self.check_server_info(audience).await {
+                        Ok(info) if !info.pq_enabled => {
+                            if peer_state.pq_pinned {
+                                return Err(ErrorKind::DowngradeDetected.into());
+                            }
+                            if !peer_state.allow_classical_exception {
+                                return Err(ErrorKind::ClassicalApprovalRequired {
+                                    peer_signed_off: false,
+                                }
+                                .into());
+                            }
+                            server_pq_disabled_fallback = true;
+                            self.handshake
+                                .claim_bundle(ClaimBundleRequest {
+                                    identity_key: Bytes::copy_from_slice(peer),
+                                    preferred_suites: vec![],
+                                })
+                                .await?
+                        }
+                        Err(info_err) if info_err.kind() == ErrorKind::DowngradeDetected => {
+                            return Err(info_err);
+                        }
+                        Ok(_) | Err(_) => return Err(e.into()),
+                    }
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -1432,7 +1467,7 @@ mod v2 {
                             peer_state.pinned_manifest_seq.max(manifest.manifest_seq);
 
                         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                        if local_pq_enabled {
+                        if local_pq_enabled && !server_pq_disabled_fallback {
                             return self.build_pq_initiate_v2(
                                 peer,
                                 updated_peer_state,
@@ -1443,8 +1478,12 @@ mod v2 {
                                 mailbox,
                             );
                         }
+                        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                        let _ = server_pq_disabled_fallback;
 
-                        // Local PQ is OFF (or classical-only build) while peer has PQ ON.
+                        // Local PQ is OFF (or classical-only build), or the server rolled back to
+                        // `PQ_ENABLED="false"` with explicit classical approval while the peer has
+                        // non-strict PQ ON.
                         if manifest.strict_pq {
                             return Err(ErrorKind::PqRequired.into());
                         }
@@ -1828,15 +1867,18 @@ mod v2 {
                     continue;
                 }
                 let peer_state = peer_state_for(&msg.sender);
-                // `accept_initial_v2` is purely local with no transient errors: always acknowledge
-                // every processed inbox ID so permanent failures (e.g. canonical low-order sender
-                // `InvalidKeys`, `UnsupportedSuite`, `InvalidInitialMessage`, `PqRequired`,
-                // `DowngradeDetected`, etc.) cannot permanently DoS the inbox.
-                ack_ids.push(msg.id);
-                if let Ok(outcome) =
-                    self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone())
-                {
-                    outcomes.push((msg.sender, outcome));
+                // `accept_initial_v2` is purely local: acknowledge accepted, quarantined, and
+                // permanently rejected IDs so invalid entries cannot DoS the inbox, but leave
+                // `UnsupportedSuite` queued on the server so a capable build can decrypt it later.
+                match self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone()) {
+                    Ok(outcome) => {
+                        ack_ids.push(msg.id);
+                        outcomes.push((msg.sender, outcome));
+                    }
+                    Err(e) if e.kind() == ErrorKind::UnsupportedSuite => {}
+                    Err(_) => {
+                        ack_ids.push(msg.id);
+                    }
                 }
             }
             let mut result = ListAndAcceptOutcome {

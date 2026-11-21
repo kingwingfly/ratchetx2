@@ -1,7 +1,10 @@
 //! Durable outgoing messages, delivery updates and session replacement recovery.
 
 use super::contact::{forget_told, keep_last};
-use super::{Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, origin, records, same_server};
+use super::{
+    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ProtocolRpcScope, origin, records,
+    same_server, should_require_update_for_rpc,
+};
 use crate::content::{Content, Events, Kind, stamp};
 use crate::state::{Delivery, MessageView, Step, Ui};
 use crate::util::{describe, now, short};
@@ -151,7 +154,7 @@ impl Engine {
                     (Step::Refused, 0)
                 }
                 Err(e) => {
-                    self.check_protocol_error(&e);
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                     result = Err(describe(&e));
                     break;
                 }
@@ -296,7 +299,7 @@ impl Engine {
                 return Ok(false);
             }
             Err(e) => {
-                self.check_protocol_error(&e);
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 return Err(describe(&e));
             }
         }
@@ -480,7 +483,7 @@ impl Inner {
                 Err(e) => {
                     let kind = e.kind();
                     self.roll_back(peer, snapshot)?;
-                    if kind == ErrorKind::Unimplemented && !local_pq {
+                    if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !local_pq {
                         return Ok(SealOutcome::UpdateRequired(describe(&e)));
                     }
                     let paused = match kind {

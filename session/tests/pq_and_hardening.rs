@@ -1411,12 +1411,22 @@ mod pq_e2e {
                     ambiguous()
                 }
             };
-            let calls = RpcErrors::new([
-                ("claim_bundle", failure()),
-                ("list_initial_messages", failure()),
-                ("push_v2", failure()),
-                ("fetch_signed", failure()),
-            ]);
+            let calls = if !strict && confirmed {
+                RpcErrors::new([
+                    ("claim_bundle", failure()),
+                    ("get_server_info", failure()),
+                    ("list_initial_messages", failure()),
+                    ("push_v2", failure()),
+                    ("fetch_signed", failure()),
+                ])
+            } else {
+                RpcErrors::new([
+                    ("claim_bundle", failure()),
+                    ("list_initial_messages", failure()),
+                    ("push_v2", failure()),
+                    ("fetch_signed", failure()),
+                ])
+            };
             let config = PqConfig {
                 strict_pq: strict,
                 ..Default::default()
@@ -4306,6 +4316,227 @@ mod pq_e2e {
     }
 
     #[tokio::test]
+    async fn pq_disabled_rollback_allows_explicitly_approved_classical_chat_and_enforces_pins() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use storage::LocalPqHandshakeStore as _;
+
+        #[derive(Debug, Clone)]
+        struct ToggleableV2Handshake {
+            pq_on: Arc<HandshakeV2Server<SharedStore>>,
+            pq_off: Arc<HandshakeV2Server<SharedStore>>,
+            enabled: Arc<AtomicBool>,
+        }
+
+        impl ToggleableV2Handshake {
+            fn current(&self) -> &HandshakeV2Server<SharedStore> {
+                if self.enabled.load(Ordering::Relaxed) {
+                    &self.pq_on
+                } else {
+                    &self.pq_off
+                }
+            }
+        }
+
+        impl LocalHandshakeV2 for ToggleableV2Handshake {
+            async fn get_server_info(
+                &self,
+                r: GetServerInfoRequest,
+            ) -> protocol::Result<GetServerInfoResponse> {
+                self.current().get_server_info(r).await
+            }
+            async fn publish_v2(&self, r: PublishV2Request) -> protocol::Result<PublishV2Response> {
+                self.current().publish_v2(r).await
+            }
+            async fn refill_prekeys(
+                &self,
+                r: RefillPrekeysRequest,
+            ) -> protocol::Result<RefillPrekeysResponse> {
+                self.current().refill_prekeys(r).await
+            }
+            async fn get_manifest(
+                &self,
+                r: GetManifestRequest,
+            ) -> protocol::Result<GetManifestResponse> {
+                self.current().get_manifest(r).await
+            }
+            async fn claim_bundle(
+                &self,
+                r: ClaimBundleRequest,
+            ) -> protocol::Result<ClaimBundleResponse> {
+                self.current().claim_bundle(r).await
+            }
+            async fn send_initial_v2(
+                &self,
+                r: SendInitialV2Request,
+            ) -> protocol::Result<SendInitialV2Response> {
+                self.current().send_initial_v2(r).await
+            }
+            async fn list_initial_messages(
+                &self,
+                r: ListInitialMessagesRequest,
+            ) -> protocol::Result<ListInitialMessagesResponse> {
+                self.current().list_initial_messages(r).await
+            }
+            async fn ack_initial_messages(
+                &self,
+                r: AckInitialMessagesRequest,
+            ) -> protocol::Result<AckInitialMessagesResponse> {
+                self.current().ack_initial_messages(r).await
+            }
+        }
+
+        let store = SharedStore::default();
+        let on_info = ServerInfoConfig::new(AUDIENCE);
+        let mut off_info = ServerInfoConfig::new(AUDIENCE);
+        off_info.pq_enabled = false;
+        off_info.supported_suites.clear();
+        off_info.pq_ratchet_supported = false;
+
+        let enabled = Arc::new(AtomicBool::new(true));
+        let hs = ToggleableV2Handshake {
+            pq_on: Arc::new(HandshakeV2Server::new(store.clone(), on_info)),
+            pq_off: Arc::new(HandshakeV2Server::new(store.clone(), off_info)),
+            enabled: enabled.clone(),
+        };
+        let mb = DualMailbox::new(store.clone(), AUDIENCE);
+
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs.clone());
+        let mut carol = Client::new(hs.clone())
+            .with_pq_config(PqConfig {
+                strict_pq: true,
+                ..PqConfig::default()
+            })
+            .unwrap();
+
+        // 1. Bob (non-strict PQ) and Carol (strict PQ) publish PQ-ON manifests while PQ is enabled.
+        bob.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+        carol.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+
+        // 2. Operator rolls back relay to PQ_ENABLED="false"; Bob and Carol stay offline with
+        //    their PQ-ON manifests still stored on the relay.
+        enabled.store(false, Ordering::Relaxed);
+
+        // 3. Unapproved PQ-capable Alice gets ClassicalApprovalRequired (NOT raw Unimplemented)
+        //    and Bob's classical OPKs are NOT popped on rejection.
+        let opks_before = store
+            .pq_snapshot(&bob.identity_key())
+            .await
+            .unwrap()
+            .classical_one_time_count;
+        let err = alice
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi bob",
+                mb.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::ClassicalApprovalRequired {
+                peer_signed_off: false
+            }
+        );
+        assert_eq!(
+            store
+                .pq_snapshot(&bob.identity_key())
+                .await
+                .unwrap()
+                .classical_one_time_count,
+            opks_before,
+            "unapproved initiation must not consume Bob's OPK"
+        );
+
+        // 4. Local strict_pq still hard-fails with PqRequired.
+        let mut strict_alice = Client::new(hs.clone())
+            .with_pq_config(PqConfig {
+                strict_pq: true,
+                ..PqConfig::default()
+            })
+            .unwrap();
+        let mut approved = PeerPqState::default();
+        approved.approve_classical_exception();
+        let err = strict_alice
+            .prepare_initiate_v2(AUDIENCE, &bob.identity_key(), &approved, b"hi", mb.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PqRequired);
+
+        // 5. An existing PQ pin is still enforced (DowngradeDetected even with classical exception).
+        let mut pinned = PeerPqState::default();
+        pinned.pin_peer_pq();
+        pinned.approve_classical_exception();
+        let err = alice
+            .prepare_initiate_v2(AUDIENCE, &bob.identity_key(), &pinned, b"hi", mb.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DowngradeDetected);
+
+        // 6. A peer whose signed manifest requires strict_pq STILL fails with PqRequired even after
+        //    Alice explicitly approves classical fallback.
+        let err = alice
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &carol.identity_key(),
+                &approved,
+                b"hi carol",
+                mb.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PqRequired);
+
+        // 7. Explicitly approved Alice succeeds cleanly against non-strict Bob during PQ rollback!
+        let prepared = alice
+            .prepare_initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &approved,
+                b"classical-during-rollback",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(!prepared.security.is_pq);
+        alice
+            .send_prepared_initiate_v2(&prepared.request)
+            .await
+            .unwrap();
+        let mut alice_session = prepared.session;
+        alice_session.send_v2(b"follow-up").await.unwrap();
+
+        // Bob drains the classical initial (quarantined while Bob's local PQ is ON) and decrypts.
+        let accepted = bob
+            .list_and_accept_v2(AUDIENCE, 10, mb.clone(), |_| {
+                let mut ps = PeerPqState::default();
+                ps.approve_classical_exception();
+                ps
+            })
+            .await
+            .unwrap();
+        assert_eq!(accepted.outcomes.len(), 1);
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                mut session,
+                first_message,
+                security,
+            },
+        ) = accepted.outcomes.into_iter().next().unwrap()
+        else {
+            panic!("expected classical session accepted with explicit exception");
+        };
+        assert!(!security.is_pq);
+        assert_eq!(first_message, b"classical-during-rollback");
+        let msgs = session.receive_v2(&bob, AUDIENCE).await.unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.as_ref().unwrap(), b"follow-up");
+    }
+
+    #[tokio::test]
     async fn v2_infinite_expired_pages_relay_terminates_cleanly() {
         #[derive(Debug, Clone)]
         struct InfiniteExpiredV2Mailbox {
@@ -4999,7 +5230,7 @@ mod v2_wire_unconditional {
         let store = SharedStore::default();
         let hs = V2OnlyHandshake::new(store, AUDIENCE);
         let alice = Client::new(hs.clone());
-        let mut bob = Client::new(hs);
+        let mut bob = Client::new(hs.clone());
         bob.publish_v2(AUDIENCE, 2, 0).await.unwrap();
 
         let wire = protocol::handshake_v2::InitialMessageV2 {
@@ -5022,5 +5253,25 @@ mod v2_wire_unconditional {
             .accept_initial_v2(&alice.identity_key(), &PeerPqState::default(), &parsed, ())
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::UnsupportedSuite);
+
+        // Queue that PQ initial on the server and verify `list_and_accept_v2` leaves it
+        // unacknowledged (still queued) on a classical-only build rather than deleting it!
+        let queued = hs
+            .send_initial_v2(protocol::handshake_v2::SendInitialV2Request {
+                recipient: Bytes::copy_from_slice(&bob.identity_key()),
+                message: Some(wire),
+            })
+            .await
+            .unwrap();
+        assert!(queued.id > 0);
+        let outcome = bob
+            .list_and_accept_v2(AUDIENCE, 10, (), |_| PeerPqState::default())
+            .await
+            .unwrap();
+        assert!(outcome.outcomes.is_empty());
+        assert!(outcome.ack_error.is_none());
+        let still_queued = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        assert_eq!(still_queued.messages.len(), 1);
+        assert_eq!(still_queued.messages[0].id, queued.id);
     }
 }

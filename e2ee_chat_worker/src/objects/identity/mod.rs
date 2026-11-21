@@ -27,7 +27,10 @@ use super::{
     checked_integer, decode, has_table,
 };
 use rows::{ExpiredObjectRow, OldestRow};
-pub use ws::{HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY};
+pub use ws::{
+    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE,
+    HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS,
+};
 
 /// Maximum expired R2 objects deleted in a single alarm tick.
 const ALARM_R2_BATCH: u64 = 500;
@@ -226,6 +229,13 @@ impl Identity {
     /// storage alarm scheduling), preserving atomicity.
     async fn serve(&self, call: IdentityCall) -> Result<Response> {
         match call {
+            IdentityCall::RetiredPublishV1
+            | IdentityCall::RetiredTakeBundleV1
+            | IdentityCall::RetiredAddInitialMessageV1
+            | IdentityCall::RetiredTakeInitialMessagesV1
+            | IdentityCall::RetiredAppendV1 => {
+                Response::error("legacy v1 IdentityCall is retired", 501)
+            }
             IdentityCall::Read {
                 sender,
                 after,
