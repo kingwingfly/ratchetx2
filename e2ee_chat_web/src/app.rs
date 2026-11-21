@@ -1715,7 +1715,7 @@ fn take_secret(signal: RwSignal<String>) -> Zeroizing<String> {
 
 /// Zeroize and clear a secret `RwSignal<String>` in place.
 fn clear_secret(signal: RwSignal<String>) {
-    signal.update(|value| value.zeroize());
+    let _ = signal.try_update(|value| value.zeroize());
 }
 
 /// Sign in to the server with its password, which storing files there takes, as they cost it
@@ -1723,6 +1723,7 @@ fn clear_secret(signal: RwSignal<String>) {
 #[component]
 fn SignInDialog() -> impl IntoView {
     let password = RwSignal::new(String::new());
+    on_cleanup(move || clear_secret(password));
     let progress = Progress::new();
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
@@ -1825,6 +1826,10 @@ fn CreateVault() -> impl IntoView {
     let name = RwSignal::new(String::new());
     let passphrase = RwSignal::new(String::new());
     let repeat = RwSignal::new(String::new());
+    on_cleanup(move || {
+        clear_secret(passphrase);
+        clear_secret(repeat);
+    });
     let pq_compiled = !PqConfig::compiled_suites().is_empty();
     let pq_enabled = RwSignal::new(pq_compiled);
     let invited = invited_server();
@@ -1925,6 +1930,7 @@ fn CreateVault() -> impl IntoView {
 #[component]
 fn UnlockVault() -> impl IntoView {
     let passphrase = RwSignal::new(String::new());
+    on_cleanup(move || clear_secret(passphrase));
     let progress = Progress::new();
     let confirm_reset = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
@@ -2241,11 +2247,9 @@ fn Identity() -> impl IntoView {
     let strict_pq = RwSignal::new(pq_compiled && initial_pq.pq_enabled && initial_pq.strict_pq);
     // Saving, publishing or signing out, which its buttons wait for.
     let busy = RwSignal::new(false);
-    let initial_pq_for_submit = initial_pq.clone();
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         let engine = engine();
-        let old_pq = initial_pq_for_submit.clone();
         let next_pq = PqConfig {
             pq_enabled: pq_compiled && pq_enabled.get_untracked(),
             preferred_suite: preferred_suite.get_untracked(),
@@ -2255,8 +2259,15 @@ fn Identity() -> impl IntoView {
         let next_name = name.get_untracked();
         act_while(busy, async move {
             engine.set_name(next_name).await?;
-            let pq_changed = pq_compiled && next_pq != old_pq;
-            if pq_changed {
+            let pq_changed = pq_compiled
+                && engine
+                    .ui()
+                    .me
+                    .with_untracked(|me| me.as_ref().is_some_and(|me| me.pq_config != next_pq));
+            if pq_compiled {
+                // Always invoke `set_pq_config` when PQ is compiled: it compares against live
+                // vault state (avoiding stale mount-time snapshots after a failed publish) and
+                // no-ops cleanly when `previous == config && !needs_publish`.
                 engine.set_pq_config(next_pq).await?;
             }
             engine.ui().dialog.set(None);
@@ -3396,7 +3407,7 @@ fn select(element: &web_sys::Element, selector: &str) -> Vec<web_sys::Element> {
 /// highlight its code blocks, `pre > code[data-lang]`, and draw its Mermaid ones, as images.
 /// Blocks that fail stay as they are, saying why in `data-error`.
 fn enhance(element: &web_sys::Element) {
-    for link in select(element, "a[href^='http']") {
+    for link in select(element, "a[href^='http' i]") {
         let _ = link.set_attribute("target", "_blank");
         let _ = link.set_attribute("rel", "noopener noreferrer");
     }
@@ -3798,6 +3809,7 @@ async fn draw_page(pdf: workers::Pdf, canvas: &HtmlCanvasElement) -> Result<(), 
 }
 
 fn table_view(table: preview::Table) -> AnyView {
+    let notice = table.notice();
     let mut rows = table.rows.into_iter();
     let header = rows.next().unwrap_or_default();
     view! {
@@ -3816,15 +3828,11 @@ fn table_view(table: preview::Table) -> AnyView {
                         .collect_view()}
                 </tbody>
             </table>
-            {table
-                .more
-                .then(|| {
-                    view! {
-                        <p class="preview-note">
-                            {format!("Only the first {} rows show.", preview::ROWS_MAX)}
-                        </p>
-                    }
-                })}
+            {notice.map(|notice| {
+                view! {
+                    <p class="preview-note">{notice}</p>
+                }
+            })}
         </div>
     }
     .into_any()

@@ -131,6 +131,7 @@ pub struct PreparedPublish {
     /// The signed v1 publish request to transmit.
     pub request: PublishRequest,
     extended: bool,
+    was_publishing: bool,
     one_time_prekeys: Vec<PublicKey>,
 }
 
@@ -532,7 +533,8 @@ impl<H> Client<H> {
     /// [`Client::commit_publish`] on success or [`Client::rollback_publish_on_refusal`] on
     /// [`ErrorKind::SignInRequired`].
     pub fn prepare_publish(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
-        let extended = self.state.publishing;
+        let was_publishing = self.state.publishing;
+        let extended = was_publishing;
         let published = if extended {
             self.state
                 .prekeys
@@ -548,6 +550,7 @@ impl<H> Client<H> {
         Ok(PreparedPublish {
             request,
             extended,
+            was_publishing,
             one_time_prekeys: published.one_time_prekeys,
         })
     }
@@ -556,6 +559,7 @@ impl<H> Client<H> {
     /// current generation WITHOUT rotating the signed prekey (generates a generation if none
     /// exists yet).
     pub fn prepare_extend_keys(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
+        let was_publishing = self.state.publishing;
         let had_gen = self.state.prekeys.generation_count() > 0;
         let published = self
             .state
@@ -567,6 +571,7 @@ impl<H> Client<H> {
         Ok(PreparedPublish {
             request,
             extended: had_gen,
+            was_publishing,
             one_time_prekeys: published.one_time_prekeys,
         })
     }
@@ -577,10 +582,12 @@ impl<H> Client<H> {
     }
 
     /// Retract newly added one-time prekeys from a prepared classical publish that was refused
-    /// before storage (e.g. [`ErrorKind::SignInRequired`]).
+    /// before storage (e.g. [`ErrorKind::SignInRequired`], [`ErrorKind::LimitExceeded`], or
+    /// [`ErrorKind::Protocol`]).
     pub fn rollback_publish_on_refusal(&mut self, prepared: PreparedPublish) {
         if prepared.extended {
             self.state.prekeys.retract(&prepared.one_time_prekeys);
+            self.state.publishing = prepared.was_publishing;
         }
     }
 
@@ -654,7 +661,12 @@ impl<H: LocalHandshake> Client<H> {
                 self.commit_publish(prepared);
                 Ok(())
             }
-            Err(e) if e.kind() == ErrorKind::SignInRequired => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::SignInRequired | ErrorKind::LimitExceeded | ErrorKind::Protocol
+                ) =>
+            {
                 self.rollback_publish_on_refusal(prepared);
                 Err(e)
             }
@@ -1088,6 +1100,34 @@ pub(crate) enum LastAction {
     ReceivedEarlier,
 }
 
+/// Verify that a `Party`'s associated data binds the exact `(me, peer)` identity pair with length
+/// matching classical X3DH (64 bytes) or PQXDH (96 bytes).
+#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+fn check_party_identity_ad(
+    ad: &[u8],
+    me: &PublicKey,
+    peer: &PublicKey,
+    expected_pq: Option<bool>,
+) -> Result<()> {
+    let classical_len = 2 * xeddsa::PUBLIC_KEY_LENGTH;
+    let pq_len = x3dh::PQXDH_ASSOCIATED_DATA_LENGTH;
+    match expected_pq {
+        Some(true) if ad.len() != pq_len => return Err(ErrorKind::MalformedState.into()),
+        Some(false) if ad.len() != classical_len => {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        None if ad.len() != classical_len && ad.len() != pq_len => {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        _ => {}
+    }
+    let (first, second) = (&ad[..32], &ad[32..64]);
+    if !((first == me && second == peer) || (first == peer && second == me)) {
+        return Err(ErrorKind::MalformedState.into());
+    }
+    Ok(())
+}
+
 impl SessionState {
     /// The peer's identity key.
     pub fn peer(&self) -> &PublicKey {
@@ -1104,7 +1144,8 @@ impl SessionState {
         self.active.as_ref().map(|active| active.security)
     }
 
-    /// Validate canonical keys, bounded collections, integer bounds, and PQ metadata invariants.
+    /// Validate canonical keys, bounded collections, integer bounds, AD identity-pair bindings,
+    /// and PQ metadata invariants.
     #[cfg(any(feature = "prost", feature = "serde"))]
     fn validate(&self) -> Result<()> {
         if !xeddsa::is_canonical_public_key(&self.me)
@@ -1140,6 +1181,12 @@ impl SessionState {
             } else if active.security.suite.is_some() || active.security.pq_ratchet {
                 return Err(ErrorKind::MalformedState.into());
             }
+            check_party_identity_ad(
+                active.party.associated_data(),
+                &self.me,
+                &self.peer,
+                Some(active.security.is_pq),
+            )?;
             if active.security.pq_ratchet != active.party.is_pq_ratchet_active() {
                 return Err(ErrorKind::MalformedState.into());
             }
@@ -1149,6 +1196,9 @@ impl SessionState {
             {
                 return Err(ErrorKind::MalformedState.into());
             }
+        }
+        for earlier in &self.others {
+            check_party_identity_ad(earlier.party.associated_data(), &self.me, &self.peer, None)?;
         }
         Ok(())
     }
@@ -1226,6 +1276,12 @@ where
                 } else if suite.is_some() || pq_ratchet {
                     return Err(ErrorKind::MalformedState.into());
                 }
+                check_party_identity_ad(
+                    active.party.associated_data(),
+                    &self.me,
+                    &self.peer,
+                    Some(is_pq),
+                )?;
                 let party = rkyv::deserialize::<Party, rkyv::rancor::Error>(&active.party)
                     .map_err(|_| ErrorKind::MalformedState)?;
                 if pq_ratchet != party.is_pq_ratchet_active() {
@@ -1237,6 +1293,14 @@ where
                 {
                     return Err(ErrorKind::MalformedState.into());
                 }
+            }
+            for earlier in self.others.iter() {
+                check_party_identity_ad(
+                    earlier.party.associated_data(),
+                    &self.me,
+                    &self.peer,
+                    None,
+                )?;
             }
             Ok(())
         };
@@ -1440,33 +1504,6 @@ impl TryFrom<&proto::SessionState> for SessionState {
                 .map_err(|_| ErrorKind::MalformedState.into())
         }
 
-        /// Verify that `party`'s associated data binds the exact `(me, peer)` identity pair.
-        fn check_party_identity_ad(
-            party: &party::proto::Party,
-            me: &PublicKey,
-            peer: &PublicKey,
-            expected_pq: Option<bool>,
-        ) -> Result<()> {
-            let ad = &party.associated_data;
-            let classical_len = 2 * xeddsa::PUBLIC_KEY_LENGTH;
-            let pq_len = x3dh::PQXDH_ASSOCIATED_DATA_LENGTH;
-            match expected_pq {
-                Some(true) if ad.len() != pq_len => return Err(ErrorKind::MalformedState.into()),
-                Some(false) if ad.len() != classical_len => {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                None if ad.len() != classical_len && ad.len() != pq_len => {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                _ => {}
-            }
-            let (first, second) = (&ad[..32], &ad[32..64]);
-            if !((first == me && second == peer) || (first == peer && second == me)) {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            Ok(())
-        }
-
         if state.others.len() > KEPT_SESSIONS || state.delivered.len() > MAX_STORED_DELIVERED {
             return Err(ErrorKind::MalformedState.into());
         }
@@ -1480,7 +1517,12 @@ impl TryFrom<&proto::SessionState> for SessionState {
                     Some(sec) => SessionSecurity::try_from(sec)?,
                     None => SessionSecurity::classical(),
                 };
-                check_party_identity_ad(proto_party, &me, &peer, Some(security.is_pq))?;
+                check_party_identity_ad(
+                    &proto_party.associated_data,
+                    &me,
+                    &peer,
+                    Some(security.is_pq),
+                )?;
                 Some(Active {
                     party: Party::try_from(proto_party)?,
                     id: key(&state.id)?,
@@ -1527,7 +1569,7 @@ impl TryFrom<&proto::SessionState> for SessionState {
                 .iter()
                 .map(|earlier| {
                     let proto_party = earlier.party.as_ref().ok_or(ErrorKind::MalformedState)?;
-                    check_party_identity_ad(proto_party, &me, &peer, None)?;
+                    check_party_identity_ad(&proto_party.associated_data, &me, &peer, None)?;
                     Ok(Earlier {
                         party: Party::try_from(proto_party)?,
                         delivery_key: delivery_key(&earlier.delivery_key)?,
@@ -2096,13 +2138,6 @@ impl<M: LocalMailbox> Session<M> {
                 continue;
             };
             let decrypted = self.decrypt(message);
-            let mut initial_messages = mem::take(carried);
-            if let Some(initial_message) = attached(&envelope)
-                && initial_messages.len() < MAX_CARRIED_INITIALS
-                && !initial_messages.contains(&initial_message)
-            {
-                initial_messages.push(initial_message);
-            }
             let stalls = decrypted.as_ref().is_err_and(|e| {
                 !matches!(
                     e.kind(),
@@ -2111,6 +2146,13 @@ impl<M: LocalMailbox> Session<M> {
             }) && envelope.sequence > self.state.skip_through;
             if stalls {
                 self.state.stalled_through = last;
+                let mut initial_messages = mem::take(carried);
+                if let Some(initial_message) = attached(&envelope)
+                    && initial_messages.len() < MAX_CARRIED_INITIALS
+                    && !initial_messages.contains(&initial_message)
+                {
+                    initial_messages.push(initial_message);
+                }
                 // What still does not decrypt once they are accepted is skipped, the rest of
                 // the page with it: so each of its sessions is offered now.
                 for initial_message in envelopes
@@ -2131,6 +2173,10 @@ impl<M: LocalMailbox> Session<M> {
                 });
                 return Ok(Some(received));
             }
+            // Keep expired-envelope carried initials in `carried` so they always flush at page
+            // end via the trailing `Err(ErrorKind::Expired)` entry instead of being attached to
+            // `Ok`/`DuplicateMessage`/`EvictedMessage` entries.
+            let initial_messages = attached(&envelope).into_iter().collect();
             self.state.cursor = self.state.cursor.max(envelope.sequence);
             let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
             if let Ok((_, _, token)) = &decrypted {
@@ -3539,5 +3585,101 @@ mod test {
             SessionSecurity::pq(PqSuite::MlKem1024, true);
         let bad_sec = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
         assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_sec).is_err());
+        alice_session.state.active.as_mut().unwrap().security = SessionSecurity::classical();
+
+        // 6. SessionState: active or earlier party whose AD does not bind `(me, peer)` rejected!
+        let mut carol = Client::new(InProcessHandshake(&handshake));
+        let carol_session = carol
+            .initiate(&bob.identity_key(), b"carol", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+        let orig_peer = alice_session.state.peer;
+        alice_session.state.peer = carol.identity_key();
+        let bad_active_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_active_ad).is_err());
+        alice_session.state.peer = orig_peer;
+
+        // Tampered `others[0].party` AD (foreign Carol->Bob party inside Alice->Bob state) rejected!
+        alice_session
+            .state
+            .others
+            .push(Earlier::from(carol_session.state.active.unwrap()));
+        let bad_earlier_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_earlier_ad).is_err());
+        alice_session.state.others.clear();
+
+        // Wrong AD length on active party (32 bytes instead of 64/96) rejected!
+        let bad_ad_party = Party::new(
+            Ratchet::bob(
+                &SharedKeys::from_secret(&[7u8; 32]),
+                DhPrivateKey::from([8u8; 32]),
+            ),
+            vec![0xAA; 32],
+        );
+        alice_session.state.active.as_mut().unwrap().party = bad_ad_party;
+        let bad_len_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_len_ad).is_err());
+    }
+
+    #[cfg(feature = "serde")]
+    #[tokio::test]
+    async fn serde_validate_rejects_tampered_party_associated_data() {
+        let handshake = HandshakeServer::new(MemoryStore::default());
+        let mailbox = MailboxServer::new(MemoryStore::default());
+        let (alice, alice_session, bob, _bob_session) = talking(&handshake, &mailbox).await;
+        let mut carol = Client::new(InProcessHandshake(&handshake));
+        let carol_session = carol
+            .initiate(&bob.identity_key(), b"carol", InProcessMailbox(&mailbox))
+            .await
+            .unwrap();
+
+        let to_raw = |s: SessionState| RawSessionState {
+            active: s.active,
+            others: s.others,
+            me: s.me,
+            peer: s.peer,
+            cursor: s.cursor,
+            last: s.last,
+            direction_changes: s.direction_changes,
+            stalled_through: s.stalled_through,
+            skip_through: s.skip_through,
+            delivered: s.delivered,
+            peer_pq: s.peer_pq,
+            next_session_seq: s.next_session_seq,
+        };
+
+        // 1. Valid state passes serde TryFrom<RawSessionState>.
+        let valid_state = SessionState::try_from(to_raw(alice_session.state)).unwrap();
+        assert_eq!(valid_state.me, alice.identity_key());
+
+        // 2. Active party with mismatched peer identity in AD is rejected.
+        let mut wrong_peer_raw = to_raw(valid_state);
+        let orig_peer = wrong_peer_raw.peer;
+        wrong_peer_raw.peer = carol.identity_key();
+        let err = SessionState::try_from(wrong_peer_raw).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MalformedState);
+
+        // 3. Earlier (`others`) party from a different identity pair (Carol->Bob) is rejected.
+        let (alice2, alice2_session, _bob2, _bob2_session) = talking(&handshake, &mailbox).await;
+        let _ = (alice2, orig_peer);
+        let mut bad_others_raw = to_raw(alice2_session.state);
+        bad_others_raw
+            .others
+            .push(Earlier::from(carol_session.state.active.unwrap()));
+        let err = SessionState::try_from(bad_others_raw).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MalformedState);
+
+        // 4. Active party with wrong AD length (32 bytes) is rejected.
+        let (_a3, a3_session, _b3, _b3_session) = talking(&handshake, &mailbox).await;
+        let mut bad_len_raw = to_raw(a3_session.state);
+        bad_len_raw.active.as_mut().unwrap().party = Party::new(
+            Ratchet::bob(
+                &SharedKeys::from_secret(&[9u8; 32]),
+                DhPrivateKey::from([10u8; 32]),
+            ),
+            vec![0xBB; 32],
+        );
+        let err = SessionState::try_from(bad_len_raw).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::MalformedState);
     }
 }

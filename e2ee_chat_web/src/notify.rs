@@ -24,6 +24,8 @@ const PATH: &str = "/notifications";
 /// What keeps the socket open through idle proxies, answered by the Worker without waking it,
 /// and shows the Worker it is open still.
 const PING: &str = "ping";
+/// Text frame sent by the Worker immediately after verifying the first-frame `SubscribeRequest`.
+const AUTH_OK: &str = "ok";
 /// Milliseconds between pings, often enough for proxies that close idle connections.
 const PING_EVERY: i32 = 60_000;
 /// Maximum buffered notification events before coalescing into a resync (bounds memory under flood).
@@ -33,13 +35,19 @@ const MAX_NOTIFICATION_BYTES: usize = 1024;
 
 /// What happens on a subscription's socket.
 pub enum Event {
-    /// The socket opened and the signed first-frame `SubscribeRequest` was sent.
+    /// The socket opened and the server acknowledged the signed first-frame `SubscribeRequest`.
     Open,
     Notification(Notification),
     /// Some notifications were dropped due to backpressure; the caller should run a sync.
     Resync,
     /// The socket closed, or never opened, e.g. as the server sends no notifications.
     Closed,
+}
+
+/// Process a text WebSocket frame against `authenticated`, returning `true` only on the first
+/// `"ok"` auth acknowledgement (so subsequent `"ok"` frames or `"pong"` frames are ignored).
+fn handle_auth_text_frame(authenticated: &Cell<bool>, text: &str) -> bool {
+    text == AUTH_OK && !authenticated.replace(true)
 }
 
 /// A WebSocket subscribed to a client's notifications. Closed when dropped.
@@ -76,6 +84,7 @@ impl Subscription {
         let (sender, events) = mpsc::channel(MAX_PENDING_EVENTS);
         let sender = Rc::new(RefCell::new(Some(sender)));
         let overflow = Rc::new(Cell::new(false));
+        let authenticated = Rc::new(Cell::new(false));
 
         let on_open = {
             let sender = sender.clone();
@@ -86,18 +95,25 @@ impl Subscription {
                     if let Some(mut tx) = sender.borrow_mut().take() {
                         let _ = tx.try_send(Event::Closed);
                     }
-                    return;
                 }
-                if let Some(tx) = sender.borrow_mut().as_mut() {
-                    let _ = tx.try_send(Event::Open);
-                }
+                // Wait for the server's `"ok"` auth-ack text frame before emitting `Event::Open`,
+                // so first-frame auth failures (`1008`) never reset reconnect backoff.
             })
         };
         let on_message = {
             let sender = sender.clone();
             let overflow = overflow.clone();
+            let authenticated = authenticated.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                // Pongs come as text, notifications as binary frames.
+                // Auth ack (`"ok"`) and pongs come as text frames; notifications as binary frames.
+                if let Some(text) = event.data().as_string() {
+                    if handle_auth_text_frame(&authenticated, &text)
+                        && let Some(tx) = sender.borrow_mut().as_mut()
+                    {
+                        let _ = tx.try_send(Event::Open);
+                    }
+                    return;
+                }
                 let Ok(data) = event.data().dyn_into::<ArrayBuffer>() else {
                     return;
                 };
@@ -169,16 +185,17 @@ fn keep_alive(socket: WebSocket) {
     });
 }
 
-/// The WebSocket address of `server`: `ws` for `http`, `wss` for `https`.
+/// The WebSocket address of `server`: `ws` for `http`, `wss` for `https` (case-insensitive).
 fn socket_address(server: &str) -> String {
-    let server = server.trim_end_matches('/');
-    if let Some(rest) = server.strip_prefix("https://") {
-        format!("wss://{rest}")
-    } else if let Some(rest) = server.strip_prefix("http://") {
-        format!("ws://{rest}")
-    } else {
-        server.to_string()
+    let server = server.trim().trim_end_matches('/');
+    if let Some((scheme, rest)) = server.split_once("://") {
+        if scheme.eq_ignore_ascii_case("https") {
+            return format!("wss://{rest}");
+        } else if scheme.eq_ignore_ascii_case("http") {
+            return format!("ws://{rest}");
+        }
     }
+    server.to_string()
 }
 
 #[cfg(test)]
@@ -195,5 +212,39 @@ mod tests {
         );
         assert!(!url.contains("request="));
         assert!(subscription_url("https://chat.example.com", &[0u8; 31]).is_err());
+    }
+
+    #[test]
+    fn socket_address_matches_scheme_case_insensitively() {
+        assert_eq!(
+            socket_address("HTTPS://Chat.Example.COM/"),
+            "wss://Chat.Example.COM"
+        );
+        assert_eq!(
+            socket_address("HTTP://localhost:8787/"),
+            "ws://localhost:8787"
+        );
+        assert_eq!(
+            socket_address("HtTpS://[::1]:8443"),
+            "wss://[::1]:8443"
+        );
+        assert_eq!(
+            socket_address("wss://already.example/"),
+            "wss://already.example"
+        );
+    }
+
+    #[test]
+    fn auth_ok_text_frame_emits_open_once_and_ignores_pongs_and_repeats() {
+        let authenticated = Cell::new(false);
+        assert!(!handle_auth_text_frame(&authenticated, "pong"));
+        assert!(!authenticated.get());
+        assert!(!handle_auth_text_frame(&authenticated, "OK"));
+        assert!(!authenticated.get());
+        assert!(handle_auth_text_frame(&authenticated, "ok"));
+        assert!(authenticated.get());
+        // Subsequent "ok" or "pong" frames are ignored.
+        assert!(!handle_auth_text_frame(&authenticated, "ok"));
+        assert!(!handle_auth_text_frame(&authenticated, "pong"));
     }
 }

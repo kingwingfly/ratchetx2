@@ -15,7 +15,13 @@ port = 8080
 backend = "http://127.0.0.1:8787/handshake.v1.HandshakeService/"
 
 [[proxy]]
+backend = "http://127.0.0.1:8787/handshake.v2.HandshakeService/"
+
+[[proxy]]
 backend = "http://127.0.0.1:8787/mailbox.v1.MailboxService/"
+
+[[proxy]]
+backend = "http://127.0.0.1:8787/mailbox.v2.MailboxService/"
 
 [[proxy]]
 backend = "http://127.0.0.1:8787/attachment.v1.AttachmentService/"
