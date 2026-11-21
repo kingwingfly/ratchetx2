@@ -264,8 +264,8 @@ fn Sidebar() -> impl IntoView {
                 </div>
                 <button
                     class="btn icon small"
-                    title="Your key"
-                    aria-label="Your key"
+                    title="Your identity"
+                    aria-label="Your identity"
                     on:click=move |_| ui.dialog.set(Some(Dialog::Identity))
                 >
                     {icon(Icon::Key)}
