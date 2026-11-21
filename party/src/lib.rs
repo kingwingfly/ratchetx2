@@ -53,6 +53,11 @@ pub mod proto {
     }
 }
 
+#[cfg(all(
+    feature = "serde",
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+pub use party::LegacyPartyPqV1;
 pub use party::Party;
 #[cfg(feature = "serde")]
 pub use party::{LegacyPartyV0, LegacyPartyV1};

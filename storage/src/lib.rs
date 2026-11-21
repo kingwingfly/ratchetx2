@@ -31,9 +31,17 @@ pub const MAX_QUEUE_MESSAGES: usize = 2000;
 pub const MAX_QUEUE_BYTES: u64 = 64 << 20;
 
 /// An X25519 or XEdDSA public key.
-pub type PublicKey = [u8; xeddsa::PUBLIC_KEY_LENGTH];
+pub type PublicKey = [u8; 32];
 /// An XEdDSA signature.
-pub type Signature = [u8; xeddsa::SIGNATURE_LENGTH];
+pub type Signature = [u8; 64];
+
+// Check the storage wire widths against the crypto crate without requiring a random source
+// in a standalone storage backend.
+#[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
+const _: (PublicKey, Signature) = (
+    [0; xeddsa::PUBLIC_KEY_LENGTH],
+    [0; xeddsa::SIGNATURE_LENGTH],
+);
 
 /// A published prekey bundle, without its one-time prekeys.
 #[derive(Debug, Clone, PartialEq, Eq)]

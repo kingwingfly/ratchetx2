@@ -47,9 +47,11 @@ use xeddsa::XEdDSAPrivateKey;
 use xeddsa::XEdDSAPublicKey;
 use zeroize::Zeroizing;
 
-/// Upper bound on queued delivery tokens permitted when restoring saved session state.
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+/// Upper bound on queued delivery tokens in session state.
 const MAX_STORED_DELIVERED: usize = 4096;
+
+/// Request at most the default mailbox fetch limit per page.
+const MAX_RECEIVE_PAGE: u32 = 100;
 
 /// Maximum number of recent locally signed `CapabilityManifest` digests retained in `ClientState`.
 #[cfg(any(
@@ -694,7 +696,7 @@ impl<H: LocalHandshake> Client<H> {
                 self.commit_publish(prepared);
                 Ok(())
             }
-            Err(e) if e.kind() == ErrorKind::SignInRequired => {
+            Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::SignInRequired => {
                 self.rollback_publish_on_refusal(prepared);
                 Err(e)
             }
@@ -712,10 +714,11 @@ impl<H: LocalHandshake> Client<H> {
                 Ok(())
             }
             Err(e)
-                if matches!(
-                    e.kind(),
-                    ErrorKind::SignInRequired | ErrorKind::LimitExceeded | ErrorKind::Protocol
-                ) =>
+                if e.is_server_refusal()
+                    && matches!(
+                        e.kind(),
+                        ErrorKind::SignInRequired | ErrorKind::LimitExceeded | ErrorKind::Protocol
+                    ) =>
             {
                 self.rollback_publish_on_refusal(prepared);
                 Err(e)
@@ -937,9 +940,18 @@ impl<H: LocalHandshake> Client<H> {
         )
     }
 
-    /// Sign a notification subscription bound to the configured relay audience using its clock.
+    /// Sign a notification subscription for a configured relay URL or host using its clock.
+    /// Use [`Self::subscription_for_canonical_audience`] with a previously parsed audience.
     pub fn subscription_for_audience(&self, audience: &str) -> Result<SubscribeRequest> {
-        Ok(SubscribeRequest::sign_for_audience(
+        self.subscription_for_canonical_audience(&protocol::NormalizedAudience::parse(audience)?)
+    }
+
+    /// Sign a notification subscription for an already normalized relay audience.
+    pub fn subscription_for_canonical_audience(
+        &self,
+        audience: &protocol::NormalizedAudience,
+    ) -> Result<SubscribeRequest> {
+        Ok(SubscribeRequest::sign_for_canonical_audience(
             &self.state.identity,
             audience,
             self.clock.now(),
@@ -2116,27 +2128,40 @@ impl<M: LocalMailbox> Session<M> {
         entry: impl Fn(Result<Vec<u8>>, bool, Vec<E::Initial>) -> R,
     ) -> Result<Vec<R>> {
         let mut expired_pages = 0;
-        loop {
-            let cursor = self.state.cursor;
-            let told = self.state.delivered.len().min(MAX_DELIVERED);
+        // An all-expired page can lead to another fetch in this call. Stage its progress
+        // until the last page validates, so a bad continuation also leaves the state intact.
+        let mut cursor = self.state.cursor;
+        let mut acknowledged = 0;
+        let received = 'pages: loop {
+            let after = cursor;
+            let delivered = &self.state.delivered[acknowledged..];
+            let told = delivered.len().min(MAX_DELIVERED);
             let request = FetchRequest {
                 sender: Bytes::copy_from_slice(&self.state.peer),
                 recipient: Bytes::copy_from_slice(&self.state.me),
                 after: cursor,
-                limit: 0,
-                delivered: self.state.delivered[..told]
+                limit: MAX_RECEIVE_PAGE,
+                delivered: delivered[..told]
                     .iter()
                     .map(|token| Bytes::copy_from_slice(token))
                     .collect(),
             };
             let page = fetch(&self.mailbox, request).await?;
-            if page
-                .iter()
-                .any(|env| env.sequence() > protocol::MAX_SAFE_INTEGER)
-            {
+            let receipts_fit = (delivered.len() - told)
+                .checked_add(page.len())
+                .is_some_and(|n| n <= MAX_STORED_DELIVERED);
+            if page.len() > MAX_RECEIVE_PAGE as usize || !receipts_fit {
                 return Err(ErrorKind::Protocol.into());
             }
-            self.state.delivered.drain(..told);
+            let mut prev = cursor;
+            for envelope in &page {
+                let seq = envelope.sequence();
+                if seq <= prev || seq > protocol::MAX_SAFE_INTEGER {
+                    return Err(ErrorKind::Protocol.into());
+                }
+                prev = seq;
+            }
+            acknowledged += told;
 
             let mut received = Vec::with_capacity(page.len());
             let mut carried = Vec::new();
@@ -2148,10 +2173,15 @@ impl<M: LocalMailbox> Session<M> {
                     if !carry_initial(&mut carried, initial) {
                         break;
                     }
-                    self.state.cursor = self.state.cursor.max(sequence);
+                    cursor = sequence;
                     continue;
                 };
 
+                // A page with a message always returns a result. Free the acknowledged
+                // capacity before decrypting, which can itself enqueue a receipt.
+                if acknowledged != 0 {
+                    self.state.delivered.drain(..mem::take(&mut acknowledged));
+                }
                 let decrypted = self.decrypt(&message);
                 if sequence > self.state.skip_through
                     && decrypted.as_ref().is_err_and(|e| {
@@ -2174,10 +2204,10 @@ impl<M: LocalMailbox> Session<M> {
                         self.state.stalled_through = next_sequence;
                     }
                     received.push(entry(Err(ErrorKind::Stalled.into()), false, carried));
-                    return Ok(received);
+                    break 'pages received;
                 }
 
-                self.state.cursor = self.state.cursor.max(sequence);
+                cursor = sequence;
                 let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
                 // decrypt() already queues the tokens of duplicate and evicted messages.
                 if let Ok((_, _, token)) = &decrypted {
@@ -2192,14 +2222,17 @@ impl<M: LocalMailbox> Session<M> {
             if !carried.is_empty() {
                 received.push(entry(Err(ErrorKind::Expired.into()), false, carried));
             }
-            if !received.is_empty() || self.state.cursor == cursor {
-                return Ok(received);
+            if !received.is_empty() || cursor == after {
+                break received;
             }
             expired_pages += 1;
             if expired_pages == MAX_EXPIRED_PAGES {
-                return Ok(received);
+                break received;
             }
-        }
+        };
+        self.state.cursor = cursor;
+        self.state.delivered.drain(..acknowledged);
+        Ok(received)
     }
 }
 
@@ -2302,6 +2335,7 @@ mod test {
     #[derive(Default)]
     struct ScriptedMailbox {
         page: Vec<Envelope>,
+        ignore_cursor: bool,
         fail_after: Option<u64>,
         fetches: Cell<usize>,
     }
@@ -2315,7 +2349,7 @@ mod test {
             Ok(self
                 .page
                 .iter()
-                .filter(|e| e.sequence > after)
+                .filter(|e| self.ignore_cursor || e.sequence > after)
                 .cloned()
                 .collect())
         }
@@ -2323,6 +2357,7 @@ mod test {
 
     impl LocalMailbox for ScriptedMailbox {
         async fn fetch(&self, req: FetchRequest) -> protocol::Result<FetchResponse> {
+            assert_eq!(req.limit, 100);
             Ok(FetchResponse {
                 messages: self.page_after(req.after)?,
             })
@@ -2339,6 +2374,7 @@ mod test {
             &self,
             req: protocol::mailbox_v2::FetchSignedRequest,
         ) -> protocol::Result<protocol::mailbox_v2::FetchSignedResponse> {
+            assert_eq!(req.limit, 100);
             Ok(protocol::mailbox_v2::FetchSignedResponse {
                 messages: self
                     .page_after(req.after)?
@@ -2443,21 +2479,80 @@ mod test {
     }
 
     #[tokio::test]
-    async fn unsafe_sequence_rejects_the_entire_page_before_decryption() {
+    async fn invalid_pages_preserve_receipts_cursor_and_ratchet() {
         for version in MailboxVersion::ALL {
             let (bob, mut session, message) = scripted_mailbox().await;
-            session.mailbox.page = vec![
-                Envelope {
-                    sequence: 1,
-                    message: Some(message),
-                    initial_message: None,
-                },
-                Envelope {
-                    sequence: protocol::MAX_SAFE_INTEGER + 1,
-                    ..Default::default()
-                },
-            ];
-            session.state.delivered.push([5; DELIVERY_TOKEN_LENGTH]);
+            session.state.cursor = 5;
+            session.state.stalled_through = 7;
+            session.mailbox.ignore_cursor = true;
+            let token = [5; DELIVERY_TOKEN_LENGTH];
+            // With at most 100 new receipts and up to 1000 acknowledged, a state already
+            // within the 4096-token cap always fits. Merged sessions can start above it.
+            for (sequences, receipt_count) in [
+                ((6..=106).collect::<Vec<_>>(), MAX_STORED_DELIVERED),
+                (vec![6], MAX_STORED_DELIVERED + MAX_DELIVERED),
+                (vec![5], 1),
+                (vec![4], 1),
+                (vec![6, 6], 1),
+                (vec![7, 6], 1),
+                (vec![6, protocol::MAX_SAFE_INTEGER + 1], 1),
+            ] {
+                session.mailbox.page = sequences
+                    .into_iter()
+                    .map(|sequence| Envelope {
+                        sequence,
+                        message: None,
+                        initial_message: None,
+                    })
+                    .collect();
+                // Even an authentic message at the front must remain decryptable on retry.
+                if session.mailbox.page[0].sequence > session.state.cursor {
+                    session.mailbox.page[0].message = Some(message.clone());
+                }
+                let receipts = vec![token; receipt_count];
+                session.state.delivered.clone_from(&receipts);
+                assert_eq!(
+                    version
+                        .receive(&mut session, &bob)
+                        .await
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::Protocol
+                );
+                assert_eq!(
+                    (session.state.cursor, session.state.stalled_through),
+                    (5, 7)
+                );
+                assert_eq!(session.state.delivered, receipts);
+            }
+            session.state.delivered = vec![token; MAX_STORED_DELIVERED];
+            session.mailbox.page = vec![Envelope {
+                sequence: 6,
+                message: Some(message),
+                initial_message: None,
+            }];
+            assert_eq!(
+                contents(version.receive(&mut session, &bob).await.unwrap()),
+                [b"message"]
+            );
+            assert_eq!(
+                session.state.delivered.len(),
+                MAX_STORED_DELIVERED - MAX_DELIVERED + 1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bad_continuation_preserves_progress_from_before_the_fetch() {
+        for version in MailboxVersion::ALL {
+            let (bob, mut session, _) = scripted_mailbox().await;
+            let receipts = vec![[7; DELIVERY_TOKEN_LENGTH]; MAX_DELIVERED + 1];
+            session.state.delivered.clone_from(&receipts);
+            session.mailbox.page = vec![Envelope {
+                sequence: 1,
+                ..Default::default()
+            }];
+            session.mailbox.ignore_cursor = true;
             assert_eq!(
                 version
                     .receive(&mut session, &bob)
@@ -2466,16 +2561,9 @@ mod test {
                     .kind(),
                 ErrorKind::Protocol
             );
-            assert_eq!(
-                (session.state.cursor, session.state.stalled_through),
-                (0, 0)
-            );
-            assert_eq!(session.state.delivered, [[5; DELIVERY_TOKEN_LENGTH]]);
-            session.mailbox.page.pop();
-            assert_eq!(
-                contents(version.receive(&mut session, &bob).await.unwrap()),
-                [b"message"]
-            );
+            assert_eq!(session.mailbox.fetches.get(), 2);
+            assert_eq!(session.state.cursor, 0);
+            assert_eq!(session.state.delivered, receipts);
         }
     }
 
@@ -2610,12 +2698,15 @@ mod test {
     }
 
     #[tokio::test]
-    async fn a_page_that_goes_nowhere_is_the_end() {
+    async fn a_repeated_expired_sequence_is_refused_after_one_fetch() {
         let handshake = HandshakeServer::new(MemoryStore::default());
         let mailbox = MailboxServer::new(MemoryStore::default());
         let (_alice, _alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
         let mut bob_session = Session::restore(Repeating(Cell::new(0)), bob_session.state);
-        assert!(bob_session.receive().await.unwrap().is_empty());
+        assert_eq!(
+            bob_session.receive().await.unwrap_err().kind(),
+            ErrorKind::Protocol
+        );
         assert_eq!(bob_session.mailbox.0.get(), 1);
     }
 
@@ -3663,6 +3754,22 @@ mod test {
             alice.subscription_for_audience("").unwrap_err().kind(),
             ErrorKind::Protocol
         );
+        for (url, expected) in [
+            ("http://relay.example:443", "relay.example:443"),
+            ("https://relay.example:80", "relay.example:80"),
+        ] {
+            let audience = NormalizedAudience::parse(url).unwrap();
+            let bound = alice
+                .subscription_for_canonical_audience(&audience)
+                .unwrap();
+            assert_eq!(bound.audience, expected);
+            assert_eq!(
+                bound
+                    .verify_for_canonical_audience(&audience, behind)
+                    .unwrap(),
+                key
+            );
+        }
     }
 
     #[tokio::test]

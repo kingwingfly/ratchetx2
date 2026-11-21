@@ -30,6 +30,71 @@ pub const MAX_CLOCK_SKEW: u64 = 5 * 60 * 1000;
 /// are rejected rather than clamped.
 pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
+/// A canonical relay host and optional port, normalized with the original URL's scheme.
+/// Keep this value when signing or verifying multiple requests for the same relay. For
+/// example, `http://relay.example:443` retains its port after the scheme is removed.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct NormalizedAudience(String);
+
+impl NormalizedAudience {
+    /// Parse a configured host or HTTP(S) / WS(S) URL using [`normalize_audience`].
+    pub fn parse(raw: &str) -> Result<Self> {
+        normalize_audience(raw).map(Self)
+    }
+
+    /// Borrow the canonical audience used in signed requests.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Take ownership of the canonical audience string.
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl AsRef<str> for NormalizedAudience {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for NormalizedAudience {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for NormalizedAudience {
+    type Err = Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        Self::parse(raw)
+    }
+}
+
+impl TryFrom<&str> for NormalizedAudience {
+    type Error = Error;
+
+    fn try_from(raw: &str) -> Result<Self> {
+        Self::parse(raw)
+    }
+}
+
+impl TryFrom<String> for NormalizedAudience {
+    type Error = Error;
+
+    fn try_from(raw: String) -> Result<Self> {
+        Self::parse(&raw)
+    }
+}
+
+impl From<NormalizedAudience> for String {
+    fn from(audience: NormalizedAudience) -> Self {
+        audience.into_string()
+    }
+}
+
 /// Canonical relay audience (`host[:port]`) for a configured host or HTTP(S) / WS(S) URL.
 /// Hosts use URL-standard IDNA and IP address serialization. Paths, queries, fragments and
 /// default ports are omitted. With no scheme, both 80 and 443 are considered default ports.
@@ -154,6 +219,8 @@ mod tests {
             ("wss://example。com:08080", "example.com:8080"),
             ("http://[::ffff:192.0.2.1]:", "[::ffff:c000:201]"),
             ("http://127.1:80", "127.0.0.1"),
+            ("http://relay.example:443", "relay.example:443"),
+            ("https://relay.example:80", "relay.example:80"),
         ] {
             let url = url::Url::parse(input).unwrap();
             assert_eq!(
@@ -161,6 +228,7 @@ mod tests {
                 expected
             );
             assert_eq!(normalize_audience(input).unwrap(), expected);
+            assert_eq!(NormalizedAudience::parse(input).unwrap().as_str(), expected);
         }
         assert_eq!(
             normalize_audience("münchen.example:8443").unwrap(),

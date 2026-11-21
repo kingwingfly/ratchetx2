@@ -6,7 +6,7 @@
 //! unconditionally with **zero** `ml-kem` dependency. The cryptographic PQXDH / v2 wire methods
 //! are compiled only when `ml-kem-1024`, `ml-kem-768`, or `pq` is enabled.
 
-pub use protocol::normalize_audience;
+pub use protocol::{NormalizedAudience, normalize_audience};
 use x3dh::PqSuite;
 
 use crate::error::{ErrorKind, Result};
@@ -290,6 +290,10 @@ mod v2 {
     /// Maximum inbox message IDs acknowledged in one `AckInitialMessages` call.
     const MAX_ACK_BATCH: usize = 100;
 
+    fn unimplemented_refusal(error: &protocol::Error) -> bool {
+        error.is_server_refusal() && error.kind() == protocol::ErrorKind::Unimplemented
+    }
+
     /// Which transport path succeeded in [`Client::transmit_publish_v2_or_v1_fallback`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum PublishV2Outcome {
@@ -430,6 +434,9 @@ mod v2 {
 
         fn try_from(wire: &handshake_v2::InitialMessageV2) -> Result<Self> {
             let malformed = || Error::from(ErrorKind::InvalidInitialMessage);
+            if wire.id > protocol::MAX_SAFE_INTEGER {
+                return Err(malformed());
+            }
             let first_message = wire.first_message.clone().ok_or_else(malformed)?;
             match wire.version {
                 1 => {
@@ -1199,9 +1206,9 @@ mod v2 {
                 } else {
                     PublishV2Outcome::V2ClassicalOff
                 }),
-                Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
+                Err(e) if unimplemented_refusal(&e) => {
                     if self.state.pq_config.strict_pq {
-                        return Err(ErrorKind::PqRequired.into());
+                        return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
                     }
                     if prepared_pq && let Some(orig_manifest) = prepared.request.manifest.as_ref() {
                         let timestamp = self.next_timestamp()?;
@@ -1245,7 +1252,7 @@ mod v2 {
                                     .retract_pq(&[], &prepared.pq_one_time_prekeys);
                                 return Ok(PublishV2Outcome::V2ClassicalOff);
                             }
-                            Err(e2) if e2.kind() == protocol::ErrorKind::Unimplemented => {
+                            Err(e2) if unimplemented_refusal(&e2) => {
                                 // True v1-only server; fall through to v1 Handshake::publish.
                             }
                             Err(e2) => return Err(e2.into()),
@@ -1289,12 +1296,14 @@ mod v2 {
                     Ok(())
                 }
                 Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::SignInRequired
-                            | ErrorKind::PqRequired
-                            | ErrorKind::LimitExceeded
-                    ) =>
+                    if e.is_server_refusal()
+                        && matches!(
+                            e.kind(),
+                            ErrorKind::SignInRequired
+                                | ErrorKind::PqRequired
+                                | ErrorKind::LimitExceeded
+                                | ErrorKind::Protocol
+                        ) =>
                 {
                     self.rollback_publish_v2_on_refusal(prepared);
                     Err(e)
@@ -1345,10 +1354,10 @@ mod v2 {
 
             let response = match claim {
                 Ok(resp) => resp,
-                Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
+                Err(e) if unimplemented_refusal(&e) => {
                     // Legacy v1-only server.
                     if strict_pq {
-                        return Err(ErrorKind::PqRequired.into());
+                        return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
                     }
                     if local_pq_enabled {
                         if peer_state.pq_pinned {
@@ -1793,6 +1802,9 @@ mod v2 {
                     let mut messages = Vec::with_capacity(response.messages.len());
                     let mut malformed_ids = vec![];
                     for wire in &response.messages {
+                        if wire.id > protocol::MAX_SAFE_INTEGER {
+                            continue;
+                        }
                         match InitialMessageV2::try_from(wire) {
                             Ok(msg) => messages.push(msg),
                             Err(_) if wire.id != 0 => malformed_ids.push(wire.id),
@@ -1805,9 +1817,9 @@ mod v2 {
                         fell_back_to_v1: false,
                     })
                 }
-                Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
+                Err(e) if unimplemented_refusal(&e) => {
                     if self.state.pq_config.strict_pq {
-                        return Err(ErrorKind::PqRequired.into());
+                        return Err(Error::from_protocol_with_kind(ErrorKind::PqRequired, e));
                     }
                     let v1_messages = self.take_initial_messages().await?;
                     let messages = v1_messages
@@ -1845,7 +1857,9 @@ mod v2 {
             mut peer_state_for: impl FnMut(&PublicKey) -> PeerPqState,
         ) -> Result<ListAndAcceptOutcome<M>> {
             let listed = self.list_initial_messages_v2(audience, limit).await?;
+            let can_ack = |id| id != 0 && id <= protocol::MAX_SAFE_INTEGER;
             let mut ack_ids = listed.malformed_ids;
+            ack_ids.retain(|&id| can_ack(id));
             let mut outcomes = Vec::with_capacity(listed.messages.len());
             for msg in &listed.messages {
                 let peer_state = peer_state_for(&msg.sender);
@@ -1853,7 +1867,7 @@ mod v2 {
                 // every processed inbox ID so permanent failures (e.g. canonical low-order sender
                 // `InvalidKeys`, `UnsupportedSuite`, `InvalidInitialMessage`, `PqRequired`,
                 // `DowngradeDetected`, etc.) cannot permanently DoS the inbox.
-                if msg.id != 0 {
+                if can_ack(msg.id) {
                     ack_ids.push(msg.id);
                 }
                 if let Ok(outcome) =
@@ -1944,7 +1958,7 @@ mod v2 {
             let request = self.push_v2_request(sealed.clone());
             match self.mailbox.push_v2(request).await {
                 Ok(resp) => Ok(resp.sequence),
-                Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
+                Err(e) if unimplemented_refusal(&e) => {
                     let resp = self.mailbox.push(self.push_request(sealed)).await?;
                     Ok(resp.sequence)
                 }
@@ -2008,9 +2022,12 @@ mod v2 {
                     )?;
                     match mailbox.fetch_signed(signed).await {
                         Ok(response) => Ok(response.messages),
-                        Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
+                        Err(e) if unimplemented_refusal(&e) => {
                             if client.state.pq_config.strict_pq {
-                                return Err(ErrorKind::PqRequired.into());
+                                return Err(Error::from_protocol_with_kind(
+                                    ErrorKind::PqRequired,
+                                    e,
+                                ));
                             }
                             Ok(mailbox
                                 .fetch(request)

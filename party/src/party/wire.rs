@@ -281,5 +281,167 @@ impl TryFrom<SevenFields> for LegacyPartyV1 {
     }
 }
 
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+pub use legacy_pq::LegacyPartyPqV1;
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+mod legacy_pq {
+    use super::*;
+    use serde::de::Visitor;
+
+    type EightFields = (
+        Ratchet,
+        SkippedKeys,
+        u64,
+        u64,
+        u64,
+        Vec<u8>,
+        EvictedSet,
+        Option<LegacyKemRatchet>,
+    );
+
+    /// Serde reader for the eight-field positional format written by pre-version-2 PQ builds.
+    ///
+    /// These builds encoded the KEM suite as Serde's build-dependent enum variant index.
+    /// Migrate under the same ML-KEM feature set that wrote the record. Use `pq` for a
+    /// dual-suite build, or `ml-kem-1024` or `ml-kem-768` for the original single suite.
+    /// The eight-field layout also covers classical sessions saved by those builds.
+    #[derive(Deserialize)]
+    #[serde(try_from = "EightFields")]
+    pub struct LegacyPartyPqV1(Party);
+
+    impl LegacyPartyPqV1 {
+        /// Returns the validated party with its original KEM state and eviction history.
+        pub fn into_party(self) -> Party {
+            self.0
+        }
+    }
+
+    impl TryFrom<EightFields> for LegacyPartyPqV1 {
+        type Error = Error;
+
+        fn try_from(
+            (
+                ratchet,
+                skipped_message_keys,
+                previous_chain_length,
+                message_number_sender,
+                message_number_receiver,
+                associated_data,
+                current_chain_evicted,
+                kem,
+            ): EightFields,
+        ) -> Result<Self> {
+            let party = Party {
+                ratchet,
+                skipped_message_keys,
+                previous_chain_length,
+                message_number_sender,
+                message_number_receiver,
+                associated_data,
+                current_chain_evicted,
+                kem_ratchet: kem.map(|legacy| legacy.0),
+            };
+            party.validate()?;
+            Ok(Self(party))
+        }
+    }
+
+    // Preserve the historical feature gates and declaration order for the positional enum.
+    #[derive(Deserialize)]
+    enum LegacyPqSuite {
+        #[cfg(feature = "ml-kem-1024")]
+        MlKem1024,
+        #[cfg(feature = "ml-kem-768")]
+        MlKem768,
+    }
+
+    struct LegacyKemRatchet(KemRatchet);
+
+    impl<'de> Deserialize<'de> for LegacyKemRatchet {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> core::result::Result<Self, D::Error> {
+            struct LegacyKemVisitor;
+
+            impl<'de> Visitor<'de> for LegacyKemVisitor {
+                type Value = LegacyKemRatchet;
+
+                fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str("an eleven-field legacy KEM ratchet")
+                }
+
+                fn visit_seq<A: SeqAccess<'de>>(
+                    self,
+                    mut fields: A,
+                ) -> core::result::Result<Self::Value, A::Error> {
+                    let suite = match fields
+                        .next_element()?
+                        .ok_or_else(|| de::Error::invalid_length(0, &self))?
+                    {
+                        #[cfg(feature = "ml-kem-1024")]
+                        LegacyPqSuite::MlKem1024 => PqSuite::MlKem1024,
+                        #[cfg(feature = "ml-kem-768")]
+                        LegacyPqSuite::MlKem768 => PqSuite::MlKem768,
+                    };
+                    let translated = KemFields {
+                        suite_id: Some(suite.id()),
+                        fields,
+                    };
+                    KemRatchet::deserialize(BinaryValue(SeqAccessDeserializer::new(translated)))
+                        .map(LegacyKemRatchet)
+                }
+            }
+
+            d.deserialize_tuple(11, LegacyKemVisitor)
+        }
+    }
+
+    // Replay the translated suite, then let the current KEM reader consume and validate
+    // the remaining fields directly from the original binary deserializer.
+    struct KemFields<A> {
+        suite_id: Option<u8>,
+        fields: A,
+    }
+
+    impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for KemFields<A> {
+        type Error = A::Error;
+
+        fn next_element_seed<T: DeserializeSeed<'de>>(
+            &mut self,
+            seed: T,
+        ) -> core::result::Result<Option<T::Value>, A::Error> {
+            if let Some(id) = self.suite_id.take() {
+                return seed
+                    .deserialize(BinaryValue(id.into_deserializer()))
+                    .map(Some);
+            }
+            self.fields.next_element_seed(seed)
+        }
+    }
+
+    // Serde's sequence and u8 value adapters both default to human-readable mode.
+    struct BinaryValue<D>(D);
+
+    impl<'de, D: Deserializer<'de>> Deserializer<'de> for BinaryValue<D> {
+        type Error = D::Error;
+
+        fn is_human_readable(&self) -> bool {
+            false
+        }
+
+        fn deserialize_any<V: Visitor<'de>>(
+            self,
+            visitor: V,
+        ) -> core::result::Result<V::Value, D::Error> {
+            self.0.deserialize_any(visitor)
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+            struct enum identifier ignored_any
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

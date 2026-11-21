@@ -192,6 +192,194 @@ fn legacy_readers_validate_before_conversion() {
         let v1 = postcard::to_allocvec(&(six, &bob.current_chain_evicted)).unwrap();
         assert!(postcard::from_bytes::<LegacyPartyV0>(&v0).is_err());
         assert!(postcard::from_bytes::<LegacyPartyV1>(&v1).is_err());
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        assert!(postcard::from_bytes::<LegacyPartyPqV1>(&[v1.as_slice(), &[0]].concat()).is_err());
+    }
+}
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+mod pq_legacy {
+    use super::*;
+    use crate::EncryptedMessage;
+    use ratchetx2::pq::MAX_PENDING_OFFERS;
+
+    // Captured with 44b6e39 as (Alice, Bob, Alice's in-flight message). With rekey_messages=2
+    // and rekey_turns=0, A0, B0, A1..A3, B1 leave Alice retransmitting a ciphertext and Bob
+    // holding a queued peer key. Both have pending local offers and encapsulation history.
+    const ACTIVE_1024: &[u8] = include_bytes!("../../../tests/fixtures/active-v1-1024.postcard");
+    const ACTIVE_768_DUAL: &[u8] =
+        include_bytes!("../../../tests/fixtures/active-v1-768-dual.postcard");
+    const ACTIVE_768_SINGLE: &[u8] =
+        include_bytes!("../../../tests/fixtures/active-v1-768-single.postcard");
+
+    fn migrate(bytes: &[u8], old_index: u8, suite: PqSuite) -> (Party, &[u8]) {
+        let (legacy, rest) = postcard::take_from_bytes::<LegacyPartyPqV1>(bytes).unwrap();
+        let record = &bytes[..bytes.len() - rest.len()];
+        let (_, kem) = postcard::take_from_bytes::<SevenFields>(record).unwrap();
+        assert_eq!(&kem[..2], &[1, old_index]); // Some followed by the old suite enum.
+        let mut expected = [&[VERSION, suite.id()][..], record].concat();
+        let suite_offset = expected.len() - kem.len() + 1;
+        expected[suite_offset] = suite.id();
+        let party = legacy.into_party();
+        assert_eq!(party.pq_suite(), Some(suite));
+        assert_eq!(postcard::to_allocvec(&party).unwrap(), expected);
+        for tag in [0, 1, 2, 0xff] {
+            let nested = [record, &[tag]].concat();
+            let ((party, actual), tail) =
+                postcard::take_from_bytes::<(LegacyPartyPqV1, u8)>(&nested).unwrap();
+            assert_eq!(actual, tag);
+            assert!(tail.is_empty());
+            assert_eq!(
+                postcard::to_allocvec(&party.into_party()).unwrap(),
+                expected
+            );
+        }
+        (postcard::from_bytes(&expected).unwrap(), rest)
+    }
+
+    #[test]
+    fn live_peers_resume_across_the_positional_migration() {
+        for (capture, index, id, enabled) in [
+            (ACTIVE_1024, 0, 1, cfg!(feature = "ml-kem-1024")),
+            (
+                ACTIVE_768_DUAL,
+                1,
+                2,
+                cfg!(all(feature = "ml-kem-1024", feature = "ml-kem-768")),
+            ),
+            (ACTIVE_768_SINGLE, 0, 2, cfg!(not(feature = "ml-kem-1024"))),
+        ] {
+            let (_, sender, rest) = unchecked(capture);
+            let (_, receiver, _) = unchecked(rest);
+            for snapshot in [&sender, &receiver] {
+                assert!(!snapshot.pending_offers.is_empty());
+                assert!(snapshot.active_offer_id.is_some());
+                assert!(!snapshot.encapsulated_ek_ids.is_empty());
+                assert!(snapshot.messages_since_rekey > 0);
+                assert!(!snapshot.initial_offer_needed);
+            }
+            assert!(sender.active_send_ct.is_some());
+            assert!(receiver.peer_pending_ek.is_some());
+            assert!(receiver.turns_since_rekey > 0);
+            if !enabled {
+                assert!(postcard::from_bytes::<LegacyPartyPqV1>(capture).is_err());
+                continue;
+            }
+            let suite = PqSuite::from_id(id).unwrap();
+            let (mut alice, rest) = migrate(capture, index, suite);
+            let (mut bob, rest) = migrate(rest, index, suite);
+            let (in_flight, tail) = postcard::take_from_bytes::<EncryptedMessage>(rest).unwrap();
+            assert!(tail.is_empty());
+            assert_eq!(bob.decrypt(&in_flight).unwrap(), b"in flight");
+            exchange(&mut bob, &mut alice);
+            exchange(&mut bob, &mut alice);
+        }
+    }
+
+    #[test]
+    fn pq_builds_saved_classical_parties_with_an_explicit_none() {
+        for tag in [0, 1, 2, 0xff] {
+            let bytes = [V1, &[0, tag]].concat();
+            let ((party, actual), rest) =
+                postcard::take_from_bytes::<(LegacyPartyPqV1, u8)>(&bytes).unwrap();
+            assert_eq!(actual, tag);
+            assert!(rest.is_empty());
+            let mut party = party.into_party();
+            assert_eq!(postcard::to_allocvec(&party).unwrap(), CLASSIC);
+            exchange(&mut alice(&party), &mut party);
+        }
+    }
+
+    // An unchecked positional view for changing individual fields of the real captures.
+    // All untouched fields still go through the production deserializer, including key seeds.
+    #[derive(Clone, Serialize, Deserialize)]
+    struct UncheckedKem {
+        suite: u32,
+        rekey_messages: u64,
+        rekey_turns: u64,
+        pending_offers: Vec<([u8; 16], Vec<u8>)>,
+        active_offer_id: Option<[u8; 16]>,
+        active_send_ct: Option<([u8; 16], Vec<u8>)>,
+        peer_pending_ek: Option<([u8; 16], Vec<u8>)>,
+        encapsulated_ek_ids: Vec<[u8; 16]>,
+        messages_since_rekey: u64,
+        turns_since_rekey: u64,
+        initial_offer_needed: bool,
+    }
+
+    fn unchecked(bytes: &[u8]) -> (&[u8], UncheckedKem, &[u8]) {
+        let (_, kem) = postcard::take_from_bytes::<SevenFields>(bytes).unwrap();
+        let (some, rest) = postcard::take_from_bytes::<Option<UncheckedKem>>(kem).unwrap();
+        (&bytes[..bytes.len() - kem.len()], some.unwrap(), rest)
+    }
+
+    fn decodes(prefix: &[u8], kem: &UncheckedKem) -> bool {
+        let option = postcard::to_allocvec(&Some(kem)).unwrap();
+        postcard::from_bytes::<LegacyPartyPqV1>(&[prefix, &option].concat()).is_ok()
+    }
+
+    #[test]
+    fn legacy_kem_fields_undergo_full_state_validation() {
+        let (fixture, id) = if cfg!(feature = "ml-kem-1024") {
+            (ACTIVE_1024, 1)
+        } else {
+            (ACTIVE_768_SINGLE, 2)
+        };
+        let (prefix, alice, rest) = unchecked(fixture);
+        let (bob_prefix, bob, _) = unchecked(rest);
+        assert!(decodes(prefix, &alice));
+        assert!(decodes(bob_prefix, &bob));
+        let mut bad = alice.clone();
+        bad.suite = 2; // Above the last variant even in a dual-suite build.
+        assert!(!decodes(prefix, &bad));
+        let mut bad = alice.clone();
+        bad.active_send_ct.as_mut().unwrap().1.pop();
+        assert!(!decodes(prefix, &bad));
+        let mut bad = bob.clone();
+        bad.peer_pending_ek.as_mut().unwrap().1.pop();
+        assert!(!decodes(bob_prefix, &bad));
+        let mut bad = bob;
+        bad.peer_pending_ek.as_mut().unwrap().0[0] ^= 1;
+        assert!(!decodes(bob_prefix, &bad));
+        let mut bad = alice.clone();
+        bad.active_offer_id.as_mut().unwrap()[0] ^= 1;
+        assert!(!decodes(prefix, &bad));
+        let mut bad = alice.clone();
+        bad.pending_offers[0].0[0] ^= 1;
+        assert!(!decodes(prefix, &bad));
+
+        // Use distinct valid offers so only the count makes the final record invalid.
+        let mut extra = KemRatchet::new(PqSuite::from_id(id).unwrap());
+        for _ in 0..MAX_PENDING_OFFERS {
+            extra.force_rekey().unwrap();
+        }
+        let extra: UncheckedKem =
+            postcard::from_bytes(&postcard::to_allocvec(&extra).unwrap()).unwrap();
+        let mut full = alice;
+        for offer in extra.pending_offers {
+            full.pending_offers.push(offer);
+            assert_eq!(
+                decodes(prefix, &full),
+                full.pending_offers.len() <= MAX_PENDING_OFFERS
+            );
+        }
+    }
+
+    #[cfg(not(feature = "ml-kem-1024"))]
+    #[test]
+    fn legacy_index_zero_still_requires_768_ciphertext_and_key_lengths() {
+        let (prefix, mut alice, rest) = unchecked(ACTIVE_1024);
+        let (bob_prefix, mut bob, _) = unchecked(rest);
+        // Isolate the suite-sized fields from the separate seed/ID mismatch.
+        for (prefix, kem) in [(prefix, &mut alice), (bob_prefix, &mut bob)] {
+            assert_eq!(kem.suite, 0);
+            kem.pending_offers.clear();
+            kem.active_offer_id = None;
+            assert!(!decodes(prefix, kem));
+            kem.active_send_ct = None;
+            kem.peer_pending_ek = None;
+            assert!(decodes(prefix, kem));
+        }
     }
 }
 

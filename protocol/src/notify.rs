@@ -14,7 +14,7 @@ use bytes::Bytes;
 use x3dh::PublicKey;
 use xeddsa::XEdDSAPrivateKey;
 
-use crate::{ErrorKind, Result, check_safe_integer, normalize_audience, verify_recent};
+use crate::{ErrorKind, NormalizedAudience, Result, check_safe_integer, verify_recent};
 
 #[allow(missing_docs)]
 mod proto {
@@ -49,32 +49,58 @@ impl SubscribeRequest {
         )
     }
 
-    /// Sign a v2 subscription bound to the configured relay's canonical audience.
+    /// Normalize a configured relay URL or host and sign a v2 subscription for it.
+    /// Use [`Self::sign_for_canonical_audience`] with a previously parsed audience.
     pub fn sign_for_audience(
         identity: &XEdDSAPrivateKey,
         audience: &str,
         timestamp: u64,
     ) -> Result<Self> {
+        Self::sign_for_canonical_audience(
+            identity,
+            &NormalizedAudience::parse(audience)?,
+            timestamp,
+        )
+    }
+
+    /// Sign a v2 subscription using the exact bytes of an already normalized audience.
+    pub fn sign_for_canonical_audience(
+        identity: &XEdDSAPrivateKey,
+        audience: &NormalizedAudience,
+        timestamp: u64,
+    ) -> Result<Self> {
         check_safe_integer(timestamp)?;
-        let audience = normalize_audience(audience)?;
         let identity_key = identity.compute_public_key().to_bytes();
-        let signature = identity.sign(subscribe_message_v2(&audience, &identity_key, timestamp)?);
+        let signature = identity.sign(subscribe_message_v2(
+            audience.as_str(),
+            &identity_key,
+            timestamp,
+        )?);
         Ok(Self {
             identity_key: Bytes::copy_from_slice(&identity_key),
             timestamp,
             signature: Bytes::copy_from_slice(&signature),
-            audience,
+            audience: audience.as_str().to_owned(),
         })
     }
 
-    /// Verify a recent v2 subscription for the configured relay. An empty audience is
+    /// Verify a recent v2 subscription for a configured relay URL or host. An empty audience is
     /// malformed. A different audience or an invalid signature yields [`ErrorKind::InvalidSignature`].
+    /// Use [`Self::verify_for_canonical_audience`] with a previously parsed audience.
     pub fn verify_for_audience(&self, expected_audience: &str, now: u64) -> Result<PublicKey> {
-        let expected = normalize_audience(expected_audience)?;
+        self.verify_for_canonical_audience(&NormalizedAudience::parse(expected_audience)?, now)
+    }
+
+    /// Verify a recent v2 subscription against an already normalized relay audience.
+    pub fn verify_for_canonical_audience(
+        &self,
+        expected_audience: &NormalizedAudience,
+        now: u64,
+    ) -> Result<PublicKey> {
         if self.audience.is_empty() {
             return Err(ErrorKind::Malformed.into());
         }
-        if self.audience != expected {
+        if self.audience != expected_audience.as_str() {
             return Err(ErrorKind::InvalidSignature.into());
         }
         verify_recent(
@@ -182,6 +208,36 @@ mod test {
             assert_eq!(
                 serde_json::from_value::<SubscribeRequest>(json).unwrap(),
                 request
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_subscriptions_preserve_scheme_specific_ports() {
+        let identity = XEdDSAPrivateKey::generate();
+        let bare = NormalizedAudience::parse("relay.example").unwrap();
+        for (url, expected) in [
+            ("http://relay.example:443", "relay.example:443"),
+            ("https://relay.example:80", "relay.example:80"),
+        ] {
+            let audience = NormalizedAudience::parse(url).unwrap();
+            let request =
+                SubscribeRequest::sign_for_canonical_audience(&identity, &audience, 5).unwrap();
+            assert_eq!(request.audience, expected);
+            assert_eq!(
+                request.verify_for_canonical_audience(&audience, 5).unwrap(),
+                identity.compute_public_key().to_bytes()
+            );
+            assert_eq!(
+                request
+                    .verify_for_canonical_audience(&bare, 5)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidSignature
+            );
+            assert_eq!(
+                request.verify_for_audience(url, 5).unwrap(),
+                identity.compute_public_key().to_bytes()
             );
         }
     }

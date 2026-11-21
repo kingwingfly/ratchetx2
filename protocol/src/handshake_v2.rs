@@ -27,7 +27,7 @@ pub(crate) mod proto {
     include!(concat!(env!("OUT_DIR"), "/handshake.v2.rs"));
 }
 
-pub use crate::normalize_audience;
+pub use crate::{NormalizedAudience, normalize_audience};
 pub use proto::*;
 #[cfg(feature = "server")]
 pub use server::{HandshakeV2Limits, HandshakeV2Server, ServerInfoConfig};
