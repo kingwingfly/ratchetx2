@@ -5,7 +5,7 @@
 
 use bytes::Bytes;
 
-use crate::{PublicKey, Result, Signature};
+use crate::{PublicKey, Result, Signature, StoredMessage};
 
 /// Length of a deterministic post-quantum prekey identifier (SHA-256).
 pub const PQ_PREKEY_ID_LENGTH: usize = 32;
@@ -258,14 +258,15 @@ pub trait LocalPqHandshakeStore {
     async fn pq_snapshot(&self, identity_key: &PublicKey) -> Result<PqStorageSnapshot>;
 }
 
-/// Optional idempotent mailbox append extension sharing the same underlying queue as
-/// [`LocalMailboxStore`](crate::LocalMailboxStore).
+/// Storage for the v2 idempotent mailbox service. Every method is atomic.
+///
+/// Self-contained with no dependency on legacy v1 [`LocalMailboxStore`](crate::LocalMailboxStore).
 #[trait_variant::make(IdempotentMailboxStore: Send)]
 pub trait LocalIdempotentMailboxStore {
     /// Append a message to the queue from `sender` to `recipient`, deduplicating retries when
     /// `client_message_id` is `Some` and has already been committed for `(sender, recipient)`.
     /// Backends must retain bounded, expiring `(sender, recipient, client_message_id) -> sequence`
-    /// tombstones independently of row deletion by [`delete_delivered`](crate::LocalMailboxStore::delete_delivered).
+    /// tombstones independently of row deletion by [`delete_delivered`](Self::delete_delivered).
     /// While the tombstone is retained, a retry returns the original sequence even after the recipient has
     /// acknowledged the message, without inserting another queue slot.
     #[allow(clippy::too_many_arguments)]
@@ -279,4 +280,23 @@ pub trait LocalIdempotentMailboxStore {
         delivery_hash: Option<[u8; 32]>,
         client_message_id: Option<[u8; 16]>,
     ) -> Result<u64>;
+
+    /// Delete the messages of the queue from `sender` to `recipient` whose delivery tokens'
+    /// SHA-256 are among `hashes`, as their recipient has them.
+    async fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> Result<()>;
+
+    /// The messages of the queue from `sender` to `recipient` after sequence number `after`,
+    /// in order, at most `limit`.
+    async fn read(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredMessage>>;
 }

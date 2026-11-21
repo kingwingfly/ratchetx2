@@ -24,7 +24,10 @@ mod proto {
 pub use proto::{notification::Event, *};
 
 impl SubscribeRequest {
-    /// A subscription to `identity`'s notifications, signed by it.
+    /// A legacy v1 subscription to `identity`'s notifications, signed by it without an audience.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+    )]
     pub fn sign(identity: &XEdDSAPrivateKey, timestamp: u64) -> Self {
         let identity_key = identity.compute_public_key().to_bytes();
         let signature = identity.sign(subscribe_message(&identity_key, timestamp));
@@ -36,9 +39,12 @@ impl SubscribeRequest {
         }
     }
 
-    /// The identity key subscribing, once the signature by that key verifies and the timestamp
-    /// is within [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of `now`, in milliseconds since the
-    /// Unix epoch.
+    /// The identity key subscribing via a legacy v1 subscription, once the signature by that key
+    /// verifies and the timestamp is within [`MAX_CLOCK_SKEW`](crate::MAX_CLOCK_SKEW) of `now`,
+    /// in milliseconds since the Unix epoch.
+    #[deprecated(
+        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+    )]
     pub fn verify(&self, now: u64) -> Result<PublicKey> {
         verify_recent(
             &self.identity_key,
@@ -162,6 +168,7 @@ impl Notification {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod test {
     use super::*;
     use crate::{MAX_CLOCK_SKEW, error::ErrorKind};

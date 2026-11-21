@@ -136,66 +136,80 @@ pub struct StoredMessage {
     pub initial_message: Option<Bytes>,
 }
 
-/// Storage for the handshake server. Every method is atomic.
-#[trait_variant::make(HandshakeStore: Send)]
-pub trait LocalHandshakeStore {
-    /// Store `bundle` and replace its owner's one-time prekeys with `one_time_prekeys`, if
-    /// `bundle.timestamp` is greater than the stored bundle's. Returns whether it was stored.
-    async fn publish(&self, bundle: Bundle, one_time_prekeys: Vec<PublicKey>) -> Result<bool>;
-    /// The bundle of `identity_key`, with one of its one-time prekeys, which is removed.
-    async fn take_bundle(
-        &self,
-        identity_key: &PublicKey,
-    ) -> Result<Option<(Bundle, Option<PublicKey>)>>;
-    /// Add `initial_message` to its recipient's inbox, unless the inbox already holds `limit`.
-    /// Returns whether it was added.
-    async fn add_initial_message(
-        &self,
-        initial_message: StoredInitialMessage,
-        limit: usize,
-    ) -> Result<bool>;
-    /// Take every initial message to `recipient`, if `timestamp` is greater than the previous
-    /// take's. Returns `None` otherwise.
-    async fn take_initial_messages(
-        &self,
-        recipient: &PublicKey,
-        timestamp: u64,
-    ) -> Result<Option<Vec<StoredInitialMessage>>>;
+#[allow(deprecated)]
+mod legacy_traits {
+    use super::*;
+
+    /// Storage for the legacy v1 handshake server. Every method is atomic.
+    #[deprecated(
+        note = "legacy v1 handshake store is deprecated; use LocalPqHandshakeStore / PqHandshakeStore (see git tag archive/legacy-v1)"
+    )]
+    #[trait_variant::make(HandshakeStore: Send)]
+    pub trait LocalHandshakeStore {
+        /// Store `bundle` and replace its owner's one-time prekeys with `one_time_prekeys`, if
+        /// `bundle.timestamp` is greater than the stored bundle's. Returns whether it was stored.
+        async fn publish(&self, bundle: Bundle, one_time_prekeys: Vec<PublicKey>) -> Result<bool>;
+        /// The bundle of `identity_key`, with one of its one-time prekeys, which is removed.
+        async fn take_bundle(
+            &self,
+            identity_key: &PublicKey,
+        ) -> Result<Option<(Bundle, Option<PublicKey>)>>;
+        /// Add `initial_message` to its recipient's inbox, unless the inbox already holds `limit`.
+        /// Returns whether it was added.
+        async fn add_initial_message(
+            &self,
+            initial_message: StoredInitialMessage,
+            limit: usize,
+        ) -> Result<bool>;
+        /// Take every initial message to `recipient`, if `timestamp` is greater than the previous
+        /// take's. Returns `None` otherwise.
+        async fn take_initial_messages(
+            &self,
+            recipient: &PublicKey,
+            timestamp: u64,
+        ) -> Result<Option<Vec<StoredInitialMessage>>>;
+    }
+
+    /// Storage for the legacy v1 mailbox server. Every method is atomic.
+    #[deprecated(
+        note = "legacy v1 mailbox store is deprecated; use LocalIdempotentMailboxStore / IdempotentMailboxStore (see git tag archive/legacy-v1)"
+    )]
+    #[trait_variant::make(MailboxStore: Send)]
+    pub trait LocalMailboxStore {
+        /// Append a message to the queue from `sender` to `recipient`, with the initial message of
+        /// its session if any, and SHA-256 of its delivery token if any; returns its sequence
+        /// number, which goes on from the queue's last, even once its messages are deleted.
+        async fn append(
+            &self,
+            sender: &PublicKey,
+            recipient: &PublicKey,
+            header: Bytes,
+            content: Bytes,
+            initial_message: Option<Bytes>,
+            delivery_hash: Option<[u8; 32]>,
+        ) -> Result<u64>;
+        /// Delete the messages of the queue from `sender` to `recipient` whose delivery tokens'
+        /// SHA-256 are among `hashes`, as their recipient has them.
+        async fn delete_delivered(
+            &self,
+            sender: &PublicKey,
+            recipient: &PublicKey,
+            hashes: &[[u8; 32]],
+        ) -> Result<()>;
+        /// The messages of the queue from `sender` to `recipient` after sequence number `after`,
+        /// in order, at most `limit`.
+        async fn read(
+            &self,
+            sender: &PublicKey,
+            recipient: &PublicKey,
+            after: u64,
+            limit: u32,
+        ) -> Result<Vec<StoredMessage>>;
+    }
 }
 
-/// Storage for the mailbox server. Every method is atomic.
-#[trait_variant::make(MailboxStore: Send)]
-pub trait LocalMailboxStore {
-    /// Append a message to the queue from `sender` to `recipient`, with the initial message of
-    /// its session if any, and SHA-256 of its delivery token if any; returns its sequence number,
-    /// which goes on from the queue's last, even once its messages are deleted.
-    async fn append(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        header: Bytes,
-        content: Bytes,
-        initial_message: Option<Bytes>,
-        delivery_hash: Option<[u8; 32]>,
-    ) -> Result<u64>;
-    /// Delete the messages of the queue from `sender` to `recipient` whose delivery tokens'
-    /// SHA-256 are among `hashes`, as their recipient has them.
-    async fn delete_delivered(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        hashes: &[[u8; 32]],
-    ) -> Result<()>;
-    /// The messages of the queue from `sender` to `recipient` after sequence number `after`,
-    /// in order, at most `limit`.
-    async fn read(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        after: u64,
-        limit: u32,
-    ) -> Result<Vec<StoredMessage>>;
-}
+#[allow(deprecated)]
+pub use legacy_traits::{HandshakeStore, LocalHandshakeStore, LocalMailboxStore, MailboxStore};
 
 /// Storage for the attachment server. Every method is atomic.
 #[trait_variant::make(AttachmentStore: Send)]

@@ -13,9 +13,8 @@ use web_time as _;
 use web_time::Instant;
 
 use crate::{
-    AttachmentId, AttachmentStore, Bundle, ErrorKind, HandshakeStore, MAX_QUEUE_BYTES,
-    MAX_QUEUE_MESSAGES, MAX_SAFE_INTEGER, MailboxStore, PublicKey, Result, StoredAttachment,
-    StoredInitialMessage, StoredMessage,
+    AttachmentId, AttachmentStore, Bundle, ErrorKind, MAX_QUEUE_BYTES, MAX_QUEUE_MESSAGES,
+    MAX_SAFE_INTEGER, PublicKey, Result, StoredAttachment, StoredInitialMessage, StoredMessage,
 };
 #[cfg(feature = "pq")]
 use crate::{
@@ -23,6 +22,8 @@ use crate::{
     PublishV2Record, PublishV2Status, RefillPrekeysRecord, RefillStatus, StoredCapabilityManifest,
     StoredInitialMessageV2, StoredPqPrekey,
 };
+#[allow(deprecated)]
+use crate::{HandshakeStore, MailboxStore};
 
 /// How long a mailbox retry can recover the original sequence after insertion.
 #[cfg(feature = "pq")]
@@ -232,8 +233,43 @@ impl Inner {
         });
         Ok(next)
     }
+
+    fn delete_delivered_inner(
+        &mut self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) {
+        if let Some(queue) = self.queues.get_mut(&(*sender, *recipient)) {
+            queue.retain(|queued| {
+                !queued
+                    .delivery_hash
+                    .is_some_and(|hash| hashes.contains(&hash))
+            });
+        }
+    }
+
+    fn read_inner(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+    ) -> Vec<StoredMessage> {
+        let Some(queue) = self.queues.get(&(*sender, *recipient)) else {
+            return vec![];
+        };
+        // In order, with gaps where messages were delivered or expired.
+        let start = queue.partition_point(|queued| queued.message.sequence <= after);
+        queue[start..]
+            .iter()
+            .take(limit as usize)
+            .map(|queued| queued.message.clone())
+            .collect()
+    }
 }
 
+#[allow(deprecated)]
 impl HandshakeStore for MemoryStore {
     async fn publish(&self, bundle: Bundle, one_time_prekeys: Vec<PublicKey>) -> Result<bool> {
         check_safe_int(bundle.timestamp)?;
@@ -727,6 +763,7 @@ fn suite_counts(queue: &VecDeque<StoredPqPrekey>) -> Vec<(u8, usize)> {
     counts.into_iter().collect()
 }
 
+#[allow(deprecated)]
 impl MailboxStore for MemoryStore {
     async fn append(
         &self,
@@ -754,14 +791,9 @@ impl MailboxStore for MemoryStore {
         recipient: &PublicKey,
         hashes: &[[u8; 32]],
     ) -> Result<()> {
-        let mut inner = self.inner.lock();
-        if let Some(queue) = inner.queues.get_mut(&(*sender, *recipient)) {
-            queue.retain(|queued| {
-                !queued
-                    .delivery_hash
-                    .is_some_and(|hash| hashes.contains(&hash))
-            });
-        }
+        self.inner
+            .lock()
+            .delete_delivered_inner(sender, recipient, hashes);
         Ok(())
     }
 
@@ -772,17 +804,10 @@ impl MailboxStore for MemoryStore {
         after: u64,
         limit: u32,
     ) -> Result<Vec<StoredMessage>> {
-        let inner = self.inner.lock();
-        let Some(queue) = inner.queues.get(&(*sender, *recipient)) else {
-            return Ok(vec![]);
-        };
-        // In order, with gaps where messages were delivered or expired.
-        let start = queue.partition_point(|queued| queued.message.sequence <= after);
-        Ok(queue[start..]
-            .iter()
-            .take(limit as usize)
-            .map(|queued| queued.message.clone())
-            .collect())
+        Ok(self
+            .inner
+            .lock()
+            .read_inner(sender, recipient, after, limit))
     }
 }
 
@@ -902,6 +927,31 @@ impl IdempotentMailboxStore for MemoryStore {
         }
         Ok(seq)
     }
+
+    async fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> Result<()> {
+        self.inner
+            .lock()
+            .delete_delivered_inner(sender, recipient, hashes);
+        Ok(())
+    }
+
+    async fn read(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .inner
+            .lock()
+            .read_inner(sender, recipient, after, limit))
+    }
 }
 
 impl AttachmentStore for MemoryStore {
@@ -947,6 +997,7 @@ impl AttachmentStore for MemoryStore {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod test {
     use super::*;
 
@@ -1100,12 +1151,16 @@ mod test {
                 )
             };
             let seq = append().await.unwrap();
-            store
-                .delete_delivered(&alice, &bob, &[[3; 32]])
+            IdempotentMailboxStore::delete_delivered(&store, &alice, &bob, &[[3; 32]])
                 .await
                 .unwrap();
             assert_eq!(append().await.unwrap(), seq);
-            assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
+            assert!(
+                IdempotentMailboxStore::read(&store, &alice, &bob, 0, 10)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             store
                 .inner
                 .lock()
@@ -1148,8 +1203,7 @@ mod test {
             assert_eq!(append(&carol, 1).await, 1);
             assert_eq!(append(&bob, 2).await, 2);
             for id in 3..=20 {
-                store
-                    .delete_delivered(&alice, &bob, &[[id - 1; 32]])
+                IdempotentMailboxStore::delete_delivered(&store, &alice, &bob, &[[id - 1; 32]])
                     .await
                     .unwrap();
                 assert_eq!(append(&bob, id).await, u64::from(id));
@@ -1163,6 +1217,203 @@ mod test {
             assert_eq!(append(&bob, 1).await, 1);
             assert_eq!(append(&carol, 1).await, 1);
             assert_eq!(append(&bob, 2).await, 21);
+        });
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn legacy_v1_and_v2_memory_store_isolation() {
+        futures::executor::block_on(async {
+            let store = MemoryStore::default();
+            let (alice, bob, carol) = ([11; 32], [12; 32], [13; 32]);
+            let pq_key = |suite: u8, tag: u8| StoredPqPrekey {
+                suite,
+                id: [tag; 32],
+                encapsulation_key: Bytes::from(vec![tag; if suite == 1 { 1568 } else { 1184 }]),
+                signature: [tag; 64],
+            };
+            let manifest = |seq: u64, generation: u64, strict_pq: bool| StoredCapabilityManifest {
+                audience: "chat.example".to_string(),
+                identity_key: bob,
+                manifest_seq: seq,
+                generation,
+                issued_at: 1000 + seq,
+                expires_at: 100_000 + seq,
+                pq_enabled: true,
+                strict_pq,
+                pq_ratchet_supported: true,
+                offered_suites: vec![1, 2],
+                signed_prekey: [20 + (generation as u8); 32],
+                pq_last_resort: vec![
+                    crate::PqLastResortCommitment {
+                        suite: 1,
+                        prekey_id: [0xA1; 32],
+                    },
+                    crate::PqLastResortCommitment {
+                        suite: 2,
+                        prekey_id: [0xA2; 32],
+                    },
+                ],
+                signature: [0x55; 64],
+            };
+
+            // Legacy v1 user falls back in v2 claim_bundle with manifest = None.
+            assert!(
+                store
+                    .publish(
+                        Bundle {
+                            identity_key: carol,
+                            signed_prekey: [30; 32],
+                            signed_prekey_signature: [31; 64],
+                            timestamp: 10,
+                        },
+                        vec![[32; 32]],
+                    )
+                    .await
+                    .unwrap()
+            );
+            let claimed_v1 = store.claim_bundle(&carol, &[1, 2]).await.unwrap().unwrap();
+            assert_eq!(claimed_v1.manifest, None);
+            assert_eq!(claimed_v1.signed_prekey, [30; 32]);
+
+            // Legacy v1 take_bundle never consumes PQOPKs, and v1 publish is refused once a v2 manifest exists.
+            assert_eq!(
+                store
+                    .publish_v2(PublishV2Record {
+                        manifest: manifest(1, 1, false),
+                        signed_prekey_signature: Some([0x44; 64]),
+                        one_time_prekeys: vec![[40; 32], [41; 32]],
+                        pq_last_resort: vec![pq_key(1, 0xA1), pq_key(2, 0xA2)],
+                        pq_one_time_prekeys: vec![pq_key(1, 0xB1), pq_key(2, 0xB2)],
+                        timestamp: 1001,
+                    })
+                    .await
+                    .unwrap(),
+                PublishV2Status::Stored
+            );
+            let (v1_bundle, v1_opk) = store.take_bundle(&bob).await.unwrap().unwrap();
+            assert_eq!(v1_bundle.signed_prekey, [21; 32]);
+            assert_eq!(v1_opk, Some([40; 32]));
+            assert_eq!(
+                store.pq_snapshot(&bob).await.unwrap().pq_one_time_counts,
+                vec![(1, 1), (2, 1)]
+            );
+            assert!(
+                !store
+                    .publish(
+                        Bundle {
+                            identity_key: bob,
+                            signed_prekey: [99; 32],
+                            signed_prekey_signature: [98; 64],
+                            timestamp: 2000,
+                        },
+                        vec![[42; 32]],
+                    )
+                    .await
+                    .unwrap()
+            );
+
+            // Strict PQ publish clears legacy v1 bundle.
+            assert_eq!(
+                store
+                    .publish_v2(PublishV2Record {
+                        manifest: manifest(2, 2, true),
+                        signed_prekey_signature: None,
+                        one_time_prekeys: vec![[60; 32]],
+                        pq_last_resort: vec![pq_key(1, 0xA1), pq_key(2, 0xA2)],
+                        pq_one_time_prekeys: vec![pq_key(1, 0xB4)],
+                        timestamp: 2002,
+                    })
+                    .await
+                    .unwrap(),
+                PublishV2Status::Stored
+            );
+            assert_eq!(store.take_bundle(&bob).await.unwrap(), None);
+
+            // Legacy v1 take_initial_messages drains only v1 messages, leaving v2 PQ intact.
+            assert!(
+                store
+                    .add_initial_message(
+                        StoredInitialMessage {
+                            sender: alice,
+                            recipient: bob,
+                            ephemeral_key: [80; 32],
+                            signed_prekey: [22; 32],
+                            one_time_prekey: None,
+                            header: Bytes::from_static(b"v1-h"),
+                            content: Bytes::from_static(b"v1-c"),
+                        },
+                        10,
+                    )
+                    .await
+                    .unwrap()
+            );
+            let pq_id = store
+                .add_initial_message_v2(
+                    StoredInitialMessageV2 {
+                        id: 0,
+                        version: 2,
+                        sender: alice,
+                        recipient: bob,
+                        ephemeral_key: [81; 32],
+                        signed_prekey: [22; 32],
+                        one_time_prekey: None,
+                        header: Bytes::from_static(b"v2-h"),
+                        content: Bytes::from_static(b"v2-c"),
+                        pq_suite: Some(1),
+                        pq_last_resort: false,
+                        pq_prekey_id: Some([0xB4; 32]),
+                        pq_ciphertext: Some(Bytes::from(vec![0xCC; 1568])),
+                        manifest_digest: Some([0xDD; 32]),
+                    },
+                    10,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            let v1_taken = store
+                .take_initial_messages(&bob, 3000)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(v1_taken.len(), 1);
+            assert_eq!(v1_taken[0].header, Bytes::from_static(b"v1-h"));
+            let remaining = store.list_initial_messages(&bob, 10).await.unwrap();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].id, pq_id);
+
+            // Legacy MailboxStore::append shares queue with IdempotentMailboxStore.
+            let seq1 = store
+                .append_idempotent(
+                    &alice,
+                    &bob,
+                    Bytes::from_static(b"h1"),
+                    Bytes::from_static(b"c1"),
+                    None,
+                    None,
+                    Some([0x42; 16]),
+                )
+                .await
+                .unwrap();
+            let seq2 = store
+                .append(
+                    &alice,
+                    &bob,
+                    Bytes::from_static(b"h2"),
+                    Bytes::from_static(b"c2"),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(seq2, seq1 + 1);
+            assert_eq!(
+                IdempotentMailboxStore::read(&store, &alice, &bob, 0, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                2
+            );
         });
     }
 }
