@@ -9,14 +9,7 @@ pub const MATCHES_MAX: usize = 10_000;
 /// The most memory a pattern's compiled form may take, in bytes.
 const PATTERN_SIZE_MAX: usize = 1 << 20;
 
-/// What a search found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Found {
-    /// Each match's start and end, in UTF-16 code units, in order; none is empty.
-    pub matches: Vec<(u32, u32)>,
-    /// Whether there are more than [`MATCHES_MAX`].
-    pub more: bool,
-}
+pub use crate::rpc::SearchFound as Found;
 
 /// The matches of `pattern` in `text`: a regular expression, or else the text as written, in
 /// either case ignoring case unless `case` says otherwise. An invalid pattern says why.
