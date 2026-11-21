@@ -1,15 +1,12 @@
 //! Per-sender message queues and idempotent delivery receipts.
 
 use storage::{MAX_QUEUE_BYTES, MAX_QUEUE_MESSAGES, MAX_SAFE_INTEGER};
-#[cfg(feature = "pq")]
-use worker::SqlStorage;
-use worker::{Date, Error, Result, SqlStorageValue};
+use worker::{Date, Error, Result, SqlStorage, SqlStorageValue};
 
 use super::{Identity, rows::*};
 use crate::objects::{AppendOutcome, Content, StoredRow, blob, checked_integer};
 
 pub(super) const DEDUP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
-#[cfg(feature = "pq")]
 pub(super) const MAX_DEDUP_TOMBSTONES_PER_QUEUE: u64 = 4096;
 
 impl Identity {
@@ -26,7 +23,6 @@ impl Identity {
     ) -> Result<AppendOutcome> {
         let now = Date::now().as_millis();
         let now_val = checked_integer(now)?;
-        #[cfg(feature = "pq")]
         let dedup_id = {
             let sql = self.sql();
             if client_message_id.is_some() && crate::objects::has_table(&sql, "mailbox_dedup")? {
@@ -36,11 +32,8 @@ impl Identity {
                 None
             }
         };
-        #[cfg(not(feature = "pq"))]
-        let _ = client_message_id;
 
         self.transaction_sync(|sql| {
-            #[cfg(feature = "pq")]
             if let Some(cid) = dedup_id {
                 sql.exec(
                     "DELETE FROM mailbox_dedup WHERE sender = ? AND expires_at <= ?",
@@ -103,7 +96,6 @@ impl Identity {
                     now_val,
                 ],
             )?;
-            #[cfg(feature = "pq")]
             if let Some(cid) = dedup_id {
                 record_tombstone(sql, sender, cid, queue.sequence, now)?;
             }
@@ -158,7 +150,7 @@ impl Identity {
         // Step 2: materialize ONLY the exact rows that fit within the byte budget.
         let rows: Vec<MessageRow> = sql
             .exec(
-                "SELECT sequence, header, content, object, size, initial_message FROM messages \
+                "SELECT sequence, header, content, object, initial_message FROM messages \
                  WHERE sender = ? AND sequence > ? AND sequence <= ? ORDER BY sequence",
                 vec![
                     blob(sender),
@@ -224,7 +216,6 @@ impl Identity {
     }
 }
 
-#[cfg(feature = "pq")]
 fn record_tombstone(
     sql: &SqlStorage,
     sender: &[u8],

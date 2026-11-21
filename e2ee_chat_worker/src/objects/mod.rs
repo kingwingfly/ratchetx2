@@ -16,10 +16,7 @@ use worker::{
 };
 
 pub use attachment::{Attachment, DEFAULT_FILE_RETENTION_DAYS};
-pub use identity::{
-    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE,
-    HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS, Identity,
-};
+pub use identity::{HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, Identity};
 
 /// The binding of the identities' namespace.
 const IDENTITIES: &str = "IDENTITIES";
@@ -47,15 +44,14 @@ fn stub(namespace: &ObjectNamespace, key: &[u8]) -> Result<Stub> {
     namespace.id_from_name(&crate::hex(key))?.get_stub()
 }
 
-/// Outcome of an [`IdentityCall::Append`] or [`IdentityCall::AppendIdempotent`], distinguishing
-/// a definitive pre-commit rejection (safe to delete a staged R2 blob) from an ambiguous RPC error
-/// (must NOT delete the R2 blob).
+/// Outcome of an [`IdentityCall::AppendIdempotent`], distinguishing a definitive pre-commit
+/// rejection (safe to delete a staged R2 blob) from an ambiguous RPC error (must NOT delete the
+/// R2 blob).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AppendOutcome {
     /// A new message row was committed at this sequence number.
     Appended(u64),
     /// Deduplicated against a previously committed `client_message_id` (newly staged blob unused).
-    #[cfg(feature = "pq")]
     Deduplicated(u64),
     /// Rejected before commit because the per-queue row or byte quota would be exceeded.
     LimitExceeded,
@@ -65,31 +61,6 @@ pub enum AppendOutcome {
 /// messages to it.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IdentityCall {
-    /// Store the legacy v1 bundle, and replace classical one-time prekeys, if `timestamp` is newer
-    /// than the stored v1 bundle's. Does NOT overwrite or clear v2 manifests or PQ prekeys.
-    Publish {
-        signed_prekey: Vec<u8>,
-        signature: Vec<u8>,
-        timestamp: u64,
-        one_time_prekeys: Vec<Vec<u8>>,
-    },
-    /// The legacy v1 bundle, with a classical one-time prekey, which goes. Never pops PQOPKs.
-    TakeBundle,
-    /// Add a classical v1 initial message to the inbox, unless it holds `limit`.
-    AddInitialMessage { message: InitialMessage, limit: u64 },
-    /// Take classical v1 initial messages only, if `timestamp` is newer than the last take's.
-    /// Does not allocate tables for unknown identities and never drains v2 PQ initial messages.
-    TakeInitialMessages { timestamp: u64 },
-    /// Append a message to the queue from `sender`. Answers [`AppendOutcome`].
-    Append {
-        sender: Vec<u8>,
-        header: Vec<u8>,
-        content: Content,
-        /// The content's length, wherever it is.
-        size: u64,
-        initial_message: Option<Vec<u8>>,
-        delivery_hash: Option<Vec<u8>>,
-    },
     /// The messages of the queue from `sender` after `after`, at most `limit`, and at most
     /// `max_size` bytes (header + initial_message + content) but for the first.
     Read {
@@ -111,7 +82,6 @@ pub enum IdentityCall {
         objects: Vec<String>,
     },
     /// Atomically publish a signed v2 CapabilityManifest and classical + PQ prekeys.
-    #[cfg(feature = "pq")]
     PublishV2 {
         manifest: ManifestWire,
         signed_prekey_signature: Option<Vec<u8>>,
@@ -121,7 +91,6 @@ pub enum IdentityCall {
         timestamp: u64,
     },
     /// Append classical OPKs and/or signed PQOPKs to the current generation without rotating SPK.
-    #[cfg(feature = "pq")]
     RefillPrekeys {
         generation: u64,
         one_time_prekeys: Vec<Vec<u8>>,
@@ -131,32 +100,26 @@ pub enum IdentityCall {
         timestamp: u64,
     },
     /// Non-consuming read of the stored CapabilityManifest.
-    #[cfg(feature = "pq")]
     GetManifest,
-    /// Atomically claim a bundle with preferred PQ suites (or classical v1 fallback).
-    #[cfg(feature = "pq")]
+    /// Atomically claim a bundle with preferred PQ suites (or classical fallback).
     ClaimBundle { preferred_suites: Vec<u8> },
     /// Insert a v1 or v2 initial message into the inbox, returning `Option<u64>` assigned ID.
-    #[cfg(feature = "pq")]
     AddInitialMessageV2 {
         message: InitialMessageV2Wire,
         limit: u64,
     },
     /// Non-destructively list up to `limit` pending initial messages (both v1 and v2).
-    #[cfg(feature = "pq")]
     ListInitialMessages { limit: u64 },
     /// Delete only the specified initial message IDs, returning count deleted.
-    #[cfg(feature = "pq")]
     AckInitialMessages { ids: Vec<u64> },
     /// Diagnostic snapshot of v2 PQ storage state.
-    #[cfg(feature = "pq")]
     PqSnapshot,
-    /// Idempotent append sharing the same queue as [`IdentityCall::Append`].
-    #[cfg(feature = "pq")]
+    /// Idempotent append to the queue from `sender`. Answers [`AppendOutcome`].
     AppendIdempotent {
         sender: Vec<u8>,
         header: Vec<u8>,
         content: Content,
+        /// The content's length, wherever it is.
         size: u64,
         initial_message: Option<Vec<u8>>,
         delivery_hash: Option<Vec<u8>>,
@@ -171,26 +134,6 @@ pub enum Content {
     Object(String),
 }
 
-/// A bundle as kept, with a one-time prekey taken from it, if any was left.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct TakenBundle {
-    pub signed_prekey: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub timestamp: u64,
-    pub one_time_prekey: Option<Vec<u8>>,
-}
-
-/// An initial message, as kept in its recipient's inbox.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct InitialMessage {
-    pub sender: Vec<u8>,
-    pub ephemeral_key: Vec<u8>,
-    pub signed_prekey: Vec<u8>,
-    pub one_time_prekey: Option<Vec<u8>>,
-    pub header: Vec<u8>,
-    pub content: Vec<u8>,
-}
-
 /// A message of a queue, as kept.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StoredRow {
@@ -200,14 +143,12 @@ pub struct StoredRow {
     pub initial_message: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqCommitmentWire {
     pub suite: u8,
     pub prekey_id: Vec<u8>,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestWire {
     pub audience: String,
@@ -225,7 +166,6 @@ pub struct ManifestWire {
     pub signature: Vec<u8>,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqPrekeyWire {
     pub suite: u8,
@@ -234,7 +174,6 @@ pub struct PqPrekeyWire {
     pub signature: Vec<u8>,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PublishV2Outcome {
     Stored,
@@ -242,7 +181,6 @@ pub enum PublishV2Outcome {
     DuplicatePrekey,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RefillOutcome {
     Stored {
@@ -256,7 +194,6 @@ pub enum RefillOutcome {
     LimitExceeded,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClaimedBundleWire {
     pub manifest: Option<ManifestWire>,
@@ -267,7 +204,6 @@ pub struct ClaimedBundleWire {
     pub pq_one_time_prekey: Option<PqPrekeyWire>,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InitialMessageV2Wire {
     pub id: u64,
@@ -285,7 +221,6 @@ pub struct InitialMessageV2Wire {
     pub manifest_digest: Option<Vec<u8>>,
 }
 
-#[cfg(feature = "pq")]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PqSnapshotWire {
     pub manifest: Option<ManifestWire>,

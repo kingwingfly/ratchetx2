@@ -19,21 +19,25 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 hmac = "0.13"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 prost = "0.14"
-protocol = { path = "../protocol", features = ["server", "connect"] }
+protocol = { path = "../protocol", features = ["server", "connect", "pq"] }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 sha2 = "0.11"
-storage = { path = "../storage", default-features = false }
+storage = { path = "../storage", default-features = false, features = ["pq"] }
 # The `#[durable_object]` macro expands to wasm-bindgen code.
 wasm-bindgen = "0.2"
 worker = "0.9"
 xeddsa = { path = "../xeddsa" }
 
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+storage = { path = "../storage", features = ["memory", "pq"] }
+
 [features]
 default = ["pq"]
-# Optional post-quantum handshake.v2 and mailbox.v2 routes & storage (zero ML-KEM deps).
-pq = ["protocol/pq", "storage/pq"]
+# Retained as a no-op feature for compatibility; handshake.v2 and mailbox.v2 routes & storage are
+# always enabled (zero ML-KEM deps) and controlled at runtime via `PQ_ENABLED`.
+pq = []
 # `POST /conformance` runs the storage conformance suites against the bindings, which must be
 # empty, e.g. a fresh `wrangler dev`. Never deploy it.
 conformance = ["storage/testing"]

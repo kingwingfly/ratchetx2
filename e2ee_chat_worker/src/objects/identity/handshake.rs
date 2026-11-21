@@ -1,18 +1,13 @@
-//! Classical and post-quantum bundles, prekeys, and the handshake inbox.
+//! V2 capability manifests, classical and post-quantum prekeys, and the two-phase handshake inbox.
 
-#[cfg(feature = "pq")]
-use worker::Error;
-use worker::{Date, Result, SqlStorageValue};
+use worker::{Date, Error, Result, SqlStorageValue};
 
 use super::{Identity, rows::*};
-#[cfg(feature = "pq")]
 use crate::objects::{
     ClaimedBundleWire, InitialMessageV2Wire, ManifestWire, PqCommitmentWire, PqPrekeyWire,
-    PqSnapshotWire, PublishV2Outcome, RefillOutcome,
+    PqSnapshotWire, PublishV2Outcome, RefillOutcome, blob, checked_integer, has_table,
 };
-use crate::objects::{InitialMessage, TakenBundle, blob, checked_integer, has_table};
 
-#[cfg(feature = "pq")]
 struct PqInitialBindings {
     version: SqlStorageValue,
     suite: SqlStorageValue,
@@ -23,97 +18,6 @@ struct PqInitialBindings {
 }
 
 impl Identity {
-    /// Legacy v1 publish: refused once a v2 `capability_manifest` exists, and guarded by a
-    /// persistent `last_v1_publish_ts` watermark that survives v1 bundle removal.
-    pub(super) fn publish(
-        &self,
-        signed_prekey: &[u8],
-        signature: &[u8],
-        timestamp: u64,
-        one_time_prekeys: &[Vec<u8>],
-    ) -> Result<bool> {
-        let ts_val = checked_integer(timestamp)?;
-        let sql = self.sql();
-        if has_table(&sql, "capability_manifest")? {
-            let manifests: CountRow = sql
-                .exec("SELECT count(*) AS count FROM capability_manifest", None)?
-                .one()?;
-            if manifests.count > 0 {
-                return Ok(false);
-            }
-        }
-        if has_table(&sql, "publish_watermarks")? {
-            let wm: Vec<WatermarkRow> = sql
-                .exec(
-                    "SELECT last_v1_publish_ts, last_refill_ts FROM publish_watermarks",
-                    None,
-                )?
-                .to_array()?;
-            if wm
-                .first()
-                .is_some_and(|row| row.last_v1_publish_ts >= timestamp)
-            {
-                return Ok(false);
-            }
-        }
-        let stored: Vec<TimestampRow> =
-            sql.exec("SELECT timestamp FROM bundle", None)?.to_array()?;
-        if stored.first().is_some_and(|row| row.timestamp >= timestamp) {
-            return Ok(false);
-        }
-        let mut opk_positions = Vec::with_capacity(one_time_prekeys.len());
-        for pos in 0..one_time_prekeys.len() {
-            opk_positions.push(checked_integer(pos as u64)?);
-        }
-        sql.exec("DELETE FROM one_time_prekeys", None)?;
-        for (pos_val, prekey) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
-            sql.exec(
-                "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
-                vec![pos_val, blob(prekey)],
-            )?;
-        }
-        sql.exec(
-            "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, ?) \
-             ON CONFLICT (only) DO UPDATE SET signed_prekey = excluded.signed_prekey, \
-             signature = excluded.signature, timestamp = excluded.timestamp",
-            vec![blob(signed_prekey), blob(signature), ts_val.clone()],
-        )?;
-        if has_table(&sql, "publish_watermarks")? {
-            sql.exec(
-                "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
-                 VALUES (0, ?, 0) \
-                 ON CONFLICT (only) DO UPDATE SET \
-                 last_v1_publish_ts = max(publish_watermarks.last_v1_publish_ts, excluded.last_v1_publish_ts)",
-                vec![ts_val],
-            )?;
-        }
-        Ok(true)
-    }
-
-    /// Legacy v1 `FetchBundle`: pops at most one classical OPK and NEVER consumes PQOPKs.
-    pub(super) fn take_bundle(&self) -> Result<Option<TakenBundle>> {
-        if !self.has_tables()? {
-            return Ok(None);
-        }
-        let sql = self.sql();
-        let Some(bundle) = sql
-            .exec(
-                "SELECT signed_prekey, signature, timestamp FROM bundle",
-                None,
-            )?
-            .to_array::<BundleRow>()?
-            .pop()
-        else {
-            return Ok(None);
-        };
-        Ok(Some(TakenBundle {
-            signed_prekey: bundle.signed_prekey,
-            signature: bundle.signature,
-            timestamp: bundle.timestamp,
-            one_time_prekey: self.pop_classical_opk()?,
-        }))
-    }
-
     fn pop_classical_opk(&self) -> Result<Option<Vec<u8>>> {
         let sql = self.sql();
         let prekey = sql
@@ -132,94 +36,6 @@ impl Identity {
         Ok(prekey.map(|p| p.prekey))
     }
 
-    pub(super) fn add_initial_message(&self, message: &InitialMessage, limit: u64) -> Result<bool> {
-        let sql = self.sql();
-        let count: CountRow = sql
-            .exec("SELECT count(*) AS count FROM initial_messages", None)?
-            .one()?;
-        if count.count >= limit {
-            return Ok(false);
-        }
-        sql.exec(
-            "INSERT INTO initial_messages (sender, ephemeral_key, signed_prekey, \
-             one_time_prekey, header, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            vec![
-                blob(&message.sender),
-                blob(&message.ephemeral_key),
-                blob(&message.signed_prekey),
-                message
-                    .one_time_prekey
-                    .as_deref()
-                    .map_or(SqlStorageValue::Null, blob),
-                blob(&message.header),
-                blob(&message.content),
-                checked_integer(Date::now().as_millis())?,
-            ],
-        )?;
-        Ok(true)
-    }
-
-    /// Legacy v1 `TakeInitialMessages`: ONLY selects and deletes classical v1 initial messages
-    /// (`NOT EXISTS` in `initial_messages_pq`), so v1 `Take` can NEVER drain v2 PQ initials.
-    pub(super) fn take_initial_messages(
-        &self,
-        timestamp: u64,
-    ) -> Result<Option<Vec<InitialMessage>>> {
-        let ts_val = checked_integer(timestamp)?;
-        let sql = self.sql();
-        let last: Vec<LastTakeRow> = sql.exec("SELECT last_take FROM inbox", None)?.to_array()?;
-        if last.first().is_some_and(|row| row.last_take >= timestamp) {
-            return Ok(None);
-        }
-        sql.exec(
-            "INSERT INTO inbox (only, last_take) VALUES (0, ?) \
-             ON CONFLICT (only) DO UPDATE SET last_take = excluded.last_take",
-            vec![ts_val],
-        )?;
-        let has_pq_table = has_table(&sql, "initial_messages_pq")?;
-        let messages: Vec<InitialMessageRow> = if has_pq_table {
-            sql.exec(
-                "SELECT sender, ephemeral_key, signed_prekey, one_time_prekey, header, content \
-                 FROM initial_messages \
-                 WHERE NOT EXISTS (SELECT 1 FROM initial_messages_pq WHERE initial_message_id = initial_messages.id) \
-                 ORDER BY id",
-                None,
-            )?
-            .to_array()?
-        } else {
-            sql.exec(
-                "SELECT sender, ephemeral_key, signed_prekey, one_time_prekey, header, content \
-                 FROM initial_messages ORDER BY id",
-                None,
-            )?
-            .to_array()?
-        };
-        if has_pq_table {
-            sql.exec(
-                "DELETE FROM initial_messages \
-                 WHERE NOT EXISTS (SELECT 1 FROM initial_messages_pq WHERE initial_message_id = initial_messages.id)",
-                None,
-            )?;
-            self.cleanup_orphan_pq_initials()?;
-        } else {
-            sql.exec("DELETE FROM initial_messages", None)?;
-        }
-        Ok(Some(
-            messages
-                .into_iter()
-                .map(|row| InitialMessage {
-                    sender: row.sender,
-                    ephemeral_key: row.ephemeral_key,
-                    signed_prekey: row.signed_prekey,
-                    one_time_prekey: row.one_time_prekey,
-                    header: row.header,
-                    content: row.content,
-                })
-                .collect(),
-        ))
-    }
-
-    #[cfg(feature = "pq")]
     pub(super) fn publish_v2(
         &self,
         manifest: &ManifestWire,
@@ -282,8 +98,8 @@ impl Identity {
             return Ok(PublishV2Outcome::StaleSequence);
         }
 
-        // Prepare v1 bundle timestamp before any mutations.
-        let next_v1_ts = if !manifest.strict_pq && signed_prekey_signature.is_some() {
+        // Prepare classical SPK signature bundle timestamp before any mutations.
+        let next_bundle_ts = if !manifest.strict_pq && signed_prekey_signature.is_some() {
             let prev: Vec<TimestampRow> =
                 sql.exec("SELECT timestamp FROM bundle", None)?.to_array()?;
             let next_ts = prev
@@ -294,8 +110,8 @@ impl Identity {
             None
         };
 
-        // Update or clear legacy v1 bundle depending on strict_pq and signed_prekey_signature.
-        if let (Some(sig), Some(next_ts_val)) = (signed_prekey_signature, next_v1_ts) {
+        // Store or clear classical SPK signature row depending on strict_pq and signature presence.
+        if let (Some(sig), Some(next_ts_val)) = (signed_prekey_signature, next_bundle_ts) {
             sql.exec(
                 "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, ?) \
                  ON CONFLICT (only) DO UPDATE SET signed_prekey = excluded.signed_prekey, \
@@ -389,7 +205,6 @@ impl Identity {
         Ok(PublishV2Outcome::Stored)
     }
 
-    #[cfg(feature = "pq")]
     pub(super) fn refill_prekeys(
         &self,
         generation: u64,
@@ -413,10 +228,7 @@ impl Identity {
 
         let sql = self.sql();
         let wm: Vec<WatermarkRow> = sql
-            .exec(
-                "SELECT last_v1_publish_ts, last_refill_ts FROM publish_watermarks",
-                None,
-            )?
+            .exec("SELECT last_refill_ts FROM publish_watermarks", None)?
             .to_array()?;
         if wm
             .first()
@@ -514,7 +326,6 @@ impl Identity {
         })
     }
 
-    #[cfg(feature = "pq")]
     pub(super) fn get_manifest(&self) -> Result<Option<ManifestWire>> {
         if !self.has_tables()? {
             return Ok(None);
@@ -555,7 +366,6 @@ impl Identity {
         }))
     }
 
-    #[cfg(feature = "pq")]
     pub(super) fn claim_bundle(
         &self,
         preferred_suites: &[u8],
@@ -568,14 +378,11 @@ impl Identity {
             let signed_prekey_signature = if manifest.strict_pq {
                 None
             } else {
-                sql.exec(
-                    "SELECT signed_prekey, signature, timestamp FROM bundle",
-                    None,
-                )?
-                .to_array::<BundleRow>()?
-                .pop()
-                .filter(|b| b.signed_prekey == manifest.signed_prekey)
-                .map(|b| b.signature)
+                sql.exec("SELECT signed_prekey, signature FROM bundle", None)?
+                    .to_array::<BundleRow>()?
+                    .pop()
+                    .filter(|b| b.signed_prekey == manifest.signed_prekey)
+                    .map(|b| b.signature)
             };
             let one_time_prekey = self.pop_classical_opk()?;
 
@@ -652,12 +459,9 @@ impl Identity {
             }));
         }
 
-        // Graceful fallback for classical-only v1 users.
+        // Preserve read compatibility for pre-existing DOs that still have a classical bundle row.
         let Some(bundle) = sql
-            .exec(
-                "SELECT signed_prekey, signature, timestamp FROM bundle",
-                None,
-            )?
+            .exec("SELECT signed_prekey, signature FROM bundle", None)?
             .to_array::<BundleRow>()?
             .pop()
         else {
@@ -674,7 +478,6 @@ impl Identity {
         }))
     }
 
-    #[cfg(feature = "pq")]
     pub(super) fn add_initial_message_v2(
         &self,
         message: &InitialMessageV2Wire,
@@ -744,7 +547,6 @@ impl Identity {
         })
     }
 
-    #[cfg(feature = "pq")]
     pub(super) fn list_initial_messages(&self, limit: u64) -> Result<Vec<InitialMessageV2Wire>> {
         if !self.has_tables()? || limit == 0 {
             return Ok(vec![]);
@@ -810,7 +612,6 @@ impl Identity {
         }
     }
 
-    #[cfg(feature = "pq")]
     pub(super) fn ack_initial_messages(&self, ids: &[u64]) -> Result<u64> {
         for &id in ids {
             let _ = checked_integer(id)?;
@@ -836,7 +637,6 @@ impl Identity {
         Ok(deleted)
     }
 
-    #[cfg(feature = "pq")]
     fn pq_one_time_counts(&self) -> Result<Vec<(u8, u64)>> {
         let sql = self.sql();
         if !has_table(&sql, "pq_one_time_prekeys")? {
@@ -851,7 +651,6 @@ impl Identity {
         Ok(rows.into_iter().map(|r| (r.suite as u8, r.count)).collect())
     }
 
-    #[cfg(feature = "pq")]
     pub(super) fn pq_snapshot(&self) -> Result<PqSnapshotWire> {
         if !self.has_tables()? {
             return Ok(PqSnapshotWire {

@@ -1,4 +1,4 @@
-//! Identity tables and in-place schema upgrades.
+//! Identity tables and in-place v1/v2 -> v3 schema upgrades.
 
 use storage::MAX_SAFE_INTEGER;
 use worker::{Result, SqlStorage};
@@ -6,7 +6,8 @@ use worker::{Result, SqlStorage};
 use super::{Identity, mailbox::DEDUP_TTL_MS, rows::TableInfoRow};
 use crate::objects::{checked_integer, has_table};
 
-/// Core v1 tables (unchanged layout for backwards compatibility with existing DO instances).
+/// Core v1 tables (unchanged layout so existing deployed DO instances auto-migrate cleanly
+/// without losing rows).
 const SCHEMA_V1: &str = "
 CREATE TABLE IF NOT EXISTS bundle (
     only INTEGER PRIMARY KEY CHECK (only = 0),
@@ -53,7 +54,7 @@ CREATE INDEX IF NOT EXISTS messages_by_age ON messages (created_at);
 ";
 
 /// Additive v2 side tables and schema version marker. Never relies on SQLite foreign_keys pragma:
-/// orphan cleanup is performed explicitly in take/ack/alarm/delete.
+/// orphan cleanup is performed explicitly in ack/alarm.
 const SCHEMA_V2: &str = "
 CREATE TABLE IF NOT EXISTS meta (
     only INTEGER PRIMARY KEY CHECK (only = 0),
@@ -115,8 +116,18 @@ CREATE TABLE IF NOT EXISTS publish_watermarks (
 );
 ";
 
-/// Tracks verified subscriptions. On a password-protected server, creating replay state before
-/// the identity has core tables requires a sign-in cookie.
+/// V2 -> V3 in-place migration statements for `mailbox_dedup` expiry support.
+const MIGRATE_DEDUP_ADD_EXPIRES_AT: &str =
+    "ALTER TABLE mailbox_dedup ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0";
+const MIGRATE_DEDUP_BACKFILL_EXPIRES_AT: &str = "UPDATE mailbox_dedup SET expires_at = CASE \
+     WHEN created_at >= ? THEN ? ELSE created_at + ? END WHERE expires_at = 0";
+const MIGRATE_DEDUP_INDEXES: &str = "CREATE INDEX IF NOT EXISTS mailbox_dedup_by_expiry ON mailbox_dedup (expires_at); \
+     CREATE INDEX IF NOT EXISTS mailbox_dedup_by_sender \
+     ON mailbox_dedup (sender, created_at, sequence);";
+const MIGRATE_META_TO_V3: &str =
+    "UPDATE meta SET schema_version = 3 WHERE only = 0 AND schema_version < 3";
+
+/// Tracks verified audience-bound v2 subscriptions for replay protection.
 pub(super) const SCHEMA_SEEN_SUBSCRIBES: &str = "
 CREATE TABLE IF NOT EXISTS seen_subscribes (
     sig_hash TEXT PRIMARY KEY,
@@ -131,7 +142,8 @@ impl Identity {
         has_table(&self.sql(), "messages")
     }
 
-    /// Creates core v1 tables and additive v2 side tables on first write.
+    /// Creates core v1 tables and additive v2/v3 side tables on first write (upgrading existing
+    /// v1/v2 DO instances in-place without losing rows).
     pub(super) fn create_tables(&self) -> Result<()> {
         let sql = self.sql();
         sql.exec(SCHEMA_V1, None)?;
@@ -139,9 +151,8 @@ impl Identity {
         self.ensure_mailbox_dedup_schema(&sql)
     }
 
-    /// Ensures additive v2 side tables exist (for upgrading an existing v1 DO in-place on first v2
-    /// write).
-    #[cfg(feature = "pq")]
+    /// Ensures additive v2/v3 side tables exist (for upgrading an existing v1/v2 DO in-place on
+    /// first write).
     pub(super) fn ensure_v2_tables(&self) -> Result<()> {
         self.create_tables()
     }
@@ -156,13 +167,9 @@ impl Identity {
                 .exec("PRAGMA table_info(mailbox_dedup)", None)?
                 .to_array::<TableInfoRow>()?;
             if !columns.iter().any(|column| column.name == "expires_at") {
+                sql.exec(MIGRATE_DEDUP_ADD_EXPIRES_AT, None)?;
                 sql.exec(
-                    "ALTER TABLE mailbox_dedup ADD COLUMN expires_at INTEGER NOT NULL DEFAULT 0",
-                    None,
-                )?;
-                sql.exec(
-                    "UPDATE mailbox_dedup SET expires_at = CASE \
-                     WHEN created_at >= ? THEN ? ELSE created_at + ? END WHERE expires_at = 0",
+                    MIGRATE_DEDUP_BACKFILL_EXPIRES_AT,
                     vec![
                         checked_integer(MAX_SAFE_INTEGER - DEDUP_TTL_MS)?,
                         checked_integer(MAX_SAFE_INTEGER)?,
@@ -170,17 +177,9 @@ impl Identity {
                     ],
                 )?;
             }
-            sql.exec(
-                "CREATE INDEX IF NOT EXISTS mailbox_dedup_by_expiry ON mailbox_dedup (expires_at); \
-                 CREATE INDEX IF NOT EXISTS mailbox_dedup_by_sender \
-                 ON mailbox_dedup (sender, created_at, sequence);",
-                None,
-            )?;
+            sql.exec(MIGRATE_DEDUP_INDEXES, None)?;
             if has_table(sql, "meta")? {
-                sql.exec(
-                    "UPDATE meta SET schema_version = 3 WHERE only = 0 AND schema_version < 3",
-                    None,
-                )?;
+                sql.exec(MIGRATE_META_TO_V3, None)?;
             }
             Ok(())
         })?;
@@ -199,5 +198,45 @@ impl Identity {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_v1_v2_v3_migration_schema_is_preserved_intact() {
+        for table in [
+            "CREATE TABLE IF NOT EXISTS bundle",
+            "CREATE TABLE IF NOT EXISTS one_time_prekeys",
+            "CREATE TABLE IF NOT EXISTS inbox",
+            "CREATE TABLE IF NOT EXISTS initial_messages",
+            "CREATE TABLE IF NOT EXISTS queues",
+            "CREATE TABLE IF NOT EXISTS messages",
+        ] {
+            assert!(SCHEMA_V1.contains(table), "missing v1 table: {table}");
+        }
+
+        for table in [
+            "CREATE TABLE IF NOT EXISTS meta",
+            "INSERT INTO meta (only, schema_version) VALUES (0, 2)",
+            "CREATE TABLE IF NOT EXISTS capability_manifest",
+            "CREATE TABLE IF NOT EXISTS pq_last_resort",
+            "CREATE TABLE IF NOT EXISTS pq_one_time_prekeys",
+            "CREATE TABLE IF NOT EXISTS initial_messages_pq",
+            "CREATE TABLE IF NOT EXISTS mailbox_dedup",
+            "CREATE TABLE IF NOT EXISTS publish_watermarks",
+        ] {
+            assert!(SCHEMA_V2.contains(table), "missing v2 table: {table}");
+        }
+
+        assert!(MIGRATE_DEDUP_ADD_EXPIRES_AT.contains("ADD COLUMN expires_at"));
+        assert!(MIGRATE_DEDUP_BACKFILL_EXPIRES_AT.contains("SET expires_at = CASE"));
+        assert!(MIGRATE_DEDUP_INDEXES.contains("mailbox_dedup_by_expiry"));
+        assert!(MIGRATE_DEDUP_INDEXES.contains("mailbox_dedup_by_sender"));
+        assert!(MIGRATE_META_TO_V3.contains("schema_version = 3"));
+        assert!(SCHEMA_SEEN_SUBSCRIBES.contains("CREATE TABLE IF NOT EXISTS seen_subscribes"));
+        assert!(MAX_SAFE_INTEGER > DEDUP_TTL_MS);
     }
 }

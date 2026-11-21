@@ -21,15 +21,8 @@ use crate::objects::checked_integer;
 /// Internal header set to `"1"` when deployment password auth is satisfied (either `PASSWORD`
 /// is not configured, or the request carried a valid sign-in cookie).
 pub const HEADER_DEPLOYMENT_AUTH: &str = "x-e2ee-deployment-auth";
-/// Internal header carrying the hex-encoded signature of a query-param verified `SubscribeRequest`.
-pub const HEADER_SUBSCRIBE_SIG: &str = "x-e2ee-subscribe-sig";
-/// Internal header carrying the decimal timestamp of a query-param verified `SubscribeRequest`.
-pub const HEADER_SUBSCRIBE_TS: &str = "x-e2ee-subscribe-ts";
 /// Internal header carrying the hex-encoded expected identity key for first-frame WS auth.
 pub const HEADER_PENDING_IDENTITY: &str = "x-e2ee-pending-identity";
-
-/// Internal relay audience for first-frame subscription verification.
-pub const HEADER_SUBSCRIBE_AUDIENCE: &str = "x-e2ee-subscribe-audience";
 
 /// What a client sends to keep its WebSocket open, and the answer, given without waking the
 /// object.
@@ -37,6 +30,11 @@ pub(super) const PING: &str = "ping";
 pub(super) const PONG: &str = "pong";
 /// Text frame sent once a first-frame-auth WebSocket's `SubscribeRequest` is verified.
 const AUTH_OK: &str = "ok";
+/// WebSocket close code sent when a client attempts an unbound legacy v1 subscription.
+const LEGACY_V1_WS_CLOSE_CODE: u16 = 4010;
+/// WebSocket close reason sent with [`LEGACY_V1_WS_CLOSE_CODE`].
+const LEGACY_V1_WS_CLOSE_REASON: &str =
+    "Legacy v1 notifications deprecated; refresh or upgrade the app";
 /// How long, in milliseconds, a socket may go without a ping: its client pings every minute.
 const STALE: f64 = 3.0 * 60_000.0;
 /// Maximum concurrent authenticated WebSocket connections per Identity DO.
@@ -68,12 +66,46 @@ enum SubscribeRecordOutcome {
     CapacityExceeded,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct WsClose {
+    code: u16,
+    reason: &'static str,
+}
+
 fn deployment_auth_header_satisfied(value: Option<&str>) -> bool {
     value == Some("1")
 }
 
-fn allow_subscription_storage(deployment_authenticated: bool, has_core_tables: bool) -> bool {
-    deployment_authenticated || has_core_tables
+/// Validates a first-frame [`SubscribeRequest`]: requires an audience-bound v2 request
+/// unconditionally, returning close code `4010` when `audience` is empty.
+fn verify_first_frame_subscribe(
+    subscription: &SubscribeRequest,
+    expected_identity: &[u8],
+    expected_audience: &str,
+    now_ms: u64,
+) -> std::result::Result<[u8; 64], WsClose> {
+    if !subscription.is_audience_bound() {
+        return Err(WsClose {
+            code: LEGACY_V1_WS_CLOSE_CODE,
+            reason: LEGACY_V1_WS_CLOSE_REASON,
+        });
+    }
+    let audience = crate::subscribe_audience(expected_audience.to_owned());
+    let identity_key =
+        crate::verify_subscribe_request(subscription, &audience, now_ms).map_err(|_| WsClose {
+            code: 1008,
+            reason: "invalid subscription",
+        })?;
+    if identity_key.as_slice() != expected_identity {
+        return Err(WsClose {
+            code: 1008,
+            reason: "identity mismatch",
+        });
+    }
+    <[u8; 64]>::try_from(subscription.signature.as_ref()).map_err(|_| WsClose {
+        code: 1008,
+        reason: "invalid signature",
+    })
 }
 
 /// Per-WebSocket attachment stored via hibernation API.
@@ -140,23 +172,17 @@ impl Identity {
             return Ok(());
         };
         let now_ms = Date::now().as_millis();
-        let expected_audience = crate::subscribe_audience(expected_audience);
-        let Ok(identity_key) = crate::verify_subscribe_request(
+        let sig = match verify_first_frame_subscribe(
             &subscription,
+            &expected_identity,
             &expected_audience,
-            crate::legacy_v1_enabled(&self.env),
             now_ms,
-        ) else {
-            let _ = socket.close(Some(1008), Some("invalid subscription"));
-            return Ok(());
-        };
-        if identity_key.as_slice() != expected_identity.as_slice() {
-            let _ = socket.close(Some(1008), Some("identity mismatch"));
-            return Ok(());
-        }
-        let Ok(sig) = <[u8; 64]>::try_from(subscription.signature.as_ref()) else {
-            let _ = socket.close(Some(1008), Some("invalid signature"));
-            return Ok(());
+        ) {
+            Ok(sig) => sig,
+            Err(close) => {
+                let _ = socket.close(Some(close.code), Some(close.reason));
+                return Ok(());
+            }
         };
         match self
             .record_subscribe_signature(&sig, subscription.timestamp, now_ms)
@@ -231,83 +257,37 @@ impl Identity {
         Ok(SubscribeRecordOutcome::Fresh)
     }
 
-    /// Accepts a WebSocket connection after checking replay protection (query-param auth) or
-    /// setting up pending first-frame auth.
+    /// Accepts a WebSocket connection for first-frame audience-bound v2 authentication.
     ///
     /// Pending unauthenticated sockets are capped separately ([`MAX_PENDING_WEBSOCKETS`], HTTP
     /// 429) and NEVER evict authenticated sockets. Authenticated sockets are capped at
     /// [`MAX_WEBSOCKETS`], evicting the oldest authenticated socket only when an authenticated
-    /// connection arrives.
+    /// connection completes verification.
     pub(super) async fn accept_websocket(&self, request: &Request) -> Result<Response> {
-        let now_ms = Date::now().as_millis();
         let now_f64 = js_sys::Date::now();
         let deployment_authenticated = deployment_auth_header_satisfied(
             request.headers().get(HEADER_DEPLOYMENT_AUTH)?.as_deref(),
         );
-        let storage_allowed = || -> Result<bool> {
-            let has_core_tables = !deployment_authenticated && self.has_tables()?;
-            Ok(allow_subscription_storage(
-                deployment_authenticated,
-                has_core_tables,
-            ))
-        };
-
-        let attachment = if let (Some(sig_hex), Some(ts_str)) = (
-            request.headers().get(HEADER_SUBSCRIBE_SIG)?,
-            request.headers().get(HEADER_SUBSCRIBE_TS)?,
-        ) {
-            let Some(sig) = crate::decode_hex_fixed::<64>(&sig_hex) else {
-                return Response::error("malformed subscription", 400);
-            };
-            let Ok(ts) = ts_str.parse::<u64>() else {
-                return Response::error("malformed subscription", 400);
-            };
-            if ts.abs_diff(now_ms) > MAX_CLOCK_SKEW {
-                return Response::error("invalid subscription", 403);
-            }
-            if !storage_allowed()? {
-                return Response::error("sign in to this server to use it", 403);
-            }
-            match self.record_subscribe_signature(&sig, ts, now_ms).await? {
-                SubscribeRecordOutcome::Fresh => {}
-                SubscribeRecordOutcome::Replayed => {
-                    return Response::error("replayed subscription", 403);
-                }
-                SubscribeRecordOutcome::CapacityExceeded => {
-                    return Response::error("too many recent subscriptions", 429);
-                }
-            }
-            self.prune_and_cap_authenticated(now_f64, MAX_WEBSOCKETS - 1, None);
-            WsAttachment {
-                opened_at: now_f64,
-                authenticated: true,
-                expected_identity: None,
-                expected_audience: None,
-            }
-        } else if let Some(id_hex) = request.headers().get(HEADER_PENDING_IDENTITY)? {
-            let Some(id) = crate::decode_hex_fixed::<32>(&id_hex) else {
-                return Response::error("malformed identity", 400);
-            };
-            let Some(raw) = request.headers().get(HEADER_SUBSCRIBE_AUDIENCE)? else {
-                return Response::error("missing subscription audience", 400);
-            };
-            let Ok(audience) = protocol::normalize_audience(&crate::subscribe_audience(raw)) else {
-                return Response::error("malformed subscription audience", 400);
-            };
-            if !storage_allowed()? {
-                return Response::error("sign in to this server to use it", 403);
-            }
-            if self.prune_and_count_pending(now_f64) >= MAX_PENDING_WEBSOCKETS {
-                return Response::error("too many pending connections", 429);
-            }
-            WsAttachment {
-                opened_at: now_f64,
-                authenticated: false,
-                expected_identity: Some(id.to_vec()),
-                expected_audience: Some(audience),
-            }
-        } else {
+        if !deployment_authenticated {
+            return Response::error("sign in to this server to use it", 403);
+        }
+        let Some(id_hex) = request.headers().get(HEADER_PENDING_IDENTITY)? else {
             return Response::error("unauthorized", 403);
+        };
+        let Some(id) = crate::decode_hex_fixed::<32>(&id_hex) else {
+            return Response::error("malformed identity", 400);
+        };
+        let Ok(audience) = crate::server_id(&self.env, request) else {
+            return Response::error("malformed subscription audience", 400);
+        };
+        if self.prune_and_count_pending(now_f64) >= MAX_PENDING_WEBSOCKETS {
+            return Response::error("too many pending connections", 429);
+        }
+        let attachment = WsAttachment {
+            opened_at: now_f64,
+            authenticated: false,
+            expected_identity: Some(id.to_vec()),
+            expected_audience: Some(audience),
         };
 
         let pair = WebSocketPair::new()?;
@@ -415,8 +395,8 @@ impl Identity {
     }
 }
 
-/// Reads the socket attachment, supporting both the new [`WsAttachment`] struct and legacy bare
-/// `f64` attachments from sockets opened before upgrade.
+/// Reads the socket attachment, supporting both the [`WsAttachment`] struct and bare `f64`
+/// attachments from already-open hibernating sockets across worker deploys.
 fn read_ws_attachment(socket: &WebSocket) -> Option<WsAttachment> {
     if let Ok(Some(att)) = socket.deserialize_attachment::<WsAttachment>() {
         return Some(att);
@@ -435,7 +415,23 @@ fn read_ws_attachment(socket: &WebSocket) -> Option<WsAttachment> {
 
 #[cfg(test)]
 mod tests {
+    use prost::bytes::Bytes;
+    use xeddsa::XEdDSAPrivateKey;
+
     use super::*;
+
+    fn legacy_unbound_subscribe(identity: &XEdDSAPrivateKey, timestamp: u64) -> SubscribeRequest {
+        let key = identity.compute_public_key().to_bytes();
+        let mut msg = b"notify.v1/subscribe".to_vec();
+        msg.extend_from_slice(&key);
+        msg.extend_from_slice(&timestamp.to_le_bytes());
+        SubscribeRequest {
+            identity_key: Bytes::copy_from_slice(&key),
+            timestamp,
+            signature: Bytes::copy_from_slice(&identity.sign(msg)),
+            audience: String::new(),
+        }
+    }
 
     #[test]
     fn deployment_auth_header_requires_exactly_one() {
@@ -446,10 +442,83 @@ mod tests {
     }
 
     #[test]
-    fn subscription_storage_requires_deployment_auth_or_core_tables() {
-        assert!(!allow_subscription_storage(false, false));
-        assert!(allow_subscription_storage(false, true));
-        assert!(allow_subscription_storage(true, false));
-        assert!(allow_subscription_storage(true, true));
+    fn first_frame_rejects_unbound_legacy_v1_subscribe_with_4010() {
+        let identity = XEdDSAPrivateKey::generate();
+        let key = identity.compute_public_key().to_bytes();
+        let now = 1_000_000;
+        let unbound = legacy_unbound_subscribe(&identity, now);
+
+        assert_eq!(
+            verify_first_frame_subscribe(&unbound, &key, "relay.example", now),
+            Err(WsClose {
+                code: 4010,
+                reason: "Legacy v1 notifications deprecated; refresh or upgrade the app",
+            })
+        );
+    }
+
+    #[test]
+    fn first_frame_accepts_valid_audience_bound_v2_and_rejects_mismatches() {
+        let alice = XEdDSAPrivateKey::generate();
+        let bob = XEdDSAPrivateKey::generate();
+        let alice_key = alice.compute_public_key().to_bytes();
+        let bob_key = bob.compute_public_key().to_bytes();
+        let now = 1_000_000;
+
+        let valid =
+            SubscribeRequest::sign_for_audience(&alice, "https://Relay.Example", now).unwrap();
+        let sig = verify_first_frame_subscribe(&valid, &alice_key, "relay.example", now).unwrap();
+        assert_eq!(sig.as_slice(), valid.signature.as_ref());
+
+        // Wrong audience -> 1008 invalid subscription.
+        assert_eq!(
+            verify_first_frame_subscribe(&valid, &alice_key, "other.example", now),
+            Err(WsClose {
+                code: 1008,
+                reason: "invalid subscription",
+            })
+        );
+
+        // Wrong identity -> 1008 identity mismatch.
+        assert_eq!(
+            verify_first_frame_subscribe(&valid, &bob_key, "relay.example", now),
+            Err(WsClose {
+                code: 1008,
+                reason: "identity mismatch",
+            })
+        );
+
+        // Stale timestamp -> 1008 invalid subscription.
+        assert_eq!(
+            verify_first_frame_subscribe(
+                &valid,
+                &alice_key,
+                "relay.example",
+                now + MAX_CLOCK_SKEW + 1
+            ),
+            Err(WsClose {
+                code: 1008,
+                reason: "invalid subscription",
+            })
+        );
+
+        // Tampered audience on a v1 signature -> 1008 invalid subscription (not 4010).
+        let mut tampered = legacy_unbound_subscribe(&alice, now);
+        tampered.audience = "relay.example".into();
+        assert_eq!(
+            verify_first_frame_subscribe(&tampered, &alice_key, "relay.example", now),
+            Err(WsClose {
+                code: 1008,
+                reason: "invalid subscription",
+            })
+        );
+
+        // Non-default ports are preserved end-to-end.
+        let http_443 =
+            SubscribeRequest::sign_for_audience(&alice, "http://relay.example:443", now).unwrap();
+        assert!(
+            verify_first_frame_subscribe(&http_443, &alice_key, "relay.example:443", now).is_ok()
+        );
+        assert!(verify_first_frame_subscribe(&http_443, &alice_key, "relay.example", now).is_err());
     }
 }
