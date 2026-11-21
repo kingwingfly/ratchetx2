@@ -54,7 +54,7 @@ use crate::{
         Attachment, Body, ClassicalPrompt, ContactView, Delivery, Dialog, FileView, Link,
         LocalFile, Me, MessageView, Opening, PendingNewChat, Phase, RemoteFile, SecurityAlert,
         SecurityView, ServerPqStatus, SignIn, SignInFlow, SignInSuccessAction, Step, Ui,
-        UploadState, UploadView, order,
+        UnavailableReason, UploadState, UploadView, order,
     },
     transport::{self, Connect, Fetch, Progress},
     util::{
@@ -240,10 +240,40 @@ struct Stream {
     clock: u64,
 }
 
+/// Result of saving post-quantum encryption preferences in [`Engine::set_pq_config`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PqSaveOutcome {
+    /// Config matched current vault state and no publish was pending.
+    Unchanged,
+    /// Config was saved locally and updated prekeys/manifest were published to the server.
+    Published,
+    /// Config was saved locally; publishing updated prekeys requires signing in first.
+    SavedLocallyNeedsSignIn,
+    /// Config was saved locally; publishing updated prekeys will retry once connected.
+    SavedLocallyPendingPublish,
+}
+
+/// Error fetching an attachment chunk, preserving HTTP 404 (`NotFound`) so callers can mark the
+/// attachment gone from the server.
+enum FetchError {
+    NotFound(String),
+    Other(String),
+}
+
+impl FetchError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NotFound(msg) | Self::Other(msg) => msg,
+        }
+    }
+}
+
 /// What fetching an attachment's chunks takes, see [`Engine::chunk`].
 struct Fetching {
     /// The chat it is in.
     peer: PublicKey,
+    /// Its entry in the history.
+    index: u64,
     id: [u8; 16],
     key: Zeroizing<[u8; attachment::KEY_LENGTH]>,
     key_hash: [u8; 32],
@@ -664,6 +694,7 @@ impl Engine {
                 insecure_context: true,
             } => {
                 self.ui.phase.set(Phase::Unavailable(
+                    UnavailableReason::InsecureContext,
                     "This page requires a secure context (HTTPS or localhost) for the Web Locks \
                      API, which prevents concurrent tabs from corrupting your vault."
                         .to_string(),
@@ -674,6 +705,7 @@ impl Engine {
                 insecure_context: false,
             } => {
                 self.ui.phase.set(Phase::Unavailable(
+                    UnavailableReason::LocksUnavailable,
                     "This browser does not provide the Web Locks API, so the vault cannot be \
                      opened safely without risking concurrent tab corruption."
                         .to_string(),
@@ -685,7 +717,10 @@ impl Engine {
             Ok(true) => self.ui.phase.set(Phase::Locked),
             Ok(false) => self.ui.phase.set(Phase::Create),
             // Offering to create one could replace a vault that is there.
-            Err(e) => self.ui.phase.set(Phase::Unavailable(describe(&e))),
+            Err(e) => self
+                .ui
+                .phase
+                .set(Phase::Unavailable(UnavailableReason::StorageUnavailable, describe(&e))),
         }
     }
 
@@ -1949,6 +1984,132 @@ impl Engine {
         }
     }
 
+    /// Execute a full signed-prekey + manifest publish under the held `inner` lock, preserving the
+    /// structured [`ErrorKind`] so [`set_pq_config`](Self::set_pq_config) can distinguish definitive
+    /// server refusals from transient network/sign-in failures.
+    async fn publish_full(
+        &self,
+        inner: &mut Inner,
+        now_anyway: bool,
+    ) -> Result<(), (Option<ErrorKind>, String)> {
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            let prepared = inner
+                .client
+                .prepare_publish_v2(&inner.audience, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS)
+                .map_err(|e| (Some(e.kind()), describe(&e)))?;
+            // H-2: Persist new prekeys & manifest state BEFORE transmitting!
+            inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+            match inner
+                .client
+                .transmit_publish_v2_or_v1_fallback(&prepared)
+                .await
+            {
+                Ok(outcome) => {
+                    inner.client.commit_publish_v2(prepared);
+                    self.publish_waits_sign_in.set(false);
+                    inner.state.published_at = now();
+                    inner.state.used_one_time_prekeys = 0;
+                    inner.state.used_pq_one_time_prekeys = 0;
+                    inner.state.needs_publish = false;
+                    inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
+                    let log_msg = match outcome {
+                        PublishV2Outcome::V2Pq => {
+                            let suites_len = inner.client.pq_config().offered_suites().len();
+                            inner.last_server_pq_opks =
+                                Some((PQ_ONE_TIME_PREKEYS * suites_len) as u32);
+                            if inner.server_pq == ServerPqStatus::Disabled {
+                                inner.server_pq = ServerPqStatus::Unknown;
+                            }
+                            "published post-quantum + classical prekeys and signed capability manifest"
+                        }
+                        PublishV2Outcome::V2ClassicalOff => {
+                            inner.last_server_pq_opks = Some(0);
+                            if inner.client.pq_config().pq_enabled {
+                                inner.server_pq = ServerPqStatus::Disabled;
+                                "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
+                            } else {
+                                "published classical prekeys and signed PQ-off capability manifest"
+                            }
+                        }
+                        PublishV2Outcome::V1Fallback => {
+                            inner.last_server_pq_opks = Some(0);
+                            inner.server_pq = ServerPqStatus::Disabled;
+                            "published classical prekeys via v1 fallback"
+                        }
+                    };
+                    inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+                    self.ui.me.set(Some(inner.me()));
+                    self.ui.log(log_msg);
+                    Ok(())
+                }
+                Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                    inner.client.rollback_publish_v2_on_refusal(prepared);
+                    inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+                    self.publish_waits_sign_in.set(true);
+                    if !now_anyway {
+                        return Ok(());
+                    }
+                    Err((Some(ErrorKind::SignInRequired), describe(&e)))
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::PqRequired
+                            | ErrorKind::LimitExceeded
+                            | ErrorKind::UnsupportedSuite
+                            | ErrorKind::InvalidKeys
+                    ) =>
+                {
+                    let kind = e.kind();
+                    inner.client.rollback_publish_v2_on_refusal(prepared);
+                    inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+                    Err((Some(kind), describe(&e)))
+                }
+                Err(e) => Err((Some(e.kind()), describe(&e))),
+            }
+        }
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        {
+            let prepared = inner
+                .client
+                .prepare_publish(ONE_TIME_PREKEYS)
+                .map_err(|e| (Some(e.kind()), describe(&e)))?;
+            // H-2: Persist new prekeys BEFORE transmitting!
+            inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+            match inner.client.transmit_publish(&prepared).await {
+                Ok(()) => {
+                    inner.client.commit_publish(prepared);
+                    self.publish_waits_sign_in.set(false);
+                    inner.state.published_at = now();
+                    inner.state.used_one_time_prekeys = 0;
+                    inner.state.needs_publish = false;
+                    inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
+                    inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+                    self.ui.log(format!(
+                        "published a new signed prekey and {ONE_TIME_PREKEYS} one-time prekeys"
+                    ));
+                    Ok(())
+                }
+                Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                    inner.client.rollback_publish_on_refusal(prepared);
+                    inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+                    self.publish_waits_sign_in.set(true);
+                    if !now_anyway {
+                        return Ok(());
+                    }
+                    Err((Some(ErrorKind::SignInRequired), describe(&e)))
+                }
+                Err(e) if e.kind() == ErrorKind::LimitExceeded => {
+                    inner.client.rollback_publish_on_refusal(prepared);
+                    inner.save(&[]).await.map_err(|e| (None, describe(&e)))?;
+                    Err((Some(ErrorKind::LimitExceeded), describe(&e)))
+                }
+                Err(e) => Err((Some(e.kind()), describe(&e))),
+            }
+        }
+    }
+
     /// Publish new prekeys (SPK rotation / PQ manifest) if due or requested, or replenish low
     /// OPKs/PQOPKs WITHOUT rotating SPK via non-rotating refill. Always persists newly generated
     /// private keys to IndexedDB BEFORE transmitting over the network (H-2).
@@ -1972,118 +2133,10 @@ impl Engine {
             if self.publish_waits_sign_in.get() && !now_anyway {
                 return Ok(());
             }
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            {
-                let prepared = inner
-                    .client
-                    .prepare_publish_v2(&inner.audience, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS)
-                    .map_err(|e| describe(&e))?;
-                // H-2: Persist new prekeys & manifest state BEFORE transmitting!
-                inner.save(&[]).await.map_err(|e| describe(&e))?;
-                match inner
-                    .client
-                    .transmit_publish_v2_or_v1_fallback(&prepared)
-                    .await
-                {
-                    Ok(outcome) => {
-                        inner.client.commit_publish_v2(prepared);
-                        self.publish_waits_sign_in.set(false);
-                        inner.state.published_at = now();
-                        inner.state.used_one_time_prekeys = 0;
-                        inner.state.used_pq_one_time_prekeys = 0;
-                        inner.state.needs_publish = false;
-                        inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
-                        let log_msg = match outcome {
-                            PublishV2Outcome::V2Pq => {
-                                let suites_len = inner.client.pq_config().offered_suites().len();
-                                inner.last_server_pq_opks =
-                                    Some((PQ_ONE_TIME_PREKEYS * suites_len) as u32);
-                                if inner.server_pq == ServerPqStatus::Disabled {
-                                    inner.server_pq = ServerPqStatus::Unknown;
-                                }
-                                "published post-quantum + classical prekeys and signed capability manifest"
-                            }
-                            PublishV2Outcome::V2ClassicalOff => {
-                                inner.last_server_pq_opks = Some(0);
-                                if inner.client.pq_config().pq_enabled {
-                                    inner.server_pq = ServerPqStatus::Disabled;
-                                    "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
-                                } else {
-                                    "published classical prekeys and signed PQ-off capability manifest"
-                                }
-                            }
-                            PublishV2Outcome::V1Fallback => {
-                                inner.last_server_pq_opks = Some(0);
-                                inner.server_pq = ServerPqStatus::Disabled;
-                                "published classical prekeys via v1 fallback"
-                            }
-                        };
-                        inner.save(&[]).await.map_err(|e| describe(&e))?;
-                        self.ui.me.set(Some(inner.me()));
-                        self.ui.log(log_msg);
-                        return Ok(());
-                    }
-                    Err(e) if e.kind() == ErrorKind::SignInRequired => {
-                        inner.client.rollback_publish_v2_on_refusal(prepared);
-                        inner.save(&[]).await.map_err(|e| describe(&e))?;
-                        self.publish_waits_sign_in.set(true);
-                        if !now_anyway {
-                            return Ok(());
-                        }
-                        return Err(describe(&e));
-                    }
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            ErrorKind::PqRequired | ErrorKind::LimitExceeded
-                        ) =>
-                    {
-                        inner.client.rollback_publish_v2_on_refusal(prepared);
-                        inner.save(&[]).await.map_err(|e| describe(&e))?;
-                        return Err(describe(&e));
-                    }
-                    Err(e) => return Err(describe(&e)),
-                }
-            }
-            #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-            {
-                let prepared = inner
-                    .client
-                    .prepare_publish(ONE_TIME_PREKEYS)
-                    .map_err(|e| describe(&e))?;
-                // H-2: Persist new prekeys BEFORE transmitting!
-                inner.save(&[]).await.map_err(|e| describe(&e))?;
-                match inner.client.transmit_publish(&prepared).await {
-                    Ok(()) => {
-                        inner.client.commit_publish(prepared);
-                        self.publish_waits_sign_in.set(false);
-                        inner.state.published_at = now();
-                        inner.state.used_one_time_prekeys = 0;
-                        inner.state.needs_publish = false;
-                        inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
-                        inner.save(&[]).await.map_err(|e| describe(&e))?;
-                        self.ui.log(format!(
-                            "published a new signed prekey and {ONE_TIME_PREKEYS} one-time prekeys"
-                        ));
-                        return Ok(());
-                    }
-                    Err(e) if e.kind() == ErrorKind::SignInRequired => {
-                        inner.client.rollback_publish_on_refusal(prepared);
-                        inner.save(&[]).await.map_err(|e| describe(&e))?;
-                        self.publish_waits_sign_in.set(true);
-                        if !now_anyway {
-                            return Ok(());
-                        }
-                        return Err(describe(&e));
-                    }
-                    Err(e) if e.kind() == ErrorKind::LimitExceeded => {
-                        inner.client.rollback_publish_on_refusal(prepared);
-                        inner.save(&[]).await.map_err(|e| describe(&e))?;
-                        return Err(describe(&e));
-                    }
-                    Err(e) => return Err(describe(&e)),
-                }
-            }
+            return self
+                .publish_full(inner, now_anyway)
+                .await
+                .map_err(|(_, msg)| msg);
         }
 
         // M-5: Non-rotating OPK/PQOPK refill (does NOT rotate SPK!).
@@ -2498,19 +2551,25 @@ impl Engine {
     /// Save `content` for `peer`, then push it, encrypted as its turn comes. What the user sends
     /// goes through [`Engine::queue`], to go in order.
     async fn send(&self, peer: PublicKey, content: Kind) -> Result<(), String> {
-        {
+        self.send_returning_index(peer, content).await.map(drop)
+    }
+
+    async fn send_returning_index(&self, peer: PublicKey, content: Kind) -> Result<u64, String> {
+        let index = {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
             let view = inner.add(&peer, content, false).await?;
+            let index = view.index;
             self.show_new(inner, &peer, vec![view]);
             self.ui.contacts.set(inner.views());
-        }
+            index
+        };
         // Saved, so it goes in a later sync if not now.
         if let Err(e) = self.flush(&peer).await {
             self.ui.link.set(Link::Offline(e));
         }
         self.wake();
-        Ok(())
+        Ok(index)
     }
 
     /// Send `peer` an attachment of `file`, then upload it: the peer can download it meanwhile,
@@ -2654,6 +2713,11 @@ impl Engine {
             };
             let key = (peer, id, attachment_key_hash(&pending.key));
             let Some(file) = self.files.borrow().get(&key).cloned() else {
+                self.show_upload(
+                    &peer,
+                    &pending,
+                    UploadState::Paused("choose the file again to upload".to_string()),
+                );
                 continue;
             };
             if let Err(e) = self.start_waiting(peer, id, file).await {
@@ -2734,7 +2798,7 @@ impl Engine {
             token: upload.token().to_vec(),
             key: upload.key().to_vec(),
             prefix_hash: Sha256::digest([]).to_vec(),
-            history_index: 0,
+            history_index: kept.history_index,
             expires: upload.expires().unwrap_or_default(),
             ..kept
         };
@@ -2845,8 +2909,11 @@ impl Engine {
             expires: pending.expires,
         };
         // Sent first, then kept: going wrong in between sends it twice, not never.
-        self.send(*peer, Kind::Attachment(pointer)).await?;
+        let index = self
+            .send_returning_index(*peer, Kind::Attachment(pointer))
+            .await?;
         pending.announced = true;
+        pending.history_index = index;
         self.save_upload(peer, &pending).await?;
         Ok(pending)
     }
@@ -3002,11 +3069,21 @@ impl Engine {
                 describe(&e)
             ));
         }
+        let announced = pending
+            .as_ref()
+            .filter(|pending| pending.announced)
+            .map(|pending| pending.history_index);
         inner
             .vault
             .forget_upload(&peer, &id)
             .await
-            .map_err(|e| describe(&e))
+            .map_err(|e| describe(&e))?;
+        if let Some(hint_index) = announced {
+            let _ = self
+                .note_gone_inner(inner, &peer, Some(hint_index), &id)
+                .await;
+        }
+        Ok(())
     }
 
     /// Cancel the message at `index`, to `peer`, held until this browser signs in to the server:
@@ -3127,11 +3204,7 @@ impl Engine {
         if file.size() as u64 != pending.size {
             return Err(other());
         }
-        self.show_upload(
-            peer,
-            pending,
-            UploadState::Paused("checking the file…".into()),
-        );
+        self.show_upload(peer, pending, UploadState::Checking);
         let mut hasher = Sha256::new();
         for index in 0..pending.encrypted {
             hasher.update(read_chunk(file, index, pending.size).await?);
@@ -3171,6 +3244,11 @@ impl Engine {
             // go up.
             Ok(false) => {
                 self.drop_upload(&peer, id).await?;
+                if pending.announced {
+                    let _ = self
+                        .note_gone_by_id(&peer, Some(pending.history_index), &id)
+                        .await;
+                }
                 return Err(format!(
                     "{} is no longer on the server, so its upload stopped",
                     pending.name
@@ -3254,21 +3332,74 @@ impl Engine {
     /// gone from the server, unless the entry is no longer that attachment's message, as the
     /// chat was deleted, and maybe started again, meanwhile.
     async fn note_gone(&self, peer: &PublicKey, index: u64, id: &[u8; 16]) -> Result<(), String> {
+        self.note_gone_by_id(peer, Some(index), id).await
+    }
+
+    /// Locate the history entry for attachment `id` (checking `hint_index` first, then scanning
+    /// history backwards if needed) and mark it `gone = true`, updating `ui.gone` immediately.
+    async fn note_gone_by_id(
+        &self,
+        peer: &PublicKey,
+        hint_index: Option<u64>,
+        id: &[u8; 16],
+    ) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        let entry = inner
-            .vault
-            .entry(peer, index)
-            .await
-            .map_err(|e| describe(&e))?;
-        let Some(mut entry) = entry.filter(|entry| {
+        self.note_gone_inner(inner, peer, hint_index, id).await
+    }
+
+    async fn note_gone_inner(
+        &self,
+        inner: &mut Inner,
+        peer: &PublicKey,
+        hint_index: Option<u64>,
+        id: &[u8; 16],
+    ) -> Result<(), String> {
+        let matches_id = |entry: &HistoryEntry| {
             matches!(
                 entry.content.as_ref().and_then(|content| content.kind.as_ref()),
                 Some(Kind::Attachment(pointer)) if pointer.id == id
             )
-        }) else {
+        };
+        let mut found: Option<(u64, HistoryEntry)> = None;
+        if let Some(index) = hint_index
+            && let Some(entry) = inner
+                .vault
+                .entry(peer, index)
+                .await
+                .map_err(|e| describe(&e))?
+                .filter(matches_id)
+        {
+            found = Some((index, entry));
+        }
+        if found.is_none() {
+            let mut end = inner
+                .contacts
+                .iter()
+                .find(|contact| contact.peer == *peer)
+                .map_or(0, |contact| contact.state.history_len);
+            while end > 0 && found.is_none() {
+                let page = inner
+                    .vault
+                    .history(peer, end, HISTORY_SHOWN)
+                    .await
+                    .map_err(|e| describe(&e))?;
+                found = page
+                    .into_iter()
+                    .rev()
+                    .find(|(_, entry)| matches_id(entry));
+                end = end.saturating_sub(HISTORY_SHOWN);
+            }
+        }
+        let Some((index, mut entry)) = found else {
             return Ok(());
         };
+        self.ui.gone.update(|gone| {
+            gone.insert((*peer, index));
+        });
+        if entry.gone {
+            return Ok(());
+        }
         entry.gone = true;
         inner
             .save(&records(peer, &[(index, entry)]))
@@ -3415,6 +3546,7 @@ impl Engine {
     pub async fn open_attachment(
         &self,
         peer: PublicKey,
+        index: u64,
         pointer: AttachmentPointer,
         clock: u64,
     ) -> Result<(), String> {
@@ -3435,10 +3567,15 @@ impl Engine {
             done: 0,
             waiting: false,
         }));
-        let opened = self
-            .fetch_attachment(peer, &id, pointer, Waiter::Viewer)
+        let fetched = self
+            .fetch_attachment(peer, index, &id, pointer, Waiter::Viewer)
             .await;
-        let opened = self.told_downloaded(peer, clock, opened).await;
+        if let Err(FetchError::NotFound(_)) = &fetched {
+            let _ = self.note_gone_by_id(&peer, Some(index), &id).await;
+        }
+        let opened = self
+            .told_downloaded(peer, clock, fetched.map_err(FetchError::into_message))
+            .await;
         // Unless the viewer closed, or went on to another file, meanwhile.
         if !self.opening(&id) {
             return Ok(());
@@ -3464,6 +3601,7 @@ impl Engine {
     pub async fn media(
         &self,
         peer: PublicKey,
+        index: u64,
         pointer: AttachmentPointer,
         clock: u64,
         shows: &dyn Fn() -> bool,
@@ -3472,9 +3610,13 @@ impl Engine {
             return Err("the attachment is malformed".to_string());
         };
         let fetched = self
-            .fetch_attachment(peer, &id, pointer, Waiter::Chat(shows))
+            .fetch_attachment(peer, index, &id, pointer, Waiter::Chat(shows))
             .await;
-        self.told_downloaded(peer, clock, fetched).await
+        if let Err(FetchError::NotFound(_)) = &fetched {
+            let _ = self.note_gone_by_id(&peer, Some(index), &id).await;
+        }
+        self.told_downloaded(peer, clock, fetched.map_err(FetchError::into_message))
+            .await
     }
 
     /// The attachment `fetched`, once the peer is told it is downloaded, if it is the peer's,
@@ -3541,10 +3683,11 @@ impl Engine {
     async fn fetch_attachment(
         &self,
         peer: PublicKey,
+        index: u64,
         id: &[u8; 16],
         pointer: AttachmentPointer,
         waiter: Waiter<'_>,
-    ) -> Result<Option<(Attachment, bool)>, String> {
+    ) -> Result<Option<(Attachment, bool)>, FetchError> {
         // The sender's own, while on the page that chose it: keyed by `(peer, id, key_hash)` so
         // another peer or mismatched key can never read a cached plaintext file (M-13).
         let key_hash = attachment_key_hash(&pointer.key);
@@ -3552,7 +3695,7 @@ impl Engine {
         if let Some(file) = file {
             let buffer = JsFuture::from(file.array_buffer())
                 .await
-                .map_err(|e| format!("Cannot read {}: {}", pointer.name, js_error(e)))?;
+                .map_err(|e| FetchError::Other(format!("Cannot read {}: {}", pointer.name, js_error(e))))?;
             let attachment = Attachment {
                 name: pointer.name,
                 mime: pointer.mime,
@@ -3560,12 +3703,17 @@ impl Engine {
             };
             return Ok(Some((attachment, false)));
         }
-        let fetching = self.fetching(peer, &pointer).await?;
+        let fetching = self
+            .fetching(peer, index, &pointer)
+            .await
+            .map_err(FetchError::Other)?;
         // It grows as its chunks decrypt, not to the size the peer claims, which nothing backs
         // until they do.
         let (mut data, mut fetched) = (vec![], false);
-        for index in 0..fetching.chunks {
-            let Some((plaintext, from_server)) = self.chunk(&fetching, index, waiter).await? else {
+        for chunk_index in 0..fetching.chunks {
+            let Some((plaintext, from_server)) =
+                self.chunk(&fetching, chunk_index, waiter).await?
+            else {
                 return Ok(None);
             };
             fetched |= from_server;
@@ -3575,7 +3723,10 @@ impl Engine {
             }
         }
         if data.len() as u64 != pointer.size {
-            return Err(format!("{} is not the size it should be", pointer.name));
+            return Err(FetchError::Other(format!(
+                "{} is not the size it should be",
+                pointer.name
+            )));
         }
         let attachment = Attachment {
             name: pointer.name,
@@ -3594,13 +3745,14 @@ impl Engine {
     pub async fn stream(
         &self,
         peer: PublicKey,
+        index: u64,
         pointer: &AttachmentPointer,
         clock: u64,
     ) -> Option<String> {
         if !glue::streaming() {
             return None;
         }
-        let fetching = self.fetching(peer, pointer).await.ok()?;
+        let fetching = self.fetching(peer, index, pointer).await.ok()?;
         let mut token = [0; 16];
         getrandom::fill(&mut token).ok()?;
         let token = hex(&token);
@@ -3759,9 +3911,16 @@ impl Engine {
             Some(file) => (read_chunk(&file, index, fetching.size).await?, false),
             None => {
                 let plays = || self.streams.borrow().contains_key(token);
-                match self.chunk(fetching, index, Waiter::Chat(&plays)).await? {
-                    Some(chunk) => chunk,
-                    None => return Ok(None),
+                match self.chunk(fetching, index, Waiter::Chat(&plays)).await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => return Ok(None),
+                    Err(FetchError::NotFound(msg)) => {
+                        let _ = self
+                            .note_gone_by_id(&fetching.peer, Some(fetching.index), &fetching.id)
+                            .await;
+                        return Err(msg);
+                    }
+                    Err(FetchError::Other(msg)) => return Err(msg),
                 }
             }
         };
@@ -3802,6 +3961,7 @@ impl Engine {
     async fn fetching(
         &self,
         peer: PublicKey,
+        index: u64,
         pointer: &AttachmentPointer,
     ) -> Result<Fetching, String> {
         let malformed = || "the attachment is malformed".to_string();
@@ -3831,6 +3991,7 @@ impl Engine {
             .map(|pending| pending.uploaded);
         Ok(Fetching {
             peer,
+            index,
             id,
             key,
             key_hash,
@@ -3850,20 +4011,24 @@ impl Engine {
         fetching: &Fetching,
         index: u32,
         waiter: Waiter<'_>,
-    ) -> Result<Option<(Vec<u8>, bool)>, String> {
+    ) -> Result<Option<(Vec<u8>, bool)>, FetchError> {
         if !self.waits(waiter, &fetching.id) {
             return Ok(None);
         }
-        let (chunk, kept) = match self.kept_chunk(&fetching.peer, &fetching.id, index).await? {
+        let (chunk, kept) = match self
+            .kept_chunk(&fetching.peer, &fetching.id, index)
+            .await
+            .map_err(FetchError::Other)?
+        {
             Some(chunk) => (chunk, true),
             None if fetching
                 .unfinished
                 .is_some_and(|uploaded| index >= uploaded) =>
             {
-                return Err(format!(
+                return Err(FetchError::Other(format!(
                     "{} is not all uploaded: choose the file again to go on",
                     fetching.name
-                ));
+                )));
             }
             None => match self
                 .await_chunk(
@@ -3881,12 +4046,13 @@ impl Engine {
         };
         let last = index + 1 == fetching.chunks;
         let plaintext = attachment::decrypt_chunk(&fetching.key, index, last, &chunk)
-            .map_err(|_| format!("{} does not decrypt", fetching.name))?;
+            .map_err(|_| FetchError::Other(format!("{} does not decrypt", fetching.name)))?;
         // Kept only once it decrypts, so that a chunk that does not is fetched again next time
         // rather than kept for good.
         if !kept {
             self.keep_chunk(&fetching.peer, &fetching.id, index, &chunk)
-                .await?;
+                .await
+                .map_err(FetchError::Other)?;
         }
         Ok(Some((plaintext, !kept)))
     }
@@ -3901,7 +4067,7 @@ impl Engine {
         id: &[u8; 16],
         index: u32,
         waiter: Waiter<'_>,
-    ) -> Result<Option<Vec<u8>>, String> {
+    ) -> Result<Option<Vec<u8>>, FetchError> {
         let (mut waited, mut wait) = (0, POLL_CHUNK_MIN);
         loop {
             if !self.waits(waiter, id) {
@@ -3921,18 +4087,19 @@ impl Engine {
                     wait = (wait * 2).min(POLL_CHUNK_MAX);
                 }
                 Ok(None) => {
-                    return Err(format!(
+                    return Err(FetchError::Other(format!(
                         "{name} is still being uploaded, but nothing came for a while; open it \
                          again later"
-                    ));
+                    )));
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {
-                    return Err(format!(
-                        "{name} is no longer on the server: its sender cancelled it, or it \
-                         expired, as the server keeps attachments for a while only"
-                    ));
+                    return Err(FetchError::NotFound(format!(
+                        "{name} is no longer on the server: it was deleted from the server, its \
+                         upload was cancelled, or it expired (the server keeps attachments \
+                         temporarily)"
+                    )));
                 }
-                Err(e) => return Err(describe(&e)),
+                Err(e) => return Err(FetchError::Other(describe(&e))),
             }
         }
     }
@@ -4458,6 +4625,7 @@ impl Engine {
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.peer != peer));
+        self.ui.gone.update(|gone| gone.retain(|(p, _)| *p != peer));
         // Nor does what waited for a sign-in, which would otherwise hold up a chat started
         // again with the peer, or go to it.
         self.waits_sign_in.borrow_mut().remove(&peer);
@@ -4510,13 +4678,19 @@ impl Engine {
     /// Update local post-quantum security preferences, persist them, and publish a signed
     /// `CapabilityManifest` (ON with PQSPK+PQOPKs, or OFF clearing server PQ prekeys while keeping
     /// local PQ keys for in-flight handshakes).
-    pub async fn set_pq_config(&self, config: PqConfig) -> Result<(), String> {
-        {
+    ///
+    /// Definitive server refusals (such as `PqRequired` on a classical-only server or
+    /// `LimitExceeded`) roll back the modified `PqConfig` cleanly so cancelling `Settings` never
+    /// leaves rejected preferences persisted. Transient offline / sign-in failures keep the
+    /// durable local preference with `needs_publish = true` and report that explicitly.
+    pub async fn set_pq_config(&self, config: PqConfig) -> Result<PqSaveOutcome, String> {
+        let (previous, previous_needs_publish) = {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
             let previous = inner.client.pq_config().clone();
-            if previous == config && !inner.state.needs_publish {
-                return Ok(());
+            let previous_needs_publish = inner.state.needs_publish;
+            if previous == config && !previous_needs_publish {
+                return Ok(PqSaveOutcome::Unchanged);
             }
             inner
                 .client
@@ -4525,14 +4699,56 @@ impl Engine {
             inner.state.needs_publish = true;
             if let Err(e) = inner.save(&[]).await {
                 let _ = inner.client.set_pq_config(previous);
-                inner.state.needs_publish = false;
+                inner.state.needs_publish = previous_needs_publish;
                 return Err(describe(&e));
             }
             self.ui.me.set(Some(inner.me()));
-        }
+            (previous, previous_needs_publish)
+        };
         self.refresh_server_info(true).await;
+
+        let mut guard = self.inner.lock().await;
+        let inner = guard.as_mut().ok_or("locked")?;
+        if config.strict_pq && inner.server_pq == ServerPqStatus::Disabled {
+            let _ = inner.client.set_pq_config(previous);
+            inner.state.needs_publish = previous_needs_publish;
+            let _ = inner.save(&[]).await;
+            self.ui.me.set(Some(inner.me()));
+            return Err(
+                "Cannot require post-quantum encryption: this server does not have post-quantum \
+                 encryption enabled."
+                    .to_string(),
+            );
+        }
+
         // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.
-        self.publish(true).await
+        match self.publish_full(inner, true).await {
+            Ok(()) => Ok(PqSaveOutcome::Published),
+            Err((Some(kind), msg))
+                if matches!(
+                    kind,
+                    ErrorKind::PqRequired
+                        | ErrorKind::LimitExceeded
+                        | ErrorKind::UnsupportedSuite
+                        | ErrorKind::InvalidKeys
+                ) =>
+            {
+                let _ = inner.client.set_pq_config(previous);
+                inner.state.needs_publish = previous_needs_publish;
+                let _ = inner.save(&[]).await;
+                self.ui.me.set(Some(inner.me()));
+                if kind == ErrorKind::PqRequired {
+                    Err(
+                        "Cannot require post-quantum encryption: this server does not support it."
+                            .to_string(),
+                    )
+                } else {
+                    Err(msg)
+                }
+            }
+            Err((Some(ErrorKind::SignInRequired), _)) => Ok(PqSaveOutcome::SavedLocallyNeedsSignIn),
+            Err(_) => Ok(PqSaveOutcome::SavedLocallyPendingPublish),
+        }
     }
 
     /// Explicitly approve a classical fallback exception for `peer`, releasing any quarantined
@@ -4640,7 +4856,14 @@ impl Engine {
             let inner = guard.as_mut().ok_or("locked")?;
             let pq_cfg = inner.client.pq_config().clone();
             if !pq_cfg.pq_enabled || pq_cfg.offered_suites().is_empty() {
-                return Err("Enable post-quantum encryption in Your Identity first.".to_string());
+                return Err("Enable post-quantum encryption in Settings first.".to_string());
+            }
+            if inner.server_pq == ServerPqStatus::Disabled {
+                return Err(describe_upgrade_pq_error(
+                    ErrorKind::Unimplemented,
+                    &inner.server_pq,
+                    String::new(),
+                ));
             }
             let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
                 return Err("no such chat".to_string());
@@ -4676,7 +4899,10 @@ impl Engine {
                 Err(e) => {
                     inner.roll_back(&peer, snapshot)?;
                     let kind = e.kind();
-                    if let Some(contact) = inner.contact(&peer) {
+                    let persist_alert = inner
+                        .contact(&peer)
+                        .is_some_and(|c| c.session.needs_new_session() || c.state.quarantined);
+                    if persist_alert && let Some(contact) = inner.contact(&peer) {
                         match kind {
                             ErrorKind::DowngradeDetected => {
                                 contact.session.peer_pq_state_mut().downgrade_detected = true;
@@ -4697,10 +4923,14 @@ impl Engine {
                             }
                             _ => {}
                         }
+                        let _ = inner.save(&[]).await;
                     }
-                    let _ = inner.save(&[]).await;
                     self.ui.contacts.set(inner.views());
-                    return Err(describe(&e));
+                    return Err(describe_upgrade_pq_error(
+                        kind,
+                        &inner.server_pq,
+                        describe(&e),
+                    ));
                 }
             };
             // Verify that the new session actually negotiated post-quantum encryption.
@@ -5500,12 +5730,14 @@ impl Engine {
     }
 
     /// Show the history entries of the chat with `peer` that changed, `entries`, if it is on
-    /// screen: how far each got, and its place, in the chat's order.
+    /// screen: how far each got, its place, and updated body (such as held attachments gaining
+    /// their real upload pointer once signed in), in the chat's order.
     fn show_changes(&self, inner: &Inner, peer: &PublicKey, entries: &[(u64, HistoryEntry)]) {
         if self.ui.open.get_untracked() != Some(*peer) || entries.is_empty() {
             return;
         }
         let me = inner.client.identity_key();
+        let contact = inner.contacts.iter().find(|contact| contact.peer == *peer);
         self.ui.messages.update(|messages| {
             for (index, entry) in entries {
                 if let Some(message) = messages.iter_mut().find(|message| message.index == *index) {
@@ -5513,10 +5745,75 @@ impl Engine {
                     if entry.outgoing {
                         message.delivery = entry.delivery();
                     }
+                    if let Some(contact) = contact {
+                        let mut updated = contact.message(*index, entry.clone()).body;
+                        // Preserve already-loaded inline bytes on `Body::File` when delivery ticks
+                        // read back a stripped `HistoryEntry` from IndexedDB.
+                        if let (Body::File(existing), Body::File(next)) =
+                            (&message.body, &mut updated)
+                            && existing.data.is_some()
+                            && next.data.is_none()
+                        {
+                            next.data = existing.data.clone();
+                        }
+                        if message.body != updated {
+                            message.body = updated;
+                        }
+                    }
                 }
             }
             order(messages, &me, peer);
         });
+    }
+}
+
+/// Map `upgrade_to_pq` session errors to plain-English user messages, checking server PQ status
+/// first so a classical-only server is never blamed on the peer.
+#[cfg_attr(
+    not(any(feature = "ml-kem-1024", feature = "ml-kem-768")),
+    allow(dead_code)
+)]
+fn describe_upgrade_pq_error(
+    kind: ErrorKind,
+    server_pq: &ServerPqStatus,
+    fallback: String,
+) -> String {
+    if *server_pq == ServerPqStatus::Disabled || kind == ErrorKind::Unimplemented {
+        return "Cannot upgrade to post-quantum encryption: this server does not have \
+                post-quantum encryption enabled."
+            .to_string();
+    }
+    match kind {
+        ErrorKind::ClassicalApprovalRequired {
+            peer_signed_off: true,
+        } => "Cannot upgrade to post-quantum encryption: this peer has post-quantum encryption \
+              turned off."
+            .to_string(),
+        ErrorKind::ClassicalApprovalRequired {
+            peer_signed_off: false,
+        } => "Cannot upgrade to post-quantum encryption: this peer has no post-quantum prekeys \
+              on the server."
+            .to_string(),
+        ErrorKind::PeerManifestExpired => {
+            "This peer's signed post-quantum capability manifest has expired. Try again after \
+             they come online."
+                .to_string()
+        }
+        ErrorKind::PqRequired => {
+            "Require post-quantum (strict mode) is enabled, and a post-quantum session could not \
+             be established with this peer."
+                .to_string()
+        }
+        ErrorKind::DowngradeDetected => {
+            "Downgrade detected: the server did not return valid post-quantum prekeys for this \
+             peer."
+                .to_string()
+        }
+        ErrorKind::UnsupportedSuite => {
+            "No mutually supported post-quantum encryption suite is available with this peer."
+                .to_string()
+        }
+        _ => fallback,
     }
 }
 
@@ -5961,6 +6258,7 @@ impl Contact {
                 Some(Kind::Deleted(_)) => Body::Deleted,
                 Some(Kind::Attachment(pointer)) => Body::Remote(RemoteFile {
                     peer: self.peer,
+                    index,
                     pointer,
                     clock,
                 }),
@@ -6099,7 +6397,8 @@ fn percent_decode(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Build an invitation link for `me` relative to `page_origin`, appending `&pq=1` when PQ is enabled.
+/// Build an invitation link for `me` relative to `page_origin`, appending `&pq=1` when local PQ
+/// is enabled and the server has not disabled post-quantum encryption.
 pub fn build_invitation_link(page_origin: &str, me: &Me) -> String {
     let mut link = format!(
         "{}/#chat={}",
@@ -6112,7 +6411,10 @@ pub fn build_invitation_link(page_origin: &str, me: &Me) -> String {
     if !same_server(&me.server, page_origin) {
         link.push_str(&format!("&server={}", percent_encode(&me.server)));
     }
-    if me.pq_config.pq_enabled && !me.pq_config.offered_suites().is_empty() {
+    if me.pq_config.pq_enabled
+        && !me.pq_config.offered_suites().is_empty()
+        && me.server_pq != ServerPqStatus::Disabled
+    {
         link.push_str("&pq=1");
     }
     link
@@ -6249,6 +6551,93 @@ mod tests {
                 pq_pinned: false,
             }
         );
+    }
+
+    #[test]
+    fn invitation_link_omits_pq_pin_when_server_disables_pq() {
+        let key = [0x4Bu8; 32];
+        let mut me = Me {
+            name: "Alice".to_string(),
+            key,
+            server: "https://chat.example.com".to_string(),
+            pq_config: PqConfig::default(),
+            server_pq: ServerPqStatus::Disabled,
+        };
+        let link = build_invitation_link("https://chat.example.com", &me);
+        assert!(
+            !link.contains("&pq=1"),
+            "invitation link must omit &pq=1 on classical-only servers: {link}"
+        );
+        let (_, hash) = link.split_once('#').expect("has fragment");
+        assert_eq!(
+            parse_invitation_hash(hash),
+            Some(Dialog::NewChat {
+                key: key_to_url(&key),
+                name: "Alice".to_string(),
+                server: None,
+                pq_pinned: false,
+            })
+        );
+
+        // Once the server advertises PQ enabled (in PQ builds), `&pq=1` is emitted again.
+        me.server_pq = ServerPqStatus::Enabled {
+            suites: PqConfig::compiled_suites(),
+            pq_ratchet: true,
+        };
+        let enabled_link = build_invitation_link("https://chat.example.com", &me);
+        let expected_pq = me.pq_config.pq_enabled && !me.pq_config.offered_suites().is_empty();
+        assert_eq!(enabled_link.contains("&pq=1"), expected_pq);
+    }
+
+    #[test]
+    fn describe_upgrade_pq_error_maps_plain_english_and_prioritizes_server_disabled() {
+        let disabled = ServerPqStatus::Disabled;
+        let msg = describe_upgrade_pq_error(
+            ErrorKind::ClassicalApprovalRequired {
+                peer_signed_off: true,
+            },
+            &disabled,
+            "raw".to_string(),
+        );
+        assert!(msg.contains("this server does not have post-quantum encryption enabled"), "{msg}");
+        assert!(!msg.contains("peer_signed_off"), "{msg}");
+
+        let unknown = ServerPqStatus::Unknown;
+        let signed_off = describe_upgrade_pq_error(
+            ErrorKind::ClassicalApprovalRequired {
+                peer_signed_off: true,
+            },
+            &unknown,
+            "raw".to_string(),
+        );
+        assert!(signed_off.contains("peer has post-quantum encryption turned off"), "{signed_off}");
+        assert!(!signed_off.contains("peer_signed_off"), "{signed_off}");
+
+        let legacy = describe_upgrade_pq_error(
+            ErrorKind::ClassicalApprovalRequired {
+                peer_signed_off: false,
+            },
+            &unknown,
+            "raw".to_string(),
+        );
+        assert!(legacy.contains("no post-quantum prekeys"), "{legacy}");
+
+        let expired = describe_upgrade_pq_error(
+            ErrorKind::PeerManifestExpired,
+            &unknown,
+            "raw".to_string(),
+        );
+        assert!(expired.contains("expired"), "{expired}");
+
+        let strict = describe_upgrade_pq_error(ErrorKind::PqRequired, &unknown, "raw".to_string());
+        assert!(strict.contains("strict mode"), "{strict}");
+
+        let downgrade = describe_upgrade_pq_error(
+            ErrorKind::DowngradeDetected,
+            &unknown,
+            "raw".to_string(),
+        );
+        assert!(downgrade.contains("Downgrade detected"), "{downgrade}");
     }
 
     #[test]

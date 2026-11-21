@@ -2356,6 +2356,7 @@ fn canonical_mathml_tag(tag: &str) -> Option<&'static str> {
 }
 
 fn emit_sanitized_attrs(out: &mut String, tag: &'static str, attrs: &[(String, String)]) {
+    let mut external_http_link = false;
     for (name, raw_value) in attrs {
         let decoded = decode_entities(raw_value, true);
         let validated: Option<String> = match (tag, name.as_str()) {
@@ -2370,6 +2371,9 @@ fn emit_sanitized_attrs(out: &mut String, tag: &'static str, attrs: &[(String, S
                             Some(format!("#fn-{fragment}"))
                         }
                     } else {
+                        if normalized.starts_with("http://") || normalized.starts_with("https://") {
+                            external_http_link = true;
+                        }
                         Some(normalized)
                     }
                 } else {
@@ -2475,6 +2479,9 @@ fn emit_sanitized_attrs(out: &mut String, tag: &'static str, attrs: &[(String, S
             out.push_str(&escape(&value));
             out.push('"');
         }
+    }
+    if external_http_link {
+        out.push_str(" target=\"_blank\" rel=\"noopener noreferrer\"");
     }
 }
 
@@ -2997,7 +3004,7 @@ mod test {
         assert!(!html.contains("<script"), "{html}");
         assert!(!html.contains("slide:"), "{html}");
         assert!(
-            html.contains(r#"<a href="https://example.com">web</a>"#),
+            html.contains(r#"<a href="https://example.com" target="_blank" rel="noopener noreferrer">web</a>"#),
             "{html}"
         );
         assert!(html.contains(r##"<a href="#">script</a>"##), "{html}");
@@ -3148,7 +3155,10 @@ mod test {
         let a_ping = sanitize_html(
             r#"<a href="https://example.com" ping="https://evil.example" onclick="alert(1)" style="position:fixed" target="_top">go</a>"#,
         );
-        assert_eq!(a_ping, r#"<a href="https://example.com">go</a>"#);
+        assert_eq!(
+            a_ping,
+            r#"<a href="https://example.com" target="_blank" rel="noopener noreferrer">go</a>"#
+        );
 
         let entity_js = sanitize_html(
             r#"<a href="&#x6a;avascript:alert(1)">a</a><a href="javascript&colon;alert(1)">b</a><a href="java&#x09;script:alert(1)">c</a>"#,
@@ -3463,8 +3473,34 @@ mod test {
         assert!(html.contains(r#"href="mailto:User@Example.COM""#), "{html}");
         assert!(!html.to_ascii_lowercase().contains("javascript:"), "{html}");
 
-        // Direct HTML sanitization also lowercases uppercase schemes.
+        // Direct HTML sanitization also lowercases uppercase schemes and emits safe external attrs.
         let sanitized = sanitize_html(r#"<a href="HTTPS://example.com/KeepCase">x</a>"#);
-        assert_eq!(sanitized, r#"<a href="https://example.com/KeepCase">x</a>"#);
+        assert_eq!(
+            sanitized,
+            r#"<a href="https://example.com/KeepCase" target="_blank" rel="noopener noreferrer">x</a>"#
+        );
+    }
+
+    #[test]
+    fn sanitize_html_external_links_emit_target_blank_and_noopener_idempotently() {
+        let http = sanitize_html(r#"<a href="http://example.com/a" target="_self" rel="opener">a</a>"#);
+        assert_eq!(
+            http,
+            r#"<a href="http://example.com/a" target="_blank" rel="noopener noreferrer">a</a>"#
+        );
+        assert_eq!(sanitize_html(&http), http);
+
+        let https = sanitize_html(r#"<a href="https://example.com/b">b</a>"#);
+        assert_eq!(
+            https,
+            r#"<a href="https://example.com/b" target="_blank" rel="noopener noreferrer">b</a>"#
+        );
+        assert_eq!(sanitize_html(&https), https);
+
+        // Mailto and in-page fragments do not get external target/rel attributes.
+        let mailto = sanitize_html(r#"<a href="mailto:user@example.com">mail</a>"#);
+        assert_eq!(mailto, r#"<a href="mailto:user@example.com">mail</a>"#);
+        let frag = sanitize_html(r##"<a href="#note">jump</a>"##);
+        assert_eq!(frag, r##"<a href="#fn-note">jump</a>"##);
     }
 }

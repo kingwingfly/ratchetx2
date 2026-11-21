@@ -11,6 +11,17 @@ use crate::{
     util::{now, short},
 };
 
+/// Why the vault cannot be opened on this page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnavailableReason {
+    /// Opened over an insecure origin (plain HTTP, non-localhost) where Web Locks are unavailable.
+    InsecureContext,
+    /// Browser does not expose the Web Locks API needed to prevent concurrent-tab corruption.
+    LocksUnavailable,
+    /// Browser storage (IndexedDB) could not be opened.
+    StorageUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     Loading,
@@ -20,8 +31,8 @@ pub enum Phase {
     Unlocked,
     /// Another tab has the vault open.
     Elsewhere,
-    /// The browser's storage or Web Locks failed, so whether it holds a vault is unknown; the error.
-    Unavailable(String),
+    /// Storage or Web Locks failed, so whether a vault is here is unknown; the cause and error.
+    Unavailable(UnavailableReason, String),
 }
 
 /// How the last sync went.
@@ -287,6 +298,8 @@ pub struct UploadView {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum UploadState {
     Running,
+    /// Verifying the chosen file's hash before resuming so encrypted chunks cannot reuse a nonce.
+    Checking,
     /// The server cannot be reached; it goes on once it can.
     Retrying,
     /// Stopped, for this reason; going on may need the file chosen again.
@@ -297,6 +310,8 @@ pub enum UploadState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RemoteFile {
     pub peer: PublicKey,
+    /// Its entry in the history.
+    pub index: u64,
     pub pointer: AttachmentPointer,
     /// The clock of the message the peer sent it in, to tell the peer once it is downloaded;
     /// 0 for this client's own.
@@ -378,6 +393,8 @@ pub enum Dialog {
     Files(PublicKey),
     /// Sign in to the server, which keeps files only for those who do.
     SignIn,
+    /// Recent activity log (reachable on narrow mobile viewports where `Welcome` is hidden).
+    Activity,
 }
 
 /// A pending "New chat" / invitation draft preserved while the user signs in to the server.
@@ -550,9 +567,13 @@ impl SignInFlow {
                 }
                 Some(Dialog::SignIn)
             }
-            Some(Dialog::Identity | Dialog::Settings | Dialog::Contact(_) | Dialog::Files(_)) => {
-                None
-            }
+            Some(
+                Dialog::Identity
+                | Dialog::Settings
+                | Dialog::Contact(_)
+                | Dialog::Files(_)
+                | Dialog::Activity,
+            ) => None,
         }
     }
 
@@ -695,6 +716,9 @@ pub struct Ui {
     /// The messages held until this browser signs in to the server, by chat and history entry,
     /// which can be cancelled.
     pub held: RwSignal<HashSet<(PublicKey, u64)>>,
+    /// Attachments known to be gone from the server during this session, by chat and history entry,
+    /// so open file browsers reflect 404s, cancellations, and deletions immediately.
+    pub gone: RwSignal<HashSet<(PublicKey, u64)>>,
     pub me: RwSignal<Option<Me>>,
     pub contacts: RwSignal<Vec<ContactView>>,
     /// The chat on screen, if any.
@@ -733,6 +757,7 @@ impl Ui {
             away: RwSignal::new(false),
             uploads: RwSignal::new(vec![]),
             held: RwSignal::new(HashSet::new()),
+            gone: RwSignal::new(HashSet::new()),
             me: RwSignal::new(None),
             contacts: RwSignal::new(vec![]),
             open: RwSignal::new(None),
