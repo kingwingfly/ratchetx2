@@ -814,7 +814,7 @@ impl Vault {
         &self,
         state: &AppState,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
-        outgoing: &[(String, Option<OutgoingRecord>)],
+        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> Result<()> {
         let (transaction, store, mut next_header) = self.begin_checked_rw_tx().await?;
         let Some(next_revision) = next_header.revision.checked_add(1) else {
@@ -826,16 +826,7 @@ impl Vault {
         let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
         let write_res: Result<()> = (|| {
             self.put_entries(&store, entries)?;
-            for (key, record) in outgoing {
-                match record {
-                    Some(record) => {
-                        store.put(&bytes(&self.seal(key, record)), Some(&key.as_str().into()))?;
-                    }
-                    None => {
-                        store.delete(JsValue::from_str(key))?;
-                    }
-                }
-            }
+            self.put_outgoing(&store, outgoing)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
             Ok(())
@@ -846,6 +837,25 @@ impl Vault {
         }
         commit(transaction).await?;
         *self.header.borrow_mut() = next_header;
+        Ok(())
+    }
+
+    /// Put or delete `outgoing` records in `store`.
+    fn put_outgoing<'a>(
+        &self,
+        store: &idb::ObjectStore,
+        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+    ) -> Result<()> {
+        for (key, record) in outgoing {
+            match record {
+                Some(record) => {
+                    store.put(&bytes(&self.seal(key, record)), Some(&key.as_str().into()))?;
+                }
+                None => {
+                    store.delete(JsValue::from_str(key))?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1085,12 +1095,14 @@ impl Vault {
     }
 
     /// Save `state`, without the history, files, outbox, attachments and uploads of the chat
-    /// with `peer`, and `entries` of other chats with it, enforcing monotonic `revision` CAS.
+    /// with `peer`, and `entries` / `outgoing` of other chats with it, enforcing monotonic
+    /// `revision` CAS.
     pub async fn forget<'a>(
         &self,
         state: &AppState,
         peer: &PublicKey,
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> Result<()> {
         let (transaction, store, mut next_header) = self.begin_checked_rw_tx().await?;
         let Some(next_revision) = next_header.revision.checked_add(1) else {
@@ -1106,6 +1118,7 @@ impl Vault {
                 store.delete(prefix_range(&format!("{prefix}/{}/", hex(peer)))?)?;
             }
             self.put_entries(&store, entries)?;
+            self.put_outgoing(&store, outgoing)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
             Ok(())

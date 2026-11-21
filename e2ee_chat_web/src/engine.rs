@@ -288,6 +288,11 @@ struct Inner {
     /// initial messages, which the server deleted once taken, and the greeting of a chat started.
     /// Each save writes them too, until one succeeds, so that the history has no gap.
     unsaved: Vec<(PublicKey, (String, HistoryEntry))>,
+    /// Requeued outbox records that a save failed to write after an accepted replacement session
+    /// reset `outbox[*].sealed = false` in memory. Each save writes them before any caller
+    /// `outgoing` updates until one succeeds so `seal_next` never reads stale empty-content
+    /// sealed outbox records from IndexedDB.
+    unsaved_outbox: Vec<(PublicKey, (String, Option<OutgoingRecord>))>,
     /// The chats whose records left unsaved a save wrote, which then show them.
     saved_late: Vec<PublicKey>,
 }
@@ -593,6 +598,7 @@ impl Engine {
             client,
             contacts: vec![],
             unsaved: vec![],
+            unsaved_outbox: vec![],
             saved_late: vec![],
         })
         .await;
@@ -643,6 +649,7 @@ impl Engine {
             client,
             contacts,
             unsaved: vec![],
+            unsaved_outbox: vec![],
             saved_late: vec![],
         })
         .await;
@@ -935,7 +942,7 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
-        if !inner.unsaved.is_empty() {
+        if !inner.unsaved.is_empty() || !inner.unsaved_outbox.is_empty() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
         let late = std::mem::take(&mut inner.saved_late);
@@ -1076,6 +1083,11 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return Ok(false);
         };
+        // Flush any unsaved requeued outbox records before `seal_next` reads from IndexedDB,
+        // ensuring we never encrypt stale empty-content records after an earlier save failure.
+        if inner.unsaved_outbox.iter().any(|(p, _)| p == peer) {
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
         // Never send or send receipts on a brand-new quarantined classical contact.
         if inner
             .contacts
@@ -1591,9 +1603,13 @@ impl Engine {
                 // Requeue any outbox messages sealed on a replaced session so they re-encrypt onto
                 // the new active session atomically with this save.
                 let mut requeued_outbox = vec![];
+                let mut requeued_peers = vec![];
                 for replaced_peer in replaced_peers {
                     match inner.requeue_sealed(&replaced_peer).await {
-                        Ok(requeued) => requeued_outbox.extend(requeued),
+                        Ok(requeued) => {
+                            requeued_peers.extend(std::iter::repeat_n(replaced_peer, requeued.len()));
+                            requeued_outbox.extend(requeued);
+                        }
                         Err(e) => {
                             self.ui.log(format!(
                                 "could not requeue pending messages for {}: {e}",
@@ -1608,6 +1624,9 @@ impl Engine {
                     && let Err(e) = inner.save_with(&records, &requeued_outbox).await
                 {
                     inner.unsaved.extend(peers.into_iter().zip(records));
+                    inner
+                        .unsaved_outbox
+                        .extend(requeued_peers.into_iter().zip(requeued_outbox));
                     return Err(describe(&e));
                 }
                 // Refresh UI immediately after durable local persistence so transient ack errors
@@ -1733,9 +1752,13 @@ impl Engine {
                 }
             }
             let mut requeued_outbox = vec![];
+            let mut requeued_peers = vec![];
             for replaced_peer in replaced_peers {
                 match inner.requeue_sealed(&replaced_peer).await {
-                    Ok(requeued) => requeued_outbox.extend(requeued),
+                    Ok(requeued) => {
+                        requeued_peers.extend(std::iter::repeat_n(replaced_peer, requeued.len()));
+                        requeued_outbox.extend(requeued);
+                    }
                     Err(e) => {
                         self.ui.log(format!(
                             "could not requeue pending messages for {}: {e}",
@@ -1747,6 +1770,9 @@ impl Engine {
             if let Err(e) = inner.save_with(&records, &requeued_outbox).await {
                 // The server deleted them, and their sessions are accepted: they show once saved.
                 inner.unsaved.extend(peers.into_iter().zip(records));
+                inner
+                    .unsaved_outbox
+                    .extend(requeued_peers.into_iter().zip(requeued_outbox));
                 return Err(describe(&e));
             }
             if let Some(open) = self.ui.open.get_untracked() {
@@ -4216,7 +4242,16 @@ impl Engine {
             .iter()
             .filter(|(unsaved, _)| *unsaved != peer)
             .map(|(_, record)| record);
-        if let Err(e) = inner.vault.forget(&state, &peer, unsaved).await {
+        let unsaved_outbox = inner
+            .unsaved_outbox
+            .iter()
+            .filter(|(unsaved, _)| *unsaved != peer)
+            .map(|(_, record)| record);
+        if let Err(e) = inner
+            .vault
+            .forget(&state, &peer, unsaved, unsaved_outbox)
+            .await
+        {
             if let Some(snapshot) = snapshot {
                 inner.roll_back(&peer, snapshot)?;
             }
@@ -4254,6 +4289,7 @@ impl Engine {
                 .map(|(unsaved, _)| unsaved)
                 .filter(|unsaved| *unsaved != peer),
         );
+        inner.unsaved_outbox.clear();
         inner.state.farewells.extend(farewell);
         self.wake();
         if self.ui.open.get_untracked() == Some(peer) {
@@ -4680,11 +4716,17 @@ impl Inner {
         outgoing: &[(String, Option<OutgoingRecord>)],
     ) -> crate::vault::Result<()> {
         let unsaved = self.unsaved.iter().map(|(_, record)| record);
+        let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
         self.vault
-            .save(&self.app_state(), unsaved.chain(entries), outgoing)
+            .save(
+                &self.app_state(),
+                unsaved.chain(entries),
+                unsaved_outbox.chain(outgoing),
+            )
             .await?;
         self.saved_late
             .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
+        self.unsaved_outbox.clear();
         Ok(())
     }
 
@@ -5144,6 +5186,8 @@ impl Inner {
                     .await
                 {
                     self.unsaved.push((*peer, record));
+                    self.unsaved_outbox
+                        .extend(requeued.into_iter().map(|rec| (*peer, rec)));
                     return Err(describe(&e));
                 }
                 self.saved_late.push(*peer);
@@ -5213,6 +5257,8 @@ impl Inner {
         {
             // Accepted, it cannot be again: it shows once saved.
             self.unsaved.push((*peer, record));
+            self.unsaved_outbox
+                .extend(requeued.into_iter().map(|rec| (*peer, rec)));
             return Err(describe(&e));
         }
         self.saved_late.push(*peer);
