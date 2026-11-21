@@ -50,11 +50,54 @@ fn handle_auth_text_frame(authenticated: &Cell<bool>, text: &str) -> bool {
     text == AUTH_OK && !authenticated.replace(true)
 }
 
+#[derive(Default)]
+struct FrameState {
+    authenticated: Cell<bool>,
+    open_pending: Cell<bool>,
+    overflow: Cell<bool>,
+}
+
+impl FrameState {
+    fn text(&self, tx: &mut mpsc::Sender<Event>, text: &str) {
+        if handle_auth_text_frame(&self.authenticated, text)
+            && tx.try_send(Event::Open).is_err_and(|e| e.is_full())
+        {
+            self.open_pending.set(true);
+        }
+    }
+
+    fn binary(&self, tx: &mut mpsc::Sender<Event>, len: usize, bytes: impl FnOnce() -> Vec<u8>) {
+        if !self.authenticated.get() || len > MAX_NOTIFICATION_BYTES {
+            return;
+        }
+        if let Ok(notification) = Notification::decode(bytes().as_slice())
+            && tx
+                .try_send(Event::Notification(notification))
+                .is_err_and(|e| e.is_full())
+        {
+            self.overflow.set(true);
+        }
+    }
+
+    async fn next(&self, events: &mut mpsc::Receiver<Event>) -> Event {
+        if self.open_pending.replace(false) {
+            return Event::Open;
+        }
+        match events.try_recv() {
+            Ok(Event::Closed) if self.overflow.replace(false) => Event::Resync,
+            Ok(event) => event,
+            Err(_) if self.overflow.replace(false) => Event::Resync,
+            Err(e) if e.is_closed() => Event::Closed,
+            Err(_) => events.next().await.unwrap_or(Event::Closed),
+        }
+    }
+}
+
 /// A WebSocket subscribed to a client's notifications. Closed when dropped.
 pub struct Subscription {
     socket: WebSocket,
     events: mpsc::Receiver<Event>,
-    overflow: Rc<Cell<bool>>,
+    frames: Rc<FrameState>,
     _on_open: Closure<dyn FnMut()>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_close: Closure<dyn FnMut()>,
@@ -83,8 +126,7 @@ impl Subscription {
         socket.set_binary_type(BinaryType::Arraybuffer);
         let (sender, events) = mpsc::channel(MAX_PENDING_EVENTS);
         let sender = Rc::new(RefCell::new(Some(sender)));
-        let overflow = Rc::new(Cell::new(false));
-        let authenticated = Rc::new(Cell::new(false));
+        let frames = Rc::new(FrameState::default());
 
         let on_open = {
             let sender = sender.clone();
@@ -102,30 +144,19 @@ impl Subscription {
         };
         let on_message = {
             let sender = sender.clone();
-            let overflow = overflow.clone();
-            let authenticated = authenticated.clone();
+            let frames = frames.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                // Auth ack (`"ok"`) and pongs come as text frames; notifications as binary frames.
-                if let Some(text) = event.data().as_string() {
-                    if handle_auth_text_frame(&authenticated, &text)
-                        && let Some(tx) = sender.borrow_mut().as_mut()
-                    {
-                        let _ = tx.try_send(Event::Open);
-                    }
-                    return;
-                }
-                let Ok(data) = event.data().dyn_into::<ArrayBuffer>() else {
+                let mut sender = sender.borrow_mut();
+                let Some(tx) = sender.as_mut() else {
                     return;
                 };
-                if data.byte_length() as usize > MAX_NOTIFICATION_BYTES {
-                    return;
-                }
-                if let Ok(notification) =
-                    Notification::decode(Uint8Array::new(&data).to_vec().as_slice())
-                    && let Some(tx) = sender.borrow_mut().as_mut()
-                    && tx.try_send(Event::Notification(notification)).is_err()
-                {
-                    overflow.set(true);
+                let data = event.data();
+                if let Some(text) = data.as_string() {
+                    frames.text(tx, &text);
+                } else if let Ok(buffer) = data.dyn_into::<ArrayBuffer>() {
+                    frames.binary(tx, buffer.byte_length() as usize, || {
+                        Uint8Array::new(&buffer).to_vec()
+                    });
                 }
             })
         };
@@ -142,7 +173,7 @@ impl Subscription {
         Ok(Self {
             socket,
             events,
-            overflow,
+            frames,
             _on_open: on_open,
             _on_message: on_message,
             _on_close: on_close,
@@ -151,12 +182,7 @@ impl Subscription {
 
     /// The next event; [`Event::Closed`] is the last.
     pub async fn next(&mut self) -> Event {
-        match self.events.try_recv() {
-            Ok(event) => event,
-            Err(e) if e.is_closed() => Event::Closed,
-            Err(_) if self.overflow.replace(false) => Event::Resync,
-            Err(_) => self.events.next().await.unwrap_or(Event::Closed),
-        }
+        self.frames.next(&mut self.events).await
     }
 }
 
@@ -208,7 +234,10 @@ mod tests {
         let url = subscription_url("https://chat.example.com/", &id).unwrap();
         assert_eq!(
             url,
-            format!("wss://chat.example.com/notifications?identity={}", "ab".repeat(32))
+            format!(
+                "wss://chat.example.com/notifications?identity={}",
+                "ab".repeat(32)
+            )
         );
         assert!(!url.contains("request="));
         assert!(subscription_url("https://chat.example.com", &[0u8; 31]).is_err());
@@ -224,10 +253,7 @@ mod tests {
             socket_address("HTTP://localhost:8787/"),
             "ws://localhost:8787"
         );
-        assert_eq!(
-            socket_address("HtTpS://[::1]:8443"),
-            "wss://[::1]:8443"
-        );
+        assert_eq!(socket_address("HtTpS://[::1]:8443"), "wss://[::1]:8443");
         assert_eq!(
             socket_address("wss://already.example/"),
             "wss://already.example"
@@ -246,5 +272,54 @@ mod tests {
         // Subsequent "ok" or "pong" frames are ignored.
         assert!(!handle_auth_text_frame(&authenticated, "ok"));
         assert!(!handle_auth_text_frame(&authenticated, "pong"));
+    }
+
+    #[test]
+    fn notifications_require_authentication_and_overflow_resyncs() {
+        let state = FrameState::default();
+        let (mut tx, mut rx) = mpsc::channel(0);
+        state.binary(&mut tx, 0, || panic!("pre-auth frame read"));
+        assert!(rx.try_recv().is_err());
+        assert!(!state.overflow.get());
+        state.text(&mut tx, "ok");
+        state.text(&mut tx, "ok");
+        state.text(&mut tx, "pong");
+        assert!(matches!(rx.try_recv(), Ok(Event::Open)));
+        assert!(rx.try_recv().is_err());
+        let bytes = Notification::default().encode_to_vec();
+        for _ in 0..2 {
+            state.binary(&mut tx, bytes.len(), || bytes.clone());
+        }
+        assert!(matches!(
+            futures::executor::block_on(state.next(&mut rx)),
+            Event::Notification(_)
+        ));
+        assert!(matches!(
+            futures::executor::block_on(state.next(&mut rx)),
+            Event::Resync
+        ));
+        drop(tx);
+        assert!(matches!(
+            futures::executor::block_on(state.next(&mut rx)),
+            Event::Closed
+        ));
+    }
+
+    #[test]
+    fn deferred_open_precedes_already_queued_events() {
+        let state = FrameState::default();
+        let (mut tx, mut rx) = mpsc::channel(0);
+        assert!(tx.try_send(Event::Resync).is_ok());
+        state.text(&mut tx, "ok");
+        state.text(&mut tx, "ok");
+        assert!(matches!(
+            futures::executor::block_on(state.next(&mut rx)),
+            Event::Open
+        ));
+        assert!(matches!(
+            futures::executor::block_on(state.next(&mut rx)),
+            Event::Resync
+        ));
+        assert!(rx.try_recv().is_err());
     }
 }

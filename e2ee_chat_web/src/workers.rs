@@ -10,8 +10,17 @@ use std::{
     rc::Rc,
 };
 
-use e2ee_chat_preview::{READY, Worker, audio::Tags, language::Language};
-use js_sys::{Array, Float64Array, Function, Promise, Uint8Array, Uint8ClampedArray, Uint32Array};
+use e2ee_chat_preview::{
+    Worker,
+    audio::Tags,
+    language::Language,
+    rpc::{
+        Request, WirePayload, WorkerEvent, decode_audio_tags, decode_code_highlight,
+        decode_diagram_svg, decode_pdf_close, decode_pdf_open, decode_pdf_render,
+        decode_search_find, encode_request_frame,
+    },
+};
+use js_sys::{Function, Promise};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{Event, ImageData, MessageEvent};
@@ -126,17 +135,16 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
     debug_assert_eq!(ready_id, READY_ID);
     let on_message = {
         let calls = calls.clone();
-        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-            let data = event.data();
-            if data.as_string().as_deref() == Some(READY) {
-                calls.settle(READY_ID, true, &JsValue::UNDEFINED);
-                return;
-            }
-            let reply = Array::from(&data);
-            if let Some(id) = reply.get(0).as_f64() {
-                calls.settle(id as u32, reply.get(1).is_truthy(), &reply.get(2));
-            }
-        })
+        Closure::<dyn FnMut(MessageEvent)>::new(
+            move |event: MessageEvent| match WorkerEvent::decode(event.data()) {
+                Ok(WorkerEvent::Ready) => calls.settle(READY_ID, true, &JsValue::UNDEFINED),
+                Ok(WorkerEvent::Reply { id, result }) if id != READY_ID => match result {
+                    Ok(value) => calls.settle(id, true, &value),
+                    Err(error) => calls.settle(id, false, &error),
+                },
+                _ => {}
+            },
+        )
     };
     let on_error = {
         let calls = calls.clone();
@@ -183,15 +191,11 @@ fn failure(error: JsValue) -> String {
     error.as_string().unwrap_or_else(|| js_error(error))
 }
 
-/// Call `method` of the worker `kind` with `arguments`, moving the buffers in `transfer` to it;
-/// on its start `start` only, if given, which a call needs that names what it opened. Returns
-/// the answer, and the start that gave it.
+/// Send a request to the worker. A document handle is valid only in the worker that opened it.
 async fn call(
     kind: Worker,
     start: Option<u32>,
-    method: &str,
-    arguments: &[JsValue],
-    transfer: Option<Array>,
+    request: Request<&[u8], &str>,
 ) -> Result<(JsValue, u32), String> {
     let running = match start {
         // What it opened went with the worker that opened it.
@@ -220,15 +224,12 @@ async fn call(
             .map_err(failure)?;
     }
     let (id, answer) = running.calls.add();
-    let request = Array::of2(&id.into(), &method.into());
-    for argument in arguments {
-        request.push(argument);
-    }
-    let sent = match &transfer {
+    let payload: WirePayload = encode_request_frame(id, request);
+    let sent = match payload.transfer {
         Some(transfer) => running
             .worker
-            .post_message_with_transfer(&request, transfer),
-        None => running.worker.post_message(&request),
+            .post_message_with_transfer(&payload.value, &transfer),
+        None => running.worker.post_message(&payload.value),
     };
     if let Err(e) = sent {
         running.calls.settle(id, false, &e);
@@ -242,50 +243,24 @@ async fn call(
 
 /// `text`, highlighted as `language`, as HTML: escaped text in spans.
 pub async fn highlight(language: &Language, text: &str) -> Result<String, String> {
-    let arguments = [language.name.into(), text.into()];
-    call(
-        Worker::Code(language.group),
-        None,
-        "highlight",
-        &arguments,
-        None,
-    )
-    .await?
-    .0
-    .as_string()
-    .ok_or_else(|| "no HTML".to_string())
+    let request = Request::Highlight {
+        language: language.name,
+        text,
+    };
+    let (reply, _) = call(Worker::Code(language.group), None, request).await?;
+    decode_code_highlight(reply)
 }
 
 /// The Mermaid diagram `source`, as SVG.
 pub async fn diagram(source: &str) -> Result<String, String> {
-    call(Worker::Diagram, None, "svg", &[source.into()], None)
-        .await?
-        .0
-        .as_string()
-        .ok_or_else(|| "no SVG".to_string())
+    let (reply, _) = call(Worker::Diagram, None, Request::Svg(source)).await?;
+    decode_diagram_svg(reply)
 }
 
 /// What the tags of the audio `data` say of it, if it has any.
 pub async fn audio_tags(data: &[u8]) -> Result<Option<Tags>, String> {
-    let bytes = Uint8Array::from(data);
-    let transfer = Array::of1(&bytes.buffer());
-    let (reply, _) = call(Worker::Audio, None, "tags", &[bytes.into()], Some(transfer)).await?;
-    if reply.is_null() {
-        return Ok(None);
-    }
-    let reply = Array::from(&reply);
-    let cover = reply
-        .get(4)
-        .as_string()
-        .zip(reply.get(5).dyn_into::<Uint8Array>().ok())
-        .map(|(mime, cover)| (mime, cover.to_vec()));
-    Ok(Some(Tags {
-        title: reply.get(0).as_string(),
-        artist: reply.get(1).as_string(),
-        album: reply.get(2).as_string(),
-        year: reply.get(3).as_f64().map(|year| year as u16),
-        cover,
-    }))
+    let (reply, _) = call(Worker::Audio, None, Request::Tags(data)).await?;
+    decode_audio_tags(reply)
 }
 
 /// The matches of `pattern` in `text`, a regular expression unless `regex` says otherwise,
@@ -297,15 +272,15 @@ pub async fn find(
     case: bool,
     regex: bool,
 ) -> Result<(Vec<(u32, u32)>, bool), String> {
-    let arguments = [text.into(), pattern.into(), case.into(), regex.into()];
-    let (reply, _) = call(Worker::Search, None, "find", &arguments, None).await?;
-    let reply = Array::from(&reply);
-    let flat = Uint32Array::new(&reply.get(0)).to_vec();
-    let (pairs, _) = flat.as_chunks::<2>();
-    Ok((
-        pairs.iter().map(|&[start, end]| (start, end)).collect(),
-        reply.get(1).is_truthy(),
-    ))
+    let request = Request::Find {
+        text,
+        pattern,
+        case,
+        regex,
+    };
+    let (reply, _) = call(Worker::Search, None, request).await?;
+    let found = decode_search_find(reply)?;
+    Ok((found.matches, found.more))
 }
 
 /// A PDF document a worker opened.
@@ -317,45 +292,41 @@ pub struct Pdf {
 
 /// Open the PDF `data`: the document, and its pages' sizes, in points.
 pub async fn open_pdf(data: &[u8]) -> Result<(Pdf, Vec<(f64, f64)>), String> {
-    let bytes = Uint8Array::from(data);
-    let transfer = Array::of1(&bytes.buffer());
-    let (reply, start) = call(Worker::Pdf, None, "open", &[bytes.into()], Some(transfer)).await?;
-    let reply = Array::from(&reply);
-    let id = reply.get(0).as_f64().ok_or("no document")? as u32;
-    let sizes = Float64Array::new(&reply.get(1)).to_vec();
-    let (pages, _) = sizes.as_chunks::<2>();
+    let (reply, start) = call(Worker::Pdf, None, Request::Open(data)).await?;
+    let opened = decode_pdf_open(reply)?;
     Ok((
-        Pdf { start, id },
-        pages
-            .iter()
-            .map(|&[width, height]| (width, height))
-            .collect(),
+        Pdf {
+            start,
+            id: opened.doc_id,
+        },
+        opened.sizes,
     ))
 }
 
 /// The page `index` of `pdf`, drawn `width` pixels wide.
 pub async fn render_pdf(pdf: Pdf, index: usize, width: u32) -> Result<ImageData, String> {
-    let arguments = [pdf.id.into(), (index as u32).into(), width.into()];
-    let (reply, _) = call(Worker::Pdf, Some(pdf.start), "render", &arguments, None).await?;
-    let reply = Array::from(&reply);
-    let (Some(width), Some(height)) = (reply.get(0).as_f64(), reply.get(1).as_f64()) else {
-        return Err("no page".to_string());
+    let request = Request::Render {
+        doc_id: pdf.id,
+        page: u32::try_from(index).map_err(|_| "invalid page index")?,
+        width,
     };
-    let pixels: Uint8ClampedArray = reply.get(2).unchecked_into();
-    ImageData::new_with_js_u8_clamped_array_and_sh(&pixels, width as u32, height as u32)
+    let (reply, _) = call(Worker::Pdf, Some(pdf.start), request).await?;
+    let page = decode_pdf_render(reply)?;
+    ImageData::new_with_js_u8_clamped_array_and_sh(&page.pixels, page.width, page.height)
         .map_err(js_error)
 }
 
 /// Free `pdf`, if its worker still runs.
 pub fn close_pdf(pdf: Pdf) {
     spawn_local(async move {
-        let _ = call(
+        if let Ok((reply, _)) = call(
             Worker::Pdf,
             Some(pdf.start),
-            "close",
-            &[pdf.id.into()],
-            None,
+            Request::Close { doc_id: pdf.id },
         )
-        .await;
+        .await
+        {
+            let _ = decode_pdf_close(reply);
+        }
     });
 }

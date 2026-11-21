@@ -31,7 +31,7 @@ use js_sys::Uint8Array;
 use prost::Message;
 use session::{PublicKey, Sealed, protocol::mailbox::PushRequest};
 use wasm_bindgen::JsValue;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     content::{Content, Events, Kind},
@@ -113,7 +113,50 @@ pub struct VaultHeader {
     pub revision: u64,
 }
 
+fn verify_checked_header(expected: &VaultHeader, raw: &[u8]) -> Result<VaultHeader> {
+    let decoded = VaultHeader::decode(raw).map_err(|e| Error::Corrupt(e.to_string()))?;
+    if decoded.version != VAULT_VERSION_V2 || decoded.revision != expected.revision {
+        return Err(Error::Conflict {
+            expected: expected.revision,
+            actual: decoded.revision,
+        });
+    }
+    if expected.version != VAULT_VERSION_V2
+        || decoded != *expected
+        || raw != expected.encode_to_vec()
+    {
+        return Err(Error::Corrupt(
+            "vault header was modified unexpectedly".into(),
+        ));
+    }
+    Ok(expected.clone())
+}
+
+fn reseal_state_for_next_revision(
+    key: &[u8; 32],
+    current: &VaultHeader,
+    sealed_state: &[u8],
+) -> Result<(VaultHeader, Vec<u8>, Vec<u8>)> {
+    let plain = open_bytes(key, &state_v2_aad(&current.encode_to_vec()), sealed_state)
+        .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
+    let next = current.next_revision()?;
+    let header = next.encode_to_vec();
+    let sealed = seal_bytes(key, &state_v2_aad(&header), plain.as_slice());
+    Ok((next, header, sealed))
+}
+
 impl VaultHeader {
+    fn next_revision(&self) -> Result<Self> {
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| Error::Corrupt("vault revision overflow".into()))?;
+        Ok(Self {
+            revision,
+            ..self.clone()
+        })
+    }
+
     /// A new v2 header with a random 16-byte salt and hardened Argon2id parameters (64 MiB).
     fn new() -> Self {
         let mut salt = vec![0; 16];
@@ -251,6 +294,9 @@ pub struct AppState {
     /// Whether a full manifest/prekey publish is pending (e.g. after toggling PQ config).
     #[prost(bool, tag = "9")]
     pub needs_publish: bool,
+    /// Locally processed v2 inbox IDs awaiting acknowledgement after durable persistence.
+    #[prost(uint64, repeated, tag = "10")]
+    pub pending_inbox_acks: Vec<u64>,
 }
 
 /// A peer, and the session with it.
@@ -327,6 +373,9 @@ pub struct ContactState {
     /// classical session. Cleared only by explicit classical approval or verified PQ upgrade.
     #[prost(bool, tag = "24")]
     pub quarantined_primary: bool,
+    /// A replacement session took over before the sealed outbox could be rebuilt from history.
+    #[prost(bool, tag = "25")]
+    pub needs_requeue_sealed: bool,
 }
 
 /// Events encrypted for the peer, waiting to be pushed, see [`ContactState::sealed_events`].
@@ -409,7 +458,20 @@ impl PendingUpload {
     pub fn started(&self) -> bool {
         !self.token.is_empty()
     }
+
+    fn clear_secrets(&mut self) {
+        self.token.zeroize();
+        self.key.zeroize();
+    }
 }
+
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        self.clear_secrets();
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for PendingUpload {}
 
 impl fmt::Debug for PendingUpload {
     /// Shows no key, token or hash.
@@ -782,7 +844,6 @@ impl Vault {
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
         let store = transaction.object_store(STORE)?;
-        let expected = self.header.borrow().revision;
         let current = match store.get(JsValue::from_str(HEADER))?.await? {
             Some(v) => Uint8Array::new(&v).to_vec(),
             None => {
@@ -790,21 +851,13 @@ impl Vault {
                 return Err(Error::Corrupt("vault header missing".into()));
             }
         };
-        let decoded = match VaultHeader::decode(current.as_slice()) {
-            Ok(decoded) => decoded,
+        match verify_checked_header(&self.header.borrow(), &current) {
+            Ok(trusted) => Ok((transaction, store, trusted)),
             Err(e) => {
                 let _ = transaction.abort();
-                return Err(Error::Corrupt(e.to_string()));
+                Err(e)
             }
-        };
-        if decoded.version != VAULT_VERSION_V2 || decoded.revision != expected {
-            let _ = transaction.abort();
-            return Err(Error::Conflict {
-                expected,
-                actual: decoded.revision,
-            });
         }
-        Ok((transaction, store, decoded))
     }
 
     /// Save `state`, `entries`, each file of theirs in a record of its own, and `outgoing`,
@@ -816,12 +869,8 @@ impl Vault {
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> Result<()> {
-        let (transaction, store, mut next_header) = self.begin_checked_rw_tx().await?;
-        let Some(next_revision) = next_header.revision.checked_add(1) else {
-            let _ = transaction.abort();
-            return Err(Error::Corrupt("vault revision overflow".into()));
-        };
-        next_header.revision = next_revision;
+        let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
+        let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
         let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
         let write_res: Result<()> = (|| {
@@ -883,14 +932,20 @@ impl Vault {
     /// The bytes of the file of the history entry `index` of the chat with `peer`.
     pub async fn file(&self, peer: &PublicKey, index: u64) -> Result<Vec<u8>> {
         let name = file_key(peer, index);
-        let sealed = get(&self.database, &name)
+        self.file_data(&name)
             .await?
-            .ok_or_else(|| Error::Corrupt(format!("{name} is missing")))?;
+            .ok_or_else(|| Error::Corrupt(format!("{name} is missing")))
+    }
+
+    async fn file_data(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let Some(sealed) = get(&self.database, name).await? else {
+            return Ok(None);
+        };
         let record = self
-            .open(&name, &sealed)
+            .open(name, &sealed)
             .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
         FileRecord::decode(record.as_slice())
-            .map(|record| record.data)
+            .map(|record| Some(record.data))
             .map_err(|e| Error::Corrupt(e.to_string()))
     }
 
@@ -907,7 +962,9 @@ impl Vault {
             .as_ref()
             .and_then(|content| content.kind.clone());
         if entry.file > 0 {
-            let data = self.file(peer, index).await?;
+            let Some(data) = self.file_data(&file_key(peer, index)).await? else {
+                return Ok(None);
+            };
             match kind.as_mut() {
                 Some(Kind::File(file)) => file.data = data,
                 Some(Kind::Image(image)) => *image = data,
@@ -1019,26 +1076,55 @@ impl Vault {
         Ok(count)
     }
 
-    /// Keep `upload`, in the chat with `peer`, replacing what was kept of it.
+    /// Keep `upload` in the chat with `peer`, replacing any previous copy.
     pub async fn save_upload(&self, peer: &PublicKey, upload: &PendingUpload) -> Result<()> {
         let name = upload_key(peer, &upload.id);
-        let (transaction, store, _) = self.begin_checked_rw_tx().await?;
-        if let Err(e) = store.put(&bytes(&self.seal(&name, upload)), Some(&name.as_str().into())) {
-            let _ = transaction.abort();
-            return Err(e.into());
-        }
-        commit(transaction).await
+        let sealed = self.seal(&name, upload);
+        self.write_upload(&name, Some(&sealed)).await
     }
 
-    /// Forget the upload `id`, in the chat with `peer`, once cancelled, or its attachment
-    /// deleted from the server.
+    /// Forget the upload once cancelled or deleted from the server.
     pub async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> Result<()> {
-        let (transaction, store, _) = self.begin_checked_rw_tx().await?;
-        if let Err(e) = store.delete(JsValue::from_str(&upload_key(peer, id))) {
-            let _ = transaction.abort();
-            return Err(e.into());
+        self.write_upload(&upload_key(peer, id), None).await
+    }
+
+    /// Advance the revision and rebind STATE to it in the same transaction as the upload.
+    async fn write_upload(&self, name: &str, upload: Option<&[u8]>) -> Result<()> {
+        let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
+        let write = async {
+            let state = store
+                .get(JsValue::from_str(STATE))?
+                .await?
+                .ok_or_else(|| Error::Corrupt("no state".into()))?;
+            let (next, header, sealed) = reseal_state_for_next_revision(
+                &self.key,
+                &trusted,
+                &Uint8Array::new(&state).to_vec(),
+            )?;
+            let name = JsValue::from_str(name);
+            match upload {
+                Some(upload) => {
+                    store.put(&bytes(upload), Some(&name))?;
+                }
+                None => {
+                    store.delete(name)?;
+                }
+            }
+            store.put(&bytes(&sealed), Some(&STATE.into()))?;
+            store.put(&bytes(&header), Some(&HEADER.into()))?;
+            Ok(next)
         }
-        commit(transaction).await
+        .await;
+        let next = match write {
+            Ok(next) => next,
+            Err(e) => {
+                let _ = transaction.abort();
+                return Err(e);
+            }
+        };
+        commit(transaction).await?;
+        *self.header.borrow_mut() = next;
+        Ok(())
     }
 
     /// The upload `id`, in the chat with `peer`, if kept.
@@ -1104,12 +1190,8 @@ impl Vault {
         entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
     ) -> Result<()> {
-        let (transaction, store, mut next_header) = self.begin_checked_rw_tx().await?;
-        let Some(next_revision) = next_header.revision.checked_add(1) else {
-            let _ = transaction.abort();
-            return Err(Error::Corrupt("vault revision overflow".into()));
-        };
-        next_header.revision = next_revision;
+        let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
+        let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
         let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
         let write_res: Result<()> = (|| {
@@ -1261,7 +1343,10 @@ mod tests {
                 matches!(bad.validate(), Err(Error::Corrupt(_))),
                 "expected Corrupt for {bad:?}"
             );
-            assert!(matches!(bad.derive_key(b"passphrase"), Err(Error::Corrupt(_))));
+            assert!(matches!(
+                bad.derive_key(b"passphrase"),
+                Err(Error::Corrupt(_))
+            ));
         }
     }
 
@@ -1275,7 +1360,9 @@ mod tests {
             version: 0,
             revision: 0,
         };
-        let key = legacy_header.derive_key(b"correct horse battery staple").unwrap();
+        let key = legacy_header
+            .derive_key(b"correct horse battery staple")
+            .unwrap();
 
         let state = AppState {
             name: "Alice".to_string(),
@@ -1307,13 +1394,91 @@ mod tests {
         let mut tampered_rev = v2_header.clone();
         tampered_rev.revision = 2;
         assert!(
-            open_bytes(&key, &state_v2_aad(&tampered_rev.encode_to_vec()), &v2_sealed).is_none()
+            open_bytes(
+                &key,
+                &state_v2_aad(&tampered_rev.encode_to_vec()),
+                &v2_sealed
+            )
+            .is_none()
         );
 
         let mut tampered_mem = v2_header;
         tampered_mem.memory = ARGON2_DEFAULT_MEMORY;
         assert!(
-            open_bytes(&key, &state_v2_aad(&tampered_mem.encode_to_vec()), &v2_sealed).is_none()
+            open_bytes(
+                &key,
+                &state_v2_aad(&tampered_mem.encode_to_vec()),
+                &v2_sealed
+            )
+            .is_none()
         );
+    }
+
+    #[test]
+    fn checked_header_requires_the_authenticated_encoding() {
+        let trusted = VaultHeader::new();
+        assert_eq!(
+            verify_checked_header(&trusted, &trusted.encode_to_vec()).unwrap(),
+            trusted
+        );
+        for field in 0..6 {
+            let mut changed = trusted.clone();
+            match field {
+                0 => changed.salt[0] ^= 1,
+                1 => changed.memory += 1,
+                2 => changed.iterations += 1,
+                3 => changed.parallelism += 1,
+                4 => changed.revision += 1,
+                _ => changed.version = 1,
+            }
+            let error = verify_checked_header(&trusted, &changed.encode_to_vec()).unwrap_err();
+            if field < 4 {
+                assert!(matches!(error, Error::Corrupt(_)));
+            } else {
+                assert!(matches!(error, Error::Conflict { .. }));
+            }
+        }
+        let mut extra = trusted.encode_to_vec();
+        extra.extend([0x38, 1]);
+        assert!(matches!(
+            verify_checked_header(&trusted, &extra),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn upload_revisions_authenticate_state_at_each_commit() {
+        let key = [42; 32];
+        let mut current = VaultHeader::new();
+        let mut sealed = seal_bytes(&key, &state_v2_aad(&current.encode_to_vec()), b"state");
+        for _ in 0..2 {
+            let (next, header, updated) =
+                reseal_state_for_next_revision(&key, &current, &sealed).unwrap();
+            assert_eq!(next.revision, current.revision + 1);
+            assert_eq!(next.encode_to_vec(), header);
+            assert_eq!(
+                &**open_bytes(&key, &state_v2_aad(&header), &updated).unwrap(),
+                b"state"
+            );
+            assert!(open_bytes(&key, &state_v2_aad(&current.encode_to_vec()), &updated).is_none());
+            current = next;
+            sealed = updated;
+        }
+        sealed[0] ^= 1;
+        assert!(matches!(
+            reseal_state_for_next_revision(&key, &current, &sealed),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn pending_upload_wipes_both_secrets() {
+        fn requires_wipe_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+        let mut upload = PendingUpload::default();
+        upload.token.extend([1; 16]);
+        upload.key.extend([2; 32]);
+        requires_wipe_on_drop(&upload);
+        upload.clear_secrets();
+        assert!(upload.token.is_empty() && upload.key.is_empty());
     }
 }
