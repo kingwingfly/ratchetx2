@@ -28,8 +28,8 @@ use crate::{
     search::Search,
     state::{
         Attachment, Body, ClassicalPrompt, ContactView, Delivery, Dialog, FileView, Link,
-        LocalFile, Me, MessageView, Phase, RemoteFile, SecurityAlert, ServerPqStatus, SignIn,
-        Streamed, Ui, UploadState, UploadView,
+        LocalFile, Me, MessageView, PendingNewChat, Phase, RemoteFile, SecurityAlert,
+        ServerPqStatus, SignIn, SignInSuccessAction, Streamed, Ui, UploadState, UploadView,
     },
     util::{clock, day, js_error, key_to_text, month, short, size, size_u64, sleep},
     workers,
@@ -1662,7 +1662,17 @@ fn VaultDialog() -> impl IntoView {
             .with_untracked(|dialog| matches!(dialog, Some(Dialog::SignIn)))
         {
             // Dismissed, e.g. with Escape, the sign-in is put off, as "Not now" puts it off.
-            engine().decline_sign_in();
+            // If an invitation / NewChat draft was waiting behind sign-in, restore it and keep
+            // the native modal dialog open instead of letting it close and clear `ui.dialog`.
+            if engine().dismiss_sign_in() {
+                event.prevent_default();
+            }
+        }
+    };
+    let on_close = move |_| {
+        // Ignore stale queued close events if a new modal dialog has already opened.
+        if dialog.get_untracked().is_some_and(|d| !d.open()) {
+            ui.dialog.set(None);
         }
     };
     view! {
@@ -1671,7 +1681,7 @@ fn VaultDialog() -> impl IntoView {
             class:wide=move || matches!(ui.dialog.get(), Some(Dialog::Files(_)))
             node_ref=dialog
             on:cancel=on_cancel
-            on:close=move |_| ui.dialog.set(None)
+            on:close=on_close
         >
             {move || match (ui.phase.get(), ui.dialog.get()) {
                 (Phase::Create, _) => view! { <CreateVault /> }.into_any(),
@@ -1719,12 +1729,21 @@ fn clear_secret(signal: RwSignal<String>) {
 }
 
 /// Sign in to the server with its password, which storing files there takes, as they cost it
-/// storage: what waited for it goes then.
+/// storage: what waited for it goes then, and any pending invitation / new-chat draft resumes.
 #[component]
 fn SignInDialog() -> impl IntoView {
     let password = RwSignal::new(String::new());
     on_cleanup(move || clear_secret(password));
     let progress = Progress::new();
+    let pending_hint = engine()
+        .pending_new_chat_hint()
+        .map(|(auto_start, has_key)| match (auto_start, has_key) {
+            (true, _) => {
+                "Sign in to continue starting your chat — your invitation details are saved."
+            }
+            (false, true) => "After you sign in, your invitation will open automatically.",
+            (false, false) => "After you sign in, you will return to starting your chat.",
+        });
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         let engine = engine();
@@ -1735,13 +1754,50 @@ fn SignInDialog() -> impl IntoView {
             drop(secret);
             match result {
                 Ok(signed_in) => {
-                    engine.ui().dialog.set(None);
-                    engine.ui().notify(format!(
-                        "Signed in until {}: your files go now.",
-                        day(signed_in.expires)
-                    ));
+                    let until = day(signed_in.expires);
+                    match engine.complete_sign_in_flow() {
+                        SignInSuccessAction::Close => {
+                            engine.close_dialog_if_sign_in();
+                            engine
+                                .ui()
+                                .notify(format!("Signed in until {until}: your files go now."));
+                        }
+                        SignInSuccessAction::ReopenNewChat(dialog) => {
+                            engine.ui().dialog.set(Some(dialog));
+                            engine.ui().notify(format!("Signed in until {until}."));
+                        }
+                        SignInSuccessAction::AutoStartChat(pending) => {
+                            progress.try_start("Starting chat…");
+                            match engine
+                                .start_chat(
+                                    &pending.key,
+                                    pending.name.clone(),
+                                    pending.pq_pinned,
+                                    pending.allow_classical,
+                                )
+                                .await
+                            {
+                                Ok(peer) => {
+                                    engine.finish_auto_start_chat(None);
+                                    engine.close_dialog_if_new_chat();
+                                    engine.open(Some(peer)).await;
+                                    engine.ui().notify(format!("Signed in until {until}."));
+                                }
+                                Err(StartChatError::SignInRequired) => {
+                                    engine.finish_auto_start_chat(Some(
+                                        StartChatError::SignInRequired,
+                                    ));
+                                    progress.try_fail("Sign-in is still required by the server.");
+                                }
+                                Err(err) => {
+                                    engine.finish_auto_start_chat(Some(err));
+                                    engine.ui().notify(format!("Signed in until {until}."));
+                                }
+                            }
+                        }
+                    }
                 }
-                Err(e) => progress.fail(e),
+                Err(e) => progress.try_fail(e),
             }
         });
     };
@@ -1754,12 +1810,14 @@ fn SignInDialog() -> impl IntoView {
                 "signed in for a while. What you sent waits until then, unless you cancel it in "
                 "its chat."
             </p>
+            {pending_hint.map(|hint| view! { <p class="hint">{hint}</p> })}
             <label for="server-password">"The server's password"</label>
             <input
                 id="server-password"
                 type="password"
                 autocomplete="current-password"
                 required
+                autofocus
                 bind:value=password
             />
             {progress.view()}
@@ -1767,9 +1825,9 @@ fn SignInDialog() -> impl IntoView {
                 <button
                     type="button"
                     class="btn"
+                    disabled=move || progress.working.get()
                     on:click=move |_| {
-                        engine().decline_sign_in();
-                        close_dialog();
+                        engine().dismiss_sign_in();
                     }
                 >
                     "Not now"
@@ -1807,9 +1865,24 @@ impl Progress {
         self.message.set(message.to_string());
     }
 
+    fn try_start(&self, message: &str) {
+        let _ = self.working.try_set(true);
+        let _ = self.message.try_set(message.to_string());
+    }
+
     fn fail(&self, error: impl Into<String>) {
         self.working.set(false);
         self.message.set(error.into());
+    }
+
+    fn try_fail(&self, error: impl Into<String>) {
+        let _ = self.working.try_set(false);
+        let _ = self.message.try_set(error.into());
+    }
+
+    fn clear(&self) {
+        let _ = self.working.try_set(false);
+        let _ = self.message.try_set(String::new());
     }
 
     fn view(self) -> impl IntoView {
@@ -2035,6 +2108,43 @@ fn Unavailable(error: String) -> impl IntoView {
     }
 }
 
+fn apply_start_chat_error(
+    err: StartChatError,
+    classical_needed: RwSignal<Option<bool>>,
+    progress: Progress,
+) {
+    match err {
+        StartChatError::SignInRequired => progress.clear(),
+        StartChatError::ClassicalApprovalRequired { peer_signed_off } => {
+            let _ = classical_needed.try_set(Some(peer_signed_off));
+            progress.try_fail(if peer_signed_off {
+                "This peer signed a manifest disabling post-quantum encryption."
+            } else {
+                "This peer has no post-quantum prekeys on the server."
+            });
+        }
+        StartChatError::DowngradeDetected => {
+            progress.try_fail(
+                "Downgrade detected: this invitation pinned post-quantum encryption, but \
+                 the server did not provide valid PQ prekeys.",
+            );
+        }
+        StartChatError::PeerManifestExpired => {
+            progress.try_fail(
+                "This peer's signed post-quantum capability manifest has expired. Try \
+                 again after they come online.",
+            );
+        }
+        StartChatError::PqRequired => {
+            progress.try_fail(
+                "Require PQ (strict mode) is enabled, and a post-quantum session could not \
+                 be established with this peer.",
+            );
+        }
+        StartChatError::Other(e) => progress.try_fail(e),
+    }
+}
+
 #[component]
 fn NewChat(
     key: String,
@@ -2045,58 +2155,58 @@ fn NewChat(
     // An invitation for another server than the vault's: the inviter's keys are not on it.
     let elsewhere = ui().me.get_untracked().and_then(|me| {
         server
+            .as_ref()
             .filter(|server| !same_server(server, &me.server))
-            .map(|server| (server, me.server))
+            .map(|server| (server.clone(), me.server))
     });
+    engine().new_chat_mounted(key.clone(), name.clone(), server.clone(), pq_pinned);
     let key = RwSignal::new(key);
     let name = RwSignal::new(name);
+    let server_saved = StoredValue::new(server);
+    Effect::new(move || {
+        engine().new_chat_edited(key.get(), name.get());
+    });
+    on_cleanup(move || {
+        engine().new_chat_unmounted();
+    });
     let progress = Progress::new();
     let classical_needed = RwSignal::new(None::<bool>);
+    if let Some(feedback) = engine().take_new_chat_feedback() {
+        apply_start_chat_error(feedback, classical_needed, progress);
+    }
     let start = move |allow_classical: bool| {
         classical_needed.set(None);
         progress.start("Fetching their prekeys…");
         let engine = engine();
+        let draft = PendingNewChat {
+            key: key.get_untracked(),
+            name: name.get_untracked(),
+            server: server_saved.get_value(),
+            pq_pinned,
+            allow_classical,
+            auto_start: true,
+        };
+        engine.begin_new_chat_submit(draft.clone());
         spawn_local(async move {
-            match engine
+            let outcome = engine
                 .start_chat(
-                    &key.get_untracked(),
-                    name.get_untracked(),
-                    pq_pinned,
-                    allow_classical,
+                    &draft.key,
+                    draft.name.clone(),
+                    draft.pq_pinned,
+                    draft.allow_classical,
                 )
-                .await
-            {
+                .await;
+            engine.end_new_chat_submit();
+            match outcome {
                 Ok(peer) => {
-                    engine.ui().dialog.set(None);
+                    engine.close_dialog_if_new_chat();
                     engine.open(Some(peer)).await;
                 }
-                Err(StartChatError::ClassicalApprovalRequired { peer_signed_off }) => {
-                    classical_needed.set(Some(peer_signed_off));
-                    progress.fail(if peer_signed_off {
-                        "This peer signed a manifest disabling post-quantum encryption."
-                    } else {
-                        "This peer has no post-quantum prekeys on the server."
-                    });
+                Err(StartChatError::SignInRequired) => {
+                    progress.clear();
+                    engine.require_sign_in_for_new_chat(draft);
                 }
-                Err(StartChatError::DowngradeDetected) => {
-                    progress.fail(
-                        "Downgrade detected: this invitation pinned post-quantum encryption, but \
-                         the server did not provide valid PQ prekeys.",
-                    );
-                }
-                Err(StartChatError::PeerManifestExpired) => {
-                    progress.fail(
-                        "This peer's signed post-quantum capability manifest has expired. Try \
-                         again after they come online.",
-                    );
-                }
-                Err(StartChatError::PqRequired) => {
-                    progress.fail(
-                        "Require PQ (strict mode) is enabled, and a post-quantum session could not \
-                         be established with this peer.",
-                    );
-                }
-                Err(StartChatError::Other(e)) => progress.fail(e),
+                Err(err) => apply_start_chat_error(err, classical_needed, progress),
             }
         });
     };

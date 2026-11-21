@@ -166,14 +166,42 @@ pub fn size(bytes: usize) -> String {
     size_u64(bytes as u64)
 }
 
-/// An error and its causes, e.g. "protocol error: limit exceeded: resource_exhausted: ...", as
+/// An error and its causes, e.g. "protocol error: malformed message: ...", as
 /// an error's kind alone rarely says what to do.
+///
+/// Consecutive layers that repeat the previous message (e.g. `session::Error` wrapping
+/// `protocol::Error` with the same `SignInRequired`, `LimitExceeded`, or `Server` kind) are
+/// collapsed so prefixes are never duplicated.
 pub fn describe(error: &dyn std::error::Error) -> String {
     let mut description = error.to_string();
+    let mut last = description.clone();
     let mut source = error.source();
     while let Some(error) = source {
-        description.push_str(": ");
-        description.push_str(&error.to_string());
+        let next = error.to_string();
+        let trimmed = next.trim();
+        if trimmed.is_empty()
+            || trimmed == last
+            || description == trimmed
+            || description.ends_with(&format!(": {trimmed}"))
+        {
+            source = error.source();
+            continue;
+        }
+        let piece = if !last.is_empty() {
+            trimmed
+                .strip_prefix(&last)
+                .and_then(|rest| rest.strip_prefix(": "))
+                .unwrap_or(trimmed)
+        } else {
+            trimmed
+        };
+        if !piece.is_empty() {
+            if !description.is_empty() {
+                description.push_str(": ");
+            }
+            description.push_str(piece);
+            last = piece.to_string();
+        }
         source = error.source();
     }
     description
@@ -240,5 +268,71 @@ mod test {
         let first = monotonic_now_ms();
         let second = monotonic_now_ms();
         assert!(second >= first);
+    }
+
+    #[test]
+    fn describe_deduplicates_repeated_sign_in_and_kind_prefixes() {
+        // Exact error chain seen when a Connect 403 permission_denied travels through
+        // `protocol::Error(SignInRequired)` -> `session::Error(SignInRequired)`.
+        let proto_err = session::protocol::Error::new(
+            session::protocol::ErrorKind::SignInRequired,
+            "permission_denied: sign in to this server to use it",
+        );
+        let session_err = session::Error::from(proto_err);
+        let formatted = describe(&session_err);
+        assert_eq!(
+            formatted,
+            "sign-in required: permission_denied: sign in to this server to use it"
+        );
+        assert_eq!(
+            formatted.matches("sign-in required").count(),
+            1,
+            "sign-in required prefix must never be duplicated: {formatted}"
+        );
+
+        // Bare `SignInRequired` without an inner server detail still formats once.
+        let bare = session::Error::from(session::protocol::Error::from(
+            session::protocol::ErrorKind::SignInRequired,
+        ));
+        assert_eq!(describe(&bare), "sign-in required");
+
+        // Other matching kind pairs (`LimitExceeded`, `Server`) also collapse duplicates.
+        let limit_err = session::Error::from(session::protocol::Error::new(
+            session::protocol::ErrorKind::LimitExceeded,
+            "resource_exhausted: inbox full",
+        ));
+        assert_eq!(
+            describe(&limit_err),
+            "limit exceeded: resource_exhausted: inbox full"
+        );
+
+        let server_err = session::Error::from(session::protocol::Error::new(
+            session::protocol::ErrorKind::Server,
+            "internal: upstream failed",
+        ));
+        assert_eq!(describe(&server_err), "server error: internal: upstream failed");
+
+        // Distinct layers stay preserved in full.
+        let proto_malformed = session::Error::from(session::protocol::Error::new(
+            session::protocol::ErrorKind::Malformed,
+            "invalid key length",
+        ));
+        assert_eq!(
+            describe(&proto_malformed),
+            "protocol error: malformed message: invalid key length"
+        );
+
+        // Lower-layer error that already includes the outer prefix does not duplicate it.
+        let prefixed = session::Error::new(
+            session::ErrorKind::SignInRequired,
+            "sign-in required: session expired",
+        );
+        assert_eq!(describe(&prefixed), "sign-in required: session expired");
+
+        // Party error with identical message collapses to a single string.
+        let party_err = session::Error::from(party::error::Error::from(
+            party::error::ErrorKind::Undecryptable,
+        ));
+        assert_eq!(describe(&party_err), "cannot decrypt the message");
     }
 }
