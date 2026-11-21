@@ -19,14 +19,14 @@ use protocol::{
         PushResponse,
     },
 };
+#[cfg(all(feature = "prost", feature = "ml-kem-1024"))]
+use session::Session;
 use session::{
     Client, ErrorKind, PeerPqState, PublicKey, SessionSecurity, check_peer_hello,
     expected_audience_from_url,
 };
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 use session::{PqConfig, PqSuite};
-#[cfg(all(feature = "prost", feature = "ml-kem-1024"))]
-use session::Session;
 use storage::MemoryStore;
 
 /// Shared `Arc<MemoryStore>` implementing both v1 and (when PQ is enabled) v2 storage traits.
@@ -190,10 +190,20 @@ fn hello_bytes(name: &str, session_seq: u64, pq_capable: bool) -> Vec<u8> {
 #[test]
 fn expected_audience_normalizes_urls_and_rejects_bad_inputs() {
     let cases = [
-        ("https://Chat.Example.COM:443/path?x=1#frag", "chat.example.com"),
+        ("https://München.example:443/api", "xn--mnchen-3ya.example"),
+        ("http://BÜCHER.example:80", "xn--bcher-kva.example"),
+        ("münchen.example:8443", "xn--mnchen-3ya.example:8443"),
+        ("example。com:08080", "example.com:8080"),
+        (
+            "https://Chat.Example.COM:443/path?x=1#frag",
+            "chat.example.com",
+        ),
         ("HTTPS://Chat.Example.COM/path", "chat.example.com"),
         ("HTTP://localhost:8787/", "localhost:8787"),
-        ("WSS://Chat.Example.COM:0443/notifications", "chat.example.com"),
+        (
+            "WSS://Chat.Example.COM:0443/notifications",
+            "chat.example.com",
+        ),
         ("WS://LocalHost:0080/notifications", "localhost"),
         ("https://chat.example.com:8443/", "chat.example.com:8443"),
         ("https://chat.example.com:0443", "chat.example.com"),
@@ -224,6 +234,8 @@ fn expected_audience_normalizes_urls_and_rejects_bad_inputs() {
     }
 
     let bad = [
+        "xn--.example",
+        "https://example.com/a\0b",
         "",
         "   ",
         "https://user@evil.example",
@@ -327,7 +339,11 @@ async fn expired_envelope_carried_initial_survives_ok_duplicate_and_evicted() {
     for (case_name, greeting, follow_up) in [
         ("Ok", &b"carried-before-ok"[..], ok_msg),
         ("DuplicateMessage", &b"carried-before-dup"[..], msg1200),
-        ("EvictedMessage", &b"carried-before-evicted"[..], evicted_msg),
+        (
+            "EvictedMessage",
+            &b"carried-before-evicted"[..],
+            evicted_msg,
+        ),
     ] {
         let mut alice_new = alice
             .initiate(&bob.identity_key(), greeting, mb.clone())
@@ -443,6 +459,72 @@ async fn classical_persist_before_transmit_and_extend_without_rotating_spk() {
 }
 
 #[tokio::test]
+async fn classical_initial_and_in_band_hello_reject_unsafe_sequences_without_changing_state() {
+    let hs = V1Handshake(Arc::new(HandshakeServer::new(SharedStore::default())));
+    let mut alice = Client::new(hs.clone());
+    let mut bob = Client::new(hs);
+    bob.publish_keys(2).await.unwrap();
+    let invalid = protocol::MAX_SAFE_INTEGER + 1;
+    alice
+        .initiate(
+            &bob.identity_key(),
+            &hello_bytes("alice", invalid, true),
+            (),
+        )
+        .await
+        .unwrap();
+    alice
+        .initiate(&bob.identity_key(), &hello_bytes("alice", 1, false), ())
+        .await
+        .unwrap();
+    let inbox = bob.take_initial_messages().await.unwrap();
+    assert!(inbox[0].x3dh.one_time_prekey.is_some());
+    let count = bob.current_one_time_count();
+    assert_eq!(
+        bob.accept(&alice.identity_key(), &inbox[0], ())
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInitialMessage
+    );
+    assert_eq!(bob.current_one_time_count(), count);
+
+    let (mut session, _) = bob.accept(&alice.identity_key(), &inbox[1], ()).unwrap();
+    let before = session.peer_pq_state().clone();
+    let hello = Hello {
+        pq_capable: true,
+        session_seq: invalid,
+        ..Default::default()
+    };
+    let mut state = before.clone();
+    let stale = session::HelloCheck {
+        downgrade_detected: false,
+        recommend_start_again: false,
+        stale_session_seq: true,
+    };
+    assert_eq!(
+        check_peer_hello(&mut state, SessionSecurity::classical(), &hello, true),
+        stale
+    );
+    assert_eq!(state, before);
+    assert_eq!(session.check_peer_hello(&hello, true), stale);
+    assert_eq!(session.peer_pq_state(), &before);
+
+    #[cfg(feature = "prost")]
+    {
+        let wire = session::proto::SessionState::from(session.state());
+        let restored = session::SessionState::try_from(&wire).unwrap();
+        assert_eq!(restored.peer_pq_state(), &before);
+    }
+    #[cfg(feature = "rkyv")]
+    {
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(session.state()).unwrap();
+        let restored =
+            rkyv::from_bytes::<session::SessionState, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(restored.peer_pq_state(), &before);
+    }
+}
+
+#[tokio::test]
 async fn hello_session_seq_anti_rollback_protects_active_session() {
     let store = SharedStore::default();
     let hs = V1Handshake(Arc::new(HandshakeServer::new(store.clone())));
@@ -453,19 +535,35 @@ async fn hello_session_seq_anti_rollback_protects_active_session() {
 
     // 1. Alice starts session #1 (seq=1) and session #2 (seq=2), and a legacy seq=0 initial.
     let s1 = alice
-        .initiate(&bob.identity_key(), &hello_bytes("alice", 1, false), mb.clone())
+        .initiate(
+            &bob.identity_key(),
+            &hello_bytes("alice", 1, false),
+            mb.clone(),
+        )
         .await
         .unwrap();
     let mut s2 = alice
-        .initiate(&bob.identity_key(), &hello_bytes("alice", 2, false), mb.clone())
+        .initiate(
+            &bob.identity_key(),
+            &hello_bytes("alice", 2, false),
+            mb.clone(),
+        )
         .await
         .unwrap();
     let s0 = alice
-        .initiate(&bob.identity_key(), &hello_bytes("alice", 0, false), mb.clone())
+        .initiate(
+            &bob.identity_key(),
+            &hello_bytes("alice", 0, false),
+            mb.clone(),
+        )
         .await
         .unwrap();
     let mut s3 = alice
-        .initiate(&bob.identity_key(), &hello_bytes("alice", 3, false), mb.clone())
+        .initiate(
+            &bob.identity_key(),
+            &hello_bytes("alice", 3, false),
+            mb.clone(),
+        )
         .await
         .unwrap();
     drop((s1, s0));
@@ -545,7 +643,12 @@ async fn hello_session_seq_anti_rollback_protects_active_session() {
 
     // In-band check_peer_hello also detects stale seq and downgrade!
     let mut ps = PeerPqState::default();
-    let c0 = check_peer_hello(&mut ps, SessionSecurity::classical(), &Hello::classical("a"), false);
+    let c0 = check_peer_hello(
+        &mut ps,
+        SessionSecurity::classical(),
+        &Hello::classical("a"),
+        false,
+    );
     assert!(!c0.stale_session_seq);
     let c1 = check_peer_hello(
         &mut ps,
@@ -559,7 +662,12 @@ async fn hello_session_seq_anti_rollback_protects_active_session() {
     );
     assert!(!c1.stale_session_seq);
     assert_eq!(ps.peer_session_seq, 2);
-    let c_zero = check_peer_hello(&mut ps, SessionSecurity::classical(), &Hello::classical("a"), false);
+    let c_zero = check_peer_hello(
+        &mut ps,
+        SessionSecurity::classical(),
+        &Hello::classical("a"),
+        false,
+    );
     assert!(c_zero.stale_session_seq);
 }
 
@@ -567,10 +675,14 @@ async fn hello_session_seq_anti_rollback_protects_active_session() {
 async fn evicted_message_acks_delivery_token_and_surfaces_distinctly() {
     let store = SharedStore::default();
     let hs = V1Handshake(Arc::new(HandshakeServer::new(store.clone())));
-    let mailbox_server = Arc::new(MailboxServer::builder(store.clone()).limits(MailboxLimits {
-        max_fetch: 50,
-        ..MailboxLimits::default()
-    }).build());
+    let mailbox_server = Arc::new(
+        MailboxServer::builder(store.clone())
+            .limits(MailboxLimits {
+                max_fetch: 50,
+                ..MailboxLimits::default()
+            })
+            .build(),
+    );
     let mb = V1Mailbox(mailbox_server.clone());
 
     let mut alice = Client::new(hs.clone());
@@ -821,7 +933,9 @@ async fn state_validation_on_prost_restore_rejects_corruption() {
     let mut bad_key = base_session.clone();
     bad_key.me[31] |= 0x80;
     assert_eq!(
-        session::SessionState::try_from(&bad_key).unwrap_err().kind(),
+        session::SessionState::try_from(&bad_key)
+            .unwrap_err()
+            .kind(),
         ErrorKind::MalformedState
     );
 
@@ -1001,7 +1115,10 @@ mod pq_e2e {
         fn new(store: SharedStore, audience: &str) -> Self {
             Self {
                 v1: Arc::new(HandshakeServer::new(store.clone())),
-                v2: Arc::new(HandshakeV2Server::new(store, ServerInfoConfig::new(audience))),
+                v2: Arc::new(HandshakeV2Server::new(
+                    store,
+                    ServerInfoConfig::new(audience),
+                )),
             }
         }
     }
@@ -1357,7 +1474,11 @@ mod pq_e2e {
         let info = alice.check_server_info(AUDIENCE).await.unwrap();
         assert!(info.pq_enabled);
         assert_eq!(
-            alice.check_server_info("wrong.example").await.unwrap_err().kind(),
+            alice
+                .check_server_info("wrong.example")
+                .await
+                .unwrap_err()
+                .kind(),
             ErrorKind::DowngradeDetected
         );
 
@@ -1428,7 +1549,10 @@ mod pq_e2e {
         let sealed = alice_session.encrypt(b"turn-1").unwrap();
         let seq1 = alice_session.push_v2(sealed.clone()).await.unwrap();
         let seq1_retry = alice_session.push_v2(sealed).await.unwrap();
-        assert_eq!(seq1, seq1_retry, "PushV2 client_message_id must deduplicate retries");
+        assert_eq!(
+            seq1, seq1_retry,
+            "PushV2 client_message_id must deduplicate retries"
+        );
 
         let rx = session.receive_v2(&bob, AUDIENCE).await.unwrap();
         assert_eq!(rx.len(), 1);
@@ -1500,10 +1624,17 @@ mod pq_e2e {
         let mut outcomes = bob
             .list_and_accept_v2(AUDIENCE, 10, mb.clone(), |_| PeerPqState::default())
             .await
-            .unwrap();
+            .unwrap()
+            .outcomes;
         assert_eq!(outcomes.len(), 1);
-        let (_, AcceptedInitial::Accepted { mut session, first_message, security }) =
-            outcomes.pop().unwrap()
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                mut session,
+                first_message,
+                security,
+            },
+        ) = outcomes.pop().unwrap()
         else {
             panic!("expected accepted ML-KEM-768 session");
         };
@@ -1550,9 +1681,16 @@ mod pq_e2e {
         let mut outcomes = bob
             .list_and_accept_v2(AUDIENCE, 10, mb, |_| PeerPqState::default())
             .await
-            .unwrap();
-        let (_, AcceptedInitial::Accepted { mut session, first_message, security }) =
-            outcomes.pop().unwrap()
+            .unwrap()
+            .outcomes;
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                mut session,
+                first_message,
+                security,
+            },
+        ) = outcomes.pop().unwrap()
         else {
             panic!("expected accepted PQXDH session with classical ratchet");
         };
@@ -1562,12 +1700,270 @@ mod pq_e2e {
             SessionSecurity::pq(PqConfig::default_suite(), false)
         );
 
-        session.send_v2(b"classical-ratchet-over-pqxdh").await.unwrap();
+        session
+            .send_v2(b"classical-ratchet-over-pqxdh")
+            .await
+            .unwrap();
         let got = alice_session.receive_v2(&alice, AUDIENCE).await.unwrap();
         assert_eq!(
             got[0].content.as_deref().unwrap(),
             b"classical-ratchet-over-pqxdh"
         );
+    }
+
+    #[tokio::test]
+    async fn unsafe_pq_and_classical_initials_preserve_all_private_prekeys() {
+        let hs = DualHandshake::new(SharedStore::default(), AUDIENCE);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs);
+        bob.publish_v2(AUDIENCE, 3, 3).await.unwrap();
+        let invalid = hello_bytes("alice", protocol::MAX_SAFE_INTEGER + 1, true);
+        alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                &invalid,
+                (),
+            )
+            .await
+            .unwrap();
+        alice
+            .initiate(&bob.identity_key(), &invalid, ())
+            .await
+            .unwrap();
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        assert_eq!(listed.messages.len(), 2);
+        assert!(listed.messages[0].uses_pq_one_time_prekey());
+        assert!(!listed.messages[1].is_pq());
+        let suite = listed.messages[0].pq_suite().unwrap();
+        let counts = (
+            bob.current_one_time_count(),
+            bob.current_pq_one_time_count(suite),
+        );
+        for initial in &listed.messages {
+            assert!(initial.uses_one_time_prekey());
+            assert_eq!(
+                bob.accept_initial_v2(&alice.identity_key(), &PeerPqState::default(), initial, ())
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidInitialMessage
+            );
+            assert_eq!(
+                (
+                    bob.current_one_time_count(),
+                    bob.current_pq_one_time_count(suite)
+                ),
+                counts
+            );
+        }
+        let mut wire = protocol::handshake_v2::InitialMessageV2 {
+            version: 1,
+            identity_key: Bytes::copy_from_slice(&alice.identity_key()),
+            ephemeral_key: Bytes::from_static(&[2; 32]),
+            signed_prekey: Bytes::from_static(&[3; 32]),
+            first_message: Some(party::EncryptedMessage::default()),
+            ..Default::default()
+        };
+        assert!(InitialMessageV2::try_from(&wire).is_ok());
+        wire.manifest_digest = Bytes::from_static(&[4; 32]);
+        assert_eq!(
+            InitialMessageV2::try_from(&wire).unwrap_err().kind(),
+            ErrorKind::InvalidInitialMessage
+        );
+    }
+
+    #[tokio::test]
+    async fn toggling_pq_off_for_a_replacement_never_approves_future_classical_sessions() {
+        for pinned in [true, false] {
+            let hs = DualHandshake::new(SharedStore::default(), AUDIENCE);
+            let mut bob = Client::new(hs.clone());
+            let mut alice = Client::new(hs);
+            bob.publish_v2(AUDIENCE, 4, 2).await.unwrap();
+            let peer = alice.identity_key();
+            let mut chat = if pinned {
+                alice
+                    .initiate_v2(
+                        AUDIENCE,
+                        &bob.identity_key(),
+                        &PeerPqState::default(),
+                        &hello_bytes("alice", 1, true),
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                let result = bob
+                    .list_and_accept_v2(AUDIENCE, 10, (), |_| PeerPqState::default())
+                    .await
+                    .unwrap();
+                assert!(result.ack_error.is_none() && result.unacked_ids.is_empty());
+                let (
+                    _,
+                    AcceptedInitial::Accepted {
+                        session, security, ..
+                    },
+                ) = result.outcomes.into_iter().next().unwrap()
+                else {
+                    panic!("expected PQ session");
+                };
+                assert!(security.is_pq);
+                session
+            } else {
+                alice
+                    .initiate(&bob.identity_key(), &hello_bytes("alice", 1, false), ())
+                    .await
+                    .unwrap();
+                let inbox = bob.take_initial_messages().await.unwrap();
+                bob.accept(&peer, &inbox[0], ()).unwrap().0
+            };
+            let off = PqConfig {
+                pq_enabled: false,
+                ..PqConfig::default()
+            };
+            alice.set_pq_config(off.clone()).unwrap();
+            alice.publish_v2(AUDIENCE, 2, 0).await.unwrap();
+            bob.set_pq_config(off).unwrap();
+
+            alice
+                .initiate(&bob.identity_key(), &hello_bytes("alice", 2, false), ())
+                .await
+                .unwrap();
+            let listed = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+            let initial = &listed.messages[0];
+            let AcceptedInitial::Accepted { session, .. } = bob
+                .accept_initial_v2(&peer, chat.peer_pq_state(), initial, ())
+                .unwrap()
+            else {
+                panic!("local PQ is off");
+            };
+            assert!(!session.peer_pq_state().allow_classical_exception);
+            assert!(chat.accept_replacement_with_policy(session, false).unwrap());
+            assert_eq!(chat.peer_pq_state().pq_pinned, pinned);
+            assert!(!chat.peer_pq_state().allow_classical_exception);
+            bob.ack_initial_messages_v2(AUDIENCE, vec![initial.id])
+                .await
+                .unwrap();
+
+            bob.set_pq_config(PqConfig::default()).unwrap();
+            alice
+                .initiate(&bob.identity_key(), &hello_bytes("alice", 3, false), ())
+                .await
+                .unwrap();
+            let listed = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+            let AcceptedInitial::Quarantined {
+                session,
+                peer_was_pq_pinned,
+                ..
+            } = bob
+                .accept_initial_v2(&peer, chat.peer_pq_state(), &listed.messages[0], ())
+                .unwrap()
+            else {
+                panic!("expected approval prompt");
+            };
+            assert_eq!(peer_was_pq_pinned, pinned);
+            if pinned {
+                assert_eq!(
+                    chat.accept_replacement_with_policy(session, true)
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::DowngradeDetected
+                );
+            }
+            assert_eq!(
+                bob.prepare_initiate_v2(AUDIENCE, &peer, chat.peer_pq_state(), b"hi", ())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::ClassicalApprovalRequired {
+                    peer_signed_off: true
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn only_definitive_connect_refusals_roll_back_refilled_prekeys() {
+        use protocol::ErrorKind as Kind;
+        use protocol::connect::{ConnectClient, LocalPost, ProcedureV2};
+        #[derive(Clone, Copy)]
+        enum Reply {
+            Http(u16, &'static str),
+            Transport(Kind),
+        }
+        impl LocalPost for Reply {
+            async fn post(&self, path: &str, _: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
+                assert_eq!(path, ProcedureV2::RefillPrekeys.path());
+                match self {
+                    Self::Http(200, _) => Ok((200, vec![0xff])),
+                    Self::Http(status, code) => Ok((
+                        *status,
+                        format!(r#"{{"code":"{code}","message":"failure"}}"#).into_bytes(),
+                    )),
+                    Self::Transport(kind) => Err((*kind).into()),
+                }
+            }
+        }
+        for (response, expected, refused) in [
+            (
+                Reply::Http(429, "resource_exhausted"),
+                ErrorKind::LimitExceeded,
+                true,
+            ),
+            (
+                Reply::Http(403, "permission_denied"),
+                ErrorKind::SignInRequired,
+                true,
+            ),
+            (Reply::Http(404, "not_found"), ErrorKind::NotFound, true),
+            (
+                Reply::Http(501, "unimplemented"),
+                ErrorKind::Unimplemented,
+                true,
+            ),
+            (
+                Reply::Http(400, "invalid_argument"),
+                ErrorKind::Protocol,
+                true,
+            ),
+            (
+                Reply::Http(400, "failed_precondition"),
+                ErrorKind::Protocol,
+                true,
+            ),
+            (
+                Reply::Http(401, "unauthenticated"),
+                ErrorKind::Protocol,
+                true,
+            ),
+            (Reply::Http(200, ""), ErrorKind::InvalidResponse, false),
+            (
+                Reply::Transport(Kind::LimitExceeded),
+                ErrorKind::InvalidResponse,
+                false,
+            ),
+            (
+                Reply::Transport(Kind::Malformed),
+                ErrorKind::InvalidResponse,
+                false,
+            ),
+            (Reply::Http(500, "internal"), ErrorKind::Server, false),
+            (Reply::Http(503, "unavailable"), ErrorKind::Server, false),
+            (Reply::Transport(Kind::Connect), ErrorKind::Server, false),
+        ] {
+            let mut bob = Client::new(ConnectClient::new(response));
+            let publish = bob.prepare_publish_v2(AUDIENCE, 1, 1).unwrap();
+            bob.commit_publish_v2(publish);
+            let error = bob.refill_prekeys_v2(AUDIENCE, 1, 1).await.unwrap_err();
+            assert_eq!(error.kind(), expected);
+            assert_eq!(error.is_server_refusal(), refused);
+            let count = if refused { 1 } else { 2 };
+            assert_eq!(bob.current_one_time_count(), count);
+            assert_eq!(
+                bob.current_pq_one_time_count(PqConfig::default_suite()),
+                count
+            );
+        }
+        assert!(!session::Error::from(ErrorKind::Protocol).is_server_refusal());
     }
 
     #[tokio::test]
@@ -1587,7 +1983,13 @@ mod pq_e2e {
         // 1. Alice (PQ ON) tries to initiate with legacy TUI peer without exception -> prompts!
         let mut peer_state = PeerPqState::default();
         let err = alice
-            .initiate_v2(AUDIENCE, &tui.identity_key(), &peer_state, b"hi", mb.clone())
+            .initiate_v2(
+                AUDIENCE,
+                &tui.identity_key(),
+                &peer_state,
+                b"hi",
+                mb.clone(),
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -1601,7 +2003,13 @@ mod pq_e2e {
         //    legacy TUI peer can take_initial_messages & talk!
         peer_state.approve_classical_exception();
         let mut alice_session = alice
-            .initiate_v2(AUDIENCE, &tui.identity_key(), &peer_state, b"hi-tui", mb.clone())
+            .initiate_v2(
+                AUDIENCE,
+                &tui.identity_key(),
+                &peer_state,
+                b"hi-tui",
+                mb.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(alice_session.security(), Some(SessionSecurity::classical()));
@@ -1740,10 +2148,17 @@ mod pq_e2e {
         let mut outcomes = bob
             .list_and_accept_v2(AUDIENCE, 10, mb.clone(), |_| PeerPqState::default())
             .await
-            .unwrap();
+            .unwrap()
+            .outcomes;
         assert_eq!(outcomes.len(), 1);
-        let (_, AcceptedInitial::Accepted { mut session, first_message, security }) =
-            outcomes.pop().unwrap()
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                mut session,
+                first_message,
+                security,
+            },
+        ) = outcomes.pop().unwrap()
         else {
             panic!("in-flight PQ handshake must still be accepted after toggling PQ OFF");
         };
@@ -1762,7 +2177,13 @@ mod pq_e2e {
             ..PeerPqState::default()
         };
         let err = carol
-            .initiate_v2(AUDIENCE, &bob.identity_key(), &carol_peer_state, b"hi", mb.clone())
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &carol_peer_state,
+                b"hi",
+                mb.clone(),
+            )
             .await
             .unwrap_err();
         assert_eq!(
@@ -1773,10 +2194,19 @@ mod pq_e2e {
         );
         carol_peer_state.approve_classical_exception();
         let carol_classical = carol
-            .initiate_v2(AUDIENCE, &bob.identity_key(), &carol_peer_state, b"ok-classical", mb.clone())
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &carol_peer_state,
+                b"ok-classical",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        assert_eq!(carol_classical.security(), Some(SessionSecurity::classical()));
+        assert_eq!(
+            carol_classical.security(),
+            Some(SessionSecurity::classical())
+        );
 
         // 6. Bob toggles PQ BACK ON and re-publishes PQ prekeys (manifest_seq = 3)!
         bob.set_pq_config(PqConfig {
@@ -1791,7 +2221,13 @@ mod pq_e2e {
 
         // Carol starts a fresh PQ session with Bob!
         let carol_pq = carol
-            .initiate_v2(AUDIENCE, &bob.identity_key(), &carol_peer_state, b"back-to-pq", mb)
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &carol_peer_state,
+                b"back-to-pq",
+                mb,
+            )
             .await
             .unwrap();
         assert!(carol_pq.security().unwrap().is_pq);
@@ -1867,7 +2303,13 @@ mod pq_e2e {
         let mut alice_wrong_aud = Client::new(hs.clone());
         assert_eq!(
             alice_wrong_aud
-                .initiate_v2("attacker.example", &bob.identity_key(), &PeerPqState::default(), b"hi", mb.clone())
+                .initiate_v2(
+                    "attacker.example",
+                    &bob.identity_key(),
+                    &PeerPqState::default(),
+                    b"hi",
+                    mb.clone()
+                )
                 .await
                 .unwrap_err()
                 .kind(),
@@ -1883,7 +2325,13 @@ mod pq_e2e {
             });
             assert_eq!(
                 alice_suite_downgrade
-                    .initiate_v2(AUDIENCE, &bob.identity_key(), &PeerPqState::default(), b"hi", mb)
+                    .initiate_v2(
+                        AUDIENCE,
+                        &bob.identity_key(),
+                        &PeerPqState::default(),
+                        b"hi",
+                        mb
+                    )
                     .await
                     .unwrap_err()
                     .kind(),
@@ -1919,6 +2367,189 @@ mod pq_e2e {
         );
         assert!(stale_check.stale_session_seq);
         assert_eq!(state.peer_session_seq, 1);
+    }
+
+    /// Runs requests against the real in-process servers, with one selected response failure.
+    struct InterruptedPost {
+        hs: DualHandshake,
+        mb: DualMailbox,
+        fail_ack_on: Option<usize>,
+        acknowledgements: std::cell::Cell<usize>,
+        lose_refill_response: bool,
+    }
+
+    impl protocol::connect::LocalPost for InterruptedPost {
+        async fn post(&self, path: &str, body: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
+            use protocol::connect::{CONTENT_TYPE, ProcedureV2, handle_v2};
+            let procedure = ProcedureV2::from_path(path).unwrap();
+            if procedure == ProcedureV2::AckInitialMessages {
+                let call = self.acknowledgements.get() + 1;
+                self.acknowledgements.set(call);
+                if self.fail_ack_on == Some(call) {
+                    return Err(protocol::ErrorKind::Connect.into());
+                }
+            }
+            let response =
+                handle_v2(&self.hs, &self.mb, procedure, Some(CONTENT_TYPE), &body).await;
+            if procedure == ProcedureV2::RefillPrekeys && self.lose_refill_response {
+                assert_eq!(response.status, 200);
+                return Ok((200, vec![0xff]));
+            }
+            Ok((response.status, response.body))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_ack_returns_accepted_sessions_and_only_the_outstanding_ids() {
+        use protocol::{connect::ConnectClient, handshake_v2::HandshakeV2Limits};
+        for (preceding, fail_on) in [(0, 1), (200, 2)] {
+            let store = SharedStore::default();
+            let limit = 201;
+            let hs = DualHandshake {
+                v2: Arc::new(
+                    HandshakeV2Server::builder(store.clone())
+                        .info(ServerInfoConfig::new(AUDIENCE))
+                        .limits(HandshakeV2Limits {
+                            max_initial_messages: limit,
+                            max_list_limit: limit,
+                            ..Default::default()
+                        })
+                        .build(),
+                ),
+                ..DualHandshake::new(store.clone(), AUDIENCE)
+            };
+            let mb = DualMailbox::new(store.clone(), AUDIENCE);
+            let mut alice = Client::new(hs.clone());
+            let mut bob = Client::new(ConnectClient::new(InterruptedPost {
+                hs,
+                mb: mb.clone(),
+                fail_ack_on: Some(fail_on),
+                acknowledgements: Default::default(),
+                lose_refill_response: false,
+            }));
+            bob.publish_v2(AUDIENCE, 1, 1).await.unwrap();
+            for _ in 0..preceding {
+                assert!(
+                    storage::LocalHandshakeStore::add_initial_message(
+                        &store,
+                        storage::StoredInitialMessage {
+                            sender: [0; 32],
+                            recipient: bob.identity_key(),
+                            ephemeral_key: [2; 32],
+                            signed_prekey: [3; 32],
+                            one_time_prekey: None,
+                            header: Bytes::new(),
+                            content: Bytes::new(),
+                        },
+                        limit
+                    )
+                    .await
+                    .unwrap()
+                );
+            }
+            let mut sender = alice
+                .initiate_v2(
+                    AUDIENCE,
+                    &bob.identity_key(),
+                    &PeerPqState::default(),
+                    b"first",
+                    mb.clone(),
+                )
+                .await
+                .unwrap();
+            let outcome = bob
+                .list_and_accept_v2(AUDIENCE, 0, mb, |_| PeerPqState::default())
+                .await
+                .unwrap();
+            assert!(outcome.ack_error.is_some());
+            let first_pending = if fail_on == 1 { 1 } else { 101 };
+            assert_eq!(
+                outcome.unacked_ids,
+                (first_pending..=preceding + 1).collect::<Vec<_>>()
+            );
+            assert_eq!(outcome.outcomes.len(), 1);
+            let (
+                peer,
+                AcceptedInitial::Accepted {
+                    mut session,
+                    first_message,
+                    ..
+                },
+            ) = outcome.outcomes.into_iter().next().unwrap()
+            else {
+                panic!("accepted session was lost");
+            };
+            assert_eq!(peer, alice.identity_key());
+            assert_eq!(first_message, b"first");
+            assert_eq!(bob.current_one_time_count(), 0);
+            assert_eq!(bob.current_pq_one_time_count(PqConfig::default_suite()), 0);
+            sender.send_v2(b"second").await.unwrap();
+            assert_eq!(
+                session.receive_v2(&bob, AUDIENCE).await.unwrap()[0]
+                    .content
+                    .as_deref()
+                    .unwrap(),
+                b"second"
+            );
+            let pending = bob.list_initial_messages_v2(AUDIENCE, 0).await.unwrap();
+            assert_eq!(
+                pending.messages.iter().map(|m| m.id).collect::<Vec<_>>(),
+                outcome.unacked_ids
+            );
+            let count = outcome.unacked_ids.len() as u32;
+            assert_eq!(
+                bob.ack_initial_messages_v2(AUDIENCE, outcome.unacked_ids)
+                    .await
+                    .unwrap(),
+                count
+            );
+            assert!(
+                bob.list_initial_messages_v2(AUDIENCE, 0)
+                    .await
+                    .unwrap()
+                    .messages
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreadable_committed_refill_still_decrypts_a_session_using_both_new_keys() {
+        let store = SharedStore::default();
+        let hs = DualHandshake::new(store.clone(), AUDIENCE);
+        let mb = DualMailbox::new(store, AUDIENCE);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(protocol::connect::ConnectClient::new(InterruptedPost {
+            hs,
+            mb: mb.clone(),
+            fail_ack_on: None,
+            acknowledgements: Default::default(),
+            lose_refill_response: true,
+        }));
+        bob.publish_v2(AUDIENCE, 0, 0).await.unwrap();
+        let err = bob.refill_prekeys_v2(AUDIENCE, 1, 1).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidResponse);
+        assert!(!err.is_server_refusal());
+        alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"refilled",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 1).await.unwrap();
+        let init = &listed.messages[0];
+        assert!(init.uses_one_time_prekey() && init.uses_pq_one_time_prekey());
+        let AcceptedInitial::Accepted { first_message, .. } = bob
+            .accept_initial_v2(&alice.identity_key(), &PeerPqState::default(), init, mb)
+            .unwrap()
+        else {
+            panic!("expected a session using the refilled keys");
+        };
+        assert_eq!(first_message, b"refilled");
     }
 
     #[tokio::test]
@@ -2056,9 +2687,15 @@ mod pq_e2e {
                 |_| PeerPqState::default(),
             )
             .await
-            .unwrap();
-        let (_, AcceptedInitial::Accepted { session: mut bob_session, .. }) =
-            outcomes.pop().unwrap()
+            .unwrap()
+            .outcomes;
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                session: mut bob_session,
+                ..
+            },
+        ) = outcomes.pop().unwrap()
         else {
             panic!("expected accepted");
         };
@@ -2085,13 +2722,12 @@ mod pq_e2e {
         alice_session.send_v2(b"expired-msg").await.unwrap();
         alice_session.send_v2(b"after-expired").await.unwrap();
 
-        // Bob fetches page 1 (expired seq 1 carrying PQ initial) -> loops to page 2 (seq 2
-        // encrypted on new PQ session -> Stalled!) -> Stalled MUST carry the v2 PQ initial!
+        // The expired first page surfaces the carried PQ initial before fetching page two.
         let rx = bob_session.receive_v2(&bob, AUDIENCE).await.unwrap();
         assert_eq!(rx.len(), 1);
         assert_eq!(
             rx[0].content.as_ref().unwrap_err().kind(),
-            ErrorKind::Stalled
+            ErrorKind::Expired
         );
         assert_eq!(rx[0].initial_messages.len(), 1);
         assert!(rx[0].initial_messages[0].is_pq());
@@ -2192,13 +2828,15 @@ mod pq_e2e {
                 alice_session.peer_pq_state().clone()
             })
             .await
-            .unwrap();
+            .unwrap()
+            .outcomes;
         let mut b_in = bob
             .list_and_accept_v2(AUDIENCE, 10, mb.clone(), |_| {
                 bob_session.peer_pq_state().clone()
             })
             .await
-            .unwrap();
+            .unwrap()
+            .outcomes;
         let (_, AcceptedInitial::Accepted { session: a_acc, .. }) = a_in.pop().unwrap() else {
             panic!("expected accepted");
         };
@@ -2363,7 +3001,8 @@ mod pq_e2e {
         let outcomes = bob
             .list_and_accept_v2(AUDIENCE, 10, mb, |_| PeerPqState::default())
             .await
-            .unwrap();
+            .unwrap()
+            .outcomes;
         assert!(outcomes.is_empty());
         assert!(
             bob.list_initial_messages_v2(AUDIENCE, 10)
@@ -2399,7 +3038,13 @@ mod pq_e2e {
         };
         assert_eq!(
             alice
-                .initiate_v2(AUDIENCE, &bob.identity_key(), &pinned_seq1, b"hi", mb.clone())
+                .initiate_v2(
+                    AUDIENCE,
+                    &bob.identity_key(),
+                    &pinned_seq1,
+                    b"hi",
+                    mb.clone()
+                )
                 .await
                 .unwrap_err()
                 .kind(),
@@ -2424,7 +3069,13 @@ mod pq_e2e {
         };
         assert_eq!(
             alice
-                .initiate_v2(AUDIENCE, &bob.identity_key(), &pinned_seq2, b"hi", mb.clone())
+                .initiate_v2(
+                    AUDIENCE,
+                    &bob.identity_key(),
+                    &pinned_seq2,
+                    b"hi",
+                    mb.clone()
+                )
                 .await
                 .unwrap_err()
                 .kind(),
@@ -2482,11 +3133,7 @@ mod pq_e2e {
         let pq_bundle = x3dh::PqPrekeyBundle::try_from(&claimed).unwrap();
         let foreign_digest = [0xAB; 32];
         let (pq_init, agreement) = pq_bundle
-            .initiate_pq(
-                &alice_id_copy,
-                &bob.identity_key(),
-                Some(&foreign_digest),
-            )
+            .initiate_pq(&alice_id_copy, &bob.identity_key(), Some(&foreign_digest))
             .unwrap();
         let ratchet = ratchetx2::Ratchet::alice(
             &ratchetx2::SharedKeys::from_secret(&agreement.secret_key),
@@ -2525,7 +3172,8 @@ mod pq_e2e {
     }
 
     #[tokio::test]
-    async fn forged_initials_never_trigger_downgrade_or_pq_required_and_strict_pq_rejects_missing_digest() {
+    async fn forged_initials_never_trigger_downgrade_or_pq_required_and_strict_pq_rejects_missing_digest()
+     {
         let store = SharedStore::default();
         let hs = DualHandshake::new(store.clone(), AUDIENCE);
         let mb = DualMailbox::new(store, AUDIENCE);
@@ -2783,10 +3431,17 @@ mod pq_e2e {
         let mut outcomes = bob
             .list_and_accept_v2(AUDIENCE, 10, mb, |_| PeerPqState::default())
             .await
-            .unwrap();
+            .unwrap()
+            .outcomes;
         assert_eq!(outcomes.len(), 1);
-        let (_, AcceptedInitial::Accepted { first_message, security, .. }) =
-            outcomes.pop().unwrap()
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                first_message,
+                security,
+                ..
+            },
+        ) = outcomes.pop().unwrap()
         else {
             panic!("expected in-flight PQ handshake to decrypt across 1st PQ-OFF rotation");
         };
@@ -2875,9 +3530,15 @@ mod pq_e2e {
         let mut outcomes = bob
             .list_and_accept_v2(AUDIENCE, 10, bob_mb, |_| PeerPqState::default())
             .await
-            .unwrap();
-        let (_, AcceptedInitial::Accepted { session: mut bob_session, .. }) =
-            outcomes.pop().unwrap()
+            .unwrap()
+            .outcomes;
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                session: mut bob_session,
+                ..
+            },
+        ) = outcomes.pop().unwrap()
         else {
             panic!("expected accepted");
         };
@@ -2903,7 +3564,10 @@ mod pq_e2e {
         let ok_msg = alice_old.encrypt(b"v2-ok-after-expired").unwrap();
         alice_old.push_v2(msg600).await.unwrap();
         alice_old.push_v2(msg1200.clone()).await.unwrap();
-        assert_eq!(bob_session.receive_v2(&bob, AUDIENCE).await.unwrap().len(), 2);
+        assert_eq!(
+            bob_session.receive_v2(&bob, AUDIENCE).await.unwrap().len(),
+            2
+        );
 
         for (case_name, greeting, follow_up) in [
             ("Ok", &b"v2-carried-ok"[..], ok_msg),
@@ -3087,7 +3751,10 @@ mod pq_e2e {
 
         // 1. Bob publishes PQ-ON while server has PQ_ENABLED=true (creates `capability_manifest`).
         let prep1 = bob.prepare_publish_v2(AUDIENCE, 5, 5).unwrap();
-        let out1 = bob.transmit_publish_v2_or_v1_fallback(&prep1).await.unwrap();
+        let out1 = bob
+            .transmit_publish_v2_or_v1_fallback(&prep1)
+            .await
+            .unwrap();
         assert_eq!(out1, session::PublishV2Outcome::V2Pq);
         bob.commit_publish_v2(prep1);
 
@@ -3128,10 +3795,17 @@ mod pq_e2e {
         let mut drained = bob
             .list_and_accept_v2(AUDIENCE, 10, mb, |_| PeerPqState::default())
             .await
-            .unwrap();
+            .unwrap()
+            .outcomes;
         assert_eq!(drained.len(), 1);
-        let (_, AcceptedInitial::Accepted { first_message, security, .. }) =
-            drained.pop().unwrap()
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                first_message,
+                security,
+                ..
+            },
+        ) = drained.pop().unwrap()
         else {
             panic!("expected in-flight PQ initial to drain during PQ_ENABLED=false");
         };

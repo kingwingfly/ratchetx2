@@ -386,7 +386,13 @@ mod test {
     #[test]
     fn upload_guards_against_nonce_reuse_and_resumed_floor() {
         let key = generate_key();
-        let upload = Upload::new([1; ID_LENGTH], Zeroizing::new([2; TOKEN_LENGTH]), key, 3, None);
+        let upload = Upload::new(
+            [1; ID_LENGTH],
+            Zeroizing::new([2; TOKEN_LENGTH]),
+            key,
+            3,
+            None,
+        );
         let c0 = upload.try_encrypt(0, b"chunk-zero").unwrap();
         // Idempotent retry with identical plaintext produces the exact same ciphertext.
         let c0_retry = upload.try_encrypt(0, b"chunk-zero").unwrap();
@@ -399,13 +405,8 @@ mod test {
         assert_eq!(err.kind(), ErrorKind::NonceReuse);
 
         // Resumed upload refuses any chunk below `sealed_chunks`.
-        let resumed = Upload::resume_from(
-            *upload.id(),
-            *upload.token(),
-            Key::new(*upload.key()),
-            3,
-            2,
-        );
+        let resumed =
+            Upload::resume_from(*upload.id(), *upload.token(), Key::new(*upload.key()), 3, 2);
         assert_eq!(
             resumed.try_encrypt(0, b"chunk-zero").unwrap_err().kind(),
             ErrorKind::NonceReuse

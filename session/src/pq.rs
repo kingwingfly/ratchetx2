@@ -6,6 +6,7 @@
 //! unconditionally with **zero** `ml-kem` dependency. The cryptographic PQXDH / v2 wire methods
 //! are compiled only when `ml-kem-1024`, `ml-kem-768`, or `pq` is enabled.
 
+pub use protocol::normalize_audience;
 use x3dh::PqSuite;
 
 use crate::error::{ErrorKind, Result};
@@ -192,7 +193,7 @@ pub struct HelloCheck {
     /// `true` when the caller should start a fresh PQ session to recover from a downgrade.
     pub recommend_start_again: bool,
     /// `true` if `hello.session_seq` was stale (`0` or `<= peer_state.peer_session_seq` once
-    /// `peer_state.peer_session_seq > 0`).
+    /// `peer_state.peer_session_seq > 0`) or exceeded [`protocol::MAX_SAFE_INTEGER`].
     pub stale_session_seq: bool,
 }
 
@@ -211,6 +212,13 @@ pub fn check_peer_hello(
     hello: &protocol::content::Hello,
     local_pq_enabled: bool,
 ) -> HelloCheck {
+    if hello.session_seq > protocol::MAX_SAFE_INTEGER {
+        return HelloCheck {
+            downgrade_detected: false,
+            recommend_start_again: false,
+            stale_session_seq: true,
+        };
+    }
     let stale_session_seq = if peer_state.peer_session_seq > 0 {
         hello.session_seq == 0 || hello.session_seq <= peer_state.peer_session_seq
     } else {
@@ -234,95 +242,9 @@ pub fn check_peer_hello(
     }
 }
 
-/// Derive the canonical expected server audience (`host` or `host:port`, lowercased, with IPv6
-/// addresses normalized and default HTTP/HTTPS ports stripped) from a locally configured server
-/// URL or hostname.
-///
-/// Matches `protocol::handshake_v2::normalize_audience` exactly:
-/// - trims surrounding whitespace
-/// - strips an optional `http://`, `https://`, `ws://`, or `wss://` scheme case-insensitively
-/// - strips any trailing path, query, or fragment
-/// - lowercases hostnames and canonicalizes bracketed IPv6 literals via [`std::net::Ipv6Addr`]
-/// - parses numeric ports (stripping leading zeros and empty trailing `:`)
-/// - drops default ports (`:443` for `https`/`wss`, `:80` for `http`/`ws`, and both `:80` and
-///   `:443` when no scheme was specified)
-///
-/// Clients MUST derive their expected audience from the locally configured server origin/host
-/// rather than trusting `GetServerInfo.server_id`.
+/// Derive the canonical audience from the locally configured relay URL or hostname.
 pub fn expected_audience_from_url(url_or_host: &str) -> Result<String> {
-    let trimmed = url_or_host.trim();
-    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
-        return Err(ErrorKind::Protocol.into());
-    }
-    let (explicit_scheme, rest) = if let Some((scheme, after)) = trimmed.split_once("://") {
-        match scheme.to_ascii_lowercase().as_str() {
-            "https" | "wss" => (Some("https"), after),
-            "http" | "ws" => (Some("http"), after),
-            _ => return Err(ErrorKind::Protocol.into()),
-        }
-    } else {
-        (None, trimmed)
-    };
-
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if authority.is_empty() || authority.contains('@') {
-        return Err(ErrorKind::Protocol.into());
-    }
-
-    let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix('[') {
-        let Some((ipv6_raw, tail)) = after_bracket.split_once(']') else {
-            return Err(ErrorKind::Protocol.into());
-        };
-        let ipv6: std::net::Ipv6Addr = ipv6_raw.parse().map_err(|_| ErrorKind::Protocol)?;
-        let port_str = if tail.is_empty() {
-            None
-        } else if let Some(p) = tail.strip_prefix(':') {
-            Some(p)
-        } else {
-            return Err(ErrorKind::Protocol.into());
-        };
-        (format!("[{ipv6}]"), port_str)
-    } else {
-        if authority.contains('[') || authority.contains(']') {
-            return Err(ErrorKind::Protocol.into());
-        }
-        let (host_raw, port_str) = match authority.split_once(':') {
-            Some((h, p)) => {
-                if p.contains(':') {
-                    return Err(ErrorKind::Protocol.into());
-                }
-                (h, Some(p))
-            }
-            None => (authority, None),
-        };
-        if host_raw.is_empty() || host_raw.bytes().any(|b| b.is_ascii_control()) {
-            return Err(ErrorKind::Protocol.into());
-        }
-        (host_raw.to_ascii_lowercase(), port_str)
-    };
-
-    let port = match port_str {
-        None | Some("") => None,
-        Some(p) => {
-            if !p.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(ErrorKind::Protocol.into());
-            }
-            let parsed: u16 = p.parse().map_err(|_| ErrorKind::Protocol)?;
-            Some(parsed)
-        }
-    };
-
-    let port = match (explicit_scheme, port) {
-        (Some("https"), Some(443)) => None,
-        (Some("http"), Some(80)) => None,
-        (None, Some(80 | 443)) => None,
-        (_, other) => other,
-    };
-
-    Ok(match port {
-        Some(p) => format!("{host}:{p}"),
-        None => host,
-    })
+    normalize_audience(url_or_host).map_err(|_| ErrorKind::Protocol.into())
 }
 
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -344,7 +266,7 @@ mod v2 {
             manifest_digest, sign_manifest, verify_manifest, verify_manifest_at,
             verify_wire_pq_prekey,
         },
-        mailbox::{DELIVERY_TOKEN_LENGTH, FetchRequest, LocalMailbox, MAX_DELIVERED},
+        mailbox::LocalMailbox,
         mailbox_v2::{
             CLIENT_MESSAGE_ID_LENGTH, EnvelopeV2, FetchSignedRequest, LocalMailboxV2,
             PushV2Request, decode_carried_initial, encode_carried_initial,
@@ -357,12 +279,10 @@ mod v2 {
     };
     use xeddsa::XEdDSAPublicKey;
 
-    use super::{
-        DEFAULT_MANIFEST_TTL_MS, PeerPqState, SessionSecurity, check_peer_hello,
-    };
+    use super::{DEFAULT_MANIFEST_TTL_MS, PeerPqState, SessionSecurity, check_peer_hello};
     use crate::{
-        Active, Client, DeliveryKey, InitialMessage, MAX_CARRIED_INITIALS, MAX_EXPIRED_PAGES,
-        Sealed, Session,
+        Active, Client, DeliveryKey, InitialMessage, MailboxEnvelope, Sealed, Session,
+        checked_initial_hello,
         error::{Error, ErrorKind, Result},
         extract_hello,
     };
@@ -560,6 +480,18 @@ mod v2 {
         pub fell_back_to_v1: bool,
     }
 
+    /// Locally processed inbox outcomes and the progress of their server acknowledgement.
+    #[derive(Debug)]
+    pub struct ListAndAcceptOutcome<M> {
+        /// Every initial message accepted or quarantined locally, with its prekeys confirmed.
+        pub outcomes: Vec<(PublicKey, AcceptedInitial<M>)>,
+        /// Handled IDs whose acknowledgement is still outstanding. Empty on success or v1 fallback.
+        pub unacked_ids: Vec<u64>,
+        /// Acknowledgement failure. Persist `outcomes` and retry
+        /// [`Client::ack_initial_messages_v2`] with `unacked_ids`.
+        pub ack_error: Option<Error>,
+    }
+
     /// Outcome of accepting an inbound v1/v2 initial message via [`Client::accept_initial_v2`].
     #[derive(Debug)]
     pub enum AcceptedInitial<M> {
@@ -586,6 +518,23 @@ mod v2 {
             /// `true` if the peer was already PQ-pinned (`peer_state.pq_pinned`).
             peer_was_pq_pinned: bool,
         },
+    }
+
+    impl MailboxEnvelope for EnvelopeV2 {
+        type Initial = InitialMessageV2;
+
+        fn sequence(&self) -> u64 {
+            self.sequence
+        }
+
+        fn into_parts(self) -> (Option<EncryptedMessage>, Option<InitialMessageV2>) {
+            (
+                self.message,
+                self.initial_message
+                    .as_ref()
+                    .and_then(|im| InitialMessageV2::try_from(im).ok()),
+            )
+        }
     }
 
     /// A message received via [`Session::receive_v2`] / [`Session::fetch_v2`].
@@ -891,8 +840,8 @@ mod v2 {
             })
         }
 
-        /// Retract newly added OPKs/PQOPKs from a prepared v2 refill that was definitively
-        /// refused before storage (e.g. `ErrorKind::SignInRequired`).
+        /// Retract newly added OPKs/PQOPKs from a prepared v2 refill after
+        /// [`Error::is_server_refusal`] confirms the relay refused it.
         pub fn rollback_refill_v2_on_refusal(&mut self, prepared: PreparedRefillV2) {
             self.state
                 .prekeys
@@ -941,8 +890,8 @@ mod v2 {
             if initial_message.sender != *peer {
                 return Err(ErrorKind::UnexpectedPeer.into());
             }
-            let local_pq_enabled =
-                self.state.pq_config.pq_enabled && !self.state.pq_config.offered_suites().is_empty();
+            let local_pq_enabled = self.state.pq_config.pq_enabled
+                && !self.state.pq_config.offered_suites().is_empty();
             let strict_pq = self.state.pq_config.strict_pq;
 
             match &initial_message.kind {
@@ -974,14 +923,10 @@ mod v2 {
                         match classical_party.decrypt(first_message) {
                             Ok(content) => (classical_party, content, false),
                             Err(e) if e.kind() == party::error::ErrorKind::InvalidHeader => {
-                                let party_suite =
-                                    party::PqSuite::from_id(agreement.suite.as_u8())
-                                        .ok_or(ErrorKind::UnsupportedSuite)?;
-                                let mut pq_party = Party::new_pq(
-                                    ratchet,
-                                    agreement.associated_data,
-                                    party_suite,
-                                );
+                                let party_suite = party::PqSuite::from_id(agreement.suite.as_u8())
+                                    .ok_or(ErrorKind::UnsupportedSuite)?;
+                                let mut pq_party =
+                                    Party::new_pq(ratchet, agreement.associated_data, party_suite);
                                 let content = pq_party.decrypt(first_message).map_err(|err| {
                                     Error::new(ErrorKind::InvalidInitialMessage, err)
                                 })?;
@@ -1006,6 +951,8 @@ mod v2 {
                             _ => {}
                         }
                     }
+                    let incoming_seq =
+                        checked_initial_hello(&content)?.map_or(0, |h| h.session_seq);
                     self.state.prekeys.confirm_pq(pq_init)?;
                     let security = SessionSecurity::pq(agreement.suite, pq_ratchet);
                     let mut updated_peer_pq = peer_state.clone();
@@ -1013,7 +960,6 @@ mod v2 {
                     updated_peer_pq.peer_pq_capable = true;
                     updated_peer_pq.allow_classical_exception = false;
                     updated_peer_pq.downgrade_detected = false;
-                    let incoming_seq = extract_hello(&content).map_or(0, |h| h.session_seq);
                     if incoming_seq > updated_peer_pq.peer_session_seq {
                         updated_peer_pq.peer_session_seq = incoming_seq;
                     }
@@ -1035,11 +981,10 @@ mod v2 {
                     })
                 }
                 InitialMessageKind::Classical(classical) => {
-                    let (agreement, signed_prekey) = self.state.prekeys.accept(
-                        &self.state.identity,
-                        peer,
-                        &classical.x3dh,
-                    )?;
+                    let (agreement, signed_prekey) =
+                        self.state
+                            .prekeys
+                            .accept(&self.state.identity, peer, &classical.x3dh)?;
                     let ratchet = Ratchet::bob(
                         &SharedKeys::from_secret(&agreement.secret_key),
                         DhPrivateKey::from(signed_prekey.to_bytes()),
@@ -1055,32 +1000,22 @@ mod v2 {
                     if strict_pq {
                         return Err(ErrorKind::PqRequired.into());
                     }
+                    let hello = checked_initial_hello(&content)?;
                     self.state.prekeys.confirm(&classical.x3dh)?;
 
                     let security = SessionSecurity::classical();
-                    let hello = extract_hello(&content);
                     let incoming_seq = hello.as_ref().map_or(0, |h| h.session_seq);
                     let quarantined = local_pq_enabled
                         && (peer_state.pq_pinned || !peer_state.allow_classical_exception);
 
                     let mut updated_peer_pq = peer_state.clone();
-                    if !local_pq_enabled {
-                        // Local user explicitly turned PQ off: permit classical acceptance.
-                        updated_peer_pq.allow_classical_exception = true;
-                    }
                     if quarantined {
-                        if peer_state.pq_pinned
-                            || hello.as_ref().is_some_and(|h| h.pq_capable)
-                        {
+                        if peer_state.pq_pinned || hello.as_ref().is_some_and(|h| h.pq_capable) {
                             updated_peer_pq.downgrade_detected = true;
                         }
                     } else if let Some(ref h) = hello {
-                        let _ = check_peer_hello(
-                            &mut updated_peer_pq,
-                            security,
-                            h,
-                            local_pq_enabled,
-                        );
+                        let _ =
+                            check_peer_hello(&mut updated_peer_pq, security, h, local_pq_enabled);
                     }
 
                     let active = Active {
@@ -1193,16 +1128,7 @@ mod v2 {
             let prepared = self.prepare_refill_v2(audience, one_time_count, pq_one_time_count)?;
             match self.transmit_refill_v2(&prepared).await {
                 Ok(response) => Ok(response),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        ErrorKind::SignInRequired
-                            | ErrorKind::LimitExceeded
-                            | ErrorKind::Unimplemented
-                            | ErrorKind::NotFound
-                            | ErrorKind::Protocol
-                    ) =>
-                {
+                Err(e) if e.is_server_refusal() => {
                     self.rollback_refill_v2_on_refusal(prepared);
                     Err(e)
                 }
@@ -1231,17 +1157,20 @@ mod v2 {
             }
             let mut total = 0u32;
             for chunk in ids.chunks(MAX_ACK_BATCH) {
-                let timestamp = self.next_timestamp()?;
-                let request = AckInitialMessagesRequest::sign(
-                    &self.state.identity,
-                    audience,
-                    chunk.to_vec(),
-                    timestamp,
-                )?;
-                let response = self.handshake.ack_initial_messages(request).await?;
-                total = total.saturating_add(response.deleted);
+                total = total.saturating_add(self.ack_initial_chunk(audience, chunk).await?);
             }
             Ok(total)
+        }
+
+        async fn ack_initial_chunk(&mut self, audience: &str, ids: &[u64]) -> Result<u32> {
+            let timestamp = self.next_timestamp()?;
+            let request = AckInitialMessagesRequest::sign(
+                &self.state.identity,
+                audience,
+                ids.to_vec(),
+                timestamp,
+            )?;
+            Ok(self.handshake.ack_initial_messages(request).await?.deleted)
         }
     }
 
@@ -1274,9 +1203,7 @@ mod v2 {
                     if self.state.pq_config.strict_pq {
                         return Err(ErrorKind::PqRequired.into());
                     }
-                    if prepared_pq
-                        && let Some(orig_manifest) = prepared.request.manifest.as_ref()
-                    {
+                    if prepared_pq && let Some(orig_manifest) = prepared.request.manifest.as_ref() {
                         let timestamp = self.next_timestamp()?;
                         let expires_at = timestamp
                             .checked_add(DEFAULT_MANIFEST_TTL_MS)
@@ -1355,8 +1282,7 @@ mod v2 {
             one_time_count: usize,
             pq_one_time_count: usize,
         ) -> Result<()> {
-            let prepared =
-                self.prepare_publish_v2(audience, one_time_count, pq_one_time_count)?;
+            let prepared = self.prepare_publish_v2(audience, one_time_count, pq_one_time_count)?;
             match self.transmit_publish_v2_or_v1_fallback(&prepared).await {
                 Ok(_) => {
                     self.commit_publish_v2(prepared);
@@ -1472,13 +1398,14 @@ mod v2 {
                     // 2. Check manifest validity window against server clock (a peer offline past
                     //    DEFAULT_MANIFEST_TTL_MS surfaces PeerManifestExpired rather than a false
                     //    downgrade alarm).
-                    verify_manifest_at(manifest, audience, self.clock.now())
-                        .map_err(|e| match e.kind() {
+                    verify_manifest_at(manifest, audience, self.clock.now()).map_err(
+                        |e| match e.kind() {
                             protocol::ErrorKind::StaleTimestamp => {
                                 Error::new(ErrorKind::PeerManifestExpired, e)
                             }
                             _ => Error::new(ErrorKind::DowngradeDetected, e),
-                        })?;
+                        },
+                    )?;
                     let resp_spk: PublicKey = protocol::fixed(&response.signed_prekey)
                         .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                     if manifest.signed_prekey.as_ref() != resp_spk.as_slice() {
@@ -1488,9 +1415,8 @@ mod v2 {
                     if manifest.pq_enabled {
                         updated_peer_state.pq_pinned = true;
                         updated_peer_state.peer_pq_capable = true;
-                        updated_peer_state.pinned_manifest_seq = peer_state
-                            .pinned_manifest_seq
-                            .max(manifest.manifest_seq);
+                        updated_peer_state.pinned_manifest_seq =
+                            peer_state.pinned_manifest_seq.max(manifest.manifest_seq);
 
                         if local_pq_enabled {
                             return self.build_pq_initiate_v2(
@@ -1525,9 +1451,8 @@ mod v2 {
                         {
                             return Err(ErrorKind::DowngradeDetected.into());
                         }
-                        updated_peer_state.pinned_manifest_seq = peer_state
-                            .pinned_manifest_seq
-                            .max(manifest.manifest_seq);
+                        updated_peer_state.pinned_manifest_seq =
+                            peer_state.pinned_manifest_seq.max(manifest.manifest_seq);
                         updated_peer_state.peer_pq_capable = false;
 
                         if strict_pq {
@@ -1621,8 +1546,7 @@ mod v2 {
                 .find(|c| c.suite == u32::from(expected_suite.as_u8()))
                 .ok_or(ErrorKind::DowngradeDetected)
                 .and_then(|c| {
-                    protocol::fixed(&c.prekey_id)
-                        .map_err(|_| ErrorKind::DowngradeDetected)
+                    protocol::fixed(&c.prekey_id).map_err(|_| ErrorKind::DowngradeDetected)
                 })?;
 
             if let Some(lr_wire) = &response.pq_last_resort {
@@ -1684,7 +1608,10 @@ mod v2 {
             if let Some(hello) = extract_hello(content)
                 && hello.session_seq > 0
             {
-                session.state.next_session_seq = hello.session_seq.saturating_add(1);
+                session.state.next_session_seq = hello
+                    .session_seq
+                    .saturating_add(1)
+                    .min(protocol::MAX_SAFE_INTEGER);
             }
 
             Ok(PreparedInitiateV2 {
@@ -1749,7 +1676,10 @@ mod v2 {
             if let Some(hello) = extract_hello(content)
                 && hello.session_seq > 0
             {
-                session.state.next_session_seq = hello.session_seq.saturating_add(1);
+                session.state.next_session_seq = hello
+                    .session_seq
+                    .saturating_add(1)
+                    .min(protocol::MAX_SAFE_INTEGER);
             }
             Ok(PreparedInitiateV2 {
                 session,
@@ -1856,12 +1786,8 @@ mod v2 {
                 return Err(ErrorKind::Protocol.into());
             }
             let timestamp = self.next_timestamp()?;
-            let request = ListInitialMessagesRequest::sign(
-                &self.state.identity,
-                audience,
-                limit,
-                timestamp,
-            )?;
+            let request =
+                ListInitialMessagesRequest::sign(&self.state.identity, audience, limit, timestamp)?;
             match self.handshake.list_initial_messages(request).await {
                 Ok(response) => {
                     let mut messages = Vec::with_capacity(response.messages.len());
@@ -1904,7 +1830,8 @@ mod v2 {
 
         /// Convenience two-phase inbox flow: list, accept locally (returning both
         /// [`AcceptedInitial::Accepted`] and [`AcceptedInitial::Quarantined`] outcomes), and
-        /// acknowledge handled inbox IDs.
+        /// acknowledge handled inbox IDs. An acknowledgement failure returns the local outcomes
+        /// in `Ok`. Persist them and retry the IDs in [`ListAndAcceptOutcome::unacked_ids`].
         ///
         /// Callers that must persist accepted state to durable storage BEFORE acknowledging the
         /// server should instead call [`list_initial_messages_v2`](Self::list_initial_messages_v2),
@@ -1916,7 +1843,7 @@ mod v2 {
             limit: u32,
             mailbox: M,
             mut peer_state_for: impl FnMut(&PublicKey) -> PeerPqState,
-        ) -> Result<Vec<(PublicKey, AcceptedInitial<M>)>> {
+        ) -> Result<ListAndAcceptOutcome<M>> {
             let listed = self.list_initial_messages_v2(audience, limit).await?;
             let mut ack_ids = listed.malformed_ids;
             let mut outcomes = Vec::with_capacity(listed.messages.len());
@@ -1935,10 +1862,21 @@ mod v2 {
                     outcomes.push((msg.sender, outcome));
                 }
             }
-            if !listed.fell_back_to_v1 && !ack_ids.is_empty() {
-                self.ack_initial_messages_v2(audience, ack_ids).await?;
+            let mut result = ListAndAcceptOutcome {
+                outcomes,
+                unacked_ids: vec![],
+                ack_error: None,
+            };
+            if !listed.fell_back_to_v1 {
+                for (index, chunk) in ack_ids.chunks(MAX_ACK_BATCH).enumerate() {
+                    if let Err(error) = self.ack_initial_chunk(audience, chunk).await {
+                        result.ack_error = Some(error);
+                        result.unacked_ids = ack_ids.split_off(index * MAX_ACK_BATCH);
+                        break;
+                    }
+                }
             }
-            Ok(outcomes)
+            Ok(result)
         }
     }
 
@@ -2051,183 +1989,54 @@ mod v2 {
             if audience.trim().is_empty() {
                 return Err(ErrorKind::Protocol.into());
             }
-            let mut carried: Vec<InitialMessageV2> = vec![];
-            let mut expired_pages = 0usize;
-            loop {
-                let cursor = self.state.cursor;
-                match self
-                    .receive_page_v2(client, audience, &mut carried)
-                    .await?
-                {
-                    None => {
-                        if !carried.is_empty() {
-                            return Ok(vec![ReceivedV2 {
-                                content: Err(ErrorKind::Expired.into()),
-                                earlier: false,
-                                initial_messages: carried,
-                            }]);
-                        }
-                        return Ok(vec![]);
+            let peer = self.state.peer;
+            self.receive_pages(
+                async |mailbox, request| {
+                    let timestamp = client.clock.now();
+                    if timestamp > protocol::MAX_SAFE_INTEGER {
+                        return Err(ErrorKind::Protocol.into());
                     }
-                    Some(received) if received.is_empty() && self.state.cursor > cursor => {
-                        expired_pages += 1;
-                        if expired_pages >= MAX_EXPIRED_PAGES
-                            || carried.len() >= MAX_CARRIED_INITIALS
-                        {
-                            if !carried.is_empty() {
-                                return Ok(vec![ReceivedV2 {
-                                    content: Err(ErrorKind::Expired.into()),
-                                    earlier: false,
-                                    initial_messages: carried,
-                                }]);
+                    let signed = FetchSignedRequest::sign(
+                        &client.state.identity,
+                        audience,
+                        &peer,
+                        request.after,
+                        request.limit,
+                        0,
+                        request.delivered.clone(),
+                        timestamp,
+                    )?;
+                    match mailbox.fetch_signed(signed).await {
+                        Ok(response) => Ok(response.messages),
+                        Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
+                            if client.state.pq_config.strict_pq {
+                                return Err(ErrorKind::PqRequired.into());
                             }
-                            return Ok(vec![]);
+                            Ok(mailbox
+                                .fetch(request)
+                                .await?
+                                .messages
+                                .into_iter()
+                                .map(|env| EnvelopeV2 {
+                                    sequence: env.sequence,
+                                    message: env.message,
+                                    initial_message: env
+                                        .initial_message
+                                        .as_ref()
+                                        .map(handshake_v2::InitialMessageV2::from),
+                                })
+                                .collect())
                         }
+                        Err(e) => Err(e.into()),
                     }
-                    Some(mut received) => {
-                        if !carried.is_empty() {
-                            received.push(ReceivedV2 {
-                                content: Err(ErrorKind::Expired.into()),
-                                earlier: false,
-                                initial_messages: mem::take(&mut carried),
-                            });
-                        }
-                        return Ok(received);
-                    }
-                }
-            }
-        }
-
-        async fn receive_page_v2<H>(
-            &mut self,
-            client: &Client<H>,
-            audience: &str,
-            carried: &mut Vec<InitialMessageV2>,
-        ) -> Result<Option<Vec<ReceivedV2>>> {
-            let told = self.state.delivered.len().min(MAX_DELIVERED);
-            let delivered: Vec<Bytes> = self.state.delivered[..told]
-                .iter()
-                .map(|token| Bytes::copy_from_slice(token))
-                .collect();
-            let timestamp = client.clock.now();
-            if timestamp > protocol::MAX_SAFE_INTEGER {
-                return Err(ErrorKind::Protocol.into());
-            }
-            let request = FetchSignedRequest::sign(
-                &client.state.identity,
-                audience,
-                &self.state.peer,
-                self.state.cursor,
-                0,
-                0,
-                delivered.clone(),
-                timestamp,
-            )?;
-
-            let messages: Vec<EnvelopeV2> = match self.mailbox.fetch_signed(request).await {
-                Ok(resp) => resp.messages,
-                Err(e) if e.kind() == protocol::ErrorKind::Unimplemented => {
-                    if client.state.pq_config.strict_pq {
-                        return Err(ErrorKind::PqRequired.into());
-                    }
-                    let v1_resp = self
-                        .mailbox
-                        .fetch(FetchRequest {
-                            sender: Bytes::copy_from_slice(&self.state.peer),
-                            recipient: Bytes::copy_from_slice(&self.state.me),
-                            after: self.state.cursor,
-                            limit: 0,
-                            delivered,
-                        })
-                        .await?;
-                    v1_resp
-                        .messages
-                        .into_iter()
-                        .map(|env| EnvelopeV2 {
-                            sequence: env.sequence,
-                            message: env.message,
-                            initial_message: env
-                                .initial_message
-                                .as_ref()
-                                .map(handshake_v2::InitialMessageV2::from),
-                        })
-                        .collect()
-                }
-                Err(e) => return Err(e.into()),
-            };
-
-            self.state.delivered.drain(..told);
-            if messages.is_empty() {
-                return Ok(None);
-            }
-            let last = messages.last().map_or(0, |envelope| envelope.sequence);
-            let attached = |envelope: &EnvelopeV2| {
-                envelope
-                    .initial_message
-                    .as_ref()
-                    .and_then(|im| InitialMessageV2::try_from(im).ok())
-            };
-            let mut received = Vec::with_capacity(messages.len());
-            let mut envelopes = messages.into_iter();
-            while let Some(envelope) = envelopes.next() {
-                let Some(message) = &envelope.message else {
-                    self.state.cursor = self.state.cursor.max(envelope.sequence);
-                    if let Some(im) = attached(&envelope)
-                        && carried.len() < MAX_CARRIED_INITIALS
-                        && !carried.contains(&im)
-                    {
-                        carried.push(im);
-                    }
-                    continue;
-                };
-                let decrypted = self.decrypt(message);
-                let stalls = decrypted.as_ref().is_err_and(|e| {
-                    !matches!(
-                        e.kind(),
-                        ErrorKind::DuplicateMessage | ErrorKind::EvictedMessage
-                    )
-                }) && envelope.sequence > self.state.skip_through;
-                if stalls {
-                    self.state.stalled_through = last;
-                    let mut initial_messages = mem::take(carried);
-                    if let Some(im) = attached(&envelope)
-                        && initial_messages.len() < MAX_CARRIED_INITIALS
-                        && !initial_messages.contains(&im)
-                    {
-                        initial_messages.push(im);
-                    }
-                    for im in envelopes.by_ref().filter_map(|env| attached(&env)) {
-                        if initial_messages.len() >= MAX_CARRIED_INITIALS {
-                            break;
-                        }
-                        if !initial_messages.contains(&im) {
-                            initial_messages.push(im);
-                        }
-                    }
-                    received.push(ReceivedV2 {
-                        content: Err(ErrorKind::Stalled.into()),
-                        earlier: false,
-                        initial_messages,
-                    });
-                    return Ok(Some(received));
-                }
-                // Keep expired-envelope carried initials in `carried` so they always flush at
-                // page end via the trailing `Err(ErrorKind::Expired)` entry instead of being
-                // attached to `Ok`/`DuplicateMessage`/`EvictedMessage` entries.
-                let initial_messages = attached(&envelope).into_iter().collect();
-                self.state.cursor = self.state.cursor.max(envelope.sequence);
-                let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
-                if let Ok((_, _, token)) = &decrypted {
-                    self.state.delivered.push(*token);
-                }
-                received.push(ReceivedV2 {
-                    content: decrypted.map(|(content, ..)| content),
+                },
+                |content, earlier, initial_messages| ReceivedV2 {
+                    content,
                     earlier,
                     initial_messages,
-                });
-            }
-            let _ = DELIVERY_TOKEN_LENGTH;
-            Ok(Some(received))
+                },
+            )
+            .await
         }
     }
 }

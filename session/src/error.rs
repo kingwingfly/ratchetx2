@@ -10,6 +10,7 @@ use std::error::Error as StdError;
 pub struct Error {
     kind: ErrorKind,
     source: Option<Box<dyn StdError + Send + Sync>>,
+    server_refusal: bool,
 }
 
 impl Error {
@@ -18,6 +19,7 @@ impl Error {
         Self {
             kind,
             source: Some(source.into()),
+            server_refusal: false,
         }
     }
 
@@ -25,11 +27,21 @@ impl Error {
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
+
+    /// Whether the server definitively refused the request. Only this outcome permits
+    /// rolling back private prekeys prepared for a refill.
+    pub fn is_server_refusal(&self) -> bool {
+        self.server_refusal
+    }
 }
 
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
-        Self { kind, source: None }
+        Self {
+            kind,
+            source: None,
+            server_refusal: false,
+        }
     }
 }
 
@@ -37,6 +49,7 @@ impl From<protocol::Error> for Error {
     fn from(error: protocol::Error) -> Self {
         use protocol::ErrorKind as Kind;
         let kind = match error.kind() {
+            Kind::InvalidResponse => ErrorKind::InvalidResponse,
             Kind::NotFound => ErrorKind::NotFound,
             Kind::LimitExceeded => ErrorKind::LimitExceeded,
             Kind::SignInRequired => ErrorKind::SignInRequired,
@@ -44,7 +57,10 @@ impl From<protocol::Error> for Error {
             Kind::Malformed | Kind::InvalidSignature | Kind::StaleTimestamp => ErrorKind::Protocol,
             _ => ErrorKind::Server,
         };
-        Self::new(kind, error)
+        Self {
+            server_refusal: error.is_server_refusal(),
+            ..Self::new(kind, error)
+        }
     }
 }
 
@@ -90,6 +106,9 @@ pub enum ErrorKind {
     /// The server cannot be reached, or failed.
     #[error("server error")]
     Server,
+    /// The client could not read or decode the server's response.
+    #[error("invalid server response")]
+    InvalidResponse,
     /// Nobody published keys for this identity.
     #[error("no keys published for this identity")]
     NotFound,
@@ -170,7 +189,9 @@ pub enum ErrorKind {
     PeerManifestExpired,
     /// Peer lacks PQ (or published a signed `OFF` manifest) while local PQ is enabled, and no
     /// classical exception has been approved yet.
-    #[error("classical fallback requires explicit user approval (peer_signed_off={peer_signed_off})")]
+    #[error(
+        "classical fallback requires explicit user approval (peer_signed_off={peer_signed_off})"
+    )]
     ClassicalApprovalRequired {
         /// `true` if the peer published a valid signed `CapabilityManifest` with
         /// `pq_enabled == false`; `false` if the peer has no manifest (legacy v1 user).

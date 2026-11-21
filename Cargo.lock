@@ -3567,6 +3567,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "trait-variant",
+ "url",
  "web-time",
  "x3dh",
  "xeddsa",

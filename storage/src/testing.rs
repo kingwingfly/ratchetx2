@@ -288,8 +288,8 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
         encapsulation_key: Bytes::from(vec![tag; if suite == 1 { 1568 } else { 1184 }]),
         signature: [tag; 64],
     };
-    let manifest = |seq: u64, generation: u64, pq_enabled: bool, strict_pq: bool| {
-        StoredCapabilityManifest {
+    let manifest =
+        |seq: u64, generation: u64, pq_enabled: bool, strict_pq: bool| StoredCapabilityManifest {
             audience: "chat.example".to_string(),
             identity_key: bob,
             manifest_seq: seq,
@@ -316,13 +316,18 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
                 vec![]
             },
             signature: [0x55; 64],
-        }
-    };
+        };
 
     // Unknown identity returns None / empty without allocating.
     assert_eq!(store.get_manifest(&bob).await.unwrap(), None);
     assert_eq!(store.claim_bundle(&bob, &[1, 2]).await.unwrap(), None);
-    assert!(store.list_initial_messages(&bob, 10).await.unwrap().is_empty());
+    assert!(
+        store
+            .list_initial_messages(&bob, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(store.ack_initial_messages(&bob, &[1]).await.unwrap(), 0);
 
     // Legacy v1-only user falls back cleanly in ClaimBundle (manifest = None).
@@ -385,7 +390,10 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
         pq_one_time_prekeys: vec![pq_key(1, 0xB1), pq_key(2, 0xB2)],
         timestamp: 1001,
     };
-    assert_eq!(store.publish_v2(valid).await.unwrap(), PublishV2Status::Stored);
+    assert_eq!(
+        store.publish_v2(valid).await.unwrap(),
+        PublishV2Status::Stored
+    );
     assert_eq!(
         store.get_manifest(&bob).await.unwrap(),
         Some(manifest(1, 1, true, false))
@@ -622,7 +630,11 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
     assert_eq!(listed[1].id, pq_id);
 
     // Legacy v1 take_initial_messages drains ONLY the classical v1 message; v2 PQ survives!
-    let v1_taken = store.take_initial_messages(&bob, 3000).await.unwrap().unwrap();
+    let v1_taken = store
+        .take_initial_messages(&bob, 3000)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(v1_taken.len(), 1);
     assert_eq!(v1_taken[0].header, Bytes::from_static(b"v1-h"));
 
@@ -633,12 +645,20 @@ pub async fn pq_handshake_store<S: LocalHandshakeStore + LocalPqHandshakeStore>(
 
     // Ack deletes only the acknowledged ID.
     assert_eq!(store.ack_initial_messages(&bob, &[pq_id]).await.unwrap(), 1);
-    assert!(store.list_initial_messages(&bob, 10).await.unwrap().is_empty());
+    assert!(
+        store
+            .list_initial_messages(&bob, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 /// Conformance suite for [`LocalIdempotentMailboxStore`] sharing state with [`LocalMailboxStore`].
 #[cfg(feature = "pq")]
-pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMailboxStore>(store: &S) {
+pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMailboxStore>(
+    store: &S,
+) {
     let (alice, bob) = ([21; 32], [22; 32]);
     let cid = [0x42; 16];
 
@@ -670,6 +690,39 @@ pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMail
         .unwrap();
     assert_eq!(seq1_retry, 1);
 
+    store
+        .delete_delivered(&alice, &bob, &[[1; 32]])
+        .await
+        .unwrap();
+    let retry = store
+        .append_idempotent(
+            &alice,
+            &bob,
+            Bytes::new(),
+            Bytes::new(),
+            None,
+            Some([1; 32]),
+            Some(cid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(retry, seq1);
+    assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
+
+    let next = store
+        .append_idempotent(
+            &alice,
+            &bob,
+            Bytes::new(),
+            Bytes::new(),
+            None,
+            None,
+            Some([0x43; 16]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next, seq1 + 1);
+
     // Shares the same underlying queue with classical v1 append/read.
     let seq2 = store
         .append(
@@ -682,9 +735,9 @@ pub async fn idempotent_mailbox_store<S: LocalMailboxStore + LocalIdempotentMail
         )
         .await
         .unwrap();
-    assert_eq!(seq2, 2);
+    assert_eq!(seq2, next + 1);
     let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].sequence, 1);
-    assert_eq!(messages[1].sequence, 2);
+    assert_eq!(messages[0].sequence, next);
+    assert_eq!(messages[1].sequence, seq2);
 }

@@ -30,6 +30,53 @@ pub const MAX_CLOCK_SKEW: u64 = 5 * 60 * 1000;
 /// are rejected rather than clamped.
 pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
+/// Canonical relay audience (`host[:port]`) for a configured host or HTTP(S) / WS(S) URL.
+/// Hosts use URL-standard IDNA and IP address serialization. Paths, queries, fragments and
+/// default ports are omitted. With no scheme, both 80 and 443 are considered default ports.
+/// Invalid authorities, userinfo, internal whitespace and control characters are malformed.
+pub fn normalize_audience(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if raw.bytes().any(|b| b.is_ascii_control()) || trimmed.chars().any(char::is_whitespace) {
+        return Err(ErrorKind::Malformed.into());
+    }
+    let (rest, default_port) = match trimmed
+        .split_once("://")
+        .filter(|(scheme, _)| !scheme.contains(['/', '?', '#']))
+    {
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("wss") =>
+        {
+            (rest, Some(443))
+        }
+        Some((scheme, rest))
+            if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("ws") =>
+        {
+            (rest, Some(80))
+        }
+        Some(_) => return Err(ErrorKind::Malformed.into()),
+        None => (trimmed, None),
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    // A bracketed IPv6 host ends in ']' unless a port follows it.
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !authority.ends_with(']') => (host, port),
+        _ => (authority, ""),
+    };
+    let host = url::Host::parse(host).map_err(|_| ErrorKind::Malformed)?;
+    if port.is_empty() {
+        return Ok(host.to_string());
+    }
+    if !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ErrorKind::Malformed.into());
+    }
+    let port: u16 = port.parse().map_err(|_| ErrorKind::Malformed)?;
+    if Some(port) == default_port || (default_port.is_none() && matches!(port, 80 | 443)) {
+        Ok(host.to_string())
+    } else {
+        Ok(format!("{host}:{port}"))
+    }
+}
+
 /// Read a fixed-size bytes field, such as a 32-byte key.
 ///
 /// Fails with [`ErrorKind::Malformed`] if it has another length.
@@ -59,7 +106,9 @@ pub(crate) fn check_safe_integer(value: u64) -> Result<()> {
 pub(crate) fn now_millis() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
-        .map_or(0, |elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(MAX_SAFE_INTEGER))
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(MAX_SAFE_INTEGER)
+        })
 }
 
 /// Validates that a monotonically increasing timestamp does not exceed [`MAX_SAFE_INTEGER`] or
@@ -91,4 +140,50 @@ pub(crate) fn verify_recent(
         return Err(ErrorKind::StaleTimestamp.into());
     }
     Ok(identity_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonical_audiences_match_url_hosts_and_ports() {
+        for (input, expected) in [
+            ("https://München.example:443/api", "xn--mnchen-3ya.example"),
+            ("http://BÜCHER.example:80", "xn--bcher-kva.example"),
+            ("wss://example。com:08080", "example.com:8080"),
+            ("http://[::ffff:192.0.2.1]:", "[::ffff:c000:201]"),
+            ("http://127.1:80", "127.0.0.1"),
+        ] {
+            let url = url::Url::parse(input).unwrap();
+            assert_eq!(
+                &url[url::Position::BeforeHost..url::Position::AfterPort],
+                expected
+            );
+            assert_eq!(normalize_audience(input).unwrap(), expected);
+        }
+        assert_eq!(
+            normalize_audience("münchen.example:8443").unwrap(),
+            "xn--mnchen-3ya.example:8443"
+        );
+        assert_eq!(
+            normalize_audience("example.com/path?to=https://example.org").unwrap(),
+            "example.com"
+        );
+        for bad in [
+            "xn--.example",
+            "https://example.com/a\0b",
+            "example.com\u{7f}",
+            "ex%00ample.com",
+            "https://user@example.com",
+            "ftp://example.com",
+            "example.com]",
+            "[::1]x",
+        ] {
+            assert_eq!(
+                normalize_audience(bad).unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
+        }
+    }
 }

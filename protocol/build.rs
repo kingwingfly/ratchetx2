@@ -29,6 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .extern_path(".party.v1", "::party::proto")
         // It holds a key: its `Debug` is written by hand, without it.
         .skip_debug([".content.v1.AttachmentPointer"])
+        .field_attribute(
+            ".notify.v1.SubscribeRequest.audience",
+            r#"#[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]"#,
+        )
         .type_attribute(".", SERDE)
         .type_attribute(".", RKYV);
     #[cfg(feature = "protox")]

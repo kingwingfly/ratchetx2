@@ -352,9 +352,20 @@ impl<P: LocalPost> ConnectClient<P> {
         path: &str,
         request: impl Message,
     ) -> Result<T> {
-        let (status, body) = self.0.post(path, request.encode_to_vec()).await?;
+        let (status, body) = self
+            .0
+            .post(path, request.encode_to_vec())
+            .await
+            .map_err(|e| {
+                if e.kind() == ErrorKind::Connect {
+                    e
+                } else {
+                    Error::ambiguous_response(ErrorKind::InvalidResponse, e)
+                }
+            })?;
         if status == 200 {
-            return T::decode(body.as_slice()).map_err(|e| Error::new(ErrorKind::Malformed, e));
+            return T::decode(body.as_slice())
+                .map_err(|e| Error::ambiguous_response(ErrorKind::InvalidResponse, e));
         }
         let error = match serde_json::from_slice::<CallError>(&body) {
             Ok(error) => error,
@@ -487,7 +498,8 @@ impl<P: LocalPost> LocalHandshakeV2 for ConnectClient<P> {
         &self,
         request: ListInitialMessagesRequest,
     ) -> Result<ListInitialMessagesResponse> {
-        self.call_v2(ProcedureV2::ListInitialMessages, request).await
+        self.call_v2(ProcedureV2::ListInitialMessages, request)
+            .await
     }
 
     async fn ack_initial_messages(
@@ -735,6 +747,59 @@ mod test {
             let client = ConnectClient::new(Answering(status, body));
             assert_eq!(client.push(request()).await.unwrap_err().kind(), kind);
         }
+    }
+
+    #[tokio::test]
+    async fn refusals_and_ambiguous_responses_remain_distinct() {
+        struct ResponseError(ErrorKind);
+        impl LocalPost for ResponseError {
+            async fn post(&self, _: &str, _: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+                Err(self.0.into())
+            }
+        }
+        struct Reply(Code);
+        impl LocalPost for Reply {
+            async fn post(&self, _: &str, _: Vec<u8>) -> Result<(u16, Vec<u8>)> {
+                Ok((self.0.status(), error_body(self.0, "failure")))
+            }
+        }
+        for code in Code::ALL {
+            let error = ConnectClient::new(Reply(code))
+                .push(PushRequest::default())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::from(code));
+            assert_eq!(
+                error.is_server_refusal(),
+                !matches!(code, Code::Internal | Code::Unavailable | Code::Unknown)
+            );
+        }
+        for kind in [
+            ErrorKind::LimitExceeded,
+            ErrorKind::Malformed,
+            ErrorKind::Connect,
+        ] {
+            let error = ConnectClient::new(ResponseError(kind))
+                .push(PushRequest::default())
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if kind == ErrorKind::Connect {
+                    kind
+                } else {
+                    ErrorKind::InvalidResponse
+                }
+            );
+            assert!(!error.is_server_refusal());
+            assert!(!Error::ambiguous_response(kind, "response read failed").is_server_refusal());
+        }
+        let error = ConnectClient::new(Answering(200, &[0xff]))
+            .push(PushRequest::default())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidResponse);
+        assert!(!error.is_server_refusal());
     }
 
     #[tokio::test]
@@ -1060,17 +1125,8 @@ mod test {
 
         let fetched = client
             .fetch_signed(
-                FetchSignedRequest::sign(
-                    &bob,
-                    "connect.test",
-                    &alice_pk,
-                    0,
-                    10,
-                    0,
-                    vec![],
-                    now,
-                )
-                .unwrap(),
+                FetchSignedRequest::sign(&bob, "connect.test", &alice_pk, 0, 10, 0, vec![], now)
+                    .unwrap(),
             )
             .await
             .unwrap();

@@ -10,6 +10,7 @@ use std::error::Error as StdError;
 pub struct Error {
     kind: ErrorKind,
     source: Option<Box<dyn StdError + Send + Sync>>,
+    ambiguous: bool,
 }
 
 impl Error {
@@ -18,7 +19,35 @@ impl Error {
         Self {
             kind,
             source: Some(source.into()),
+            ambiguous: false,
         }
+    }
+
+    /// A failure reading the response, after the server may already have committed the request.
+    pub fn ambiguous_response(
+        kind: ErrorKind,
+        source: impl Into<Box<dyn StdError + Send + Sync>>,
+    ) -> Self {
+        Self {
+            ambiguous: true,
+            ..Self::new(kind, source)
+        }
+    }
+
+    /// Whether the server definitively refused the request, so locally prepared keys can be
+    /// rolled back. Transport, response-decoding and internal server errors leave this unknown.
+    pub fn is_server_refusal(&self) -> bool {
+        !self.ambiguous
+            && matches!(
+                self.kind,
+                ErrorKind::SignInRequired
+                    | ErrorKind::LimitExceeded
+                    | ErrorKind::Unimplemented
+                    | ErrorKind::NotFound
+                    | ErrorKind::Malformed
+                    | ErrorKind::InvalidSignature
+                    | ErrorKind::StaleTimestamp
+            )
     }
 
     /// The kind of this error.
@@ -29,7 +58,11 @@ impl Error {
 
 impl From<ErrorKind> for Error {
     fn from(kind: ErrorKind) -> Self {
-        Self { kind, source: None }
+        Self {
+            kind,
+            source: None,
+            ambiguous: false,
+        }
     }
 }
 
@@ -72,6 +105,9 @@ pub enum ErrorKind {
     /// Failed to connect to the server.
     #[error("failed to connect")]
     Connect,
+    /// The client could not read or decode the response. The server may have committed the request.
+    #[error("invalid response")]
+    InvalidResponse,
     /// A request or response is malformed, e.g. a key of the wrong length.
     #[error("malformed message")]
     Malformed,
