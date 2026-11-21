@@ -1,0 +1,637 @@
+//! Server notifications, synchronization and incoming mailbox pages.
+
+use super::outbox::{RequeueOutcome, needs_new_session};
+use super::{
+    AWAY_CHECK, Engine, HIDDEN_GRACE, HistoryStore, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE,
+    POLL_SLOW, POLL_STEP, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE, origin, records,
+    same_server,
+};
+use crate::content::{Content, Kind};
+use crate::notify::{Event, Subscription};
+use crate::state::Link;
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+use crate::state::ServerPqStatus;
+use crate::transport::{Connect, Fetch};
+use crate::util::{describe, monotonic_now_ms, now, sleep};
+use crate::vault::{ContactState, SECURITY_ALERT_DOWNGRADE};
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+use bytes::Bytes;
+use futures::future::{Either, select};
+use leptos::prelude::*;
+use leptos::task::spawn_local;
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+use prost::Message as _;
+use session::protocol::mailbox::LocalMailbox;
+use session::protocol::notify::{self, Notification};
+use session::{Client, ErrorKind, PublicKey, Session, proto};
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+use session::{
+    PqSuite,
+    protocol::{
+        handshake_v2::InitialMessageV2 as WireInitialMessageV2,
+        mailbox_v2::{LocalMailboxV2, PushV2Request},
+    },
+};
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
+impl Engine {
+    /// Whether the user is here: the page shown and in focus, or hidden for less than
+    /// [`HIDDEN_GRACE`], or out of focus for less than [`UNFOCUSED_GRACE`]. Notifications are
+    /// for then only, as a WebSocket open is held on the server.
+    pub(super) fn present(&self) -> bool {
+        let document = document();
+        let grace = if document.hidden() {
+            Some(HIDDEN_GRACE)
+        } else if !document.has_focus().unwrap_or(true) {
+            Some(UNFOCUSED_GRACE)
+        } else {
+            None
+        };
+        let present = match grace {
+            Some(grace) => {
+                let now = monotonic_now_ms();
+                let since = *self.away_since.get().get_or_insert(now);
+                self.away_since.set(Some(since));
+                now.saturating_sub(since) < grace
+            }
+            None => {
+                self.away_since.set(None);
+                true
+            }
+        };
+        if self.ui.away.get_untracked() == present {
+            self.ui.away.set(!present);
+        }
+        present
+    }
+
+    /// Sync until the page goes.
+    pub(super) fn run(self: Rc<Self>) {
+        spawn_local(async move {
+            let mut delay = POLL_FAST;
+            loop {
+                let asked = self.ui.syncing.get_untracked();
+                let active = self.sync().await;
+                if asked {
+                    self.ui.syncing.set(false);
+                }
+                delay = if self.ui.live.get_untracked() {
+                    POLL_LIVE
+                } else if active {
+                    POLL_FAST
+                } else {
+                    (delay * 3 / 2).min(POLL_SLOW)
+                };
+                let mut waited = 0;
+                let mut was_present = self.present();
+                loop {
+                    if self.wake.replace(false) {
+                        delay = POLL_FAST;
+                        break;
+                    }
+                    let present = self.present();
+                    // Back: what came meanwhile, at once.
+                    if present && !was_present {
+                        delay = POLL_FAST;
+                        break;
+                    }
+                    was_present = present;
+                    if waited >= if present { delay } else { delay.max(POLL_AWAY) } {
+                        break;
+                    }
+                    sleep(POLL_STEP).await;
+                    waited += POLL_STEP;
+                }
+            }
+        });
+    }
+
+    /// Subscribe to this client's notifications while the user is here, until the page goes,
+    /// subscribing again whenever the socket closes, and act on each. Away, the socket closes,
+    /// which tells the server, and opens again on coming back.
+    pub(super) fn listen(self: Rc<Self>) {
+        spawn_local(async move {
+            let mut retry = RESUBSCRIBE_MIN;
+            loop {
+                while !self.present() {
+                    sleep(AWAY_CHECK).await;
+                }
+                let subscribed = {
+                    let mut guard = self.inner.lock().await;
+                    let Some(inner) = guard.as_mut() else {
+                        return;
+                    };
+                    inner
+                        .client
+                        .subscription_for_audience(&inner.server)
+                        .map_err(|e| describe(&e))
+                        .and_then(|request| Subscription::open(&inner.server, &request))
+                };
+                let mut left = false;
+                match subscribed {
+                    Ok(mut subscription) => loop {
+                        let next =
+                            select(Box::pin(subscription.next()), Box::pin(sleep(AWAY_CHECK)));
+                        match next.await {
+                            Either::Left((Event::Open, _)) => {
+                                self.ui.live.set(true);
+                                retry = RESUBSCRIBE_MIN;
+                                // What came while it was closed has no notification.
+                                self.wake();
+                            }
+                            Either::Left((Event::Notification(notification), _)) => {
+                                self.notified(notification).await
+                            }
+                            Either::Left((Event::Resync, _)) => self.wake(),
+                            Either::Left((Event::Closed, _)) => break,
+                            // Away: dropped, the subscription closes its socket.
+                            Either::Right(_) if !self.present() => {
+                                left = true;
+                                break;
+                            }
+                            Either::Right(_) => {}
+                        }
+                    },
+                    Err(e) => self
+                        .ui
+                        .log(format!("cannot subscribe to notifications: {e}")),
+                }
+                self.ui.live.set(false);
+                if left {
+                    retry = RESUBSCRIBE_MIN;
+                    continue;
+                }
+                sleep(retry).await;
+                retry = (retry * 2).min(RESUBSCRIBE_MAX);
+            }
+        });
+    }
+
+    /// Fetch what `notification` says arrived; if that fails, sync soon.
+    async fn notified(&self, notification: Notification) {
+        let fetched = match notification.event {
+            Some(notify::Event::MessageFrom(sender)) => {
+                match PublicKey::try_from(sender.as_ref()) {
+                    // Then what it moved on goes, e.g. events to tell, or messages to send
+                    // again, as the peer deleted the chat.
+                    Ok(peer) => match self.receive(&peer).await {
+                        Ok(_) => self.flush(&peer).await.map(drop),
+                        Err(e) => Err(e),
+                    },
+                    Err(_) => return,
+                }
+            }
+            Some(notify::Event::InitialMessage(_)) => self.take_initial_messages().await.map(drop),
+            None => return,
+        };
+        if fetched.is_err() {
+            self.wake();
+        }
+    }
+
+    /// Sync soon.
+    pub fn wake(&self) {
+        self.wake.set(true);
+    }
+
+    /// Sync now, as asked on the page, showing it until done.
+    pub fn sync_now(&self) {
+        self.ui.syncing.set(true);
+        self.wake();
+    }
+
+    /// Query `GetServerInfo` verifying `server_id` against the client's locally derived expected
+    /// audience (never blindly trusting server-supplied audience strings).
+    pub(super) async fn refresh_server_info(&self, force: bool) {
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            let mut guard = self.inner.lock().await;
+            let Some(inner) = guard.as_mut() else {
+                return;
+            };
+            if !force && inner.server_pq != ServerPqStatus::Unknown {
+                return;
+            }
+            let status = match inner.client.check_server_info(&inner.audience).await {
+                Ok(info) if info.pq_enabled => {
+                    let suites = info
+                        .supported_suites
+                        .iter()
+                        .filter_map(|&s| u8::try_from(s).ok().and_then(PqSuite::from_u8))
+                        .collect();
+                    ServerPqStatus::Enabled {
+                        suites,
+                        pq_ratchet: info.pq_ratchet_supported,
+                    }
+                }
+                Ok(_) => ServerPqStatus::Disabled,
+                Err(e) if e.kind() == ErrorKind::Unimplemented => ServerPqStatus::Disabled,
+                Err(e) if e.kind() == ErrorKind::DowngradeDetected => {
+                    self.ui.log(format!(
+                        "server identity mismatch for {}: possible relay impersonation",
+                        inner.audience
+                    ));
+                    self.ui.notify(format!(
+                        "Server identity mismatch for {} — refusing to trust server PQ metadata.",
+                        inner.audience
+                    ));
+                    ServerPqStatus::AudienceMismatch
+                }
+                Err(_) => return,
+            };
+            if inner.server_pq != status {
+                inner.server_pq = status;
+                self.ui.me.set(Some(inner.me()));
+            }
+        }
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        {
+            let _ = force;
+        }
+    }
+
+    /// One round: save what an earlier save failed to, check server PQ info, tell peers of chats
+    /// deleted here, take initial messages, publish/refill prekeys when due, receive, and push what
+    /// waits. Returns whether anything happened.
+    pub(super) async fn sync(&self) -> bool {
+        // A step that keeps failing, e.g. a large file timing out over a slow link, a take of
+        // initial messages the server refuses, or one chat's queue that cannot be fetched, must
+        // not keep the round from the other steps and chats: its error is kept, and the round
+        // goes on. Receiving goes before pushing, so that what waits since the user was offline
+        // goes on a new session if the peer deleted the chat meanwhile.
+        let mut failure = None;
+        let mut active = false;
+        if let Err(e) = self.save_late().await {
+            failure.get_or_insert(e);
+        }
+        self.refresh_server_info(false).await;
+        if let Err(e) = self.say_farewells().await {
+            failure.get_or_insert(e);
+        }
+        let reached = match self.take_initial_messages().await {
+            Ok(taken) => {
+                active |= taken;
+                true
+            }
+            Err(e) => {
+                failure.get_or_insert(e);
+                false
+            }
+        };
+        // Not while the server does not answer signed requests: each publish that fails keeps
+        // its new one-time prekeys, as the server may have them, see `Client::publish_keys`, so
+        // retrying every round while offline would grow the state, which each save writes whole.
+        if reached && let Err(e) = self.publish(false).await {
+            failure.get_or_insert(e);
+        }
+        for peer in self.peers().await {
+            match self.receive(&peer).await {
+                Ok(received) => active |= received,
+                Err(e) => {
+                    failure.get_or_insert(e);
+                }
+            }
+        }
+        for peer in self.peers().await {
+            match self.flush(&peer).await {
+                Ok(pushed) => active |= pushed,
+                Err(e) => {
+                    failure.get_or_insert(e);
+                }
+            }
+        }
+        match failure {
+            None => self.ui.link.set(Link::Synced(now())),
+            Some(e) => self.ui.link.set(Link::Offline(e)),
+        }
+        active
+    }
+
+    /// Save the history records an earlier save failed to write, see `Inner::unsaved`, unless
+    /// another save did, and show their chats.
+    async fn save_late(&self) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return Ok(());
+        };
+        if inner.needs_save() {
+            inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
+        let late = std::mem::take(&mut inner.saved_late);
+        if std::mem::take(&mut inner.contacts_dirty_late) || !late.is_empty() {
+            self.ui.me.set(Some(inner.me()));
+            self.ui.contacts.set(inner.views());
+            // The open chat shows them in their places.
+            if let Some(open) = self.ui.open.get_untracked()
+                && late.contains(&open)
+            {
+                self.show_history(inner, &open).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Push the messages telling peers that their chats were deleted here, see
+    /// [`delete`](Self::delete).
+    pub(super) async fn say_farewells(&self) -> Result<(), String> {
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return Ok(());
+        };
+        let signs_in_here = same_server(&inner.server, &origin());
+        while let Some(farewell) = inner.state.farewells.first().cloned() {
+            let push_req = farewell.push.unwrap_or_default();
+            let pushed: session::Result<()> = {
+                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                {
+                    let client = Fetch::client(&inner.server);
+                    let v2_req = if !farewell.push_v2.is_empty() {
+                        PushV2Request::decode(farewell.push_v2.as_slice()).unwrap_or_else(|_| {
+                            PushV2Request {
+                                sender: push_req.sender.clone(),
+                                recipient: push_req.recipient.clone(),
+                                message: push_req.message.clone(),
+                                initial_message: push_req
+                                    .initial_message
+                                    .as_ref()
+                                    .map(WireInitialMessageV2::from),
+                                delivery_hash: push_req.delivery_hash.clone(),
+                                client_message_id: Bytes::from(farewell.client_message_id.clone()),
+                            }
+                        })
+                    } else {
+                        PushV2Request {
+                            sender: push_req.sender.clone(),
+                            recipient: push_req.recipient.clone(),
+                            message: push_req.message.clone(),
+                            initial_message: push_req
+                                .initial_message
+                                .as_ref()
+                                .map(WireInitialMessageV2::from),
+                            delivery_hash: push_req.delivery_hash.clone(),
+                            client_message_id: Bytes::from(farewell.client_message_id.clone()),
+                        }
+                    };
+                    match client.push_v2(v2_req).await {
+                        Ok(_) => Ok(()),
+                        Err(e) if e.kind() == session::protocol::ErrorKind::Unimplemented => {
+                            if inner.client.pq_config().strict_pq {
+                                Err(ErrorKind::PqRequired.into())
+                            } else {
+                                client
+                                    .push(push_req)
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(session::Error::from)
+                            }
+                        }
+                        Err(e) => Err(e.into()),
+                    }
+                }
+                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                {
+                    Fetch::client(&inner.server)
+                        .push(push_req)
+                        .await
+                        .map(|_| ())
+                        .map_err(session::Error::from)
+                }
+            };
+            match pushed {
+                Ok(()) => {}
+                // Pushing takes a sign-in: they wait for it, without failing the round.
+                Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => return Ok(()),
+                // Refused for good, e.g. as the peer's inbox is full, or as this page cannot sign
+                // in to the server: it must not hold up the others, nor keep the sync failing.
+                Err(e)
+                    if e.is_server_refusal()
+                        && matches!(
+                            e.kind(),
+                            ErrorKind::LimitExceeded
+                                | ErrorKind::Protocol
+                                | ErrorKind::SignInRequired
+                        ) =>
+                {
+                    self.ui.log(format!(
+                        "could not tell a deleted chat's peer of it: {}",
+                        describe(&e)
+                    ));
+                }
+                Err(e) => return Err(describe(&e)),
+            }
+            inner.state.farewells.remove(0);
+            inner.save_state().await.map_err(|e| describe(&e))?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn peers(&self) -> Vec<PublicKey> {
+        let inner = self.inner.lock().await;
+        inner
+            .iter()
+            .flat_map(|inner| inner.contacts.iter().map(|contact| contact.peer))
+            .collect()
+    }
+
+    /// Receive the messages from `peer`, a page at a time. Returns whether any came.
+    pub(super) async fn receive(&self, peer: &PublicKey) -> Result<bool, String> {
+        let mut received = false;
+        let mut recommend_upgrade = false;
+        loop {
+            let mut guard = self.inner.lock().await;
+            let Some(inner) = guard.as_mut() else {
+                return Ok(received);
+            };
+            let open = self.ui.open.get_untracked() == Some(*peer) && !document().hidden();
+            let local_pq = inner.local_pq_enabled();
+            let Some(index) = inner.contacts.iter().position(|c| c.peer == *peer) else {
+                return Ok(received);
+            };
+            // Never fetch/decrypt or send receipts on a brand-new quarantined classical contact.
+            if inner.contacts[index].is_new_quarantined() {
+                return Ok(received);
+            }
+            let (page, snapshot) = inner
+                .fetch_page(index, async |session, _client, _audience| {
+                    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                    {
+                        session.fetch_v2(_client, _audience).await
+                    }
+                    #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                    {
+                        session.receive().await
+                    }
+                })
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            let contact = &mut inner.contacts[index];
+            let (mut entries, mut undecryptable, mut evicted) = (vec![], 0usize, 0usize);
+            // Where receiving stopped, with the initial messages that came with the rest of the
+            // page.
+            let mut stalled = None;
+            let mut carried_initials = vec![];
+            let mut deleted = false;
+            // What the peer told of this client's messages, by their history entries.
+            let mut steps = vec![];
+            for message in page {
+                if message.is_evicted() {
+                    evicted += 1;
+                    entries.push(contact.add_evicted());
+                    continue;
+                }
+                let content = match message.content {
+                    Ok(content) => content,
+                    // At a message that may be on a session whose initial message is waiting,
+                    // the page's last.
+                    Err(e) if e.kind() == ErrorKind::Stalled => {
+                        stalled = Some(message.initial_messages);
+                        continue;
+                    }
+                    // Trailing carried initial messages from expired server envelopes.
+                    Err(e) if e.kind() == ErrorKind::Expired => {
+                        carried_initials.extend(message.initial_messages);
+                        continue;
+                    }
+                    Err(e) if e.kind() == ErrorKind::DuplicateMessage => continue,
+                    // Anyone can push to a queue, and an earlier session's messages stay in it.
+                    Err(_) => {
+                        carried_initials.extend(message.initial_messages);
+                        undecryptable += 1;
+                        continue;
+                    }
+                };
+                let mut content = Content::from_bytes(&content);
+                if let Some(events) = content.events.take() {
+                    steps.extend(contact.told(&events));
+                    if content.kind.is_none() {
+                        continue;
+                    }
+                }
+                if let Some(Kind::Hello(ref hello)) = content.kind {
+                    let hc = contact.session.check_peer_hello(hello, local_pq);
+                    if hc.downgrade_detected {
+                        contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                        if hc.recommend_start_again
+                            && !contact.state.request
+                            && !contact.state.quarantined
+                        {
+                            recommend_upgrade = true;
+                        }
+                    }
+                }
+                // M-14: Only a live-session Delete retires the session and requeues unread
+                // messages; an archived earlier-session Delete must NOT requeue the live chat!
+                if matches!(content.kind, Some(Kind::Deleted(_))) && !message.earlier {
+                    contact.session.retire();
+                    deleted = true;
+                }
+                entries.push(contact.add_received(content, open));
+            }
+            if undecryptable > 0 {
+                let label = contact.view().label();
+                self.ui.log(format!(
+                    "skipped {undecryptable} message(s) from {label} that do not decrypt, e.g. \
+                     ones of an earlier session"
+                ));
+            }
+            if evicted > 0 {
+                let label = contact.view().label();
+                self.ui.log(format!(
+                    "{evicted} message(s) from {label} arrived too late and their decryption key was evicted"
+                ));
+            }
+            // The entries of this client's messages that the peer's events moved on; then, if
+            // the session is retired, as the peer deleted the chat or the two kept missing each
+            // other, what was encrypted on it, and what the peer never read if it deleted the
+            // chat, waits for a new one.
+            let mut changed = BTreeMap::new();
+            let moved = match inner.step(peer, &mut changed, steps).await {
+                Ok(()) if deleted || needs_new_session(inner, peer) => {
+                    inner.requeue(peer, deleted, &changed).await
+                }
+                Ok(()) => Ok(RequeueOutcome::default()),
+                Err(e) => Err(describe(&e)),
+            };
+            let requeued = match moved {
+                Ok(requeued) => requeued,
+                Err(e) => {
+                    inner.roll_back(peer, snapshot)?;
+                    return Err(e);
+                }
+            };
+            changed.extend(requeued.history.iter().cloned());
+            let changed: Vec<_> = changed.into_iter().collect();
+            let records: Vec<_> = records(peer, &entries)
+                .into_iter()
+                .chain(records(peer, &changed))
+                .collect();
+            if let Err(e) = inner.save_with(&records, &requeued.outbox).await {
+                inner.roll_back(peer, snapshot)?;
+                return Err(describe(&e));
+            }
+            requeued.log_missing(&self.ui, peer);
+            received |= !entries.is_empty();
+            if self.ui.open.get_untracked() == Some(*peer)
+                && let Some(contact) = inner.contact(peer)
+            {
+                let views: Vec<_> = entries
+                    .into_iter()
+                    .map(|(index, entry)| contact.message(index, entry))
+                    .collect();
+                self.show_changes(inner, peer, &changed);
+                self.show_new(inner, peer, views);
+            }
+            self.ui.contacts.set(inner.views());
+            if let Some(initial_messages) = stalled {
+                // Its initial message, which went first, may have come since they were last
+                // taken, or have been lost, and come with the page: once they are taken, and
+                // those are accepted, receiving goes on, past what still does not decrypt.
+                drop(guard);
+                self.take_initial_messages().await?;
+                let mut guard = self.inner.lock().await;
+                if let Some(inner) = guard.as_mut() {
+                    for initial_message in carried_initials.iter().chain(&initial_messages) {
+                        recommend_upgrade |=
+                            self.join_carried(inner, peer, initial_message).await?;
+                    }
+                    if let Some(contact) = inner.contact(peer) {
+                        contact.session.skip_stalled();
+                    }
+                    self.ui.contacts.set(inner.views());
+                }
+            } else if !carried_initials.is_empty() {
+                for initial_message in &carried_initials {
+                    recommend_upgrade |= self.join_carried(inner, peer, initial_message).await?;
+                }
+                self.ui.contacts.set(inner.views());
+            }
+        }
+        if recommend_upgrade {
+            let _ = self.upgrade_to_pq(*peer).await;
+        }
+        Ok(received)
+    }
+}
+
+impl<V: HistoryStore> Inner<V> {
+    /// A fetch may consume delivery receipts and advance across expired pages before failing.
+    /// Restore the whole snapshot on error. Keep it for the caller until the page is persisted.
+    pub(super) async fn fetch_page<T>(
+        &mut self,
+        index: usize,
+        fetch: impl AsyncFnOnce(&mut Session<Connect>, &Client<Connect>, &str) -> session::Result<T>,
+    ) -> Result<(T, (proto::SessionState, ContactState)), String> {
+        let contact = &mut self.contacts[index];
+        let (peer, snapshot) = (contact.peer, contact.snapshot());
+        match fetch(&mut contact.session, &self.client, &self.audience).await {
+            Ok(page) => Ok((page, snapshot)),
+            Err(e) => {
+                self.roll_back(&peer, snapshot)?;
+                Err(describe(&e))
+            }
+        }
+    }
+}

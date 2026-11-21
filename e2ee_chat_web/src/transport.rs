@@ -65,7 +65,7 @@ fn asks_sign_in(status: u16, body: &[u8]) -> bool {
 /// Check that a Connect response body length does not exceed [`MAX_CONNECT_RESPONSE_BYTES`].
 fn check_response_size(len: u64) -> protocol::Result<()> {
     if len > MAX_CONNECT_RESPONSE_BYTES as u64 {
-        return Err(Error::new(
+        return Err(Error::ambiguous_response(
             ErrorKind::LimitExceeded,
             format!("response exceeds maximum size of {MAX_CONNECT_RESPONSE_BYTES} bytes"),
         ));
@@ -211,7 +211,7 @@ impl LocalPost for Fetch {
                 // Its sender lives as long as the closures.
                 Either::Left((Ok(XhrOutcome::Loaded), _)) => break Ok(()),
                 Either::Left((Ok(XhrOutcome::Oversized), _)) => {
-                    break Err(Error::new(
+                    break Err(Error::ambiguous_response(
                         ErrorKind::LimitExceeded,
                         format!(
                             "response exceeds maximum size of {MAX_CONNECT_RESPONSE_BYTES} bytes"
@@ -219,7 +219,10 @@ impl LocalPost for Fetch {
                     ));
                 }
                 Either::Left(_) => {
-                    break Err(Error::new(ErrorKind::Connect, "the server cannot be reached"));
+                    break Err(Error::new(
+                        ErrorKind::Connect,
+                        "the server cannot be reached",
+                    ));
                 }
                 Either::Right(_)
                     if monotonic_now_ms().saturating_sub(moved.get()) > STALL_MILLIS =>
@@ -234,7 +237,8 @@ impl LocalPost for Fetch {
         };
         ended?;
         observe(&self.server, &request);
-        let status = request.status().map_err(failed)?;
+        let invalid = |e| Error::ambiguous_response(ErrorKind::InvalidResponse, js_error(e));
+        let status = request.status().map_err(invalid)?;
         // Enforce bounded response size BEFORE copying into Rust memory or decoding.
         if let Ok(Some(cl)) = request.get_response_header("content-length")
             && let Ok(parsed) = cl.trim().parse::<u64>()
@@ -243,9 +247,14 @@ impl LocalPost for Fetch {
         }
         let body: ArrayBuffer = request
             .response()
-            .map_err(failed)?
+            .map_err(invalid)?
             .dyn_into()
-            .map_err(|_| Error::new(ErrorKind::Malformed, "unexpected response buffer type"))?;
+            .map_err(|_| {
+                Error::ambiguous_response(
+                    ErrorKind::InvalidResponse,
+                    "unexpected response buffer type",
+                )
+            })?;
         check_response_size(u64::from(body.byte_length()))?;
         let body = Uint8Array::new(&body).to_vec();
         if asks_sign_in(status, &body)
@@ -342,5 +351,6 @@ mod tests {
         assert!(check_response_size(MAX_CONNECT_RESPONSE_BYTES as u64).is_ok());
         let err = check_response_size(MAX_CONNECT_RESPONSE_BYTES as u64 + 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::LimitExceeded);
+        assert!(!err.is_server_refusal());
     }
 }

@@ -5,9 +5,9 @@
 //! highlighted code. The highlight registry is among web-sys's unstable APIs, so it is called as
 //! JavaScript sees it.
 
-use js_sys::{Array, Function, Reflect};
+use js_sys::Array;
 use leptos::{ev, html, prelude::*, task::spawn_local};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use web_sys::{MutationObserver, MutationObserverInit, Node, Range};
 
 use crate::{
@@ -287,44 +287,49 @@ fn scroll_to(root: &web_sys::Element, range: &Range) {
     root.set_scroll_top(root.scroll_top() + offset as i32);
 }
 
-/// The page's highlight registry, if it has one.
-fn registry() -> Option<JsValue> {
-    let css = Reflect::get(&js_sys::global(), &"CSS".into()).ok()?;
-    Reflect::get(&css, &"highlights".into())
-        .ok()
-        .filter(|registry| !registry.is_undefined())
+#[wasm_bindgen]
+extern "C" {
+    type GlobalWithHighlight;
+    #[wasm_bindgen(method, getter = CSS, catch)]
+    fn css(this: &GlobalWithHighlight) -> Result<Option<CssNamespace>, JsValue>;
+    type CssNamespace;
+    #[wasm_bindgen(method, getter, catch)]
+    fn highlights(this: &CssNamespace) -> Result<Option<HighlightRegistry>, JsValue>;
+    type HighlightRegistry;
+    #[wasm_bindgen(method, catch)]
+    fn set(
+        this: &HighlightRegistry,
+        name: &str,
+        highlight: &CustomHighlight,
+    ) -> Result<(), JsValue>;
+    #[wasm_bindgen(method, catch)]
+    fn delete(this: &HighlightRegistry, name: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(js_name = Highlight)]
+    type CustomHighlight;
+    #[wasm_bindgen(constructor, variadic, catch, js_class = "Highlight")]
+    fn new(ranges: &Array) -> Result<CustomHighlight, JsValue>;
 }
 
-/// Call `method` of `registry` with `arguments`.
-fn call(registry: &JsValue, method: &str, arguments: &Array) {
-    if let Some(method) = Reflect::get(registry, &method.into())
-        .ok()
-        .and_then(|method| method.dyn_into::<Function>().ok())
-    {
-        let _ = method.apply(registry, arguments);
-    }
+fn registry() -> Option<HighlightRegistry> {
+    js_sys::global()
+        .unchecked_ref::<GlobalWithHighlight>()
+        .css()
+        .ok()??
+        .highlights()
+        .ok()?
 }
 
-/// Mark `ranges` as the highlight `name`.
 fn highlight(name: &str, ranges: &[Range]) {
-    let Some(registry) = registry() else {
-        return;
-    };
-    let Some(constructor) = Reflect::get(&js_sys::global(), &"Highlight".into())
-        .ok()
-        .and_then(|constructor| constructor.dyn_into::<Function>().ok())
-    else {
-        return;
-    };
-    let ranges: Array = ranges.iter().collect();
-    if let Ok(highlight) = Reflect::construct(&constructor, &ranges) {
-        call(&registry, "set", &Array::of2(&name.into(), &highlight));
+    if let Some(registry) = registry()
+        && let Ok(mark) = CustomHighlight::new(&ranges.iter().collect())
+    {
+        let _ = registry.set(name, &mark);
     }
 }
 
 fn unhighlight(name: &str) {
     if let Some(registry) = registry() {
-        call(&registry, "delete", &Array::of1(&name.into()));
+        let _ = registry.delete(name);
     }
 }
 

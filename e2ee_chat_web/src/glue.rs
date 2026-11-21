@@ -6,18 +6,68 @@
 use std::{cell::RefCell, rc::Rc};
 
 use futures::channel::oneshot;
-use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use js_sys::{Array, ArrayBuffer, Object, Promise, Uint8Array};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{MessageEvent, MessagePort, Navigator};
+use web_sys::{Clipboard, MessageEvent, MessagePort, Navigator, ServiceWorkerContainer};
 
-fn navigator() -> Navigator {
-    web_sys::window().expect("a window").navigator()
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(extends = Navigator)]
+    type BrowserNavigator;
+    #[wasm_bindgen(method, getter = clipboard, catch)]
+    fn optional_clipboard(this: &BrowserNavigator) -> Result<Option<Clipboard>, JsValue>;
+    #[wasm_bindgen(method, getter = serviceWorker, catch)]
+    fn optional_service_worker(
+        this: &BrowserNavigator,
+    ) -> Result<Option<MediaServiceWorkers>, JsValue>;
+    #[wasm_bindgen(method, getter = locks, catch)]
+    fn optional_locks(this: &BrowserNavigator) -> Result<Option<WebLockManager>, JsValue>;
+
+    type WebLockManager;
+    #[wasm_bindgen(method, catch)]
+    fn request(
+        this: &WebLockManager,
+        name: &str,
+        options: &LockOptions,
+        callback: &JsValue,
+    ) -> Result<Promise, JsValue>;
+    #[wasm_bindgen(extends = Object)]
+    type LockOptions;
+    #[wasm_bindgen(method, setter = ifAvailable)]
+    fn set_if_available(this: &LockOptions, value: bool);
+
+    #[wasm_bindgen(extends = ServiceWorkerContainer)]
+    type MediaServiceWorkers;
+    #[wasm_bindgen(method, js_name = startMessages, catch)]
+    fn try_start_messages(this: &MediaServiceWorkers) -> Result<(), JsValue>;
+
+    #[wasm_bindgen(extends = Object)]
+    type MediaRequestMsg;
+    #[wasm_bindgen(method, getter, catch)]
+    fn media(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(method, getter, catch)]
+    fn start(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(method, getter, catch)]
+    fn end(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
+
+    #[wasm_bindgen(extends = Object)]
+    type MediaReplyMsg;
+    #[wasm_bindgen(method, setter = size)]
+    fn set_size(this: &MediaReplyMsg, size: f64);
+    #[wasm_bindgen(method, setter = mime)]
+    fn set_mime(this: &MediaReplyMsg, mime: &str);
+    #[wasm_bindgen(method, setter = bytes)]
+    fn set_bytes(this: &MediaReplyMsg, bytes: &ArrayBuffer);
+    #[wasm_bindgen(method, setter = error)]
+    fn set_error(this: &MediaReplyMsg, status: u16);
 }
 
-/// Whether `navigator` has the API `name`.
-fn has(navigator: &Navigator, name: &str) -> bool {
-    Reflect::get(navigator, &name.into()).is_ok_and(|api| !api.is_undefined())
+fn navigator() -> BrowserNavigator {
+    web_sys::window()
+        .expect("a window")
+        .navigator()
+        .unchecked_into()
 }
 
 /// Result of attempting to acquire the exclusive tab lock for the vault.
@@ -33,10 +83,7 @@ pub enum LockStatus {
 
 /// Whether this page is running in a secure context (HTTPS or localhost).
 fn is_secure_context() -> bool {
-    web_sys::window()
-        .and_then(|w| Reflect::get(&w, &"isSecureContext".into()).ok())
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
+    web_sys::window().is_some_and(|window| window.is_secure_context())
 }
 
 /// Take the lock `name` for as long as the page lives, failing closed if another tab holds it
@@ -44,17 +91,7 @@ fn is_secure_context() -> bool {
 pub async fn take_lock(name: &str) -> LockStatus {
     let insecure_context = !is_secure_context();
     let unavailable = LockStatus::Unavailable { insecure_context };
-    let navigator = navigator();
-    let Some(locks) = Reflect::get(&navigator, &"locks".into())
-        .ok()
-        .filter(|locks| !locks.is_undefined() && !locks.is_null())
-    else {
-        return unavailable;
-    };
-    let Some(request) = Reflect::get(&locks, &"request".into())
-        .ok()
-        .and_then(|request| request.dyn_into::<Function>().ok())
-    else {
+    let Ok(Some(locks)) = navigator().optional_locks() else {
         return unavailable;
     };
     let (taken, told) = oneshot::channel();
@@ -84,14 +121,9 @@ pub async fn take_lock(name: &str) -> LockStatus {
             }
         })
     };
-    let options = Object::new();
-    if Reflect::set(&options, &"ifAvailable".into(), &JsValue::TRUE).is_err() {
-        return unavailable;
-    }
-    let requested = request
-        .call3(&locks, &name.into(), &options, granted.as_ref())
-        .and_then(|value| value.dyn_into::<Promise>());
-    match requested {
+    let options: LockOptions = Object::new().unchecked_into();
+    options.set_if_available(true);
+    match locks.request(name, &options, granted.as_ref()) {
         Ok(requested) => {
             // Called once, and when held the lock's promise lives with the page.
             granted.forget();
@@ -108,27 +140,28 @@ pub async fn take_lock(name: &str) -> LockStatus {
 
 /// Copy `text` to the clipboard; `false` if the browser refused.
 pub async fn copy(text: &str) -> bool {
-    let navigator = navigator();
-    has(&navigator, "clipboard")
-        && JsFuture::from(navigator.clipboard().write_text(text))
-            .await
-            .is_ok()
+    let Ok(Some(clipboard)) = navigator().optional_clipboard() else {
+        return false;
+    };
+    JsFuture::from(clipboard.write_text(text)).await.is_ok()
 }
 
 /// Register the service worker that streams media, `media-worker.js`, if the browser has them.
 pub fn register_media_worker() {
-    let navigator = navigator();
-    if has(&navigator, "serviceWorker") {
+    if let Ok(Some(container)) = navigator().optional_service_worker() {
         // Unregistered, it does nothing; its promise only tells so.
-        let _ = navigator.service_worker().register("/media-worker.js");
+        let _ = container.register("/media-worker.js");
     }
 }
 
 /// Whether the service worker controls the page, so that media streams through it; else it is
 /// fetched whole before it plays.
 pub fn streaming() -> bool {
-    let navigator = navigator();
-    has(&navigator, "serviceWorker") && navigator.service_worker().controller().is_some()
+    navigator()
+        .optional_service_worker()
+        .ok()
+        .flatten()
+        .is_some_and(|container| container.controller().is_some())
 }
 
 /// The service worker's request for the bytes of a stream from `start`, to `end` if given, for a
@@ -146,21 +179,18 @@ pub type MediaReply<'a> = Result<(u64, &'a str, &'a [u8]), u16>;
 
 impl MediaRequest {
     pub fn reply(self, reply: MediaReply<'_>) {
-        let message = Object::new();
+        let message: MediaReplyMsg = Object::new().unchecked_into();
         let transfer = Array::new();
-        let set = |name: &str, value: &JsValue| {
-            let _ = Reflect::set(&message, &name.into(), value);
-        };
         match reply {
             Ok((size, mime, bytes)) => {
                 // Moved to the service worker rather than copied.
                 let buffer = Uint8Array::from(bytes).buffer();
-                set("size", &(size as f64).into());
-                set("mime", &mime.into());
-                set("bytes", &buffer);
+                message.set_size(size as f64);
+                message.set_mime(mime);
+                message.set_bytes(&buffer);
                 transfer.push(&buffer);
             }
-            Err(status) => set("error", &status.into()),
+            Err(status) => message.set_error(status),
         }
         let _ = self
             .reply
@@ -170,19 +200,22 @@ impl MediaRequest {
 
 /// Answer the service worker's requests for media, as they come, with `answer`.
 pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
-    let navigator = navigator();
-    if !has(&navigator, "serviceWorker") {
+    let Ok(Some(container)) = navigator().optional_service_worker() else {
         return;
-    }
-    let container = navigator.service_worker();
+    };
     let listener = Closure::<dyn Fn(MessageEvent)>::new(move |event: MessageEvent| {
         let data = event.data();
-        let field = |name: &str| Reflect::get(&data, &name.into()).ok();
-        let token = field("media").and_then(|token| token.as_string());
-        let start = field("start").and_then(|start| start.as_f64());
+        if !data.is_object() || data.is_null() {
+            return;
+        }
+        let request: MediaRequestMsg = data.unchecked_into();
+        let token = request.media().ok().and_then(|v| v.as_string());
+        let start = request.start().ok().and_then(|v| v.as_f64());
         let reply = event.ports().get(0).dyn_into::<MessagePort>().ok();
         if let (Some(token), Some(start), Some(reply)) = (token, start, reply) {
-            let end = field("end")
+            let end = request
+                .end()
+                .ok()
                 .and_then(|end| end.as_f64())
                 .map(|end| end as u64);
             answer(MediaRequest {
@@ -196,11 +229,7 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
     let _ =
         container.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref());
     // Messages are let through once the page loads, or once asked to, which web-sys cannot.
-    if let Ok(start) = Reflect::get(&container, &"startMessages".into())
-        .and_then(|start| start.dyn_into::<Function>())
-    {
-        let _ = start.call0(&container);
-    }
+    let _ = container.try_start_messages();
     // Listening as long as the page lives.
     listener.forget();
 }

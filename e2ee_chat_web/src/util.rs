@@ -1,6 +1,7 @@
 //! Small helpers: keys as text, time, sizes, errors and waiting.
 
 use base64::prelude::*;
+use js_sys::Intl::{DateTimeFormatOptions, DayFormat, MonthFormat, YearFormat};
 use session::PublicKey;
 use wasm_bindgen::JsCast;
 
@@ -77,18 +78,9 @@ pub fn monotonic_now_ms() -> u64 {
         static HIGH_WATER_MS: Cell<u64> = const { Cell::new(0) };
     }
 
-    let global: wasm_bindgen::JsValue = web_sys::window()
-        .map(wasm_bindgen::JsValue::from)
-        .unwrap_or_else(|| js_sys::global().into());
-    let perf_ms = js_sys::Reflect::get(&global, &"performance".into())
-        .ok()
-        .filter(|perf| !perf.is_undefined() && !perf.is_null())
-        .and_then(|perf| {
-            let now = js_sys::Reflect::get(&perf, &"now".into())
-                .ok()
-                .and_then(|func| func.dyn_into::<js_sys::Function>().ok())?;
-            now.call0(&perf).ok()?.as_f64()
-        })
+    let perf_ms = web_sys::window()
+        .and_then(|w| w.performance())
+        .map(|p| p.now())
         .filter(|ms| ms.is_finite() && *ms >= 0.0);
 
     let raw = match perf_ms {
@@ -127,26 +119,28 @@ pub fn clock(millis: u64) -> String {
 
 /// The month of a time, as the reader's language writes it, e.g. "October 2026".
 pub fn month(millis: u64) -> String {
-    local_date(millis, &[("month", "long"), ("year", "numeric")])
+    let options = DateTimeFormatOptions::new();
+    options.set_month(MonthFormat::Long);
+    options.set_year(YearFormat::Numeric);
+    local_date(millis, &options)
 }
 
 /// The day of a time, as the reader's language writes it, e.g. "27 Oct".
 pub fn day(millis: u64) -> String {
-    local_date(millis, &[("day", "numeric"), ("month", "short")])
+    let options = DateTimeFormatOptions::new();
+    options.set_day(DayFormat::Numeric);
+    options.set_month(MonthFormat::Short);
+    local_date(millis, &options)
 }
 
-/// The date of a time with the fields `fields` of `Intl.DateTimeFormat`, in the reader's
-/// language.
-fn local_date(millis: u64, fields: &[(&str, &str)]) -> String {
+/// Format a date in the reader's language.
+fn local_date(millis: u64, options: &DateTimeFormatOptions) -> String {
     let date = js_sys::Date::new(&(millis as f64).into());
-    let options = js_sys::Object::new();
-    for (field, value) in fields {
-        let _ = js_sys::Reflect::set(&options, &(*field).into(), &(*value).into());
-    }
     let language = web_sys::window()
         .and_then(|window| window.navigator().language())
         .unwrap_or_else(|| "en".to_string());
-    date.to_locale_date_string(&language, &options).into()
+    date.to_locale_date_string(&language, options.as_ref())
+        .into()
 }
 
 /// A size in bytes, for people.
@@ -310,7 +304,10 @@ mod test {
             session::protocol::ErrorKind::Server,
             "internal: upstream failed",
         ));
-        assert_eq!(describe(&server_err), "server error: internal: upstream failed");
+        assert_eq!(
+            describe(&server_err),
+            "server error: internal: upstream failed"
+        );
 
         // Distinct layers stay preserved in full.
         let proto_malformed = session::Error::from(session::protocol::Error::new(
