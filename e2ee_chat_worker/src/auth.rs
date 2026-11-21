@@ -147,6 +147,13 @@ struct FailureTracker {
     clients: HashMap<String, VecDeque<u64>>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PasswordAttemptOutcome {
+    RateLimited,
+    WrongPassword { failures: usize },
+    Accepted,
+}
+
 impl FailureTracker {
     fn prune(attempts: &mut VecDeque<u64>, now: u64) {
         let cutoff = now.saturating_sub(THROTTLE_WINDOW_MS);
@@ -165,6 +172,30 @@ impl FailureTracker {
             self.clients.remove(client_key);
         }
         count
+    }
+
+    /// Recheck the limit after reading the body and record any failure before yielding.
+    fn verify_password_attempt(
+        &mut self,
+        client_key: &str,
+        now: u64,
+        key: &str,
+        password: &str,
+        given: Option<&[u8]>,
+    ) -> PasswordAttemptOutcome {
+        if self.recent_failures(client_key, now) >= MAX_FAILURES_PER_WINDOW {
+            return PasswordAttemptOutcome::RateLimited;
+        }
+        // Compare MACs in constant time so the comparison reveals nothing about the password.
+        let expected = mac(key, b"password", password.as_bytes())
+            .finalize()
+            .into_bytes();
+        if given.is_some_and(|body| mac(key, b"password", body).verify_slice(&expected).is_ok()) {
+            return PasswordAttemptOutcome::Accepted;
+        }
+        PasswordAttemptOutcome::WrongPassword {
+            failures: self.record_failure(client_key, now),
+        }
     }
 
     fn record_failure(&mut self, client_key: &str, now: u64) -> usize {
@@ -210,29 +241,22 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
         return Response::error("too many failed sign-in attempts", 429);
     }
     let given = crate::read_body(&mut request, MAX_PASSWORD).await?;
-    // Compare MACs in constant time so the comparison reveals nothing about the password.
-    let expected = mac(&key, b"password", password.as_bytes())
-        .finalize()
-        .into_bytes();
-    if !given.is_some_and(|body| {
-        mac(&key, b"password", &body)
-            .verify_slice(&expected)
-            .is_ok()
-    }) {
-        let now = Date::now().as_millis();
-        // Several request bodies can arrive concurrently after the first throttle check.
-        let failures = FAILED_ATTEMPTS.with_borrow_mut(|tracker| {
-            (tracker.recent_failures(&client_key, now) < MAX_FAILURES_PER_WINDOW)
-                .then(|| tracker.record_failure(&client_key, now))
-        });
-        let Some(failures) = failures else {
+    let now = Date::now().as_millis();
+    let outcome = FAILED_ATTEMPTS.with_borrow_mut(|tracker| {
+        tracker.verify_password_attempt(&client_key, now, &key, &password, given.as_deref())
+    });
+    match outcome {
+        PasswordAttemptOutcome::RateLimited => {
             return Response::error("too many failed sign-in attempts", 429);
-        };
-        let delay_ms = WRONG_PASSWORD_BASE_DELAY_MS
-            .saturating_mul(1u64 << (failures.saturating_sub(1).min(3)))
-            .min(WRONG_PASSWORD_MAX_DELAY_MS);
-        Delay::from(Duration::from_millis(delay_ms)).await;
-        return Response::error("wrong password", 403);
+        }
+        PasswordAttemptOutcome::WrongPassword { failures } => {
+            let delay_ms = WRONG_PASSWORD_BASE_DELAY_MS
+                .saturating_mul(1u64 << (failures.saturating_sub(1).min(3)))
+                .min(WRONG_PASSWORD_MAX_DELAY_MS);
+            Delay::from(Duration::from_millis(delay_ms)).await;
+            return Response::error("wrong password", 403);
+        }
+        PasswordAttemptOutcome::Accepted => {}
     }
     let lasts = crate::period(env, "SESSION_DAYS", DEFAULT_SESSION_DAYS).as_secs();
     let claims = Claims {
@@ -295,6 +319,56 @@ fn answer(claims: Option<&Claims>, cookie: Option<String>) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_flight_password_attempts_observe_the_limit_until_the_window_expires() {
+        let mut tracker = FailureTracker::default();
+        let now = 100;
+        // All requests pass their pre-body checks before any body finishes arriving.
+        for _ in 0..MAX_FAILURES_PER_WINDOW + 2 {
+            assert!(tracker.recent_failures("client", now) < MAX_FAILURES_PER_WINDOW);
+        }
+        for failures in 1..=MAX_FAILURES_PER_WINDOW {
+            assert_eq!(
+                tracker.verify_password_attempt("client", now, "key", "correct", Some(b"wrong")),
+                PasswordAttemptOutcome::WrongPassword { failures }
+            );
+        }
+        for body in [b"correct".as_slice(), b"wrong"] {
+            assert_eq!(
+                tracker.verify_password_attempt("client", now, "key", "correct", Some(body)),
+                PasswordAttemptOutcome::RateLimited
+            );
+        }
+        assert_eq!(
+            tracker.recent_failures("client", now),
+            MAX_FAILURES_PER_WINDOW
+        );
+
+        let later = now + THROTTLE_WINDOW_MS + 1;
+        assert_eq!(
+            tracker.verify_password_attempt("client", later, "key", "correct", Some(b"correct")),
+            PasswordAttemptOutcome::Accepted
+        );
+        assert_eq!(tracker.recent_failures("client", later), 0);
+    }
+
+    #[test]
+    fn oversized_bodies_count_as_failures_and_valid_passwords_preserve_the_count() {
+        let mut tracker = FailureTracker::default();
+        for failures in 1..=MAX_FAILURES_PER_WINDOW {
+            assert_eq!(
+                tracker.verify_password_attempt("client", 100, "key", "correct", Some(b"correct")),
+                PasswordAttemptOutcome::Accepted
+            );
+            assert_eq!(tracker.recent_failures("client", 100), failures - 1);
+            assert_eq!(
+                tracker.verify_password_attempt("client", 100, "key", "correct", None),
+                PasswordAttemptOutcome::WrongPassword { failures }
+            );
+            assert_eq!(tracker.recent_failures("client", 100), failures);
+        }
+    }
 
     #[test]
     fn password_failures_are_per_client() {

@@ -3,9 +3,9 @@
 //! it, one per sender, and the WebSockets its client subscribed with, which hear at once of what
 //! arrives.
 //!
-//! Reads of an unknown identity leave the core tables unallocated. A verified subscription
-//! creates its own replay table, even before the identity publishes a bundle. V2 handshakes
-//! use side tables and share the mailbox message queues with v1.
+//! Reads of an unknown identity leave the core tables unallocated. On a password-protected server,
+//! a cookie-free signed query subscription can create its replay table only if the core tables
+//! already exist. V2 handshakes use side tables and share the mailbox message queues with v1.
 
 mod handshake;
 mod mailbox;
@@ -31,7 +31,8 @@ use super::{
 };
 use rows::{ExpiredObjectRow, OldestRow};
 pub use ws::{
-    HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE, HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS,
+    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE,
+    HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS,
 };
 
 /// Maximum expired R2 objects deleted in a single alarm tick.
