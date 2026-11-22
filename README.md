@@ -1,6 +1,6 @@
 # About
 
-![The web client: a chat with read receipts, a file and an image](image/screenshot.png)
+![The web client: a post-quantum chat with read receipts, a file and an image](image/screenshot.png)
 
 - **[E2EE chat Worker](e2ee_chat_worker/README.md)**: the chat server as a Cloudflare Worker, over Connect, storing in Durable Objects and R2, and serving the web client
 - **[E2EE chat web client](e2ee_chat_web/README.md)**: the web client, in Leptos: keys and sessions stay in the browser, in a vault sealed by a passphrase
