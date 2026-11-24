@@ -60,8 +60,9 @@ pub(super) struct Fetching {
 /// Who waits for an attachment.
 #[derive(Clone, Copy)]
 pub(super) enum Waiter<'a> {
-    /// The viewer, until it closes or goes on to another file.
-    Viewer,
+    /// The viewer, for the preview request identified by its monotonic token, until it closes or
+    /// goes on to another request.
+    Viewer(u64),
     /// The chat, showing it in place, while this says it does.
     Chat(&'a dyn Fn() -> bool),
 }
@@ -1030,6 +1031,7 @@ impl Engine {
     /// at `clock`, is downloaded whole, the peer is told.
     pub async fn open_attachment(
         &self,
+        token: u64,
         peer: PublicKey,
         index: u64,
         pointer: AttachmentPointer,
@@ -1046,6 +1048,7 @@ impl Engine {
             return Err("the attachment is malformed".to_string());
         };
         self.ui.opening.set(Some(Opening {
+            token,
             id,
             name: pointer.name.clone(),
             size: pointer.size,
@@ -1053,7 +1056,7 @@ impl Engine {
             waiting: false,
         }));
         let fetched = self
-            .fetch_attachment(peer, index, &id, pointer, Waiter::Viewer)
+            .fetch_attachment(peer, index, &id, pointer, Waiter::Viewer(token))
             .await;
         if let Err(FetchError::NotFound(_)) = &fetched {
             let _ = self.note_gone_by_id(&peer, Some(index), &id).await;
@@ -1061,8 +1064,9 @@ impl Engine {
         let opened = self
             .told_downloaded(peer, clock, fetched.map_err(FetchError::into_message))
             .await;
-        // Unless the viewer closed, or went on to another file, meanwhile.
-        if !self.opening(&id) {
+        // Unless the viewer closed, navigated away, or started another request (even for the same
+        // attachment ID) meanwhile.
+        if !self.opening(token, &id) {
             return Ok(());
         }
         match opened {
@@ -1138,17 +1142,22 @@ impl Engine {
         self.flush(&peer).await.map(drop)
     }
 
-    /// Whether the viewer still waits for the attachment `id`.
-    fn opening(&self, id: &[u8; 16]) -> bool {
-        self.ui
-            .opening
-            .with_untracked(|opening| opening.as_ref().is_some_and(|opening| opening.id == *id))
+    /// Whether the viewer still waits for the attachment `id` of preview request `token`.
+    fn opening(&self, token: u64, id: &[u8; 16]) -> bool {
+        self.ui.opening.with_untracked(|opening| {
+            opening
+                .as_ref()
+                .is_some_and(|opening| opening.token == token && opening.id == *id)
+        })
     }
 
-    /// Note how far opening the attachment `id` got.
-    pub(super) fn opened(&self, id: &[u8; 16], done: u64, waiting: bool) {
+    /// Note how far opening the attachment `id` of preview request `token` got.
+    pub(super) fn opened(&self, token: u64, id: &[u8; 16], done: u64, waiting: bool) {
         self.ui.opening.update(|opening| {
-            if let Some(opening) = opening.as_mut().filter(|opening| opening.id == *id) {
+            if let Some(opening) = opening
+                .as_mut()
+                .filter(|opening| opening.token == token && opening.id == *id)
+            {
                 (opening.done, opening.waiting) = (done, waiting);
             }
         });
@@ -1157,7 +1166,7 @@ impl Engine {
     /// Whether `waiter` still waits for the attachment `id`.
     pub(super) fn waits(&self, waiter: Waiter<'_>, id: &[u8; 16]) -> bool {
         match waiter {
-            Waiter::Viewer => self.opening(id),
+            Waiter::Viewer(token) => self.opening(token, id),
             Waiter::Chat(shows) => shows(),
         }
     }
@@ -1202,8 +1211,8 @@ impl Engine {
             };
             fetched |= from_server;
             data.extend(plaintext);
-            if let Waiter::Viewer = waiter {
-                self.opened(id, data.len() as u64, false);
+            if let Waiter::Viewer(token) = waiter {
+                self.opened(token, id, data.len() as u64, false);
             }
         }
         if data.len() as u64 != pointer.size {
@@ -1339,12 +1348,16 @@ impl Engine {
             match attachment::download_chunk(attachments, id, index).await {
                 Ok(Some(chunk)) => return Ok(Some(chunk)),
                 Ok(None) if waited < STALLED => {
-                    self.ui.opening.update(|opening| {
-                        if let Some(opening) = opening.as_mut().filter(|opening| opening.id == *id)
-                        {
-                            opening.waiting = true;
-                        }
-                    });
+                    if let Waiter::Viewer(token) = waiter {
+                        self.ui.opening.update(|opening| {
+                            if let Some(opening) = opening
+                                .as_mut()
+                                .filter(|opening| opening.token == token && opening.id == *id)
+                            {
+                                opening.waiting = true;
+                            }
+                        });
+                    }
                     sleep(wait).await;
                     waited += wait;
                     wait = (wait * 2).min(POLL_CHUNK_MAX);

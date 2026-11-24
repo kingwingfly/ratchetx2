@@ -8,7 +8,11 @@ use crate::{
 };
 
 use super::{
-    common::{ASKED_SHOWN, Progress, SecretInput, ToggleSwitch, invited_server, lock},
+    common::{
+        ASKED_SHOWN, Progress, SecretInput, ToggleSwitch, cancel_active_chat_history_reservation,
+        cancel_chat_history, commit_chat_history, invited_server, is_chat_history_owned, lock,
+        reserve_chat_history, retain_active_chat_history_reservation, retain_chat_history,
+    },
     engine,
 };
 
@@ -17,7 +21,21 @@ use super::{
 #[component]
 pub(super) fn SignInDialog() -> impl IntoView {
     let password_input = SecretInput::new();
-    on_cleanup(move || password_input.clear());
+    let active_submit = StoredValue::new(None::<(u64, super::history::Reservation)>);
+    // Bind async sign-in completions strictly to this mounted form instance so dismissing a
+    // password-only SignInDialog never allows its late completion to adopt a newer auto-start draft.
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let alive_cleanup = alive.clone();
+    on_cleanup(move || {
+        alive_cleanup.store(false, std::sync::atomic::Ordering::Relaxed);
+        password_input.clear();
+        if let Some((auto_start_id, reservation)) =
+            active_submit.try_update_value(Option::take).flatten()
+        {
+            let _ = cancel_chat_history(Some(reservation));
+            engine().cancel_startup_submission(auto_start_id);
+        }
+    });
     let progress = Progress::new();
     let pending_hint = engine()
         .pending_new_chat_hint()
@@ -35,39 +53,114 @@ pub(super) fn SignInDialog() -> impl IntoView {
         }
         let secret = password_input.take();
         let engine = engine();
+        // Reserve a chat-level history entry during the submit gesture when sign-in will
+        // auto-start a pending chat so WebKit preserves swipe-back after slow relay requests.
+        let auto_start_id = engine.pending_auto_start_id();
+        if let Some(id) = auto_start_id {
+            engine.begin_sign_in_auto_start(id);
+        }
+        let reservation = auto_start_id.map(|_| reserve_chat_history());
+        if let (Some(id), Some(res)) = (auto_start_id, reservation) {
+            active_submit.set_value(Some((id, res)));
+        }
+        let alive = alive.clone();
         progress.start("Signing in…");
         spawn_local(async move {
             let result = engine.sign_in(&secret).await;
             drop(secret);
+            let clear_active = |target_id: Option<u64>| {
+                if let Some(target_id) = target_id {
+                    let _ = active_submit.try_update_value(|slot| {
+                        if slot.is_some_and(|(id, _)| id == target_id) {
+                            *slot = None;
+                        }
+                    });
+                }
+            };
             match result {
                 Ok(signed_in) => {
                     let until = day(signed_in.expires);
+                    // If this SignInDialog instance was dismissed/unmounted or its auto-start
+                    // draft was cancelled/superseded while signing in, do not start a cancelled
+                    // chat or adopt a newer dialog's draft.
+                    if !alive.load(std::sync::atomic::Ordering::Relaxed)
+                        || auto_start_id.is_some_and(|id| {
+                            engine.is_submission_cancelled(id)
+                                || !is_chat_history_owned(reservation)
+                        })
+                    {
+                        clear_active(auto_start_id);
+                        let _ = cancel_chat_history(reservation);
+                        if let Some(id) = auto_start_id {
+                            engine.finish_auto_start_chat(id, None);
+                            engine.finish_submission(id);
+                        }
+                        progress.clear();
+                        engine.ui().notify(format!(
+                            "Signed in until {until}: waiting messages and files go now."
+                        ));
+                        return;
+                    }
                     match engine.complete_sign_in_flow() {
                         SignInSuccessAction::Close => {
+                            clear_active(auto_start_id);
+                            let _ = cancel_chat_history(reservation);
+                            if let Some(id) = auto_start_id {
+                                engine.finish_submission(id);
+                            }
                             engine.close_dialog_if_sign_in();
                             engine.ui().notify(format!(
                                 "Signed in until {until}: waiting messages and files go now."
                             ));
                         }
                         SignInSuccessAction::ReopenNewChat(dialog) => {
+                            clear_active(auto_start_id);
+                            let _ = retain_chat_history(reservation);
+                            if let Some(id) = auto_start_id {
+                                engine.finish_submission(id);
+                            }
                             engine.ui().dialog.set(Some(dialog));
                             engine.ui().notify(format!("Signed in until {until}."));
                         }
-                        SignInSuccessAction::AutoStartChat(pending) => {
+                        SignInSuccessAction::AutoStartChat { id, pending } => {
+                            if auto_start_id != Some(id) {
+                                clear_active(auto_start_id);
+                                let _ = cancel_chat_history(reservation);
+                                if let Some(prev_id) = auto_start_id {
+                                    engine.finish_submission(prev_id);
+                                }
+                                progress.clear();
+                                engine.ui().notify(format!(
+                                    "Signed in until {until}: waiting messages and files go now."
+                                ));
+                                return;
+                            }
+                            if let Some(res) = reservation {
+                                active_submit.set_value(Some((id, res)));
+                            }
                             progress.try_start("Starting chat…");
-                            match engine
+                            let outcome = engine
                                 .start_chat(
+                                    id,
                                     &pending.key,
                                     pending.name.clone(),
                                     pending.pq_pinned,
                                     pending.allow_classical,
                                 )
-                                .await
-                            {
+                                .await;
+                            clear_active(Some(id));
+                            let cancelled = engine.is_submission_cancelled(id);
+                            engine.finish_submission(id);
+                            match outcome {
                                 Ok(peer) => {
-                                    engine.finish_auto_start_chat(None);
+                                    if cancelled || !is_chat_history_owned(reservation) {
+                                        engine.finish_auto_start_chat(id, None);
+                                        progress.clear();
+                                        return;
+                                    }
+                                    engine.finish_auto_start_chat(id, None);
                                     engine.close_dialog_if_new_chat();
-                                    engine.open(Some(peer)).await;
+                                    commit_chat_history(reservation, peer).await;
                                     // If sending the initial greeting hit a secondary
                                     // `SignInRequired` after persisting the chat, `SignInDialog`
                                     // intentionally stayed open — reset `progress` so buttons are
@@ -86,15 +179,35 @@ pub(super) fn SignInDialog() -> impl IntoView {
                                         engine.ui().notify(format!("Signed in until {until}."));
                                     }
                                 }
+                                Err(StartChatError::Cancelled) => {
+                                    let _ = cancel_chat_history(reservation);
+                                    progress.clear();
+                                }
                                 Err(StartChatError::SignInRequired) => {
-                                    engine.finish_auto_start_chat(Some(
-                                        StartChatError::SignInRequired,
-                                    ));
-                                    progress.try_fail("Sign-in is still required by the server.");
+                                    // Retain the gesture-pushed reserved slot while `SignInDialog`
+                                    // stays open for a retry.
+                                    let still_owned =
+                                        !cancelled && retain_chat_history(reservation);
+                                    if still_owned {
+                                        engine.finish_auto_start_chat(
+                                            id,
+                                            Some(StartChatError::SignInRequired),
+                                        );
+                                        progress
+                                            .try_fail("Sign-in is still required by the server.");
+                                    } else {
+                                        progress.clear();
+                                    }
                                 }
                                 Err(err) => {
+                                    // Retain the gesture-pushed reserved slot as `SignInDialog`
+                                    // reopens `NewChat` for retry (e.g. "Allow classical").
+                                    let still_owned =
+                                        !cancelled && retain_chat_history(reservation);
                                     progress.clear();
-                                    engine.finish_auto_start_chat(Some(err));
+                                    if still_owned {
+                                        engine.finish_auto_start_chat(id, Some(err));
+                                    }
                                     engine.ui().notify(format!("Signed in until {until}."));
                                 }
                             }
@@ -102,8 +215,21 @@ pub(super) fn SignInDialog() -> impl IntoView {
                     }
                 }
                 Err(e) => {
-                    progress.try_fail(e);
-                    password_input.focus();
+                    clear_active(auto_start_id);
+                    if alive.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = retain_chat_history(reservation);
+                        if let Some(id) = auto_start_id {
+                            engine.finish_submission(id);
+                        }
+                        progress.try_fail(e);
+                        password_input.focus();
+                    } else {
+                        let _ = cancel_chat_history(reservation);
+                        if let Some(id) = auto_start_id {
+                            engine.finish_submission(id);
+                        }
+                        progress.clear();
+                    }
                 }
             }
         });
@@ -135,7 +261,11 @@ pub(super) fn SignInDialog() -> impl IntoView {
                     disabled=move || progress.working.get()
                     on:click=move |_| {
                         password_input.clear();
-                        engine().dismiss_sign_in();
+                        if engine().dismiss_sign_in() {
+                            retain_active_chat_history_reservation();
+                        } else {
+                            cancel_active_chat_history_reservation();
+                        }
                     }
                 >
                     "Not now"
@@ -349,7 +479,8 @@ pub(super) fn Elsewhere() -> impl IntoView {
             <h2>"Open in another tab"</h2>
             <p>
                 "The vault is open in another tab or window of this browser. Two pages on one "
-                "vault would tangle its sessions, so close the other one, then reload this page."
+                "vault would tangle its sessions, so close the other one — this page will "
+                "continue automatically, or you can reload it."
             </p>
             <div class="actions">
                 <button class="btn primary" on:click=move |_| lock()>

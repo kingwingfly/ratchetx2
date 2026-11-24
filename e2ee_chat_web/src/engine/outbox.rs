@@ -10,9 +10,9 @@ use crate::state::{Delivery, MessageView, Step, Ui};
 use crate::util::{describe, now, short};
 use crate::vault::{
     Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, HistoryEntry, Outgoing, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
-    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
-    history_key, outbox_key,
+    ContactState, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, Outgoing,
+    OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
+    SECURITY_ALERT_PQ_REQUIRED, SealedEvents, history_key, outbox_key,
 };
 use leptos::prelude::*;
 use session::{ErrorKind, PublicKey};
@@ -124,10 +124,39 @@ impl Engine {
                     break;
                 }
             };
+            // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE transmitting a message that can carry a
+            // previously unsent initial greeting so a lost response still notifies an established
+            // peer on deletion without carrying the unconfirmed greeting.
+            let promoted_from_unsent = inner
+                .contacts
+                .iter()
+                .any(|c| c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT);
+            if promoted_from_unsent {
+                let snapshot = inner.contact(peer).map(|c| c.snapshot());
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                }
+                if let Err(e) = inner.save(&[]).await {
+                    if let Some(snapshot) = snapshot {
+                        let _ = inner.roll_back(peer, snapshot);
+                    }
+                    result = Err(describe(&e));
+                    break;
+                }
+            }
             let Some(contact) = inner.contact(peer) else {
                 break;
             };
             let push_res = contact.session.push_v2(record.to_push()).await.map(|_| ());
+            if let Err(ref e) = push_res
+                && e.is_server_refusal()
+                && promoted_from_unsent
+            {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                }
+                let _ = inner.save_state().await;
+            }
             let step = match push_res {
                 Ok(()) => {
                     self.release(peer, outgoing.history_index);
@@ -164,6 +193,7 @@ impl Engine {
             changed = true;
         }
         if !completed.is_empty() {
+            let pushed_any = completed.iter().any(|(_, step, _)| *step == Step::Pushed);
             let mut entries = vec![];
             let mut gone = vec![];
             let mut keep_in_outbox = vec![];
@@ -207,6 +237,9 @@ impl Engine {
                 if let Some(contact) = inner.contact(peer) {
                     let drain_end = pushed_count.min(contact.state.outbox.len());
                     contact.state.outbox.splice(0..drain_end, keep_in_outbox);
+                    if pushed_any {
+                        contact.mark_greeting_confirmed();
+                    }
                     if !new_awaiting.is_empty() {
                         contact.state.awaiting.extend(new_awaiting);
                         keep_last(&mut contact.state.awaiting);
@@ -288,9 +321,35 @@ impl Engine {
                 sealed
             }
         };
+        let promoted_from_unsent = inner
+            .contacts
+            .iter()
+            .any(|c| c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT);
+        if promoted_from_unsent {
+            let snapshot = inner.contact(peer).map(|c| c.snapshot());
+            if let Some(contact) = inner.contact(peer) {
+                contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+            }
+            if let Err(e) = inner.save(&[]).await {
+                if let Some(snapshot) = snapshot {
+                    inner.roll_back(peer, snapshot)?;
+                }
+                return Err(describe(&e));
+            }
+        }
         let contact = inner.contact(peer).ok_or("no such chat")?;
         let message = sealed.record.unwrap_or_default().to_push();
-        match contact.session.push_v2(message).await {
+        let push_res = contact.session.push_v2(message).await;
+        if let Err(ref e) = push_res
+            && e.is_server_refusal()
+            && promoted_from_unsent
+        {
+            if let Some(contact) = inner.contact(peer) {
+                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+            }
+            let _ = inner.save_state().await;
+        }
+        match push_res {
             Ok(_) => {}
             // The chat waits for the sign-in, as a message refused for it does, rather than
             // tries every round, and goes once signed in.
@@ -303,9 +362,11 @@ impl Engine {
                 return Err(describe(&e));
             }
         }
+        let contact = inner.contact(peer).ok_or("no such chat")?;
         // Those told since it was encrypted stay, to go in the next. Persist immediately after
         // clearing `sealed_events` so reload never re-pushes already-sent events.
         let snapshot = contact.snapshot();
+        contact.mark_greeting_confirmed();
         contact.state.sealed_events = None;
         if let (Some(events), Some(told)) = (&mut contact.state.events, &sealed.events) {
             forget_told(events, told);
@@ -394,6 +455,7 @@ impl Inner {
         // If saving fails, the message is forgotten: it never left.
         let snapshot = contact.snapshot();
         let index = contact.next_history_index().map_err(str::to_string)?;
+        contact.mark_index_acked(index);
         // Encrypted as it goes, once its place in the chat is known, see `flush`.
         let record = OutgoingRecord {
             message: None,
@@ -464,13 +526,28 @@ impl Inner {
                     if let Some(contact) = self.contact(peer) {
                         contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                         contact.state.security_alert = SECURITY_ALERT_NONE;
+                        contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
                     }
-                    // H-2: Persist new session BEFORE transmitting!
+                    // H-2: Persist new session and uncertain delivery marker BEFORE transmitting!
                     if let Err(e) = self.save(&[]).await {
                         self.roll_back(peer, snapshot)?;
                         return Err(describe(&e));
                     }
-                    let _ = self.client.send_prepared_initiate_v2(&outgoing).await;
+                    match self.client.send_prepared_initiate_v2(&outgoing).await {
+                        Ok(()) => {
+                            if let Some(contact) = self.contact(peer) {
+                                contact.mark_greeting_confirmed();
+                            }
+                            let _ = self.save_state().await;
+                        }
+                        Err(e) if e.is_server_refusal() => {
+                            if let Some(contact) = self.contact(peer) {
+                                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                            }
+                            let _ = self.save_state().await;
+                        }
+                        Err(_) => {}
+                    }
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
                     self.roll_back(peer, snapshot)?;

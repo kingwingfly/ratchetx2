@@ -44,6 +44,26 @@ pub fn from_hex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Percent-decode a URI component or fragment, pure Rust for native tests.
+pub fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = *bytes.get(i + 1)? as char;
+            let lo = *bytes.get(i + 2)? as char;
+            let val = u8::from_str_radix(&format!("{hi}{lo}"), 16).ok()?;
+            out.push(val);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 /// The first bytes of a key, to tell keys apart at a glance; not enough to verify one.
 pub fn short(key: &PublicKey) -> String {
     let hex = hex(&key[..4]);

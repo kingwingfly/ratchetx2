@@ -136,6 +136,7 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .banner span { flex: 1; min-width: 220px; }
 .banner-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
 .messages { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 4px; }
+.load-earlier { align-self: center; margin-bottom: 8px; }
 .message { max-width: min(560px, 80%); align-self: flex-start; display: flex; flex-direction: column; align-items: flex-start; margin-top: 6px; }
 .message.me { align-self: flex-end; align-items: flex-end; }
 .bubble { padding: 8px 12px; border: 1px solid var(--line); border-radius: 14px 14px 14px 4px; background: var(--raised); white-space: pre-wrap; overflow-wrap: anywhere; }

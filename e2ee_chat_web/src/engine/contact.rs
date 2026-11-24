@@ -10,8 +10,10 @@ use crate::transport::{Connect, Fetch};
 use crate::util::{describe, now, short};
 use crate::vault::{
     CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, HistoryEntry, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
-    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
+    ContactState, GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_LEGACY_UNKNOWN,
+    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, IndexRange,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
+    SECURITY_ALERT_PQ_REQUIRED,
 };
 use crate::{content, preview};
 use session::{ErrorKind, PublicKey, Session, SessionState, proto};
@@ -81,6 +83,98 @@ pub(super) fn accept_contact_request_state(
     Ok(())
 }
 
+/// How [`Engine::delete`](super::Engine::delete) should notify a peer when deleting a chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FarewellMode {
+    /// Suppress farewell completely (unaccepted request, quarantined, or unsent/refused greeting).
+    Suppress,
+    /// Send a farewell without any carried `initial_message` (greeting transmission was uncertain).
+    WithoutInitial,
+    /// Send a normal farewell on an established/confirmed session.
+    Normal,
+}
+
+/// Read-tracking metadata for one history entry currently rendered on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DisplayedEntry {
+    pub(super) index: u64,
+    pub(super) counts_unread: bool,
+    pub(super) clock: Option<u64>,
+}
+
+fn acked_ranges_contain(ranges: &[IndexRange], index: u64) -> bool {
+    let pos = ranges.partition_point(|r| r.end <= index);
+    ranges
+        .get(pos)
+        .is_some_and(|r| r.start <= index && index < r.end)
+}
+
+fn coalesce_acked_ranges(ranges: &mut Vec<IndexRange>) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_by_key(|r| (r.start, r.end));
+    let mut write = 0usize;
+    for read in 1..ranges.len() {
+        let next = ranges[read];
+        if next.start <= ranges[write].end {
+            ranges[write].end = ranges[write].end.max(next.end);
+        } else {
+            write += 1;
+            ranges[write] = next;
+        }
+    }
+    ranges.truncate(write + 1);
+}
+
+pub(super) fn insert_acked_range(ranges: &mut Vec<IndexRange>, start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    if let Some(last) = ranges.last_mut() {
+        if start > last.end {
+            ranges.push(IndexRange { start, end });
+            return;
+        }
+        if start >= last.start {
+            last.end = last.end.max(end);
+            return;
+        }
+    } else {
+        ranges.push(IndexRange { start, end });
+        return;
+    }
+    ranges.push(IndexRange { start, end });
+    coalesce_acked_ranges(ranges);
+}
+
+fn merge_acked_batch(ranges: &mut Vec<IndexRange>, batch: Vec<IndexRange>) {
+    if batch.is_empty() {
+        return;
+    }
+    if ranges.is_empty() {
+        *ranges = batch;
+        return;
+    }
+    // Fast path: the entire sorted batch lies at or after the tail range.
+    if let (Some(last), Some(first)) = (ranges.last_mut(), batch.first())
+        && first.start >= last.start
+    {
+        for range in batch {
+            if let Some(tail) = ranges.last_mut()
+                && range.start <= tail.end
+            {
+                tail.end = tail.end.max(range.end);
+            } else {
+                ranges.push(range);
+            }
+        }
+        return;
+    }
+    ranges.extend(batch);
+    coalesce_acked_ranges(ranges);
+}
+
 impl Contact {
     pub(super) fn replace_session(
         &mut self,
@@ -91,6 +185,9 @@ impl Contact {
             .session
             .accept_replacement_with_policy(incoming, local_pq)?;
         if took_over {
+            // A peer-initiated session took over as the active session, replacing any unconfirmed
+            // local greeting and any superseded fallback farewells on the previous session.
+            self.mark_greeting_confirmed();
             self.state.sealed_events = None;
             self.state.needs_requeue_sealed |= self.state.outbox.iter().any(|o| o.sealed);
         }
@@ -215,6 +312,7 @@ impl Contact {
     /// Record an evicted (undecryptable-aged) message distinctly in history.
     pub(super) fn add_evicted(&mut self) -> Result<(u64, HistoryEntry), &'static str> {
         let index = self.next_history_index()?;
+        self.mark_index_acked(index);
         let place = place_of(0, &self.state);
         self.state.clock = self.state.clock.max(place);
         self.state.peer_last = place;
@@ -243,9 +341,12 @@ impl Contact {
         self.state.clock = self.state.clock.max(place);
         self.state.peer_last = place;
         match &content.kind {
-            Some(Kind::Hello(hello)) => self.state.hello_name = hello.name.clone(),
+            Some(Kind::Hello(hello)) => {
+                self.state.hello_name = hello.name.clone();
+                self.mark_index_acked(index);
+            }
             _ if !open => self.state.unread = self.state.unread.saturating_add(1),
-            _ => {}
+            _ => self.mark_index_acked(index),
         }
         // A message to read, which the peer waits to hear of, by its clock.
         let readable = content.kind.as_ref().is_some_and(Kind::is_readable);
@@ -275,14 +376,107 @@ impl Contact {
         keep_last(&mut events.read);
     }
 
-    /// Count the chat's messages as read, as it is on screen; the peer is told of those it was
-    /// not told of. Returns whether that changed anything.
-    pub(super) fn read_all(&mut self) -> bool {
-        let unseen = std::mem::take(&mut self.state.unseen);
-        let changed = self.state.unread > 0 || !unseen.is_empty();
-        self.state.unread = 0;
-        for clock in unseen {
-            self.tell_read(clock);
+    /// Record that history entry `index` does not require future unread acknowledgment (outgoing,
+    /// greeting, evicted, or already displayed).
+    pub(super) fn mark_index_acked(&mut self, index: u64) {
+        insert_acked_range(&mut self.state.acked_ranges, index, index.saturating_add(1));
+    }
+
+    /// Mark the active session's greeting as confirmed delivered and drop any superseded fallback
+    /// farewells from prior/deleted sessions. Returns `true` if contact state changed.
+    pub(super) fn mark_greeting_confirmed(&mut self) -> bool {
+        let changed = self.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
+            || !self.state.fallback_farewells.is_empty();
+        self.state.greeting_delivery = GREETING_DELIVERY_CONFIRMED;
+        self.state.fallback_farewells.clear();
+        changed
+    }
+
+    /// Whether the active local session still carries an unacknowledged initial message.
+    pub(super) fn has_carried_initial(&self) -> bool {
+        !proto::SessionState::from(self.session.state())
+            .initial_message
+            .is_empty()
+    }
+
+    /// How deleting this contact should handle farewell transmission.
+    pub(super) fn farewell_mode(&self) -> FarewellMode {
+        if self.state.request
+            || self.state.quarantined
+            || self.state.greeting_delivery == GREETING_DELIVERY_UNSENT
+        {
+            FarewellMode::Suppress
+        } else if self.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
+            || (self.state.greeting_delivery == GREETING_DELIVERY_LEGACY_UNKNOWN
+                && self.has_carried_initial())
+        {
+            FarewellMode::WithoutInitial
+        } else {
+            FarewellMode::Normal
+        }
+    }
+
+    /// Idempotently acknowledge `entries` that are actually displayed on screen, keyed by their
+    /// history indices in [`ContactState::acked_ranges`].
+    ///
+    /// - Entries whose indices were already acknowledged are skipped so reopening or reloading the
+    ///   same partial page never double-decrements `unread` (even for zero-clock messages).
+    /// - Newly acknowledged unread entries decrement `unread` independently of the `EVENTS_KEPT`
+    ///   cap on `unseen`, while queuing read receipts strictly for displayed clocks present in
+    ///   `unseen`.
+    /// - `unread` is never decremented below `unseen.len()`, preventing staged/undisplayed entries
+    ///   from losing their unread badge.
+    pub(super) fn acknowledge_entries(&mut self, entries: &[DisplayedEntry]) -> bool {
+        let had_unread = self.state.unread > 0 || !self.state.unseen.is_empty();
+        let mut changed = false;
+        let mut acked_unread = 0u32;
+        let mut new_ranges: Vec<IndexRange> = Vec::new();
+        for entry in entries {
+            if acked_ranges_contain(&self.state.acked_ranges, entry.index)
+                || acked_ranges_contain(&new_ranges, entry.index)
+            {
+                continue;
+            }
+            insert_acked_range(&mut new_ranges, entry.index, entry.index.saturating_add(1));
+            if entry.counts_unread {
+                acked_unread = acked_unread.saturating_add(1);
+            }
+            if let Some(clock) = entry.clock
+                && let Some(pos) = self.state.unseen.iter().rposition(|&c| c == clock)
+            {
+                self.state.unseen.remove(pos);
+                self.tell_read(clock);
+                changed = true;
+            }
+        }
+        let any_newly_acked = !new_ranges.is_empty();
+        if any_newly_acked {
+            merge_acked_batch(&mut self.state.acked_ranges, new_ranges);
+        }
+        if had_unread && acked_unread > 0 {
+            let min_unread = u32::try_from(self.state.unseen.len()).unwrap_or(u32::MAX);
+            let next_unread = self
+                .state
+                .unread
+                .saturating_sub(acked_unread)
+                .max(min_unread);
+            if next_unread != self.state.unread {
+                self.state.unread = next_unread;
+                changed = true;
+            }
+        }
+        if self.state.unread > 0
+            && self.state.unseen.is_empty()
+            && self.state.history_len > 0
+            && self.state.acked_ranges.len() == 1
+            && self.state.acked_ranges[0].start == 0
+            && self.state.acked_ranges[0].end >= self.state.history_len
+        {
+            self.state.unread = 0;
+            changed = true;
+        }
+        if had_unread && any_newly_acked {
+            changed = true;
         }
         changed
     }

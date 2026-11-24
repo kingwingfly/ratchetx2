@@ -43,6 +43,8 @@ tar = { version = "0.4", default-features = false }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+    "AbortController",
+    "AbortSignal",
     "BinaryType",
     "Blob",
     "BlobPropertyBag",
@@ -71,13 +73,16 @@ web-sys = { version = "0.3", features = [
     "IntersectionObserverEntry",
     "IntersectionObserverInit",
     "Location",
+    "MediaQueryList",
     "MessageEvent",
     "MessagePort",
     "MutationObserver",
     "MutationObserverInit",
     "Navigator",
     "NodeList",
+    "PageTransitionEvent",
     "Performance",
+    "PopStateEvent",
     "ProgressEvent",
     "Range",
     "ServiceWorker",

@@ -11,7 +11,7 @@ use crate::{
     preview::{self, DiffLine, Kind},
     search::Search,
     state::{Attachment, RemoteFile, Streamed},
-    util::{js_error, size, size_u64},
+    util::{js_error, percent_decode, size, size_u64},
     workers,
 };
 
@@ -19,7 +19,9 @@ use super::{
     Toast,
     common::act,
     engine,
-    media::{blob_url, image_url, release, stop_media},
+    media::{
+        begin_preview_request, blob_url, cancel_pending_previews, image_url, release, stop_media,
+    },
     pdf::PdfView,
     ui,
 };
@@ -46,6 +48,14 @@ pub(super) fn Viewer() -> impl IntoView {
         })
     };
     let close = move || {
+        // Only invalidate pending previews when closing an active viewer/opening/stream so a
+        // queued native `close` event firing after a new file read starts cannot cancel it.
+        let was_open = ui.viewer.with_untracked(Option::is_some)
+            || ui.opening.with_untracked(Option::is_some)
+            || ui.streaming.with_untracked(Option::is_some);
+        if was_open {
+            cancel_pending_previews();
+        }
         ui.viewer.set(None);
         ui.opening.set(None);
         ui.streaming.set(None);
@@ -160,8 +170,20 @@ pub(super) fn Viewer() -> impl IntoView {
             })
             .unwrap_or_default()
     };
+    let on_cancel = move |_: ev::Event| {
+        // Invalidate pending previews immediately when native cancellation (e.g. Escape) begins,
+        // before the queued `close` event runs, so an in-flight download finishing in that gap
+        // cannot reopen the viewer and make `on_close` skip cleanup.
+        close();
+    };
+    let on_close = move |_| {
+        // Ignore stale queued native `close` events if the viewer has already reopened.
+        if dialog.get_untracked().is_some_and(|d| !d.open()) {
+            close();
+        }
+    };
     view! {
-        <dialog class="viewer" node_ref=dialog on:close=move |_| close()>
+        <dialog class="viewer" node_ref=dialog on:cancel=on_cancel on:close=on_close>
             <div class="viewer-bar">
                 <span>{title}</span>
                 <div>
@@ -234,15 +256,22 @@ fn StreamedView(streamed: Streamed) -> impl IntoView {
     let unplayable = {
         let (url, remote) = (streamed.url.clone(), streamed.remote.clone());
         move |_: ev::ErrorEvent| {
-            // Unless the viewer went on meanwhile.
+            // Unless the viewer went on or the chat closed meanwhile.
             let shown = ui()
                 .streaming
                 .with_untracked(|shown| shown.as_ref().is_some_and(|shown| shown.url == url));
-            if shown {
+            if shown && ui().open.get_untracked() == Some(remote.peer) {
                 let remote = remote.clone();
+                let token = begin_preview_request();
                 act(async move {
                     engine()
-                        .open_attachment(remote.peer, remote.index, remote.pointer, remote.clock)
+                        .open_attachment(
+                            token,
+                            remote.peer,
+                            remote.index,
+                            remote.pointer,
+                            remote.clock,
+                        )
                         .await
                 });
             }
@@ -445,7 +474,20 @@ fn CodeView(text: String, language: Option<&'static str>) -> impl IntoView {
     .into_any()
 }
 
-/// Highlight fenced code and draw diagrams inside a sanitized Markdown document or slide.
+/// Resolve a same-document `#fragment` href into `(raw, percent_decoded)` target ID candidates,
+/// matching native HTML fragment lookup without mutating `location.hash`.
+pub(super) fn preview_fragment_candidates(href: &str) -> Option<(String, Option<String>)> {
+    let raw = href.strip_prefix('#')?;
+    if raw.is_empty() {
+        return Some((String::new(), None));
+    }
+    let decoded = percent_decode(raw).filter(|decoded| decoded != raw);
+    Some((raw.to_string(), decoded))
+}
+
+/// Highlight fenced code and draw diagrams inside a sanitized Markdown document or slide, and
+/// scroll/focus same-document `#…` anchor links (such as footnotes) inside the preview without
+/// mutating browser history or `location.hash`.
 #[component]
 fn Enhanced(children: Children) -> impl IntoView {
     let node = NodeRef::<html::Div>::new();
@@ -454,8 +496,52 @@ fn Enhanced(children: Children) -> impl IntoView {
             enhance(&element);
         }
     });
+    let on_click = move |event: ev::MouseEvent| {
+        let Some(target) = event
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        let Ok(Some(anchor)) = target.closest("a[href]") else {
+            return;
+        };
+        let Some(href) = anchor.get_attribute("href") else {
+            return;
+        };
+        let Some((raw_id, decoded_id)) = preview_fragment_candidates(&href) else {
+            return;
+        };
+        event.prevent_default();
+        if raw_id.is_empty() {
+            return;
+        }
+        if let Some(container) = node.get_untracked() {
+            let candidates = select(&container, "[id]");
+            let matched = candidates
+                .iter()
+                .find(|el| el.get_attribute("id").as_deref() == Some(raw_id.as_str()))
+                .or_else(|| {
+                    let decoded = decoded_id.as_deref()?;
+                    candidates
+                        .iter()
+                        .find(|el| el.get_attribute("id").as_deref() == Some(decoded))
+                });
+            if let Some(element) = matched {
+                element.scroll_into_view();
+                // Move keyboard focus to the target (matching native fragment navigation) without
+                // altering Tab order or mutating the URL.
+                if let Ok(html_el) = element.clone().dyn_into::<web_sys::HtmlElement>() {
+                    if !html_el.has_attribute("tabindex") {
+                        let _ = html_el.set_attribute("tabindex", "-1");
+                    }
+                    let _ = html_el.focus();
+                }
+            }
+        }
+    };
     view! {
-        <div class="enhanced" node_ref=node>
+        <div class="enhanced" node_ref=node on:click=on_click>
             {children()}
         </div>
     }

@@ -1,10 +1,11 @@
 use leptos::{ev, html, prelude::*};
 use session::PublicKey;
+use wasm_bindgen::JsCast;
 
 use crate::{
     icon::{Icon, icon},
     state::{
-        Body, ClassicalPrompt, ContactView, Delivery, Dialog, MessageView, SecurityAlert,
+        Body, ClassicalPrompt, ContactView, Delivery, Dialog, MessageRow, SecurityAlert,
         UploadState, UploadView,
     },
     util::{clock, short},
@@ -422,7 +423,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                     </button>
                 </div>
             </Show>
-            <Messages label=Signal::derive(label) />
+            <Messages peer label=Signal::derive(label) />
             <Uploads peer />
             <Composer
                 peer
@@ -436,29 +437,97 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
 /// Pixels from the bottom of a chat within which it still follows the latest message.
 const FOLLOW_SLACK: i32 = 40;
 
+/// Snapshot of the topmost visible message row before prepending earlier history so the scroll
+/// position can be restored after the new rows render (even at `scrollTop == 0` or on browsers
+/// without CSS scroll anchoring).
+fn capture_visible_anchor(list: &web_sys::Element) -> Option<(String, f64)> {
+    let list_top = list.get_bounding_client_rect().top();
+    let nodes = list.query_selector_all("[data-index]").ok()?;
+    for i in 0..nodes.length() {
+        let Some(node) = nodes.get(i) else {
+            continue;
+        };
+        let Ok(el) = node.dyn_into::<web_sys::Element>() else {
+            continue;
+        };
+        let rect = el.get_bounding_client_rect();
+        if rect.bottom() > list_top
+            && let Some(index) = el.get_attribute("data-index")
+        {
+            return Some((index, rect.top() - list_top));
+        }
+    }
+    None
+}
+
+/// Restore the previously visible message row's offset relative to the scroll viewport after
+/// prepending an earlier history page.
+fn restore_visible_anchor(list: &web_sys::Element, anchor: &(String, f64)) {
+    let selector = format!("[data-index=\"{}\"]", anchor.0);
+    if let Ok(Some(el)) = list.query_selector(&selector) {
+        let list_top = list.get_bounding_client_rect().top();
+        let current_offset = el.get_bounding_client_rect().top() - list_top;
+        let delta = (current_offset - anchor.1).round() as i32;
+        if delta != 0 {
+            list.set_scroll_top(list.scroll_top() + delta);
+        }
+    }
+}
+
 #[component]
-fn Messages(label: Signal<String>) -> impl IntoView {
+fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
     let ui = ui();
     let list = NodeRef::<html::Div>::new();
+    let loading_earlier = RwSignal::new(false);
     // Follow the latest message while at the bottom, so that what changes, as a sync goes,
     // does not move the history away from the user reading it; and on sending one.
     let follow = StoredValue::new(true);
     let newest = StoredValue::new(None::<u64>);
+    let oldest = StoredValue::new(None::<u64>);
+    // Anchor row refreshed on any user scroll while `load_earlier` awaits the engine mutex or
+    // IndexedDB; consumed immediately inside the `ui.messages` effect when earlier rows prepend so
+    // scroll position is restored before `inner.save_state().await` yields and before any scroll
+    // event can overwrite the anchor.
+    let pending_anchor = StoredValue::new(None::<(String, f64)>);
+    let awaiting_earlier = StoredValue::new(false);
     Effect::new(move || {
-        let sent = ui.messages.with(|messages| {
-            let last = messages.iter().max_by_key(|message| message.index)?;
-            let new = newest.get_value().is_some_and(|newest| last.index > newest);
-            newest.set_value(Some(last.index));
-            Some(new && last.outgoing)
+        let (sent, prepended) = ui.messages.with(|messages| {
+            let mut min_idx: Option<u64> = None;
+            let mut max_msg: Option<(u64, bool)> = None;
+            for message in messages {
+                min_idx = Some(min_idx.map_or(message.index, |m| m.min(message.index)));
+                if max_msg.is_none_or(|(idx, _)| message.index > idx) {
+                    max_msg = Some((message.index, message.outgoing));
+                }
+            }
+            let sent = max_msg.map(|(idx, outgoing)| {
+                let new = newest.get_value().is_some_and(|prev| idx > prev);
+                newest.set_value(Some(idx));
+                new && outgoing
+            });
+            let prepended = min_idx.is_some_and(|idx| {
+                let grew_older = oldest.get_value().is_some_and(|prev| idx < prev);
+                oldest.set_value(Some(idx));
+                grew_older
+            });
+            (sent, prepended)
         });
         if sent == Some(true) {
             follow.set_value(true);
         }
+        let restore_anchor = if prepended && awaiting_earlier.get_value() {
+            awaiting_earlier.set_value(false);
+            pending_anchor.try_update_value(Option::take).flatten()
+        } else {
+            None
+        };
         if let Some(list) = list.get() {
             // Unless the chat went meanwhile.
             request_animation_frame(move || {
                 if follow.try_get_value() == Some(true) {
                     list.set_scroll_top(list.scroll_height());
+                } else if let Some(anchor) = restore_anchor {
+                    restore_visible_anchor(&list, &anchor);
                 }
             });
         }
@@ -467,10 +536,49 @@ fn Messages(label: Signal<String>) -> impl IntoView {
         if let Some(list) = list.try_get_untracked().flatten() {
             let below = list.scroll_height() - list.scroll_top() - list.client_height();
             follow.try_set_value(below < FOLLOW_SLACK);
+            if awaiting_earlier.try_get_value() == Some(true) {
+                pending_anchor.try_set_value(capture_visible_anchor(&list));
+            }
         }
     };
     view! {
         <div class="messages" node_ref=list aria-live="polite" on:scroll=scrolled>
+            <Show when=move || ui.has_older_messages.get()>
+                <button
+                    type="button"
+                    class="btn small load-earlier"
+                    disabled=move || loading_earlier.get()
+                    on:click=move |_| {
+                        follow.set_value(false);
+                        let initial_anchor = list
+                            .try_get_untracked()
+                            .flatten()
+                            .and_then(|el| capture_visible_anchor(&el));
+                        awaiting_earlier.set_value(initial_anchor.is_some());
+                        pending_anchor.set_value(initial_anchor);
+                        act_while(loading_earlier, async move {
+                            let result = engine().load_earlier(peer).await;
+                            // Only clean up when no older rows were prepended or an error
+                            // occurred; when rows WERE prepended (`Ok(true)`), leave the anchor
+                            // intact so `Messages`'s microtask `Effect` consumes and restores it
+                            // (including when `load_earlier` returns without awaiting `save_state`).
+                            if !matches!(result, Ok(true)) {
+                                awaiting_earlier.try_set_value(false);
+                                let _ = pending_anchor.try_update_value(Option::take);
+                            }
+                            result.map(|_| ())
+                        });
+                    }
+                >
+                    {move || {
+                        if loading_earlier.get() {
+                            "Loading earlier messages…"
+                        } else {
+                            "Load earlier messages"
+                        }
+                    }}
+                </button>
+            </Show>
             <For
                 each=move || ui.messages.get()
                 key=|message| message.index
@@ -482,13 +590,15 @@ fn Messages(label: Signal<String>) -> impl IntoView {
 
 /// A message, as a bubble, an image, a file or a note.
 /// The notes name the peer by `label`, which changes once a request is accepted.
-/// Delivery ticks and held-attachment pointer upgrades update reactively without remounting
-/// active `<InlineMedia>` players.
-fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
+/// Delivery ticks and held-attachment pointer upgrades update via per-row reactive signals in O(1)
+/// without rescanning `ui.messages` or remounting active `<InlineMedia>` players.
+fn message_item(message: MessageRow, label: Signal<String>) -> AnyView {
     let ui = ui();
     let index = message.index;
     let outgoing = message.outgoing;
     let initial_delivery = message.delivery;
+    let delivery_signal = message.delivery_signal;
+    let remote_body_signal = message.remote_body_signal;
     let time = clock(message.at);
     let content = match message.body {
         Body::Text(text) => view! { <div class="bubble">{text}</div> }.into_any(),
@@ -500,22 +610,15 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
                 None => ().into_any(),
             },
         },
-        // Remote attachments track body updates via a fine-grained Memo so held attachments
+        // Remote attachments track body updates via their per-row signal so held attachments
         // (empty pointer before sign-in) transition seamlessly to live cards/inline media once
         // `start_waiting` populates their pointer, while ordinary delivery ticks never remount them.
         Body::Remote(_) => {
             let initial_body = message.body;
-            let body = Memo::new(move |_| {
-                ui.messages.with(|messages| {
-                    messages
-                        .iter()
-                        .find(|m| m.index == index)
-                        .map(|m| m.body.clone())
-                        .unwrap_or_else(|| initial_body.clone())
-                })
-            });
             (move || {
-                let current = body.get();
+                let current = remote_body_signal
+                    .and_then(|signal| signal.try_get())
+                    .unwrap_or_else(|| initial_body.clone());
                 match inline_media(&current) {
                     Some((source, sort)) => view! { <InlineMedia source sort /> }.into_any(),
                     None => match Source::of(&current) {
@@ -534,11 +637,11 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
                     format!("{} started this chat, as “{name}” · {time}", label.get())
                 }
             };
-            return view! { <div class="note">{note}</div> }.into_any();
+            return view! { <div class="note" data-index=index>{note}</div> }.into_any();
         }
         Body::Deleted => {
             let note = move || format!("{} deleted this chat · {time}", label.get());
-            return view! { <div class="note">{note}</div> }.into_any();
+            return view! { <div class="note" data-index=index>{note}</div> }.into_any();
         }
         Body::Evicted => {
             let note = move || {
@@ -547,7 +650,7 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
                     label.get()
                 )
             };
-            return view! { <div class="note evicted">{note}</div> }.into_any();
+            return view! { <div class="note evicted" data-index=index>{note}</div> }.into_any();
         }
         Body::Unknown => {
             let note = move || {
@@ -556,23 +659,19 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
                     label.get()
                 )
             };
-            return view! { <div class="note">{note}</div> }.into_any();
+            return view! { <div class="note" data-index=index>{note}</div> }.into_any();
         }
     };
-    let delivery = Memo::new(move |_| {
-        ui.messages.with(|messages| {
-            messages
-                .iter()
-                .find(|m| m.index == index)
-                .map(|m| m.delivery)
-                .unwrap_or(initial_delivery)
-        })
-    });
+    let delivery = move || {
+        delivery_signal
+            .and_then(|signal| signal.try_get())
+            .unwrap_or(initial_delivery)
+    };
     // How far it got, right of its time, as Telegram shows it: a clock while it waits, one tick
     // once the server has it, two once the peer read it, and three once it downloaded its
     // attachment; what that says, for its tooltip and screen readers; and whether the peer read
     // it.
-    let status = move || match delivery.get() {
+    let status = move || match delivery() {
         Delivery::Received => None,
         Delivery::Pending => Some((Icon::Pending, "waiting to be sent", false)),
         Delivery::Failed => Some((Icon::Failed, "could not be sent", false)),
@@ -608,9 +707,9 @@ fn message_item(message: MessageView, label: Signal<String>) -> AnyView {
         }
     });
     view! {
-        <div class="message" class:me=outgoing>
+        <div class="message" class:me=outgoing data-index=index>
             {content}
-            <span class="meta" class:failed=move || delivery.get() == Delivery::Failed>
+            <span class="meta" class:failed=move || delivery() == Delivery::Failed>
                 {held}
                 {time}
                 {move || {
