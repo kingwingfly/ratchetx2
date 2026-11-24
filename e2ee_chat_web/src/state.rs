@@ -220,18 +220,58 @@ pub struct MessageView {
     pub delivery: Delivery,
 }
 
+/// Rendered message row carrying per-row reactive signals for mutable fields (`delivery` on
+/// outgoing messages and `body` on remote attachments), avoiding O(N²) rescans of `Ui::messages`
+/// as older history pages accumulate.
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    pub index: u64,
+    pub place: u64,
+    pub outgoing: bool,
+    pub at: u64,
+    pub body: Body,
+    pub delivery: Delivery,
+    pub delivery_signal: Option<RwSignal<Delivery>>,
+    pub remote_body_signal: Option<RwSignal<Body>>,
+}
+
+impl MessageRow {
+    pub fn from_view(view: MessageView) -> Self {
+        let delivery_signal = view.outgoing.then(|| RwSignal::new(view.delivery));
+        let remote_body_signal =
+            matches!(view.body, Body::Remote(_)).then(|| RwSignal::new(view.body.clone()));
+        Self {
+            index: view.index,
+            place: view.place,
+            outgoing: view.outgoing,
+            at: view.at,
+            body: view.body,
+            delivery: view.delivery,
+            delivery_signal,
+            remote_body_signal,
+        }
+    }
+}
+
+fn order_key(place: u64, outgoing: bool, mine_first: bool, index: u64) -> (bool, u64, bool, u64) {
+    (place == 0, place, outgoing != mine_first, index)
+}
+
 /// Put `messages`, of the chat between `me` and `peer`, in its order, the same on both sides: by
 /// place, then by sender, the one with the lower identity key first. One with no place yet, as
 /// it waits to be pushed, goes last, in the order it was sent.
 pub fn order(messages: &mut [MessageView], me: &PublicKey, peer: &PublicKey) {
     let mine_first = me < peer;
     messages.sort_by_key(|message| {
-        (
-            message.place == 0,
-            message.place,
-            message.outgoing != mine_first,
-            message.index,
-        )
+        order_key(message.place, message.outgoing, mine_first, message.index)
+    });
+}
+
+/// Put rendered [`MessageRow`]s in the exact same display order as [`order`].
+pub fn order_rows(messages: &mut [MessageRow], me: &PublicKey, peer: &PublicKey) {
+    let mine_first = me < peer;
+    messages.sort_by_key(|message| {
+        order_key(message.place, message.outgoing, mine_first, message.index)
     });
 }
 
@@ -340,6 +380,8 @@ pub struct RemoteFile {
 /// An attachment being opened: fetched, unless kept here, and decrypted, a chunk at a time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Opening {
+    /// Monotonic preview-request token binding progress and completion strictly to this request.
+    pub token: u64,
     pub id: [u8; 16],
     pub name: String,
     pub size: u64,
@@ -468,13 +510,16 @@ pub enum SignInSuccessAction {
     /// Proactive sign-in interrupted an invitation before submission: reopen `NewChat` prefilled.
     ReopenNewChat(Dialog),
     /// User submitted `NewChat` before signing in: automatically resume starting the chat.
-    AutoStartChat(PendingNewChat),
+    AutoStartChat { id: u64, pending: PendingNewChat },
 }
 
 /// Pure state machine coordinating server sign-in prompts with invitation / `NewChat` drafts so
 /// signing in or cancelling never loses a parsed invitation link or typed inputs.
 #[derive(Debug, Default)]
 pub struct SignInFlow {
+    /// Monotonic identifier assigned to each submitted or preserved startup draft so a stale
+    /// completion or error can never clobber a newer draft.
+    next_submission_id: u64,
     /// Whether the user put off signing in, so background sync refusals do not interrupt again
     /// until the user explicitly initiates an action or signs in.
     declined_sign_in: bool,
@@ -482,12 +527,17 @@ pub struct SignInFlow {
     active_new_chat: Option<PendingNewChat>,
     /// Draft of an in-flight `NewChat` submission, so concurrent transport `403` hooks preserve
     /// `auto_start: true` and `allow_classical`.
-    submitting_new_chat: Option<PendingNewChat>,
+    submitting_new_chat: Option<(u64, PendingNewChat)>,
     /// Preserved invitation / `NewChat` draft waiting behind `Dialog::SignIn`.
-    pending_new_chat: Option<PendingNewChat>,
+    pending_new_chat: Option<(u64, PendingNewChat)>,
 }
 
 impl SignInFlow {
+    fn next_id(&mut self) -> u64 {
+        self.next_submission_id = self.next_submission_id.wrapping_add(1).max(1);
+        self.next_submission_id
+    }
+
     /// Decide the initial dialog when the vault unlocks with an invitation link.
     ///
     /// `signed_in` is `Some(false)` when `/auth` confirmed the browser is not signed in,
@@ -502,7 +552,8 @@ impl SignInFlow {
             && signed_in == Some(false)
             && let Some(pending) = PendingNewChat::from_dialog(&dialog, false, false)
         {
-            self.pending_new_chat = Some(pending);
+            let id = self.next_id();
+            self.pending_new_chat = Some((id, pending));
             return Dialog::SignIn;
         }
         dialog
@@ -539,15 +590,53 @@ impl SignInFlow {
         self.active_new_chat = None;
     }
 
-    /// Mark that the user submitted `NewChat` (`Start` or `Allow classical`).
-    pub fn begin_new_chat_submit(&mut self, mut draft: PendingNewChat) {
+    /// Mark that the user submitted `NewChat` (`Start` or `Allow classical`), returning its
+    /// unique submission ID.
+    pub fn begin_new_chat_submit(&mut self, mut draft: PendingNewChat) -> u64 {
+        let id = self.next_id();
         draft.auto_start = true;
-        self.submitting_new_chat = Some(draft);
+        self.submitting_new_chat = Some((id, draft));
+        id
     }
 
-    /// Clear the in-flight `NewChat` submission marker.
-    pub fn end_new_chat_submit(&mut self) {
-        self.submitting_new_chat = None;
+    /// Clear the in-flight `NewChat` submission marker only if it still belongs to `submission_id`.
+    pub fn end_new_chat_submit(&mut self, submission_id: u64) {
+        if self
+            .submitting_new_chat
+            .as_ref()
+            .is_some_and(|(id, _)| *id == submission_id)
+        {
+            self.submitting_new_chat = None;
+        }
+    }
+
+    /// Cancel a specific startup submission without disturbing any newer draft or submission.
+    pub fn cancel_submission(&mut self, submission_id: u64) {
+        self.end_new_chat_submit(submission_id);
+        if self
+            .pending_new_chat
+            .as_ref()
+            .is_some_and(|(id, _)| *id == submission_id)
+        {
+            self.pending_new_chat = None;
+        }
+    }
+
+    /// Cancel whichever in-flight `NewChat` submission or pending `SignIn` draft is currently
+    /// active, clearing both auto-start and non-auto-start pending drafts while returning all
+    /// cancelled auto-start submission IDs so the engine can suppress late network hooks.
+    pub fn cancel_active_submissions(&mut self) -> Vec<u64> {
+        let mut cancelled = Vec::new();
+        if let Some((id, _)) = self.submitting_new_chat.take() {
+            cancelled.push(id);
+        }
+        if let Some((id, pending)) = self.pending_new_chat.take()
+            && pending.auto_start
+            && !cancelled.contains(&id)
+        {
+            cancelled.push(id);
+        }
+        cancelled
     }
 
     /// Handle a server sign-in prompt (from background sync/transport when `background` is `true`,
@@ -576,13 +665,15 @@ impl SignInFlow {
                 None
             }
             Some(dialog @ Dialog::NewChat { .. }) => {
-                let preserved = self
-                    .submitting_new_chat
+                if let Some(submitting) = self.submitting_new_chat.clone() {
+                    self.pending_new_chat = Some(submitting);
+                } else if let Some(draft) = self
+                    .active_new_chat
                     .clone()
-                    .or_else(|| self.active_new_chat.clone())
-                    .or_else(|| PendingNewChat::from_dialog(dialog, false, false));
-                if let Some(draft) = preserved {
-                    self.pending_new_chat = Some(draft);
+                    .or_else(|| PendingNewChat::from_dialog(dialog, false, false))
+                {
+                    let id = self.next_id();
+                    self.pending_new_chat = Some((id, draft));
                 }
                 Some(Dialog::SignIn)
             }
@@ -599,24 +690,33 @@ impl SignInFlow {
     /// Handle `start_chat` returning `SignInRequired` after the user explicitly submitted
     /// `NewChat`: always preserve the draft with `auto_start: true` and present `SignIn`, even if
     /// the user had previously declined sign-in.
-    pub fn on_start_chat_sign_in_required(&mut self, mut draft: PendingNewChat) -> Dialog {
-        self.submitting_new_chat = None;
+    pub fn on_start_chat_sign_in_required(
+        &mut self,
+        submission_id: u64,
+        mut draft: PendingNewChat,
+    ) -> Dialog {
+        self.end_new_chat_submit(submission_id);
         draft.auto_start = true;
-        self.pending_new_chat = Some(draft);
+        self.pending_new_chat = Some((submission_id, draft));
         Dialog::SignIn
     }
 
-    /// Clear any pending `NewChat` draft when the chat was already created and persisted, and only
-    /// sending its initial greeting hit `SignInRequired`.
-    pub fn on_chat_created_greeting_needs_sign_in(&mut self) -> Dialog {
-        self.submitting_new_chat = None;
-        self.pending_new_chat = None;
+    /// Clear any pending `NewChat` draft belonging to `submission_id` when the chat was already
+    /// created and persisted, and only sending its initial greeting hit `SignInRequired`.
+    pub fn on_chat_created_greeting_needs_sign_in(&mut self, submission_id: u64) -> Dialog {
+        self.cancel_submission(submission_id);
         Dialog::SignIn
     }
 
     /// Clear the declined flag once sign-in succeeds.
     pub fn reset_declined(&mut self) {
         self.declined_sign_in = false;
+    }
+
+    /// Suppress subsequent background sign-in prompts without restoring any cancelled draft
+    /// (e.g. when browser Back dismisses `Dialog::SignIn`).
+    pub fn decline_background_prompts(&mut self) {
+        self.declined_sign_in = true;
     }
 
     /// Decide the next action after sign-in succeeds.
@@ -627,32 +727,42 @@ impl SignInFlow {
         self.declined_sign_in = false;
         match &self.pending_new_chat {
             None => SignInSuccessAction::Close,
-            Some(pending) if pending.auto_start => {
-                SignInSuccessAction::AutoStartChat(pending.clone())
-            }
+            Some((id, pending)) if pending.auto_start => SignInSuccessAction::AutoStartChat {
+                id: *id,
+                pending: pending.clone(),
+            },
             Some(_) => {
-                let pending = self.pending_new_chat.take().expect("checked Some");
+                let (_, pending) = self.pending_new_chat.take().expect("checked Some");
                 SignInSuccessAction::ReopenNewChat(pending.into_dialog())
             }
         }
     }
 
-    /// Complete an `AutoStartChat` attempt after sign-in.
+    /// Complete an `AutoStartChat` attempt after sign-in, scoped strictly to `submission_id` so a
+    /// stale error or completion can never discard a newer pending draft or close a newer dialog.
     ///
-    /// - `succeeded == true`: clears `pending_new_chat` and returns `(true, None)` if it was still
-    ///   pending (so the caller should close `SignInDialog`), or `(false, None)` if it had already
-    ///   been cleared (e.g. greeting hit `SignInRequired` after persisting the chat).
+    /// - `succeeded == true`: clears `pending_new_chat` if it still matches `submission_id` and
+    ///   returns `(true, None)` (so the caller closes `SignInDialog`), or `(false, None)` if it
+    ///   was already cleared or replaced.
     /// - `still_needs_sign_in == true`: preserves `pending_new_chat` and keeps `SignInDialog`.
     /// - Otherwise (e.g. `ClassicalApprovalRequired` or another error): takes `pending_new_chat`
-    ///   and returns `(false, Some(Dialog::NewChat { .. }))` to reopen `NewChat` prefilled.
+    ///   only if it still matches `submission_id` and returns `(false, Some(Dialog::NewChat))`.
     pub fn on_auto_start_finished(
         &mut self,
+        submission_id: u64,
         succeeded: bool,
         still_needs_sign_in: bool,
     ) -> (bool, Option<Dialog>) {
+        if !self
+            .pending_new_chat
+            .as_ref()
+            .is_some_and(|(id, _)| *id == submission_id)
+        {
+            return (false, None);
+        }
         if succeeded {
-            let had_pending = self.pending_new_chat.take().is_some();
-            return (had_pending, None);
+            self.pending_new_chat = None;
+            return (true, None);
         }
         if still_needs_sign_in {
             return (false, None);
@@ -660,19 +770,24 @@ impl SignInFlow {
         let reopened = self
             .pending_new_chat
             .take()
-            .map(PendingNewChat::into_dialog);
+            .map(|(_, pending)| pending.into_dialog());
         (false, reopened)
     }
 
     /// Handle cancelling / dismissing `SignInDialog` ("Not now" or Escape).
     ///
-    /// Marks sign-in as declined for background syncs and returns `Some(Dialog::NewChat { .. })`
-    /// if a preserved invitation/draft should be restored immediately.
-    pub fn on_dismiss_sign_in(&mut self) -> Option<Dialog> {
+    /// Marks sign-in as declined for background syncs and returns `(cancelled_auto_start_id,
+    /// restored_dialog)` where `restored_dialog` is `Some(Dialog::NewChat { .. })` if a preserved
+    /// invitation/draft should be restored immediately.
+    pub fn on_dismiss_sign_in(&mut self) -> (Option<u64>, Option<Dialog>) {
         self.declined_sign_in = true;
-        self.pending_new_chat
-            .take()
-            .map(PendingNewChat::into_dialog)
+        match self.pending_new_chat.take() {
+            Some((id, pending)) => {
+                let cancelled = pending.auto_start.then_some(id);
+                (cancelled, Some(pending.into_dialog()))
+            }
+            None => (None, None),
+        }
     }
 
     /// Hint metadata for `SignInDialog`: `Some((auto_start, has_key))` when a `NewChat` draft is
@@ -680,7 +795,14 @@ impl SignInFlow {
     pub fn pending_new_chat_hint(&self) -> Option<(bool, bool)> {
         self.pending_new_chat
             .as_ref()
-            .map(|pending| (pending.auto_start, !pending.key.trim().is_empty()))
+            .map(|(_, pending)| (pending.auto_start, !pending.key.trim().is_empty()))
+    }
+
+    /// Submission ID of a pending `auto_start: true` chat waiting behind `SignInDialog`, if any.
+    pub fn pending_auto_start_id(&self) -> Option<u64> {
+        self.pending_new_chat
+            .as_ref()
+            .and_then(|(id, pending)| pending.auto_start.then_some(*id))
     }
 }
 
@@ -752,7 +874,12 @@ pub struct Ui {
     /// The chat on screen, if any.
     pub open: RwSignal<Option<PublicKey>>,
     /// The messages of the chat on screen.
-    pub messages: RwSignal<Vec<MessageView>>,
+    pub messages: RwSignal<Vec<MessageRow>>,
+    /// Whether the currently open chat has earlier history pages before the oldest displayed entry.
+    pub has_older_messages: RwSignal<bool>,
+    /// Monotonic deletion notification `(seq, peer)` so browser history invalidates deleted-chat
+    /// tokens even when the user navigated away before the vault deletion committed.
+    pub deleted_peer: RwSignal<Option<(u64, PublicKey)>>,
     /// What happened, and when, for the activity list.
     pub log: RwSignal<Vec<(u64, String)>>,
     /// A message for the notice, and its number, so that a newer one is not hidden early.
@@ -794,6 +921,8 @@ impl Ui {
             isolated_contacts: RwSignal::new(vec![]),
             open: RwSignal::new(None),
             messages: RwSignal::new(vec![]),
+            has_older_messages: RwSignal::new(false),
+            deleted_peer: RwSignal::new(None),
             log: RwSignal::new(vec![]),
             notice: RwSignal::new(None),
             update_required: RwSignal::new(None),
@@ -976,7 +1105,7 @@ mod tests {
             flow.on_unlock_with_invitation(invite.clone(), true, Some(false)),
             Dialog::SignIn
         );
-        assert_eq!(flow.on_dismiss_sign_in(), Some(invite.clone()));
+        assert_eq!(flow.on_dismiss_sign_in(), (None, Some(invite.clone())));
         assert_eq!(flow.pending_new_chat_hint(), None);
         assert_eq!(flow.on_ask_sign_in(Some(&invite), true, true), None);
 
@@ -1051,13 +1180,13 @@ mod tests {
         // Even after dismissing an earlier proactive sign-in prompt, clicking Start still opens
         // SignInDialog and preserves the draft with `auto_start: true`.
         let mut flow = SignInFlow::default();
-        assert_eq!(flow.on_dismiss_sign_in(), None);
-        flow.begin_new_chat_submit(draft.clone());
+        assert_eq!(flow.on_dismiss_sign_in(), (None, None));
+        let submit_id = flow.begin_new_chat_submit(draft.clone());
 
         // If `transport` fires `refused_for_sign_in` concurrently while `start_chat` is in flight,
         // `auto_start: true` is preserved (not downgraded to `false`).
         let mut flow_race = SignInFlow::default();
-        flow_race.begin_new_chat_submit(PendingNewChat {
+        let race_id = flow_race.begin_new_chat_submit(PendingNewChat {
             allow_classical: true,
             ..draft.clone()
         });
@@ -1068,16 +1197,19 @@ mod tests {
         assert_eq!(flow_race.pending_new_chat_hint(), Some((true, true)));
         assert_eq!(
             flow_race.on_sign_in_succeeded(),
-            SignInSuccessAction::AutoStartChat(PendingNewChat {
-                allow_classical: true,
-                auto_start: true,
-                ..draft.clone()
-            })
+            SignInSuccessAction::AutoStartChat {
+                id: race_id,
+                pending: PendingNewChat {
+                    allow_classical: true,
+                    auto_start: true,
+                    ..draft.clone()
+                },
+            }
         );
 
         // Explicit `start_chat` SignInRequired works even when `declined_sign_in == true`.
         assert_eq!(
-            flow.on_start_chat_sign_in_required(draft.clone()),
+            flow.on_start_chat_sign_in_required(submit_id, draft.clone()),
             Dialog::SignIn
         );
         assert_eq!(flow.pending_new_chat_hint(), Some((true, true)));
@@ -1089,48 +1221,140 @@ mod tests {
         };
         assert_eq!(
             flow.on_sign_in_succeeded(),
-            SignInSuccessAction::AutoStartChat(expected_auto.clone())
+            SignInSuccessAction::AutoStartChat {
+                id: submit_id,
+                pending: expected_auto.clone(),
+            }
         );
 
         // If start_chat still hits SignInRequired, draft stays intact for another retry.
-        assert_eq!(flow.on_auto_start_finished(false, true), (false, None));
+        assert_eq!(
+            flow.on_auto_start_finished(submit_id, false, true),
+            (false, None)
+        );
         assert_eq!(flow.pending_new_chat_hint(), Some((true, true)));
 
         // If start_chat needs classical approval (or another error), NewChat reopens prefilled.
         assert_eq!(
-            flow.on_auto_start_finished(false, false),
+            flow.on_auto_start_finished(submit_id, false, false),
             (false, Some(open_dialog.clone()))
         );
         assert_eq!(flow.pending_new_chat_hint(), None);
 
-        // Successful AutoStartChat closes SignInDialog and clears pending state.
+        // Successful AutoStartChat closes SignInDialog and clears pending state; a stale
+        // submission ID cannot clobber a newer pending draft or submission.
+        let submit_id_2 = flow.begin_new_chat_submit(draft.clone());
         assert_eq!(
-            flow.on_start_chat_sign_in_required(draft.clone()),
+            flow.on_start_chat_sign_in_required(submit_id_2, draft.clone()),
             Dialog::SignIn
         );
+        // Stale completion/error for `submit_id` must be a complete no-op on `submit_id_2`.
+        assert_eq!(
+            flow.on_auto_start_finished(submit_id, true, false),
+            (false, None)
+        );
+        assert_eq!(
+            flow.on_auto_start_finished(submit_id, false, false),
+            (false, None)
+        );
+        assert_eq!(flow.pending_auto_start_id(), Some(submit_id_2));
         assert_eq!(
             flow.on_sign_in_succeeded(),
-            SignInSuccessAction::AutoStartChat(expected_auto)
+            SignInSuccessAction::AutoStartChat {
+                id: submit_id_2,
+                pending: expected_auto,
+            }
         );
-        assert_eq!(flow.on_auto_start_finished(true, false), (true, None));
+        assert_eq!(
+            flow.on_auto_start_finished(submit_id_2, true, false),
+            (true, None)
+        );
         assert_eq!(flow.pending_new_chat_hint(), None);
 
-        // Cancelling SignInDialog in Case B restores NewChat with invitation intact.
+        // Cancelling SignInDialog in Case B restores NewChat with invitation intact and reports
+        // the cancelled auto-start submission ID.
+        let submit_id_3 = flow.begin_new_chat_submit(draft.clone());
         assert_eq!(
-            flow.on_start_chat_sign_in_required(draft.clone()),
+            flow.on_start_chat_sign_in_required(submit_id_3, draft.clone()),
             Dialog::SignIn
         );
-        assert_eq!(flow.on_dismiss_sign_in(), Some(open_dialog));
+        assert_eq!(
+            flow.on_dismiss_sign_in(),
+            (Some(submit_id_3), Some(open_dialog.clone()))
+        );
         assert_eq!(flow.pending_new_chat_hint(), None);
 
-        // If chat was already persisted and only sending greeting hit SignInRequired, pending
-        // NewChat is cleared so signing in does not re-open NewChat.
-        flow.begin_new_chat_submit(draft);
+        // If chat was already persisted and only sending greeting hit SignInRequired (including when
+        // the transport refusal hook ran before `send_prepared_initiate_v2` returned), pending
+        // NewChat is cleared so signing in or dismissing does not re-open NewChat.
+        flow.reset_declined();
+        let submit_id_4 = flow.begin_new_chat_submit(draft);
         assert_eq!(
-            flow.on_chat_created_greeting_needs_sign_in(),
+            flow.on_ask_sign_in(Some(&open_dialog), true, true),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(
+            flow.on_chat_created_greeting_needs_sign_in(submit_id_4),
             Dialog::SignIn
         );
         assert_eq!(flow.pending_new_chat_hint(), None);
         assert_eq!(flow.on_sign_in_succeeded(), SignInSuccessAction::Close);
+
+        // Backing out of `Dialog::SignIn` via browser Back records the decline without restoring
+        // any cancelled draft, suppressing subsequent background 403 prompts while still honoring
+        // explicit user actions.
+        let mut back_flow = SignInFlow::default();
+        let back_id = back_flow.begin_new_chat_submit(PendingNewChat {
+            key: "peer-key-789".into(),
+            name: "Carol".into(),
+            server: None,
+            pq_pinned: false,
+            allow_classical: false,
+            auto_start: true,
+        });
+        assert_eq!(
+            back_flow.on_start_chat_sign_in_required(
+                back_id,
+                PendingNewChat {
+                    key: "peer-key-789".into(),
+                    name: "Carol".into(),
+                    server: None,
+                    pq_pinned: false,
+                    allow_classical: false,
+                    auto_start: true,
+                },
+            ),
+            Dialog::SignIn
+        );
+        assert_eq!(back_flow.cancel_active_submissions(), vec![back_id]);
+        back_flow.decline_background_prompts();
+        assert_eq!(back_flow.pending_new_chat_hint(), None);
+        assert_eq!(back_flow.on_ask_sign_in(None, true, true), None);
+        assert_eq!(
+            back_flow.on_ask_sign_in(None, true, false),
+            Some(Dialog::SignIn)
+        );
+
+        // Browser Back dismissing SignIn must ALSO discard non-auto-start pending drafts so an
+        // unrelated later sign-in does not reopen a discarded form (while Escape / `on_dismiss_sign_in`
+        // still restores it explicitly).
+        let mut non_auto_flow = SignInFlow::default();
+        let idle_dialog = Dialog::NewChat {
+            key: "peer-key-idle".into(),
+            name: "Idle".into(),
+            server: None,
+            pq_pinned: false,
+        };
+        assert_eq!(
+            non_auto_flow.on_ask_sign_in(Some(&idle_dialog), true, true),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(non_auto_flow.pending_new_chat_hint(), Some((false, true)));
+        assert_eq!(non_auto_flow.cancel_active_submissions(), Vec::<u64>::new());
+        assert_eq!(non_auto_flow.pending_new_chat_hint(), None);
+        assert_eq!(
+            non_auto_flow.on_sign_in_succeeded(),
+            SignInSuccessAction::Close
+        );
     }
 }

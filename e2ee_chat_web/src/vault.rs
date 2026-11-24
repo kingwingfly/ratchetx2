@@ -86,6 +86,24 @@ pub const SECURITY_ALERT_DOWNGRADE: u32 = 1;
 pub const SECURITY_ALERT_MANIFEST_EXPIRED: u32 = 2;
 pub const SECURITY_ALERT_PQ_REQUIRED: u32 = 3;
 
+/// Initial-greeting delivery state stored in [`ContactState::greeting_delivery`].
+///
+/// - `GREETING_DELIVERY_LEGACY_UNKNOWN` (0): absent in vaults created before tag 27; treated as
+///   uncertain (`WithoutInitial`) whenever the saved session still carries an initial message.
+/// - `GREETING_DELIVERY_UNSENT` (1): never transmitted (e.g. cancelled during `save`) or
+///   definitively refused by the server; deleting suppresses any farewell so a cancelled or
+///   unannounced greeting (and user name) is never transmitted.
+/// - `GREETING_DELIVERY_UNCERTAIN` (2): transmission was attempted without confirmation (lost
+///   response or post-success save failure); deleting sends a farewell without any carried
+///   `initial_message` so an established peer learns of deletion while an unreached peer never
+///   receives the unconfirmed greeting.
+/// - `GREETING_DELIVERY_CONFIRMED` (3): explicitly confirmed transmitted (or active/peer-initiated
+///   session); deleting sends a normal farewell.
+pub const GREETING_DELIVERY_LEGACY_UNKNOWN: u32 = 0;
+pub const GREETING_DELIVERY_UNSENT: u32 = 1;
+pub const GREETING_DELIVERY_UNCERTAIN: u32 = 2;
+pub const GREETING_DELIVERY_CONFIRMED: u32 = 3;
+
 /// AES-GCM nonce length.
 const NONCE_LEN: usize = <Aes256Gcm as AeadCore>::NonceSize::USIZE;
 
@@ -478,6 +496,28 @@ pub struct ContactState {
     /// Carried initial messages persisted atomically with the mailbox cursor until durably joined.
     #[prost(bytes = "vec", repeated, tag = "26")]
     pub pending_carried_initials: Vec<Vec<u8>>,
+    /// Delivery status of the initial greeting (`GREETING_DELIVERY_*`).
+    #[prost(uint32, tag = "27")]
+    pub greeting_delivery: u32,
+    /// Coalesced half-open history index ranges `[start, end)` already acknowledged on screen, so
+    /// reloading a partial history page is idempotent for both clocked and clockless entries.
+    #[prost(message, repeated, tag = "28")]
+    pub acked_ranges: Vec<IndexRange>,
+    /// Durable fallback farewells from a previously established session (e.g. before a PQ upgrade
+    /// or recreating a deleted chat). Retained until the active replacement session's greeting is
+    /// confirmed delivered (or a peer-initiated session replaces it), and moved back to
+    /// [`AppState::farewells`] if the chat is deleted before that confirmation.
+    #[prost(message, repeated, tag = "29")]
+    pub fallback_farewells: Vec<Farewell>,
+}
+
+/// Coalesced half-open history index range `[start, end)` already acknowledged on screen.
+#[derive(Clone, Copy, PartialEq, Eq, prost::Message)]
+pub struct IndexRange {
+    #[prost(uint64, tag = "1")]
+    pub start: u64,
+    #[prost(uint64, tag = "2")]
+    pub end: u64,
 }
 
 /// Events encrypted for the peer, waiting to be pushed, see [`ContactState::sealed_events`].
@@ -835,6 +875,15 @@ pub struct Vault {
     header: RefCell<VaultHeader>,
 }
 
+/// Fail closed before opening or mutating any IndexedDB write transaction once `pagehide` has
+/// released this tab's exclusive Web Lock (or if the lock is not held).
+fn ensure_vault_lock_owned() -> Result<()> {
+    if !crate::glue::owns_lock() {
+        return Err(Error::Storage("page is closing; tab lock released".into()));
+    }
+    Ok(())
+}
+
 impl Vault {
     /// Whether this browser has a vault.
     pub async fn exists() -> Result<bool> {
@@ -843,6 +892,7 @@ impl Vault {
 
     /// A new v2 vault holding `state`, under `passphrase`, replacing any other.
     pub async fn create(passphrase: &[u8], state: &AppState) -> Result<Self> {
+        ensure_vault_lock_owned()?;
         let database = open().await?;
         let header = VaultHeader::new();
         let key = header.derive_key(passphrase)?;
@@ -853,6 +903,7 @@ impl Vault {
             header: RefCell::new(header),
         };
         let sealed_state = vault.seal_with_aad(&state_v2_aad(&header_bytes), state);
+        ensure_vault_lock_owned()?;
         let transaction = vault
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
@@ -901,6 +952,7 @@ impl Vault {
             let v2_sealed_state =
                 seal_bytes(&key, &state_v2_aad(&v2_header_bytes), plain.as_slice());
 
+            ensure_vault_lock_owned()?;
             let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
             let store = transaction.object_store(STORE)?;
             // CAS check inside the upgrade transaction: ensure HEADER wasn't changed concurrently.
@@ -911,6 +963,10 @@ impl Vault {
                     return Err(Error::Corrupt("no vault".into()));
                 }
             };
+            if let Err(e) = ensure_vault_lock_owned() {
+                let _ = transaction.abort();
+                return Err(e);
+            }
             if current != header_bytes {
                 let actual = VaultHeader::decode(current.as_slice())
                     .map(|h| h.revision)
@@ -957,10 +1013,12 @@ impl Vault {
         Ok((vault, state, deferred))
     }
 
-    /// Open an IndexedDB RW transaction and enforce monotonic CAS revision BEFORE any writes.
+    /// Open an IndexedDB RW transaction and enforce lock ownership plus monotonic CAS revision
+    /// BEFORE any writes.
     async fn begin_checked_rw_tx(
         &self,
     ) -> Result<(idb::Transaction, idb::ObjectStore, VaultHeader)> {
+        ensure_vault_lock_owned()?;
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
@@ -972,6 +1030,10 @@ impl Vault {
                 return Err(Error::Corrupt("vault header missing".into()));
             }
         };
+        if let Err(e) = ensure_vault_lock_owned() {
+            let _ = transaction.abort();
+            return Err(e);
+        }
         match verify_checked_header(&self.header.borrow(), &current) {
             Ok(trusted) => Ok((transaction, store, trusted)),
             Err(e) => {
@@ -1236,6 +1298,7 @@ impl Vault {
                 .get(JsValue::from_str(STATE))?
                 .await?
                 .ok_or_else(|| Error::Corrupt("no state".into()))?;
+            ensure_vault_lock_owned()?;
             let (next, header, sealed) = reseal_state_for_next_revision(
                 &self.key,
                 &trusted,
@@ -1358,9 +1421,10 @@ impl Vault {
 
     /// Delete the vault for good.
     pub async fn destroy() -> Result<()> {
-        let transaction = open()
-            .await?
-            .transaction(&[STORE], TransactionMode::ReadWrite)?;
+        ensure_vault_lock_owned()?;
+        let database = open().await?;
+        ensure_vault_lock_owned()?;
+        let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
         transaction.object_store(STORE)?.clear()?;
         commit(transaction).await
     }

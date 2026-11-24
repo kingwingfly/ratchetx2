@@ -333,20 +333,29 @@ impl Engine {
         let late = std::mem::take(&mut inner.saved_late);
         if std::mem::take(&mut inner.contacts_dirty_late) || !late.is_empty() {
             self.ui.me.set(Some(inner.me()));
-            self.ui.contacts.set(inner.views());
-            // The open chat shows them in their places.
+            // The open chat shows them in their places; only mark read what history actually
+            // loaded onto screen (at most `HISTORY_SHOWN` entries), and keep the peer queued for
+            // retry if loading failed.
             if let Some(open) = self.ui.open.get_untracked()
                 && late.contains(&open)
             {
-                self.show_history(inner, &open).await;
+                if self.show_history(inner, &open).await {
+                    if self.acknowledge_displayed_window(inner, &open)
+                        && let Err(e) = inner.save_state().await
+                    {
+                        self.ui.notify(describe(&e));
+                    }
+                } else if self.ui.open.get_untracked() == Some(open)
+                    && inner.contact(&open).is_some()
+                {
+                    inner.saved_late.push(open);
+                }
             }
+            self.ui.contacts.set(inner.views());
         }
-        let open_peer = self
-            .ui
-            .open
-            .get_untracked()
-            .filter(|_| !document().hidden());
-        let replayed = self.replay_deferred_initials(inner, open_peer).await?;
+        // Defer read receipts until `save_initial_batch` confirms the chat is still open and
+        // visible after persistence, since `close_chat` can run without waiting for `inner`.
+        let replayed = self.replay_deferred_initials(inner, None).await?;
         let pending: Vec<_> = inner
             .contacts
             .iter()
@@ -433,7 +442,6 @@ impl Engine {
             let Some(inner) = guard.as_mut() else {
                 return Ok(received);
             };
-            let open = self.ui.open.get_untracked() == Some(*peer) && !document().hidden();
             let local_pq = inner.local_pq_enabled();
             let Some(index) = inner.contacts.iter().position(|c| c.peer == *peer) else {
                 return Ok(received);
@@ -499,6 +507,12 @@ impl Engine {
                     }
                 };
                 let mut content = Content::from_bytes(&content);
+                // Only active-session traffic (`!message.earlier`) proves the peer received the
+                // active session's greeting; confirm before the receipt-only early `continue` so
+                // read/download receipts clear `fallback_farewells` too.
+                if !message.earlier {
+                    contact.mark_greeting_confirmed();
+                }
                 if let Some(events) = content.events.take() {
                     steps.extend(contact.told(&events));
                     if content.kind.is_none() {
@@ -523,7 +537,9 @@ impl Engine {
                     contact.session.retire();
                     deleted = true;
                 }
-                match contact.add_received(content, open) {
+                // Record as unread until persisted and actually displayed on a visible screen;
+                // `close_chat` can clear `ui.open` while `fetch_page` or IndexedDB waits.
+                match contact.add_received(content, false) {
                     Ok(entry) => entries.push(entry),
                     Err(reason) => {
                         inner.roll_back(peer, snapshot)?;
@@ -580,15 +596,36 @@ impl Engine {
                 .await?;
             requeued.log_missing(&self.ui, peer);
             received |= !entries.is_empty();
-            if self.ui.open.get_untracked() == Some(*peer)
-                && let Some(contact) = inner.contact(peer)
-            {
-                let views: Vec<_> = entries
-                    .into_iter()
-                    .map(|(index, entry)| contact.message(index, entry))
+            if self.ui.open.get_untracked() == Some(*peer) {
+                let displayed_entries: Vec<_> = entries
+                    .iter()
+                    .map(|(index, entry)| {
+                        let (counts_unread, clock) = super::handshake::entry_read_tracking(entry);
+                        super::contact::DisplayedEntry {
+                            index: *index,
+                            counts_unread,
+                            clock,
+                        }
+                    })
                     .collect();
-                self.show_changes(inner, peer, &changed);
-                self.show_new(inner, peer, views);
+                let views: Option<Vec<_>> = inner.contact(peer).map(|contact| {
+                    entries
+                        .into_iter()
+                        .map(|(index, entry)| contact.message(index, entry))
+                        .collect()
+                });
+                if let Some(views) = views {
+                    let showed_entries = !views.is_empty();
+                    self.show_changes(inner, peer, &changed);
+                    self.show_new(inner, peer, views);
+                    // Acknowledge ONLY the messages just appended to a visible, non-quarantined
+                    // screen, retaining them in `displayed_history` if hidden or quarantined so
+                    // `mark_read` / quarantine clearance reconciles them later.
+                    if showed_entries {
+                        self.acknowledge_appended_displayed(inner, peer, &displayed_entries)
+                            .await;
+                    }
+                }
             }
             self.ui.contacts.set(inner.views());
             if stalled {

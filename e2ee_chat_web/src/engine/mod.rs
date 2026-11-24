@@ -14,26 +14,29 @@ mod sync;
 #[cfg(test)]
 mod tests;
 
-use crate::content::{Deleted, Kind, stamp};
+use crate::content::Kind;
 use crate::glue::LockStatus;
 use crate::state::{
-    Body, ContactView, Dialog, IsolatedContactView, Link, Me, MessageView, PendingNewChat, Phase,
-    ServerPqStatus, SignIn, SignInFlow, SignInSuccessAction, Ui, UnavailableReason, UploadState,
-    order,
+    Body, ContactView, Delivery, Dialog, IsolatedContactView, Link, Me, MessageRow, MessageView,
+    PendingNewChat, Phase, ServerPqStatus, SignIn, SignInFlow, SignInSuccessAction, Ui,
+    UnavailableReason, UploadState, order, order_rows,
 };
 use crate::transport::{Connect, Fetch};
-use crate::util::{describe, js_error, key_to_url, short, size_u64, sleep};
+use crate::util::{describe, js_error, key_to_url, percent_decode, short, size_u64, sleep};
 use crate::vault::{
     AppState, CarriedDeferredTimestamp, ContactState, DeferredInitial, DeferredInitialsRecord,
     HistoryEntry, OutgoingRecord, Vault, history_key,
 };
 use crate::{content, glue, transport};
 use attachments::upload_of;
-use contact::{Contact, forget_told, isolated_contact_views, restore_contacts, stored_contacts};
+use contact::{
+    Contact, DisplayedEntry, FarewellMode, isolated_contact_views, restore_contacts,
+    stored_contacts,
+};
 use futures::channel::oneshot;
 use futures::future::{Either, select};
 use futures::lock::Mutex;
-use handshake::build_farewell;
+use handshake::encrypt_session_farewells;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use session::attachment::{CHUNK_SIZE, Upload};
@@ -79,6 +82,8 @@ pub enum StartChatError {
     DowngradeDetected,
     PeerManifestExpired,
     PqRequired,
+    /// The user dismissed or backed out of the startup form before the chat was created.
+    Cancelled,
     Other(String),
 }
 /// Maximum milliseconds to wait for a proactive `/auth` check when unlocking via an invitation link.
@@ -189,6 +194,162 @@ pub struct Engine {
     /// Whether publishing prekeys was definitively refused for the current settings with no
     /// rollback snapshot: background publishing pauses until the user adjusts settings or retries.
     publish_waits_settings: Cell<bool>,
+    /// Monotonic generation and target peer (`None` for chat list) for [`Engine::open`],
+    /// [`Engine::close_chat`], and open-chat deletion so an older in-flight `open` never
+    /// overwrites a newer navigation while deleting peer A never cancels a queued open of peer B.
+    open_tracker: Cell<OpenTracker>,
+    /// Submission ID of a `start_chat` call currently awaiting network RPCs under `inner`, together
+    /// with whether the chat has already been persisted (`greeting_only == true`), used to suppress
+    /// late transport 403 sign-in prompts for discarded submissions and prevent greeting-only 403s
+    /// from re-attaching an auto-start draft.
+    in_flight_start_chat: Cell<Option<(u64, bool)>>,
+    /// Startup submission IDs with active async tasks, reference-counted so overlapping `NewChat`
+    /// and `SignInDialog` tasks sharing an ID keep cancellation live until the last task finishes.
+    live_submissions: RefCell<HashMap<u64, usize>>,
+    /// Live startup submission IDs cancelled by browser Back or native dialog dismissal.
+    cancelled_submissions: RefCell<HashSet<u64>>,
+    /// Exact set of history entries currently rendered on screen for the open chat, so
+    /// visibility-return (`mark_read`), `saved_late` recovery, paging earlier history, and lifting
+    /// quarantine only acknowledge messages that were actually displayed.
+    displayed_history: RefCell<Option<DisplayedHistory>>,
+    /// Per-row reactive signals for the currently displayed chat, enabling O(1) delivery and
+    /// remote-attachment updates without scanning `ui.messages` per row and disposing cleanly on
+    /// chat switches.
+    displayed_rows: RefCell<DisplayedRows>,
+    /// Monotonic counter tagging `Ui::deleted_peer` notifications.
+    deleted_peer_seq: Cell<u64>,
+}
+
+/// Per-row reactive signal handles owned by the currently rendered chat.
+#[derive(Debug, Clone, Copy)]
+struct RowSignals {
+    place: u64,
+    delivery: Option<RwSignal<Delivery>>,
+    remote_body: Option<RwSignal<Body>>,
+}
+
+impl RowSignals {
+    fn from_row(row: &MessageRow) -> Self {
+        Self {
+            place: row.place,
+            delivery: row.delivery_signal,
+            remote_body: row.remote_body_signal,
+        }
+    }
+
+    fn dispose(self) {
+        if let Some(signal) = self.delivery {
+            signal.dispose();
+        }
+        if let Some(signal) = self.remote_body {
+            signal.dispose();
+        }
+    }
+}
+
+/// Index map of rendered message rows for the active chat.
+#[derive(Default)]
+struct DisplayedRows {
+    peer: Option<PublicKey>,
+    rows: HashMap<u64, RowSignals>,
+}
+
+/// Tracks what is currently displayed in `ui.messages` for an open chat so read acknowledgments
+/// are idempotent by history index and older history pages remain reachable.
+#[derive(Debug, Clone)]
+struct DisplayedHistory {
+    peer: PublicKey,
+    /// Whether the latest history window load (`load_history` / `show_history`) succeeded.
+    history_loaded: bool,
+    /// Oldest history index boundary loaded so far (`0` means the start of history is reached).
+    loaded_start: u64,
+    /// Displayed entries whose unread/receipt state has not yet been acknowledged on screen.
+    pending_entries: Vec<DisplayedEntry>,
+}
+
+/// Loaded history page returned by [`Engine::load_history_before`] together with its read-tracking
+/// entries.
+struct LoadedHistoryPage {
+    messages: Vec<MessageView>,
+    loaded_start: u64,
+    entries: Vec<DisplayedEntry>,
+}
+
+/// Tracks the latest requested chat open/close generation and target peer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct OpenTracker {
+    generation: u64,
+    target: Option<PublicKey>,
+    /// If the previous target generation was invalidated by deleting that peer (rather than by a
+    /// newer navigation), record that generation so its queued `Engine::open` returns
+    /// [`OpenOutcome::Ignored`] and reconciles browser history instead of leaving the list on a
+    /// deleted chat entry.
+    deleted_generation: Option<u64>,
+}
+
+impl OpenTracker {
+    pub(super) fn begin_open(&mut self, peer: PublicKey) -> u64 {
+        self.generation = self.generation.wrapping_add(1);
+        self.target = Some(peer);
+        self.deleted_generation = None;
+        self.generation
+    }
+
+    pub(super) fn close(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.target = None;
+        self.deleted_generation = None;
+    }
+
+    pub(super) fn is_current(&self, generation: u64) -> bool {
+        self.generation == generation
+    }
+
+    pub(super) fn was_deleted(&self, generation: u64) -> bool {
+        self.deleted_generation == Some(generation)
+    }
+
+    pub(super) fn is_settled_on(&self, displayed: Option<PublicKey>, peer: PublicKey) -> bool {
+        displayed == Some(peer) && self.target == Some(peer)
+    }
+
+    pub(super) fn invalidate_peer(&mut self, peer: PublicKey) {
+        if self.target == Some(peer) {
+            let invalidated = self.generation;
+            self.generation = self.generation.wrapping_add(1);
+            self.target = None;
+            self.deleted_generation = Some(invalidated);
+        }
+    }
+}
+
+/// Whether the browser tab is currently visible (always `true` in native tests).
+#[cfg(target_arch = "wasm32")]
+pub(super) fn is_page_visible() -> bool {
+    !document().hidden()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn is_page_visible() -> bool {
+    true
+}
+
+/// Result of [`Engine::load_history`], distinguishing a missing contact from a vault load failure.
+enum LoadedHistory {
+    Missing,
+    Loaded(LoadedHistoryPage),
+    Failed(String),
+}
+
+/// Result of [`Engine::open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenOutcome {
+    /// The requested chat (or chat list) is now active on screen.
+    Opened,
+    /// A newer [`Engine::open`] or chat deletion superseded this call before it completed.
+    Superseded,
+    /// The request could not be opened (vault locked, own identity key, or unknown contact).
+    Ignored,
 }
 
 /// SHA-256 digest of an attachment key, binding plaintext/file caches without storing raw keys as map keys.
@@ -315,6 +476,13 @@ impl Engine {
             new_chat_feedback: RefCell::default(),
             publish_waits_sign_in: Cell::default(),
             publish_waits_settings: Cell::default(),
+            open_tracker: Cell::new(OpenTracker::default()),
+            in_flight_start_chat: Cell::new(None),
+            live_submissions: RefCell::default(),
+            cancelled_submissions: RefCell::default(),
+            displayed_history: RefCell::default(),
+            displayed_rows: RefCell::default(),
+            deleted_peer_seq: Cell::new(0),
         });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
         let weak = Rc::downgrade(&engine);
@@ -471,6 +639,19 @@ impl Engine {
         }
     }
 
+    /// Present `dialog` only if `ui.dialog` does not already hold an equal dialog, avoiding
+    /// unmounting and rebuilding an active `SignInDialog` (which would cancel its live submission
+    /// and history reservation).
+    pub(super) fn show_dialog_if_changed(&self, dialog: Dialog) {
+        if self
+            .ui
+            .dialog
+            .with_untracked(|current| current.as_ref() != Some(&dialog))
+        {
+            self.ui.dialog.set(Some(dialog));
+        }
+    }
+
     /// Ask the user to sign in to the server, as what was sent waits for it. If `NewChat` is
     /// currently open, preserves its invitation/draft so it can resume seamlessly after sign-in.
     fn ask_sign_in(&self) {
@@ -482,13 +663,28 @@ impl Engine {
             )
         });
         if let Some(dialog) = next {
-            self.ui.dialog.set(Some(dialog));
+            self.show_dialog_if_changed(dialog);
         }
     }
 
     /// The server refused a call, whichever, as this browser is not signed in to it, which every
-    /// write takes: ask, unless the user put it off.
+    /// write takes: ask, unless the user put it off or cancelled the in-flight startup submission.
     fn refused_for_sign_in(&self) {
+        if let Some((id, greeting_only)) = self.in_flight_start_chat.get() {
+            if self.is_submission_cancelled(id) {
+                return;
+            }
+            if greeting_only {
+                if self.can_sign_in_here.get() {
+                    let dialog = self
+                        .sign_in_flow
+                        .borrow_mut()
+                        .on_chat_created_greeting_needs_sign_in(id);
+                    self.show_dialog_if_changed(dialog);
+                }
+                return;
+            }
+        }
         let next = self.ui.dialog.with_untracked(|current| {
             self.sign_in_flow.borrow_mut().on_ask_sign_in(
                 current.as_ref(),
@@ -497,15 +693,34 @@ impl Engine {
             )
         });
         if let Some(dialog) = next {
-            self.ui.dialog.set(Some(dialog));
+            self.show_dialog_if_changed(dialog);
         }
     }
 
+    fn mark_submission_cancelled(&self, submission_id: u64) {
+        if self.live_submissions.borrow().contains_key(&submission_id) {
+            self.cancelled_submissions
+                .borrow_mut()
+                .insert(submission_id);
+        }
+    }
+
+    /// Suppress subsequent background sign-in prompts without restoring any cancelled draft
+    /// (called when browser Back or an OS close dismisses `Dialog::SignIn`).
+    pub fn decline_sign_in_prompts(&self) {
+        self.sign_in_flow.borrow_mut().decline_background_prompts();
+    }
+
     /// The user dismissed `SignInDialog` ("Not now" or Escape): suppress background sign-in
-    /// prompts, restore any preserved `NewChat` / invitation draft, and return `true` if a
-    /// dialog was restored (so a native `<dialog>` cancel event keeps the modal open).
+    /// prompts, mark any live auto-start submission cancelled, restore any preserved `NewChat` /
+    /// invitation draft, and return `true` if a dialog was restored (so a native `<dialog>` cancel
+    /// event keeps the modal open).
     pub fn dismiss_sign_in(&self) -> bool {
-        match self.sign_in_flow.borrow_mut().on_dismiss_sign_in() {
+        let (cancelled_id, restored) = self.sign_in_flow.borrow_mut().on_dismiss_sign_in();
+        if let Some(id) = cancelled_id {
+            self.mark_submission_cancelled(id);
+        }
+        match restored {
             Some(restored) => {
                 self.ui.dialog.set(Some(restored));
                 true
@@ -541,30 +756,100 @@ impl Engine {
         self.sign_in_flow.borrow_mut().on_new_chat_unmounted();
     }
 
-    /// Mark that `NewChat` has an in-flight `start_chat` submission.
-    pub fn begin_new_chat_submit(&self, draft: PendingNewChat) {
-        self.sign_in_flow.borrow_mut().begin_new_chat_submit(draft);
+    /// Mark that `NewChat` has an in-flight `start_chat` submission, returning its unique ID.
+    pub fn begin_new_chat_submit(&self, draft: PendingNewChat) -> u64 {
+        let id = self.sign_in_flow.borrow_mut().begin_new_chat_submit(draft);
+        *self.live_submissions.borrow_mut().entry(id).or_insert(0) += 1;
+        id
     }
 
-    /// Clear the in-flight `NewChat` submission marker.
-    pub fn end_new_chat_submit(&self) {
-        self.sign_in_flow.borrow_mut().end_new_chat_submit();
+    /// Register a live `SignInDialog` auto-start task for `submission_id` so dismissal cancels it
+    /// without retaining tombstones for idle dialogs.
+    pub fn begin_sign_in_auto_start(&self, submission_id: u64) {
+        *self
+            .live_submissions
+            .borrow_mut()
+            .entry(submission_id)
+            .or_insert(0) += 1;
+    }
+
+    /// Decrement the active task count for `submission_id` once its async task finishes, clearing
+    /// its cancellation tombstone only once all overlapping tasks sharing `submission_id` end.
+    pub fn finish_submission(&self, submission_id: u64) {
+        let mut live = self.live_submissions.borrow_mut();
+        if let Some(count) = live.get_mut(&submission_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                live.remove(&submission_id);
+                self.cancelled_submissions
+                    .borrow_mut()
+                    .remove(&submission_id);
+            }
+        } else {
+            self.cancelled_submissions
+                .borrow_mut()
+                .remove(&submission_id);
+        }
+        self.sign_in_flow
+            .borrow_mut()
+            .end_new_chat_submit(submission_id);
+    }
+
+    /// Mark a specific startup submission cancelled (e.g. on dialog unmount) so late network
+    /// responses cannot reopen Sign In, send a greeting, or clobber a newer draft.
+    pub fn cancel_startup_submission(&self, submission_id: u64) {
+        self.mark_submission_cancelled(submission_id);
+        self.sign_in_flow
+            .borrow_mut()
+            .cancel_submission(submission_id);
+    }
+
+    /// Cancel whichever in-flight `NewChat` or auto-start `SignIn` submission is currently active
+    /// (called synchronously on browser Back or native dialog cancel/close).
+    pub fn cancel_active_startup_submission(&self) {
+        let cancelled = self.sign_in_flow.borrow_mut().cancel_active_submissions();
+        for id in cancelled {
+            self.mark_submission_cancelled(id);
+        }
+        if let Some((id, _)) = self.in_flight_start_chat.get() {
+            self.mark_submission_cancelled(id);
+        }
+    }
+
+    /// Whether `submission_id` was cancelled by user Back or native dialog dismissal.
+    pub fn is_submission_cancelled(&self, submission_id: u64) -> bool {
+        self.cancelled_submissions.borrow().contains(&submission_id)
+    }
+
+    /// Clear any preserved `pending_new_chat` draft belonging to `submission_id` once `NewChat`
+    /// has already succeeded (e.g. if a concurrent background 403 opened `SignInDialog` with this
+    /// draft before `start_chat` acquired the engine mutex), without marking `submission_id`
+    /// cancelled or closing `SignInDialog`.
+    pub fn clear_pending_new_chat(&self, submission_id: u64) {
+        self.sign_in_flow
+            .borrow_mut()
+            .cancel_submission(submission_id);
     }
 
     /// Preserve a submitted `NewChat` draft (with `auto_start: true`) and immediately present
     /// `SignInDialog` cleanly when `start_chat` hits `SignInRequired`.
-    pub fn require_sign_in_for_new_chat(&self, draft: PendingNewChat) {
+    pub fn require_sign_in_for_new_chat(&self, submission_id: u64, draft: PendingNewChat) {
         let dialog = self
             .sign_in_flow
             .borrow_mut()
-            .on_start_chat_sign_in_required(draft);
-        self.ui.dialog.set(Some(dialog));
+            .on_start_chat_sign_in_required(submission_id, draft);
+        self.show_dialog_if_changed(dialog);
     }
 
     /// Hint for `SignInDialog` when a `NewChat` / invitation draft is waiting:
     /// `Some((auto_start, has_key))`.
     pub fn pending_new_chat_hint(&self) -> Option<(bool, bool)> {
         self.sign_in_flow.borrow().pending_new_chat_hint()
+    }
+
+    /// Submission ID of a pending `auto_start: true` chat waiting behind `SignInDialog`, if any.
+    pub fn pending_auto_start_id(&self) -> Option<u64> {
+        self.sign_in_flow.borrow().pending_auto_start_id()
     }
 
     /// Close the dialog only if `NewChat` is still the active dialog (avoiding clobbering
@@ -595,18 +880,20 @@ impl Engine {
         self.sign_in_flow.borrow_mut().on_sign_in_succeeded()
     }
 
-    /// Complete an automatic post-sign-in `start_chat` attempt, closing `SignInDialog` on success
-    /// or reopening `NewChat` prefilled with `err` when user attention is required.
-    pub fn finish_auto_start_chat(&self, err: Option<StartChatError>) {
+    /// Complete an automatic post-sign-in `start_chat` attempt scoped strictly to `submission_id`,
+    /// closing `SignInDialog` on success or reopening `NewChat` prefilled with `err` when user
+    /// attention is required.
+    pub fn finish_auto_start_chat(&self, submission_id: u64, err: Option<StartChatError>) {
         let (succeeded, still_needs_sign_in) = match &err {
             None => (true, false),
             Some(StartChatError::SignInRequired) => (false, true),
             Some(_) => (false, false),
         };
-        let (close_sign_in, reopened) = self
-            .sign_in_flow
-            .borrow_mut()
-            .on_auto_start_finished(succeeded, still_needs_sign_in);
+        let (close_sign_in, reopened) = self.sign_in_flow.borrow_mut().on_auto_start_finished(
+            submission_id,
+            succeeded,
+            still_needs_sign_in,
+        );
         if close_sign_in {
             self.close_dialog_if_sign_in();
         } else if let Some(dialog) = reopened {
@@ -629,8 +916,15 @@ impl Engine {
     /// Find out whether to create or unlock the vault.
     pub async fn start(&self) {
         glue::register_media_worker();
-        // Two tabs on one vault would fork the sessions' ratchets.
-        match crate::glue::take_lock("e2ee-chat").await {
+        // Two tabs on one vault would fork the sessions' ratchets. If another tab holds the lock,
+        // display `Elsewhere` immediately while waiting ONLY when this tab is visible and focused,
+        // so refreshing or locking a foreground tab never hands the vault to a background waiter.
+        let mut lock = crate::glue::take_lock("e2ee-chat").await;
+        if lock == LockStatus::HeldElsewhere && !crate::glue::lock_released() {
+            self.ui.phase.set(Phase::Elsewhere);
+            lock = crate::glue::wait_for_lock_when_active("e2ee-chat").await;
+        }
+        match lock {
             LockStatus::Acquired => {}
             LockStatus::HeldElsewhere => {
                 self.ui.phase.set(Phase::Elsewhere);
@@ -659,7 +953,11 @@ impl Engine {
                 return;
             }
         }
+        if crate::glue::lock_released() {
+            return;
+        }
         match Vault::exists().await {
+            Ok(_) if crate::glue::lock_released() => {}
             Ok(true) => self.ui.phase.set(Phase::Locked),
             Ok(false) => self.ui.phase.set(Phase::Create),
             // Offering to create one could replace a vault that is there.
@@ -891,32 +1189,257 @@ impl Engine {
         Ok(index)
     }
 
-    /// Show the chat with `peer`, or the chat list.
-    pub async fn open(&self, peer: Option<PublicKey>) {
-        let mut guard = self.inner.lock().await;
-        let Some(inner) = guard.as_mut() else {
-            return;
+    /// Whether `peer` is currently displayed on screen with its history loaded and no conflicting
+    /// queued navigation.
+    pub fn is_settled_on(&self, peer: PublicKey) -> bool {
+        self.open_tracker
+            .get()
+            .is_settled_on(self.ui.open.get_untracked(), peer)
+            && self.is_history_loaded_for(peer)
+    }
+
+    /// Invalidate any queued [`Engine::open`] synchronously (e.g. when the user clicks in-app
+    /// Close while browser `history.back()` is settling) without clearing `ui.open` prematurely,
+    /// so an in-flight history load cannot open and mark a chat read after the user chose to leave.
+    pub fn cancel_pending_open(&self) {
+        let mut tracker = self.open_tracker.get();
+        tracker.close();
+        self.open_tracker.set(tracker);
+    }
+
+    /// Clear `ui.messages` and dispose every per-row reactive signal owned by the previous chat.
+    fn clear_displayed_messages(&self) {
+        self.ui.messages.set(vec![]);
+        let old = {
+            let mut displayed = self.displayed_rows.borrow_mut();
+            displayed.peer = None;
+            std::mem::take(&mut displayed.rows)
         };
-        let Some(peer) = peer else {
-            self.ui.open.set(None);
-            self.ui.messages.set(vec![]);
+        for signals in old.into_values() {
+            signals.dispose();
+        }
+    }
+
+    /// Replace the displayed message list for `peer`, reusing existing per-row reactive signals
+    /// when refreshing the same chat (so `<For>` children stay wired to live signals) and
+    /// disposing removed/old signals cleanly.
+    fn set_displayed_messages(&self, peer: PublicKey, views: Vec<MessageView>, open_peer: bool) {
+        let mut displayed = self.displayed_rows.borrow_mut();
+        let same_peer = displayed.peer == Some(peer);
+        let mut old_rows = std::mem::take(&mut displayed.rows);
+        let mut next_rows = HashMap::with_capacity(views.len());
+        let mut rows = Vec::with_capacity(views.len());
+        for view in views {
+            if same_peer && let Some(existing) = old_rows.remove(&view.index) {
+                if let Some(sig) = existing.delivery
+                    && sig.get_untracked() != view.delivery
+                {
+                    sig.set(view.delivery);
+                }
+                if let Some(sig) = existing.remote_body
+                    && sig.with_untracked(|current| *current != view.body)
+                {
+                    sig.set(view.body.clone());
+                }
+                let row = MessageRow {
+                    index: view.index,
+                    place: view.place,
+                    outgoing: view.outgoing,
+                    at: view.at,
+                    body: view.body,
+                    delivery: view.delivery,
+                    delivery_signal: existing.delivery,
+                    remote_body_signal: existing.remote_body,
+                };
+                next_rows.insert(
+                    row.index,
+                    RowSignals {
+                        place: row.place,
+                        delivery: existing.delivery,
+                        remote_body: existing.remote_body,
+                    },
+                );
+                rows.push(row);
+            } else {
+                let row = MessageRow::from_view(view);
+                next_rows.insert(row.index, RowSignals::from_row(&row));
+                rows.push(row);
+            }
+        }
+        displayed.peer = Some(peer);
+        displayed.rows = next_rows;
+        drop(displayed);
+
+        self.ui.messages.set(rows);
+        if open_peer {
+            self.ui.open.set(Some(peer));
+        }
+        for signals in old_rows.into_values() {
+            signals.dispose();
+        }
+    }
+
+    /// Return to the chat list immediately without waiting for `inner` (which a stalled network
+    /// sync or flush may hold), invalidating any in-flight [`Engine::open`] so it cannot reopen
+    /// the closed chat or write stale history messages.
+    pub fn close_chat(&self) {
+        let mut tracker = self.open_tracker.get();
+        tracker.close();
+        self.open_tracker.set(tracker);
+        *self.displayed_history.borrow_mut() = None;
+        self.ui.has_older_messages.set(false);
+        self.ui.open.set(None);
+        self.clear_displayed_messages();
+    }
+
+    fn is_history_loaded_for(&self, peer: PublicKey) -> bool {
+        self.displayed_history
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.peer == peer && d.history_loaded)
+    }
+
+    /// Record entries just appended to `ui.messages` for `peer` so later visibility return
+    /// (`mark_read`) or quarantine clearance reconciles them idempotently by history index.
+    fn record_displayed_entries(&self, peer: &PublicKey, entries: &[DisplayedEntry]) {
+        if entries.is_empty() {
             return;
+        }
+        let mut slot = self.displayed_history.borrow_mut();
+        let displayed = match slot.as_mut().filter(|d| d.peer == *peer) {
+            Some(d) => d,
+            None => slot.insert(DisplayedHistory {
+                peer: *peer,
+                history_loaded: false,
+                loaded_start: 0,
+                pending_entries: Vec::new(),
+            }),
+        };
+        displayed.pending_entries.extend_from_slice(entries);
+    }
+
+    /// Acknowledge newly appended displayed entries immediately when visible and unquarantined, or
+    /// retain them in `displayed_history` so `mark_read` / quarantine clearance reconciles them.
+    async fn acknowledge_appended_displayed(
+        &self,
+        inner: &mut Inner<impl HistoryStore>,
+        peer: &PublicKey,
+        entries: &[DisplayedEntry],
+    ) {
+        if self.ui.open.get_untracked() != Some(*peer) || entries.is_empty() {
+            return;
+        }
+        let can_ack_now = is_page_visible()
+            && inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == *peer)
+                .is_some_and(|c| !c.state.quarantined);
+        if can_ack_now {
+            if inner
+                .contact(peer)
+                .is_some_and(|contact| contact.acknowledge_entries(entries))
+                && let Err(e) = inner.save_state().await
+            {
+                self.ui.notify(describe(&e));
+            }
+        } else {
+            self.record_displayed_entries(peer, entries);
+        }
+    }
+
+    /// Acknowledge only the entries currently tracked as displayed on screen for `peer`, returning
+    /// `true` if unread count, `acked_ranges`, or pending read receipts changed.
+    fn acknowledge_displayed_window(
+        &self,
+        inner: &mut Inner<impl HistoryStore>,
+        peer: &PublicKey,
+    ) -> bool {
+        if self.ui.open.get_untracked() != Some(*peer) || !is_page_visible() {
+            return false;
+        }
+        let Some(contact) = inner.contact(peer) else {
+            return false;
+        };
+        if contact.state.quarantined {
+            return false;
+        }
+        let mut slot = self.displayed_history.borrow_mut();
+        let Some(displayed) = slot.as_mut().filter(|d| d.peer == *peer) else {
+            return false;
+        };
+        let entries = std::mem::take(&mut displayed.pending_entries);
+        contact.acknowledge_entries(&entries)
+    }
+
+    /// Show the chat with `peer`, or the chat list.
+    pub async fn open(&self, peer: Option<PublicKey>) -> OpenOutcome {
+        let Some(peer) = peer else {
+            self.close_chat();
+            return OpenOutcome::Opened;
+        };
+        let mut tracker = self.open_tracker.get();
+        let generation = tracker.begin_open(peer);
+        self.open_tracker.set(tracker);
+        let mut guard = self.inner.lock().await;
+        let current = self.open_tracker.get();
+        if current.was_deleted(generation) {
+            return OpenOutcome::Ignored;
+        }
+        if !current.is_current(generation) {
+            return OpenOutcome::Superseded;
+        }
+        let Some(inner) = guard.as_mut() else {
+            return OpenOutcome::Ignored;
         };
         // Self-peer guard: never open a chat with one's own identity key.
         if peer == inner.client.identity_key() {
-            return;
+            return OpenOutcome::Ignored;
         }
-        self.show_history(inner, &peer).await;
-        let Some(contact) = inner.contact(&peer) else {
-            return;
+        let loaded = match self.load_history(inner, &peer).await {
+            LoadedHistory::Missing => return OpenOutcome::Ignored,
+            LoadedHistory::Loaded(page) => Some(page),
+            LoadedHistory::Failed(e) => {
+                self.ui.notify(e);
+                None
+            }
         };
-        // Do not mark quarantined messages as read or send receipts before explicit approval.
-        let read = if contact.state.quarantined {
-            false
-        } else {
-            contact.read_all()
+        let current = self.open_tracker.get();
+        if current.was_deleted(generation) {
+            return OpenOutcome::Ignored;
+        }
+        if !current.is_current(generation) {
+            return OpenOutcome::Superseded;
+        }
+        if inner.contact(&peer).is_none() {
+            return OpenOutcome::Ignored;
+        }
+        let (messages, has_older) = match loaded {
+            Some(page) => {
+                let has_older = page.loaded_start > 0;
+                *self.displayed_history.borrow_mut() = Some(DisplayedHistory {
+                    peer,
+                    history_loaded: true,
+                    loaded_start: page.loaded_start,
+                    pending_entries: page.entries,
+                });
+                (page.messages, has_older)
+            }
+            None => {
+                *self.displayed_history.borrow_mut() = Some(DisplayedHistory {
+                    peer,
+                    history_loaded: false,
+                    loaded_start: 0,
+                    pending_entries: Vec::new(),
+                });
+                (vec![], false)
+            }
         };
-        self.ui.open.set(Some(peer));
+        self.ui.has_older_messages.set(has_older);
+        self.set_displayed_messages(peer, messages, true);
+        // Do not mark quarantined messages as read, or acknowledge messages if history failed to
+        // load or the tab became hidden before display (`visibilitychange` calls `mark_read` on return).
+        let read = self.acknowledge_displayed_window(inner, &peer);
         if read && let Err(e) = inner.save_state().await {
             self.ui.notify(describe(&e));
         }
@@ -926,46 +1449,235 @@ impl Engine {
         if read && let Err(e) = self.flush(&peer).await {
             self.ui.link.set(Link::Offline(e));
         }
+        OpenOutcome::Opened
     }
 
-    /// Show the last [`HISTORY_SHOWN`] entries of the history of the chat with `peer`.
-    async fn show_history(&self, inner: &mut Inner, peer: &PublicKey) {
-        let Some(contact) = inner.contacts.iter().find(|contact| contact.peer == *peer) else {
-            return;
-        };
-        let history = inner
-            .vault
-            .history(peer, contact.state.history_len, HISTORY_SHOWN)
-            .await;
+    /// Load up to `limit` entries immediately before `before` for `peer`, ordered for display,
+    /// without touching `ui.messages`.
+    async fn load_history_window(
+        &self,
+        inner: &mut Inner,
+        peer: &PublicKey,
+        before: u64,
+        limit: u64,
+    ) -> LoadedHistory {
+        if inner.contacts.iter().all(|contact| contact.peer != *peer) {
+            return LoadedHistory::Missing;
+        }
+        let loaded_start = before.saturating_sub(limit);
+        let history = inner.vault.history(peer, before, limit).await;
         let Some(contact) = inner.contact(peer) else {
-            return;
+            return LoadedHistory::Missing;
         };
-        let mut messages: Vec<_> = match history {
-            Ok(history) => history
-                .into_iter()
-                .map(|(index, entry)| contact.message(index, entry))
-                .collect(),
-            Err(e) => {
-                self.ui.notify(describe(&e));
-                vec![]
+        match history {
+            Ok(history) => {
+                let mut entries = Vec::with_capacity(history.len());
+                let mut messages = Vec::with_capacity(history.len());
+                for (index, entry) in history {
+                    let (counts_unread, clock) = handshake::entry_read_tracking(&entry);
+                    entries.push(DisplayedEntry {
+                        index,
+                        counts_unread,
+                        clock,
+                    });
+                    messages.push(contact.message(index, entry));
+                }
+                order(&mut messages, &inner.client.identity_key(), peer);
+                LoadedHistory::Loaded(LoadedHistoryPage {
+                    messages,
+                    loaded_start,
+                    entries,
+                })
+            }
+            Err(e) => LoadedHistory::Failed(describe(&e)),
+        }
+    }
+
+    /// Load the last [`HISTORY_SHOWN`] entries of the history of the chat with `peer`, ordered for
+    /// display, without touching `ui.messages`.
+    async fn load_history(&self, inner: &mut Inner, peer: &PublicKey) -> LoadedHistory {
+        let Some(history_len) = inner
+            .contacts
+            .iter()
+            .find(|contact| contact.peer == *peer)
+            .map(|contact| contact.state.history_len)
+        else {
+            return LoadedHistory::Missing;
+        };
+        self.load_history_window(inner, peer, history_len, HISTORY_SHOWN)
+            .await
+    }
+
+    /// Refresh the history of the chat with `peer` if it is still the open chat when the read
+    /// completes, preserving any earlier pages the user already loaded (`loaded_start`) instead of
+    /// collapsing back to the tail [`HISTORY_SHOWN`] window. Returns `true` only when history
+    /// loaded successfully and was applied to the still-open chat.
+    async fn show_history(&self, inner: &mut Inner, peer: &PublicKey) -> bool {
+        let Some(history_len) = inner
+            .contacts
+            .iter()
+            .find(|contact| contact.peer == *peer)
+            .map(|contact| contact.state.history_len)
+        else {
+            return false;
+        };
+        let existing_start = self
+            .displayed_history
+            .borrow()
+            .as_ref()
+            .filter(|d| d.peer == *peer && d.history_loaded)
+            .map(|d| d.loaded_start);
+        let limit = match existing_start {
+            Some(start) => history_len.saturating_sub(start).max(HISTORY_SHOWN),
+            None => HISTORY_SHOWN,
+        };
+        match self
+            .load_history_window(inner, peer, history_len, limit)
+            .await
+        {
+            LoadedHistory::Loaded(page) if self.ui.open.get_untracked() == Some(*peer) => {
+                let has_older = page.loaded_start > 0;
+                *self.displayed_history.borrow_mut() = Some(DisplayedHistory {
+                    peer: *peer,
+                    history_loaded: true,
+                    loaded_start: page.loaded_start,
+                    pending_entries: page.entries,
+                });
+                self.ui.has_older_messages.set(has_older);
+                self.set_displayed_messages(*peer, page.messages, false);
+                true
+            }
+            LoadedHistory::Failed(e) => {
+                self.ui.notify(e);
+                false
+            }
+            LoadedHistory::Missing | LoadedHistory::Loaded(_) => false,
+        }
+    }
+
+    /// Load the preceding page of up to [`HISTORY_SHOWN`] older messages for the currently open
+    /// chat so unread messages before the tail page are reachable and acknowledged once displayed.
+    /// Returns `Ok(true)` when at least one older row was prepended to `ui.messages`.
+    pub async fn load_earlier(&self, peer: PublicKey) -> Result<bool, String> {
+        let mut guard = self.inner.lock().await;
+        if self.ui.open.get_untracked() != Some(peer) {
+            return Ok(false);
+        }
+        let Some(inner) = guard.as_mut() else {
+            return Err("locked".into());
+        };
+        let before = match self
+            .displayed_history
+            .borrow()
+            .as_ref()
+            .filter(|d| d.peer == peer && d.history_loaded)
+        {
+            Some(d) if d.loaded_start > 0 => d.loaded_start,
+            _ => {
+                self.ui.has_older_messages.set(false);
+                return Ok(false);
             }
         };
-        order(&mut messages, &inner.client.identity_key(), peer);
-        self.ui.messages.set(messages);
+        let page = match self
+            .load_history_window(inner, &peer, before, HISTORY_SHOWN)
+            .await
+        {
+            LoadedHistory::Loaded(page) => page,
+            LoadedHistory::Missing => return Ok(false),
+            LoadedHistory::Failed(e) => return Err(e),
+        };
+        if self.ui.open.get_untracked() != Some(peer) {
+            return Ok(false);
+        }
+        let still_at_boundary = self
+            .displayed_history
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.peer == peer && d.history_loaded && d.loaded_start == before);
+        if !still_at_boundary {
+            return Ok(false);
+        }
+        let has_older = page.loaded_start > 0;
+        let me = inner.client.identity_key();
+        let added_rows: Vec<MessageRow> = {
+            let mut displayed = self.displayed_rows.borrow_mut();
+            if displayed.peer != Some(peer) {
+                displayed.peer = Some(peer);
+                let old = std::mem::take(&mut displayed.rows);
+                for signals in old.into_values() {
+                    signals.dispose();
+                }
+            }
+            page.messages
+                .into_iter()
+                .filter_map(|view| {
+                    if displayed.rows.contains_key(&view.index) {
+                        None
+                    } else {
+                        let row = MessageRow::from_view(view);
+                        displayed.rows.insert(row.index, RowSignals::from_row(&row));
+                        Some(row)
+                    }
+                })
+                .collect()
+        };
+        let prepended = !added_rows.is_empty();
+        if prepended {
+            self.ui.messages.update(|messages| {
+                messages.extend(added_rows);
+                order_rows(messages, &me, &peer);
+            });
+        }
+        if let Some(displayed) = self
+            .displayed_history
+            .borrow_mut()
+            .as_mut()
+            .filter(|d| d.peer == peer)
+        {
+            displayed.loaded_start = page.loaded_start;
+            displayed.pending_entries.extend(page.entries);
+        }
+        self.ui.has_older_messages.set(has_older);
+        let read = self.acknowledge_displayed_window(inner, &peer);
+        if read && let Err(e) = inner.save_state().await {
+            self.ui.notify(describe(&e));
+        }
+        self.ui.contacts.set(inner.views());
+        drop(guard);
+        // Schedule receipt delivery asynchronously via the sync loop so local history paging never
+        // blocks on a slow or stalled relay.
+        if read {
+            self.wake();
+        }
+        Ok(prepended)
     }
 
-    /// Count the messages of the chat with `peer` as read, e.g. back on the page with the chat
-    /// open: they show already, as [`receive`](Self::receive) adds them to the open chat. The
-    /// peer learns it.
+    /// Count the displayed messages of the chat with `peer` as read, e.g. back on the page with
+    /// the chat open: if full history is not yet displayed (e.g. after a history-load failure or
+    /// pending `saved_late` / staged `unsaved` entries), reload history first and acknowledge only
+    /// what is actually displayed.
     pub async fn mark_read(&self, peer: PublicKey) {
         let mut guard = self.inner.lock().await;
+        // Re-check after acquiring the mutex: `close_chat` can clear `ui.open` (or the tab can
+        // hide again) while a prior `receive` held `inner`.
+        if self.ui.open.get_untracked() != Some(peer) || !is_page_visible() {
+            return;
+        }
         let Some(inner) = guard.as_mut() else {
             return;
         };
-        let Some(contact) = inner.contact(&peer) else {
-            return;
-        };
-        if contact.state.quarantined || !contact.read_all() {
+        let needs_reload = !self.is_history_loaded_for(peer)
+            || inner.saved_late.contains(&peer)
+            || inner.unsaved.iter().any(|(p, _)| *p == peer);
+        if needs_reload {
+            if self.show_history(inner, &peer).await {
+                inner.saved_late.retain(|saved| *saved != peer);
+            }
+            if self.ui.open.get_untracked() != Some(peer) || !is_page_visible() {
+                return;
+            }
+        }
+        if !self.acknowledge_displayed_window(inner, &peer) {
             return;
         }
         if let Err(e) = inner.save_state().await {
@@ -1016,6 +1728,9 @@ impl Engine {
     /// of the chat goes as it is delivered, or expires; but for its uploads that went up and
     /// have not finished, which it deletes, as they never can now.
     pub async fn delete(&self, peer: PublicKey) -> Result<(), String> {
+        if !crate::glue::owns_lock() {
+            return Err("page is closing; tab lock released".into());
+        }
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
         // Read before anything changes, as the vault forgets them with the chat: those still
@@ -1048,30 +1763,26 @@ impl Engine {
             && !contact.state.request
             && !contact.state.quarantined
         {
-            let mut deleted = Kind::Deleted(Deleted {}).to_bytes();
-            contact.state.clock = contact.state.clock.saturating_add(1);
-            stamp(&mut deleted, contact.state.clock);
-            let mut events = contact.state.events.take();
-            // Events encrypted already on the active session go as they are, before the rest.
-            let active = contact.session.active_id().map(|id| id.to_vec());
-            if let Some(sealed) = contact.state.sealed_events.take()
-                && Some(&sealed.session) == active.as_ref()
-            {
-                let sealed_msg = sealed.record.unwrap_or_default().to_push();
-                farewell.push(build_farewell(contact, sealed_msg));
-                if let (Some(events), Some(told)) = (&mut events, &sealed.events) {
-                    forget_told(events, told);
-                }
+            let mode = contact.farewell_mode();
+            if mode != FarewellMode::Normal {
+                // Restore any durable fallback farewells from a previously established session (e.g.
+                // before an unconfirmed PQ upgrade or recreating a previously deleted chat) so the
+                // peer still learns of deletion even when the replacement greeting was unsent or
+                // uncertain.
+                farewell.extend(contact.state.fallback_farewells.clone());
             }
-            let events = events.filter(|events| !events.is_empty());
-            for content in events
-                .map(|events| events.to_bytes())
-                .into_iter()
-                .chain([deleted])
-            {
-                if let Ok(message) = contact.session.encrypt(&content) {
-                    farewell.push(build_farewell(contact, message));
-                }
+            if mode != FarewellMode::Suppress {
+                contact.state.clock = contact.state.clock.saturating_add(1);
+                let clock = contact.state.clock;
+                let sealed_events = contact.state.sealed_events.take();
+                let events = contact.state.events.take();
+                farewell.extend(encrypt_session_farewells(
+                    &mut contact.session,
+                    clock,
+                    sealed_events,
+                    events,
+                    mode,
+                ));
             }
         }
         // Forgotten in the vault first, so that if that fails, the chat stays whole; with the
@@ -1141,10 +1852,27 @@ impl Engine {
         inner.unsaved_outbox.clear();
         inner.state.farewells.extend(farewell);
         self.wake();
-        if self.ui.open.get_untracked() == Some(peer) {
-            self.ui.open.set(None);
-            self.ui.messages.set(vec![]);
+        // Only invalidate a queued open targeting the deleted peer; preserve queued navigation to
+        // a different peer started while the vault deletion was committing.
+        let mut tracker = self.open_tracker.get();
+        tracker.invalidate_peer(peer);
+        self.open_tracker.set(tracker);
+        if self
+            .displayed_history
+            .borrow()
+            .as_ref()
+            .is_some_and(|d| d.peer == peer)
+        {
+            *self.displayed_history.borrow_mut() = None;
         }
+        if self.ui.open.get_untracked() == Some(peer) {
+            self.ui.has_older_messages.set(false);
+            self.ui.open.set(None);
+            self.clear_displayed_messages();
+        }
+        let seq = self.deleted_peer_seq.get().wrapping_add(1).max(1);
+        self.deleted_peer_seq.set(seq);
+        self.ui.deleted_peer.set(Some((seq, peer)));
         self.ui.contacts.set(inner.views());
         self.ui.isolated_contacts.set(inner.isolated_views());
         if was_isolated {
@@ -1390,6 +2118,11 @@ impl<V: HistoryStore> Inner<V> {
         let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
         let state = self.app_state();
         let deferred = self.deferred_record();
+        if !crate::glue::owns_lock() {
+            return Err(crate::vault::Error::Storage(
+                "page is closing; tab lock released".into(),
+            ));
+        }
         self.vault
             .save(
                 &state,
@@ -1517,10 +2250,44 @@ impl Engine {
             return;
         }
         let me = inner.client.identity_key();
-        self.ui.messages.update(|messages| {
-            messages.extend(views);
-            order(messages, &me, peer);
-        });
+        let added_rows: Vec<MessageRow> = {
+            let mut displayed = self.displayed_rows.borrow_mut();
+            if displayed.peer != Some(*peer) {
+                displayed.peer = Some(*peer);
+                let old = std::mem::take(&mut displayed.rows);
+                for signals in old.into_values() {
+                    signals.dispose();
+                }
+            }
+            views
+                .into_iter()
+                .filter_map(|view| {
+                    if let Some(existing) = displayed.rows.get_mut(&view.index) {
+                        if let Some(sig) = existing.delivery
+                            && sig.get_untracked() != view.delivery
+                        {
+                            sig.set(view.delivery);
+                        }
+                        if let Some(sig) = existing.remote_body
+                            && sig.with_untracked(|current| *current != view.body)
+                        {
+                            sig.set(view.body);
+                        }
+                        None
+                    } else {
+                        let row = MessageRow::from_view(view);
+                        displayed.rows.insert(row.index, RowSignals::from_row(&row));
+                        Some(row)
+                    }
+                })
+                .collect()
+        };
+        if !added_rows.is_empty() {
+            self.ui.messages.update(|messages| {
+                messages.extend(added_rows);
+                order_rows(messages, &me, peer);
+            });
+        }
     }
 
     /// Show the history entries of the chat with `peer` that changed, `entries`, if it is on
@@ -1537,32 +2304,48 @@ impl Engine {
         }
         let me = inner.client.identity_key();
         let contact = inner.contacts.iter().find(|contact| contact.peer == *peer);
-        self.ui.messages.update(|messages| {
+        let mut place_updates: Vec<(u64, u64)> = Vec::new();
+        {
+            let mut displayed = self.displayed_rows.borrow_mut();
+            if displayed.peer != Some(*peer) {
+                return;
+            }
             for (index, entry) in entries {
-                if let Some(message) = messages.iter_mut().find(|message| message.index == *index) {
-                    message.place = entry.place;
-                    if entry.outgoing {
-                        message.delivery = entry.delivery();
-                    }
-                    if let Some(contact) = contact {
-                        let mut updated = contact.message(*index, entry.clone()).body;
-                        // Preserve already-loaded inline bytes on `Body::File` when delivery ticks
-                        // read back a stripped `HistoryEntry` from IndexedDB.
-                        if let (Body::File(existing), Body::File(next)) =
-                            (&message.body, &mut updated)
-                            && existing.data.is_some()
-                            && next.data.is_none()
-                        {
-                            next.data = existing.data.clone();
-                        }
-                        if message.body != updated {
-                            message.body = updated;
-                        }
+                let Some(signals) = displayed.rows.get_mut(index) else {
+                    continue;
+                };
+                if entry.outgoing
+                    && let Some(sig) = signals.delivery
+                {
+                    let next_delivery = entry.delivery();
+                    if sig.get_untracked() != next_delivery {
+                        sig.set(next_delivery);
                     }
                 }
+                if let Some(sig) = signals.remote_body
+                    && let Some(contact) = contact
+                {
+                    let updated = contact.message(*index, entry.clone()).body;
+                    if sig.with_untracked(|current| *current != updated) {
+                        sig.set(updated);
+                    }
+                }
+                if signals.place != entry.place {
+                    signals.place = entry.place;
+                    place_updates.push((*index, entry.place));
+                }
             }
-            order(messages, &me, peer);
-        });
+        }
+        if !place_updates.is_empty() {
+            self.ui.messages.update(|messages| {
+                for (index, place) in place_updates {
+                    if let Some(message) = messages.iter_mut().find(|m| m.index == index) {
+                        message.place = place;
+                    }
+                }
+                order_rows(messages, &me, peer);
+            });
+        }
     }
 }
 
@@ -1624,26 +2407,6 @@ fn percent_encode(input: &str) -> String {
     out
 }
 
-/// Percent-decode a URI component, pure Rust for native tests.
-fn percent_decode(input: &str) -> Option<String> {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hi = *bytes.get(i + 1)? as char;
-            let lo = *bytes.get(i + 2)? as char;
-            let val = u8::from_str_radix(&format!("{hi}{lo}"), 16).ok()?;
-            out.push(val);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
 /// Build an invitation link for `me` relative to `page_origin`, appending `&pq=1` when local PQ
 /// is enabled and the server has not disabled post-quantum encryption.
 pub fn build_invitation_link(page_origin: &str, me: &Me) -> String {
@@ -1699,10 +2462,12 @@ pub fn invitation() -> Option<Dialog> {
     parse_invitation_hash(&hash)
 }
 
-/// Remove the invitation from the page's address, once it shows.
+/// Remove the invitation from the page's address, once it shows, preserving any existing
+/// `history.state` token stamped by session-history management.
 fn forget_invitation() {
     let location = window().location();
     if let (Ok(history), Ok(path)) = (window().history(), location.pathname()) {
-        let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&path));
+        let state = history.state().unwrap_or(wasm_bindgen::JsValue::NULL);
+        let _ = history.replace_state_with_url(&state, "", Some(&path));
     }
 }

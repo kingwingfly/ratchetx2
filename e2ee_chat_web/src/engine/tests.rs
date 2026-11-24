@@ -12,7 +12,7 @@ use super::settings::{
 };
 use super::sync::{farewell_push_v2_request, resolve_stalled_peer};
 use super::{
-    AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS,
+    AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, OpenTracker,
     ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash,
     build_invitation_link, checked_name, normalize_update_reason, parse_invitation_hash,
     should_require_update_for_rpc,
@@ -2531,4 +2531,634 @@ fn legacy_farewell_without_client_message_id_derives_deterministic_id() {
             .as_ref(),
         &expected_id
     );
+}
+
+#[test]
+fn open_tracker_invalidates_only_deleted_peer_tracks_deletion_and_checks_settlement() {
+    let alice = [0xAA; 32];
+    let bob = [0xBB; 32];
+    let mut tracker = OpenTracker::default();
+
+    // Opening Alice then closing immediately supersedes Alice (not marked deleted).
+    let gen_alice = tracker.begin_open(alice);
+    assert!(tracker.is_current(gen_alice));
+    assert!(tracker.is_settled_on(Some(alice), alice));
+    tracker.close();
+    assert!(!tracker.is_current(gen_alice));
+    assert!(!tracker.was_deleted(gen_alice));
+    assert!(!tracker.is_settled_on(Some(alice), alice));
+
+    // Queued open for Alice is invalidated AND flagged `was_deleted` when Alice is deleted so
+    // `Engine::open` returns `Ignored` and reconciles browser history.
+    let gen_alice_2 = tracker.begin_open(alice);
+    tracker.invalidate_peer(alice);
+    assert!(!tracker.is_current(gen_alice_2));
+    assert!(tracker.was_deleted(gen_alice_2));
+
+    // Queued open for Bob must NOT be invalidated when Alice's deletion finishes, and while Alice
+    // is still displayed on screen `is_settled_on(Some(alice), alice)` must be false so a deferred
+    // `Open(alice)` still supersedes Bob's queued open.
+    let gen_bob = tracker.begin_open(bob);
+    assert!(!tracker.is_settled_on(Some(alice), alice));
+    assert!(tracker.is_settled_on(Some(bob), bob));
+    tracker.invalidate_peer(alice);
+    assert!(tracker.is_current(gen_bob));
+    assert!(!tracker.was_deleted(gen_bob));
+}
+
+#[test]
+fn read_displayed_acknowledges_only_newly_displayed_entries_and_idle_dismiss_does_not_leak() {
+    // `read_displayed` decrements only the newly displayed entries' unread count and drains only
+    // their clocks from `unseen`, preserving earlier undisplayed messages (e.g. after a history
+    // load failure or pending `saved_late` reload).
+    let client = Client::new(Fetch::client(TEST_SERVER));
+    let peer = Client::new(Fetch::client(TEST_SERVER)).identity_key();
+    let mut inner = load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
+    let contact = inner.contact(&peer).unwrap();
+    let (_, earlier) = contact
+        .add_received(
+            Content {
+                clock: 10,
+                kind: Some(Kind::Text("earlier".into())),
+                events: None,
+            },
+            false,
+        )
+        .unwrap();
+    let (_, newer) = contact
+        .add_received(
+            Content {
+                clock: 20,
+                kind: Some(Kind::Text("newer".into())),
+                events: None,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(contact.state.unread, 2);
+    assert_eq!(contact.state.unseen, vec![10, 20]);
+    assert_eq!(
+        super::handshake::entry_read_tracking(&earlier),
+        (true, Some(10))
+    );
+    let (counts_unread, clock) = super::handshake::entry_read_tracking(&newer);
+    assert_eq!((counts_unread, clock), (true, Some(20)));
+    assert!(
+        contact.acknowledge_entries(&[super::contact::DisplayedEntry {
+            index: 1,
+            counts_unread,
+            clock,
+        }])
+    );
+    assert_eq!(contact.state.unread, 1);
+    assert_eq!(contact.state.unseen, vec![10]);
+    assert_eq!(
+        contact.state.events.as_ref().map(|e| e.read.clone()),
+        Some(vec![20])
+    );
+
+    // Dismissing an idle SignInDialog after NewChat's original task already finished must not
+    // retain stale cancellation IDs in `Engine::cancelled_submissions`.
+    let engine = Engine::new(Ui::new());
+    let draft = crate::state::PendingNewChat {
+        key: "peer-key".into(),
+        name: "Alice".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: true,
+    };
+    let id = engine.begin_new_chat_submit(draft.clone());
+    engine.finish_submission(id);
+    engine.require_sign_in_for_new_chat(id, draft.clone());
+    assert!(engine.dismiss_sign_in());
+    assert!(!engine.is_submission_cancelled(id));
+
+    // Overlapping `NewChat` and `SignInDialog` tasks sharing a `submission_id` reference-count
+    // `live_submissions`: when the original `NewChat` task finishes first, cancellation remains
+    // live for the overlapping `SignIn` auto-start task until that second task finishes too.
+    let shared_id = engine.begin_new_chat_submit(draft.clone());
+    engine.require_sign_in_for_new_chat(shared_id, draft);
+    engine.begin_sign_in_auto_start(shared_id);
+    engine.finish_submission(shared_id);
+    engine.cancel_active_startup_submission();
+    assert!(engine.is_submission_cancelled(shared_id));
+    engine.finish_submission(shared_id);
+    assert!(!engine.is_submission_cancelled(shared_id));
+}
+
+#[test]
+fn unannounced_greeting_suppresses_farewell_and_displayed_window_reconciles_accurately() {
+    use super::contact::{DisplayedEntry, FarewellMode};
+    use crate::vault::{
+        GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_LEGACY_UNKNOWN, GREETING_DELIVERY_UNCERTAIN,
+        GREETING_DELIVERY_UNSENT,
+    };
+
+    let client = Client::new(Fetch::client(TEST_SERVER));
+    let peer = Client::new(Fetch::client(TEST_SERVER)).identity_key();
+    let mut inner = load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
+
+    // Greeting delivery states distinguish:
+    // - LEGACY_UNKNOWN (0): WithoutInitial if active session still carries an initial, else Normal;
+    // - UNSENT (never attempted / definitively refused) -> suppress farewell completely;
+    // - UNCERTAIN (lost response / post-success save failure) -> farewell with `initial_message = None`;
+    // - CONFIRMED -> normal farewell.
+    {
+        let contact = inner.contact(&peer).unwrap();
+        assert_eq!(
+            contact.state.greeting_delivery,
+            GREETING_DELIVERY_LEGACY_UNKNOWN
+        );
+        assert_eq!(
+            contact.farewell_mode(),
+            if contact.has_carried_initial() {
+                FarewellMode::WithoutInitial
+            } else {
+                FarewellMode::Normal
+            }
+        );
+        contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+        assert_eq!(contact.farewell_mode(), FarewellMode::Suppress);
+        contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+        assert_eq!(contact.farewell_mode(), FarewellMode::WithoutInitial);
+        contact.state.greeting_delivery = GREETING_DELIVERY_CONFIRMED;
+        assert_eq!(contact.farewell_mode(), FarewellMode::Normal);
+    }
+
+    // Truncated history window acknowledges ONLY the entries actually loaded onto screen, is
+    // idempotent across repeated loads of both clocked AND zero-clock messages, never wipes unread
+    // below staged/unseen messages, and handles > EVENTS_KEPT displayed unread entries cleanly.
+    {
+        let contact = inner.contact(&peer).unwrap();
+        for clock in [10u64, 20, 30] {
+            contact
+                .add_received(
+                    Content {
+                        clock,
+                        kind: Some(Kind::Text(format!("msg-{clock}"))),
+                        events: None,
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        assert_eq!(contact.state.unread, 3);
+        assert_eq!(contact.state.unseen, vec![10, 20, 30]);
+        let tail = [
+            DisplayedEntry {
+                index: 1,
+                counts_unread: true,
+                clock: Some(20),
+            },
+            DisplayedEntry {
+                index: 2,
+                counts_unread: true,
+                clock: Some(30),
+            },
+        ];
+        assert!(contact.acknowledge_entries(&tail));
+        assert_eq!(contact.state.unread, 1);
+        assert_eq!(contact.state.unseen, vec![10]);
+        assert_eq!(
+            contact.state.events.as_ref().map(|e| e.read.clone()),
+            Some(vec![20, 30])
+        );
+        // Second call over the same displayed window must not double-decrement or duplicate receipts.
+        assert!(!contact.acknowledge_entries(&tail));
+        assert_eq!(contact.state.unread, 1);
+        assert_eq!(contact.state.unseen, vec![10]);
+
+        // Loading the earlier page (`index: 0`) clears the remaining unread message and sends its receipt.
+        assert!(contact.acknowledge_entries(&[DisplayedEntry {
+            index: 0,
+            counts_unread: true,
+            clock: Some(10),
+        }]));
+        assert_eq!(contact.state.unread, 0);
+        assert!(contact.state.unseen.is_empty());
+        assert_eq!(
+            contact.state.events.as_ref().map(|e| e.read.clone()),
+            Some(vec![20, 30, 10])
+        );
+    }
+
+    // Zero-clock messages on a partial page are counted as read strictly once per history index,
+    // so reopening the same partial page does not clear an older unshown zero-clock message.
+    {
+        let mut inner_zero =
+            load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
+        let contact = inner_zero.contact(&peer).unwrap();
+        let mut page = Vec::new();
+        for i in 0..3u64 {
+            let (idx, entry) = contact
+                .add_received(
+                    Content {
+                        clock: 0,
+                        kind: Some(Kind::Deleted(crate::content::Deleted {})),
+                        events: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            let (counts_unread, clock) = super::handshake::entry_read_tracking(&entry);
+            if i > 0 {
+                page.push(DisplayedEntry {
+                    index: idx,
+                    counts_unread,
+                    clock,
+                });
+            }
+        }
+        assert_eq!(contact.state.unread, 3);
+        assert!(contact.acknowledge_entries(&page));
+        assert_eq!(contact.state.unread, 1);
+        // Reopening the exact same partial page leaves index 0 unread!
+        assert!(!contact.acknowledge_entries(&page));
+        assert_eq!(contact.state.unread, 1);
+        // Loading earlier page (index 0) clears the final unread entry.
+        assert!(contact.acknowledge_entries(&[DisplayedEntry {
+            index: 0,
+            counts_unread: true,
+            clock: None,
+        }]));
+        assert_eq!(contact.state.unread, 0);
+    }
+
+    // Displaying more than `EVENTS_KEPT` (1,001) clocked unread messages clears all 1,001 from
+    // `unread` even though `unseen` only retains the newest 1,000 clocks.
+    {
+        let mut inner_many =
+            load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
+        let contact = inner_many.contact(&peer).unwrap();
+        let mut displayed = Vec::with_capacity(super::EVENTS_KEPT + 1);
+        for i in 0..(super::EVENTS_KEPT + 1) {
+            let clock = (i as u64) + 1;
+            let (idx, entry) = contact
+                .add_received(
+                    Content {
+                        clock,
+                        kind: Some(Kind::Text(format!("bulk-{clock}"))),
+                        events: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            let (counts_unread, readable_clock) = super::handshake::entry_read_tracking(&entry);
+            displayed.push(DisplayedEntry {
+                index: idx,
+                counts_unread,
+                clock: readable_clock,
+            });
+        }
+        assert_eq!(contact.state.unread, (super::EVENTS_KEPT + 1) as u32);
+        assert_eq!(contact.state.unseen.len(), super::EVENTS_KEPT);
+        assert!(contact.acknowledge_entries(&displayed));
+        assert_eq!(contact.state.unread, 0);
+        assert!(contact.state.unseen.is_empty());
+    }
+
+    // Messages displayed while an existing contact's replacement session is quarantined remain
+    // unread until quarantine lifts, at which point `acknowledge_displayed_window` reconciles BOTH
+    // the previously displayed messages AND the newly released quarantined message together.
+    use leptos::prelude::Set;
+    let ui = Ui::new();
+    ui.open.set(Some(peer));
+    let engine = Engine::new(ui);
+    let mut displayed_q = Vec::new();
+    {
+        let contact = inner.contact(&peer).unwrap();
+        contact.state.unread = 0;
+        contact.state.unseen.clear();
+        contact.state.events = None;
+        contact.state.quarantined = true;
+        for clock in [40u64, 50] {
+            let (idx, entry) = contact
+                .add_received(
+                    Content {
+                        clock,
+                        kind: Some(Kind::Text(format!("while-quarantined-{clock}"))),
+                        events: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            let (counts_unread, readable_clock) = super::handshake::entry_read_tracking(&entry);
+            displayed_q.push(DisplayedEntry {
+                index: idx,
+                counts_unread,
+                clock: readable_clock,
+            });
+        }
+    }
+    engine.record_displayed_entries(&peer, &displayed_q);
+    assert!(!engine.acknowledge_displayed_window(&mut inner, &peer));
+    assert_eq!(inner.contact(&peer).unwrap().state.unread, 2);
+
+    // Lift quarantine and append released first message (clock 60).
+    let released_entry = {
+        let contact = inner.contact(&peer).unwrap();
+        contact.state.quarantined = false;
+        let (idx, entry) = contact
+            .add_received(
+                Content {
+                    clock: 60,
+                    kind: Some(Kind::Text("released-first".into())),
+                    events: None,
+                },
+                false,
+            )
+            .unwrap();
+        let (counts_unread, clock) = super::handshake::entry_read_tracking(&entry);
+        DisplayedEntry {
+            index: idx,
+            counts_unread,
+            clock,
+        }
+    };
+    engine.record_displayed_entries(&peer, &[released_entry]);
+    assert!(engine.acknowledge_displayed_window(&mut inner, &peer));
+    let contact = inner.contact(&peer).unwrap();
+    assert_eq!(contact.state.unread, 0);
+    assert!(contact.state.unseen.is_empty());
+    assert_eq!(
+        contact.state.events.as_ref().map(|e| e.read.clone()),
+        Some(vec![40, 50, 60])
+    );
+
+    // A staged/undisplayed entry (not in `displayed_history`) must NOT have its unread count wiped
+    // when `acknowledge_displayed_window` runs on an already-acknowledged window.
+    {
+        let contact = inner.contact(&peer).unwrap();
+        contact
+            .add_received(
+                Content {
+                    clock: 70,
+                    kind: Some(Kind::Text("staged-not-shown".into())),
+                    events: None,
+                },
+                false,
+            )
+            .unwrap();
+    }
+    assert!(!engine.acknowledge_displayed_window(&mut inner, &peer));
+    let contact = inner.contact(&peer).unwrap();
+    assert_eq!(contact.state.unread, 1);
+    assert_eq!(contact.state.unseen, vec![70]);
+
+    // `cancel_pending_open` synchronously invalidates a queued open without clearing `ui.open`.
+    let engine_close = Engine::new(Ui::new());
+    let mut t = engine_close.open_tracker.get();
+    let open_gen = t.begin_open(peer);
+    engine_close.open_tracker.set(t);
+    assert!(engine_close.open_tracker.get().is_current(open_gen));
+    engine_close.cancel_pending_open();
+    assert!(!engine_close.open_tracker.get().is_current(open_gen));
+}
+
+#[test]
+fn fallback_farewells_greeting_only_403_and_per_row_signals() {
+    use crate::state::{Body, Delivery, Dialog, MessageView, PendingNewChat, Ui};
+    use crate::vault::{
+        GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
+    };
+    use leptos::prelude::{Get, GetUntracked, Set, WithUntracked};
+
+    // 1. `encrypt_session_farewells` + `fallback_farewells` preserve a deletion notice on a prior
+    // established session until `mark_greeting_confirmed()` clears it.
+    let mut recipient = Client::new(Fetch::client(TEST_SERVER));
+    let bob_peer = recipient.identity_key();
+    let published = recipient.prepare_publish_v2("chat.example", 1, 1).unwrap();
+    let p = &published.request;
+    let bundle = protocol::handshake_v2::ClaimBundleResponse {
+        signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+        signed_prekey_signature: p.signed_prekey_signature.clone(),
+        one_time_prekey: p.one_time_prekeys.first().cloned(),
+        pq_last_resort: p.pq_last_resort.first().cloned(),
+        pq_one_time_prekey: p.pq_one_time_prekeys.first().cloned(),
+        manifest: p.manifest.clone(),
+    };
+    recipient.commit_publish_v2(published);
+    let mut sender = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
+    let prepared = futures::executor::block_on(sender.prepare_initiate_v2(
+        "chat.example",
+        &bob_peer,
+        &Default::default(),
+        &Kind::Text("hello".into()).to_bytes(),
+        Fetch::client(TEST_SERVER),
+    ))
+    .unwrap();
+    let active_state = ContactState {
+        peer: bob_peer.to_vec(),
+        session: Some(prepared.session.state().into()),
+        greeting_delivery: GREETING_DELIVERY_CONFIRMED,
+        ..ContactState::default()
+    };
+    let alice_state = ClientState::try_from(&session::proto::ClientState::from(sender.state()))
+        .expect("round-trip sender client state");
+    let alice = Client::restore(Fetch::client(TEST_SERVER), alice_state);
+    let mut inner = load_contacts(&alice, vec![active_state]);
+    let fallback = {
+        let contact = inner.contact(&bob_peer).unwrap();
+        let mode = contact.farewell_mode();
+        assert_eq!(mode, super::contact::FarewellMode::Normal);
+        let clock = contact.state.clock.saturating_add(1);
+        super::handshake::encrypt_session_farewells(&mut contact.session, clock, None, None, mode)
+    };
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(
+        fallback[0].recipient().as_deref(),
+        Some(bob_peer.as_slice())
+    );
+    let normal_req =
+        session::protocol::mailbox_v2::PushV2Request::decode(fallback[0].push_v2.as_slice())
+            .unwrap();
+    assert!(normal_req.initial_message.is_some());
+
+    {
+        let contact = inner.contact(&bob_peer).unwrap();
+        contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+        contact.state.fallback_farewells = fallback.clone();
+        assert_eq!(
+            contact.farewell_mode(),
+            super::contact::FarewellMode::Suppress
+        );
+        // Persisting through protobuf keeps `fallback_farewells` durable across reloads.
+        let encoded = contact.state.encode_to_vec();
+        let decoded = ContactState::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.fallback_farewells, fallback);
+        // Confirming delivery of the replacement greeting clears `fallback_farewells`.
+        assert!(contact.mark_greeting_confirmed());
+        assert_eq!(contact.state.greeting_delivery, GREETING_DELIVERY_CONFIRMED);
+        assert!(contact.state.fallback_farewells.is_empty());
+        assert!(!contact.mark_greeting_confirmed());
+    }
+
+    // Also verify `GREETING_DELIVERY_UNCERTAIN` strips carried `initial_message`.
+    {
+        let contact = inner.contact(&bob_peer).unwrap();
+        contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+        let mode = contact.farewell_mode();
+        assert_eq!(mode, super::contact::FarewellMode::WithoutInitial);
+        let clock = contact.state.clock.saturating_add(1);
+        let uncertain = super::handshake::encrypt_session_farewells(
+            &mut contact.session,
+            clock,
+            None,
+            None,
+            mode,
+        );
+        assert_eq!(uncertain.len(), 1);
+        let decoded_req =
+            session::protocol::mailbox_v2::PushV2Request::decode(uncertain[0].push_v2.as_slice())
+                .unwrap();
+        assert!(decoded_req.initial_message.is_none());
+    }
+
+    // 2. Greeting-only 403 hook clears auto-start ownership immediately so `SignInDialog` cannot
+    // steal the history reservation during an async refusal save.
+    let engine = Engine::new(Ui::new());
+    engine.can_sign_in_here.set(true);
+    let draft = PendingNewChat {
+        key: "peer-key".into(),
+        name: "Bob".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: true,
+    };
+    let submit_id = engine.begin_new_chat_submit(draft);
+    engine.in_flight_start_chat.set(Some((submit_id, true)));
+    engine.refused_for_sign_in();
+    assert_eq!(engine.pending_auto_start_id(), None);
+    assert_eq!(engine.ui().dialog.get_untracked(), Some(Dialog::SignIn));
+
+    // 3. `is_settled_on` requires history to actually be loaded for `peer`, and per-row reactive
+    // signals update delivery ticks in O(1) without replacing row signals on same-peer refresh.
+    let mut tracker = engine.open_tracker.get();
+    let _ = tracker.begin_open(bob_peer);
+    engine.open_tracker.set(tracker);
+    engine.ui().open.set(Some(bob_peer));
+    assert!(!engine.is_settled_on(bob_peer));
+    *engine.displayed_history.borrow_mut() = Some(super::DisplayedHistory {
+        peer: bob_peer,
+        history_loaded: true,
+        loaded_start: 0,
+        pending_entries: Vec::new(),
+    });
+    assert!(engine.is_settled_on(bob_peer));
+
+    let msg0 = MessageView {
+        index: 0,
+        place: 1,
+        outgoing: true,
+        at: 100,
+        body: Body::Text("hi".into()),
+        delivery: Delivery::Sent,
+    };
+    engine.set_displayed_messages(bob_peer, vec![msg0.clone()], true);
+    let sig0 = engine
+        .ui()
+        .messages
+        .with_untracked(|rows| rows[0].delivery_signal)
+        .expect("outgoing message has delivery signal");
+    assert_eq!(sig0.get_untracked(), Delivery::Sent);
+
+    let updated_entry = HistoryEntry {
+        outgoing: true,
+        at: 100,
+        content: Some(Content {
+            clock: 1,
+            kind: Some(Kind::Text("hi".into())),
+            events: None,
+        }),
+        delivery: Delivery::Read.into(),
+        place: 1,
+        ..HistoryEntry::default()
+    };
+    engine.show_changes(&inner, &bob_peer, &[(0, updated_entry)]);
+    assert_eq!(sig0.get_untracked(), Delivery::Read);
+
+    // Refreshing the same peer preserves `sig0` and updates its value in place.
+    let mut msg0_downloaded = msg0;
+    msg0_downloaded.delivery = Delivery::Downloaded;
+    engine.set_displayed_messages(bob_peer, vec![msg0_downloaded], false);
+    let sig0_after = engine
+        .ui()
+        .messages
+        .with_untracked(|rows| rows[0].delivery_signal)
+        .expect("reused delivery signal");
+    assert_eq!(sig0, sig0_after);
+    assert_eq!(sig0_after.get_untracked(), Delivery::Downloaded);
+
+    engine.clear_displayed_messages();
+    assert!(engine.ui().messages.with_untracked(Vec::is_empty));
+
+    // 4. `show_dialog_if_changed` does not re-notify `ui.dialog` when `Dialog::SignIn` is already
+    // open (preserving an active auto-starting `SignInDialog` and its reservation on greeting 403).
+    let dialog_notifies = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dialog_signal = engine.ui().dialog;
+    dialog_signal.set(Some(Dialog::SignIn));
+    let memo_counter = dialog_notifies.clone();
+    let observer = leptos::prelude::Memo::new(move |_| {
+        let _ = dialog_signal.get();
+        memo_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+    observer.get();
+    assert_eq!(
+        dialog_notifies.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let submit_id_2 = engine.begin_new_chat_submit(PendingNewChat {
+        key: "peer-key".into(),
+        name: "Bob".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: true,
+    });
+    engine.in_flight_start_chat.set(Some((submit_id_2, true)));
+    engine.refused_for_sign_in();
+    observer.get();
+    assert_eq!(engine.pending_auto_start_id(), None);
+    assert_eq!(
+        dialog_notifies.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "greeting-only 403 must not re-set Dialog::SignIn when already mounted"
+    );
+
+    // `require_sign_in_for_new_chat` must also avoid remounting an already-mounted SignInDialog,
+    // and `clear_pending_new_chat` clears a stale auto-start draft without closing SignInDialog.
+    let draft_3 = PendingNewChat {
+        key: "peer-key".into(),
+        name: "Bob".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: true,
+    };
+    let submit_id_3 = engine.begin_new_chat_submit(draft_3.clone());
+    engine.require_sign_in_for_new_chat(submit_id_3, draft_3);
+    observer.get();
+    assert_eq!(
+        dialog_notifies.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "require_sign_in_for_new_chat must not remount an already-mounted Dialog::SignIn"
+    );
+    assert_eq!(engine.pending_auto_start_id(), Some(submit_id_3));
+    engine.clear_pending_new_chat(submit_id_3);
+    assert_eq!(engine.pending_auto_start_id(), None);
+    assert!(!engine.is_submission_cancelled(submit_id_3));
+    assert_eq!(engine.ui().dialog.get_untracked(), Some(Dialog::SignIn));
+
+    // 5. Vault writes fail closed once `pagehide` marks the tab lock released.
+    struct RestoreLock(bool);
+    impl Drop for RestoreLock {
+        fn drop(&mut self) {
+            crate::glue::set_lock_released_for_test(self.0);
+        }
+    }
+    let _restore = RestoreLock(crate::glue::set_lock_released_for_test(true));
+    assert!(!crate::glue::owns_lock());
+    assert!(futures::executor::block_on(inner.save(&[])).is_err());
 }

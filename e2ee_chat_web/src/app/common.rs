@@ -106,8 +106,42 @@ pub(super) fn act_while(
 }
 
 pub(super) fn open_chat(peer: Option<PublicKey>) {
-    let engine = engine();
-    spawn_local(async move { engine.open(peer).await });
+    super::history::navigate(peer);
+}
+
+pub(super) fn reserve_chat_history() -> super::history::Reservation {
+    super::history::reserve()
+}
+
+pub(super) fn is_chat_history_owned(reservation: Option<super::history::Reservation>) -> bool {
+    super::history::is_reservation_owned(reservation)
+}
+
+pub(super) async fn commit_chat_history(
+    reservation: Option<super::history::Reservation>,
+    peer: PublicKey,
+) {
+    super::history::commit_reservation(reservation, peer).await;
+}
+
+pub(super) fn cancel_chat_history(reservation: Option<super::history::Reservation>) -> bool {
+    super::history::cancel_reservation(reservation)
+}
+
+pub(super) fn retain_chat_history(reservation: Option<super::history::Reservation>) -> bool {
+    super::history::retain_reservation(reservation)
+}
+
+pub(super) fn retain_active_chat_history_reservation() {
+    super::history::retain_active_reservation();
+}
+
+pub(super) fn cancel_retained_chat_history_reservation() {
+    super::history::cancel_retained_reservation();
+}
+
+pub(super) fn cancel_active_chat_history_reservation() {
+    super::history::cancel_active_reservation();
 }
 
 pub(super) fn new_chat() {

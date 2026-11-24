@@ -1,8 +1,9 @@
-use std::time::Duration;
+use std::{cell::Cell, time::Duration};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use js_sys::Uint8Array;
 use leptos::{ev, html, prelude::*, task::spawn_local};
+use session::PublicKey;
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{Blob, BlobPropertyBag, IntersectionObserver, IntersectionObserverEntry, Url};
 
@@ -20,9 +21,33 @@ use super::{
     engine, ui,
 };
 
+thread_local! {
+    /// Monotonic generation for viewer-opening requests so leaving a chat or closing the viewer
+    /// cancels any in-flight local file read or attachment stream setup before it opens the viewer.
+    static PREVIEW_GEN: Cell<u64> = const { Cell::new(0) };
+}
+
+pub(super) fn begin_preview_request() -> u64 {
+    PREVIEW_GEN.with(|gen_cell| {
+        let next = gen_cell.get().wrapping_add(1);
+        gen_cell.set(next);
+        next
+    })
+}
+
+/// Invalidate any pending asynchronous viewer opens (local file reads or stream setups).
+pub(super) fn cancel_pending_previews() {
+    let _ = begin_preview_request();
+}
+
+fn is_preview_current(token: u64, peer: PublicKey) -> bool {
+    PREVIEW_GEN.with(|gen_cell| gen_cell.get() == token) && ui().open.get_untracked() == Some(peer)
+}
+
 /// Show an attachment in the viewer, fetching it first unless it is kept here.
 fn open_attachment(remote: RemoteFile) {
     let (ui, engine) = (ui(), engine());
+    let token = begin_preview_request();
     spawn_local(async move {
         // A video or audio plays as it is fetched, if a service worker can stream it.
         let sort = preview::sort(&remote.pointer.name, &remote.pointer.mime, &[]);
@@ -31,14 +56,27 @@ fn open_attachment(remote: RemoteFile) {
                 .stream(remote.peer, remote.index, &remote.pointer, remote.clock)
                 .await
         {
+            if !is_preview_current(token, remote.peer) {
+                engine.end_stream(&url);
+                return;
+            }
             ui.viewer.set(None);
             ui.opening.set(None);
             let video = sort == Sort::Video;
             ui.streaming.set(Some(Streamed { url, remote, video }));
             return;
         }
+        if !is_preview_current(token, remote.peer) {
+            return;
+        }
         if let Err(e) = engine
-            .open_attachment(remote.peer, remote.index, remote.pointer, remote.clock)
+            .open_attachment(
+                token,
+                remote.peer,
+                remote.index,
+                remote.pointer,
+                remote.clock,
+            )
             .await
         {
             ui.notify(e);
@@ -71,10 +109,14 @@ pub(super) fn stop_media(player: &web_sys::HtmlMediaElement) {
 /// Show `file`, of a chat's history, in the viewer, its bytes read unless they are here.
 fn show_file(file: LocalFile) {
     let ui = ui();
+    let token = begin_preview_request();
     match file.data {
         Some(attachment) => ui.viewer.set(Some(attachment)),
         None => act(async move {
             let data = engine().file(file.peer, file.index).await?;
+            if !is_preview_current(token, file.peer) {
+                return Ok(());
+            }
             ui.viewer.set(Some(Attachment {
                 name: file.name,
                 mime: file.mime,
@@ -291,7 +333,10 @@ pub(super) fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
     // What it read shows at once; a stream's opens as any attachment does.
     let opened = StoredValue::new(source.clone());
     let open = move |_| match read.get_value() {
-        Some(attachment) => ui.viewer.set(Some(attachment)),
+        Some(attachment) => {
+            let _ = begin_preview_request();
+            ui.viewer.set(Some(attachment));
+        }
         None => opened.with_value(Source::open),
     };
     // One that turns out not to play, e.g. as it is no video after all, shows as a file.

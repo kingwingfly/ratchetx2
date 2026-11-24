@@ -1,5 +1,7 @@
 //! Encryption settings, classical approvals and post-quantum upgrades.
 
+use super::contact::FarewellMode;
+use super::handshake::encrypt_session_farewells;
 use super::outbox::RequeueOutcome;
 use super::{Engine, HistoryStore, Inner, PqSaveOutcome, ProtocolRpcScope, records};
 use crate::content::{Content, Kind, stamp};
@@ -8,8 +10,9 @@ use crate::transport::Fetch;
 use crate::util::{describe, now, short};
 use crate::vault::{
     CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, HistoryEntry, PendingPqRollback, SECURITY_ALERT_DOWNGRADE,
-    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED, history_key,
+    ContactState, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry,
+    PendingPqRollback, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
+    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED, history_key,
 };
 use leptos::prelude::*;
 use session::{ErrorKind, PqConfig, PublicKey, Session, SessionState};
@@ -125,10 +128,8 @@ impl Engine {
                             contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
                         }
                     }
-                    let open = self.ui.open.get_untracked() == Some(peer)
-                        && !document().hidden()
-                        && !contact.state.request;
-                    match contact.add_received(content, open) {
+                    // Record as unread until persisted and confirmed visible on screen.
+                    match contact.add_received(content, false) {
                         Ok(entry) => entries.push(entry),
                         Err(reason) => {
                             inner.roll_back(&peer, snapshot)?;
@@ -156,14 +157,47 @@ impl Engine {
             }
             requeued.log_missing(&self.ui, &peer);
             self.show_changes(inner, &peer, &requeued.history);
-            if self.ui.open.get_untracked() == Some(peer)
-                && let Some(contact) = inner.contact(&peer)
-            {
-                let views: Vec<_> = entries
-                    .into_iter()
-                    .map(|(index, entry)| contact.message(index, entry))
+            if self.ui.open.get_untracked() == Some(peer) {
+                let displayed_entries: Vec<_> = entries
+                    .iter()
+                    .map(|(index, entry)| {
+                        let (counts_unread, clock) = super::handshake::entry_read_tracking(entry);
+                        super::contact::DisplayedEntry {
+                            index: *index,
+                            counts_unread,
+                            clock,
+                        }
+                    })
                     .collect();
-                self.show_new(inner, &peer, views);
+                let views: Option<Vec<_>> = inner.contact(&peer).map(|contact| {
+                    entries
+                        .into_iter()
+                        .map(|(index, entry)| contact.message(index, entry))
+                        .collect()
+                });
+                if let Some(views) = views {
+                    let showed_views = !views.is_empty();
+                    self.show_new(inner, &peer, views);
+                    if showed_views {
+                        self.record_displayed_entries(&peer, &displayed_entries);
+                    }
+                }
+                // Lifting quarantine makes both the newly released message AND any messages
+                // already displayed on the prior session while quarantined eligible for read
+                // receipts immediately.
+                if super::is_page_visible() {
+                    let needs_reload = !self.is_history_loaded_for(peer)
+                        || inner.saved_late.contains(&peer)
+                        || inner.unsaved.iter().any(|(p, _)| *p == peer);
+                    if needs_reload && self.show_history(inner, &peer).await {
+                        inner.saved_late.retain(|saved| *saved != peer);
+                    }
+                    if self.acknowledge_displayed_window(inner, &peer)
+                        && let Err(e) = inner.save_state().await
+                    {
+                        self.ui.notify(describe(&e));
+                    }
+                }
             }
             self.ui.contacts.set(inner.views());
         }
@@ -195,6 +229,10 @@ impl Engine {
             return Err("no such chat".to_string());
         };
         let snapshot = inner.contacts[index].snapshot();
+        let old_farewell_mode = inner.contacts[index].farewell_mode();
+        let old_had_session = !inner.contacts[index].session.needs_new_session();
+        let old_was_request_or_quarantined =
+            inner.contacts[index].state.request || inner.contacts[index].state.quarantined;
         // Clear any prior classical exception before attempting PQ upgrade so
         // `prepare_start_again_v2` cannot silently negotiate another classical session.
         inner.contacts[index]
@@ -277,14 +315,53 @@ impl Engine {
                     .to_string(),
             );
         }
+        // Preserve a durable deletion path on the previous established session until the
+        // upgraded PQ greeting is confirmed delivered (e.g. if SendInitialV2 is refused and the
+        // user deletes the chat before sending another message).
+        let old_session_farewells = if old_had_session
+            && old_farewell_mode != FarewellMode::Suppress
+            && let Ok(restored) = SessionState::try_from(&snapshot.0)
+        {
+            let mut old_session = Session::restore(Fetch::client(&inner.server), restored);
+            encrypt_session_farewells(
+                &mut old_session,
+                snapshot.1.clock.saturating_add(1),
+                snapshot.1.sealed_events.clone(),
+                snapshot.1.events.clone(),
+                old_farewell_mode,
+            )
+        } else {
+            vec![]
+        };
         let mut history_records = vec![];
         let mut added_view = None;
+        let mut was_quarantined = false;
         if let Some(contact) = inner.contact(&peer) {
+            was_quarantined = contact.state.quarantined;
             contact.clear_quarantine_and_alerts();
+            contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
             contact.state.sealed_events = None;
+            if old_was_request_or_quarantined {
+                contact.state.fallback_farewells.clear();
+            } else if old_farewell_mode == FarewellMode::Normal {
+                contact.state.fallback_farewells = old_session_farewells;
+            } else if !old_session_farewells.is_empty() {
+                // Keep any earlier fallback farewells alongside this uncertain session's farewell.
+                contact
+                    .state
+                    .fallback_farewells
+                    .extend(old_session_farewells);
+                const MAX_FALLBACK_FAREWELLS: usize = 4;
+                if contact.state.fallback_farewells.len() > MAX_FALLBACK_FAREWELLS {
+                    let drop_count =
+                        contact.state.fallback_farewells.len() - MAX_FALLBACK_FAREWELLS;
+                    contact.state.fallback_farewells.drain(0..drop_count);
+                }
+            }
             if let Some((entry_index, entry)) =
                 finalize_upgrade_to_pq_request_state(&mut contact.state, hello, clock, now())
             {
+                contact.mark_index_acked(entry_index);
                 history_records.push((history_key(&peer, entry_index), entry.clone()));
                 added_view = Some(contact.message(entry_index, entry));
             }
@@ -309,12 +386,54 @@ impl Engine {
         if let Some(view) = added_view {
             self.show_new(inner, &peer, vec![view]);
         }
-        if let Err(e) = inner.client.send_prepared_initiate_v2(&outgoing).await {
+        if was_quarantined && self.ui.open.get_untracked() == Some(peer) && super::is_page_visible()
+        {
+            let needs_reload = !self.is_history_loaded_for(peer)
+                || inner.saved_late.contains(&peer)
+                || inner.unsaved.iter().any(|(p, _)| *p == peer);
+            if needs_reload && self.show_history(inner, &peer).await {
+                inner.saved_late.retain(|saved| *saved != peer);
+            }
+            if self.acknowledge_displayed_window(inner, &peer)
+                && let Err(e) = inner.save_state().await
+            {
+                self.ui.notify(describe(&e));
+            }
+        }
+        let mut ready_to_send = true;
+        if let Some(contact) = inner.contact(&peer) {
+            contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+        }
+        if let Err(e) = inner.save(&[]).await {
+            ready_to_send = false;
+            if let Some(contact) = inner.contact(&peer) {
+                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+            }
             self.ui.log(format!(
                 "upgraded session with {} saved locally; initial message will carry on next send: {}",
                 short(&peer),
                 describe(&e)
             ));
+        }
+        if ready_to_send {
+            if let Err(e) = inner.client.send_prepared_initiate_v2(&outgoing).await {
+                if e.is_server_refusal() {
+                    if let Some(contact) = inner.contact(&peer) {
+                        contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                    }
+                    let _ = inner.save_state().await;
+                }
+                self.ui.log(format!(
+                    "upgraded session with {} saved locally; initial message will carry on next send: {}",
+                    short(&peer),
+                    describe(&e)
+                ));
+            } else if inner
+                .contact(&peer)
+                .is_some_and(super::contact::Contact::mark_greeting_confirmed)
+            {
+                let _ = inner.save_state().await;
+            }
         }
         self.ui.contacts.set(inner.views());
         self.ui.log(format!(

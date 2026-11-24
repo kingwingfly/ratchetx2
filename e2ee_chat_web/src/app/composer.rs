@@ -8,6 +8,30 @@ use crate::{
 
 use super::common::{send, send_files};
 
+/// Whether entering a chat should auto-focus the composer textarea.
+///
+/// Desktop devices with a fine hovering pointer (mouse/trackpad) keep auto-focus so typing starts
+/// right away; touch-first portable devices (phones, tablets, 2-in-1s in tablet mode) skip
+/// auto-focus so the virtual keyboard does not pop up automatically.
+pub(super) fn should_autofocus_composer(hover_none: bool, pointer_coarse: bool) -> bool {
+    !(hover_none || pointer_coarse)
+}
+
+fn matches_media(query: &str) -> bool {
+    window()
+        .match_media(query)
+        .ok()
+        .flatten()
+        .is_some_and(|list| list.matches())
+}
+
+fn autofocus_allowed() -> bool {
+    should_autofocus_composer(
+        matches_media("(hover: none)"),
+        matches_media("(pointer: coarse)"),
+    )
+}
+
 #[component]
 pub(super) fn Composer(
     peer: PublicKey,
@@ -17,9 +41,13 @@ pub(super) fn Composer(
     let text = RwSignal::new(String::new());
     let textarea = NodeRef::<html::Textarea>::new();
     let file_input = NodeRef::<html::Input>::new();
-    // Typing goes to the composer when a chat opens.
+    // Typing goes to the composer when a chat opens on devices with a physical keyboard;
+    // skip on portable/touch devices so the virtual keyboard does not pop up automatically.
     Effect::new(move || {
-        if let Some(textarea) = textarea.get() {
+        if autofocus_allowed()
+            && !disabled.get_untracked()
+            && let Some(textarea) = textarea.get()
+        {
             let _ = textarea.focus();
         }
     });

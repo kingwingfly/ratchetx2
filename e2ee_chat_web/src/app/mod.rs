@@ -6,6 +6,7 @@ mod common;
 mod composer;
 mod dialogs;
 mod files;
+mod history;
 mod media;
 mod pdf;
 mod settings;
@@ -85,6 +86,8 @@ pub fn App() -> impl IntoView {
             }
         }
     });
+    // Entering a chat pushes a browser history entry so Back gestures return to the chat list.
+    history::install(ui);
 
     view! {
         <div class="app">
