@@ -121,6 +121,10 @@ impl ArchivedMessageRatchet {
     pub(crate) fn header_key(&self) -> Option<HeaderKey> {
         self.chain.as_ref().map(|chain| chain.header_key)
     }
+
+    pub(crate) fn next_header_key(&self) -> HeaderKey {
+        self.next_header_key
+    }
 }
 
 #[cfg(feature = "prost")]

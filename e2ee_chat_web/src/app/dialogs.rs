@@ -35,17 +35,21 @@ pub(super) fn VaultDialog() -> impl IntoView {
         Phase::Unlocked => ui.dialog.get().is_some(),
         Phase::Loading => false,
     };
+    let restored_new_chat_non_cancelable = StoredValue::new(false);
     Effect::new(move || {
         let shown = shown();
         if let Some(dialog) = dialog.get() {
             if shown && !dialog.open() {
+                restored_new_chat_non_cancelable.set_value(false);
                 let _ = dialog.show_modal();
             } else if !shown && dialog.open() {
+                restored_new_chat_non_cancelable.set_value(false);
                 dialog.close();
             }
         }
     });
     let on_cancel = move |event: ev::Event| {
+        restored_new_chat_non_cancelable.set_value(false);
         // The vault's dialog stays until the vault opens.
         if ui.phase.get_untracked() != Phase::Unlocked {
             event.prevent_default();
@@ -58,6 +62,9 @@ pub(super) fn VaultDialog() -> impl IntoView {
             // waiting NewChat draft is restored, otherwise unwind it back to the chat list.
             if engine().dismiss_sign_in() {
                 retain_active_chat_history_reservation();
+                if !event.cancelable() {
+                    restored_new_chat_non_cancelable.set_value(true);
+                }
                 event.prevent_default();
             } else {
                 cancel_active_chat_history_reservation();
@@ -66,15 +73,39 @@ pub(super) fn VaultDialog() -> impl IntoView {
             .dialog
             .with_untracked(|dialog| matches!(dialog, Some(Dialog::NewChat { .. })))
         {
-            // Revoke any in-flight submission and reservation synchronously on `cancel` (before
-            // the queued `close` event runs) so a late 403 in that interval cannot reopen SignIn.
+            // Revoke any in-flight submission, draft, dialog state, and reservation synchronously
+            // on `cancel` (before the queued `close` event runs) so a late 403 in that interval
+            // cannot capture the dismissed draft or reopen SignIn.
             engine().cancel_active_startup_submission();
             cancel_active_chat_history_reservation();
+            ui.dialog.set(None);
         }
     };
     let on_close = move |_| {
+        let reopen_restored_new_chat = restored_new_chat_non_cancelable.get_value();
+        restored_new_chat_non_cancelable.set_value(false);
         // Ignore stale queued close events if a new modal dialog has already opened.
-        if dialog.get_untracked().is_some_and(|d| !d.open()) {
+        if let Some(d) = dialog.get_untracked()
+            && !d.open()
+        {
+            // Non-cancelable CloseWatcher dismissals ignore `prevent_default()` in `on_cancel`
+            // and close `<dialog>` anyway. Re-open immediately for mandatory vault phases or a
+            // restored `NewChat` draft so the modal cannot permanently vanish.
+            if matches!(
+                ui.phase.get_untracked(),
+                Phase::Create | Phase::Locked | Phase::Elsewhere | Phase::Unavailable(_, _)
+            ) {
+                let _ = d.show_modal();
+                return;
+            }
+            if reopen_restored_new_chat
+                && ui
+                    .dialog
+                    .with_untracked(|current| matches!(current, Some(Dialog::NewChat { .. })))
+            {
+                let _ = d.show_modal();
+                return;
+            }
             // If a native Escape or system dialog-close request closed an active startup form
             // (`ui.dialog` is still set, unlike programmatic closes), cancel any in-flight
             // submission and unwind its reserved browser history entry synchronously.
@@ -185,11 +216,27 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
             .map(|server| (server.clone(), me.server))
     });
     engine().new_chat_mounted(key.clone(), name.clone(), server.clone(), pq_pinned);
+    let last_key = StoredValue::new(key.clone());
     let key = RwSignal::new(key);
     let name = RwSignal::new(name);
     let server_saved = StoredValue::new(server);
+    let progress = Progress::new();
+    let classical_needed = RwSignal::new(None::<bool>);
+    if let Some(feedback) = engine().take_new_chat_feedback() {
+        apply_start_chat_error(feedback, classical_needed, progress);
+    }
     Effect::new(move || {
-        engine().new_chat_edited(key.get(), name.get());
+        let current_key = key.get();
+        let current_name = name.get();
+        let key_changed = last_key.with_value(|prev| *prev != current_key);
+        if key_changed {
+            last_key.set_value(current_key.clone());
+            classical_needed.set(None);
+            if !progress.working.get_untracked() {
+                progress.clear();
+            }
+        }
+        engine().new_chat_edited(current_key, current_name);
     });
     let active_submit = StoredValue::new(None::<(u64, super::history::Reservation)>);
     on_cleanup(move || {
@@ -206,12 +253,10 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
             }
         }
     });
-    let progress = Progress::new();
-    let classical_needed = RwSignal::new(None::<bool>);
-    if let Some(feedback) = engine().take_new_chat_feedback() {
-        apply_start_chat_error(feedback, classical_needed, progress);
-    }
     let start = move |allow_classical: bool| {
+        if progress.working.get_untracked() {
+            return;
+        }
         classical_needed.set(None);
         let raw_key = key.get_untracked();
         // Validate locally before reserving browser history so mistyped keys never push a history
@@ -286,7 +331,10 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                     // Retain the gesture-pushed reserved slot while `NewChat` stays open for a
                     // retry (e.g. "Allow classical"); closing `NewChat` unwinds it cleanly.
                     let still_owned = !cancelled && retain_chat_history(Some(reservation));
-                    if still_owned {
+                    let key_unchanged = key
+                        .try_get_untracked()
+                        .is_some_and(|current| current == draft.key);
+                    if still_owned && key_unchanged {
                         apply_start_chat_error(err, classical_needed, progress);
                     } else {
                         progress.clear();
@@ -328,9 +376,21 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 }
             })}
             <label for="peer-key">"Their identity key"</label>
-            <input id="peer-key" required autocomplete="off" spellcheck="false" bind:value=key />
+            <input
+                id="peer-key"
+                required
+                autocomplete="off"
+                spellcheck="false"
+                disabled=move || progress.working.get()
+                bind:value=key
+            />
             <label for="peer-name">"Their name, for you"</label>
-            <input id="peer-name" autocomplete="off" bind:value=name />
+            <input
+                id="peer-name"
+                autocomplete="off"
+                disabled=move || progress.working.get()
+                bind:value=name
+            />
             {elsewhere
                 .map(|(theirs, yours)| {
                     view! {
@@ -404,7 +464,14 @@ fn Identity() -> impl IntoView {
         let next_name = name.get_untracked();
         act_while(busy, async move {
             engine.set_name(next_name).await?;
-            engine.ui().dialog.set(None);
+            if !busy.is_disposed()
+                && engine
+                    .ui()
+                    .dialog
+                    .with_untracked(|dialog| *dialog == Some(Dialog::Identity))
+            {
+                engine.ui().dialog.set(None);
+            }
             Ok(())
         });
     };
@@ -474,6 +541,19 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     } else {
         contact.name.clone()
     });
+    let name_edited = RwSignal::new(false);
+    // When approving classical encryption on a newly quarantined chat request unpacks the peer's
+    // `Hello` inside this dialog, prefill the untouched name field with their `hello_name`.
+    Effect::new(move |_| {
+        if let Some(c) = live_contact()
+            && c.request
+            && !c.hello_name.is_empty()
+            && !name_edited.get_untracked()
+            && name.get_untracked().is_empty()
+        {
+            name.set(c.hello_name);
+        }
+    });
     let confirm_delete = RwSignal::new(false);
     // Saving, accepting or deleting, which its buttons wait for.
     let busy = RwSignal::new(false);
@@ -489,16 +569,18 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             return;
         }
         let engine = engine();
+        let next_name = name.get_untracked();
         act_while(busy, async move {
             if req {
-                engine.accept(peer, name.get_untracked()).await?;
+                engine.accept(peer, next_name).await?;
             } else {
-                engine.rename(peer, name.get_untracked()).await?;
+                engine.rename(peer, next_name).await?;
             }
-            if engine
-                .ui()
-                .dialog
-                .with_untracked(|dialog| *dialog == Some(Dialog::Contact(peer)))
+            if !busy.is_disposed()
+                && engine
+                    .ui()
+                    .dialog
+                    .with_untracked(|dialog| *dialog == Some(Dialog::Contact(peer)))
             {
                 engine.ui().dialog.set(None);
             }
@@ -514,10 +596,11 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         act_while(busy, async move {
             engine.delete(peer).await?;
             super::history::forget_peer(peer);
-            if engine
-                .ui()
-                .dialog
-                .with_untracked(|dialog| *dialog == Some(Dialog::Contact(peer)))
+            if !busy.is_disposed()
+                && engine
+                    .ui()
+                    .dialog
+                    .with_untracked(|dialog| *dialog == Some(Dialog::Contact(peer)))
             {
                 engine.ui().dialog.set(None);
             }
@@ -546,7 +629,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                     let strict_pq = strict_pq.get();
                     let show_allow = can_allow_classical(c.classical_prompt, strict_pq);
                     let show_upgrade = pq_available(ui) && contact_can_upgrade_to_pq(&c);
-                    let show_dismiss = c.has_downgrade();
+                    let show_dismiss = c.has_downgrade() && !c.is_quarantined();
                     view! {
                         <div class="contact-security">
                             <div class="contact-security-row">
@@ -617,7 +700,12 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             <label>"Their identity key"</label>
             <Copyable text=key_to_text(&peer) what="their key" />
             <label for="contact-name">"Their name, for you"</label>
-            <input id="contact-name" autocomplete="off" bind:value=name />
+            <input
+                id="contact-name"
+                autocomplete="off"
+                bind:value=name
+                on:input=move |_| name_edited.set(true)
+            />
             <div class="actions">
                 <button
                     type="button"

@@ -129,8 +129,9 @@ impl SharedKeys {
     /// HKDF-SHA256 with [`KEY_LENGTH`] zero bytes as salt and `"ratchetx2.v1"` as info.
     pub fn from_secret(secret: &SecretKey) -> Self {
         let mut keys = Zeroizing::new([[0; KEY_LENGTH]; 3]);
-        Hkdf::<Sha256>::new(Some(&[0; KEY_LENGTH]), secret)
-            .expand(b"ratchetx2.v1", keys.as_flattened_mut())
+        let (mut prk, hkdf) = Hkdf::<Sha256>::extract(Some(&[0; KEY_LENGTH]), secret);
+        prk.zeroize();
+        hkdf.expand(b"ratchetx2.v1", keys.as_flattened_mut())
             .expect("three keys are a valid HKDF-SHA256 output length");
         let [secret_key, header_key_alice, header_key_bob] = *keys;
         Self {

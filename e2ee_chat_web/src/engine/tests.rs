@@ -284,12 +284,15 @@ fn quarantined_primary_survives_second_initial_and_blocks_accept() {
         Some(proto::SessionState::default()),
         b"msg-2".to_vec(),
         false,
+        true,
         1234,
     );
     assert!(state.quarantined_session.is_some());
     assert!(state.quarantined_primary);
     assert!(contact_state_is_new_quarantined(&state));
     assert_eq!(state.quarantined_first_message, b"msg-2");
+    assert!(!state.quarantined_was_pq_pinned);
+    assert_eq!(state.security_alert, crate::vault::SECURITY_ALERT_DOWNGRADE);
 
     // UI / Engine::accept() bypass regression: accepting while quarantined MUST be refused
     // and leave `request` and `quarantined_primary` intact.
@@ -3161,4 +3164,110 @@ fn fallback_farewells_greeting_only_403_and_per_row_signals() {
     let _restore = RestoreLock(crate::glue::set_lock_released_for_test(true));
     assert!(!crate::glue::owns_lock());
     assert!(futures::executor::block_on(inner.save(&[])).is_err());
+}
+
+#[test]
+fn resolve_stalled_pauses_existing_quarantined_contacts_and_session_seq_is_monotonic() {
+    let mut client = Client::new(Fetch::client(TEST_SERVER));
+    let (peer, incoming) = futures::executor::block_on(carried_initial(&mut client));
+    let session = match client
+        .accept_initial_v2(
+            &peer,
+            &Default::default(),
+            &incoming,
+            Fetch::client(TEST_SERVER),
+        )
+        .unwrap()
+    {
+        session::AcceptedInitial::Accepted { session, .. }
+        | session::AcceptedInitial::Quarantined { session, .. } => session,
+    };
+    let mut inner = load_contacts(&client, vec![]);
+    inner.contacts.push(super::contact::Contact {
+        peer,
+        session,
+        deferred_carried: 0,
+        state: ContactState {
+            peer: peer.to_vec(),
+            quarantined: true,
+            quarantined_primary: false,
+            ..ContactState::default()
+        },
+    });
+    // Existing contact with a quarantined inbound classical session must pause without skipping
+    // queued messages encrypted under the pending classical session.
+    assert!(super::sync::resolve_stalled_peer(
+        &mut inner,
+        &peer,
+        super::handshake::JoinCarriedOutcome::default(),
+    ));
+
+    // Once quarantine lifts, stalling skips normally.
+    inner.contact(&peer).unwrap().state.quarantined = false;
+    assert!(!super::sync::resolve_stalled_peer(
+        &mut inner,
+        &peer,
+        super::handshake::JoinCarriedOutcome::default(),
+    ));
+
+    // Monotonic new-chat session_seq stays strictly above prior AppState floor (used by start_chat,
+    // upgrade_to_pq, and seal_next so delete + inbound reconnect never reuses a low session_seq).
+    let first = inner.next_new_chat_session_seq();
+    assert!(first >= 1);
+    inner.state.next_session_seq = first.saturating_add(500);
+    let second = inner.next_new_chat_session_seq();
+    assert!(second >= first + 500);
+    let hello = inner.client.make_hello("Alice".to_string(), second);
+    assert_eq!(hello.session_seq, second);
+
+    // Quarantined contact high-water mark accounts for both active_peer_session_seq and
+    // already-held `quarantined_session.active_peer_session_seq`.
+    let contact = inner.contact(&peer).unwrap();
+    contact.state.quarantined = true;
+    contact.state.quarantined_primary = true;
+    let mut held = session::proto::SessionState::default();
+    held.active_peer_session_seq = 42;
+    contact.state.quarantined_session = Some(held);
+    let high_water = contact
+        .session
+        .peer_session_seq()
+        .max(if contact.is_new_quarantined() {
+            contact.session.active_peer_session_seq()
+        } else {
+            0
+        })
+        .max(
+            contact
+                .state
+                .quarantined_session
+                .as_ref()
+                .map_or(0, |s| s.active_peer_session_seq),
+        );
+    assert_eq!(high_water, 42);
+
+    // E3: `stage_carried_initials` skips a classical carried initial whose ephemeral key matches
+    // an already-held `quarantined_session.id`, preventing a re-quarantine/re-stage loop.
+    let classical_wire = session::protocol::handshake_v2::InitialMessageV2 {
+        version: 1,
+        identity_key: bytes::Bytes::from_static(&[7u8; 32]),
+        ephemeral_key: bytes::Bytes::from_static(&[9u8; 32]),
+        signed_prekey: bytes::Bytes::from_static(&[8u8; 32]),
+        first_message: Some(Default::default()),
+        ..Default::default()
+    };
+    let classical_init = session::InitialMessageV2::try_from(&classical_wire).unwrap();
+    let mut q_state = ContactState {
+        quarantined: true,
+        quarantined_session: Some({
+            let mut s = session::proto::SessionState::default();
+            s.id = vec![9u8; 32];
+            s
+        }),
+        ..ContactState::default()
+    };
+    super::handshake::stage_carried_initials(&mut q_state, [&classical_init]).unwrap();
+    assert!(
+        q_state.pending_carried_initials.is_empty(),
+        "already-quarantined classical initial must not be re-staged"
+    );
 }

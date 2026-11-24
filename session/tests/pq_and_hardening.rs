@@ -4427,7 +4427,8 @@ mod pq_e2e {
         );
 
         // 7. True v1-only server returns confirmed `ErrorKind::Unimplemented` (no silent v1
-        //    fallback), restoring `manifest_seq == 0` and retracting retry PQOPKs cleanly!
+        //    fallback), restoring `manifest_seq == 0`, `prekey_generation == 0`, and popping the
+        //    unpublished generation cleanly!
         let v1_store = SharedStore::default();
         let v1_srv = V1OnlyServer {
             hs: V1Handshake(Arc::new(HandshakeServer::new(v1_store.clone()))),
@@ -4440,17 +4441,20 @@ mod pq_e2e {
         assert!(err_v1.is_server_refusal());
         bob_v1.rollback_publish_v2_on_refusal(prep_v1);
         assert_eq!(bob_v1.manifest_seq(), 0);
-        assert_eq!(bob_v1.current_pq_one_time_count(suite), 3);
+        assert_eq!(bob_v1.prekey_generation(), 0);
+        assert_eq!(bob_v1.current_pq_one_time_count(suite), 0);
 
-        // Retry extends the pending generation; confirmed `Unimplemented` retracts its extra keys.
+        // Retry after rollback prepares generation 1 cleanly again and rolls back on refusal.
         let retry_v1 = bob_v1.prepare_publish_v2(AUDIENCE, 2, 2).unwrap();
-        assert_eq!(bob_v1.current_pq_one_time_count(suite), 5);
+        assert_eq!(bob_v1.prekey_generation(), 1);
+        assert_eq!(bob_v1.current_pq_one_time_count(suite), 2);
         let err_retry = bob_v1.transmit_publish_v2(&retry_v1).await.unwrap_err();
         assert_eq!(err_retry.kind(), ErrorKind::Unimplemented);
         assert!(err_retry.is_server_refusal());
         bob_v1.rollback_publish_v2_on_refusal(retry_v1);
         assert_eq!(bob_v1.manifest_seq(), 0);
-        assert_eq!(bob_v1.current_pq_one_time_count(suite), 3);
+        assert_eq!(bob_v1.prekey_generation(), 0);
+        assert_eq!(bob_v1.current_pq_one_time_count(suite), 0);
     }
 
     #[tokio::test]
@@ -5586,7 +5590,8 @@ mod v2_wire_unconditional {
             ErrorKind::Unimplemented
         );
         assert_eq!(unimpl_client.manifest_seq(), 0);
-        assert_eq!(unimpl_client.current_one_time_count(), 2);
+        assert_eq!(unimpl_client.prekey_generation(), 0);
+        assert_eq!(unimpl_client.current_one_time_count(), 0);
         assert_eq!(
             unimpl_client
                 .publish_v2(AUDIENCE, 1, 0)
@@ -5596,7 +5601,8 @@ mod v2_wire_unconditional {
             ErrorKind::Unimplemented
         );
         assert_eq!(unimpl_client.manifest_seq(), 0);
-        assert_eq!(unimpl_client.current_one_time_count(), 2);
+        assert_eq!(unimpl_client.prekey_generation(), 0);
+        assert_eq!(unimpl_client.current_one_time_count(), 0);
         assert_eq!(
             unimpl_client
                 .prepare_initiate_v2(
@@ -5695,5 +5701,481 @@ mod v2_wire_unconditional {
         let still_queued = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
         assert_eq!(still_queued.messages.len(), 1);
         assert_eq!(still_queued.messages[0].id, queued.id);
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[tokio::test]
+    async fn signed_pq_off_manifest_allows_repeated_rekeying_and_merge_guards_pq_pin() {
+        let store = SharedStore::default();
+        let hs = V2OnlyHandshake::new(store.clone(), AUDIENCE);
+        let mb = V2OnlyMailbox::new(store, AUDIENCE);
+
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs.clone());
+        alice.publish_v2(AUDIENCE, 4, 4).await.unwrap();
+        bob.publish_v2(AUDIENCE, 4, 4).await.unwrap();
+
+        // 1. Establish initial PQ session (pins Bob at manifest_seq = 1, peer_pq_capable = true).
+        let mut alice_sess = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"pq-hi",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(alice_sess.peer_pq_state().pq_pinned);
+        assert!(alice_sess.peer_pq_state().peer_pq_capable);
+        assert_eq!(alice_sess.peer_pq_state().pinned_manifest_seq, 1);
+
+        // 2. Bob legitimately turns PQ off and publishes signed PQ-OFF manifest (seq = 2).
+        bob.set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+        bob.publish_v2(AUDIENCE, 6, 0).await.unwrap();
+
+        // Alice explicitly approves classical fallback and rekeys twice against the SAME seq = 2
+        // signed PQ-OFF manifest without hitting false-positive DowngradeDetected.
+        alice_sess.peer_pq_state_mut().approve_classical_exception();
+        alice
+            .start_again_v2(AUDIENCE, &mut alice_sess, b"off-rekey-1")
+            .await
+            .unwrap();
+        assert!(!alice_sess.peer_pq_state().peer_pq_capable);
+        assert_eq!(alice_sess.peer_pq_state().pinned_manifest_seq, 2);
+
+        alice
+            .start_again_v2(AUDIENCE, &mut alice_sess, b"off-rekey-2")
+            .await
+            .unwrap();
+        assert!(!alice_sess.peer_pq_state().peer_pq_capable);
+
+        // 3. `discard_active` removes the active session without archiving it into `others`.
+        let mut bob_discard = bob
+            .initiate_v2(
+                AUDIENCE,
+                &alice.identity_key(),
+                &PeerPqState::default(),
+                b"c1",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let _ = bob_discard.encrypt(b"c2").unwrap();
+        bob_discard.discard_active();
+        assert!(bob_discard.needs_new_session());
+        let proto_after: session::proto::SessionState = bob_discard.state().into();
+        assert!(proto_after.others.is_empty());
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[tokio::test]
+    async fn fast_clock_does_not_poison_v2_rpcs_and_refused_rotation_rolls_back_generation() {
+        let store = SharedStore::default();
+        let hs = V2OnlyHandshake::new(store.clone(), AUDIENCE);
+
+        // 1. Fast device clock (+2 hours ahead of server) is synced back via ServerClock without
+        //    permanently poisoning `publish_v2`, `list_initial_messages_v2`, or `refill_prekeys_v2`.
+        let fast_clock = session::ServerClock::default();
+        let now_ms = fast_clock.now();
+        fast_clock.observe(now_ms + 2 * 60 * 60 * 1000);
+        let mut bob = Client::new(hs.clone()).with_clock(fast_clock);
+        let fast_prep = bob.prepare_publish_v2(AUDIENCE, 2, 2).unwrap();
+        let fast_err = bob.transmit_publish_v2(&fast_prep).await.unwrap_err();
+        assert_eq!(fast_err.kind(), ErrorKind::Protocol);
+        bob.rollback_publish_v2_on_refusal(fast_prep);
+        assert_eq!(bob.prekey_generation(), 0);
+
+        // Sync clock to server time and retry publish + refill + list cleanly.
+        bob.clock().observe(now_ms);
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        assert_eq!(bob.prekey_generation(), 1);
+        let _ = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+
+        // 2. Rotating publish at KEPT_GENERATIONS capacity restores evicted generation on refusal!
+        let spk1 = bob.current_signed_prekey().unwrap();
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        assert_eq!(bob.prekey_generation(), 2);
+        assert_eq!(bob.oldest_evictable_signed_prekey(), Some(spk1));
+
+        let gen3 = bob.prepare_publish_v2(AUDIENCE, 2, 2).unwrap();
+        assert_eq!(bob.prekey_generation(), 3);
+        assert_ne!(bob.oldest_evictable_signed_prekey(), Some(spk1));
+        bob.rollback_publish_v2_on_refusal(gen3);
+        assert_eq!(bob.prekey_generation(), 2);
+        assert_eq!(bob.oldest_evictable_signed_prekey(), Some(spk1));
+        // Refill on generation 2 still succeeds cleanly after rolling back refused gen 3.
+        bob.refill_prekeys_v2(AUDIENCE, 1, 1).await.unwrap();
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[tokio::test]
+    async fn merge_rejects_stale_incoming_classical_exception_and_list_batch_updates_peer_state() {
+        let store = SharedStore::default();
+        let hs = V2OnlyHandshake::new(store.clone(), AUDIENCE);
+        let mb = V2OnlyMailbox::new(store, AUDIENCE);
+
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs.clone());
+        bob.publish_v2(AUDIENCE, 6, 6).await.unwrap();
+        alice.publish_v2(AUDIENCE, 6, 6).await.unwrap();
+
+        // Alice queues a PQ initial followed by a classical initial in Bob's inbox.
+        let _ = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"pq-first",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        alice
+            .set_pq_config(PqConfig {
+                pq_enabled: false,
+                strict_pq: false,
+                ..PqConfig::default()
+            })
+            .unwrap();
+        let _ = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"classical-second",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+
+        // Even when Bob starts the batch with `allow_classical_exception = true`, once the PQ
+        // initial is accepted in the batch, the subsequent classical initial MUST be quarantined
+        // (not accepted with the stale pre-batch exception).
+        let mut pre_batch = PeerPqState::default();
+        pre_batch.approve_classical_exception();
+        let outcome = bob
+            .list_and_accept_v2(AUDIENCE, 10, mb.clone(), |_| pre_batch.clone())
+            .await
+            .unwrap();
+        assert_eq!(outcome.outcomes.len(), 2);
+        let mut iter = outcome.outcomes.into_iter();
+        let AcceptedInitial::Accepted {
+            session: mut pq_sess,
+            ..
+        } = iter.next().unwrap().1
+        else {
+            panic!("first initial must be accepted PQ");
+        };
+        assert!(
+            matches!(iter.next().unwrap().1, AcceptedInitial::Quarantined { .. }),
+            "second classical initial in same batch must be quarantined once PQ pinned in batch"
+        );
+        assert!(pq_sess.peer_pq_state().pq_pinned);
+        assert!(!pq_sess.peer_pq_state().allow_classical_exception);
+
+        // Even if a caller attempts to merge a classical session carrying stale
+        // `allow_classical_exception = true`, `accept_replacement` MUST reject with DowngradeDetected.
+        let _ = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"classical-stale-flag",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        let AcceptedInitial::Accepted {
+            session: mut stale_classical,
+            ..
+        } = bob
+            .accept_initial_v2(&alice.identity_key(), &pre_batch, &listed.messages[0], mb)
+            .unwrap()
+        else {
+            panic!("accepted under stale pre_batch");
+        };
+        stale_classical
+            .peer_pq_state_mut()
+            .approve_classical_exception();
+        assert_eq!(
+            pq_sess
+                .accept_replacement(stale_classical)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::DowngradeDetected
+        );
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[tokio::test]
+    async fn cycle3_publish_rollback_clock_recovery_hello_clear_and_carried_id_zeroing() {
+        let store = SharedStore::default();
+        let hs = V2OnlyHandshake::new(store.clone(), AUDIENCE);
+        let mb = V2OnlyMailbox::new(store, AUDIENCE);
+
+        // 1. B1: `prepare_publish_v2` error (expires_at > MAX_SAFE_INTEGER) leaves prekeys clean.
+        let near_max_clock = session::ServerClock::default();
+        near_max_clock.observe(protocol::MAX_SAFE_INTEGER - 10);
+        let mut bob = Client::new(hs.clone()).with_clock(near_max_clock);
+        assert_eq!(
+            bob.prepare_publish_v2(AUDIENCE, 2, 2).unwrap_err().kind(),
+            ErrorKind::Protocol
+        );
+        assert!(bob.current_signed_prekey().is_none());
+        assert_eq!(bob.prekey_generation(), 0);
+
+        // 2. B2: Far-future persisted `last_timestamp` does not permanently wedge `refill_prekeys_v2`.
+        let clock = session::ServerClock::default();
+        let now_ms = clock.now();
+        clock.observe(now_ms);
+        let mut carol = Client::new(hs.clone()).with_clock(clock);
+        carol.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        let mut proto_state: session::proto::ClientState = carol.state().into();
+        proto_state.last_timestamp = now_ms + protocol::MAX_CLOCK_SKEW + 60_000;
+        let restored = session::ClientState::try_from(&proto_state).unwrap();
+        let mut carol = Client::restore(hs.clone(), restored);
+        carol.clock().observe(now_ms);
+        carol.refill_prekeys_v2(AUDIENCE, 1, 1).await.unwrap();
+
+        // 3. B3: Rolling back a stale `PreparedPublishV2` after a newer publish does not clobber
+        //    the newer `manifest_seq` or `prekey_generation`.
+        let stale_prep = carol.prepare_publish_v2(AUDIENCE, 1, 1).unwrap();
+        let newer_prep = carol.prepare_publish_v2(AUDIENCE, 1, 1).unwrap();
+        let newer_seq = carol.manifest_seq();
+        let newer_gen = carol.prekey_generation();
+        carol.commit_publish_v2(newer_prep);
+        carol.rollback_publish_v2_on_refusal(stale_prep);
+        assert_eq!(carol.manifest_seq(), newer_seq);
+        assert_eq!(carol.prekey_generation(), newer_gen);
+
+        // 4. B4: `check_peer_hello` clears `allow_classical_exception` when `hello.pq_capable`.
+        let mut peer_state = PeerPqState::default();
+        peer_state.approve_classical_exception();
+        let hello = protocol::content::Hello {
+            name: "Peer".into(),
+            pq_capable: true,
+            max_version: x3dh::PQXDH_VERSION,
+            session_seq: 1,
+            offered_suites: vec![u32::from(PqSuite::MlKem1024.as_u8())],
+            pq_ratchet_capable: true,
+        };
+        let hc =
+            session::check_peer_hello(&mut peer_state, SessionSecurity::classical(), &hello, true);
+        assert!(hc.downgrade_detected);
+        assert!(peer_state.pq_pinned);
+        assert!(!peer_state.allow_classical_exception);
+
+        // 5. B5: `MailboxV2Server::push_v2` rejects carried initial with `id != 0`, and carried
+        //    decoders unconditionally zero `id`.
+        let mut alice = Client::new(hs.clone());
+        alice.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        let mut alice_sess = alice
+            .initiate_v2(
+                AUDIENCE,
+                &carol.identity_key(),
+                &PeerPqState::default(),
+                b"hello",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let sealed = alice_sess.encrypt(b"msg").unwrap();
+        let mut bad_push = alice_sess.push_v2_request(sealed);
+        let carried = bad_push.initial_message.as_mut().expect("carried initial");
+        carried.id = 99;
+        let encoded_zeroed = protocol::mailbox_v2::encode_carried_initial(carried).unwrap();
+        assert_eq!(
+            protocol::mailbox_v2::decode_carried_initial(&encoded_zeroed)
+                .unwrap()
+                .id,
+            0
+        );
+        assert_eq!(
+            session::InitialMessageV2::decode_carried(&encoded_zeroed)
+                .unwrap()
+                .id,
+            0
+        );
+        assert_eq!(
+            mb.push_v2(bad_push).await.unwrap_err().kind(),
+            protocol::ErrorKind::Malformed
+        );
+
+        // 6. B6: `MailboxV2Server::push_v2` rejects carried initial whose identity_key != sender.
+        let sealed_m2 = alice_sess.encrypt(b"m2").unwrap();
+        let mut wrong_sender_push = alice_sess.push_v2_request(sealed_m2);
+        let bob_id = bob.identity_key();
+        wrong_sender_push
+            .initial_message
+            .as_mut()
+            .unwrap()
+            .identity_key = Bytes::copy_from_slice(&bob_id);
+        assert_eq!(
+            mb.push_v2(wrong_sender_push).await.unwrap_err().kind(),
+            protocol::ErrorKind::Malformed
+        );
+
+        // 7. B3: `Session::check_peer_hello` on a retired session (`active == None`) does not
+        //    raise a false-positive downgrade for a PQ-capable peer.
+        let mut retired_sess = alice_sess;
+        retired_sess.retire();
+        assert!(retired_sess.needs_new_session());
+        let late_hello = protocol::content::Hello {
+            name: "Carol".into(),
+            pq_capable: true,
+            max_version: x3dh::PQXDH_VERSION,
+            session_seq: 1,
+            offered_suites: vec![u32::from(PqSuite::MlKem1024.as_u8())],
+            pq_ratchet_capable: true,
+        };
+        let check = retired_sess.check_peer_hello(&late_hello, true);
+        assert!(!check.downgrade_detected);
+        assert!(!retired_sess.peer_pq_state().downgrade_detected);
+        assert!(retired_sess.peer_pq_state().pq_pinned);
+
+        // 8. B4: `rollback_publish_v2_on_refusal` restores `prekey_generation` when an extended
+        //    publish (`prepare_publish_v2` on a client with `prekey_generation == 0` and existing
+        //    signed prekey) is rolled back.
+        let mut legacy_client = Client::new(hs.clone());
+        #[allow(deprecated)]
+        {
+            let prep_v1 = legacy_client.prepare_publish(1).unwrap();
+            legacy_client.commit_publish(prep_v1);
+        }
+        assert_eq!(legacy_client.prekey_generation(), 0);
+        let prep_ext = legacy_client.prepare_publish_v2(AUDIENCE, 1, 1).unwrap();
+        assert_eq!(legacy_client.prekey_generation(), 1);
+        legacy_client.rollback_publish_v2_on_refusal(prep_ext);
+        assert_eq!(legacy_client.prekey_generation(), 0);
+
+        // 9. B1 & B2: Mixed PQ/classical crossed-start deterministically prefers PQ regardless of
+        //    session id order, and merging a PQ session clears any prior `allow_classical_exception`.
+        let mut dave = Client::new(hs.clone());
+        let mut erin = Client::new(hs.clone());
+        dave.publish_v2(AUDIENCE, 4, 4).await.unwrap();
+        erin.publish_v2(AUDIENCE, 4, 4).await.unwrap();
+        // Erin initiates PQ; Dave initiates classical (with PQ temporarily disabled).
+        let erin_pq = erin
+            .initiate_v2(
+                AUDIENCE,
+                &dave.identity_key(),
+                &PeerPqState::default(),
+                b"erin-pq",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        dave.set_pq_config(PqConfig {
+            pq_enabled: false,
+            preferred_suite: PqConfig::default_suite(),
+            pq_ratchet_enabled: false,
+            strict_pq: false,
+        })
+        .unwrap();
+        let dave_cl = dave
+            .initiate_v2(
+                AUDIENCE,
+                &erin.identity_key(),
+                &PeerPqState::default(),
+                b"dave-cl",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let dave_listed = dave.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        let erin_listed = erin.list_initial_messages_v2(AUDIENCE, 10).await.unwrap();
+        // Re-enable PQ on Dave and accept Erin's PQ initial; Dave's classical session was started
+        // locally (`known_by_peer == false`) with `allow_classical_exception = true`.
+        dave.set_pq_config(PqConfig::default()).unwrap();
+        let mut dave_sess = dave_cl;
+        dave_sess.peer_pq_state_mut().approve_classical_exception();
+        let AcceptedInitial::Accepted {
+            session: dave_accepted_pq,
+            ..
+        } = dave
+            .accept_initial_v2(
+                &erin.identity_key(),
+                dave_sess.peer_pq_state(),
+                &dave_listed.messages[0],
+                mb.clone(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Dave to accept Erin's PQ initial");
+        };
+        assert!(
+            dave_sess.accept_replacement(dave_accepted_pq).unwrap(),
+            "PQ incoming session must beat unconfirmed classical local session"
+        );
+        assert!(dave_sess.security().unwrap().is_pq);
+        assert!(!dave_sess.peer_pq_state().allow_classical_exception);
+
+        // On Erin's side, accepting Dave's classical initial is quarantined (because Erin already
+        // pinned PQ for Dave); even if subsequently merged via `accept_replacement_with_policy`,
+        // it MUST NOT displace Erin's unconfirmed local PQ session.
+        let mut erin_sess = erin_pq;
+        let AcceptedInitial::Quarantined {
+            session: erin_accepted_cl,
+            peer_was_pq_pinned: true,
+            ..
+        } = erin
+            .accept_initial_v2(
+                &dave.identity_key(),
+                erin_sess.peer_pq_state(),
+                &erin_listed.messages[0],
+                mb.clone(),
+            )
+            .unwrap()
+        else {
+            panic!("expected Erin to quarantine Dave's classical initial");
+        };
+        assert!(
+            !erin_sess
+                .accept_replacement_with_policy(erin_accepted_cl, false)
+                .unwrap(),
+            "classical incoming session must NOT beat unconfirmed PQ local session"
+        );
+        assert!(erin_sess.security().unwrap().is_pq);
+
+        // 10. Cycle 5 B1: A genuinely stale `Hello { pq_capable: true, session_seq: 1 }` arriving
+        //     after `session_seq: 2` on a peer who published a newer signed `PQ-OFF` manifest
+        //     must return `stale_session_seq: true` WITHOUT mutating `peer_pq_capable`, revoking
+        //     `allow_classical_exception`, or raising a false-positive `downgrade_detected`.
+        let mut peer_after_pq_off = PeerPqState {
+            pq_pinned: true,
+            pinned_manifest_seq: 2,
+            peer_pq_capable: false,
+            allow_classical_exception: true,
+            downgrade_detected: false,
+            peer_session_seq: 2,
+        };
+        let stale_pq_hello = protocol::content::Hello {
+            name: "Peer".into(),
+            pq_capable: true,
+            max_version: x3dh::PQXDH_VERSION,
+            session_seq: 1,
+            offered_suites: vec![u32::from(PqSuite::MlKem1024.as_u8())],
+            pq_ratchet_capable: true,
+        };
+        let stale_res = session::check_peer_hello(
+            &mut peer_after_pq_off,
+            SessionSecurity::classical(),
+            &stale_pq_hello,
+            true,
+        );
+        assert!(stale_res.stale_session_seq);
+        assert!(!stale_res.downgrade_detected);
+        assert!(!stale_res.recommend_start_again);
+        assert!(!peer_after_pq_off.peer_pq_capable);
+        assert!(peer_after_pq_off.allow_classical_exception);
+        assert!(!peer_after_pq_off.downgrade_detected);
+        assert_eq!(peer_after_pq_off.peer_session_seq, 2);
     }
 }

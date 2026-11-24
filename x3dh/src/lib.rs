@@ -35,9 +35,9 @@ use x25519_dalek::SharedSecret;
 /// Re-export x25519_dalek's private key, which [`LocalPrekeys::accept`] returns.
 pub use x25519_dalek::StaticSecret;
 use xeddsa::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, XEdDSAPrivateKey, XEdDSAPublicKey};
-use zeroize::Zeroizing;
 #[cfg(feature = "rkyv")]
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::ZeroizeOnDrop;
+use zeroize::{Zeroize, Zeroizing};
 
 /// An X25519 (or XEdDSA identity) public key.
 pub type PublicKey = [u8; PUBLIC_KEY_LENGTH];
@@ -174,6 +174,22 @@ struct Generation {
     pq_one_time: HashMap<PqPrekeyId, PqPrekeySecret>,
 }
 
+/// An older prekey generation evicted during a rotating publish, kept transiently in memory so the
+/// caller can restore it if the new publish is definitively refused before reaching the server.
+///
+/// All private key material inside the evicted generation is zeroized on drop.
+pub struct EvictedGeneration {
+    generation: Generation,
+}
+
+impl core::fmt::Debug for EvictedGeneration {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EvictedGeneration")
+            .field("signed_prekey", &self.generation.signed_prekey)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Archives a [`StaticSecret`] as its bytes, zeroizing temporary copies on drop.
 #[cfg(feature = "rkyv")]
 #[derive(Zeroize, ZeroizeOnDrop, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -223,7 +239,11 @@ where
             if x25519_dalek::PublicKey::from(&spk_secret).to_bytes() != generation.signed_prekey {
                 rkyv::rancor::fail!(InvalidArchivedPrekeys);
             }
+            let mut seen_opks = HashSet::with_capacity(generation.one_time.len());
             for (opk_pub, opk_secret_def) in generation.one_time.iter() {
+                if !seen_opks.insert(*opk_pub) {
+                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
+                }
                 let opk_secret_bytes = Zeroizing::new(opk_secret_def.bytes);
                 let opk_secret = StaticSecret::from(*opk_secret_bytes);
                 if x25519_dalek::PublicKey::from(&opk_secret).to_bytes() != *opk_pub {
@@ -236,8 +256,13 @@ where
                 }
             }
             let mut last_resort_ids = HashSet::with_capacity(generation.pq_last_resort.len());
+            let mut prev_suite: Option<PqSuite> = None;
             for (k_suite, pq) in generation.pq_last_resort.iter() {
                 let key_suite = archived_suite(k_suite);
+                if prev_suite.is_some_and(|prev| key_suite <= prev) {
+                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
+                }
+                prev_suite = Some(key_suite);
                 let val_suite = archived_suite(&pq.suite);
                 if key_suite != val_suite {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
@@ -255,7 +280,11 @@ where
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
             }
+            let mut seen_pq_opks = HashSet::with_capacity(generation.pq_one_time.len());
             for (id, pq) in generation.pq_one_time.iter() {
+                if !seen_pq_opks.insert(*id) {
+                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
+                }
                 let suite = archived_suite(&pq.suite);
                 let ek = pq.ek.as_slice();
                 if ek.len() != suite.ek_len() {
@@ -578,6 +607,17 @@ impl LocalPrekeys {
         identity: &XEdDSAPrivateKey,
         one_time_count: usize,
     ) -> PublishedPrekeys {
+        self.generate_with_rollback(identity, one_time_count).0
+    }
+
+    /// Like [`generate`](Self::generate), but returns any evicted oldest generation so the caller
+    /// can restore it via [`rollback_generation`](Self::rollback_generation) if the publish is
+    /// definitively refused before reaching the server.
+    pub fn generate_with_rollback(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        one_time_count: usize,
+    ) -> (PublishedPrekeys, Option<EvictedGeneration>) {
         let (signed_prekey, signed_secret) = generate_key_pair();
         let signed_prekey_signature = identity.sign(signed_prekey);
         let mut one_time = HashMap::with_capacity(one_time_count);
@@ -588,8 +628,12 @@ impl LocalPrekeys {
                 public_key
             })
             .collect();
+        let mut evicted = None;
         while self.generations.len() >= KEPT_GENERATIONS {
-            self.generations.pop_front();
+            evicted = self
+                .generations
+                .pop_front()
+                .map(|generation| EvictedGeneration { generation });
         }
         self.generations.push_back(Generation {
             signed_prekey,
@@ -599,11 +643,14 @@ impl LocalPrekeys {
             pq_last_resort: BTreeMap::new(),
             pq_one_time: HashMap::new(),
         });
-        PublishedPrekeys {
-            signed_prekey,
-            signed_prekey_signature,
-            one_time_prekeys,
-        }
+        (
+            PublishedPrekeys {
+                signed_prekey,
+                signed_prekey_signature,
+                one_time_prekeys,
+            },
+            evicted,
+        )
     }
 
     /// Generate a new prekey generation containing classical X3DH prekeys plus a last-resort
@@ -619,6 +666,22 @@ impl LocalPrekeys {
         one_time_count: usize,
         pq_one_time_count: usize,
     ) -> Result<PublishedPqPrekeys> {
+        Ok(self
+            .generate_pq_with_rollback(identity, suite, one_time_count, pq_one_time_count)?
+            .0)
+    }
+
+    /// Like [`generate_pq`](Self::generate_pq), but returns any evicted oldest generation so the
+    /// caller can restore it via [`rollback_generation`](Self::rollback_generation) if the publish
+    /// is definitively refused before reaching the server.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    pub fn generate_pq_with_rollback(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        suite: PqSuite,
+        one_time_count: usize,
+        pq_one_time_count: usize,
+    ) -> Result<(PublishedPqPrekeys, Option<EvictedGeneration>)> {
         if !suite.is_supported() {
             return Err(ErrorKind::UnsupportedSuite.into());
         }
@@ -667,8 +730,12 @@ impl LocalPrekeys {
             pq_one_time.insert(id, PqPrekeySecret { suite, ek, seed });
         }
 
+        let mut evicted = None;
         while self.generations.len() >= KEPT_GENERATIONS {
-            self.generations.pop_front();
+            evicted = self
+                .generations
+                .pop_front()
+                .map(|generation| EvictedGeneration { generation });
         }
         self.generations.push_back(Generation {
             signed_prekey,
@@ -679,15 +746,45 @@ impl LocalPrekeys {
             pq_one_time,
         });
 
-        Ok(PublishedPqPrekeys {
-            classical: PublishedPrekeys {
-                signed_prekey,
-                signed_prekey_signature,
-                one_time_prekeys,
+        Ok((
+            PublishedPqPrekeys {
+                classical: PublishedPrekeys {
+                    signed_prekey,
+                    signed_prekey_signature,
+                    one_time_prekeys,
+                },
+                pq_last_resort: pq_last_resort_pub,
+                pq_one_time_prekeys,
             },
-            pq_last_resort: pq_last_resort_pub,
-            pq_one_time_prekeys,
-        })
+            evicted,
+        ))
+    }
+
+    /// Roll back an unpublished latest generation matching `signed_prekey` (provided no initial
+    /// message has been confirmed against it), restoring `evicted` to the front if present.
+    pub fn rollback_generation(
+        &mut self,
+        signed_prekey: &PublicKey,
+        evicted: Option<EvictedGeneration>,
+    ) -> bool {
+        if !self
+            .generations
+            .back()
+            .is_some_and(|g| g.signed_prekey == *signed_prekey && g.confirmed.is_empty())
+        {
+            return false;
+        }
+        self.generations.pop_back();
+        if let Some(evicted) = evicted
+            && self.generations.len() < KEPT_GENERATIONS
+            && !self
+                .generations
+                .iter()
+                .any(|g| g.signed_prekey == evicted.generation.signed_prekey)
+        {
+            self.generations.push_front(evicted.generation);
+        }
+        true
     }
 
     /// Replenish classical OPKs and/or PQOPKs in the latest generation without rotating the
@@ -1427,8 +1524,9 @@ impl KeyMaterial {
     /// "x3dh.v1").
     fn agree(self, alice_identity_key: &PublicKey, bob_identity_key: &PublicKey) -> Agreement {
         let mut secret_key = Zeroizing::new([0; SECRET_KEY_LENGTH]);
-        Hkdf::<Sha256>::new(Some(&[0; HASH_LENGTH]), &self.0)
-            .expand(INFO, secret_key.as_mut_slice())
+        let (mut prk, hkdf) = Hkdf::<Sha256>::extract(Some(&[0; HASH_LENGTH]), &self.0);
+        prk.zeroize();
+        hkdf.expand(INFO, secret_key.as_mut_slice())
             .expect("SK's length is a valid HKDF-SHA256 output length");
         let mut associated_data = [0; 2 * PUBLIC_KEY_LENGTH];
         let (alice, bob) = associated_data.split_at_mut(PUBLIC_KEY_LENGTH);
@@ -1461,8 +1559,9 @@ impl KeyMaterial {
         info.extend_from_slice(&transcript_hash);
 
         let mut secret_key = Zeroizing::new([0u8; SECRET_KEY_LENGTH]);
-        Hkdf::<Sha256>::new(Some(&[0u8; HASH_LENGTH]), &self.0)
-            .expand(&info, secret_key.as_mut_slice())
+        let (mut prk, hkdf) = Hkdf::<Sha256>::extract(Some(&[0u8; HASH_LENGTH]), &self.0);
+        prk.zeroize();
+        hkdf.expand(&info, secret_key.as_mut_slice())
             .expect("SK's length is a valid HKDF-SHA256 output length");
 
         let mut associated_data = [0u8; PQXDH_ASSOCIATED_DATA_LENGTH];

@@ -55,7 +55,13 @@ pub fn encode_carried_initial(initial: &InitialMessageV2) -> Result<Bytes> {
         let v1 = InitialMessageV1::try_from(initial)?;
         Ok(Bytes::from(v1.encode_to_vec()))
     } else {
-        let encoded = initial.encode_to_vec();
+        let encoded = if initial.id == 0 {
+            initial.encode_to_vec()
+        } else {
+            let mut carried = initial.clone();
+            carried.id = 0;
+            carried.encode_to_vec()
+        };
         let mut out = Vec::with_capacity(V2_CARRIED_INITIAL_MAGIC.len() + encoded.len());
         out.extend_from_slice(V2_CARRIED_INITIAL_MAGIC);
         out.extend_from_slice(&encoded);
@@ -67,7 +73,9 @@ pub fn encode_carried_initial(initial: &InitialMessageV2) -> Result<Bytes> {
 /// seamlessly normalizing both v2 (`b"\0IMV2"`-prefixed) and legacy v1 payloads.
 pub fn decode_carried_initial(bytes: &[u8]) -> Option<InitialMessageV2> {
     if let Some(rest) = bytes.strip_prefix(V2_CARRIED_INITIAL_MAGIC) {
-        InitialMessageV2::decode(rest).ok()
+        let mut msg = InitialMessageV2::decode(rest).ok()?;
+        msg.id = 0;
+        Some(msg)
     } else {
         InitialMessageV1::decode(bytes)
             .ok()
@@ -220,7 +228,17 @@ mod server {
 
             let initial_message = match request.initial_message {
                 Some(ref init) => {
-                    validate_initial_message_v2(init, &self.supported_suites, self.allow_pq_drain)?;
+                    if init.id != 0 {
+                        return Err(ErrorKind::Malformed.into());
+                    }
+                    let validated = validate_initial_message_v2(
+                        init,
+                        &self.supported_suites,
+                        self.allow_pq_drain,
+                    )?;
+                    if validated.sender != sender {
+                        return Err(ErrorKind::Malformed.into());
+                    }
                     let encoded = encode_carried_initial(init)?;
                     if encoded.len() > self.limits.max_initial_message_size {
                         return Err(ErrorKind::LimitExceeded.into());

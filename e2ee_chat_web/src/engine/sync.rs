@@ -200,7 +200,14 @@ impl Engine {
                     Err(_) => return,
                 }
             }
-            Some(notify::Event::InitialMessage(_)) => self.take_initial_messages().await.map(drop),
+            Some(notify::Event::InitialMessage(_)) => match self.take_initial_messages().await {
+                Ok(true) => {
+                    self.wake();
+                    Ok(())
+                }
+                Ok(false) => Ok(()),
+                Err(e) => Err(e),
+            },
             None => return,
         };
         if fetched.is_err() {
@@ -659,8 +666,9 @@ impl Engine {
 }
 
 /// Resolve a stalled mailbox page for `peer`: pause without calling `skip_stalled()` if any
-/// deferred carried or inbox initial exists for `peer` so a later capable build can decrypt the
-/// stalled envelopes after replaying the greeting. Returns `true` when receiving should pause.
+/// deferred carried or inbox initial exists for `peer`, or if the contact is quarantined awaiting
+/// user approval, so neither deferred-suite nor quarantined-classical envelopes are dropped.
+/// Returns `true` when receiving should pause.
 pub(super) fn resolve_stalled_peer<V: HistoryStore>(
     inner: &mut Inner<V>,
     peer: &PublicKey,
@@ -669,9 +677,10 @@ pub(super) fn resolve_stalled_peer<V: HistoryStore>(
     if join.has_deferred || inner.has_deferred_initial_for(peer) {
         return true;
     }
-    if let Some(contact) = inner.contact(peer)
-        && !contact.is_new_quarantined()
-    {
+    if let Some(contact) = inner.contact(peer) {
+        if contact.state.quarantined {
+            return true;
+        }
         contact.session.skip_stalled();
     }
     false

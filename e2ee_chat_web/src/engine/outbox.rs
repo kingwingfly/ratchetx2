@@ -82,22 +82,37 @@ impl Engine {
                 break;
             }
             if !outgoing.sealed {
-                // Pause sealing if waiting on explicit user action (classical approval / alert).
+                // Pause sealing if waiting on explicit user action (quarantine / classical approval / alert).
                 if contact.session.needs_new_session()
-                    && (contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
+                    && (contact.state.quarantined
+                        || contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
                         || contact.state.security_alert != SECURITY_ALERT_NONE)
                 {
                     break;
                 }
+                let needed_new_session = contact.session.needs_new_session();
                 // Encrypted now that it goes, so that its place is after what came so far; the
                 // ones after it wait their turn.
                 match inner.seal_next(peer).await {
-                    Ok(SealOutcome::Ready) => {}
+                    Ok(SealOutcome::Ready) => {
+                        if needed_new_session
+                            && inner
+                                .contact(peer)
+                                .is_some_and(|c| !c.session.needs_new_session())
+                        {
+                            self.ui.contacts.set(inner.views());
+                        }
+                    }
                     Ok(SealOutcome::Paused) => {
                         self.ui.contacts.set(inner.views());
                         break;
                     }
-                    Ok(SealOutcome::Failed(reason)) => {
+                    Ok(SealOutcome::Failed(reason, failed_indices)) => {
+                        for idx in &failed_indices {
+                            self.release(peer, *idx);
+                        }
+                        self.cancel_uploads_for_failed(inner, peer, &failed_indices)
+                            .await;
                         self.ui
                             .notify(format!("messages could not be sent: {reason}"));
                         if self.ui.open.get_untracked() == Some(*peer) {
@@ -172,12 +187,14 @@ impl Engine {
                 }
                 // The same, but this page cannot sign in to the server: it never will go.
                 Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                    self.release(peer, outgoing.history_index);
                     self.ui
                         .notify(format!("a message could not be sent: {NOT_SIGNED_IN_HERE}"));
                     (Step::Refused, 0)
                 }
                 // Too large for the server: it never will go.
                 Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::LimitExceeded => {
+                    self.release(peer, outgoing.history_index);
                     self.ui
                         .notify(format!("a message could not be sent: {}", describe(&e)));
                     (Step::Refused, 0)
@@ -252,6 +269,15 @@ impl Engine {
                     return Err(describe(&e));
                 }
                 self.show_changes(inner, peer, &entries);
+                let refused_indices: Vec<u64> = entries
+                    .iter()
+                    .filter(|(_, entry)| entry.delivery() == Delivery::Failed)
+                    .map(|(index, _)| *index)
+                    .collect();
+                if !refused_indices.is_empty() {
+                    self.cancel_uploads_for_failed(inner, peer, &refused_indices)
+                        .await;
+                }
             }
         }
         // Not from a page that cannot sign in to the server, which takes no push from it: each
@@ -430,7 +456,7 @@ enum SealOutcome {
     /// Paused pending explicit user security decision (classical approval / downgrade / expired manifest).
     Paused,
     /// Permanently failed to start a session (e.g. peer has no keys); outbox entries marked failed.
-    Failed(String),
+    Failed(String, Vec<u64>),
     /// Server rejected the v2 protocol (`ErrorKind::Unimplemented`); prompt the user to refresh.
     UpdateRequired(String),
 }
@@ -503,12 +529,13 @@ impl Inner {
         };
         if self.contacts[index].session.needs_new_session() {
             let snapshot = self.contacts[index].snapshot();
-            let pq_cfg = self.client.pq_config().clone();
-            let greeting = Kind::Hello(
-                self.contacts[index]
-                    .session
-                    .make_hello(self.state.name.clone(), &pq_cfg),
-            );
+            let prev_next_session_seq = self.state.next_session_seq;
+            let session_seq = self.next_new_chat_session_seq();
+            self.state.next_session_seq = session_seq
+                .saturating_add(1)
+                .min(session::protocol::MAX_SAFE_INTEGER);
+            let greeting =
+                Kind::Hello(self.client.make_hello(self.state.name.clone(), session_seq));
             self.contacts[index].state.clock = self.contacts[index].state.clock.saturating_add(1);
             let mut hello = greeting.to_bytes();
             stamp(&mut hello, self.contacts[index].state.clock);
@@ -530,6 +557,7 @@ impl Inner {
                     }
                     // H-2: Persist new session and uncertain delivery marker BEFORE transmitting!
                     if let Err(e) = self.save(&[]).await {
+                        self.state.next_session_seq = prev_next_session_seq;
                         self.roll_back(peer, snapshot)?;
                         return Err(describe(&e));
                     }
@@ -550,14 +578,16 @@ impl Inner {
                     }
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
+                    self.state.next_session_seq = prev_next_session_seq;
                     self.roll_back(peer, snapshot)?;
                     return self
                         .fail_waiting(peer, describe(&e))
                         .await
-                        .map(SealOutcome::Failed);
+                        .map(|(reason, failed)| SealOutcome::Failed(reason, failed));
                 }
                 Err(e) => {
                     let kind = e.kind();
+                    self.state.next_session_seq = prev_next_session_seq;
                     self.roll_back(peer, snapshot)?;
                     if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) {
                         return Ok(SealOutcome::UpdateRequired(describe(&e)));
@@ -565,6 +595,12 @@ impl Inner {
                     let paused = match kind {
                         ErrorKind::ClassicalApprovalRequired { peer_signed_off } => {
                             if let Some(contact) = self.contact(peer) {
+                                if matches!(
+                                    contact.state.security_alert,
+                                    SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
+                                ) {
+                                    contact.state.security_alert = SECURITY_ALERT_NONE;
+                                }
                                 contact.state.classical_approval_needed = if peer_signed_off {
                                     CLASSICAL_APPROVAL_SIGNED_OFF
                                 } else {
@@ -642,12 +678,13 @@ impl Inner {
 }
 
 impl<V: HistoryStore> Inner<V> {
-    /// Fail the messages waiting to `peer`, as they cannot go, for `reason`, which it returns.
+    /// Fail the messages waiting to `peer`, as they cannot go, for `reason`, returning `reason`
+    /// together with the failed history indices so callers can release held/upload state.
     pub(super) async fn fail_waiting(
         &mut self,
         peer: &PublicKey,
         reason: String,
-    ) -> Result<String, String> {
+    ) -> Result<(String, Vec<u64>), String> {
         let contact = self.contact(peer).ok_or("no such chat")?;
         let waiting: Vec<_> = contact
             .state
@@ -673,7 +710,7 @@ impl<V: HistoryStore> Inner<V> {
             self.roll_back(peer, snapshot)?;
             return Err(describe(&e));
         }
-        Ok(reason)
+        Ok((reason, waiting))
     }
 
     /// Move the history entries of the chat with `peer` on by `steps`, each read from the vault

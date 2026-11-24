@@ -103,6 +103,11 @@ impl ArchivedRatchet {
     pub fn header_key_receiver(&self) -> Option<HeaderKey> {
         self.message_ratchet_receiver.header_key()
     }
+
+    /// Next receiving header key of the archived ratchet.
+    pub fn next_header_key_receiver(&self) -> HeaderKey {
+        self.message_ratchet_receiver.next_header_key()
+    }
 }
 
 #[cfg(feature = "rkyv")]

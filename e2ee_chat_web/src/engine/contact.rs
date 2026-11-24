@@ -55,6 +55,7 @@ pub(super) fn record_quarantined_initial_state(
     held_session: Option<proto::SessionState>,
     first_message: Vec<u8>,
     peer_was_pq_pinned: bool,
+    downgrade_detected: bool,
     at: u64,
 ) {
     state.quarantined = true;
@@ -62,7 +63,7 @@ pub(super) fn record_quarantined_initial_state(
     state.quarantined_session = held_session;
     state.quarantined_first_message = first_message;
     state.last_activity = at;
-    if peer_was_pq_pinned {
+    if peer_was_pq_pinned || downgrade_detected {
         state.security_alert = SECURITY_ALERT_DOWNGRADE;
     }
 }
@@ -222,6 +223,7 @@ impl Contact {
         held_session: Option<proto::SessionState>,
         first_message: Vec<u8>,
         peer_was_pq_pinned: bool,
+        downgrade_detected: bool,
         at: u64,
     ) {
         record_quarantined_initial_state(
@@ -229,9 +231,10 @@ impl Contact {
             held_session,
             first_message,
             peer_was_pq_pinned,
+            downgrade_detected,
             at,
         );
-        if peer_was_pq_pinned {
+        if peer_was_pq_pinned || downgrade_detected {
             self.session.peer_pq_state_mut().downgrade_detected = true;
         }
     }

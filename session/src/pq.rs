@@ -198,20 +198,12 @@ pub struct HelloCheck {
     pub stale_session_seq: bool,
 }
 
-/// Validate a peer's decrypted [`protocol::content::Hello`] against `peer_state`,
-/// `session_security`, and `local_pq_enabled`:
-///
-/// - Enforces strictly increasing `peer_state.peer_session_seq` once a positive sequence number
-///   has been observed (`0` is tolerated only while `peer_state.peer_session_seq == 0` for legacy
-///   TUI compatibility).
-/// - Records `peer_pq_capable = true` and `pq_pinned = true` if `hello.pq_capable` is `true`.
-/// - If `!session_security.is_pq && local_pq_enabled && hello.pq_capable`, sets
-///   `peer_state.downgrade_detected = true` and recommends starting a new session.
-pub fn check_peer_hello(
+pub(crate) fn check_peer_hello_with_allow_same(
     peer_state: &mut PeerPqState,
     session_security: SessionSecurity,
     hello: &protocol::content::Hello,
     local_pq_enabled: bool,
+    allow_same_seq: bool,
 ) -> HelloCheck {
     if hello.session_seq > protocol::MAX_SAFE_INTEGER {
         return HelloCheck {
@@ -221,16 +213,29 @@ pub fn check_peer_hello(
         };
     }
     let stale_session_seq = if peer_state.peer_session_seq > 0 {
-        hello.session_seq == 0 || hello.session_seq <= peer_state.peer_session_seq
+        hello.session_seq == 0
+            || if allow_same_seq {
+                hello.session_seq < peer_state.peer_session_seq
+            } else {
+                hello.session_seq <= peer_state.peer_session_seq
+            }
     } else {
         false
     };
-    if !stale_session_seq && hello.session_seq > peer_state.peer_session_seq {
+    if stale_session_seq {
+        return HelloCheck {
+            downgrade_detected: false,
+            recommend_start_again: false,
+            stale_session_seq: true,
+        };
+    }
+    if hello.session_seq > peer_state.peer_session_seq {
         peer_state.peer_session_seq = hello.session_seq;
     }
     if hello.pq_capable {
         peer_state.peer_pq_capable = true;
         peer_state.pq_pinned = true;
+        peer_state.allow_classical_exception = false;
     }
     let downgrade_detected = !session_security.is_pq && local_pq_enabled && hello.pq_capable;
     if downgrade_detected {
@@ -239,8 +244,27 @@ pub fn check_peer_hello(
     HelloCheck {
         downgrade_detected,
         recommend_start_again: downgrade_detected,
-        stale_session_seq,
+        stale_session_seq: false,
     }
+}
+
+/// Validate a peer's decrypted [`protocol::content::Hello`] against `peer_state`,
+/// `session_security`, and `local_pq_enabled`:
+///
+/// - Enforces strictly increasing `peer_state.peer_session_seq` once a positive sequence number
+///   has been observed (`0` is tolerated only while `peer_state.peer_session_seq == 0` for legacy
+///   TUI compatibility). Stale or out-of-range greetings return early without mutating
+///   `peer_state`.
+/// - Records `peer_pq_capable = true` and `pq_pinned = true` if `hello.pq_capable` is `true`.
+/// - If `!session_security.is_pq && local_pq_enabled && hello.pq_capable`, sets
+///   `peer_state.downgrade_detected = true` and recommends starting a new session.
+pub fn check_peer_hello(
+    peer_state: &mut PeerPqState,
+    session_security: SessionSecurity,
+    hello: &protocol::content::Hello,
+    local_pq_enabled: bool,
+) -> HelloCheck {
+    check_peer_hello_with_allow_same(peer_state, session_security, hello, local_pq_enabled, false)
 }
 
 /// Derive the canonical audience from the locally configured relay URL or hostname.
@@ -312,7 +336,7 @@ mod v2 {
     /// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish_v2`], then call
     /// [`Client::commit_publish_v2`] on success or [`Client::rollback_publish_v2_on_refusal`] on
     /// definitive refusal.
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub struct PreparedPublishV2 {
         /// The signed v2 publish request to transmit.
         pub request: PublishV2Request,
@@ -321,7 +345,10 @@ mod v2 {
         /// Prekey generation number assigned to this publish.
         pub generation: u64,
         pub(crate) prev_manifest_seq: u64,
+        pub(crate) prev_prekey_generation: u64,
         pub(crate) manifest_digest: [u8; 32],
+        pub(crate) evicted_manifest_digest: Option<[u8; 32]>,
+        pub(crate) evicted_generation: Option<x3dh::EvictedGeneration>,
         pub(crate) classical: PublishedPrekeys,
         pub(crate) extended: bool,
         pub(crate) was_publishing: bool,
@@ -337,6 +364,7 @@ mod v2 {
     pub struct PreparedRefillV2 {
         /// The signed v2 refill request to transmit.
         pub request: RefillPrekeysRequest,
+        pub(crate) prev_last_timestamp: u64,
         pub(crate) one_time_prekeys: Vec<PublicKey>,
         pub(crate) pq_one_time_prekeys: Vec<PqPrekeyId>,
     }
@@ -418,7 +446,9 @@ mod v2 {
         /// [`protocol::mailbox_v2::decode_carried_initial`]).
         pub fn decode_carried(bytes: &[u8]) -> Option<Self> {
             let wire = decode_carried_initial(bytes)?;
-            Self::try_from(&wire).ok()
+            let mut msg = Self::try_from(&wire).ok()?;
+            msg.id = 0;
+            Some(msg)
         }
     }
 
@@ -527,9 +557,11 @@ mod v2 {
         fn into_parts(self) -> (Option<EncryptedMessage>, Option<InitialMessageV2>) {
             (
                 self.message,
-                self.initial_message
-                    .as_ref()
-                    .and_then(|im| InitialMessageV2::try_from(im).ok()),
+                self.initial_message.as_ref().and_then(|im| {
+                    let mut msg = InitialMessageV2::try_from(im).ok()?;
+                    msg.id = 0;
+                    Some(msg)
+                }),
             )
         }
     }
@@ -624,8 +656,14 @@ mod v2 {
                 return Err(ErrorKind::PqRequired.into());
             }
 
-            let timestamp = self.next_timestamp()?;
+            let timestamp = self.current_timestamp()?;
+            let issued_at = timestamp;
+            let expires_at = issued_at
+                .checked_add(DEFAULT_MANIFEST_TTL_MS)
+                .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
+                .ok_or(ErrorKind::Protocol)?;
             let prev_manifest_seq = self.state.manifest_seq;
+            let prev_prekey_generation = self.state.prekey_generation;
             let manifest_seq = prev_manifest_seq
                 .checked_add(1)
                 .filter(|&s| s <= protocol::MAX_SAFE_INTEGER)
@@ -637,8 +675,18 @@ mod v2 {
                 .prekeys
                 .oldest_evictable_signed_prekey()
                 .is_some_and(|spk| preserve_signed_prekeys.contains(&spk));
-            let extended = was_publishing || preserve_oldest;
-            let (classical, pq_last_resort_wire, pq_one_time_wire, pq_opk_ids, generation) = {
+            let extended =
+                (was_publishing || preserve_oldest) && self.state.prekeys.generation_count() > 0;
+            let generation = if extended {
+                self.state.prekey_generation.max(1)
+            } else {
+                self.state
+                    .prekey_generation
+                    .checked_add(1)
+                    .filter(|&g| g <= protocol::MAX_SAFE_INTEGER)
+                    .ok_or(ErrorKind::Protocol)?
+            };
+            let (classical, pq_last_resort_wire, pq_one_time_wire, pq_opk_ids, evicted_generation) = {
                 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                 let pq_branch = pq_enabled;
                 #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
@@ -650,29 +698,23 @@ mod v2 {
                     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                     {
                         let first_suite = offered[0];
-                        let first = if extended {
-                            self.state.prekeys.extend_pq(
+                        let (first, evicted) = if extended {
+                            (
+                                self.state.prekeys.extend_pq(
+                                    &self.state.identity,
+                                    first_suite,
+                                    one_time_count,
+                                    pq_one_time_count,
+                                )?,
+                                None,
+                            )
+                        } else {
+                            self.state.prekeys.generate_pq_with_rollback(
                                 &self.state.identity,
                                 first_suite,
                                 one_time_count,
                                 pq_one_time_count,
                             )?
-                        } else {
-                            self.state.prekeys.generate_pq(
-                                &self.state.identity,
-                                first_suite,
-                                one_time_count,
-                                pq_one_time_count,
-                            )?
-                        };
-                        let generation = if extended {
-                            self.state.prekey_generation.max(1)
-                        } else {
-                            self.state
-                                .prekey_generation
-                                .checked_add(1)
-                                .filter(|&g| g <= protocol::MAX_SAFE_INTEGER)
-                                .ok_or(ErrorKind::Protocol)?
                         };
                         let mut lr_wire = vec![PqPrekey::from(&first.pq_last_resort)];
                         let mut opk_wire: Vec<PqPrekey> = first
@@ -683,17 +725,37 @@ mod v2 {
                         let mut pq_opk_ids: Vec<PqPrekeyId> =
                             first.pq_one_time_prekeys.iter().map(|k| k.id).collect();
                         for &extra_suite in &offered[1..] {
-                            let extra = self.state.prekeys.extend_pq(
+                            match self.state.prekeys.extend_pq(
                                 &self.state.identity,
                                 extra_suite,
                                 0,
                                 pq_one_time_count,
-                            )?;
-                            lr_wire.push(PqPrekey::from(&extra.pq_last_resort));
-                            pq_opk_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
-                            opk_wire.extend(extra.pq_one_time_prekeys.iter().map(PqPrekey::from));
+                            ) {
+                                Ok(extra) => {
+                                    lr_wire.push(PqPrekey::from(&extra.pq_last_resort));
+                                    pq_opk_ids
+                                        .extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
+                                    opk_wire.extend(
+                                        extra.pq_one_time_prekeys.iter().map(PqPrekey::from),
+                                    );
+                                }
+                                Err(err) => {
+                                    if extended {
+                                        self.state.prekeys.retract_pq(
+                                            &first.classical.one_time_prekeys,
+                                            &pq_opk_ids,
+                                        );
+                                    } else {
+                                        self.state.prekeys.rollback_generation(
+                                            &first.classical.signed_prekey,
+                                            evicted,
+                                        );
+                                    }
+                                    return Err(err.into());
+                                }
+                            }
                         }
-                        (first.classical, lr_wire, opk_wire, pq_opk_ids, generation)
+                        (first.classical, lr_wire, opk_wire, pq_opk_ids, evicted)
                     }
                     #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
                     unreachable!("pq_branch is false when no ML-KEM suite is compiled in")
@@ -702,39 +764,27 @@ mod v2 {
                     // publishes (`KEPT_GENERATIONS = 2` retains the prior PQ generation so
                     // in-flight PQ handshakes still decrypt while avoiding dead OPK accumulation
                     // across repeated publishes).
-                    let classical = if extended {
-                        self.state
-                            .prekeys
-                            .extend(&self.state.identity, one_time_count)
+                    let (classical, evicted) = if extended {
+                        (
+                            self.state
+                                .prekeys
+                                .extend(&self.state.identity, one_time_count),
+                            None,
+                        )
                     } else {
                         self.state
                             .prekeys
-                            .generate(&self.state.identity, one_time_count)
-                    };
-                    let generation = if extended {
-                        self.state.prekey_generation.max(1)
-                    } else {
-                        self.state
-                            .prekey_generation
-                            .checked_add(1)
-                            .filter(|&g| g <= protocol::MAX_SAFE_INTEGER)
-                            .ok_or(ErrorKind::Protocol)?
+                            .generate_with_rollback(&self.state.identity, one_time_count)
                     };
                     (
                         classical,
                         Vec::<PqPrekey>::new(),
                         Vec::<PqPrekey>::new(),
                         Vec::<PqPrekeyId>::new(),
-                        generation,
+                        evicted,
                     )
                 }
             };
-
-            let issued_at = timestamp;
-            let expires_at = issued_at
-                .checked_add(DEFAULT_MANIFEST_TTL_MS)
-                .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
-                .ok_or(ErrorKind::Protocol)?;
 
             let mut manifest = CapabilityManifest {
                 audience: audience.to_string(),
@@ -761,28 +811,46 @@ mod v2 {
                     .collect(),
                 signature: Bytes::new(),
             };
-            sign_manifest(&self.state.identity, &mut manifest)?;
-            let own_digest = manifest_digest(&manifest)?;
-
             let spk_sig = if pq_enabled && strict_pq {
                 None
             } else {
                 Some(classical.signed_prekey_signature)
             };
-            let request = PublishV2Request::sign(
-                &self.state.identity,
-                manifest,
-                spk_sig,
-                &classical.one_time_prekeys,
-                pq_last_resort_wire,
-                pq_one_time_wire,
-                timestamp,
-            )?;
+            let signed = (|| -> Result<([u8; 32], PublishV2Request)> {
+                sign_manifest(&self.state.identity, &mut manifest)?;
+                let own_digest = manifest_digest(&manifest)?;
+                let request = PublishV2Request::sign(
+                    &self.state.identity,
+                    manifest,
+                    spk_sig,
+                    &classical.one_time_prekeys,
+                    pq_last_resort_wire,
+                    pq_one_time_wire,
+                    timestamp,
+                )?;
+                Ok((own_digest, request))
+            })();
+            let (own_digest, request) = match signed {
+                Ok(pair) => pair,
+                Err(err) => {
+                    if extended {
+                        self.state
+                            .prekeys
+                            .retract_pq(&classical.one_time_prekeys, &pq_opk_ids);
+                    } else {
+                        self.state
+                            .prekeys
+                            .rollback_generation(&classical.signed_prekey, evicted_generation);
+                    }
+                    return Err(err);
+                }
+            };
 
             self.state.manifest_seq = manifest_seq;
             self.state.prekey_generation = generation;
             self.state.publishing = true;
-            self.state
+            let evicted_manifest_digest = self
+                .state
                 .record_manifest_digest_preserving(own_digest, preserve_manifest_digests);
 
             Ok(PreparedPublishV2 {
@@ -790,7 +858,10 @@ mod v2 {
                 manifest_seq,
                 generation,
                 prev_manifest_seq,
+                prev_prekey_generation,
                 manifest_digest: own_digest,
+                evicted_manifest_digest,
+                evicted_generation,
                 classical,
                 extended,
                 was_publishing,
@@ -803,20 +874,40 @@ mod v2 {
             self.state.publishing = false;
         }
 
-        /// Retract newly added OPKs/PQOPKs and restore manifest sequence from a prepared v2
-        /// publish that was definitively refused before storage (e.g. `ErrorKind::SignInRequired`,
+        /// Retract newly added OPKs/PQOPKs (or pop the unpublished generation and restore any
+        /// evicted generation) and restore manifest sequence from a prepared v2 publish that was
+        /// definitively refused before storage (e.g. `ErrorKind::SignInRequired`,
         /// `ErrorKind::PqRequired`, or `ErrorKind::LimitExceeded`).
         pub fn rollback_publish_v2_on_refusal(&mut self, prepared: PreparedPublishV2) {
             if prepared.extended {
-                self.state.prekeys.retract_pq(
-                    &prepared.classical.one_time_prekeys,
-                    &prepared.pq_one_time_prekeys,
-                );
+                if self.current_signed_prekey() == Some(prepared.classical.signed_prekey) {
+                    self.state.prekeys.retract_pq(
+                        &prepared.classical.one_time_prekeys,
+                        &prepared.pq_one_time_prekeys,
+                    );
+                }
+                if self.state.manifest_seq == prepared.manifest_seq {
+                    self.state.prekey_generation = prepared.prev_prekey_generation;
+                    self.state.publishing = prepared.was_publishing;
+                    self.state.manifest_seq = prepared.prev_manifest_seq;
+                    self.state.rollback_manifest_digest(
+                        prepared.manifest_digest,
+                        prepared.evicted_manifest_digest,
+                    );
+                }
+            } else if self.state.manifest_seq == prepared.manifest_seq
+                && self.state.prekeys.rollback_generation(
+                    &prepared.classical.signed_prekey,
+                    prepared.evicted_generation,
+                )
+            {
+                self.state.prekey_generation = prepared.prev_prekey_generation;
                 self.state.publishing = prepared.was_publishing;
-            }
-            self.state.manifest_seq = prepared.prev_manifest_seq;
-            if self.state.recent_manifest_digests.last() == Some(&prepared.manifest_digest) {
-                self.state.recent_manifest_digests.pop();
+                self.state.manifest_seq = prepared.prev_manifest_seq;
+                self.state.rollback_manifest_digest(
+                    prepared.manifest_digest,
+                    prepared.evicted_manifest_digest,
+                );
             }
         }
 
@@ -840,6 +931,7 @@ mod v2 {
             self.state.pq_config.validate()?;
             let offered = self.state.pq_config.offered_suites();
             let pq_enabled = self.state.pq_config.pq_enabled && !offered.is_empty();
+            let prev_last_timestamp = self.state.last_timestamp;
             let timestamp = self.next_timestamp()?;
 
             let (classical_opks, pq_opk_wire, pq_opk_ids) = {
@@ -853,12 +945,18 @@ mod v2 {
                 if pq_branch {
                     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                     {
-                        let first = self.state.prekeys.extend_pq(
+                        let first = match self.state.prekeys.extend_pq(
                             &self.state.identity,
                             offered[0],
                             one_time_count,
                             pq_one_time_count,
-                        )?;
+                        ) {
+                            Ok(first) => first,
+                            Err(err) => {
+                                self.state.last_timestamp = prev_last_timestamp;
+                                return Err(err.into());
+                            }
+                        };
                         let mut pq_wire: Vec<PqPrekey> = first
                             .pq_one_time_prekeys
                             .iter()
@@ -867,14 +965,26 @@ mod v2 {
                         let mut pq_ids: Vec<PqPrekeyId> =
                             first.pq_one_time_prekeys.iter().map(|k| k.id).collect();
                         for &extra_suite in &offered[1..] {
-                            let extra = self.state.prekeys.extend_pq(
+                            match self.state.prekeys.extend_pq(
                                 &self.state.identity,
                                 extra_suite,
                                 0,
                                 pq_one_time_count,
-                            )?;
-                            pq_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
-                            pq_wire.extend(extra.pq_one_time_prekeys.iter().map(PqPrekey::from));
+                            ) {
+                                Ok(extra) => {
+                                    pq_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));
+                                    pq_wire.extend(
+                                        extra.pq_one_time_prekeys.iter().map(PqPrekey::from),
+                                    );
+                                }
+                                Err(err) => {
+                                    self.state
+                                        .prekeys
+                                        .retract_pq(&first.classical.one_time_prekeys, &pq_ids);
+                                    self.state.last_timestamp = prev_last_timestamp;
+                                    return Err(err.into());
+                                }
+                            }
                         }
                         (first.classical.one_time_prekeys, pq_wire, pq_ids)
                     }
@@ -889,17 +999,25 @@ mod v2 {
                 }
             };
 
-            let request = RefillPrekeysRequest::sign(
+            let request = match RefillPrekeysRequest::sign(
                 &self.state.identity,
                 audience,
                 self.state.prekey_generation,
                 &classical_opks,
                 pq_opk_wire,
                 timestamp,
-            )?;
+            ) {
+                Ok(request) => request,
+                Err(err) => {
+                    self.state.prekeys.retract_pq(&classical_opks, &pq_opk_ids);
+                    self.state.last_timestamp = prev_last_timestamp;
+                    return Err(err.into());
+                }
+            };
 
             Ok(PreparedRefillV2 {
                 request,
+                prev_last_timestamp,
                 one_time_prekeys: classical_opks,
                 pq_one_time_prekeys: pq_opk_ids,
             })
@@ -914,6 +1032,9 @@ mod v2 {
             self.state
                 .prekeys
                 .retract_pq(&prepared.one_time_prekeys, &prepared.pq_one_time_prekeys);
+            if self.state.last_timestamp == prepared.request.timestamp {
+                self.state.last_timestamp = prepared.prev_last_timestamp;
+            }
         }
 
         /// Accept an inbound v1 or v2 initial message from `peer`, applying local PQ and
@@ -1235,7 +1356,7 @@ mod v2 {
                                         e,
                                     ));
                                 }
-                                let timestamp = self.next_timestamp()?;
+                                let timestamp = self.current_timestamp()?;
                                 let expires_at = timestamp
                                     .checked_add(DEFAULT_MANIFEST_TTL_MS)
                                     .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
@@ -1274,11 +1395,10 @@ mod v2 {
                                 self.state
                                     .prekeys
                                     .retract_pq(&[], &prepared.pq_one_time_prekeys);
-                                if self.state.recent_manifest_digests.last()
-                                    == Some(&prepared.manifest_digest)
-                                {
-                                    self.state.recent_manifest_digests.pop();
-                                }
+                                self.state.rollback_manifest_digest(
+                                    prepared.manifest_digest,
+                                    prepared.evicted_manifest_digest,
+                                );
                                 return Ok(PublishV2Outcome::V2ClassicalOff);
                             }
                             Ok(_) => return Err(e.into()),
@@ -1401,7 +1521,7 @@ mod v2 {
         }
 
         async fn ack_initial_chunk(&mut self, audience: &str, ids: &[u64]) -> Result<u32> {
-            let timestamp = self.next_timestamp()?;
+            let timestamp = self.current_timestamp()?;
             let request = AckInitialMessagesRequest::sign(
                 &self.state.identity,
                 audience,
@@ -1545,6 +1665,7 @@ mod v2 {
                         // manifest stripping.
                         if !server_pq_disabled_fallback {
                             updated_peer_state.pq_pinned = true;
+                            updated_peer_state.allow_classical_exception = false;
                         }
                         updated_peer_state.peer_pq_capable = true;
                         updated_peer_state.pinned_manifest_seq =
@@ -1581,7 +1702,7 @@ mod v2 {
                         )
                     } else {
                         // Peer published a valid signed OFF manifest.
-                        if (peer_state.pq_pinned || peer_state.peer_pq_capable)
+                        if peer_state.peer_pq_capable
                             && peer_state.pinned_manifest_seq > 0
                             && manifest.manifest_seq <= peer_state.pinned_manifest_seq
                         {
@@ -1902,7 +2023,7 @@ mod v2 {
             if audience.trim().is_empty() {
                 return Err(ErrorKind::Protocol.into());
             }
-            let timestamp = self.next_timestamp()?;
+            let timestamp = self.current_timestamp()?;
             let request =
                 ListInitialMessagesRequest::sign(&self.state.identity, audience, limit, timestamp)?;
             let response = self.handshake.list_initial_messages(request).await?;
@@ -1944,16 +2065,23 @@ mod v2 {
             let mut ack_ids = listed.malformed_ids;
             ack_ids.retain(|&id| can_ack(id));
             let mut outcomes = Vec::with_capacity(listed.messages.len());
+            let mut peer_states = std::collections::HashMap::<PublicKey, PeerPqState>::new();
             for msg in &listed.messages {
                 if !can_ack(msg.id) {
                     continue;
                 }
-                let peer_state = peer_state_for(&msg.sender);
+                let peer_state = peer_states
+                    .entry(msg.sender)
+                    .or_insert_with(|| peer_state_for(&msg.sender))
+                    .clone();
                 // `accept_initial_v2` is purely local: acknowledge accepted, quarantined, and
                 // permanently rejected IDs so invalid entries cannot DoS the inbox, but leave
                 // `UnsupportedSuite` queued on the server so a capable build can decrypt it later.
                 match self.accept_initial_v2(&msg.sender, &peer_state, msg, mailbox.clone()) {
                     Ok(outcome) => {
+                        if let AcceptedInitial::Accepted { ref session, .. } = outcome {
+                            peer_states.insert(msg.sender, session.state.peer_pq.clone());
+                        }
                         ack_ids.push(msg.id);
                         outcomes.push((msg.sender, outcome));
                     }

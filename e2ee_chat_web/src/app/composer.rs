@@ -6,7 +6,7 @@ use crate::{
     icon::{Icon, icon},
 };
 
-use super::common::{send, send_files};
+use super::common::{send, send_files_to};
 
 /// Whether entering a chat should auto-focus the composer textarea.
 ///
@@ -67,8 +67,11 @@ pub(super) fn Composer(
     };
     let on_files_change = move |event: ev::Event| {
         let input: web_sys::HtmlInputElement = event_target(&event);
-        if let Some(files) = input.files() {
-            send_files(files);
+        if super::ui().open.get_untracked() == Some(peer)
+            && disabled.try_get_untracked() == Some(false)
+            && let Some(files) = input.files()
+        {
+            send_files_to(peer, files);
         }
         // So that picking the same file again sends it again.
         input.set_value("");

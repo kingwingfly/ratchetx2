@@ -327,6 +327,10 @@ pub struct AppState {
     /// deferred initials are stored in the separate [`DEFERRED_INITIALS`] record.
     #[prost(message, repeated, tag = "12")]
     pub deferred_initials: Vec<session::protocol::handshake_v2::InitialMessageV2>,
+    /// Monotonic floor for newly started chat `Hello.session_seq` values so recreating a deleted
+    /// chat never reuses `session_seq = 1` against a peer who kept the old history.
+    #[prost(uint64, tag = "13")]
+    pub next_session_seq: u64,
 }
 
 /// One encrypted inbox initial retained until a build with its suite (or restored contact) can

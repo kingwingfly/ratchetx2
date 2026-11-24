@@ -30,7 +30,7 @@ use crate::{
 
 use self::{
     chat::ChatPane,
-    common::{Copyable, invitation_link, new_chat, send_files},
+    common::{Copyable, invitation_link, new_chat, send_files_to},
     dialogs::VaultDialog,
     sidebar::Sidebar,
     viewer::Viewer,
@@ -376,19 +376,34 @@ fn Dropzone() -> impl IntoView {
         depth.set(0);
         if accepts(&event) {
             event.prevent_default();
-            if let Some(files) = event.data_transfer().and_then(|transfer| transfer.files()) {
-                send_files(files);
+            if let Some(peer) = ui.open.get_untracked()
+                && let Some(files) = event.data_transfer().and_then(|transfer| transfer.files())
+            {
+                send_files_to(peer, files);
             }
         }
     });
-    let hidden = move || {
-        depth.get() == 0
-            || ui.phase.get() != Phase::Unlocked
-            || ui.dialog.with(Option::is_some)
-            || ui.viewer.with(Option::is_some)
-            || ui.opening.with(Option::is_some)
-            || ui.streaming.with(Option::is_some)
+    let writable = move || {
+        ui.phase.get() == Phase::Unlocked
+            && ui.dialog.with(Option::is_none)
+            && ui.viewer.with(Option::is_none)
+            && ui.opening.with(Option::is_none)
+            && ui.streaming.with(Option::is_none)
+            && ui
+                .open
+                .get()
+                .and_then(|peer| ui.contact(&peer))
+                .is_some_and(|contact| !contact.request && !contact.is_quarantined())
     };
+    Effect::new(move || {
+        let _ = ui.open.get();
+        if !writable() {
+            depth.set(0);
+        }
+    });
+    let _ = window_event_listener(ev::blur, move |_| depth.set(0));
+    let _ = window_event_listener(ev::dragend, move |_| depth.set(0));
+    let hidden = move || depth.get() == 0 || !writable();
     let to = move || {
         let name = ui
             .open

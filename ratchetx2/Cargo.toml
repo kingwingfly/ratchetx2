@@ -17,12 +17,12 @@ rustdoc-args = ["--cfg", "docsrs"]
 curve25519-dalek = "5.0"
 getrandom = "0.4"
 hkdf = "0.13"
-hmac = "0.13"
+hmac = { version = "0.13", features = ["zeroize"] }
 ml-kem = { version = "0.3", default-features = false, features = ["zeroize"], optional = true }
 prost = { version = "0.14", optional = true }
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
-sha2 = "0.11"
+sha2 = { version = "0.11", features = ["zeroize"] }
 subtle = { version = "2", default-features = false }
 thiserror = "2.0"
 zeroize = { version = "1.9", features = ["derive"] }

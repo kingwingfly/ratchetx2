@@ -15,7 +15,7 @@ use worker::{
     console_error, js_sys,
 };
 
-use super::{Identity, rows::CountRow, schema::SCHEMA_SEEN_SUBSCRIBES};
+use super::{Identity, PendingExpiry, rows::CountRow, schema::SCHEMA_SEEN_SUBSCRIBES};
 use crate::objects::checked_integer;
 
 /// Internal header set to `"1"` when deployment password auth is satisfied (either `PASSWORD`
@@ -238,34 +238,64 @@ impl Identity {
         let expires_at = timestamp
             .saturating_add(MAX_CLOCK_SKEW)
             .min(MAX_SAFE_INTEGER);
-        let sql = self.sql();
-        sql.exec(SCHEMA_SEEN_SUBSCRIBES, None)?;
-        sql.exec(
-            "DELETE FROM seen_subscribes WHERE expires_at < ?",
-            vec![checked_integer(now_ms)?],
-        )?;
         let sig_hash = crate::hex(&Sha256::digest(sig));
-        let existing: CountRow = sql
-            .exec(
-                "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
-                vec![sig_hash.as_str().into()],
-            )?
-            .one()?;
-        if existing.count > 0 {
-            return Ok(SubscribeRecordOutcome::Replayed);
+        let now_val = checked_integer(now_ms)?;
+        let precheck = self.transaction_sync(|sql| {
+            sql.exec(SCHEMA_SEEN_SUBSCRIBES, None)?;
+            sql.exec(
+                "DELETE FROM seen_subscribes WHERE expires_at < ?",
+                vec![now_val.clone()],
+            )?;
+            let existing: CountRow = sql
+                .exec(
+                    "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
+                    vec![sig_hash.as_str().into()],
+                )?
+                .one()?;
+            if existing.count > 0 {
+                return Ok(SubscribeRecordOutcome::Replayed);
+            }
+            let total: CountRow = sql
+                .exec("SELECT count(*) AS count FROM seen_subscribes", None)?
+                .one()?;
+            if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
+                return Ok(SubscribeRecordOutcome::CapacityExceeded);
+            }
+            Ok(SubscribeRecordOutcome::Fresh)
+        })?;
+        if !matches!(precheck, SubscribeRecordOutcome::Fresh) {
+            return Ok(precheck);
         }
-        let total: CountRow = sql
-            .exec("SELECT count(*) AS count FROM seen_subscribes", None)?
-            .one()?;
-        if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
-            return Ok(SubscribeRecordOutcome::CapacityExceeded);
-        }
-        sql.exec(
-            "INSERT INTO seen_subscribes (sig_hash, expires_at) VALUES (?, ?)",
-            vec![sig_hash.into(), checked_integer(expires_at)?],
-        )?;
-        self.schedule_expiry(false).await?;
-        Ok(SubscribeRecordOutcome::Fresh)
+        // Arm the expiry alarm BEFORE inserting the row so a transient alarm error cannot leave
+        // an unexpiring `seen_subscribes` record behind.
+        self.set_expiry_alarm(
+            false,
+            Some(PendingExpiry::Subscribe(expires_at.saturating_add(1))),
+        )
+        .await?;
+        let expires_val = checked_integer(expires_at)?;
+        self.transaction_sync(|sql| {
+            let existing: CountRow = sql
+                .exec(
+                    "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
+                    vec![sig_hash.as_str().into()],
+                )?
+                .one()?;
+            if existing.count > 0 {
+                return Ok(SubscribeRecordOutcome::Replayed);
+            }
+            let total: CountRow = sql
+                .exec("SELECT count(*) AS count FROM seen_subscribes", None)?
+                .one()?;
+            if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
+                return Ok(SubscribeRecordOutcome::CapacityExceeded);
+            }
+            sql.exec(
+                "INSERT INTO seen_subscribes (sig_hash, expires_at) VALUES (?, ?)",
+                vec![sig_hash.as_str().into(), expires_val],
+            )?;
+            Ok(SubscribeRecordOutcome::Fresh)
+        })
     }
 
     /// Accepts a WebSocket connection for first-frame audience-bound v2 authentication.

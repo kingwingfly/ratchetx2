@@ -59,7 +59,7 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 /* Icons, stroked in the button's color; a button of only an icon is square. */
 .btn .glyph { flex: none; width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .btn.small .glyph { width: 16px; height: 16px; }
-.btn.icon { justify-content: center; width: 36px; height: 36px; padding: 0; }
+.btn.icon { flex: none; justify-content: center; width: 36px; height: 36px; padding: 0; }
 .btn.icon.small { width: 30px; height: 30px; }
 .btn.icon.done { color: var(--accent); border-color: var(--accent-line); }
 /* A button that reads as a link, within text. */
@@ -168,11 +168,12 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .clip-name:hover { color: var(--text); }
 .clip.waiting { width: 240px; height: 135px; align-items: center; justify-content: center; color: var(--muted); font-size: 12px; text-align: center; overflow-wrap: anywhere; }
 .clip.audio.waiting { height: 56px; }
-.file-card { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--raised); text-align: left; cursor: pointer; }
+.file-card { display: flex; align-items: center; gap: 12px; max-width: 100%; padding: 10px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--raised); text-align: left; cursor: pointer; }
+.file-card > span:last-child { min-width: 0; }
 .message.me .file-card { border-color: var(--accent-line); background: var(--raised-strong); }
 .file-card:hover { border-color: var(--accent); }
-.file-icon { font-family: var(--mono); font-size: 11px; color: var(--accent); border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 6px; }
-.file-card strong { display: block; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.file-icon { flex: none; max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--accent); border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 6px; }
+.file-card strong { display: block; max-width: min(260px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .file-card span { font-size: 12px; color: var(--muted); }
 .uploads { display: flex; flex-direction: column; gap: 6px; padding: 0 18px; }
 .uploads:has(.upload) { padding-block: 8px; border-top: 1px solid var(--line); }
@@ -326,23 +327,27 @@ dialog::backdrop { background: #020706d9; backdrop-filter: blur(4px); }
 
 .viewer { width: min(1100px, 94vw); height: min(820px, 90dvh); }
 .viewer-bar { height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 16px; border-bottom: 1px solid var(--line); font-size: 13px; }
-.viewer-bar span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.viewer-bar div { display: flex; gap: 8px; flex: none; }
+.viewer-bar > span { flex: 1 1 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.viewer-bar > div { display: flex; align-items: center; gap: 8px; flex: none; }
 /* The search box in the viewer's bar; its matches are marked without changing the page. */
 .search { display: flex; align-items: center; gap: 4px; }
 .search input { width: 200px; padding: 4px 10px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--sunken); color: var(--text-bright); font-size: 12px; }
 .search input:focus { outline: none; border-color: var(--accent-line); }
 .search.invalid input { border-color: var(--danger-line); }
-.search-count { min-width: 60px; text-align: center; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.search-count { flex: none; min-width: 60px; white-space: nowrap; text-align: center; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .search.invalid .search-count { color: var(--danger); }
 .btn.toggle { font-family: var(--mono); font-size: 11px; }
 .btn.toggle.on { color: var(--accent); border-color: var(--accent-line); background: var(--raised-strong); }
 ::highlight(search) { background-color: #ffcb6b40; }
 ::highlight(search-current) { background-color: #ffcb6b; color: #0b0f0e; }
 @media (max-width: 600px) {
+  .viewer-bar { padding: 0 8px; gap: 6px; }
+  .viewer-bar > div { gap: 4px; min-width: 0; flex: 0 1 auto; }
+  .search { min-width: 0; flex: 0 1 auto; }
   .search .toggle { display: none; }
-  .search input { width: 110px; }
-  .search-count { min-width: 44px; }
+  .search input { flex: 1 1 72px; min-width: 0; width: 96px; max-width: 110px; }
+  .search-count { min-width: 36px; }
+  .search-count:empty { display: none; }
 }
 .viewer-content { height: calc(100% - 52px); overflow: auto; }
 /* Of a definite height, so that what it shows, portrait or landscape, scales down to fit whole. */

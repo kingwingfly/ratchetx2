@@ -543,6 +543,7 @@ impl Party {
             dh_step_updates_sender: self.ratchet.dh_step_updates_sender(),
             has_sender_chain: self.ratchet.header_key_sender().is_some(),
             receiver_header_key: self.ratchet.header_key_receiver().map(Zeroizing::new),
+            next_receiver_header_key: Zeroizing::new(self.ratchet.next_header_key_receiver()),
             previous_chain_length: self.previous_chain_length,
             message_number_sender: self.message_number_sender,
             message_number_receiver: self.message_number_receiver,
@@ -556,6 +557,7 @@ struct PartyInvariants {
     dh_step_updates_sender: bool,
     has_sender_chain: bool,
     receiver_header_key: Option<Zeroizing<HeaderKey>>,
+    next_receiver_header_key: Zeroizing<HeaderKey>,
     previous_chain_length: u64,
     message_number_sender: u64,
     message_number_receiver: u64,
@@ -579,6 +581,7 @@ impl PartyInvariants {
             self.receiver_header_key
                 .as_deref()
                 .map(|key| (key, self.message_number_receiver)),
+            Some(&*self.next_receiver_header_key),
         )
     }
 }
@@ -655,6 +658,7 @@ where
             dh_step_updates_sender: self.ratchet.dh_step_updates_sender(),
             has_sender_chain: self.ratchet.header_key_sender().is_some(),
             receiver_header_key: self.ratchet.header_key_receiver().map(Zeroizing::new),
+            next_receiver_header_key: Zeroizing::new(self.ratchet.next_header_key_receiver()),
             previous_chain_length: self.previous_chain_length.to_native(),
             message_number_sender: self.message_number_sender.to_native(),
             message_number_receiver: self.message_number_receiver.to_native(),
@@ -804,8 +808,9 @@ struct DerivedKeys {
 /// and nonce, then the HMAC-SHA256 key.
 fn derive_keys(key: &[u8], info: &[u8], nonce: &[u8; NONCE_LEN]) -> DerivedKeys {
     let mut keys = Zeroizing::new([0; ENCRYPTION_KEY_LEN + GCM_NONCE_LEN + HASH_LEN]);
-    Hkdf::<Sha256>::new(Some(&[0; HASH_LEN]), key)
-        .expand_multi_info(&[info, nonce], keys.as_mut_slice())
+    let (mut prk, hkdf) = Hkdf::<Sha256>::extract(Some(&[0; HASH_LEN]), key);
+    prk.zeroize();
+    hkdf.expand_multi_info(&[info, nonce], keys.as_mut_slice())
         .expect("the keys are a valid HKDF-SHA256 output length");
     let (encryption_key, rest) = keys.split_at(ENCRYPTION_KEY_LEN);
     let (gcm_nonce, authentication_key) = rest.split_at(GCM_NONCE_LEN);
@@ -1738,5 +1743,28 @@ mod test {
                 }
             }
         }
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn serde_rejects_duplicate_skipped_message_numbers() {
+        let (mut alice, mut bob) = session();
+        let _m0 = alice.encrypt(b"m0").unwrap();
+        let m1 = alice.encrypt(b"m1").unwrap();
+        assert_eq!(bob.decrypt(&m1).unwrap(), b"m1");
+        let json = serde_json::to_string(&bob).unwrap();
+        // Inject a duplicate skipped message number `"0"` in `skipped_message_keys.chains[0].keys`.
+        let needle = r#""keys":{"0":"#;
+        let idx = json.find(needle).expect("expected skipped key 0 in JSON");
+        let key_end = json[idx + needle.len()..]
+            .find(']')
+            .map(|rel| idx + needle.len() + rel + 1)
+            .expect("expected end of key array");
+        let entry = &json[idx + r#""keys":{"#.len()..key_end];
+        let dup_json = format!("{},{entry}{}", &json[..key_end], &json[key_end..]);
+        assert!(
+            serde_json::from_str::<Party>(&dup_json).is_err(),
+            "serde must reject duplicate skipped message numbers"
+        );
     }
 }

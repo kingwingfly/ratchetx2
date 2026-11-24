@@ -195,6 +195,7 @@ pub struct PreparedPublish {
     pub request: PublishRequest,
     extended: bool,
     was_publishing: bool,
+    prev_last_timestamp: u64,
     one_time_prekeys: Vec<PublicKey>,
 }
 
@@ -312,12 +313,13 @@ impl ClientState {
 
     /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`
     /// while preferring to keep any digests listed in `preserve` (e.g. deferred unsupported-suite
-    /// initials waiting for replay).
+    /// initials waiting for replay). Returns any evicted digest so a refused publish can restore
+    /// it.
     pub(crate) fn record_manifest_digest_preserving(
         &mut self,
         digest: [u8; 32],
         preserve: &[[u8; 32]],
-    ) {
+    ) -> Option<[u8; 32]> {
         if let Some(pos) = self
             .recent_manifest_digests
             .iter()
@@ -326,16 +328,31 @@ impl ClientState {
             self.recent_manifest_digests.remove(pos);
         }
         self.recent_manifest_digests.push(digest);
+        let mut evicted = None;
         while self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
             if let Some(evict) = self
                 .recent_manifest_digests
                 .iter()
                 .position(|d| !preserve.contains(d))
             {
-                self.recent_manifest_digests.remove(evict);
+                evicted = Some(self.recent_manifest_digests.remove(evict));
             } else {
-                self.recent_manifest_digests.remove(0);
+                evicted = Some(self.recent_manifest_digests.remove(0));
             }
+        }
+        evicted
+    }
+
+    /// Pop a previously appended manifest digest and restore any digest it evicted.
+    pub(crate) fn rollback_manifest_digest(&mut self, added: [u8; 32], evicted: Option<[u8; 32]>) {
+        if self.recent_manifest_digests.last() == Some(&added) {
+            self.recent_manifest_digests.pop();
+        }
+        if let Some(restored) = evicted
+            && self.recent_manifest_digests.len() < MAX_RECENT_MANIFEST_DIGESTS
+            && !self.recent_manifest_digests.contains(&restored)
+        {
+            self.recent_manifest_digests.insert(0, restored);
         }
     }
 
@@ -631,7 +648,9 @@ impl<H> Client<H> {
     )]
     pub fn prepare_publish(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
         let was_publishing = self.state.publishing;
+        let prev_last_timestamp = self.state.last_timestamp;
         let extended = was_publishing;
+        let timestamp = self.next_timestamp()?;
         let published = if extended {
             self.state
                 .prekeys
@@ -642,12 +661,12 @@ impl<H> Client<H> {
                 .generate(&self.state.identity, one_time_count)
         };
         self.state.publishing = true;
-        let timestamp = self.next_timestamp()?;
         let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
         Ok(PreparedPublish {
             request,
             extended,
             was_publishing,
+            prev_last_timestamp,
             one_time_prekeys: published.one_time_prekeys,
         })
     }
@@ -660,18 +679,20 @@ impl<H> Client<H> {
     )]
     pub fn prepare_extend_keys(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
         let was_publishing = self.state.publishing;
+        let prev_last_timestamp = self.state.last_timestamp;
         let had_gen = self.state.prekeys.generation_count() > 0;
+        let timestamp = self.next_timestamp()?;
         let published = self
             .state
             .prekeys
             .extend(&self.state.identity, one_time_count);
         self.state.publishing = true;
-        let timestamp = self.next_timestamp()?;
         let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
         Ok(PreparedPublish {
             request,
             extended: had_gen,
             was_publishing,
+            prev_last_timestamp,
             one_time_prekeys: published.one_time_prekeys,
         })
     }
@@ -694,6 +715,9 @@ impl<H> Client<H> {
         if prepared.extended {
             self.state.prekeys.retract(&prepared.one_time_prekeys);
             self.state.publishing = prepared.was_publishing;
+        }
+        if self.state.last_timestamp == prepared.request.timestamp {
+            self.state.last_timestamp = prepared.prev_last_timestamp;
         }
     }
 
@@ -761,13 +785,27 @@ impl<H> Client<H> {
         )?)
     }
 
+    /// Milliseconds since the Unix epoch by the server's [clock](Self::clock), bounded by
+    /// `protocol::MAX_SAFE_INTEGER` without advancing `last_timestamp`.
+    pub(crate) fn current_timestamp(&self) -> Result<u64> {
+        let now = self.clock.now();
+        if now > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::Protocol.into());
+        }
+        Ok(now)
+    }
+
     /// Milliseconds since the Unix epoch by the server's [clock](Self::clock), strictly
-    /// increasing and bounded by `protocol::MAX_SAFE_INTEGER`.
+    /// increasing (unless a stale persisted `last_timestamp` lies more than
+    /// [`protocol::MAX_CLOCK_SKEW`] ahead of the current clock) and bounded by
+    /// `protocol::MAX_SAFE_INTEGER`.
     pub(crate) fn next_timestamp(&mut self) -> Result<u64> {
-        let next = self
-            .clock
-            .now()
-            .max(self.state.last_timestamp.saturating_add(1));
+        let now = self.clock.now();
+        let next = if self.state.last_timestamp >= now.saturating_add(protocol::MAX_CLOCK_SKEW) {
+            now
+        } else {
+            now.max(self.state.last_timestamp.saturating_add(1))
+        };
         if next > protocol::MAX_SAFE_INTEGER {
             return Err(ErrorKind::Protocol.into());
         }
@@ -1851,6 +1889,14 @@ impl<M> Session<M> {
         self.state.peer_pq.peer_session_seq
     }
 
+    /// `Hello.session_seq` carried by the active peer-initiated session (`0` if none or unset).
+    pub fn active_peer_session_seq(&self) -> u64 {
+        self.state
+            .active
+            .as_ref()
+            .map_or(0, |active| active.peer_session_seq)
+    }
+
     /// Build a [`Hello`] greeting for starting a new session with this peer, automatically
     /// allocating the next monotonic outgoing `session_seq`.
     pub fn make_hello(&mut self, name: impl Into<String>, pq_config: &PqConfig) -> Hello {
@@ -1876,18 +1922,26 @@ impl<M> Session<M> {
     /// `stale_session_seq = true` while still enforcing downgrade detection and rejecting `0` or
     /// any strictly smaller `session_seq`.
     pub fn check_peer_hello(&mut self, hello: &Hello, local_pq_enabled: bool) -> HelloCheck {
-        let security = self.security().unwrap_or_default();
         let is_own_initial_hello = (1..=protocol::MAX_SAFE_INTEGER).contains(&hello.session_seq)
             && self.state.peer_pq.peer_session_seq == hello.session_seq
             && self.state.active.as_ref().is_some_and(|active| {
                 active.known_by_peer && active.peer_session_seq == hello.session_seq
             });
-        let mut check =
-            check_peer_hello(&mut self.state.peer_pq, security, hello, local_pq_enabled);
-        if is_own_initial_hello {
-            check.stale_session_seq = false;
-        }
-        check
+        // When no active session exists (e.g. a late Hello decrypted on an earlier retired
+        // session), still enforce session_seq monotonicity and PQ pinning without flagging a
+        // false-positive downgrade against a nonexistent classical active session.
+        let effective_security = self.security().unwrap_or(SessionSecurity {
+            is_pq: true,
+            suite: None,
+            pq_ratchet: false,
+        });
+        pq::check_peer_hello_with_allow_same(
+            &mut self.state.peer_pq,
+            effective_security,
+            hello,
+            local_pq_enabled,
+            is_own_initial_hello,
+        )
     }
 
     /// Go on past the messages that receiving stopped at, as they did not decrypt, once the
@@ -1904,6 +1958,14 @@ impl<M> Session<M> {
         if let Some(active) = self.state.active.take() {
             self.state.archive(active.into());
         }
+        self.state.last = LastAction::None;
+        self.state.direction_changes = 0;
+    }
+
+    /// Discard the active session without archiving it into earlier decryption sessions (e.g. when
+    /// replacing an unapproved quarantined classical session so rejected follow-ups never decrypt).
+    pub fn discard_active(&mut self) {
+        self.state.active = None;
         self.state.last = LastAction::None;
         self.state.direction_changes = 0;
     }
@@ -1985,7 +2047,6 @@ impl<M> Session<M> {
                     && local_pq_enabled
                     && state.peer_pq.pq_pinned
                     && !state.peer_pq.allow_classical_exception
-                    && !new.peer_pq.allow_classical_exception
                 {
                     return Err(ErrorKind::DowngradeDetected.into());
                 }
@@ -2001,13 +2062,23 @@ impl<M> Session<M> {
             state.archive(earlier);
         }
 
-        // Merge per-peer PQ metadata monotonically.
+        // Merge per-peer PQ metadata monotonically while tracking `peer_pq_capable` according to
+        // manifest sequence order so accepting a newer signed PQ-OFF manifest is not clobbered.
+        let was_pq_pinned = state.peer_pq.pq_pinned;
+        let was_pq_capable = state.peer_pq.peer_pq_capable;
         state.peer_pq.pq_pinned |= new.peer_pq.pq_pinned;
-        state.peer_pq.pinned_manifest_seq = state
-            .peer_pq
-            .pinned_manifest_seq
-            .max(new.peer_pq.pinned_manifest_seq);
-        state.peer_pq.peer_pq_capable |= new.peer_pq.peer_pq_capable;
+        if new.peer_pq.pinned_manifest_seq > state.peer_pq.pinned_manifest_seq {
+            state.peer_pq.pinned_manifest_seq = new.peer_pq.pinned_manifest_seq;
+            state.peer_pq.peer_pq_capable = new.peer_pq.peer_pq_capable;
+        } else if new.peer_pq.pinned_manifest_seq == state.peer_pq.pinned_manifest_seq {
+            state.peer_pq.peer_pq_capable |= new.peer_pq.peer_pq_capable;
+        }
+        if ((!was_pq_pinned && new.peer_pq.pq_pinned)
+            || (!was_pq_capable && new.peer_pq.peer_pq_capable))
+            && !new.peer_pq.allow_classical_exception
+        {
+            state.peer_pq.allow_classical_exception = false;
+        }
         state.peer_pq.downgrade_detected |= new.peer_pq.downgrade_detected;
         state.peer_pq.peer_session_seq = state
             .peer_pq
@@ -2015,22 +2086,27 @@ impl<M> Session<M> {
             .max(new.peer_pq.peer_session_seq);
 
         if let Some(active) = new.active {
-            if active.security.is_pq {
-                state.peer_pq.allow_classical_exception = false;
-                state.peer_pq.downgrade_detected = false;
-            } else {
-                state.peer_pq.allow_classical_exception |= new.peer_pq.allow_classical_exception;
-            }
             // One this client started is not known by the peer yet.
             let started_here = !active.known_by_peer;
+            if active.security.is_pq {
+                state.peer_pq.peer_pq_capable = true;
+                state.peer_pq.allow_classical_exception = false;
+                state.peer_pq.downgrade_detected = false;
+            } else if started_here {
+                state.peer_pq.allow_classical_exception |= new.peer_pq.allow_classical_exception;
+            }
             if !started_here && active.peer_session_seq > state.peer_pq.peer_session_seq {
                 state.peer_pq.peer_session_seq = active.peer_session_seq;
             }
             let takes_over = started_here
-                || state
-                    .active
-                    .as_ref()
-                    .is_none_or(|current| current.known_by_peer || active.id > current.id);
+                || state.active.as_ref().is_none_or(|current| {
+                    current.known_by_peer
+                        || match (active.security.is_pq, current.security.is_pq) {
+                            (true, false) => true,
+                            (false, true) => false,
+                            _ => active.id > current.id,
+                        }
+                });
             if takes_over {
                 if let Some(current) = state.active.replace(active) {
                     state.archive(current.into());
@@ -2046,6 +2122,10 @@ impl<M> Session<M> {
                 // Its first message decrypted, on what is now an earlier session.
                 state.archive(active.into());
                 state.received_earlier();
+                if state.active.as_ref().is_some_and(|a| a.security.is_pq) {
+                    state.peer_pq.downgrade_detected = false;
+                    state.peer_pq.allow_classical_exception = false;
+                }
                 return Ok(false);
             }
         }

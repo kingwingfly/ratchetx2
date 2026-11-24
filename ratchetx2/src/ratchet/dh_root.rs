@@ -112,7 +112,9 @@ impl DhRootRatchet {
         let mut header_key = Zeroizing::new(HeaderKey::default());
 
         if extra_secret.is_empty() {
-            let hkdf = Hkdf::<Sha256>::new(Some(&self.root_key), dh_shared.as_slice());
+            let (mut prk, hkdf) =
+                Hkdf::<Sha256>::extract(Some(&self.root_key), dh_shared.as_slice());
+            prk.zeroize();
             hkdf.expand(b"RootKey", root_key.as_mut_slice()).unwrap();
             hkdf.expand(b"ChainKey", chain_key.as_mut_slice()).unwrap();
             hkdf.expand(b"HeaderKey", header_key.as_mut_slice())
@@ -121,7 +123,8 @@ impl DhRootRatchet {
             let mut ikm = Zeroizing::new(Vec::with_capacity(DH_KEY_LENGTH + extra_secret.len()));
             ikm.extend_from_slice(dh_shared.as_slice());
             ikm.extend_from_slice(extra_secret);
-            let hkdf = Hkdf::<Sha256>::new(Some(&self.root_key), ikm.as_slice());
+            let (mut prk, hkdf) = Hkdf::<Sha256>::extract(Some(&self.root_key), ikm.as_slice());
+            prk.zeroize();
             hkdf.expand(HYBRID_ROOT_KEY_INFO, root_key.as_mut_slice())
                 .unwrap();
             hkdf.expand(HYBRID_CHAIN_KEY_INFO, chain_key.as_mut_slice())

@@ -185,8 +185,11 @@ impl Attachment {
             let at = Date::now().as_millis().saturating_add(RETRY_ALARM);
             return storage.set_alarm(alarm_at(at)).await;
         }
-        storage.delete_alarm().await?;
-        storage.delete_all().await
+        storage.delete_all().await?;
+        if let Err(e) = storage.delete_alarm().await {
+            console_error!("cannot delete attachment alarm after deleting storage: {e}");
+        }
+        Ok(())
     }
 }
 

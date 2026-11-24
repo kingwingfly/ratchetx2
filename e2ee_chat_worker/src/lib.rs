@@ -44,6 +44,31 @@ pub(crate) const BUCKET: &str = "BUCKET";
 /// push.
 const MAX_BODY: usize = 4 << 20;
 
+/// Per-procedure request body caps for attachment routes so small RPCs never buffer multi-MiB bodies.
+fn max_body_attachment(procedure: AttachmentProcedure) -> usize {
+    match procedure {
+        AttachmentProcedure::StartUpload
+        | AttachmentProcedure::GetChunk
+        | AttachmentProcedure::DeleteAttachment => 4 << 10,
+        AttachmentProcedure::PutChunk => (2 << 20) + (4 << 10),
+    }
+}
+
+/// Per-procedure request body caps for v2 routes so small RPCs never buffer multi-MiB bodies.
+fn max_body_v2(procedure: ProcedureV2) -> usize {
+    match procedure {
+        ProcedureV2::GetServerInfo
+        | ProcedureV2::GetManifest
+        | ProcedureV2::ClaimBundle
+        | ProcedureV2::ListInitialMessages => 4 << 10,
+        ProcedureV2::AckInitialMessages => 8 << 10,
+        ProcedureV2::SendInitialV2 => 16 << 10,
+        ProcedureV2::FetchSigned => 32 << 10,
+        ProcedureV2::PublishV2 | ProcedureV2::RefillPrekeys => 256 << 10,
+        ProcedureV2::PushV2 => MAX_BODY,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Route {
     V2(ProcedureV2),
@@ -158,8 +183,11 @@ async fn call_attachment(
         return respond(connect::error(ErrorKind::SignInRequired, message));
     }
     let content_type = request.headers().get("content-type")?;
+    if let Some(response) = connect::check_content_type(content_type.as_deref()) {
+        return respond(response);
+    }
     let limits = MailboxLimits::default();
-    let response = match read_body(&mut request, MAX_BODY).await? {
+    let response = match read_body(&mut request, max_body_attachment(procedure)).await? {
         Some(body) => {
             let body = Bytes::from(body);
             let store = Store::new(env, limits.max_message_size)?;
@@ -197,9 +225,12 @@ async fn call_v2(mut request: Request, env: &Env, procedure: ProcedureV2) -> Res
         return respond(connect::error(ErrorKind::SignInRequired, message));
     }
     let content_type = request.headers().get("content-type")?;
+    if let Some(response) = connect::check_content_type(content_type.as_deref()) {
+        return respond(response);
+    }
     let server_id = server_id(env, &request)?;
     let limits = MailboxLimits::default();
-    let response = match read_body(&mut request, MAX_BODY).await? {
+    let response = match read_body(&mut request, max_body_v2(procedure)).await? {
         Some(body) => {
             let body = Bytes::from(body);
             let store = Store::new(env, limits.max_message_size)?;
@@ -278,7 +309,10 @@ fn respond(response: connect::Response) -> Result<Response> {
 
 /// Whether calls to attachment `procedure` require sign-in.
 fn writes_attachment(procedure: AttachmentProcedure) -> bool {
-    matches!(procedure, AttachmentProcedure::StartUpload)
+    matches!(
+        procedure,
+        AttachmentProcedure::StartUpload | AttachmentProcedure::PutChunk
+    )
 }
 
 /// Whether calls to v2 `procedure` write or consume prekeys, requiring sign-in.
@@ -652,9 +686,9 @@ mod tests {
     }
 
     #[test]
-    fn attachment_sign_in_is_required_only_for_start_upload() {
+    fn attachment_sign_in_is_required_for_upload_writes() {
         assert!(writes_attachment(AttachmentProcedure::StartUpload));
-        assert!(!writes_attachment(AttachmentProcedure::PutChunk));
+        assert!(writes_attachment(AttachmentProcedure::PutChunk));
         assert!(!writes_attachment(AttachmentProcedure::GetChunk));
         assert!(!writes_attachment(AttachmentProcedure::DeleteAttachment));
     }
@@ -1050,5 +1084,34 @@ mod tests {
                 assert!(verify_subscribe_request(&plain_host, &audience, now).is_err());
             }
         }
+    }
+
+    #[test]
+    fn connect_content_type_and_per_procedure_body_caps_enforce_bounds() {
+        assert!(connect::check_content_type(Some(connect::CONTENT_TYPE)).is_none());
+        assert!(connect::check_content_type(Some("application/proto; charset=utf-8")).is_none());
+        let bad = connect::check_content_type(Some("application/json")).expect("415 response");
+        assert_eq!(bad.status, 415);
+        assert!(connect::check_content_type(None).is_some());
+
+        assert_eq!(
+            max_body_attachment(AttachmentProcedure::StartUpload),
+            4 << 10
+        );
+        assert_eq!(max_body_attachment(AttachmentProcedure::GetChunk), 4 << 10);
+        assert_eq!(
+            max_body_attachment(AttachmentProcedure::DeleteAttachment),
+            4 << 10
+        );
+        assert_eq!(
+            max_body_attachment(AttachmentProcedure::PutChunk),
+            (2 << 20) + (4 << 10)
+        );
+        assert_eq!(max_body_v2(ProcedureV2::GetServerInfo), 4 << 10);
+        assert_eq!(max_body_v2(ProcedureV2::SendInitialV2), 16 << 10);
+        assert_eq!(max_body_v2(ProcedureV2::FetchSigned), 32 << 10);
+        assert_eq!(max_body_v2(ProcedureV2::PublishV2), 256 << 10);
+        assert_eq!(max_body_v2(ProcedureV2::RefillPrekeys), 256 << 10);
+        assert_eq!(max_body_v2(ProcedureV2::PushV2), MAX_BODY);
     }
 }

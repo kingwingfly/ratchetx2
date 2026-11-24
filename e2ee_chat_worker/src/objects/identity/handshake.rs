@@ -1,6 +1,6 @@
 //! V2 capability manifests, classical and post-quantum prekeys, and the two-phase handshake inbox.
 
-use worker::{Date, Error, Result, SqlStorageValue};
+use worker::{Date, Error, Result, SqlStorage, SqlStorageValue};
 
 use super::{Identity, rows::*};
 use crate::objects::{
@@ -18,8 +18,7 @@ struct PqInitialBindings {
 }
 
 impl Identity {
-    fn pop_classical_opk(&self) -> Result<Option<Vec<u8>>> {
-        let sql = self.sql();
+    fn pop_classical_opk_sql(sql: &SqlStorage) -> Result<Option<Vec<u8>>> {
         let prekey = sql
             .exec(
                 "SELECT position, prekey FROM one_time_prekeys ORDER BY position LIMIT 1",
@@ -34,6 +33,55 @@ impl Identity {
             )?;
         }
         Ok(prekey.map(|p| p.prekey))
+    }
+
+    fn get_manifest_sql(sql: &SqlStorage) -> Result<Option<ManifestWire>> {
+        if !has_table(sql, "capability_manifest")? {
+            return Ok(None);
+        }
+        let Some(row) = sql
+            .exec(
+                "SELECT audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
+                 pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
+                 pq_last_resort_commitments, signature FROM capability_manifest",
+                None,
+            )?
+            .to_array::<ManifestRow>()?
+            .pop()
+        else {
+            return Ok(None);
+        };
+        let pq_last_resort: Vec<PqCommitmentWire> =
+            postcard::from_bytes(&row.pq_last_resort_commitments)
+                .map_err(|e| Error::RustError(e.to_string()))?;
+        Ok(Some(ManifestWire {
+            audience: row.audience,
+            identity_key: row.identity_key,
+            manifest_seq: row.manifest_seq,
+            generation: row.generation,
+            issued_at: row.issued_at,
+            expires_at: row.expires_at,
+            pq_enabled: row.pq_enabled != 0,
+            strict_pq: row.strict_pq != 0,
+            pq_ratchet_supported: row.pq_ratchet_supported != 0,
+            offered_suites: row.offered_suites,
+            signed_prekey: row.signed_prekey,
+            pq_last_resort,
+            signature: row.signature,
+        }))
+    }
+
+    fn pq_one_time_counts_sql(sql: &SqlStorage) -> Result<Vec<(u8, u64)>> {
+        if !has_table(sql, "pq_one_time_prekeys")? {
+            return Ok(vec![]);
+        }
+        let rows: Vec<SuiteCountRow> = sql
+            .exec(
+                "SELECT suite, count(*) AS count FROM pq_one_time_prekeys GROUP BY suite ORDER BY suite",
+                None,
+            )?
+            .to_array()?;
+        Ok(rows.into_iter().map(|r| (r.suite as u8, r.count)).collect())
     }
 
     pub(super) fn publish_v2(
@@ -87,122 +135,123 @@ impl Identity {
         let commitments_blob = postcard::to_allocvec(&manifest.pq_last_resort)
             .map_err(|e| Error::RustError(e.to_string()))?;
 
-        let sql = self.sql();
-        let existing: Vec<ManifestSeqRow> = sql
-            .exec("SELECT manifest_seq FROM capability_manifest", None)?
-            .to_array()?;
-        if existing
-            .first()
-            .is_some_and(|row| row.manifest_seq >= manifest.manifest_seq)
-        {
-            return Ok(PublishV2Outcome::StaleSequence);
-        }
-
-        // Prepare classical SPK signature bundle timestamp before any mutations.
-        let next_bundle_ts = if !manifest.strict_pq && signed_prekey_signature.is_some() {
-            let prev: Vec<TimestampRow> =
-                sql.exec("SELECT timestamp FROM bundle", None)?.to_array()?;
-            let next_ts = prev
+        self.transaction_sync(|sql| {
+            let existing: Vec<ManifestSeqRow> = sql
+                .exec("SELECT manifest_seq FROM capability_manifest", None)?
+                .to_array()?;
+            if existing
                 .first()
-                .map_or(timestamp, |r| r.timestamp.max(timestamp));
-            Some(checked_integer(next_ts)?)
-        } else {
-            None
-        };
-
-        // Store or clear classical SPK signature row depending on strict_pq and signature presence.
-        if let (Some(sig), Some(next_ts_val)) = (signed_prekey_signature, next_bundle_ts) {
-            sql.exec(
-                "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, ?) \
-                 ON CONFLICT (only) DO UPDATE SET signed_prekey = excluded.signed_prekey, \
-                 signature = excluded.signature, timestamp = excluded.timestamp",
-                vec![blob(&manifest.signed_prekey), blob(sig), next_ts_val],
-            )?;
-        } else {
-            sql.exec("DELETE FROM bundle", None)?;
-        }
-
-        // Replace classical OPKs.
-        sql.exec("DELETE FROM one_time_prekeys", None)?;
-        for (pos_val, prekey) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
-            sql.exec(
-                "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
-                vec![pos_val, blob(prekey)],
-            )?;
-        }
-
-        // Replace or clear PQ prekeys depending on affirmative pq_enabled flag.
-        sql.exec("DELETE FROM pq_last_resort", None)?;
-        sql.exec("DELETE FROM pq_one_time_prekeys", None)?;
-        if manifest.pq_enabled {
-            for (suite_val, lr) in lr_suite_vals.into_iter().zip(pq_last_resort.iter()) {
-                sql.exec(
-                    "INSERT INTO pq_last_resort (suite, prekey_id, encapsulation_key, signature) \
-                     VALUES (?, ?, ?, ?)",
-                    vec![
-                        suite_val,
-                        blob(&lr.id),
-                        blob(&lr.encapsulation_key),
-                        blob(&lr.signature),
-                    ],
-                )?;
-            }
-            for (suite_val, opk) in pq_opk_suite_vals
-                .into_iter()
-                .zip(pq_one_time_prekeys.iter())
+                .is_some_and(|row| row.manifest_seq >= manifest.manifest_seq)
             {
+                return Ok(PublishV2Outcome::StaleSequence);
+            }
+
+            // Prepare classical SPK signature bundle timestamp before any mutations.
+            let next_bundle_ts = if !manifest.strict_pq && signed_prekey_signature.is_some() {
+                let prev: Vec<TimestampRow> =
+                    sql.exec("SELECT timestamp FROM bundle", None)?.to_array()?;
+                let next_ts = prev
+                    .first()
+                    .map_or(timestamp, |r| r.timestamp.max(timestamp));
+                Some(checked_integer(next_ts)?)
+            } else {
+                None
+            };
+
+            // Store or clear classical SPK signature row depending on strict_pq and signature presence.
+            if let (Some(sig), Some(next_ts_val)) = (signed_prekey_signature, next_bundle_ts) {
                 sql.exec(
-                    "INSERT INTO pq_one_time_prekeys (suite, prekey_id, encapsulation_key, signature) \
-                     VALUES (?, ?, ?, ?)",
-                    vec![
-                        suite_val,
-                        blob(&opk.id),
-                        blob(&opk.encapsulation_key),
-                        blob(&opk.signature),
-                    ],
+                    "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, ?) \
+                     ON CONFLICT (only) DO UPDATE SET signed_prekey = excluded.signed_prekey, \
+                     signature = excluded.signature, timestamp = excluded.timestamp",
+                    vec![blob(&manifest.signed_prekey), blob(sig), next_ts_val],
+                )?;
+            } else {
+                sql.exec("DELETE FROM bundle", None)?;
+            }
+
+            // Replace classical OPKs.
+            sql.exec("DELETE FROM one_time_prekeys", None)?;
+            for (pos_val, prekey) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
+                sql.exec(
+                    "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
+                    vec![pos_val, blob(prekey)],
                 )?;
             }
-        }
 
-        sql.exec(
-            "INSERT INTO capability_manifest \
-             (only, audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
-              pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
-              pq_last_resort_commitments, signature) \
-             VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT (only) DO UPDATE SET \
-              audience = excluded.audience, identity_key = excluded.identity_key, \
-              manifest_seq = excluded.manifest_seq, generation = excluded.generation, \
-              issued_at = excluded.issued_at, expires_at = excluded.expires_at, \
-              pq_enabled = excluded.pq_enabled, strict_pq = excluded.strict_pq, \
-              pq_ratchet_supported = excluded.pq_ratchet_supported, \
-              offered_suites = excluded.offered_suites, signed_prekey = excluded.signed_prekey, \
-              pq_last_resort_commitments = excluded.pq_last_resort_commitments, \
-              signature = excluded.signature",
-            vec![
-                manifest.audience.as_str().into(),
-                blob(&manifest.identity_key),
-                seq_val,
-                gen_val,
-                issued_val,
-                expires_val,
-                pq_enabled_val,
-                strict_pq_val,
-                pq_ratchet_val,
-                blob(&manifest.offered_suites),
-                blob(&manifest.signed_prekey),
-                blob(&commitments_blob),
-                blob(&manifest.signature),
-            ],
-        )?;
-        sql.exec(
-            "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
-             VALUES (0, ?, 0) \
-             ON CONFLICT (only) DO UPDATE SET \
-             last_v1_publish_ts = max(publish_watermarks.last_v1_publish_ts, excluded.last_v1_publish_ts)",
-            vec![ts_val],
-        )?;
-        Ok(PublishV2Outcome::Stored)
+            // Replace or clear PQ prekeys depending on affirmative pq_enabled flag.
+            sql.exec("DELETE FROM pq_last_resort", None)?;
+            sql.exec("DELETE FROM pq_one_time_prekeys", None)?;
+            if manifest.pq_enabled {
+                for (suite_val, lr) in lr_suite_vals.into_iter().zip(pq_last_resort.iter()) {
+                    sql.exec(
+                        "INSERT INTO pq_last_resort (suite, prekey_id, encapsulation_key, signature) \
+                         VALUES (?, ?, ?, ?)",
+                        vec![
+                            suite_val,
+                            blob(&lr.id),
+                            blob(&lr.encapsulation_key),
+                            blob(&lr.signature),
+                        ],
+                    )?;
+                }
+                for (suite_val, opk) in pq_opk_suite_vals
+                    .into_iter()
+                    .zip(pq_one_time_prekeys.iter())
+                {
+                    sql.exec(
+                        "INSERT INTO pq_one_time_prekeys (suite, prekey_id, encapsulation_key, signature) \
+                         VALUES (?, ?, ?, ?)",
+                        vec![
+                            suite_val,
+                            blob(&opk.id),
+                            blob(&opk.encapsulation_key),
+                            blob(&opk.signature),
+                        ],
+                    )?;
+                }
+            }
+
+            sql.exec(
+                "INSERT INTO capability_manifest \
+                 (only, audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
+                  pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
+                  pq_last_resort_commitments, signature) \
+                 VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 ON CONFLICT (only) DO UPDATE SET \
+                  audience = excluded.audience, identity_key = excluded.identity_key, \
+                  manifest_seq = excluded.manifest_seq, generation = excluded.generation, \
+                  issued_at = excluded.issued_at, expires_at = excluded.expires_at, \
+                  pq_enabled = excluded.pq_enabled, strict_pq = excluded.strict_pq, \
+                  pq_ratchet_supported = excluded.pq_ratchet_supported, \
+                  offered_suites = excluded.offered_suites, signed_prekey = excluded.signed_prekey, \
+                  pq_last_resort_commitments = excluded.pq_last_resort_commitments, \
+                  signature = excluded.signature",
+                vec![
+                    manifest.audience.as_str().into(),
+                    blob(&manifest.identity_key),
+                    seq_val,
+                    gen_val,
+                    issued_val,
+                    expires_val,
+                    pq_enabled_val,
+                    strict_pq_val,
+                    pq_ratchet_val,
+                    blob(&manifest.offered_suites),
+                    blob(&manifest.signed_prekey),
+                    blob(&commitments_blob),
+                    blob(&manifest.signature),
+                ],
+            )?;
+            sql.exec(
+                "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
+                 VALUES (0, ?, 0) \
+                 ON CONFLICT (only) DO UPDATE SET \
+                 last_v1_publish_ts = max(publish_watermarks.last_v1_publish_ts, excluded.last_v1_publish_ts)",
+                vec![ts_val],
+            )?;
+            Ok(PublishV2Outcome::Stored)
+        })
     }
 
     pub(super) fn refill_prekeys(
@@ -216,113 +265,118 @@ impl Identity {
     ) -> Result<RefillOutcome> {
         let _ = checked_integer(generation)?;
         let ts_val = checked_integer(timestamp)?;
-        let Some(manifest) = self.get_manifest()? else {
+        if !self.has_tables()? {
             return Ok(RefillOutcome::NotFound);
-        };
-        if manifest.generation != generation {
-            return Ok(RefillOutcome::StaleGeneration);
-        }
-        if !pq_one_time_prekeys.is_empty() && !manifest.pq_enabled {
-            return Ok(RefillOutcome::StaleGeneration);
         }
 
-        let sql = self.sql();
-        let wm: Vec<WatermarkRow> = sql
-            .exec("SELECT last_refill_ts FROM publish_watermarks", None)?
-            .to_array()?;
-        if wm
-            .first()
-            .is_some_and(|row| row.last_refill_ts >= timestamp)
-        {
-            return Ok(RefillOutcome::StaleTimestamp);
-        }
-        let existing_opks: Vec<PrekeyRow> = sql
-            .exec(
-                "SELECT position, prekey FROM one_time_prekeys ORDER BY position",
-                None,
-            )?
-            .to_array()?;
-        if (existing_opks.len() as u64).saturating_add(one_time_prekeys.len() as u64)
-            > max_one_time_prekeys
-        {
-            return Ok(RefillOutcome::LimitExceeded);
-        }
-        let mut seen_opks: std::collections::HashSet<Vec<u8>> =
-            existing_opks.iter().map(|r| r.prekey.clone()).collect();
-        for opk in one_time_prekeys {
-            if !seen_opks.insert(opk.clone()) {
-                return Ok(RefillOutcome::DuplicatePrekey);
-            }
-        }
-
-        let existing_pq_ids: Vec<IdBlobRow> = sql
-            .exec("SELECT prekey_id FROM pq_one_time_prekeys", None)?
-            .to_array()?;
-        if (existing_pq_ids.len() as u64).saturating_add(pq_one_time_prekeys.len() as u64)
-            > max_pq_one_time_prekeys
-        {
-            return Ok(RefillOutcome::LimitExceeded);
-        }
-        let mut seen_pq_ids: std::collections::HashSet<Vec<u8>> =
-            existing_pq_ids.into_iter().map(|r| r.prekey_id).collect();
-        let lr_ids: Vec<IdBlobRow> = sql
-            .exec("SELECT prekey_id FROM pq_last_resort", None)?
-            .to_array()?;
-        for lr in lr_ids {
-            seen_pq_ids.insert(lr.prekey_id);
-        }
-        for pq in pq_one_time_prekeys {
-            if !manifest.offered_suites.contains(&pq.suite) {
+        self.transaction_sync(|sql| {
+            let Some(manifest) = Self::get_manifest_sql(sql)? else {
+                return Ok(RefillOutcome::NotFound);
+            };
+            if manifest.generation != generation {
                 return Ok(RefillOutcome::StaleGeneration);
             }
-            if !seen_pq_ids.insert(pq.id.clone()) {
-                return Ok(RefillOutcome::DuplicatePrekey);
+            if !pq_one_time_prekeys.is_empty() && !manifest.pq_enabled {
+                return Ok(RefillOutcome::StaleGeneration);
             }
-        }
 
-        // Pre-validate all integer bindings before mutating SQLite.
-        let start_pos = existing_opks.last().map_or(0, |r| r.position + 1);
-        let mut opk_positions = Vec::with_capacity(one_time_prekeys.len());
-        for offset in 0..one_time_prekeys.len() {
-            opk_positions.push(checked_integer(start_pos.saturating_add(offset as u64))?);
-        }
-        let mut pq_suite_vals = Vec::with_capacity(pq_one_time_prekeys.len());
-        for pq in pq_one_time_prekeys {
-            pq_suite_vals.push(checked_integer(pq.suite.into())?);
-        }
+            let wm: Vec<WatermarkRow> = sql
+                .exec("SELECT last_refill_ts FROM publish_watermarks", None)?
+                .to_array()?;
+            if wm
+                .first()
+                .is_some_and(|row| row.last_refill_ts >= timestamp)
+            {
+                return Ok(RefillOutcome::StaleTimestamp);
+            }
+            let existing_opks: Vec<PrekeyRow> = sql
+                .exec(
+                    "SELECT position, prekey FROM one_time_prekeys ORDER BY position",
+                    None,
+                )?
+                .to_array()?;
+            if (existing_opks.len() as u64).saturating_add(one_time_prekeys.len() as u64)
+                > max_one_time_prekeys
+            {
+                return Ok(RefillOutcome::LimitExceeded);
+            }
+            let mut seen_opks: std::collections::HashSet<Vec<u8>> =
+                existing_opks.iter().map(|r| r.prekey.clone()).collect();
+            for opk in one_time_prekeys {
+                if !seen_opks.insert(opk.clone()) {
+                    return Ok(RefillOutcome::DuplicatePrekey);
+                }
+            }
 
-        // Record monotonic refill watermark and append OPKs/PQOPKs without rotating SPK.
-        sql.exec(
-            "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
-             VALUES (0, 0, ?) \
-             ON CONFLICT (only) DO UPDATE SET last_refill_ts = excluded.last_refill_ts",
-            vec![ts_val],
-        )?;
-        for (pos_val, opk) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
+            let existing_pq_ids: Vec<IdBlobRow> = sql
+                .exec("SELECT prekey_id FROM pq_one_time_prekeys", None)?
+                .to_array()?;
+            if (existing_pq_ids.len() as u64).saturating_add(pq_one_time_prekeys.len() as u64)
+                > max_pq_one_time_prekeys
+            {
+                return Ok(RefillOutcome::LimitExceeded);
+            }
+            let mut seen_pq_ids: std::collections::HashSet<Vec<u8>> =
+                existing_pq_ids.into_iter().map(|r| r.prekey_id).collect();
+            let lr_ids: Vec<IdBlobRow> = sql
+                .exec("SELECT prekey_id FROM pq_last_resort", None)?
+                .to_array()?;
+            for lr in lr_ids {
+                seen_pq_ids.insert(lr.prekey_id);
+            }
+            for pq in pq_one_time_prekeys {
+                if !manifest.offered_suites.contains(&pq.suite) {
+                    return Ok(RefillOutcome::StaleGeneration);
+                }
+                if !seen_pq_ids.insert(pq.id.clone()) {
+                    return Ok(RefillOutcome::DuplicatePrekey);
+                }
+            }
+
+            // Pre-validate all integer bindings before mutating SQLite.
+            let start_pos = existing_opks.last().map_or(0, |r| r.position + 1);
+            let mut opk_positions = Vec::with_capacity(one_time_prekeys.len());
+            for offset in 0..one_time_prekeys.len() {
+                opk_positions.push(checked_integer(start_pos.saturating_add(offset as u64))?);
+            }
+            let mut pq_suite_vals = Vec::with_capacity(pq_one_time_prekeys.len());
+            for pq in pq_one_time_prekeys {
+                pq_suite_vals.push(checked_integer(pq.suite.into())?);
+            }
+
+            // Record monotonic refill watermark and append OPKs/PQOPKs without rotating SPK.
             sql.exec(
-                "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
-                vec![pos_val, blob(opk)],
+                "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
+                 VALUES (0, 0, ?) \
+                 ON CONFLICT (only) DO UPDATE SET last_refill_ts = excluded.last_refill_ts",
+                vec![ts_val],
             )?;
-        }
-        // Append PQOPKs.
-        for (suite_val, pq) in pq_suite_vals.into_iter().zip(pq_one_time_prekeys.iter()) {
-            sql.exec(
-                "INSERT INTO pq_one_time_prekeys (suite, prekey_id, encapsulation_key, signature) \
-                 VALUES (?, ?, ?, ?)",
-                vec![
-                    suite_val,
-                    blob(&pq.id),
-                    blob(&pq.encapsulation_key),
-                    blob(&pq.signature),
-                ],
-            )?;
-        }
+            for (pos_val, opk) in opk_positions.into_iter().zip(one_time_prekeys.iter()) {
+                sql.exec(
+                    "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
+                    vec![pos_val, blob(opk)],
+                )?;
+            }
+            // Append PQOPKs.
+            for (suite_val, pq) in pq_suite_vals.into_iter().zip(pq_one_time_prekeys.iter()) {
+                sql.exec(
+                    "INSERT INTO pq_one_time_prekeys (suite, prekey_id, encapsulation_key, signature) \
+                     VALUES (?, ?, ?, ?)",
+                    vec![
+                        suite_val,
+                        blob(&pq.id),
+                        blob(&pq.encapsulation_key),
+                        blob(&pq.signature),
+                    ],
+                )?;
+            }
 
-        let classical_count = existing_opks.len() as u64 + one_time_prekeys.len() as u64;
-        let pq_counts = self.pq_one_time_counts()?;
-        Ok(RefillOutcome::Stored {
-            classical_count,
-            pq_counts,
+            let classical_count = existing_opks.len() as u64 + one_time_prekeys.len() as u64;
+            let pq_counts = Self::pq_one_time_counts_sql(sql)?;
+            Ok(RefillOutcome::Stored {
+                classical_count,
+                pq_counts,
+            })
         })
     }
 
@@ -330,40 +384,7 @@ impl Identity {
         if !self.has_tables()? {
             return Ok(None);
         }
-        let sql = self.sql();
-        if !has_table(&sql, "capability_manifest")? {
-            return Ok(None);
-        }
-        let Some(row) = sql
-            .exec(
-                "SELECT audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
-                 pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
-                 pq_last_resort_commitments, signature FROM capability_manifest",
-                None,
-            )?
-            .to_array::<ManifestRow>()?
-            .pop()
-        else {
-            return Ok(None);
-        };
-        let pq_last_resort: Vec<PqCommitmentWire> =
-            postcard::from_bytes(&row.pq_last_resort_commitments)
-                .map_err(|e| Error::RustError(e.to_string()))?;
-        Ok(Some(ManifestWire {
-            audience: row.audience,
-            identity_key: row.identity_key,
-            manifest_seq: row.manifest_seq,
-            generation: row.generation,
-            issued_at: row.issued_at,
-            expires_at: row.expires_at,
-            pq_enabled: row.pq_enabled != 0,
-            strict_pq: row.strict_pq != 0,
-            pq_ratchet_supported: row.pq_ratchet_supported != 0,
-            offered_suites: row.offered_suites,
-            signed_prekey: row.signed_prekey,
-            pq_last_resort,
-            signature: row.signature,
-        }))
+        Self::get_manifest_sql(&self.sql())
     }
 
     pub(super) fn claim_bundle(
@@ -373,109 +394,110 @@ impl Identity {
         if !self.has_tables()? {
             return Ok(None);
         }
-        let sql = self.sql();
-        if let Some(manifest) = self.get_manifest()? {
-            let signed_prekey_signature = if manifest.strict_pq {
-                None
-            } else {
-                sql.exec("SELECT signed_prekey, signature FROM bundle", None)?
-                    .to_array::<BundleRow>()?
-                    .pop()
-                    .filter(|b| b.signed_prekey == manifest.signed_prekey)
-                    .map(|b| b.signature)
-            };
-            let one_time_prekey = self.pop_classical_opk()?;
+        self.transaction_sync(|sql| {
+            if let Some(manifest) = Self::get_manifest_sql(sql)? {
+                let signed_prekey_signature = if manifest.strict_pq {
+                    None
+                } else {
+                    sql.exec("SELECT signed_prekey, signature FROM bundle", None)?
+                        .to_array::<BundleRow>()?
+                        .pop()
+                        .filter(|b| b.signed_prekey == manifest.signed_prekey)
+                        .map(|b| b.signature)
+                };
+                let one_time_prekey = Self::pop_classical_opk_sql(sql)?;
 
-            let (pq_last_resort, pq_one_time_prekey) = if manifest.pq_enabled
-                && !preferred_suites.is_empty()
-                && has_table(&sql, "pq_last_resort")?
-            {
-                let mut negotiated = None;
-                for &suite in preferred_suites {
-                    if !manifest.offered_suites.contains(&suite) {
-                        continue;
-                    }
-                    let lr = sql
-                        .exec(
-                            "SELECT suite, prekey_id, encapsulation_key, signature \
-                             FROM pq_last_resort WHERE suite = ?",
-                            vec![checked_integer(suite.into())?],
-                        )?
-                        .to_array::<PqLastResortRow>()?
-                        .pop();
-                    if let Some(lr) = lr {
-                        negotiated = Some((suite, lr));
-                        break;
-                    }
-                }
-                if let Some((suite, lr)) = negotiated {
-                    let opk = if has_table(&sql, "pq_one_time_prekeys")? {
-                        let row = sql
+                let (pq_last_resort, pq_one_time_prekey) = if manifest.pq_enabled
+                    && !preferred_suites.is_empty()
+                    && has_table(sql, "pq_last_resort")?
+                {
+                    let mut negotiated = None;
+                    for &suite in preferred_suites {
+                        if !manifest.offered_suites.contains(&suite) {
+                            continue;
+                        }
+                        let lr = sql
                             .exec(
-                                "SELECT position, suite, prekey_id, encapsulation_key, signature \
-                                 FROM pq_one_time_prekeys WHERE suite = ? ORDER BY position LIMIT 1",
+                                "SELECT suite, prekey_id, encapsulation_key, signature \
+                                 FROM pq_last_resort WHERE suite = ?",
                                 vec![checked_integer(suite.into())?],
                             )?
-                            .to_array::<PqOneTimeRow>()?
+                            .to_array::<PqLastResortRow>()?
                             .pop();
-                        if let Some(ref r) = row {
-                            sql.exec(
-                                "DELETE FROM pq_one_time_prekeys WHERE position = ?",
-                                vec![checked_integer(r.position)?],
-                            )?;
+                        if let Some(lr) = lr {
+                            negotiated = Some((suite, lr));
+                            break;
                         }
-                        row.map(|r| PqPrekeyWire {
-                            suite: r.suite as u8,
-                            id: r.prekey_id,
-                            encapsulation_key: r.encapsulation_key,
-                            signature: r.signature,
-                        })
+                    }
+                    if let Some((suite, lr)) = negotiated {
+                        let opk = if has_table(sql, "pq_one_time_prekeys")? {
+                            let row = sql
+                                .exec(
+                                    "SELECT position, suite, prekey_id, encapsulation_key, signature \
+                                     FROM pq_one_time_prekeys WHERE suite = ? ORDER BY position LIMIT 1",
+                                    vec![checked_integer(suite.into())?],
+                                )?
+                                .to_array::<PqOneTimeRow>()?
+                                .pop();
+                            if let Some(ref r) = row {
+                                sql.exec(
+                                    "DELETE FROM pq_one_time_prekeys WHERE position = ?",
+                                    vec![checked_integer(r.position)?],
+                                )?;
+                            }
+                            row.map(|r| PqPrekeyWire {
+                                suite: r.suite as u8,
+                                id: r.prekey_id,
+                                encapsulation_key: r.encapsulation_key,
+                                signature: r.signature,
+                            })
+                        } else {
+                            None
+                        };
+                        (
+                            Some(PqPrekeyWire {
+                                suite: lr.suite as u8,
+                                id: lr.prekey_id,
+                                encapsulation_key: lr.encapsulation_key,
+                                signature: lr.signature,
+                            }),
+                            opk,
+                        )
                     } else {
-                        None
-                    };
-                    (
-                        Some(PqPrekeyWire {
-                            suite: lr.suite as u8,
-                            id: lr.prekey_id,
-                            encapsulation_key: lr.encapsulation_key,
-                            signature: lr.signature,
-                        }),
-                        opk,
-                    )
+                        (None, None)
+                    }
                 } else {
                     (None, None)
-                }
-            } else {
-                (None, None)
+                };
+
+                return Ok(Some(ClaimedBundleWire {
+                    signed_prekey: manifest.signed_prekey.clone(),
+                    manifest: Some(manifest),
+                    signed_prekey_signature,
+                    one_time_prekey,
+                    pq_last_resort,
+                    pq_one_time_prekey,
+                }));
+            }
+
+            // Preserve read compatibility for pre-existing DOs that still have a classical bundle row.
+            let Some(bundle) = sql
+                .exec("SELECT signed_prekey, signature FROM bundle", None)?
+                .to_array::<BundleRow>()?
+                .pop()
+            else {
+                return Ok(None);
             };
-
-            return Ok(Some(ClaimedBundleWire {
-                signed_prekey: manifest.signed_prekey.clone(),
-                manifest: Some(manifest),
-                signed_prekey_signature,
+            let one_time_prekey = Self::pop_classical_opk_sql(sql)?;
+            Ok(Some(ClaimedBundleWire {
+                manifest: None,
+                signed_prekey: bundle.signed_prekey,
+                signed_prekey_signature: Some(bundle.signature),
                 one_time_prekey,
-                pq_last_resort,
-                pq_one_time_prekey,
-            }));
-        }
-
-        // Preserve read compatibility for pre-existing DOs that still have a classical bundle row.
-        let Some(bundle) = sql
-            .exec("SELECT signed_prekey, signature FROM bundle", None)?
-            .to_array::<BundleRow>()?
-            .pop()
-        else {
-            return Ok(None);
-        };
-        let one_time_prekey = self.pop_classical_opk()?;
-        Ok(Some(ClaimedBundleWire {
-            manifest: None,
-            signed_prekey: bundle.signed_prekey,
-            signed_prekey_signature: Some(bundle.signature),
-            one_time_prekey,
-            pq_last_resort: None,
-            pq_one_time_prekey: None,
-        }))
+                pq_last_resort: None,
+                pq_one_time_prekey: None,
+            }))
+        })
     }
 
     pub(super) fn add_initial_message_v2(
@@ -613,42 +635,33 @@ impl Identity {
     }
 
     pub(super) fn ack_initial_messages(&self, ids: &[u64]) -> Result<u64> {
+        let mut id_vals = Vec::with_capacity(ids.len());
         for &id in ids {
-            let _ = checked_integer(id)?;
+            id_vals.push(checked_integer(id)?);
         }
-        if !self.has_tables()? || ids.is_empty() {
+        if !self.has_tables()? || id_vals.is_empty() {
             return Ok(0);
         }
-        let sql = self.sql();
-        let has_pq_table = has_table(&sql, "initial_messages_pq")?;
-        let mut deleted = 0u64;
-        for &id in ids {
-            let id_val = checked_integer(id)?;
-            if has_pq_table {
-                sql.exec(
-                    "DELETE FROM initial_messages_pq WHERE initial_message_id = ?",
-                    vec![id_val.clone()],
-                )?;
+        self.transaction_sync(|sql| {
+            let has_pq_table = has_table(sql, "initial_messages_pq")?;
+            let mut deleted = 0u64;
+            for id_val in id_vals {
+                if has_pq_table {
+                    sql.exec(
+                        "DELETE FROM initial_messages_pq WHERE initial_message_id = ?",
+                        vec![id_val.clone()],
+                    )?;
+                }
+                let res = sql.exec("DELETE FROM initial_messages WHERE id = ?", vec![id_val])?;
+                deleted = deleted.saturating_add(res.rows_written() as u64);
             }
-            let res = sql.exec("DELETE FROM initial_messages WHERE id = ?", vec![id_val])?;
-            deleted = deleted.saturating_add(res.rows_written() as u64);
-        }
-        self.cleanup_orphan_pq_initials()?;
-        Ok(deleted)
+            Self::cleanup_orphan_pq_initials_sql(sql)?;
+            Ok(deleted)
+        })
     }
 
     fn pq_one_time_counts(&self) -> Result<Vec<(u8, u64)>> {
-        let sql = self.sql();
-        if !has_table(&sql, "pq_one_time_prekeys")? {
-            return Ok(vec![]);
-        }
-        let rows: Vec<SuiteCountRow> = sql
-            .exec(
-                "SELECT suite, count(*) AS count FROM pq_one_time_prekeys GROUP BY suite ORDER BY suite",
-                None,
-            )?
-            .to_array()?;
-        Ok(rows.into_iter().map(|r| (r.suite as u8, r.count)).collect())
+        Self::pq_one_time_counts_sql(&self.sql())
     }
 
     pub(super) fn pq_snapshot(&self) -> Result<PqSnapshotWire> {

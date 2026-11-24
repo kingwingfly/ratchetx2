@@ -1109,9 +1109,31 @@ impl Engine {
         match inner.vault.uploads(None).await {
             Ok(uploads) => {
                 for (peer, pending) in uploads {
-                    // Done, but left behind, as forgetting it failed.
+                    // Done, but left behind, as forgetting it failed (or tab closed after
+                    // keeping the final chunk before `forget_upload` committed).
+                    let chunks = attachment::chunk_count(pending.size);
                     if pending.started()
-                        && u64::from(pending.uploaded) >= attachment::chunk_count(pending.size)
+                        && (u64::from(pending.uploaded) >= chunks
+                            || u64::from(
+                                inner
+                                    .vault
+                                    .chunks_kept(&peer, &pending.id)
+                                    .await
+                                    .unwrap_or(0),
+                            ) >= chunks)
+                    {
+                        let _ = inner.vault.forget_upload(&peer, &pending.id).await;
+                        continue;
+                    }
+                    // Stale unstarted waiting upload whose outbox entry was already promoted to a
+                    // real upload (or failed/sent) before `forget_upload` committed.
+                    if !pending.started()
+                        && !inner.contacts.iter().any(|c| {
+                            c.peer == peer
+                                && c.state.outbox.iter().any(|o| {
+                                    o.history_index == pending.history_index && o.awaits_upload
+                                })
+                        })
                     {
                         let _ = inner.vault.forget_upload(&peer, &pending.id).await;
                         continue;
@@ -1697,8 +1719,12 @@ impl Engine {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
             let contact = inner.contact(&peer).ok_or("no such chat")?;
+            let snapshot = contact.snapshot();
             contact.accept_request(&name)?;
-            inner.save_state().await.map_err(|e| describe(&e))?;
+            if let Err(e) = inner.save(&[]).await {
+                inner.roll_back(&peer, snapshot)?;
+                return Err(describe(&e));
+            }
             self.ui.contacts.set(inner.views());
         }
         // The peer learns what was read of the request.
@@ -1718,8 +1744,13 @@ impl Engine {
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        change(inner.contact(&peer).ok_or("no such chat")?);
-        inner.save_state().await.map_err(|e| describe(&e))?;
+        let contact = inner.contact(&peer).ok_or("no such chat")?;
+        let snapshot = contact.snapshot();
+        change(contact);
+        if let Err(e) = inner.save(&[]).await {
+            inner.roll_back(&peer, snapshot)?;
+            return Err(describe(&e));
+        }
         self.ui.contacts.set(inner.views());
         Ok(())
     }
@@ -1733,8 +1764,10 @@ impl Engine {
         }
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        // Read before anything changes, as the vault forgets them with the chat: those still
-        // shown, going or paused, as one that just finished leaves the page before the vault.
+        // Read before anything changes, as the vault forgets them with the chat: cancel any
+        // started upload that is still shown, running, or unannounced (leaving already-finished
+        // uploads whose vault cleanup raced deletion intact), and mark every vaulted upload ID
+        // cancelled so racing tasks cannot resurrect ghost entries.
         let shown: HashSet<Vec<u8>> = self.ui.uploads.with_untracked(|uploads| {
             uploads
                 .iter()
@@ -1742,13 +1775,24 @@ impl Engine {
                 .map(|upload| upload.id.to_vec())
                 .collect()
         });
-        let unfinished: Vec<(String, Upload)> = inner
+        let running: HashSet<[u8; 16]> = self.running.borrow().clone();
+        let vault_uploads = inner
             .vault
             .uploads(Some(&peer))
             .await
-            .map_err(|e| describe(&e))?
+            .map_err(|e| describe(&e))?;
+        let mut upload_ids: HashSet<[u8; 16]> = vault_uploads
+            .iter()
+            .filter_map(|(_, pending)| <[u8; 16]>::try_from(pending.id.as_slice()).ok())
+            .collect();
+        let unfinished: Vec<(String, Upload)> = vault_uploads
             .into_iter()
-            .filter(|(_, pending)| pending.started() && shown.contains(&pending.id))
+            .filter(|(_, pending)| {
+                let id_running = <[u8; 16]>::try_from(pending.id.as_slice())
+                    .is_ok_and(|id| running.contains(&id));
+                pending.started()
+                    && (shown.contains(&pending.id) || id_running || !pending.announced)
+            })
             .filter_map(|(_, pending)| Some((pending.name.clone(), upload_of(&pending).ok()?)))
             .collect();
         // The peer is told, on the session as it is now, so that its next message starts a new
@@ -1786,8 +1830,15 @@ impl Engine {
             }
         }
         // Forgotten in the vault first, so that if that fails, the chat stays whole; with the
-        // records of other chats left unsaved, as with each save.
+        // records of other chats left unsaved, as with each save. Preserve this contact's
+        // outgoing `next_session_seq` floor in `AppState` so recreating the chat later never
+        // reuses a stale `session_seq` against a peer who kept the old history.
         let mut state = inner.app_state();
+        if let Some(contact) = inner.contact(&peer) {
+            state.next_session_seq = state
+                .next_session_seq
+                .max(contact.session.next_session_seq());
+        }
         state.contacts.retain(|contact| contact.peer != peer);
         state.farewells.extend(farewell.clone());
         let deferred = inner.deferred_record_without_peer(&peer);
@@ -1811,16 +1862,17 @@ impl Engine {
             }
             return Err(describe(&e));
         }
+        inner.state.next_session_seq = state.next_session_seq;
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
         // chat, which `may_keep` now tells them is gone.
-        let uploads: Vec<[u8; 16]> = self.ui.uploads.with_untracked(|uploads| {
+        upload_ids.extend(self.ui.uploads.with_untracked(|uploads| {
             uploads
                 .iter()
                 .filter(|upload| upload.peer == peer)
                 .map(|upload| upload.id)
-                .collect()
-        });
-        for id in uploads {
+                .collect::<Vec<_>>()
+        }));
+        for id in upload_ids {
             self.cancelled.borrow_mut().insert(id);
             self.remove_attachment_caches(&peer, &id);
         }
@@ -1828,9 +1880,20 @@ impl Engine {
         self.decrypted
             .borrow_mut()
             .retain(|((p, _, _, _), _)| *p != peer);
+        self.streams
+            .borrow_mut()
+            .retain(|_, stream| stream.fetching.peer != peer);
+        if self
+            .ui
+            .streaming
+            .with_untracked(|streamed| streamed.as_ref().is_some_and(|s| s.remote.peer == peer))
+        {
+            self.ui.streaming.set(None);
+        }
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.peer != peer));
+        self.ui.held.update(|held| held.retain(|(p, _)| *p != peer));
         self.ui.gone.update(|gone| gone.retain(|(p, _)| *p != peer));
         // Nor does what waited for a sign-in, which would otherwise hold up a chat started
         // again with the peer, or go to it.
@@ -1928,8 +1991,11 @@ impl Engine {
         let name = checked_name(&name)?;
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        inner.state.name = name;
-        inner.save_state().await.map_err(|e| describe(&e))?;
+        let prev_name = std::mem::replace(&mut inner.state.name, name);
+        if let Err(e) = inner.save(&[]).await {
+            inner.state.name = prev_name;
+            return Err(describe(&e));
+        }
         self.ui.me.set(Some(inner.me()));
         Ok(())
     }
@@ -2027,6 +2093,23 @@ impl<V: HistoryStore> Inner<V> {
             unsaved_outbox: vec![],
             saved_late: vec![],
         }
+    }
+
+    /// Monotonic outgoing `Hello.session_seq` for a newly initiated chat, strictly above any
+    /// previously started/deleted chat and floored with the current Unix timestamp in ms so
+    /// recreating a deleted chat never collides with a peer's retained `peer_session_seq`.
+    pub(super) fn next_new_chat_session_seq(&self) -> u64 {
+        let contact_max = self
+            .contacts
+            .iter()
+            .map(|c| c.session.next_session_seq())
+            .max()
+            .unwrap_or(1);
+        self.state
+            .next_session_seq
+            .max(contact_max)
+            .max(crate::util::now().min(session::protocol::MAX_SAFE_INTEGER))
+            .clamp(1, session::protocol::MAX_SAFE_INTEGER)
     }
 
     /// What the vault keeps in `STATE` (never writes tag 12 `deferred_initials`, which live in

@@ -289,23 +289,32 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         "Allow classical encryption for this chat?"
                                     }}
                                 </span>
-                                <div class="banner-actions">
-                                    {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
-                                    <Show when=move || pq_retry_ready(ui)>
-                                        <button
-                                            type="button"
-                                            class="btn primary small"
-                                            disabled=move || sec_busy.get()
-                                            on:click=move |_| {
-                                                act_while(sec_busy, async move {
-                                                    engine().retry_pq(peer).await
-                                                });
-                                            }
-                                        >
-                                            "Retry PQ"
-                                        </button>
-                                    </Show>
-                                </div>
+                                {move || {
+                                    let show_retry = pq_retry_ready(ui);
+                                    (show_allow || show_retry).then(|| {
+                                        view! {
+                                            <div class="banner-actions">
+                                                {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
+                                                {show_retry.then(|| {
+                                                    view! {
+                                                        <button
+                                                            type="button"
+                                                            class="btn primary small"
+                                                            disabled=move || sec_busy.get()
+                                                            on:click=move |_| {
+                                                                act_while(sec_busy, async move {
+                                                                    engine().retry_pq(peer).await
+                                                                });
+                                                            }
+                                                        >
+                                                            "Retry PQ"
+                                                        </button>
+                                                    }
+                                                })}
+                                            </div>
+                                        }
+                                    })
+                                }}
                             </div>
                         }
                         .into_any(),
@@ -315,6 +324,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             }}
             {move || {
                 let c = contact()?;
+                let can_dismiss = !c.is_quarantined();
+                let show_retry = !c.is_quarantined() && pq_retry_ready(ui);
                 match c.alert {
                     SecurityAlert::ManifestExpired => Some(
                         view! {
@@ -322,40 +333,44 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                 <span>
                                     "Peer's signed post-quantum capability manifest has expired (they may have been offline for a while)."
                                 </span>
-                                <div class="banner-actions">
-                                    <Show
-                                        when=move || pq_retry_ready(ui)
-                                        fallback=move || {
-                                            view! {
-                                                <button
-                                                    type="button"
-                                                    class="btn small"
-                                                    disabled=move || sec_busy.get()
-                                                    on:click=move |_| {
-                                                        act_while(sec_busy, async move {
-                                                            engine().dismiss_downgrade(peer).await
-                                                        });
-                                                    }
-                                                >
-                                                    "Dismiss"
-                                                </button>
-                                            }
-                                        }
-                                    >
-                                        <button
-                                            type="button"
-                                            class="btn small"
-                                            disabled=move || sec_busy.get()
-                                            on:click=move |_| {
-                                                act_while(sec_busy, async move {
-                                                    engine().retry_pq(peer).await
-                                                });
-                                            }
-                                        >
-                                            "Retry"
-                                        </button>
-                                    </Show>
-                                </div>
+                                {(show_retry || can_dismiss).then(|| {
+                                    view! {
+                                        <div class="banner-actions">
+                                            {show_retry.then(|| {
+                                                view! {
+                                                    <button
+                                                        type="button"
+                                                        class="btn small"
+                                                        disabled=move || sec_busy.get()
+                                                        on:click=move |_| {
+                                                            act_while(sec_busy, async move {
+                                                                engine().retry_pq(peer).await
+                                                            });
+                                                        }
+                                                    >
+                                                        "Retry"
+                                                    </button>
+                                                }
+                                            })}
+                                            {can_dismiss.then(|| {
+                                                view! {
+                                                    <button
+                                                        type="button"
+                                                        class="btn small"
+                                                        disabled=move || sec_busy.get()
+                                                        on:click=move |_| {
+                                                            act_while(sec_busy, async move {
+                                                                engine().dismiss_downgrade(peer).await
+                                                            });
+                                                        }
+                                                    >
+                                                        "Dismiss"
+                                                    </button>
+                                                }
+                                            })}
+                                        </div>
+                                    }
+                                })}
                             </div>
                         }
                         .into_any(),
@@ -364,42 +379,50 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                         view! {
                             <div class="banner warn" role="alert">
                                 <span>
-                                    "Require PQ (strict mode) is enabled, and a post-quantum session could not be established with this peer."
+                                    {if strict_pq_enabled(ui) {
+                                        "Require PQ (strict mode) is enabled, and a post-quantum session could not be established with this peer."
+                                    } else {
+                                        "A post-quantum session could not be established with this peer while strict PQ mode was enabled."
+                                    }}
                                 </span>
-                                <div class="banner-actions">
-                                    <Show
-                                        when=move || pq_retry_ready(ui)
-                                        fallback=move || {
-                                            view! {
-                                                <button
-                                                    type="button"
-                                                    class="btn small"
-                                                    disabled=move || sec_busy.get()
-                                                    on:click=move |_| {
-                                                        act_while(sec_busy, async move {
-                                                            engine().dismiss_downgrade(peer).await
-                                                        });
-                                                    }
-                                                >
-                                                    "Dismiss"
-                                                </button>
-                                            }
-                                        }
-                                    >
-                                        <button
-                                            type="button"
-                                            class="btn small"
-                                            disabled=move || sec_busy.get()
-                                            on:click=move |_| {
-                                                act_while(sec_busy, async move {
-                                                    engine().retry_pq(peer).await
-                                                });
-                                            }
-                                        >
-                                            "Retry"
-                                        </button>
-                                    </Show>
-                                </div>
+                                {(show_retry || can_dismiss).then(|| {
+                                    view! {
+                                        <div class="banner-actions">
+                                            {show_retry.then(|| {
+                                                view! {
+                                                    <button
+                                                        type="button"
+                                                        class="btn small"
+                                                        disabled=move || sec_busy.get()
+                                                        on:click=move |_| {
+                                                            act_while(sec_busy, async move {
+                                                                engine().retry_pq(peer).await
+                                                            });
+                                                        }
+                                                    >
+                                                        "Retry"
+                                                    </button>
+                                                }
+                                            })}
+                                            {can_dismiss.then(|| {
+                                                view! {
+                                                    <button
+                                                        type="button"
+                                                        class="btn small"
+                                                        disabled=move || sec_busy.get()
+                                                        on:click=move |_| {
+                                                            act_while(sec_busy, async move {
+                                                                engine().dismiss_downgrade(peer).await
+                                                            });
+                                                        }
+                                                    >
+                                                        "Dismiss"
+                                                    </button>
+                                                }
+                                            })}
+                                        </div>
+                                    }
+                                })}
                             </div>
                         }
                         .into_any(),
@@ -778,12 +801,18 @@ fn upload_row(initial: UploadView) -> impl IntoView {
         }
     };
     let paused = move || matches!(live.get().state, UploadState::Paused(_));
+    let resuming = RwSignal::new(false);
     let file_input = NodeRef::<html::Input>::new();
     // Without the file, which went with the page that chose it, the file is chosen again via a
     // declarative hidden `<input type="file">`.
     let resume = move |_| {
+        if resuming.get_untracked() {
+            return;
+        }
         if engine().has_file(&peer, &id) {
-            act(async move { engine().resume_upload(peer, id, None).await });
+            act_while(resuming, async move {
+                engine().resume_upload(peer, id, None).await
+            });
         } else if let Some(input) = file_input.get_untracked() {
             input.click();
         }
@@ -791,7 +820,9 @@ fn upload_row(initial: UploadView) -> impl IntoView {
     let on_file_change = move |event: ev::Event| {
         let input: web_sys::HtmlInputElement = event_target(&event);
         if let Some(file) = input.files().and_then(|files| files.get(0)) {
-            act(async move { engine().resume_upload(peer, id, Some(file)).await });
+            act_while(resuming, async move {
+                engine().resume_upload(peer, id, Some(file)).await
+            });
         }
         input.set_value("");
     };
@@ -809,6 +840,7 @@ fn upload_row(initial: UploadView) -> impl IntoView {
                     class="btn icon small"
                     title="Resume"
                     aria-label="Resume"
+                    disabled=move || resuming.get()
                     on:click=resume
                 >
                     {icon(Icon::Resume)}

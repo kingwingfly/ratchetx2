@@ -54,6 +54,7 @@ pub(super) struct MessageMetaRow {
     pub(super) header_len: u64,
     pub(super) size: u64,
     pub(super) init_len: u64,
+    pub(super) is_object: u64,
 }
 
 #[derive(Deserialize)]

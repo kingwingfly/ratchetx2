@@ -58,11 +58,19 @@ extern "C" {
     fn start(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
     #[wasm_bindgen(method, getter, catch)]
     fn end(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(method, getter, catch)]
+    fn suffix(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(method, getter, catch)]
+    fn whole(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
+    #[wasm_bindgen(method, getter, catch)]
+    fn invalid(this: &MediaRequestMsg) -> Result<JsValue, JsValue>;
 
     #[wasm_bindgen(extends = Object)]
     type MediaReplyMsg;
     #[wasm_bindgen(method, setter = size)]
     fn set_size(this: &MediaReplyMsg, size: f64);
+    #[wasm_bindgen(method, setter = start)]
+    fn set_start(this: &MediaReplyMsg, start: f64);
     #[wasm_bindgen(method, setter = mime)]
     fn set_mime(this: &MediaReplyMsg, mime: &str);
     #[wasm_bindgen(method, setter = bytes)]
@@ -613,33 +621,50 @@ pub fn streaming() -> bool {
         .is_some_and(|container| container.controller().is_some())
 }
 
-/// The service worker's request for the bytes of a stream from `start`, to `end` if given, for a
-/// player of the page.
+/// The byte range requested by the service worker for a media stream.
+pub enum MediaRange {
+    Whole,
+    From { start: u64, end: Option<u64> },
+    Suffix(u64),
+    Invalid,
+}
+
+/// An HTTP error replying to a [`MediaRequest`], including total size for `416` `Content-Range`.
+pub enum MediaError {
+    Status(u16),
+    OutOfRange { size: u64 },
+}
+
+/// The service worker's request for the bytes of a stream for a player of the page.
 pub struct MediaRequest {
     pub token: String,
-    pub start: u64,
-    pub end: Option<u64>,
+    pub range: MediaRange,
     reply: MessagePort,
 }
 
-/// What answers a [`MediaRequest`]: the stream's size, its MIME type, and bytes from where it
-/// asked; or an HTTP status, e.g. 404 for a stream ended.
-pub type MediaReply<'a> = Result<(u64, &'a str, &'a [u8]), u16>;
+/// What answers a [`MediaRequest`]: the stream's total size, resolved start offset, MIME type,
+/// and bytes; or a [`MediaError`].
+pub type MediaReply<'a> = Result<(u64, u64, &'a str, &'a [u8]), MediaError>;
 
 impl MediaRequest {
     pub fn reply(self, reply: MediaReply<'_>) {
         let message: MediaReplyMsg = Object::new().unchecked_into();
         let transfer = Array::new();
         match reply {
-            Ok((size, mime, bytes)) => {
+            Ok((size, start, mime, bytes)) => {
                 // Moved to the service worker rather than copied.
                 let buffer = Uint8Array::from(bytes).buffer();
                 message.set_size(size as f64);
+                message.set_start(start as f64);
                 message.set_mime(mime);
                 message.set_bytes(&buffer);
                 transfer.push(&buffer);
             }
-            Err(status) => message.set_error(status),
+            Err(MediaError::Status(status)) => message.set_error(status),
+            Err(MediaError::OutOfRange { size }) => {
+                message.set_error(416);
+                message.set_size(size as f64);
+            }
         }
         let _ = self
             .reply
@@ -659,21 +684,45 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
         }
         let request: MediaRequestMsg = data.unchecked_into();
         let token = request.media().ok().and_then(|v| v.as_string());
-        let start = request.start().ok().and_then(|v| v.as_f64());
         let reply = event.ports().get(0).dyn_into::<MessagePort>().ok();
-        if let (Some(token), Some(start), Some(reply)) = (token, start, reply) {
+        let (Some(token), Some(reply)) = (token, reply) else {
+            return;
+        };
+        let valid_u64 = |v: f64| {
+            (v.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(&v) && v.fract() == 0.0)
+                .then_some(v as u64)
+        };
+        let range = if request.invalid().ok().and_then(|v| v.as_bool()) == Some(true) {
+            MediaRange::Invalid
+        } else if request.whole().ok().and_then(|v| v.as_bool()) == Some(true) {
+            MediaRange::Whole
+        } else if let Some(suffix) = request
+            .suffix()
+            .ok()
+            .and_then(|v| v.as_f64())
+            .and_then(valid_u64)
+        {
+            MediaRange::Suffix(suffix)
+        } else if let Some(start) = request
+            .start()
+            .ok()
+            .and_then(|v| v.as_f64())
+            .and_then(valid_u64)
+        {
             let end = request
                 .end()
                 .ok()
-                .and_then(|end| end.as_f64())
-                .map(|end| end as u64);
-            answer(MediaRequest {
-                token,
-                start: start as u64,
-                end,
-                reply,
-            });
-        }
+                .and_then(|v| v.as_f64())
+                .and_then(valid_u64);
+            MediaRange::From { start, end }
+        } else {
+            MediaRange::Invalid
+        };
+        answer(MediaRequest {
+            token,
+            range,
+            reply,
+        });
     });
     let _ =
         container.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref());

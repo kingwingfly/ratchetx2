@@ -1,4 +1,4 @@
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 use pulldown_latex::config::DisplayMode;
 
 use super::{
@@ -32,12 +32,15 @@ pub fn markdown(source: &str) -> String {
                 dest_url,
                 title,
                 id,
-            }) => Event::Start(Tag::Link {
-                link_type,
-                dest_url: safe_link(dest_url),
-                title,
-                id,
-            }),
+            }) => {
+                let (link_type, dest_url) = safe_link(link_type, dest_url);
+                Event::Start(Tag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                })
+            }
             Event::Start(Tag::Image {
                 link_type,
                 dest_url,
@@ -68,10 +71,22 @@ pub fn markdown(source: &str) -> String {
 }
 
 /// A link to the web, to mail, or within the document; any other goes nowhere.
-fn safe_link(url: CowStr<'_>) -> CowStr<'_> {
-    normalize_safe_href(&url)
-        .map(CowStr::from)
-        .unwrap_or_else(|| "#".into())
+fn safe_link(link_type: LinkType, url: CowStr<'_>) -> (LinkType, CowStr<'_>) {
+    if link_type == LinkType::Email {
+        if let Some(normalized) = normalize_safe_href(&format!("mailto:{url}"))
+            && let Some(address) = normalized.strip_prefix("mailto:")
+            && !address.is_empty()
+        {
+            return (LinkType::Email, address.to_string().into());
+        }
+        return (LinkType::Inline, "#".into());
+    }
+    (
+        link_type,
+        normalize_safe_href(&url)
+            .map(CowStr::from)
+            .unwrap_or_else(|| "#".into()),
+    )
 }
 
 /// An image from a `data:image/` URL; any other shows none, rather than reach out.

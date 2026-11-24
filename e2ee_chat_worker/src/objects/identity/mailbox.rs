@@ -8,6 +8,10 @@ use crate::objects::{AppendOutcome, Content, StoredRow, blob, checked_integer};
 
 pub(super) const DEDUP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub(super) const MAX_DEDUP_TOMBSTONES_PER_QUEUE: u64 = 4096;
+/// Maximum R2-backed message rows returned in a single read page so `Store::read` stays safely
+/// below Cloudflare Workers Free-plan subrequest limits (50/invocation) even when `delete_delivered`
+/// runs in the same `FetchSigned` call.
+const MAX_READ_R2_OBJECTS: usize = 40;
 
 impl Identity {
     #[allow(clippy::too_many_arguments)]
@@ -120,7 +124,8 @@ impl Identity {
         let metas: Vec<MessageMetaRow> = sql
             .exec(
                 "SELECT sequence, length(header) AS header_len, size, \
-                 coalesce(length(initial_message), 0) AS init_len \
+                 coalesce(length(initial_message), 0) AS init_len, \
+                 (object IS NOT NULL) AS is_object \
                  FROM messages WHERE sender = ? AND sequence > ? ORDER BY sequence LIMIT ?",
                 vec![
                     blob(sender),
@@ -134,6 +139,7 @@ impl Identity {
         }
 
         let mut total_bytes = 0u64;
+        let mut r2_count = 0usize;
         let mut cutoff_sequence = metas[0].sequence;
         for (take_count, meta) in metas.iter().enumerate() {
             let row_bytes = meta
@@ -141,7 +147,8 @@ impl Identity {
                 .saturating_add(meta.init_len)
                 .saturating_add(meta.size);
             total_bytes = total_bytes.saturating_add(row_bytes);
-            if take_count > 0 && total_bytes > max_size {
+            r2_count += usize::from(meta.is_object != 0);
+            if take_count > 0 && (total_bytes > max_size || r2_count > MAX_READ_R2_OBJECTS) {
                 break;
             }
             cutoff_sequence = meta.sequence;

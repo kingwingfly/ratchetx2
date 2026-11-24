@@ -904,3 +904,201 @@ fn sanitize_html_external_links_emit_target_blank_and_noopener_idempotently() {
     let frag = sanitize_html(r##"<a href="#note">jump</a>"##);
     assert_eq!(frag, r##"<a href="#fn-note">jump</a>"##);
 }
+
+#[test]
+fn markdown_email_autolinks_preserve_mailto_href() {
+    let html = markdown("Reach me at <alice@example.com>.");
+    assert!(
+        html.contains(r#"href="mailto:alice@example.com""#),
+        "expected valid mailto autolink: {html}"
+    );
+    assert!(!html.contains(r#"href="mailto:#""#), "{html}");
+}
+
+#[test]
+fn mathml_bounds_directives_arrays_hlines_and_maps_unicode_fonts() {
+    // Excessive zero-event directives fall back cleanly without stack overflow.
+    let relax_spam = format!("$${}$$", "\\relax ".repeat(200));
+    let rendered = markdown(&relax_spam);
+    assert!(!rendered.contains("<math"), "{rendered}");
+
+    // Oversized array column specs and consecutive hlines fall back cleanly.
+    let wide_array = format!(
+        "$$\\begin{{array}}{{{}c}}x\\end{{array}}$$",
+        "|".repeat(200)
+    );
+    assert!(!markdown(&wide_array).contains("<math"));
+    let hline_spam = format!(
+        "$$\\begin{{array}}{{c}}{}x\\end{{array}}$$",
+        "\\hline ".repeat(64)
+    );
+    assert!(!markdown(&hline_spam).contains("<math"));
+
+    // Corrected Unicode Mathematical Alphanumeric offsets.
+    let fonts = markdown(r"$$\mathbf{\digamma}\ \mathfrak{HI}\ \mathit{\mathsf{AZ}}$$");
+    assert!(fonts.contains('\u{1D7CA}') || fonts.contains('\u{1D7CB}') || fonts.contains("<math"));
+    let fraktur = markdown(r"$$\mathfrak{H}\ \mathfrak{I}$$");
+    assert!(fraktur.contains('\u{210C}'), "{fraktur}");
+    assert!(fraktur.contains('\u{2111}'), "{fraktur}");
+    assert!(!fraktur.contains('\u{210D}'), "{fraktur}");
+    // Direct check of SansSerifItalic via `\mathsf` + italic or renderer mapping.
+    let sans_italic = markdown(r"$$\mathsf{\mathit{AZ}}$$");
+    assert!(!sans_italic.contains('\u{1D618}'), "{sans_italic}");
+
+    // TeX math spaces (`\ `, `~`) render real U+00A0 rather than literal `&amp;nbsp;`.
+    let spaced = markdown(r"$a\ b~c$");
+    assert!(spaced.contains("<math"), "{spaced}");
+    assert!(spaced.contains('\u{00A0}'), "{spaced}");
+    assert!(!spaced.contains("&amp;nbsp;"), "{spaced}");
+
+    // Known `pulldown-latex 0.8.0` panic, OOM, and stack-overflow inputs fall back cleanly.
+    let nasty_inputs = [
+        r"$$\char é$$".to_string(),
+        r"$$\begin{alignat}{é}a & b\end{alignat}$$".to_string(),
+        "$$\\kern 1em\u{00A0}x$$".to_string(),
+        r"$$\color{#€€}x$$".to_string(),
+        format!("$${}x$$", r"\not ".repeat(500)),
+        format!("$${}x$$", "%\n".repeat(4000)),
+        r"$$\def\a#1{#1#1#1#1#1#1#1#1#1#1}\def\b#1{\a{\a{\a{\a{\a{#1}}}}}}\b{x}$$".to_string(),
+        r"$$\newcommand{\a}[0][x]{y}\a$$".to_string(),
+        format!("$${}1$$", r"\frac1".repeat(600)),
+        format!("$${}1$$", r"\frac{1}".repeat(600)),
+        format!("$${}x$$", r"\sqrt[]".repeat(600)),
+        format!("$${}1$$", r"\overset1".repeat(600)),
+        format!("$${}x$$", r"\sideset12".repeat(500)),
+        format!("$${}x$$", r"\xleftarrow[]".repeat(500)),
+        format!("$${}x$$", r"\textcolor{red}".repeat(400)),
+        format!("$${}x$$", r"\buildrel1\over".repeat(400)),
+        // Cycle 5: optional-bracket smuggling & unbraced-primitive desync bypasses.
+        r"$$\sqrt[\char é]{x}$$".to_string(),
+        r"$$\sqrt[\color{#€€}x]{y}$$".to_string(),
+        r"$$\sqrt[\newcommand{\a}[0][x]{y}\a]{z}$$".to_string(),
+        r"$$\sqrt[\def\a#1{#1#1#1#1#1#1#1#1#1#1}\def\b#1{\a{\a{\a{\a{\a{#1}}}}}}\b{x}]{y}$$"
+            .to_string(),
+        format!("$$\\xleftarrow[{}x]{{y}}$$", r"\not ".repeat(300)),
+        format!("$${}x$$", r"\frac é".repeat(600)),
+        format!("$${}x$$", r"\frac\big(".repeat(600)),
+        format!("$${}x$$", r"\frac1\mathup".repeat(450)),
+        format!("$${}x$$", r"\buildrel a b\over".repeat(400)),
+        // Cycle 6: `%`-comment desyncs and unbraced color arguments.
+        r"$$\color{%}\n#€€}x$$".replace(r"\n", "\n"),
+        r"$$\fcolorbox{red%}\n}{#€€}{x}$$".replace(r"\n", "\n"),
+        r"$$\begin{alignat}{%}\né}a & b\end{alignat}$$".replace(r"\n", "\n"),
+        r"$$\color #€€ x$$".to_string(),
+        // Cycle 7: nested `[...]` optional-bracket desync and deeply nested `\sqrt[...]{a}`.
+        format!("$${}x$$", r"\sqrt[[1]{a}]".repeat(500)),
+        format!("$${}1{}$$", r"\sqrt[".repeat(500), "]{a}".repeat(500)),
+    ];
+    for input in &nasty_inputs {
+        let out = markdown(input);
+        assert!(
+            !out.contains("<math"),
+            "expected preflight fallback for {input:?}, got: {out}"
+        );
+    }
+
+    // Legitimate `\textcolor`, `\sqrt[3]{x}`, `\begin{alignat}{2}`, long runs of Greek symbols,
+    // and many side-by-side braced or single-leaf primitives still render cleanly.
+    assert!(markdown(r"$$\textcolor{red}{\alpha}$$").contains("<math"));
+    assert!(markdown(r"$$\sqrt[3]{x} + \xrightarrow[n]{f}$$").contains("<math"));
+    assert!(markdown(r"$$\begin{alignat}{2}a & = b\end{alignat}$$").contains("<math"));
+    assert!(
+        markdown(
+            r"$$\alpha \beta \gamma \delta \epsilon \zeta \eta \theta \iota \kappa \lambda \mu \nu \xi \omicron \pi \rho \sigma$$"
+        )
+        .contains("<math")
+    );
+    let many_fracs = format!("$${}$$", vec![r"\frac{1}{2}"; 40].join(" + "));
+    assert!(markdown(&many_fracs).contains("<math"));
+    let many_unbraced_leaves =
+        format!("$${}$$", vec![r"\frac12 + \vec x + \sqrt2"; 20].join(" + "));
+    assert!(markdown(&many_unbraced_leaves).contains("<math"));
+
+    // Deterministic adversarial fuzz across high-risk TeX tokens: must never panic or overflow.
+    let tokens = [
+        r"\frac",
+        r"\genfrac",
+        r"\sideset",
+        r"\sqrt",
+        r"\xleftarrow",
+        r"\xrightarrow",
+        r"\buildrel",
+        r"\over",
+        r"\mathup",
+        r"\mathbf",
+        r"\not",
+        r"\big(",
+        r"\text",
+        r"\color",
+        r"\textcolor",
+        r"\fcolorbox",
+        r"\begin{alignat}",
+        r"\end{alignat}",
+        r"\begin{array}{c}",
+        r"\end{array}",
+        r"\relax",
+        r"\def",
+        r"\char",
+        r"\\",
+        r"\hline",
+        "{",
+        "}",
+        "[",
+        "]",
+        "%",
+        "\n",
+        "^",
+        "_",
+        "&",
+        " ",
+        "1",
+        "é",
+        "#€€",
+        "\u{00A0}",
+    ];
+    let mut seed = 0xD1B5_4A32_D192_ED03u64;
+    let mut next_u64 = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut expr = String::with_capacity(512);
+    for _ in 0..2_000 {
+        expr.clear();
+        expr.push_str("$$");
+        let count = 1 + (next_u64() as usize % 48);
+        for _ in 0..count {
+            expr.push_str(tokens[next_u64() as usize % tokens.len()]);
+        }
+        expr.push_str("$$");
+        let rendered = markdown(&expr);
+        assert!(rendered.len() <= 300 * 1024);
+    }
+}
+
+#[test]
+fn deeply_nested_json_pretty_print_stays_bounded() {
+    // 100 levels of nesting with ~100 KB input would expand >10 MB if unbounded.
+    let nested = format!(
+        "{}{}{}{}",
+        "[".repeat(100),
+        "0,".repeat(50_000),
+        "0",
+        "]".repeat(100)
+    );
+    let Kind::Code { text, .. } = kind("nest.json", "application/json", nested.as_bytes()) else {
+        panic!("expected Code preview");
+    };
+    assert!(text.len() <= TEXT_MAX);
+}
+
+#[test]
+fn vcard_unescaping_preserves_escaped_backslashes() {
+    let vcard = "BEGIN:VCARD\r\nFN:Alice\r\nNOTE:C:\\\\notes\\nLine2\\,a\\;b\r\nEND:VCARD\r\n";
+    let Kind::Cards(cards) = kind("a.vcf", "text/vcard", vcard.as_bytes()) else {
+        panic!("expected Cards preview");
+    };
+    assert_eq!(cards.len(), 1);
+    assert_eq!(cards[0].fields[0].1, "C:\\notes\nLine2,a;b");
+}

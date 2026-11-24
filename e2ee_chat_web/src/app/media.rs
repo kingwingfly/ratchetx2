@@ -255,17 +255,16 @@ pub(super) fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
     // URL made then is let go at once.
     let here = StoredValue::new(());
     let stop_active = move || {
-        if let Some(video) = video_ref.get_untracked() {
+        if let Some(video) = video_ref.try_get_untracked().flatten() {
             stop_media(&video);
         }
-        if let Some(audio) = audio_ref.get_untracked() {
+        if let Some(audio) = audio_ref.try_get_untracked().flatten() {
             stop_media(&audio);
         }
     };
     let play = move |url: String, mime: &'static str| {
-        if let Some(Some((old_url, _))) = shown.try_set(Some((url, mime))) {
-            stop_active();
-            release(&old_url);
+        if let Some(Some((url, _))) = shown.try_set(Some((url, mime))) {
+            release(&url);
         }
     };
     let show = move |attachment: Attachment| {
@@ -471,14 +470,14 @@ pub(super) fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
     // Gone with the preview: a read that ends after shows nothing, and a URL made then is let
     // go at once.
     let here = StoredValue::new(());
+    let probe_stream = StoredValue::new(None::<String>);
     let stop_active = move || {
-        if let Some(video) = video_ref.get_untracked() {
+        if let Some(video) = video_ref.try_get_untracked().flatten() {
             stop_media(&video);
         }
     };
     let show = move |made: Preview| {
         if let Some(Some(Preview::Image(url) | Preview::Video(url))) = preview.try_set(Some(made)) {
-            stop_active();
             release(&url);
         }
     };
@@ -494,12 +493,25 @@ pub(super) fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
                         .stream(remote.peer, remote.index, &remote.pointer, remote.clock)
                         .await
                 {
+                    if here.try_get_value().is_none() {
+                        engine().end_stream(&url);
+                        return;
+                    }
                     if sort == Sort::Video {
                         show(Preview::Video(url));
                         return;
                     }
+                    probe_stream.set_value(Some(url.clone()));
                     let head = engine().stream_head(&url).await;
+                    let _ = probe_stream.try_update_value(|slot| {
+                        if slot.as_deref() == Some(url.as_str()) {
+                            *slot = None;
+                        }
+                    });
                     engine().end_stream(&url);
+                    if here.try_get_value().is_none() {
+                        return;
+                    }
                     if let Some(head) = head
                         && let Some(made) = cover(&head).await
                     {
@@ -511,6 +523,9 @@ pub(super) fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
                 let Ok(Some(attachment)) = source.read(&shows).await else {
                     return;
                 };
+                if here.try_get_value().is_none() {
+                    return;
+                }
                 let data = &attachment.data;
                 let made = match preview::media_mime(&attachment.name, &attachment.mime, data) {
                     Some(mime) if mime.starts_with("image/") => {
@@ -530,6 +545,9 @@ pub(super) fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
     }
     on_cleanup(move || {
         stop_active();
+        if let Some(url) = probe_stream.try_update_value(Option::take).flatten() {
+            engine().end_stream(&url);
+        }
         if let Some(Some(Preview::Image(url) | Preview::Video(url))) = preview.try_get_untracked() {
             release(&url);
         }

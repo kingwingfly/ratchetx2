@@ -34,13 +34,22 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    let hi = (hi as char).to_digit(16)?;
+    let lo = (lo as char).to_digit(16)?;
+    Some(((hi << 4) | lo) as u8)
+}
+
 pub fn from_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return None;
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+    bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| hex_byte(pair[0], pair[1]))
         .collect()
 }
 
@@ -51,10 +60,9 @@ pub fn percent_decode(input: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hi = *bytes.get(i + 1)? as char;
-            let lo = *bytes.get(i + 2)? as char;
-            let val = u8::from_str_radix(&format!("{hi}{lo}"), 16).ok()?;
-            out.push(val);
+            let hi = *bytes.get(i + 1)?;
+            let lo = *bytes.get(i + 2)?;
+            out.push(hex_byte(hi, lo)?);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -359,5 +367,14 @@ mod test {
             party::error::ErrorKind::Undecryptable,
         ));
         assert_eq!(describe(&party_err), "cannot decrypt the message");
+    }
+
+    #[test]
+    fn hex_and_percent_decode_reject_plus_signs() {
+        assert_eq!(from_hex("0a1f"), Some(vec![0x0a, 0x1f]));
+        assert_eq!(from_hex("+a"), None);
+        assert_eq!(from_hex("+a+b"), None);
+        assert_eq!(percent_decode("foo%20bar"), Some("foo bar".into()));
+        assert_eq!(percent_decode("foo%+a"), None);
     }
 }

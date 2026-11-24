@@ -3,7 +3,7 @@
 use super::attachments::{FetchError, Fetching, Waiter, read_chunk};
 use super::{CHUNKS_DECRYPTED_KEPT, ChunkOf, Engine};
 use crate::content::AttachmentPointer;
-use crate::glue::MediaRequest;
+use crate::glue::{MediaError, MediaRange, MediaRequest};
 use crate::state::Link;
 use crate::util::hex;
 use crate::{glue, preview};
@@ -69,57 +69,81 @@ impl Engine {
 
     /// Answer the service worker's `request` for a stream's bytes.
     pub(super) async fn serve_media(&self, request: MediaRequest) {
-        match self
-            .media_range(&request.token, request.start, request.end)
-            .await
-        {
-            Ok((size, mime, bytes)) => request.reply(Ok((size, &mime, &bytes))),
-            Err(status) => request.reply(Err(status)),
+        match self.media_range(&request.token, &request.range).await {
+            Ok((size, start, mime, bytes)) => request.reply(Ok((size, start, &mime, &bytes))),
+            Err(err) => request.reply(Err(err)),
         }
     }
 
-    /// The bytes of the stream `token` from `start`, to `end` at most, as far as the chunk they
-    /// start in goes, with its size and MIME type; or the HTTP status that says why not.
+    /// The bytes of the stream `token` for `range`, as far as the chunk they start in goes, with
+    /// total size, resolved start offset, and MIME type; or the HTTP error that says why not.
     async fn media_range(
         &self,
         token: &str,
-        start: u64,
-        end: Option<u64>,
-    ) -> Result<(u64, String, Vec<u8>), u16> {
+        range: &MediaRange,
+    ) -> Result<(u64, u64, String, Vec<u8>), MediaError> {
         const GONE: u16 = 404;
-        const OUT_OF_RANGE: u16 = 416;
         let size = self
             .streams
             .borrow()
             .get(token)
             .map(|stream| stream.fetching.size)
-            .ok_or(GONE)?;
-        if start >= size || end.is_some_and(|end| end < start) {
-            return Err(OUT_OF_RANGE);
-        }
-        let index = u32::try_from(start / CHUNK_SIZE as u64).map_err(|_| OUT_OF_RANGE)?;
+            .ok_or(MediaError::Status(GONE))?;
+        let (start, end) = match *range {
+            MediaRange::Whole => {
+                if size == 0 {
+                    let mime = self
+                        .streams
+                        .borrow()
+                        .get(token)
+                        .map(|stream| stream.mime.clone())
+                        .ok_or(MediaError::Status(GONE))?;
+                    return Ok((0, 0, mime, Vec::new()));
+                }
+                (0, None)
+            }
+            MediaRange::Invalid => return Err(MediaError::OutOfRange { size }),
+            MediaRange::Suffix(suffix) => {
+                if suffix == 0 || size == 0 {
+                    return Err(MediaError::OutOfRange { size });
+                }
+                (size.saturating_sub(suffix), Some(size - 1))
+            }
+            MediaRange::From { start, end } => {
+                if size == 0 || start >= size || end.is_some_and(|end| end < start) {
+                    return Err(MediaError::OutOfRange { size });
+                }
+                (start, end)
+            }
+        };
+        let index = u32::try_from(start / CHUNK_SIZE as u64)
+            .map_err(|_| MediaError::OutOfRange { size })?;
         let chunk = match self.stream_chunk(token, index).await {
             Ok(Some(chunk)) => chunk,
-            Ok(None) => return Err(GONE),
+            Ok(None) => return Err(MediaError::Status(GONE)),
             // E.g. its sender cancelled it.
-            Err(_) => return Err(502),
+            Err(_) => return Err(MediaError::Status(502)),
         };
-        let from = start - u64::from(index) * CHUNK_SIZE as u64;
-        let to = end.map_or(u64::MAX, |end| {
-            from.saturating_add(end - start).saturating_add(1)
+        let chunk_base = u64::from(index) * CHUNK_SIZE as u64;
+        let from = start - chunk_base;
+        let available = size.saturating_sub(chunk_base).min(chunk.len() as u64);
+        let to = end.map_or(available, |end| {
+            from.saturating_add(end - start)
+                .saturating_add(1)
+                .min(available)
         });
         let bytes = chunk
-            .get(from as usize..(to.min(chunk.len() as u64)) as usize)
+            .get(from as usize..to as usize)
             .filter(|bytes| !bytes.is_empty())
-            .ok_or(OUT_OF_RANGE)?
+            .ok_or(MediaError::OutOfRange { size })?
             .to_vec();
         let mime = self
             .streams
             .borrow()
             .get(token)
             .map(|stream| stream.mime.clone())
-            .ok_or(GONE)?;
-        Ok((size, mime, bytes))
+            .ok_or(MediaError::Status(GONE))?;
+        Ok((size, start, mime, bytes))
     }
 
     /// Chunk `index` of the stream `token`, decrypted: one decrypted lately, or from this
@@ -248,15 +272,33 @@ impl Engine {
 }
 
 /// The MIME type a stream is served as until its first bytes tell, from the page's origin: the
-/// type its sender gave, if it is a plain video or audio type, else none in particular.
+/// type its sender gave, if it is a single-slash video or audio type, else none in particular.
 fn stream_mime(mime: &str) -> String {
-    let mime = mime.to_lowercase();
-    let plain = mime
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"/+-.".contains(&byte));
-    if plain && (mime.starts_with("video/") || mime.starts_with("audio/")) {
+    let mime = mime.to_ascii_lowercase();
+    if let Some((kind, subtype)) = mime.split_once('/')
+        && matches!(kind, "video" | "audio")
+        && !subtype.is_empty()
+        && subtype
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
+    {
         mime
     } else {
         "application/octet-stream".to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stream_mime;
+
+    #[test]
+    fn stream_mime_requires_single_slash_non_empty_media_subtype() {
+        assert_eq!(stream_mime("VIDEO/MP4"), "video/mp4");
+        assert_eq!(stream_mime("audio/x-matroska"), "audio/x-matroska");
+        assert_eq!(stream_mime("video/"), "application/octet-stream");
+        assert_eq!(stream_mime("audio/"), "application/octet-stream");
+        assert_eq!(stream_mime("video/a/b"), "application/octet-stream");
+        assert_eq!(stream_mime("text/html"), "application/octet-stream");
     }
 }

@@ -31,6 +31,25 @@ pub(super) enum FetchError {
     Other(String),
 }
 
+/// Error announcing a newly started attachment in chat history, distinguishing pre-send failure
+/// (safe to cancel on the server) from post-send vault save failure (where the peer may already
+/// hold the attachment pointer).
+enum AnnounceError {
+    NotSent(String),
+    SaveAfterSend {
+        error: String,
+        pending: Box<PendingUpload>,
+    },
+}
+
+impl AnnounceError {
+    fn into_message(self) -> String {
+        match self {
+            Self::NotSent(msg) | Self::SaveAfterSend { error: msg, .. } => msg,
+        }
+    }
+}
+
 impl FetchError {
     fn into_message(self) -> String {
         match self {
@@ -78,14 +97,22 @@ impl Engine {
         file: web_sys::File,
     ) -> Result<(), String> {
         let size = file.size() as u64;
-        let (started, signs_in_here) = {
+        let (started, signs_in_here, server) = {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
+            let contact = inner.contact(&peer).ok_or("no such chat")?;
+            if contact.state.request {
+                return Err("accept the request first".into());
+            }
+            if contact.state.quarantined {
+                return Err("approve classical encryption or upgrade to post-quantum first".into());
+            }
+            let server = inner.server.clone();
             let started = inner
                 .client
-                .start_upload(&Fetch::client(&inner.server), size)
+                .start_upload(&Fetch::client(&server), size)
                 .await;
-            (started, same_server(&inner.server, &origin()))
+            (started, same_server(&server, &origin()), server)
         };
         let upload = match started {
             Ok(upload) => upload,
@@ -122,14 +149,49 @@ impl Engine {
             announced: false,
             history_index: 0,
         };
-        self.save_upload(&peer, &pending).await?;
+        if let Err(e) = self.save_upload(&peer, &pending).await {
+            let _ = upload.cancel(&Fetch::client(&server)).await;
+            return Err(e);
+        }
         self.files.borrow_mut().insert(
             (peer, *upload.id(), attachment_key_hash(upload.key())),
             file.clone(),
         );
-        let pending = self.announce(&peer, pending).await?;
+        let pending = match self.announce(&peer, pending).await {
+            Ok(Some(pending)) => pending,
+            Ok(None) => return Ok(()),
+            Err(AnnounceError::NotSent(e)) => {
+                self.cancelled.borrow_mut().insert(*upload.id());
+                self.remove_attachment_caches(&peer, upload.id());
+                {
+                    let guard = self.inner.lock().await;
+                    if let Some(inner) = guard.as_ref() {
+                        let _ = inner.vault.forget_upload(&peer, upload.id()).await;
+                    }
+                }
+                let _ = upload.cancel(&Fetch::client(&server)).await;
+                return Err(e);
+            }
+            Err(AnnounceError::SaveAfterSend { error, pending }) => {
+                let keep = {
+                    let guard = self.inner.lock().await;
+                    guard
+                        .as_ref()
+                        .is_some_and(|inner| self.may_keep(inner, &peer, upload.id()))
+                };
+                if keep {
+                    self.show_upload(&peer, &pending, UploadState::Paused(error.clone()));
+                } else {
+                    self.cancelled.borrow_mut().insert(*upload.id());
+                    self.remove_attachment_caches(&peer, upload.id());
+                    let _ = upload.cancel(&Fetch::client(&server)).await;
+                }
+                return Err(error);
+            }
+        };
         // A new upload, which nothing else runs.
         self.running.borrow_mut().insert(*upload.id());
+        self.show_upload(&peer, &pending, UploadState::Running);
         let engine = self.clone();
         spawn_local(async move {
             if let Err(e) = engine.run_upload(peer, pending, file, Sha256::new()).await {
@@ -216,16 +278,55 @@ impl Engine {
             let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
                 continue;
             };
+            if self.cancelled.borrow().contains(&id) || self.running.borrow().contains(&id) {
+                continue;
+            }
             let key = (peer, id, attachment_key_hash(&pending.key));
             let Some(file) = self.files.borrow().get(&key).cloned() else {
-                self.show_upload(
-                    &peer,
-                    &pending,
-                    UploadState::Paused("choose the file again to upload".to_string()),
-                );
+                // Re-check under the lock so an upload already promoted by a concurrent
+                // `resume_upload` or dropped by `SealOutcome::Failed` is never resurrected.
+                let still_waiting = {
+                    let guard = self.inner.lock().await;
+                    let Some(inner) = guard.as_ref() else {
+                        return;
+                    };
+                    if self.cancelled.borrow().contains(&id) || self.running.borrow().contains(&id)
+                    {
+                        false
+                    } else {
+                        inner
+                            .vault
+                            .upload(&peer, &id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_some_and(|p| {
+                                !p.started()
+                                    && inner.contacts.iter().any(|c| {
+                                        c.peer == peer
+                                            && c.state.outbox.iter().any(|o| {
+                                                o.history_index == p.history_index
+                                                    && o.awaits_upload
+                                            })
+                                    })
+                            })
+                    }
+                };
+                if still_waiting {
+                    self.show_upload(
+                        &peer,
+                        &pending,
+                        UploadState::Paused("choose the file again to upload".to_string()),
+                    );
+                }
                 continue;
             };
-            if let Err(e) = self.start_waiting(peer, id, file).await {
+            if !self.running.borrow_mut().insert(id) {
+                continue;
+            }
+            let result = self.start_waiting(peer, id, file).await;
+            self.running.borrow_mut().remove(&id);
+            if let Err(e) = result {
                 self.ui.notify(e);
             }
         }
@@ -241,6 +342,9 @@ impl Engine {
         file: web_sys::File,
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
+        if self.cancelled.borrow().contains(&waiting) {
+            return Ok(());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         let Some(kept) = inner
             .vault
@@ -251,6 +355,9 @@ impl Engine {
         else {
             return Ok(());
         };
+        if file.size() as u64 != kept.size {
+            return Err(format!("that is not {}, or it changed", kept.name));
+        }
         // Its message still waits for it, unless this record outlived its start, as forgetting
         // it failed: that message has its attachment, and a second upload must not replace it.
         let awaited = inner.contact(&peer).is_some_and(|contact| {
@@ -259,6 +366,8 @@ impl Engine {
             })
         });
         if !awaited {
+            self.release(&peer, kept.history_index);
+            self.remove_attachment_caches(&peer, &waiting);
             self.ui
                 .uploads
                 .update(|uploads| uploads.retain(|upload| upload.id != waiting));
@@ -268,6 +377,20 @@ impl Engine {
                 .await
                 .map_err(|e| describe(&e));
         }
+        // Validate the waiting message and contact BEFORE allocating a server upload so a missing
+        // history entry cannot orphan a server upload or a `started = true` vault record.
+        let mut entry = inner
+            .vault
+            .entry(&peer, kept.history_index)
+            .await
+            .map_err(|e| describe(&e))?
+            .ok_or("its message is gone")?;
+        if inner.contact(&peer).is_none() {
+            return Err("no such chat".into());
+        }
+        if self.cancelled.borrow().contains(&waiting) {
+            return Ok(());
+        }
         let started = inner
             .client
             .start_upload(&Fetch::client(&inner.server), kept.size)
@@ -276,6 +399,9 @@ impl Engine {
             Ok(upload) => upload,
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
                 drop(guard);
+                if self.cancelled.borrow().contains(&waiting) {
+                    return Ok(());
+                }
                 self.files
                     .borrow_mut()
                     .insert((peer, waiting, attachment_key_hash(&kept.key)), file);
@@ -284,13 +410,17 @@ impl Engine {
                 return Ok(());
             }
             Err(e) => {
+                if self.cancelled.borrow().contains(&waiting) {
+                    return Ok(());
+                }
                 // Report attachment 404/Unimplemented locally without tripping global update_required.
                 return Err(describe(&e));
             }
         };
+        let server = inner.server.clone();
         // Cancelled meanwhile: the server forgets it too, and cancelling fails its message.
         if self.cancelled.borrow().contains(&waiting) {
-            let _ = upload.cancel(&Fetch::client(&inner.server)).await;
+            let _ = upload.cancel(&Fetch::client(&server)).await;
             return Ok(());
         }
         let pointer = AttachmentPointer {
@@ -317,17 +447,10 @@ impl Engine {
         };
         // Kept under the server's ID first: if the message is not saved after, the upload is
         // there to cancel, rather than a message with nothing to download.
-        inner
-            .vault
-            .save_upload(&peer, &pending)
-            .await
-            .map_err(|e| describe(&e))?;
-        let mut entry = inner
-            .vault
-            .entry(&peer, kept.history_index)
-            .await
-            .map_err(|e| describe(&e))?
-            .ok_or("its message is gone")?;
+        if let Err(e) = inner.vault.save_upload(&peer, &pending).await {
+            let _ = upload.cancel(&Fetch::client(&server)).await;
+            return Err(describe(&e));
+        }
         let content = Kind::Attachment(pointer);
         let record = OutgoingRecord {
             message: None,
@@ -338,14 +461,18 @@ impl Engine {
             kind: Some(content),
             ..entry.content.unwrap_or_default()
         });
-        let contact = inner.contact(&peer).ok_or("no such chat")?;
+        let Some(contact) = inner.contact(&peer) else {
+            let _ = inner.vault.forget_upload(&peer, upload.id()).await;
+            let _ = upload.cancel(&Fetch::client(&server)).await;
+            return Err("no such chat".into());
+        };
         let snapshot = contact.snapshot();
         for outgoing in &mut contact.state.outbox {
             if outgoing.history_index == kept.history_index {
                 outgoing.awaits_upload = false;
             }
         }
-        let changed = [(kept.history_index, entry)];
+        let mut changed = [(kept.history_index, entry)];
         let saved = inner
             .save_with(
                 &records(&peer, &changed),
@@ -355,6 +482,7 @@ impl Engine {
         if let Err(e) = saved {
             inner.roll_back(&peer, snapshot)?;
             let _ = inner.vault.forget_upload(&peer, upload.id()).await;
+            let _ = upload.cancel(&Fetch::client(&server)).await;
             return Err(describe(&e));
         }
         // Its message has the attachment now: a record left behind is forgotten when found.
@@ -365,19 +493,51 @@ impl Engine {
                 describe(&e)
             ));
         }
-        self.show_changes(inner, &peer, &changed);
         // Cancelled while it started, which found nothing left to cancel: it goes no further,
-        // and its message fails, as cancelling it before would have done.
+        // and its message reverts to an un-uploaded failed attachment without publishing the
+        // cancelled pointer ID to the UI.
         if self.cancelled.borrow().contains(&waiting) {
+            self.cancelled.borrow_mut().insert(*upload.id());
+            self.remove_attachment_caches(&peer, &waiting);
+            self.remove_attachment_caches(&peer, upload.id());
             let _ = upload.cancel(&Fetch::client(&inner.server)).await;
             let _ = inner.vault.forget_upload(&peer, upload.id()).await;
-            self.fail_waiting(inner, &peer, kept.history_index).await?;
+            let contact = inner.contact(&peer).ok_or("no such chat")?;
+            let fail_snapshot = contact.snapshot();
+            contact
+                .state
+                .outbox
+                .retain(|outgoing| outgoing.history_index != kept.history_index);
+            if let Some(Kind::Attachment(pointer)) = changed[0]
+                .1
+                .content
+                .as_mut()
+                .and_then(|content| content.kind.as_mut())
+            {
+                pointer.id.clear();
+                pointer.key.clear();
+                pointer.expires = 0;
+            }
+            changed[0].1.set_delivery(Delivery::Failed);
+            if let Err(e) = inner
+                .save_with(
+                    &records(&peer, &changed),
+                    &[(outbox_key(&peer, kept.history_index), None)],
+                )
+                .await
+            {
+                inner.roll_back(&peer, fail_snapshot)?;
+                return Err(describe(&e));
+            }
+            self.release(&peer, kept.history_index);
+            self.show_changes(inner, &peer, &changed);
             drop(guard);
             if let Err(e) = self.flush(&peer).await {
                 self.ui.link.set(Link::Offline(e));
             }
             return Ok(());
         }
+        self.show_changes(inner, &peer, &changed);
         drop(guard);
         // Under the server's ID and key hash from now on.
         self.remove_attachment_caches(&peer, &waiting);
@@ -390,9 +550,31 @@ impl Engine {
             .update(|uploads| uploads.retain(|upload| upload.id != waiting));
         self.running.borrow_mut().remove(&waiting);
         self.running.borrow_mut().insert(*upload.id());
+        self.show_upload(&peer, &pending, UploadState::Running);
         self.release(&peer, kept.history_index);
         if let Err(e) = self.flush(&peer).await {
             self.ui.link.set(Link::Offline(e));
+        }
+        // If `flush` permanently failed or `cancel_held`/`cancel_upload` cancelled the upload
+        // while announcing, stop without uploading chunks to R2.
+        let failed_or_cancelled = self.cancelled.borrow().contains(upload.id()) || {
+            let guard = self.inner.lock().await;
+            if let Some(inner) = guard.as_ref() {
+                inner
+                    .vault
+                    .entry(&peer, kept.history_index)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_some_and(|e| e.delivery() == Delivery::Failed)
+            } else {
+                true
+            }
+        };
+        if failed_or_cancelled {
+            self.running.borrow_mut().remove(upload.id());
+            self.wake();
+            return Ok(());
         }
         self.wake();
         let engine = self.clone();
@@ -405,30 +587,123 @@ impl Engine {
     }
 
     /// Send the attachment of `pending` to `peer`, unless sent already, and keep that it was.
+    /// Returns `Ok(None)` if the announcement permanently failed or was cancelled during `flush`.
     async fn announce(
         &self,
         peer: &PublicKey,
         mut pending: PendingUpload,
-    ) -> Result<PendingUpload, String> {
+    ) -> Result<Option<PendingUpload>, AnnounceError> {
         if pending.announced {
-            return Ok(pending);
+            return Ok(Some(pending));
         }
-        let pointer = AttachmentPointer {
-            id: pending.id.clone(),
-            key: pending.key.clone(),
-            size: pending.size,
-            name: pending.name.clone(),
-            mime: pending.mime.clone(),
-            expires: pending.expires,
+        let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
+        // Hold one lock across scanning history for an already-persisted announcement, checking
+        // cancellation/chat deletion, and adding a new outgoing message so a queued `cancel_upload`
+        // or `delete(peer)` cannot slip in before `inner.add` and send a deleted attachment.
+        let (index, added_new) = {
+            let mut guard = self.inner.lock().await;
+            let Some(inner) = guard.as_mut() else {
+                return Err(AnnounceError::NotSent("locked".into()));
+            };
+            let mut end = inner
+                .contacts
+                .iter()
+                .find(|contact| contact.peer == *peer)
+                .map_or(0, |contact| contact.state.history_len);
+            let mut found = None;
+            while end > 0 && found.is_none() {
+                let page = inner
+                    .vault
+                    .history(peer, end, HISTORY_SHOWN)
+                    .await
+                    .map_err(|e| AnnounceError::NotSent(describe(&e)))?;
+                found = page.into_iter().rev().find_map(|(idx, entry)| {
+                    (entry.outgoing
+                        && matches!(
+                            entry.content.as_ref().and_then(|c| c.kind.as_ref()),
+                            Some(Kind::Attachment(pointer)) if pointer.id == pending.id
+                        ))
+                    .then_some(idx)
+                });
+                end = end.saturating_sub(HISTORY_SHOWN);
+            }
+            if !self.may_keep(inner, peer, &pending.id) {
+                if let Some(id) = id_arr {
+                    self.remove_attachment_caches(peer, &id);
+                    self.ui
+                        .uploads
+                        .update(|uploads| uploads.retain(|item| item.id != id));
+                }
+                return Ok(None);
+            }
+            match found {
+                Some(index) => (index, false),
+                None => {
+                    let pointer = AttachmentPointer {
+                        id: pending.id.clone(),
+                        key: pending.key.clone(),
+                        size: pending.size,
+                        name: pending.name.clone(),
+                        mime: pending.mime.clone(),
+                        expires: pending.expires,
+                    };
+                    let view = inner
+                        .add(peer, Kind::Attachment(pointer), false)
+                        .await
+                        .map_err(AnnounceError::NotSent)?;
+                    let index = view.index;
+                    self.show_new(inner, peer, vec![view]);
+                    self.ui.contacts.set(inner.views());
+                    (index, true)
+                }
+            }
         };
-        // Sent first, then kept: going wrong in between sends it twice, not never.
-        let index = self
-            .send_returning_index(*peer, Kind::Attachment(pointer))
-            .await?;
+        if added_new {
+            // Saved, so it goes in a later sync if not now.
+            if let Err(e) = self.flush(peer).await {
+                self.ui.link.set(Link::Offline(e));
+            }
+            self.wake();
+        }
+        // Hold one lock across checking delivery failure, concurrent cancellation/chat deletion,
+        // and persisting `announced = true` so a concurrent cancel cannot race into a spurious
+        // `"the upload of ... was cancelled"` error toast or mark an offline cancel gone early.
         pending.announced = true;
         pending.history_index = index;
-        self.save_upload(peer, &pending).await?;
-        Ok(pending)
+        let mut guard = self.inner.lock().await;
+        let Some(inner) = guard.as_mut() else {
+            return Err(AnnounceError::SaveAfterSend {
+                error: "locked".into(),
+                pending: Box::new(pending),
+            });
+        };
+        let entry_failed = inner
+            .vault
+            .entry(peer, index)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|e| e.delivery() == Delivery::Failed);
+        if entry_failed {
+            self.cancel_uploads_for_failed(inner, peer, &[index]).await;
+            return Ok(None);
+        }
+        if !self.may_keep(inner, peer, &pending.id) {
+            if let Some(id) = id_arr {
+                self.remove_attachment_caches(peer, &id);
+                self.ui
+                    .uploads
+                    .update(|uploads| uploads.retain(|item| item.id != id));
+            }
+            return Ok(None);
+        }
+        if let Err(e) = inner.vault.save_upload(peer, &pending).await {
+            return Err(AnnounceError::SaveAfterSend {
+                error: describe(&e),
+                pending: Box::new(pending),
+            });
+        }
+        Ok(Some(pending))
     }
 
     /// The bytes of the file of the history entry `index` of the chat with `peer`, which are
@@ -472,40 +747,56 @@ impl Engine {
         id: [u8; 16],
         file: Option<web_sys::File>,
     ) -> Result<(), String> {
-        // One that waited for a sign-in starts, its message in its place.
-        let waits = {
-            let guard = self.inner.lock().await;
-            let inner = guard.as_ref().ok_or("locked")?;
-            inner
-                .vault
-                .upload(&peer, &id)
-                .await
-                .map_err(|e| describe(&e))?
-                .is_some_and(|pending| !pending.started())
-        };
-        if waits {
-            let key = (peer, id, attachment_key_hash(&[]));
-            let file = file
-                .or_else(|| self.files.borrow().get(&key).cloned())
-                .ok_or("choose the file again")?;
-            return self.start_waiting(peer, id, file).await;
-        }
-        // Running from here on, so that resuming it again meanwhile, e.g. clicked again while
-        // the file is checked, neither checks the file twice nor sends the attachment twice.
+        // Guard the upload ID in `self.running` up front so double-clicking Resume on either a
+        // sign-in-held (`!started()`) upload or a started upload cannot race `start_waiting` and
+        // surface a spurious `"that upload is gone"` error.
         if self.cancelled.borrow().contains(&id) || !self.running.borrow_mut().insert(id) {
             return Ok(());
         }
-        let resumed = async {
-            let pending = {
-                let guard = self.inner.lock().await;
-                let inner = guard.as_ref().ok_or("locked")?;
-                inner
-                    .vault
-                    .upload(&peer, &id)
-                    .await
-                    .map_err(|e| describe(&e))?
-                    .ok_or("that upload is gone")?
+        // Look up the pending upload once under the lock, exiting quietly if it was cancelled or
+        // forgotten concurrently (e.g. by `cancel_upload`, `SealOutcome::Failed`, or `delete`).
+        let pending = {
+            let guard = self.inner.lock().await;
+            let Some(inner) = guard.as_ref() else {
+                self.running.borrow_mut().remove(&id);
+                return Err("locked".into());
             };
+            match inner.vault.upload(&peer, &id).await {
+                Ok(Some(pending)) => {
+                    if self.cancelled.borrow().contains(&id) {
+                        self.running.borrow_mut().remove(&id);
+                        return Ok(());
+                    }
+                    pending
+                }
+                Ok(None) => {
+                    self.running.borrow_mut().remove(&id);
+                    if self.cancelled.borrow().contains(&id) {
+                        return Ok(());
+                    }
+                    return Err("that upload is gone".into());
+                }
+                Err(e) => {
+                    self.running.borrow_mut().remove(&id);
+                    return Err(describe(&e));
+                }
+            }
+        };
+        // One that waited for a sign-in starts, its message in its place.
+        if !pending.started() {
+            let key = (peer, id, attachment_key_hash(&[]));
+            let file = match file.or_else(|| self.files.borrow().get(&key).cloned()) {
+                Some(file) => file,
+                None => {
+                    self.running.borrow_mut().remove(&id);
+                    return Err("choose the file again".into());
+                }
+            };
+            let result = self.start_waiting(peer, id, file).await;
+            self.running.borrow_mut().remove(&id);
+            return result;
+        }
+        let resumed = async {
             let cache_key = (peer, id, attachment_key_hash(&pending.key));
             let file = file
                 .or_else(|| self.files.borrow().get(&cache_key).cloned())
@@ -513,7 +804,9 @@ impl Engine {
             let hasher = match self.check(&peer, &pending, &file).await {
                 Ok(hasher) => hasher,
                 Err(e) => {
-                    self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
+                    if !self.cancelled.borrow().contains(&id) {
+                        self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
+                    }
                     return Err(e);
                 }
             };
@@ -524,12 +817,14 @@ impl Engine {
             self.files.borrow_mut().insert(cache_key, file.clone());
             let before_announce = pending.clone();
             let pending = match self.announce(&peer, pending).await {
-                Ok(pending) => pending,
-                Err(e) => {
+                Ok(Some(pending)) => pending,
+                Ok(None) => return Ok(None),
+                Err(err) => {
+                    let msg = err.into_message();
                     if !self.cancelled.borrow().contains(&id) {
-                        self.show_upload(&peer, &before_announce, UploadState::Paused(e.clone()));
+                        self.show_upload(&peer, &before_announce, UploadState::Paused(msg.clone()));
                     }
-                    return Err(e);
+                    return Err(msg);
                 }
             };
             Ok::<_, String>(Some((pending, file, hasher)))
@@ -564,33 +859,54 @@ impl Engine {
             .upload(&peer, &id)
             .await
             .map_err(|e| describe(&e))?;
-        // One that waited for a sign-in never went: its message fails, and what waited for it
-        // goes.
+        // One that waited for a sign-in never went: its message fails only if that outbox entry
+        // still awaits an upload (a stale unstarted record left behind after `start_waiting`
+        // promoted the message must only be forgotten, without failing the active message).
         if let Some(waiting) = pending.as_ref().filter(|pending| !pending.started()) {
-            self.fail_waiting(inner, &peer, waiting.history_index)
-                .await?;
+            let still_awaits = inner.contact(&peer).is_some_and(|contact| {
+                contact
+                    .state
+                    .outbox
+                    .iter()
+                    .any(|o| o.history_index == waiting.history_index && o.awaits_upload)
+            });
+            if still_awaits {
+                self.fail_waiting(inner, &peer, waiting.history_index)
+                    .await?;
+            } else {
+                self.release(&peer, waiting.history_index);
+            }
             inner
                 .vault
                 .forget_upload(&peer, &id)
                 .await
                 .map_err(|e| describe(&e))?;
             drop(guard);
-            if let Err(e) = self.flush(&peer).await {
+            if still_awaits && let Err(e) = self.flush(&peer).await {
                 self.ui.link.set(Link::Offline(e));
             }
             return Ok(());
         }
-        if let Some(pending) = &pending
-            && let Err(e) = upload_of(pending)?
+        let deleted_on_server = if let Some(pending) = &pending {
+            match upload_of(pending)?
                 .cancel(&Fetch::client(&inner.server))
                 .await
-        {
-            self.ui.log(format!(
-                "the server keeps what it has of {} until it expires: {}",
-                pending.name,
-                describe(&e)
-            ));
-        }
+            {
+                Ok(()) => true,
+                Err(e) if e.kind() == ErrorKind::NotFound => true,
+                Err(e) => {
+                    self.ui.log(format!(
+                        "the server keeps what it has of {} until it expires: {}",
+                        pending.name,
+                        describe(&e)
+                    ));
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let started = pending.as_ref().is_some_and(PendingUpload::started);
         let announced = pending
             .as_ref()
             .filter(|pending| pending.announced)
@@ -600,10 +916,8 @@ impl Engine {
             .forget_upload(&peer, &id)
             .await
             .map_err(|e| describe(&e))?;
-        if let Some(hint_index) = announced {
-            let _ = self
-                .note_gone_inner(inner, &peer, Some(hint_index), &id)
-                .await;
+        if started && deleted_on_server {
+            let _ = self.note_gone_inner(inner, &peer, announced, &id).await;
         }
         Ok(())
     }
@@ -615,16 +929,31 @@ impl Engine {
         let waiting = {
             let guard = self.inner.lock().await;
             let inner = guard.as_ref().ok_or("locked")?;
+            let still_awaits = inner.contacts.iter().any(|c| {
+                c.peer == peer
+                    && c.state
+                        .outbox
+                        .iter()
+                        .any(|o| o.history_index == index && o.awaits_upload)
+            });
             let uploads = inner
                 .vault
                 .uploads(Some(&peer))
                 .await
                 .map_err(|e| describe(&e))?;
-            uploads.into_iter().find_map(|(_, pending)| {
+            let found = uploads.into_iter().find_map(|(_, pending)| {
                 (!pending.started() && pending.history_index == index)
                     .then(|| <[u8; 16]>::try_from(pending.id.as_slice()).ok())
                     .flatten()
-            })
+            });
+            if still_awaits {
+                found
+            } else {
+                if let Some(stale_id) = found {
+                    let _ = inner.vault.forget_upload(&peer, &stale_id).await;
+                }
+                None
+            }
         };
         if let Some(id) = waiting {
             return self.cancel_upload(peer, id).await;
@@ -645,6 +974,7 @@ impl Engine {
                 return Ok(());
             }
             self.fail_waiting(inner, &peer, index).await?;
+            self.cancel_uploads_for_failed(inner, &peer, &[index]).await;
         }
         self.waits_sign_in.borrow_mut().remove(&peer);
         if let Err(e) = self.flush(&peer).await {
@@ -652,6 +982,130 @@ impl Engine {
         }
         self.wake();
         Ok(())
+    }
+
+    /// Cancel and forget any unstarted or started uploads associated with permanently failed or
+    /// cancelled history entries `failed_indices`, preventing orphaned R2 uploads and ghost rows.
+    pub(super) async fn cancel_uploads_for_failed(
+        &self,
+        inner: &mut Inner,
+        peer: &PublicKey,
+        failed_indices: &[u64],
+    ) {
+        if failed_indices.is_empty() {
+            return;
+        }
+        struct FailedAttachment {
+            index: u64,
+            key: Option<Zeroizing<[u8; attachment::KEY_LENGTH]>>,
+            gone: bool,
+        }
+        let mut by_id: std::collections::HashMap<[u8; 16], FailedAttachment> =
+            std::collections::HashMap::new();
+        for &idx in failed_indices {
+            if let Ok(Some(entry)) = inner.vault.entry(peer, idx).await
+                && let Some(Kind::Attachment(pointer)) =
+                    entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                && let Ok(id) = <[u8; 16]>::try_from(pointer.id.as_slice())
+            {
+                let key = <[u8; attachment::KEY_LENGTH]>::try_from(pointer.key.as_slice())
+                    .ok()
+                    .map(Zeroizing::new);
+                by_id.insert(
+                    id,
+                    FailedAttachment {
+                        index: idx,
+                        key,
+                        gone: entry.gone,
+                    },
+                );
+            }
+        }
+        let uploads = inner.vault.uploads(Some(peer)).await.unwrap_or_default();
+        let mut handled_ids = std::collections::HashSet::new();
+        for (_, pending) in uploads {
+            let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
+                continue;
+            };
+            let matched_index = by_id.get(&id).map(|item| item.index).or_else(|| {
+                (pending.announced || !pending.started())
+                    .then_some(pending.history_index)
+                    .filter(|idx| failed_indices.contains(idx))
+            });
+            if matched_index.is_none() && !by_id.contains_key(&id) {
+                continue;
+            }
+            self.cancelled.borrow_mut().insert(id);
+            self.remove_attachment_caches(peer, &id);
+            self.ui
+                .uploads
+                .update(|uploads| uploads.retain(|item| item.id != id));
+            let mut deleted_on_server = false;
+            if pending.started() {
+                if let Ok(upload) = upload_of(&pending) {
+                    handled_ids.insert(id);
+                    match upload.cancel(&Fetch::client(&inner.server)).await {
+                        Ok(()) => deleted_on_server = true,
+                        Err(e) if e.kind() == ErrorKind::NotFound => deleted_on_server = true,
+                        Err(e) => {
+                            self.ui.log(format!(
+                                "the server keeps what it has of {} until it expires: {}",
+                                pending.name,
+                                describe(&e)
+                            ));
+                        }
+                    }
+                }
+                // If `upload_of(&pending)` fails, leave `id` out of `handled_ids` so the `by_id`
+                // pass below can still attempt `attachment::delete` via `pointer.key`.
+            } else {
+                handled_ids.insert(id);
+            }
+            let _ = inner.vault.forget_upload(peer, &id).await;
+            if deleted_on_server {
+                let _ = self.note_gone_inner(inner, peer, matched_index, &id).await;
+            }
+        }
+        for (id, item) in by_id {
+            if handled_ids.contains(&id) {
+                continue;
+            }
+            self.cancelled.borrow_mut().insert(id);
+            self.remove_attachment_caches(peer, &id);
+            self.ui
+                .uploads
+                .update(|uploads| uploads.retain(|entry| entry.id != id));
+            if item.gone {
+                self.ui.gone.update(|gone| {
+                    gone.insert((*peer, item.index));
+                });
+                continue;
+            }
+            let Some(key) = item.key else {
+                continue;
+            };
+            // Upload already finished and its `PendingUpload` was forgotten: delete the completed
+            // object via its delete token, and only mark `gone` once confirmed deleted/not found
+            // so transient offline failures stay retryable from the Files dialog.
+            match attachment::delete(&Fetch::client(&inner.server), &id, &key).await {
+                Ok(()) => {
+                    let _ = self
+                        .note_gone_inner(inner, peer, Some(item.index), &id)
+                        .await;
+                }
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    let _ = self
+                        .note_gone_inner(inner, peer, Some(item.index), &id)
+                        .await;
+                }
+                Err(e) => {
+                    self.ui.log(format!(
+                        "could not delete cancelled attachment from server: {}",
+                        describe(&e)
+                    ));
+                }
+            }
+        }
     }
 
     /// Show the message at `index`, to `peer`, as held until this browser signs in.
@@ -736,6 +1190,19 @@ impl Engine {
                 ));
             }
             Err(e) => {
+                let gone = self.cancelled.borrow().contains(&id) || {
+                    let guard = self.inner.lock().await;
+                    guard
+                        .as_ref()
+                        .is_some_and(|inner| !self.may_keep(inner, &peer, &id))
+                };
+                if gone {
+                    self.remove_attachment_caches(&peer, &id);
+                    self.ui
+                        .uploads
+                        .update(|uploads| uploads.retain(|upload| upload.id != id));
+                    return Ok(());
+                }
                 self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
                 return Err(e);
             }
@@ -966,6 +1433,9 @@ impl Engine {
                 Ok(()) => return Ok(true),
                 Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
                 Err(e) if e.kind() == ErrorKind::Server => {
+                    if self.cancelled.borrow().contains(upload.id()) {
+                        return Ok(true);
+                    }
                     self.show_upload(peer, pending, UploadState::Retrying);
                     sleep(wait).await;
                     wait = (wait * 2).min(RETRY_MAX);
@@ -1009,9 +1479,13 @@ impl Engine {
         pending: &PendingUpload,
         state: UploadState,
     ) {
+        let id: [u8; 16] = pending.id.as_slice().try_into().unwrap_or_default();
+        if self.cancelled.borrow().contains(&id) {
+            return;
+        }
         let view = UploadView {
             peer: *peer,
-            id: pending.id.as_slice().try_into().unwrap_or_default(),
+            id,
             name: pending.name.clone(),
             done: (u64::from(pending.uploaded) * CHUNK_SIZE as u64).min(pending.size),
             size: pending.size,
@@ -1137,7 +1611,7 @@ impl Engine {
             let events = contact.state.events.get_or_insert_default();
             events.downloaded.push(clock);
             keep_last(&mut events.downloaded);
-            inner.save(&[]).await.map_err(|e| describe(&e))?;
+            inner.save_state().await.map_err(|e| describe(&e))?;
         }
         self.flush(&peer).await.map(drop)
     }

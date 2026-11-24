@@ -627,6 +627,7 @@ impl SignInFlow {
     /// cancelled auto-start submission IDs so the engine can suppress late network hooks.
     pub fn cancel_active_submissions(&mut self) -> Vec<u64> {
         let mut cancelled = Vec::new();
+        self.active_new_chat = None;
         if let Some((id, _)) = self.submitting_new_chat.take() {
             cancelled.push(id);
         }
@@ -1354,6 +1355,29 @@ mod tests {
         assert_eq!(non_auto_flow.pending_new_chat_hint(), None);
         assert_eq!(
             non_auto_flow.on_sign_in_succeeded(),
+            SignInSuccessAction::Close
+        );
+
+        // F1: Cancelling an open NewChat via Escape/Cancel (`cancel_active_submissions`) must also
+        // clear `active_new_chat` so a subsequent background 403 does not capture the stale draft.
+        let mut cancel_flow = SignInFlow::default();
+        cancel_flow.on_new_chat_mounted("peer-key-esc".into(), "Escaped".into(), None, true);
+        let esc_id = cancel_flow.begin_new_chat_submit(PendingNewChat {
+            key: "peer-key-esc".into(),
+            name: "Escaped".into(),
+            server: None,
+            pq_pinned: true,
+            allow_classical: false,
+            auto_start: true,
+        });
+        assert_eq!(cancel_flow.cancel_active_submissions(), vec![esc_id]);
+        assert_eq!(
+            cancel_flow.on_ask_sign_in(None, true, true),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(cancel_flow.pending_new_chat_hint(), None);
+        assert_eq!(
+            cancel_flow.on_sign_in_succeeded(),
             SignInSuccessAction::Close
         );
     }

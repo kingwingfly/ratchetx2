@@ -3,12 +3,12 @@
 use ml_kem::kem::{Decapsulate, KeyExport, TryKeyInit};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::{
-    ErrorKind, PQ_SEED_LENGTH, PQ_SHARED_SECRET_LENGTH, PqSuite, Result,
-};
+use crate::{ErrorKind, PQ_SEED_LENGTH, PQ_SHARED_SECRET_LENGTH, PqSuite, Result};
 
 /// Generates a fresh 64-byte FIPS 203 `(d, z)` seed and derives its encapsulation key bytes.
-pub(crate) fn generate_keypair(suite: PqSuite) -> Result<(Vec<u8>, Zeroizing<[u8; PQ_SEED_LENGTH]>)> {
+pub(crate) fn generate_keypair(
+    suite: PqSuite,
+) -> Result<(Vec<u8>, Zeroizing<[u8; PQ_SEED_LENGTH]>)> {
     if !suite.is_supported() {
         return Err(ErrorKind::UnsupportedSuite.into());
     }

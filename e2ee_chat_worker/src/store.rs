@@ -7,7 +7,7 @@
 //! message row can never be left pointing at a deleted blob. Only a definitive pre-commit
 //! rejection (`AppendOutcome::LimitExceeded`) deletes the staged R2 object.
 
-use futures_util::future::try_join_all;
+use futures_util::{StreamExt, TryStreamExt, stream};
 use serde::de::DeserializeOwned;
 use storage::{
     AttachmentId, Bytes, ClaimedPqBundle, Error, ErrorKind, LocalAttachmentStore,
@@ -489,7 +489,7 @@ impl LocalIdempotentMailboxStore for Store {
             max_size: self.max_read_size as u64,
         };
         let rows: Vec<StoredRow> = self.identity(recipient, &call).await?;
-        try_join_all(rows.into_iter().map(|row| async move {
+        stream::iter(rows.into_iter().map(|row| async move {
             let content = match row.content {
                 Content::Inline(content) => Some(Bytes::from(content)),
                 Content::Object(object) => self.object(&object).await?,
@@ -503,6 +503,8 @@ impl LocalIdempotentMailboxStore for Store {
                 initial_message: row.initial_message.map(Bytes::from),
             })
         }))
+        .buffered(6)
+        .try_collect()
         .await
     }
 }

@@ -76,6 +76,10 @@ pub(super) fn stage_carried_initials<'a>(
     state: &mut ContactState,
     initials: impl IntoIterator<Item = &'a Incoming>,
 ) -> Result<(), String> {
+    let quarantined_id = state
+        .quarantined
+        .then(|| state.quarantined_session.as_ref().map(|s| s.id.as_slice()))
+        .flatten();
     let pending = &mut state.pending_carried_initials;
     let mut unsupported_count = pending
         .iter()
@@ -83,6 +87,12 @@ pub(super) fn stage_carried_initials<'a>(
         .count();
     let mut supported_count = pending.len() - unsupported_count;
     for message in initials {
+        if let Some(q_id) = quarantined_id
+            && let InitialMessageKind::Classical(classical) = &message.kind
+            && classical.x3dh.ephemeral_key.as_slice() == q_id
+        {
+            continue;
+        }
         let bytes =
             session::protocol::mailbox_v2::encode_carried_initial(&initial_payload(&message.kind))
                 .map_err(|e| describe(&e))?
@@ -782,7 +792,7 @@ impl Engine {
             );
             if batch.dirty {
                 recommend_upgrade |= self.save_initial_batch(inner, batch).await?.contains(peer);
-            } else if let Err(e) = inner.save_state().await {
+            } else if let Err(e) = inner.save(&[]).await {
                 // Nothing consumed a prekey. Retry the original entry if storage recovers.
                 inner.contacts[index]
                     .state
@@ -863,15 +873,48 @@ impl Engine {
             quarantine,
         } = opened;
         let local_pq = inner.local_pq_enabled();
+        let incoming_hello_downgrade = quarantine.is_none()
+            && local_pq
+            && !session.security().is_some_and(|s| s.is_pq)
+            && matches!(
+                Content::from_bytes(&first_message).kind,
+                Some(Kind::Hello(ref hello)) if hello.pq_capable
+            );
         let existing = inner.contacts.iter().position(|c| c.peer == *peer);
         let contact = match existing {
             Some(index) => {
+                let server = inner.server.clone();
                 let contact = &mut inner.contacts[index];
                 if let Some(pinned) = quarantine {
+                    let high_water = contact
+                        .session
+                        .peer_session_seq()
+                        .max(if contact.is_new_quarantined() {
+                            contact.session.active_peer_session_seq()
+                        } else {
+                            0
+                        })
+                        .max(
+                            contact
+                                .state
+                                .quarantined_session
+                                .as_ref()
+                                .map_or(0, |s| s.active_peer_session_seq),
+                        );
+                    let incoming_seq = session.active_peer_session_seq();
+                    if high_water > 0 && (incoming_seq == 0 || incoming_seq <= high_water) {
+                        self.ui.log(format!(
+                            "ignored stale classical session request from {}",
+                            short(peer)
+                        ));
+                        return InitialOutcome::Ack;
+                    }
+                    let downgrade = pinned || session.peer_pq_state().downgrade_detected;
                     contact.record_quarantined_initial(
                         Some(session.state().into()),
                         first_message,
                         pinned,
+                        downgrade,
                         now(),
                     );
                     self.ui.log(format!(
@@ -882,9 +925,19 @@ impl Engine {
                 }
                 let is_pq = session.security().is_some_and(|security| security.is_pq);
                 let was_quarantined = contact.state.quarantined;
+                // Do not archive an unapproved primary classical session into `others` when
+                // replacing a brand-new quarantined contact with an accepted session.
+                let discarded_primary: Option<session::proto::SessionState> =
+                    if contact.is_new_quarantined() {
+                        let saved = contact.session.state().into();
+                        contact.session.discard_active();
+                        Some(saved)
+                    } else {
+                        None
+                    };
                 match contact.replace_session(session, local_pq) {
                     Ok(took_over) => {
-                        if is_pq {
+                        if is_pq || took_over || was_quarantined {
                             contact.clear_quarantine_and_alerts();
                             if was_quarantined {
                                 batch.unquarantined.insert(*peer);
@@ -895,6 +948,12 @@ impl Engine {
                         }
                     }
                     Err(e) => {
+                        if let Some(saved) = discarded_primary
+                            && let Ok(restored) = session::SessionState::try_from(&saved)
+                        {
+                            contact.session =
+                                session::Session::restore(Fetch::client(&server), restored);
+                        }
                         self.ui.log(format!(
                             "rejected incoming session from {}: {}",
                             short(peer),
@@ -920,7 +979,14 @@ impl Engine {
                 };
                 if let Some(pinned) = quarantine {
                     contact.state.quarantined_primary = true;
-                    contact.record_quarantined_initial(None, first_message, pinned, now());
+                    let downgrade = pinned || contact.session.peer_pq_state().downgrade_detected;
+                    contact.record_quarantined_initial(
+                        None,
+                        first_message,
+                        pinned,
+                        downgrade,
+                        now(),
+                    );
                     inner.contacts.push(contact);
                     self.ui.log(format!(
                         "quarantined classical chat request from {} pending approval",
@@ -936,9 +1002,14 @@ impl Engine {
         let content = Content::from_bytes(&first_message);
         if let Some(Kind::Hello(ref hello)) = content.kind {
             let check = contact.session.check_peer_hello(hello, local_pq);
-            if check.downgrade_detected {
+            // If an incoming classical initial lost a crossed-start tie-break against a local
+            // classical session, `replace_session` already merged its `peer_pq` state (including
+            // `downgrade_detected`), while `check_peer_hello` sees the already-advanced sequence.
+            let crossed_downgrade = incoming_hello_downgrade && !contact.has_healthy_pq_session();
+            if check.downgrade_detected || crossed_downgrade {
                 contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                if check.recommend_start_again
+                if local_pq
+                    && (check.recommend_start_again || crossed_downgrade)
                     && !contact.state.request
                     && !contact.state.quarantined
                 {
@@ -1053,8 +1124,12 @@ impl Engine {
                 &preserve_digests,
             )
             .map_err(PublishError::prepare)?;
-        // H-2: Persist new prekeys & manifest state BEFORE transmitting!
-        inner.save_state().await.map_err(PublishError::storage)?;
+        // H-2: Persist new prekeys & manifest state BEFORE transmitting; roll back in-memory
+        // prekeys if storage fails so never-transmitted rotations are not committed later.
+        if let Err(e) = inner.save(&[]).await {
+            inner.client.rollback_publish_v2_on_refusal(prepared);
+            return Err(PublishError::storage(e));
+        }
         match inner.client.transmit_publish_v2(&prepared).await {
             Ok(outcome) => {
                 inner.client.commit_publish_v2(prepared);
@@ -1173,7 +1248,10 @@ impl Engine {
             .client
             .prepare_refill_v2(&inner.audience, classical_count, pq_count)
             .map_err(|e| describe(&e))?;
-        inner.save_state().await.map_err(|e| describe(&e))?;
+        if let Err(e) = inner.save(&[]).await {
+            inner.client.rollback_refill_v2_on_refusal(prepared);
+            return Err(describe(&e));
+        }
         let response = match inner.client.transmit_refill_v2(&prepared).await {
             Ok(response) => response,
             Err(e) if !e.is_server_refusal() => return Err(describe(&e)),
@@ -1379,6 +1457,11 @@ impl Engine {
             let snapshot = contact.snapshot();
             if pin_pq {
                 contact.session.pin_peer_pq();
+                if contact.state.quarantined {
+                    contact.state.quarantined_was_pq_pinned = true;
+                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                    contact.session.peer_pq_state_mut().downgrade_detected = true;
+                }
             }
             if allow_classical {
                 contact
@@ -1393,7 +1476,7 @@ impl Engine {
             if !name.is_empty() {
                 contact.state.name = name;
             }
-            if let Err(e) = inner.save_state().await {
+            if let Err(e) = inner.save(&[]).await {
                 let _ = inner.roll_back(&peer, snapshot);
                 return Err(StartChatError::Other(describe(&e)));
             }
@@ -1445,7 +1528,12 @@ impl Engine {
             peer_state.approve_classical_exception();
         }
 
-        let hello = Kind::Hello(inner.client.make_hello(inner.state.name.clone(), 1));
+        let initial_session_seq = inner.next_new_chat_session_seq();
+        let hello = Kind::Hello(
+            inner
+                .client
+                .make_hello(inner.state.name.clone(), initial_session_seq),
+        );
         // The chat's first message, at its first place.
         let mut greeting = hello.to_bytes();
         stamp(&mut greeting, 1);
@@ -1533,11 +1621,16 @@ impl Engine {
                 ..ContactState::default()
             },
         });
+        let prev_next_session_seq = inner.state.next_session_seq;
+        inner.state.next_session_seq = initial_session_seq
+            .saturating_add(1)
+            .min(session::protocol::MAX_SAFE_INTEGER);
         let record = (history_key(&peer, 0), entry);
         // H-2: Persist the newly created session BEFORE transmitting the initial message!
         if let Err(e) = inner.save(std::slice::from_ref(&record)).await {
             inner.contacts.pop();
             inner.state.farewells = saved_farewells;
+            inner.state.next_session_seq = prev_next_session_seq;
             return Err(StartChatError::Other(describe(&e)));
         }
         // Recheck cancellation after IndexedDB persistence: roll back the never-announced contact

@@ -73,9 +73,9 @@ pub(super) fn initials(label: &str) -> String {
 /// A file's extension, lowercase, for its card; `file` if it has none.
 pub(super) fn extension(name: &str) -> String {
     name.rsplit_once('.')
-        .map_or("file".to_string(), |(_, extension)| {
-            extension.to_lowercase()
-        })
+        .map(|(_, extension)| extension)
+        .filter(|extension| !extension.is_empty())
+        .map_or_else(|| "file".to_string(), str::to_lowercase)
 }
 
 /// Run `action`, telling what went wrong.
@@ -224,12 +224,9 @@ pub(super) fn send(peer: PublicKey, content: content::Kind) {
     engine().queue(Sending::Content(peer, content));
 }
 
-/// Send `files` to the open chat, in their order, after what was sent before them: the small
+/// Send `files` to `peer`, in their order, after what was sent before them: the small
 /// ones in their messages, the others as attachments.
-pub(super) fn send_files(files: FileList) {
-    let Some(peer) = ui().open.get_untracked() else {
-        return;
-    };
+pub(super) fn send_files_to(peer: PublicKey, files: FileList) {
     let engine = engine();
     for file in (0..files.length()).filter_map(|i| files.get(i)) {
         engine.queue(Sending::File(peer, file));

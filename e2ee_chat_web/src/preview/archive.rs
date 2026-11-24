@@ -256,7 +256,7 @@ pub(super) fn tar(reader: impl Read, limit: u64) -> Option<Listing> {
         let entry = entry.ok().and_then(|entry| {
             Some(Entry {
                 path: entry.path().ok()?.to_string_lossy().into_owned(),
-                size: entry.header().size().ok()?,
+                size: entry.size(),
                 directory: entry.header().entry_type().is_dir(),
             })
         });

@@ -130,11 +130,7 @@ pub fn pq_opk_signing_input(suite: u8, ek: &[u8]) -> Vec<u8> {
 
 /// Signs a last-resort PQSPK encapsulation key with `identity` under the `pqxdh.v1/pqspk\0`
 /// domain separator, after checking that `ek.len()` matches `suite.ek_len()`.
-pub fn sign_pq_spk(
-    identity: &XEdDSAPrivateKey,
-    suite: PqSuite,
-    ek: &[u8],
-) -> Result<Signature> {
+pub fn sign_pq_spk(identity: &XEdDSAPrivateKey, suite: PqSuite, ek: &[u8]) -> Result<Signature> {
     if ek.len() != suite.ek_len() {
         return Err(ErrorKind::InvalidPublicKey.into());
     }
@@ -143,11 +139,7 @@ pub fn sign_pq_spk(
 
 /// Signs a one-time PQOPK encapsulation key with `identity` under the `pqxdh.v1/pqopk\0`
 /// domain separator, after checking that `ek.len()` matches `suite.ek_len()`.
-pub fn sign_pq_opk(
-    identity: &XEdDSAPrivateKey,
-    suite: PqSuite,
-    ek: &[u8],
-) -> Result<Signature> {
+pub fn sign_pq_opk(identity: &XEdDSAPrivateKey, suite: PqSuite, ek: &[u8]) -> Result<Signature> {
     if ek.len() != suite.ek_len() {
         return Err(ErrorKind::InvalidPublicKey.into());
     }

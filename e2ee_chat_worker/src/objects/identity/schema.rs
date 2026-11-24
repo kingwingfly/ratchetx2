@@ -189,8 +189,11 @@ impl Identity {
 
     /// Explicit orphan cleanup for `initial_messages_pq` (no reliance on SQLite foreign_keys).
     pub(super) fn cleanup_orphan_pq_initials(&self) -> Result<()> {
-        let sql = self.sql();
-        if has_table(&sql, "initial_messages_pq")? {
+        Self::cleanup_orphan_pq_initials_sql(&self.sql())
+    }
+
+    pub(super) fn cleanup_orphan_pq_initials_sql(sql: &SqlStorage) -> Result<()> {
+        if has_table(sql, "initial_messages_pq")? {
             sql.exec(
                 "DELETE FROM initial_messages_pq \
                  WHERE NOT EXISTS (SELECT 1 FROM initial_messages WHERE id = initial_messages_pq.initial_message_id)",

@@ -232,20 +232,57 @@ pub fn kind(name: &str, mime: &str, data: &[u8]) -> Kind {
         },
         "csv" => Kind::Table(structured::table(text, b',')),
         "tsv" => Kind::Table(structured::table(text, b'\t')),
-        "json" => {
-            let pretty = serde_json::from_str::<serde_json::Value>(text)
-                .and_then(|value| serde_json::to_string_pretty(&value));
-            code(
-                pretty.unwrap_or_else(|_| text.to_string()),
-                language::named("json"),
-            )
-        }
+        "json" => code(
+            pretty_json_bounded(text).unwrap_or_else(|| text.to_string()),
+            language::named("json"),
+        ),
         "diff" | "patch" => Kind::Diff(structured::diff(text)),
         "vcf" | "vcard" => Kind::Cards(structured::contacts(text)),
         "ics" | "ical" => Kind::Cards(structured::events(text)),
         // An SVG image showed already, as `sniff` found it; any other `.svg` shows as XML.
         _ => code(text.to_string(), language::of_file(name)),
     }
+}
+
+/// Maximum raw JSON input size pretty-printed on the main thread (keeps both the parsed DOM tree
+/// and indented output strictly bounded).
+const JSON_PRETTY_INPUT_MAX: usize = 256 * 1024;
+
+/// Pretty-print `text` as JSON when small enough and when the indented output stays within
+/// [`TEXT_MAX`], preventing deeply nested JSON from amplifying memory on the UI thread.
+fn pretty_json_bounded(text: &str) -> Option<String> {
+    use std::io::Write as _;
+
+    struct BoundedVec {
+        buf: Vec<u8>,
+        max: usize,
+    }
+
+    impl std::io::Write for BoundedVec {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if self.buf.len().saturating_add(data.len()) > self.max {
+                return Err(std::io::Error::other("pretty JSON exceeds TEXT_MAX"));
+            }
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    if text.len() > JSON_PRETTY_INPUT_MAX {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let mut writer = BoundedVec {
+        buf: Vec::with_capacity(text.len().min(64 * 1024)),
+        max: TEXT_MAX,
+    };
+    serde_json::to_writer_pretty(&mut writer, &value).ok()?;
+    writer.flush().ok()?;
+    String::from_utf8(writer.buf).ok()
 }
 
 /// `text`, highlighted as `language`, unless it is too long for that.

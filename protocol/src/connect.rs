@@ -271,7 +271,9 @@ pub struct Response {
     pub body: Vec<u8>,
 }
 
-fn check_content_type(content_type: Option<&str>) -> Option<Response> {
+/// Validate the Connect request `Content-Type` header (`application/proto`), returning a
+/// `415 Unsupported Media Type` error response before buffering the body if it does not match.
+pub fn check_content_type(content_type: Option<&str>) -> Option<Response> {
     let essence = content_type.and_then(|content_type| content_type.split(';').next());
     if !essence.is_some_and(|essence| essence.trim().eq_ignore_ascii_case(CONTENT_TYPE)) {
         return Some(Response {

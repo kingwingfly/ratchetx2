@@ -92,6 +92,7 @@ struct Running {
 struct Calls {
     pending: RefCell<HashMap<u32, (Function, Function)>>,
     next: Cell<u32>,
+    stopped: RefCell<Option<String>>,
 }
 
 impl Calls {
@@ -112,6 +113,12 @@ impl Calls {
     }
 
     fn fail_all(&self, reason: &str) {
+        {
+            let mut stopped = self.stopped.borrow_mut();
+            if stopped.is_none() {
+                *stopped = Some(reason.to_string());
+            }
+        }
         let pending: Vec<_> = self.pending.borrow_mut().drain().collect();
         for (_, (_, reject)) in pending {
             let _ = reject.call1(&JsValue::NULL, &reason.into());
@@ -181,8 +188,17 @@ fn stop(kind: Worker, calls: &Rc<Calls>, reason: &str) {
         Rc::ptr_eq(&current.calls, calls).then(|| running.remove(&kind))?
     });
     if let Some(stopped) = stopped {
+        stopped.worker.set_onmessage(None);
+        stopped.worker.set_onerror(None);
         stopped.worker.terminate();
-        stopped.calls.fail_all(reason);
+    }
+    calls.fail_all(reason);
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.worker.set_onmessage(None);
+        self.worker.set_onerror(None);
     }
 }
 
@@ -222,6 +238,17 @@ async fn call(
         JsFuture::from(running.ready.clone())
             .await
             .map_err(failure)?;
+    }
+    if let Some(reason) = running.calls.stopped.borrow().clone() {
+        return Err(reason);
+    }
+    let still_running = RUNNING.with(|all| {
+        all.borrow()
+            .get(&kind)
+            .is_some_and(|current| Rc::ptr_eq(&current.calls, &running.calls))
+    });
+    if !still_running {
+        return Err("the preview restarted: open the file again".to_string());
     }
     let (id, answer) = running.calls.add();
     let payload: WirePayload = encode_request_frame(id, request);

@@ -135,15 +135,35 @@ fn content_lines(text: &str) -> Vec<(String, String)> {
         .filter_map(|line| {
             let (name, value) = line.split_once(':')?;
             let name = name.split(';').next()?.trim().to_uppercase();
-            let value = value
-                .replace("\\n", "\n")
-                .replace("\\N", "\n")
-                .replace("\\,", ",")
-                .replace("\\;", ";")
-                .replace("\\\\", "\\");
+            let value = unescape_content_value(value);
             Some((name, value))
         })
         .collect()
+}
+
+/// Unescape RFC 5545 / RFC 6350 backslash sequences in a single pass so `\\n` becomes `\n`
+/// (literal backslash + `n`) rather than a backslash followed by a newline.
+fn unescape_content_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n' | 'N') => out.push('\n'),
+                Some(',') => out.push(','),
+                Some(';') => out.push(';'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// The contacts of the vCard file `text`.

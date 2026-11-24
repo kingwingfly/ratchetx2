@@ -24,9 +24,10 @@ pub const MAX_DELIVERED: usize = 1000;
 /// Maximum encrypted header size in bytes (8 KiB: fits encrypted PQ ratchet headers while
 /// preventing Durable Object OOM / queue bricking).
 pub const MAX_HEADER_SIZE: usize = 8 << 10;
-/// Maximum encoded carried initial message size in bytes (8 KiB: fits PQXDH initial messages
-/// while preventing Durable Object OOM / queue bricking).
-pub const MAX_INITIAL_MESSAGE_SIZE: usize = 8 << 10;
+/// Maximum encoded carried initial message size in bytes (12 KiB: accommodates
+/// `HandshakeV2Limits::max_first_message_size` (8 KiB) plus ML-KEM-1024 `InitialMessageV2`
+/// framing while preventing Durable Object OOM / queue bricking).
+pub const MAX_INITIAL_MESSAGE_SIZE: usize = 12 << 10;
 
 #[allow(deprecated)]
 mod legacy_trait {

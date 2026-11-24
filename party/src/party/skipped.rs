@@ -221,6 +221,48 @@ where
     }
 }
 
+#[cfg(feature = "serde")]
+fn deserialize_unique_message_keys<'de, D>(
+    deserializer: D,
+) -> core::result::Result<BTreeMap<u64, MessageKey>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct KeyMapGuard(BTreeMap<u64, MessageKey>);
+    impl Drop for KeyMapGuard {
+        fn drop(&mut self) {
+            for key in self.0.values_mut() {
+                key.zeroize();
+            }
+        }
+    }
+    struct UniqueKeysVisitor;
+    impl<'de> serde::de::Visitor<'de> for UniqueKeysVisitor {
+        type Value = BTreeMap<u64, MessageKey>;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("a map of unique message numbers to message keys")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> core::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut guard = KeyMapGuard(BTreeMap::new());
+            while let Some((number, value)) = map.next_entry::<u64, MessageKey>()? {
+                let mut value = Zeroizing::new(value);
+                if guard.0.contains_key(&number) {
+                    value.zeroize();
+                    return Err(serde::de::Error::custom("duplicate skipped message number"));
+                }
+                guard.0.insert(number, *value);
+            }
+            Ok(core::mem::take(&mut guard.0))
+        }
+    }
+    deserializer.deserialize_map(UniqueKeysVisitor)
+}
+
 /// The message keys skipped in one of the peer's chains.
 #[cfg_attr(test, derive(Debug, Clone, PartialEq))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -231,6 +273,10 @@ where
 pub(super) struct SkippedChain {
     header_key: HeaderKey,
     /// By message number, so the oldest comes first.
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_unique_message_keys")
+    )]
     keys: BTreeMap<u64, MessageKey>,
     /// Number of the peer's chains received after this one.
     age: usize,
@@ -453,7 +499,11 @@ impl SkippedKeys {
 #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
 pub(super) trait SkippedState {
     fn is_empty(&self) -> bool;
-    fn validate(&self, current_receiver: Option<(&HeaderKey, u64)>) -> Result<()>;
+    fn validate(
+        &self,
+        current_receiver: Option<(&HeaderKey, u64)>,
+        next_receiver: Option<&HeaderKey>,
+    ) -> Result<()>;
 }
 
 // Borrow keys in place so validation never needs to copy secret key material.
@@ -469,6 +519,7 @@ struct ChainView<'a, N, E> {
 fn validate_chains<'a, N: ExactSizeIterator<Item = u64>, E: EvictionState + 'a>(
     chains: impl ExactSizeIterator<Item = ChainView<'a, N, E>>,
     current_receiver: Option<(&HeaderKey, u64)>,
+    next_receiver: Option<&HeaderKey>,
 ) -> Result<()> {
     if chains.len() > MAX_SKIPPED_CHAINS {
         return Err(ErrorKind::MalformedState.into());
@@ -476,12 +527,13 @@ fn validate_chains<'a, N: ExactSizeIterator<Item = u64>, E: EvictionState + 'a>(
     let mut seen: Vec<&HeaderKey> = Vec::with_capacity(chains.len());
     let mut previous_age = MAX_SKIPPED_CHAINS;
     let mut remaining = SKIP_MAX;
-    for mut chain in chains {
+    for chain in chains {
         let count = chain.numbers.len() as u64;
         if count == 0
             || count > remaining
             || chain.age >= MAX_SKIPPED_CHAINS
-            || chain.age > previous_age
+            || chain.age >= previous_age
+            || next_receiver.is_some_and(|key| bool::from(key.ct_eq(chain.header_key)))
             || seen
                 .iter()
                 .any(|key| bool::from(key.ct_eq(chain.header_key)))
@@ -495,10 +547,21 @@ fn validate_chains<'a, N: ExactSizeIterator<Item = u64>, E: EvictionState + 'a>(
         let bound = current_receiver
             .filter(|(key, _)| bool::from(key.ct_eq(chain.header_key)))
             .map(|(_, next)| next);
-        if let Some(next) = bound
-            && (chain.age != 0 || chain.numbers.any(|number| number >= next))
-        {
+        if bound.is_some() {
+            if chain.age != 0 {
+                return Err(ErrorKind::MalformedState.into());
+            }
+        } else if current_receiver.is_some() && chain.age == 0 {
             return Err(ErrorKind::MalformedState.into());
+        }
+        let mut prev_number: Option<u64> = None;
+        for number in chain.numbers {
+            if prev_number.is_some_and(|prev| number <= prev)
+                || bound.is_some_and(|next| number >= next)
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+            prev_number = Some(number);
         }
         chain.evicted.validate(bound)?;
     }
@@ -511,7 +574,11 @@ impl SkippedState for SkippedKeys {
         self.chains.is_empty()
     }
 
-    fn validate(&self, current_receiver: Option<(&HeaderKey, u64)>) -> Result<()> {
+    fn validate(
+        &self,
+        current_receiver: Option<(&HeaderKey, u64)>,
+        next_receiver: Option<&HeaderKey>,
+    ) -> Result<()> {
         validate_chains(
             self.chains.iter().map(|c| ChainView {
                 header_key: &c.header_key,
@@ -520,6 +587,7 @@ impl SkippedState for SkippedKeys {
                 evicted: &c.evicted,
             }),
             current_receiver,
+            next_receiver,
         )
     }
 }
@@ -527,21 +595,39 @@ impl SkippedState for SkippedKeys {
 // Before eviction tracking, each skipped chain had exactly three positional fields.
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
+struct LegacySkippedChain(
+    HeaderKey,
+    #[serde(deserialize_with = "deserialize_unique_message_keys")] BTreeMap<u64, MessageKey>,
+    usize,
+);
+
+#[cfg(feature = "serde")]
+impl Drop for LegacySkippedChain {
+    fn drop(&mut self) {
+        self.0.zeroize();
+        for key in self.1.values_mut() {
+            key.zeroize();
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
 pub(super) struct LegacySkippedKeys {
-    chains: VecDeque<(HeaderKey, BTreeMap<u64, MessageKey>, usize)>,
+    chains: VecDeque<LegacySkippedChain>,
 }
 
 #[cfg(feature = "serde")]
 impl From<LegacySkippedKeys> for SkippedKeys {
-    fn from(old: LegacySkippedKeys) -> Self {
+    fn from(mut old: LegacySkippedKeys) -> Self {
         Self {
             chains: old
                 .chains
-                .into_iter()
-                .map(|(header_key, keys, age)| SkippedChain {
-                    header_key,
-                    keys,
-                    age,
+                .iter_mut()
+                .map(|chain| SkippedChain {
+                    header_key: chain.0,
+                    keys: core::mem::take(&mut chain.1),
+                    age: chain.2,
                     evicted: EvictedSet::default(),
                 })
                 .collect(),
@@ -562,7 +648,7 @@ impl TryFrom<SkippedKeysUnchecked> for SkippedKeys {
 
     fn try_from(raw: SkippedKeysUnchecked) -> Result<Self> {
         let skipped = Self { chains: raw.chains };
-        skipped.validate(None)?;
+        skipped.validate(None, None)?;
         Ok(skipped)
     }
 }
@@ -573,7 +659,11 @@ impl SkippedState for ArchivedSkippedKeys {
         self.chains.is_empty()
     }
 
-    fn validate(&self, current_receiver: Option<(&HeaderKey, u64)>) -> Result<()> {
+    fn validate(
+        &self,
+        current_receiver: Option<(&HeaderKey, u64)>,
+        next_receiver: Option<&HeaderKey>,
+    ) -> Result<()> {
         validate_chains(
             self.chains.iter().map(|c| ChainView {
                 header_key: &c.header_key,
@@ -582,6 +672,7 @@ impl SkippedState for ArchivedSkippedKeys {
                 evicted: &c.evicted,
             }),
             current_receiver,
+            next_receiver,
         )
     }
 }
@@ -594,7 +685,7 @@ where
 {
     fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
         use rkyv::rancor::Source;
-        self.validate(None).map_err(C::Error::new)
+        self.validate(None, None).map_err(C::Error::new)
     }
 }
 
@@ -685,29 +776,29 @@ mod state {
                 }
             }
 
-            let mut decoded = VecDeque::with_capacity(chains.len());
+            let mut skipped = Self {
+                chains: VecDeque::with_capacity(chains.len()),
+            };
             for chain in chains {
-                let header_key = key(&chain.header_key)?;
-                let age = usize::try_from(chain.age).map_err(|_| ErrorKind::MalformedState)?;
-                let evicted = EvictedSet::from_proto(&chain.evicted, chain.evicted_below)?;
-                let mut keys = BTreeMap::new();
+                let mut decoded_chain = SkippedChain {
+                    header_key: key(&chain.header_key)?,
+                    keys: BTreeMap::new(),
+                    age: usize::try_from(chain.age).map_err(|_| ErrorKind::MalformedState)?,
+                    evicted: EvictedSet::from_proto(&chain.evicted, chain.evicted_below)?,
+                };
                 for message_key in &chain.message_keys {
-                    if keys
-                        .insert(message_key.message_number, key(&message_key.key)?)
-                        .is_some()
+                    let next_key = zeroize::Zeroizing::new(key(&message_key.key)?);
+                    if let Some(mut duplicate) = decoded_chain
+                        .keys
+                        .insert(message_key.message_number, *next_key)
                     {
+                        zeroize::Zeroize::zeroize(&mut duplicate);
                         return Err(ErrorKind::MalformedState.into());
                     }
                 }
-                decoded.push_back(SkippedChain {
-                    header_key,
-                    keys,
-                    age,
-                    evicted,
-                });
+                skipped.chains.push_back(decoded_chain);
             }
-            let skipped = Self { chains: decoded };
-            skipped.validate(None)?;
+            skipped.validate(None, None)?;
             Ok(skipped)
         }
     }
@@ -793,5 +884,62 @@ mod test {
         assert!(disjoint.contains(0));
         assert!(disjoint.contains((MAX_EVICTED_RANGES as u64 + 9) * 2));
         disjoint.validate(None).unwrap();
+    }
+
+    #[cfg(any(feature = "serde", feature = "prost"))]
+    #[test]
+    fn validate_rejects_duplicate_ages_and_non_current_age_zero() {
+        // Duplicate ages must be rejected so `next_chain` + `extend` cannot exceed MAX_SKIPPED_CHAINS.
+        let mut dup_a = chain(1, 0..1);
+        dup_a.age = 1;
+        let mut dup_b = chain(2, 0..1);
+        dup_b.age = 1;
+        let dup_skipped = SkippedKeys {
+            chains: VecDeque::from([dup_a, dup_b]),
+        };
+        assert_eq!(
+            dup_skipped.validate(None, None).unwrap_err().kind(),
+            ErrorKind::MalformedState
+        );
+
+        // Non-current chain with age == 0 must be rejected when current_receiver is present.
+        let current = [9u8; 32];
+        let next = [8u8; 32];
+        let mut non_current = chain(3, 0..1);
+        non_current.age = 0;
+        let non_current_skipped = SkippedKeys {
+            chains: VecDeque::from([non_current]),
+        };
+        assert_eq!(
+            non_current_skipped
+                .validate(Some((&current, 2)), Some(&next))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MalformedState
+        );
+
+        // Skipped chain colliding with next_header_key_receiver must be rejected.
+        let mut collides_next = chain(8, 0..1);
+        collides_next.age = 1;
+        let colliding = SkippedKeys {
+            chains: VecDeque::from([collides_next]),
+        };
+        assert_eq!(
+            colliding
+                .validate(Some((&current, 2)), Some(&next))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::MalformedState
+        );
+
+        // Strictly decreasing ages with current receiver at age == 0 succeed.
+        let mut older = chain(4, 0..1);
+        older.age = 1;
+        let mut cur_chain = chain(9, 0..1);
+        cur_chain.age = 0;
+        let valid = SkippedKeys {
+            chains: VecDeque::from([older, cur_chain]),
+        };
+        valid.validate(Some((&current, 2)), Some(&next)).unwrap();
     }
 }

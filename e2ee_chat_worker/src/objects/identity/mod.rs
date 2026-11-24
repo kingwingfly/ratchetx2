@@ -39,6 +39,7 @@ pub const DEFAULT_RETENTION_DAYS: u64 = 30;
 
 enum PendingExpiry {
     Message(u64),
+    Subscribe(u64),
     R2Retry(u64),
 }
 
@@ -365,13 +366,25 @@ impl Identity {
         } else {
             storage.get_alarm().await?
         };
+        // Fast path: when an alarm is already scheduled (`!again && existing.is_some()`), it
+        // already covers all previously stored rows, so a new message/tombstone/subscription only
+        // needs to pull the alarm earlier without scanning SQLite tables on every write.
+        if !again
+            && let Some(existing_at) = existing
+            && let Some(PendingExpiry::Message(at) | PendingExpiry::Subscribe(at)) = pending
+        {
+            if i128::from(at) < i128::from(existing_at) {
+                storage.set_alarm(alarm_at(at)).await?;
+            }
+            return Ok(());
+        }
         let sql = self.sql();
         let has_core = self.has_tables()?;
         // An outstanding R2 batch has its own retry deadline. Inline data and replay records
         // can still expire sooner, including rows inserted during the R2 await.
         let (include_objects, pending_at) = match pending {
             Some(PendingExpiry::R2Retry(at)) => (false, Some(at)),
-            Some(PendingExpiry::Message(at)) => (true, Some(at)),
+            Some(PendingExpiry::Message(at) | PendingExpiry::Subscribe(at)) => (true, Some(at)),
             None => (true, None),
         };
         let retention_at = if has_core {

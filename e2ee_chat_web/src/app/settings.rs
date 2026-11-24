@@ -102,7 +102,14 @@ pub(super) fn Settings() -> impl IntoView {
             // Always invoke `set_pq_config`: it compares against live vault state, rolls back
             // definitively refused configs, and reports durable local saves clearly.
             let outcome = engine.set_pq_config(next_pq).await?;
-            engine.ui().dialog.set(None);
+            if !busy.is_disposed()
+                && engine
+                    .ui()
+                    .dialog
+                    .with_untracked(|dialog| *dialog == Some(Dialog::Settings))
+            {
+                engine.ui().dialog.set(None);
+            }
             match outcome {
                 PqSaveOutcome::Published => engine
                     .ui()
