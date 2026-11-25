@@ -1,18 +1,15 @@
-use std::time::Duration;
-
 use leptos::{ev, html, prelude::*, task::spawn_local};
 use session::{PublicKey, safety_number};
 use wasm_bindgen_futures::JsFuture;
-use web_sys::Url;
 
 use crate::{
     content,
-    engine::{NAME_MAX, StartChatError, invitation_pins_pq, same_server, sanitize_shared_name},
-    glue::{copy, start_copy_png},
+    engine::{StartChatError, invitation_pins_pq, same_server},
+    glue::start_copy_png,
     icon::{Icon, icon},
     qr::{QUIET_ZONE, QrCode},
     state::{ClassicalPrompt, ContactView, Dialog, PendingNewChat, Phase},
-    util::{hex, key_from_text, key_to_text, short},
+    util::{NAME_MAX, hex, key_from_text, key_to_text, sanitize_shared_name, short},
 };
 
 use super::{
@@ -20,18 +17,15 @@ use super::{
     auth::{CreateVault, Elsewhere, SignInDialog, Unavailable, UnlockVault},
     chat::{contact_can_upgrade_to_pq, security_badge},
     common::{
-        AllowClassical, ContactKey, Copyable, InvitationLink, Progress, act_while,
-        can_allow_classical, cancel_active_chat_history_reservation, cancel_chat_history,
-        cancel_retained_chat_history_reservation, close_dialog, commit_chat_history,
-        default_shared_contact_name, flash_copied, initials, invitation_link,
-        is_chat_history_owned, pq_available, reserve_chat_history,
-        retain_active_chat_history_reservation, retain_chat_history, send, server_pq_disabled,
-        shareable_contacts, shared_contact_pq_pinned, strict_pq_enabled, upgrade_disabled_tip,
-        writable_recipients,
+        AllowClassical, ConfirmGuard, ContactKey, CopyButton, CopyFeedbackButton, Copyable,
+        InvitationLink, Progress, act_while, avatar_letters, can_allow_classical, close_dialog,
+        default_shared_contact_name, download_blob, flash_copied, invitation_link, pq_available,
+        send, server_pq_disabled, shareable_contacts, shared_contact_pq_pinned, strict_pq_enabled,
+        upgrade_disabled_tip, writable_recipients,
     },
     engine,
     files::FileBrowser,
-    media::blob_url,
+    history,
     settings::Settings,
     ui,
 };
@@ -72,13 +66,13 @@ pub(super) fn VaultDialog() -> impl IntoView {
             // cancel any in-flight auto-start submission; retain a pushed history slot if a
             // waiting NewChat draft is restored, otherwise unwind it back to the chat list.
             if engine().dismiss_sign_in() {
-                retain_active_chat_history_reservation();
+                history::retain_active_reservation();
                 if !event.cancelable() {
                     restored_new_chat_non_cancelable.set_value(true);
                 }
                 event.prevent_default();
             } else {
-                cancel_active_chat_history_reservation();
+                history::cancel_active_reservation();
             }
         } else if ui
             .dialog
@@ -88,7 +82,7 @@ pub(super) fn VaultDialog() -> impl IntoView {
             // on `cancel` (before the queued `close` event runs) so a late 403 in that interval
             // cannot capture the dismissed draft or reopen SignIn.
             engine().cancel_active_startup_submission();
-            cancel_active_chat_history_reservation();
+            history::cancel_active_reservation();
             ui.dialog.set(None);
         }
     };
@@ -131,7 +125,7 @@ pub(super) fn VaultDialog() -> impl IntoView {
                 if dismissed_sign_in {
                     engine().decline_sign_in_prompts();
                 }
-                cancel_active_chat_history_reservation();
+                history::cancel_active_reservation();
             }
             ui.dialog.set(None);
         }
@@ -223,29 +217,79 @@ fn apply_start_chat_error(
     }
 }
 
+/// Compute the effective `(server, pq_pinned)` metadata for `NewChat` based on whether
+/// `current_key` still matches the originally invited key (by trimmed text or decoded key bytes).
+/// Replacing the invited key clears both `server` and `pq_pinned` so unrelated peers are never
+/// falsely PQ-pinned or blocked by another invite's relay mismatch.
+pub(super) fn effective_invite_context(
+    invited_key: &str,
+    current_key: &str,
+    invited_server: Option<&str>,
+    invited_pq_pinned: bool,
+) -> (Option<String>, bool) {
+    let invited_trimmed = invited_key.trim();
+    let current_trimmed = current_key.trim();
+    let matches_invited = if invited_trimmed.is_empty() {
+        false
+    } else if current_trimmed == invited_trimmed {
+        true
+    } else {
+        match (
+            key_from_text(invited_trimmed),
+            key_from_text(current_trimmed),
+        ) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    };
+    if matches_invited {
+        (invited_server.map(str::to_string), invited_pq_pinned)
+    } else {
+        (None, false)
+    }
+}
+
 #[component]
 fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -> impl IntoView {
     let ui = ui();
-    // An invitation for another server than the vault's: the inviter's keys are not on it.
-    let elsewhere = ui.me.get_untracked().and_then(|me| {
-        server
-            .as_ref()
-            .filter(|server| !same_server(server, &me.server))
-            .map(|server| (server.clone(), me.server))
-    });
-    engine().new_chat_mounted(key.clone(), name.clone(), server.clone(), pq_pinned);
+    let initial_name = sanitize_shared_name(&name);
+    let invited_key = StoredValue::new(key.clone());
+    let invited_server = StoredValue::new(server);
+    let (init_server, init_pq_pinned) = invited_server
+        .with_value(|srv| effective_invite_context(&key, &key, srv.as_deref(), pq_pinned));
+    engine().new_chat_mounted(
+        key.clone(),
+        initial_name.clone(),
+        init_server,
+        init_pq_pinned,
+    );
     let last_key = StoredValue::new(key.clone());
     let key = RwSignal::new(key);
-    let name = RwSignal::new(name);
-    let server_saved = StoredValue::new(server);
+    let name = RwSignal::new(initial_name);
     let progress = Progress::new();
     let classical_needed = RwSignal::new(None::<bool>);
     if let Some(feedback) = engine().take_new_chat_feedback() {
         apply_start_chat_error(feedback, classical_needed, progress);
     }
+    let effective = Memo::new(move |_| {
+        let current_key = key.get();
+        invited_key.with_value(|orig_key| {
+            invited_server.with_value(|orig_server| {
+                effective_invite_context(orig_key, &current_key, orig_server.as_deref(), pq_pinned)
+            })
+        })
+    });
+    // An invitation for another server than the vault's: the inviter's keys are not on it.
+    let elsewhere = Memo::new(move |_| {
+        let (eff_server, _) = effective.get();
+        let server = eff_server?;
+        let my_server = ui.me.with(|me| me.as_ref().map(|me| me.server.clone()))?;
+        (!same_server(&server, &my_server)).then_some((server, my_server))
+    });
     Effect::new(move || {
         let current_key = key.get();
         let current_name = name.get();
+        let (eff_server, eff_pq_pinned) = effective.get();
         let key_changed = last_key.with_value(|prev| *prev != current_key);
         if key_changed {
             last_key.set_value(current_key.clone());
@@ -254,14 +298,9 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 progress.clear();
             }
         }
-        engine().new_chat_edited(
-            current_key,
-            current_name,
-            server_saved.get_value(),
-            pq_pinned,
-        );
+        engine().new_chat_edited(current_key, current_name, eff_server, eff_pq_pinned);
     });
-    let active_submit = StoredValue::new(None::<(u64, super::history::Reservation)>);
+    let active_submit = StoredValue::new(None::<(u64, history::Reservation)>);
     on_cleanup(move || {
         engine().new_chat_unmounted();
         if let Some((submit_id, reservation)) =
@@ -271,13 +310,19 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 .dialog
                 .with_untracked(|dialog| matches!(dialog, Some(Dialog::SignIn)));
             if !handed_to_sign_in {
-                let _ = cancel_chat_history(Some(reservation));
+                let _ = history::cancel_reservation(Some(reservation));
                 engine().cancel_startup_submission(submit_id);
             }
         }
     });
     let start = move |allow_classical: bool| {
         if progress.working.get_untracked() {
+            return;
+        }
+        if let Some((theirs, yours)) = elsewhere.get_untracked() {
+            progress.fail(format!(
+                "They are on {theirs}, and your vault is on {yours}: a chat cannot start here."
+            ));
             return;
         }
         classical_needed.set(None);
@@ -299,18 +344,19 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
             apply_start_chat_error(StartChatError::PqRequired, classical_needed, progress);
             return;
         }
+        let (eff_server, eff_pq_pinned) = effective.get_untracked();
         progress.start("Fetching their prekeys…");
         let engine = engine();
         let draft = PendingNewChat {
             key: raw_key,
             name: name.get_untracked(),
-            server: server_saved.get_value(),
-            pq_pinned,
+            server: eff_server,
+            pq_pinned: eff_pq_pinned,
             allow_classical,
             auto_start: true,
         };
         let submit_id = engine.begin_new_chat_submit(draft.clone());
-        let reservation = reserve_chat_history();
+        let reservation = history::reserve();
         active_submit.set_value(Some((submit_id, reservation)));
         spawn_local(async move {
             let outcome = engine
@@ -332,20 +378,20 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
             engine.finish_submission(submit_id);
             match outcome {
                 Ok(peer) => {
-                    if !cancelled && is_chat_history_owned(Some(reservation)) {
+                    if !cancelled && history::is_reservation_owned(Some(reservation)) {
                         engine.clear_pending_new_chat(submit_id);
                         engine.close_dialog_if_new_chat();
-                        commit_chat_history(Some(reservation), peer).await;
+                        history::commit_reservation(Some(reservation), peer).await;
                     }
                 }
                 Err(StartChatError::Cancelled) => {
-                    let _ = cancel_chat_history(Some(reservation));
+                    let _ = history::cancel_reservation(Some(reservation));
                     progress.clear();
                 }
                 Err(StartChatError::SignInRequired) => {
                     // Retain the gesture-pushed reserved slot across the `NewChat -> SignIn`
                     // handoff so submitting SignIn reuses it without a `history.back()` race.
-                    let still_owned = !cancelled && retain_chat_history(Some(reservation));
+                    let still_owned = !cancelled && history::retain_reservation(Some(reservation));
                     progress.clear();
                     if still_owned {
                         engine.require_sign_in_for_new_chat(submit_id, draft);
@@ -354,7 +400,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 Err(err) => {
                     // Retain the gesture-pushed reserved slot while `NewChat` stays open for a
                     // retry (e.g. "Allow classical"); closing `NewChat` unwinds it cleanly.
-                    let still_owned = !cancelled && retain_chat_history(Some(reservation));
+                    let still_owned = !cancelled && history::retain_reservation(Some(reservation));
                     let key_unchanged = key
                         .try_get_untracked()
                         .is_some_and(|current| current == draft.key);
@@ -379,26 +425,29 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 "Paste their identity key. Their prekeys come from the server, and a greeting "
                 "with your name starts the session."
             </p>
-            {pq_pinned.then(|| {
-                if local_pq_enabled {
-                    view! {
-                        <p class="pq-pin-hint">
-                            <span class="sec-badge pq">"PQ pinned"</span>
-                            " This invitation expects post-quantum encryption and will refuse classical downgrades."
-                        </p>
+            {move || {
+                let (_, eff_pq_pinned) = effective.get();
+                eff_pq_pinned.then(|| {
+                    if local_pq_enabled {
+                        view! {
+                            <p class="pq-pin-hint">
+                                <span class="sec-badge pq">"PQ pinned"</span>
+                                " This invitation expects post-quantum encryption and will refuse classical downgrades."
+                            </p>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <p class="warning">
+                                "This invitation expects post-quantum encryption, but post-quantum \
+                                 encryption is disabled or not compiled into this client; starting a \
+                                 chat here will use classical encryption only."
+                            </p>
+                        }
+                        .into_any()
                     }
-                    .into_any()
-                } else {
-                    view! {
-                        <p class="warning">
-                            "This invitation expects post-quantum encryption, but post-quantum \
-                             encryption is disabled or not compiled into this client; starting a \
-                             chat here will use classical encryption only."
-                        </p>
-                    }
-                    .into_any()
-                }
-            })}
+                })
+            }}
             <label for="peer-key">"Their identity key"</label>
             <input
                 id="peer-key"
@@ -412,18 +461,20 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
             <input
                 id="peer-name"
                 autocomplete="off"
+                maxlength=NAME_MAX
                 disabled=move || progress.working.get()
                 bind:value=name
             />
-            {elsewhere
-                .map(|(theirs, yours)| {
+            {move || {
+                elsewhere.get().map(|(theirs, yours)| {
                     view! {
-                        <p class="warning">
+                        <p class="warning" role="alert">
                             "They are on " {theirs} ", and your vault on " {yours}
                             ": a chat needs both of you on one server, so it cannot start here."
                         </p>
                     }
-                })}
+                })
+            }}
             {move || {
                 classical_needed.get().map(|peer_signed_off| {
                     let strict_pq = strict_pq_enabled(ui);
@@ -442,7 +493,9 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                                 <button
                                     type="button"
                                     class="btn small"
-                                    disabled=move || progress.working.get()
+                                    disabled=move || {
+                                        progress.working.get() || elsewhere.with(Option::is_some)
+                                    }
                                     on:click=move |_| start(true)
                                 >
                                     "Allow classical"
@@ -459,13 +512,17 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                     class="btn"
                     disabled=move || progress.working.get()
                     on:click=move |_| {
-                        cancel_retained_chat_history_reservation();
+                        history::cancel_retained_reservation();
                         close_dialog();
                     }
                 >
                     "Cancel"
                 </button>
-                <button class="btn primary" type="submit" disabled=move || progress.working.get()>
+                <button
+                    class="btn primary"
+                    type="submit"
+                    disabled=move || progress.working.get() || elsewhere.with(Option::is_some)
+                >
                     "Start"
                 </button>
             </div>
@@ -515,7 +572,7 @@ fn Identity() -> impl IntoView {
                 "invitation link. Both are public: only this browser can answer."
             </p>
             <label>"Identity key"</label>
-            <Copyable text=key_to_text(&me.key) what="your key" />
+            <Copyable text=Signal::stored(key_to_text(&me.key)) what="your key" />
             <label>"Invitation link"</label>
             <InvitationLink from_identity=true />
             <label for="my-name">"Your name, which new chats see"</label>
@@ -558,7 +615,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     let is_quarantined = move || live_contact().is_some_and(|c| c.is_quarantined());
     let strict_pq = Memo::new(move |_| strict_pq_enabled(ui));
     let name = RwSignal::new(if contact.request {
-        contact.hello_name.clone()
+        sanitize_shared_name(&contact.hello_name)
     } else {
         contact.name.clone()
     });
@@ -568,18 +625,21 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
     Effect::new(move |_| {
         if let Some(c) = live_contact()
             && c.request
-            && !c.hello_name.is_empty()
             && !name_edited.get_untracked()
             && name.get_untracked().is_empty()
         {
-            name.set(c.hello_name);
+            let clean = sanitize_shared_name(&c.hello_name);
+            if !clean.is_empty() {
+                name.set(clean);
+            }
         }
     });
-    let confirm_delete = RwSignal::new(false);
+    let confirm_delete = ConfirmGuard::new();
     // Saving, accepting or deleting, which its buttons wait for.
     let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
+        confirm_delete.disarm();
         let req = is_request();
         if req && is_quarantined() {
             ui.notify(if strict_pq.get_untracked() {
@@ -609,14 +669,13 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         });
     };
     let delete = move |_| {
-        if !confirm_delete.get_untracked() {
-            confirm_delete.set(true);
+        if !confirm_delete.confirm_or_arm() {
             return;
         }
         let engine = engine();
         act_while(busy, async move {
             engine.delete(peer).await?;
-            super::history::forget_peer(peer);
+            history::forget_peer(peer);
             if !busy.is_disposed()
                 && engine
                     .ui()
@@ -629,10 +688,14 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         });
     };
     let intro = move || match live_contact() {
-        Some(c) if c.request => match c.hello_name.as_str() {
-            "" => format!("{} wants to chat.", short(&peer)),
-            hello => format!("{} wants to chat, and goes by “{hello}”.", short(&peer)),
-        },
+        Some(c) if c.request => {
+            let hello = sanitize_shared_name(&c.hello_name);
+            if hello.is_empty() {
+                format!("{} wants to chat.", short(&peer))
+            } else {
+                format!("{} wants to chat, and goes by “{hello}”.", short(&peer))
+            }
+        }
         Some(c) => format!("Your chat with {}.", c.label()),
         None => String::new(),
     };
@@ -724,6 +787,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             <input
                 id="contact-name"
                 autocomplete="off"
+                maxlength=NAME_MAX
                 bind:value=name
                 on:input=move |_| name_edited.set(true)
             />
@@ -734,7 +798,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                     disabled=move || busy.get()
                     on:click=delete
                 >
-                    {move || match (confirm_delete.get(), is_request()) {
+                    {move || match (confirm_delete.is_armed(), is_request()) {
                         (false, true) => "Delete request",
                         (false, false) => "Delete chat",
                         (true, _) => "Delete it and its history?",
@@ -863,14 +927,6 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
         ));
     };
 
-    let avatar_letters = |contact: &ContactView| {
-        if contact.name.is_empty() {
-            hex(&contact.peer[..1])
-        } else {
-            initials(&contact.name)
-        }
-    };
-
     let title = if from_contact_info {
         "Share contact"
     } else {
@@ -904,7 +960,7 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
             <p>{intro}</p>
             {move || {
                 subject.and_then(|peer| ui.contact(&peer)).map(|contact| {
-                    let letters = avatar_letters(&contact);
+                    let letters = avatar_letters(&contact.name, &contact.peer);
                     let pq = shared_contact_pq_pinned(&contact, server_pq_disabled(ui));
                     view! {
                         <div class="share-preview">
@@ -961,7 +1017,7 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
                                     {move || {
                                         live.with(|c| {
                                             c.as_ref()
-                                                .map(avatar_letters)
+                                                .map(|c| avatar_letters(&c.name, &c.peer))
                                                 .unwrap_or_else(|| hex(&peer[..1]))
                                         })
                                     }}
@@ -1059,26 +1115,10 @@ fn InviteQr(from_identity: bool) -> impl IntoView {
         let current = link.get();
         (!current.is_empty()).then(|| QrCode::encode_text(&current))
     });
-    let has_qr = move || qr.with(|code| matches!(code, Some(Ok(_))));
-    let copied_link_gen = RwSignal::new(0u32);
+    let has_qr = Signal::derive(move || qr.with(|code| matches!(code, Some(Ok(_)))));
+    let link_empty = Signal::derive(move || link.with(String::is_empty));
     let copied_image_gen = RwSignal::new(0u32);
     let download_anchor = NodeRef::<html::A>::new();
-
-    let on_copy_link = move |_| {
-        let text = link.get_untracked();
-        if text.is_empty() {
-            return;
-        }
-        spawn_local(async move {
-            if !copy(&text).await {
-                ui.notify(
-                    "The browser would not copy your invitation link; copy it from Your identity instead.",
-                );
-                return;
-            }
-            flash_copied(copied_link_gen).await;
-        });
-    };
 
     let on_copy_image = move |_| {
         let Some(png) = qr.with_untracked(|code| match code {
@@ -1104,30 +1144,15 @@ fn InviteQr(from_identity: bool) -> impl IntoView {
     };
 
     let on_download = move |_| {
-        let Some(anchor) = download_anchor.try_get_untracked().flatten() else {
-            return;
-        };
         let Some(png) = qr.with_untracked(|code| match code {
             Some(Ok(code)) => Some(code.to_export_png()),
             _ => None,
         }) else {
             return;
         };
-        let Some(url) = blob_url(&png, "image/png") else {
+        if !download_blob(&png, "image/png", "ratchetx2-invite.png", download_anchor) {
             ui.notify("Could not prepare the QR code image for download.");
-            return;
-        };
-        anchor.set_href(&url);
-        anchor.set_download("ratchetx2-invite.png");
-        anchor.click();
-        let _ = anchor.remove_attribute("href");
-        let _ = anchor.remove_attribute("download");
-        set_timeout(
-            move || {
-                let _ = Url::revoke_object_url(&url);
-            },
-            Duration::from_secs(60),
-        );
+        }
     };
 
     view! {
@@ -1182,30 +1207,23 @@ fn InviteQr(from_identity: bool) -> impl IntoView {
                 }}
             </div>
             <div class="qr-actions">
+                <CopyButton
+                    text=link.into()
+                    what="your invitation link"
+                    failure_notice="The browser would not copy your invitation link; copy it from Your identity instead."
+                    label=("Copy link", "Copied link")
+                    disabled=Some(link_empty)
+                />
+                <CopyFeedbackButton
+                    copied_gen=copied_image_gen
+                    label=Some(("Copy image", "Copied image"))
+                    disabled=Some(Signal::derive(move || !has_qr.get()))
+                    on_click=on_copy_image
+                />
                 <button
                     type="button"
                     class="btn small"
-                    class:done=move || copied_link_gen.get() != 0
-                    disabled=move || link.with(String::is_empty)
-                    on:click=on_copy_link
-                >
-                    {move || icon(if copied_link_gen.get() != 0 { Icon::Tick } else { Icon::Copy })}
-                    {move || if copied_link_gen.get() != 0 { "Copied link" } else { "Copy link" }}
-                </button>
-                <button
-                    type="button"
-                    class="btn small"
-                    class:done=move || copied_image_gen.get() != 0
-                    disabled=move || !has_qr()
-                    on:click=on_copy_image
-                >
-                    {move || icon(if copied_image_gen.get() != 0 { Icon::Tick } else { Icon::Copy })}
-                    {move || if copied_image_gen.get() != 0 { "Copied image" } else { "Copy image" }}
-                </button>
-                <button
-                    type="button"
-                    class="btn small"
-                    disabled=move || !has_qr()
+                    disabled=move || !has_qr.get()
                     on:click=on_download
                 >
                     {icon(Icon::Download)}

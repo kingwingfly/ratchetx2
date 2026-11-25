@@ -1533,9 +1533,34 @@ impl ChatHistory {
     }
 }
 
+fn fallback_session_bytes(now_ms: u64, mono_ms: u64, counter: u64) -> [u8; 8] {
+    let mut z = now_ms
+        .wrapping_add(mono_ms.rotate_left(21))
+        .wrapping_add(counter.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    if z == 0 {
+        z = 1;
+    }
+    z.to_le_bytes()
+}
+
 fn random_session_id() -> String {
+    use std::cell::Cell;
+    thread_local! {
+        static FALLBACK_SEQ: Cell<u64> = const { Cell::new(0) };
+    }
     let mut bytes = [0u8; 8];
-    let _ = getrandom::fill(&mut bytes);
+    if getrandom::fill(&mut bytes).is_err() || bytes == [0u8; 8] {
+        let seq = FALLBACK_SEQ.with(|c| {
+            let next = c.get().wrapping_add(1);
+            c.set(next);
+            next
+        });
+        bytes = fallback_session_bytes(crate::util::now(), crate::util::monotonic_now_ms(), seq);
+    }
     hex(&bytes)
 }
 
