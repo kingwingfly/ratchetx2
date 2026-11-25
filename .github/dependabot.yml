@@ -6,9 +6,15 @@ updates:
       interval: "monthly"
     groups:
       dev-dependencies:
+        dependency-type: "development"
         applies-to: version-updates
         patterns:
           - "*"
+
+  - package-ecosystem: "npm"
+    directory: "/e2ee_chat_worker"
+    schedule:
+      interval: "monthly"
 
   - package-ecosystem: "github-actions"
     directory: "/"
