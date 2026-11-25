@@ -369,6 +369,11 @@ where
             self,
             mut seq: A,
         ) -> core::result::Result<Vec<T>, A::Error> {
+            if let Some(hint) = seq.size_hint()
+                && hint > MAX
+            {
+                return Err(serde::de::Error::invalid_length(hint, &self));
+            }
             let cap = seq.size_hint().unwrap_or(0).min(MAX);
             let mut out = Vec::with_capacity(cap);
             while let Some(item) = seq.next_element::<T>()? {
@@ -408,12 +413,19 @@ where
             self,
             mut seq: A,
         ) -> core::result::Result<BTreeSet<T>, A::Error> {
+            if let Some(hint) = seq.size_hint()
+                && hint > MAX
+            {
+                return Err(serde::de::Error::invalid_length(hint, &self));
+            }
             let mut out = BTreeSet::new();
             while let Some(item) = seq.next_element::<T>()? {
-                if out.len() >= MAX && !out.contains(&item) {
+                if out.len() >= MAX {
                     return Err(serde::de::Error::invalid_length(MAX + 1, &self));
                 }
-                out.insert(item);
+                if !out.insert(item) {
+                    return Err(serde::de::Error::custom("duplicate entry in bounded set"));
+                }
             }
             Ok(out)
         }
@@ -2364,11 +2376,22 @@ mod test {
         assert!(serde_json::from_value::<LocalPrekeys>(bad_spk).is_err());
 
         // Non-canonical confirmed EK fails.
-        let mut bad_ek = val;
+        let mut bad_ek = val.clone();
         let mut ek = [0u8; 32];
         ek[31] = 0x80;
         bad_ek["generations"][0]["confirmed"] = serde_json::json!([ek]);
         assert!(serde_json::from_value::<LocalPrekeys>(bad_ek).is_err());
+
+        // Duplicate-flood `confirmed` fails immediately (both on duplicate and on > MAX hint).
+        let valid_ek = public_key(&XEdDSAPrivateKey::generate());
+        let mut dup_ek = val.clone();
+        dup_ek["generations"][0]["confirmed"] = serde_json::json!([valid_ek, valid_ek]);
+        assert!(serde_json::from_value::<LocalPrekeys>(dup_ek).is_err());
+
+        let mut flood_ek = val;
+        flood_ek["generations"][0]["confirmed"] =
+            serde_json::json!(vec![valid_ek; MAX_CONFIRMED_PER_GENERATION + 5]);
+        assert!(serde_json::from_value::<LocalPrekeys>(flood_ek).is_err());
     }
 
     #[cfg(feature = "rkyv")]

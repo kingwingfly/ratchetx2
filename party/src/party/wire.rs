@@ -56,6 +56,11 @@ fn deserialize_bounded_ad<'de, D: Deserializer<'de>>(
             self,
             mut seq: A,
         ) -> core::result::Result<Vec<u8>, A::Error> {
+            if let Some(hint) = seq.size_hint()
+                && hint > MAX_ASSOCIATED_DATA_LEN
+            {
+                return Err(de::Error::invalid_length(hint, &self));
+            }
             let cap = seq.size_hint().unwrap_or(0).min(MAX_ASSOCIATED_DATA_LEN);
             let mut out = Vec::with_capacity(cap);
             while let Some(byte) = seq.next_element::<u8>()? {
@@ -73,6 +78,10 @@ fn deserialize_bounded_ad<'de, D: Deserializer<'de>>(
 
     deserializer.deserialize_seq(BoundedBytesVisitor)
 }
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct BoundedAd(#[serde(deserialize_with = "deserialize_bounded_ad")] Vec<u8>);
 const FIELDS: &[&str] = &[
     "version",
     "capability",
@@ -264,8 +273,8 @@ impl<'de> Deserialize<'de> for Party {
     }
 }
 
-type SixFields = (Ratchet, LegacySkippedKeys, u64, u64, u64, Vec<u8>);
-type SevenFields = (Ratchet, SkippedKeys, u64, u64, u64, Vec<u8>, EvictedSet);
+type SixFields = (Ratchet, LegacySkippedKeys, u64, u64, u64, BoundedAd);
+type SevenFields = (Ratchet, SkippedKeys, u64, u64, u64, BoundedAd, EvictedSet);
 
 /// Serde reader for the six-field classical positional format predating eviction tracking.
 ///
@@ -334,7 +343,7 @@ impl TryFrom<SevenFields> for LegacyPartyV1 {
             previous_chain_length,
             message_number_sender,
             message_number_receiver,
-            associated_data,
+            associated_data: associated_data.0,
             current_chain_evicted,
             #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
             kem_ratchet: None,
@@ -358,7 +367,7 @@ mod legacy_pq {
         u64,
         u64,
         u64,
-        Vec<u8>,
+        BoundedAd,
         EvictedSet,
         Option<LegacyKemRatchet>,
     );
@@ -401,7 +410,7 @@ mod legacy_pq {
                 previous_chain_length,
                 message_number_sender,
                 message_number_receiver,
-                associated_data,
+                associated_data: associated_data.0,
                 current_chain_evicted,
                 kem_ratchet: kem.map(|legacy| legacy.0),
             };
