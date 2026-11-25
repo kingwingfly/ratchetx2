@@ -137,9 +137,9 @@ impl QrCode {
         path
     }
 
-    /// Render the QR code as a crisp, lossless 24-bit RGB PNG with `border` quiet-zone modules and
-    /// `module_px` pixels per module (pure `#000000` modules on `#ffffff` background), streaming
-    /// one scanline at a time to keep peak WASM heap allocation minimal.
+    /// Render the QR code as a crisp, lossless 1-bit grayscale PNG with `border` quiet-zone modules
+    /// and `module_px` pixels per module (`0` = black modules, `1` = white background), streaming
+    /// one packed scanline at a time to keep peak WASM heap allocation minimal.
     fn to_png(&self, module_px: u32, border: usize) -> Vec<u8> {
         let scale = module_px.max(1) as usize;
         let total_modules = self.total_size(border);
@@ -148,7 +148,7 @@ impl QrCode {
             .expect("QR PNG dimension fits usize");
         let img_dim_u32 = u32::try_from(img_dim).expect("QR PNG dimension fits u32");
 
-        let row_bytes = 1 + img_dim * 3;
+        let row_bytes = 1 + img_dim.div_ceil(8);
         let mut white_row = vec![0xFFu8; row_bytes];
         white_row[0] = 0; // PNG filter type 0 (None)
 
@@ -165,8 +165,11 @@ impl QrCode {
             for mx in 0..self.size {
                 if self.modules[row + mx] {
                     let px_start = (mx + border) * scale;
-                    let off = 1 + px_start * 3;
-                    row_buf[off..off + scale * 3].fill(0x00);
+                    for px in px_start..px_start + scale {
+                        let byte = 1 + (px >> 3);
+                        let bit = 7 - (px & 7);
+                        row_buf[byte] &= !(1u8 << bit);
+                    }
                 }
             }
             for _ in 0..scale {
@@ -179,7 +182,7 @@ impl QrCode {
         }
 
         let idat = encoder.finish().expect("in-memory zlib finish");
-        encode_rgb_png_from_idat(img_dim_u32, img_dim_u32, &idat)
+        encode_gray1_png_from_idat(img_dim_u32, img_dim_u32, &idat)
     }
 
     /// Render a share-ready PNG scaled to roughly 512 px wide with the standard 4-module quiet zone.
@@ -664,16 +667,16 @@ impl Grid {
     }
 }
 
-/// Assemble a valid 24-bit RGB PNG image from zlib-compressed `IDAT` payload bytes.
-fn encode_rgb_png_from_idat(width: u32, height: u32, idat: &[u8]) -> Vec<u8> {
+/// Assemble a valid 1-bit grayscale PNG image from zlib-compressed `IDAT` payload bytes.
+fn encode_gray1_png_from_idat(width: u32, height: u32, idat: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(64 + idat.len());
     out.extend_from_slice(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1A, b'\n']);
 
     let mut ihdr = [0u8; 13];
     ihdr[0..4].copy_from_slice(&width.to_be_bytes());
     ihdr[4..8].copy_from_slice(&height.to_be_bytes());
-    ihdr[8] = 8; // bit depth
-    ihdr[9] = 2; // RGB truecolor
+    ihdr[8] = 1; // 1-bit depth
+    ihdr[9] = 0; // grayscale
     write_png_chunk(&mut out, *b"IHDR", &ihdr);
     write_png_chunk(&mut out, *b"IDAT", idat);
     write_png_chunk(&mut out, *b"IEND", &[]);
@@ -684,20 +687,10 @@ fn write_png_chunk(out: &mut Vec<u8>, kind: [u8; 4], data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes());
     out.extend_from_slice(&kind);
     out.extend_from_slice(data);
-    let crc = crc32(&kind, data);
-    out.extend_from_slice(&crc.to_be_bytes());
-}
-
-fn crc32(head: &[u8], body: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &byte in head.iter().chain(body.iter()) {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&kind);
+    hasher.update(data);
+    out.extend_from_slice(&hasher.finalize().to_be_bytes());
 }
 
 // ISO/IEC 18004 Table 9: ECC codewords per block, indexed by [ecc][version] (version 0 unused).

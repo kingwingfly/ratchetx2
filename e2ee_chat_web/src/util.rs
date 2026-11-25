@@ -153,8 +153,8 @@ pub fn validate_relay_url(raw: &str) -> Result<String, String> {
     if trimmed.is_empty() {
         return Err("server address is empty".to_string());
     }
-    let parsed =
-        Url::parse(trimmed).map_err(|_| "server address must be a valid https:// URL".to_string())?;
+    let parsed = Url::parse(trimmed)
+        .map_err(|_| "server address must be a valid https:// URL".to_string())?;
     let is_local_http = parsed.scheme() == "http"
         && matches!(
             parsed.host(),
@@ -421,15 +421,56 @@ pub fn describe(error: &dyn std::error::Error) -> String {
     description
 }
 
-/// Wait `millis` milliseconds.
+/// Wait `millis` milliseconds. Cancels the underlying browser timer via `clearTimeout` if the
+/// returned future is dropped early (e.g. inside `futures_util::future::select`).
 pub async fn sleep(millis: i32) {
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        web_sys::window()
-            .expect("a window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis)
-            .expect("setTimeout");
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    use std::{cell::Cell, rc::Rc};
+    use wasm_bindgen::closure::Closure;
+
+    struct TimerGuard {
+        window: web_sys::Window,
+        handle: Option<i32>,
+        _closure: Closure<dyn FnMut()>,
+    }
+
+    impl Drop for TimerGuard {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                self.window.clear_timeout_with_handle(handle);
+            }
+        }
+    }
+
+    let (tx, rx) = futures_channel::oneshot::channel::<()>();
+    let tx = Rc::new(Cell::new(Some(tx)));
+    let fired = Rc::new(Cell::new(false));
+    let closure = {
+        let tx = tx.clone();
+        let fired = fired.clone();
+        Closure::<dyn FnMut()>::new(move || {
+            fired.set(true);
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(());
+            }
+        })
+    };
+    let window = web_sys::window().expect("a window");
+    let handle = window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            millis,
+        )
+        .ok();
+    let mut guard = TimerGuard {
+        window,
+        handle,
+        _closure: closure,
+    };
+    let _ = rx.await;
+    if fired.get() {
+        guard.handle = None;
+    }
+    drop(guard);
 }
 
 /// A JavaScript error as text.
@@ -560,5 +601,73 @@ mod test {
         assert_eq!(from_hex("+a+b"), None);
         assert_eq!(percent_decode("foo%20bar"), Some("foo bar".into()));
         assert_eq!(percent_decode("foo%+a"), None);
+    }
+
+    #[test]
+    fn sanitize_shared_name_strips_unicode_format_and_controls() {
+        // BiDi RLO, ZWJ/ZWNJ, BOM, tag chars, and C0/C1 controls are removed; whitespace collapses.
+        assert_eq!(
+            sanitize_shared_name("  \u{FEFF}Ali\u{202E}ce\u{200D}\u{200C}\t\nBob\x07\x7F  "),
+            "Alice Bob"
+        );
+        assert_eq!(sanitize_shared_name("\u{E0041}\u{E0042}Eve"), "Eve");
+        let long = "a".repeat(NAME_MAX + 20);
+        assert_eq!(sanitize_shared_name(&long).chars().count(), NAME_MAX);
+    }
+
+    #[test]
+    fn sanitize_filename_blocks_bidi_separators_and_reserved_names() {
+        assert_eq!(
+            sanitize_filename("invoice_\u{202E}fdp.exe"),
+            "invoice_fdp.exe"
+        );
+        assert_eq!(sanitize_filename("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(sanitize_filename("..\\..\\evil.bat"), "_.._evil.bat");
+        assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename("nul"), "_nul");
+        assert_eq!(sanitize_filename("lpt9.pdf"), "_lpt9.pdf");
+        assert_eq!(sanitize_filename("...   \u{202E}\x00 ..."), "file");
+        let long = format!("{}.pdf", "x".repeat(250));
+        let sanitized = sanitize_filename(&long);
+        assert!(sanitized.chars().count() <= 200);
+        assert!(sanitized.ends_with(".pdf"));
+    }
+
+    #[test]
+    fn validate_relay_url_enforces_https_or_local_http_origin() {
+        assert_eq!(
+            validate_relay_url("https://Chat.Example.COM:443/").unwrap(),
+            "https://chat.example.com"
+        );
+        assert_eq!(
+            validate_relay_url("https://relay.example.com:8443").unwrap(),
+            "https://relay.example.com:8443"
+        );
+        assert_eq!(
+            validate_relay_url("http://localhost:8787/").unwrap(),
+            "http://localhost:8787"
+        );
+        assert_eq!(
+            validate_relay_url("http://127.0.0.1:8787").unwrap(),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(
+            validate_relay_url("http://[::1]:8787").unwrap(),
+            "http://[::1]:8787"
+        );
+        for bad in [
+            "",
+            "chat.example.com",
+            "http://chat.example.com",
+            "ws://localhost:8787",
+            "wss://chat.example.com",
+            "javascript:alert(1)",
+            "https://user:pass@chat.example.com",
+            "https://chat.example.com?x=1",
+            "https://chat.example.com#frag",
+            "https://chat.example.com/subpath",
+        ] {
+            assert!(validate_relay_url(bad).is_err(), "should reject {bad:?}");
+        }
     }
 }

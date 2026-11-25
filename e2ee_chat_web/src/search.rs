@@ -244,36 +244,142 @@ pub fn Search(content: NodeRef<html::Div>) -> impl IntoView {
     }
 }
 
-/// The text of `root`'s text nodes, joined, and each node with where its text starts in it, in
-/// UTF-16 code units, as the matches count.
-fn text_of(root: &Node) -> (String, Vec<(Node, u32)>) {
+/// A DOM text node together with its starting UTF-16 offset and UTF-16 length in the combined
+/// searchable text.
+struct TextSegment {
+    node: Node,
+    from: u32,
+    len: u32,
+}
+
+/// Find the logical boundary ancestor (table cell, diff line, list item, block element) of `node`
+/// within `root`, together with the separator to insert when adjacent text nodes cross it.
+fn boundary_ancestor(node: &Node, root: &Node) -> Option<(Node, char)> {
+    let mut cur = node.parent_node();
+    while let Some(parent) = cur {
+        if parent == *root {
+            break;
+        }
+        if let Some(el) = parent.dyn_ref::<web_sys::Element>() {
+            let tag = el.tag_name();
+            if matches!(tag.as_str(), "TD" | "TH" | "DT" | "DD") {
+                return Some((parent, '\t'));
+            }
+            if tag == "SPAN"
+                && el.class_name().split_whitespace().any(|c| {
+                    matches!(
+                        c,
+                        "diff-file" | "diff-hunk" | "diff-added" | "diff-removed" | "diff-context"
+                    )
+                })
+            {
+                return Some((parent, '\n'));
+            }
+            if matches!(
+                tag.as_str(),
+                "TR" | "LI"
+                    | "P"
+                    | "DIV"
+                    | "H1"
+                    | "H2"
+                    | "H3"
+                    | "H4"
+                    | "H5"
+                    | "H6"
+                    | "PRE"
+                    | "BLOCKQUOTE"
+                    | "SECTION"
+            ) {
+                return Some((parent, '\n'));
+            }
+        }
+        cur = parent.parent_node();
+    }
+    None
+}
+
+/// The text of `root`'s text nodes, joined with logical separators across table cells, diff lines,
+/// and blocks so cross-cell/cross-line false matches do not occur, and each node with its starting
+/// UTF-16 offset and UTF-16 length.
+fn text_of(root: &Node) -> (String, Vec<TextSegment>) {
     let (mut text, mut nodes, mut units) = (String::new(), Vec::new(), 0u32);
     let Ok(walker) = document().create_tree_walker_with_what_to_show(root, SHOW_TEXT) else {
         return (text, nodes);
     };
+    let mut prev_boundary: Option<Node> = None;
     while let Ok(Some(node)) = walker.next_node() {
         let data = node.node_value().unwrap_or_default();
-        nodes.push((node, units));
-        units += data.encode_utf16().count() as u32;
+        let cur_boundary = boundary_ancestor(&node, root);
+        if !nodes.is_empty() {
+            let crossed = match (&prev_boundary, &cur_boundary) {
+                (Some(prev), Some((cur, sep))) if prev != cur => Some(*sep),
+                (None, Some((_, sep))) => Some(*sep),
+                (Some(_), None) => Some('\n'),
+                _ => None,
+            };
+            if let Some(sep) = crossed
+                && !text.ends_with(['\n', '\t'])
+                && !data.starts_with(['\n', '\t'])
+            {
+                text.push(sep);
+                units = units.saturating_add(1);
+            }
+        }
+        prev_boundary = cur_boundary.map(|(n, _)| n);
+        let len = data.encode_utf16().count() as u32;
+        nodes.push(TextSegment {
+            node,
+            from: units,
+            len,
+        });
+        units = units.saturating_add(len);
         text.push_str(&data);
     }
     (text, nodes)
 }
 
+/// Map a UTF-16 match `[start, end)` onto `(first_idx, start_offset, last_idx, end_offset)` over
+/// sorted non-overlapping `(from, len)` segments, handling zero-width matches (`start == end`)
+/// cleanly at offset `0`, interior offsets, and segment boundaries without inverting `set_start` /
+/// `set_end` or underflowing.
+fn locate_range(segments: &[(u32, u32)], start: u32, end: u32) -> Option<(usize, u32, usize, u32)> {
+    if segments.is_empty() || end < start {
+        return None;
+    }
+    if start == end {
+        let first = segments
+            .partition_point(|&(from, _)| from <= start)
+            .checked_sub(1)?;
+        let (from, len) = segments[first];
+        let offset = start.checked_sub(from)?.min(len);
+        return Some((first, offset, first, offset));
+    }
+    let first = segments
+        .partition_point(|&(from, _)| from <= start)
+        .checked_sub(1)?;
+    let last = segments
+        .partition_point(|&(from, _)| from < end)
+        .checked_sub(1)?;
+    if last < first {
+        return None;
+    }
+    let (start_from, start_len) = segments[first];
+    let (end_from, end_len) = segments[last];
+    let start_offset = start.checked_sub(start_from)?.min(start_len);
+    let end_offset = end.checked_sub(end_from)?.min(end_len);
+    if first == last && end_offset < start_offset {
+        return None;
+    }
+    Some((first, start_offset, last, end_offset))
+}
+
 /// The range of the text from `start` to `end`, in UTF-16 code units of the text of `nodes`.
-fn range(nodes: &[(Node, u32)], start: u32, end: u32) -> Option<Range> {
-    // The node a match starts in, and the one it ends in, where it may end at the node's end.
-    let first = nodes
-        .partition_point(|(_, from)| *from <= start)
-        .checked_sub(1)?;
-    let last = nodes
-        .partition_point(|(_, from)| *from < end)
-        .checked_sub(1)?;
-    let (start_node, start_from) = &nodes[first];
-    let (end_node, end_from) = &nodes[last];
+fn range(nodes: &[TextSegment], start: u32, end: u32) -> Option<Range> {
+    let spans: Vec<(u32, u32)> = nodes.iter().map(|seg| (seg.from, seg.len)).collect();
+    let (first, start_off, last, end_off) = locate_range(&spans, start, end)?;
     let range = document().create_range().ok()?;
-    range.set_start(start_node, start - start_from).ok()?;
-    range.set_end(end_node, end - end_from).ok()?;
+    range.set_start(&nodes[first].node, start_off).ok()?;
+    range.set_end(&nodes[last].node, end_off).ok()?;
     Some(range)
 }
 
@@ -338,4 +444,34 @@ fn clear(ranges: StoredValue<Vec<Range>, LocalStorage>) {
     ranges.set_value(Vec::new());
     unhighlight(MATCHES);
     unhighlight(CURRENT);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::locate_range;
+
+    #[test]
+    fn zero_width_matches_do_not_drop_at_zero_or_invert_at_boundaries() {
+        // Two contiguous text nodes: [0..3) and [3..6).
+        let segs = [(0, 3), (3, 3)];
+        assert_eq!(locate_range(&segs, 0, 0), Some((0, 0, 0, 0)));
+        assert_eq!(locate_range(&segs, 2, 2), Some((0, 2, 0, 2)));
+        assert_eq!(locate_range(&segs, 3, 3), Some((1, 0, 1, 0)));
+        assert_eq!(locate_range(&segs, 6, 6), Some((1, 3, 1, 3)));
+        assert_eq!(locate_range(&segs, 4, 2), None);
+        assert_eq!(locate_range(&[], 0, 0), None);
+    }
+
+    #[test]
+    fn separated_segments_clamp_synthetic_separator_offsets() {
+        // Two diff lines or table cells separated by a 1-unit synthetic separator:
+        // seg 0 = [0..3), separator at 3, seg 1 = [4..7).
+        let segs = [(0, 3), (4, 3)];
+        assert_eq!(locate_range(&segs, 0, 3), Some((0, 0, 0, 3)));
+        assert_eq!(locate_range(&segs, 4, 7), Some((1, 0, 1, 3)));
+        // Match spanning across the synthetic separator maps cleanly to valid node offsets.
+        assert_eq!(locate_range(&segs, 2, 5), Some((0, 2, 1, 1)));
+        // Match ending on the synthetic separator clamps to the end of segment 0.
+        assert_eq!(locate_range(&segs, 1, 4), Some((0, 1, 0, 3)));
+    }
 }

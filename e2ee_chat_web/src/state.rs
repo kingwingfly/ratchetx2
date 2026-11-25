@@ -964,17 +964,25 @@ impl Ui {
 
     /// Show `text` in the notice for a few seconds.
     pub fn notify(&self, text: impl Into<String>) {
-        let id = now();
-        self.notice.set(Some((id, text.into())));
+        thread_local! {
+            static NEXT_NOTICE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        let id = NEXT_NOTICE_ID.with(|next| {
+            let id = next.get().wrapping_add(1).max(1);
+            next.set(id);
+            id
+        });
+        let _ = self.notice.try_set(Some((id, text.into())));
         #[cfg(target_arch = "wasm32")]
         {
             let notice = self.notice;
             set_timeout(
                 move || {
                     if notice
-                        .with_untracked(|notice| notice.as_ref().is_some_and(|(n, _)| *n == id))
+                        .try_with_untracked(|notice| notice.as_ref().is_some_and(|(n, _)| *n == id))
+                        == Some(true)
                     {
-                        notice.set(None);
+                        let _ = notice.try_set(None);
                     }
                 },
                 Duration::from_secs(6),

@@ -3,16 +3,20 @@
 //!
 //! Connects to `/notifications?identity=<64-hex>` and authenticates with `SubscribeRequest` in
 //! the first WebSocket binary frame (never placing signed credentials in URL query parameters),
-//! and bounds pending notification buffering against message floods.
+//! enforces auth-ack and pong liveness deadlines, caps incoming frame sizes before copying into
+//! WASM memory, and bounds pending notification buffering against message floods.
 
 use std::{
     cell::{Cell, RefCell},
     rc::Rc,
 };
 
-use futures_channel::mpsc;
-use futures_util::StreamExt;
-use js_sys::{ArrayBuffer, Uint8Array};
+use futures_channel::{mpsc, oneshot};
+use futures_util::{
+    StreamExt,
+    future::{Either, select},
+};
+use js_sys::{ArrayBuffer, JsString, Uint8Array};
 use prost::Message;
 use session::protocol::notify::{Notification, SubscribeRequest};
 use wasm_bindgen::{JsCast, closure::Closure};
@@ -25,17 +29,25 @@ const PATH: &str = "/notifications";
 /// What keeps the socket open through idle proxies, answered by the Worker without waking it,
 /// and shows the Worker it is open still.
 const PING: &str = "ping";
+/// Text frame sent by the Worker in reply to [`PING`].
+const PONG: &str = "pong";
 /// Text frame sent by the Worker immediately after verifying the first-frame `SubscribeRequest`.
 const AUTH_OK: &str = "ok";
 /// WebSocket close code sent by the Worker when the client's notification protocol is deprecated
 /// and the user must refresh/upgrade the app.
 pub const CLOSE_DEPRECATED_PROTOCOL: u16 = 4010;
+/// Milliseconds allowed for the server to acknowledge first-frame authentication with `"ok"`.
+const AUTH_TIMEOUT_MS: i32 = 15_000;
 /// Milliseconds between pings, often enough for proxies that close idle connections.
 const PING_EVERY: i32 = 60_000;
+/// Milliseconds allowed for `"pong"` after sending [`PING`] before declaring the socket dead.
+const PONG_TIMEOUT_MS: i32 = 15_000;
 /// Maximum buffered notification events before coalescing into a resync (bounds memory under flood).
 const MAX_PENDING_EVENTS: usize = 64;
 /// Maximum accepted binary notification frame size in bytes (a `Notification` is at most ~64 bytes).
 const MAX_NOTIFICATION_BYTES: usize = 1024;
+/// Maximum accepted text frame length in UTF-16 code units (valid frames are `"ok"` and `"pong"`).
+const MAX_TEXT_FRAME_UNITS: usize = 64;
 
 /// What happens on a subscription's socket.
 pub enum Event {
@@ -51,27 +63,63 @@ pub enum Event {
     Closed,
 }
 
-/// Process a text WebSocket frame against `authenticated`, returning `true` only on the first
-/// `"ok"` auth acknowledgement (so subsequent `"ok"` frames or `"pong"` frames are ignored).
-fn handle_auth_text_frame(authenticated: &Cell<bool>, text: &str) -> bool {
-    text == AUTH_OK && !authenticated.replace(true)
+/// Outcome of processing a control text frame (`"ok"` or `"pong"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextOutcome {
+    Authenticated,
+    Pong,
+    Ignored,
+}
+
+/// Process a text WebSocket frame against `authenticated` and `awaiting_pong`, enforcing
+/// [`MAX_TEXT_FRAME_UNITS`] before decoding.
+fn handle_text_frame(
+    authenticated: &Cell<bool>,
+    awaiting_pong: &Cell<bool>,
+    len_units: usize,
+    text: impl FnOnce() -> String,
+) -> TextOutcome {
+    if len_units > MAX_TEXT_FRAME_UNITS {
+        return TextOutcome::Ignored;
+    }
+    let text = text();
+    if text == AUTH_OK {
+        if !authenticated.replace(true) {
+            TextOutcome::Authenticated
+        } else {
+            TextOutcome::Ignored
+        }
+    } else if text == PONG && authenticated.get() {
+        awaiting_pong.set(false);
+        TextOutcome::Pong
+    } else {
+        TextOutcome::Ignored
+    }
 }
 
 #[derive(Default)]
 struct FrameState {
     authenticated: Cell<bool>,
+    awaiting_pong: Cell<bool>,
     open_pending: Cell<bool>,
     overflow: Cell<bool>,
     upgrade_required: RefCell<Option<String>>,
 }
 
 impl FrameState {
-    fn text(&self, tx: &mut mpsc::Sender<Event>, text: &str) {
-        if handle_auth_text_frame(&self.authenticated, text)
+    fn text(
+        &self,
+        tx: &mut mpsc::Sender<Event>,
+        len_units: usize,
+        text: impl FnOnce() -> String,
+    ) -> TextOutcome {
+        let outcome = handle_text_frame(&self.authenticated, &self.awaiting_pong, len_units, text);
+        if outcome == TextOutcome::Authenticated
             && tx.try_send(Event::Open).is_err_and(|e| e.is_full())
         {
             self.open_pending.set(true);
         }
+        outcome
     }
 
     fn binary(&self, tx: &mut mpsc::Sender<Event>, len: usize, bytes: impl FnOnce() -> Vec<u8>) {
@@ -134,6 +182,8 @@ pub struct Subscription {
     socket: WebSocket,
     events: mpsc::Receiver<Event>,
     frames: Rc<FrameState>,
+    /// Dropping this cancels the background auth-deadline & keep-alive task immediately.
+    _cancel: oneshot::Sender<()>,
     _on_open: Closure<dyn FnMut()>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_close: Closure<dyn FnMut(CloseEvent)>,
@@ -163,6 +213,10 @@ impl Subscription {
         let (sender, events) = mpsc::channel(MAX_PENDING_EVENTS);
         let sender = Rc::new(RefCell::new(Some(sender)));
         let frames = Rc::new(FrameState::default());
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let (auth_tx, auth_rx) = oneshot::channel::<()>();
+        let auth_tx = Rc::new(Cell::new(Some(auth_tx)));
+        let pong_tx: Rc<Cell<Option<oneshot::Sender<()>>>> = Rc::new(Cell::new(None));
 
         let on_open = {
             let sender = sender.clone();
@@ -181,14 +235,30 @@ impl Subscription {
         let on_message = {
             let sender = sender.clone();
             let frames = frames.clone();
+            let auth_tx = auth_tx.clone();
+            let pong_tx = pong_tx.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let mut sender = sender.borrow_mut();
                 let Some(tx) = sender.as_mut() else {
                     return;
                 };
                 let data = event.data();
-                if let Some(text) = data.as_string() {
-                    frames.text(tx, &text);
+                if let Some(js_str) = data.dyn_ref::<JsString>() {
+                    // Check UTF-16 length in JS BEFORE allocating a Rust `String`.
+                    let len = js_str.length() as usize;
+                    match frames.text(tx, len, || String::from(js_str)) {
+                        TextOutcome::Authenticated => {
+                            if let Some(done) = auth_tx.take() {
+                                let _ = done.send(());
+                            }
+                        }
+                        TextOutcome::Pong => {
+                            if let Some(done) = pong_tx.take() {
+                                let _ = done.send(());
+                            }
+                        }
+                        TextOutcome::Ignored => {}
+                    }
                 } else if let Ok(buffer) = data.dyn_into::<ArrayBuffer>() {
                     frames.binary(tx, buffer.byte_length() as usize, || {
                         Uint8Array::new(&buffer).to_vec()
@@ -208,11 +278,12 @@ impl Subscription {
         socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
-        keep_alive(socket.clone());
+        keep_alive(socket.clone(), frames.clone(), cancel_rx, auth_rx, pong_tx);
         Ok(Self {
             socket,
             events,
             frames,
+            _cancel: cancel_tx,
             _on_open: on_open,
             _on_message: on_message,
             _on_close: on_close,
@@ -234,17 +305,62 @@ impl Drop for Subscription {
     }
 }
 
-/// Ping on `socket` until it closes.
-fn keep_alive(socket: WebSocket) {
+/// Enforce the initial auth-ack deadline and, once authenticated, ping periodically with a pong
+/// timeout until the socket closes or `cancel` fires (cancelling all browser timers on drop).
+fn keep_alive(
+    socket: WebSocket,
+    frames: Rc<FrameState>,
+    mut cancel: oneshot::Receiver<()>,
+    auth_ok: oneshot::Receiver<()>,
+    pong_slot: Rc<Cell<Option<oneshot::Sender<()>>>>,
+) {
     wasm_bindgen_futures::spawn_local(async move {
-        loop {
-            sleep(PING_EVERY).await;
-            match socket.ready_state() {
-                WebSocket::OPEN => {
-                    let _ = socket.send_with_str(PING);
+        // Phase 1: Require `"ok"` auth acknowledgement within `AUTH_TIMEOUT_MS`.
+        let wait_auth = select(auth_ok, Box::pin(sleep(AUTH_TIMEOUT_MS)));
+        match select(cancel, wait_auth).await {
+            Either::Left(_) => return,
+            Either::Right((Either::Left((Ok(()), _)), next_cancel)) => cancel = next_cancel,
+            Either::Right(_) => {
+                if !frames.authenticated.get() {
+                    let _ = socket.close();
                 }
-                WebSocket::CONNECTING => {}
-                _ => return,
+                return;
+            }
+        }
+        // Phase 2: Authenticated keep-alive pings with pong liveness checks.
+        loop {
+            match select(cancel, Box::pin(sleep(PING_EVERY))).await {
+                Either::Left(_) => return,
+                Either::Right((_, next_cancel)) => cancel = next_cancel,
+            }
+            if socket.ready_state() != WebSocket::OPEN {
+                return;
+            }
+            let (tx, rx) = oneshot::channel::<()>();
+            pong_slot.set(Some(tx));
+            frames.awaiting_pong.set(true);
+            if socket.send_with_str(PING).is_err() {
+                pong_slot.set(None);
+                let _ = socket.close();
+                return;
+            }
+            let wait_pong = select(rx, Box::pin(sleep(PONG_TIMEOUT_MS)));
+            match select(cancel, wait_pong).await {
+                Either::Left(_) => {
+                    pong_slot.set(None);
+                    return;
+                }
+                Either::Right((Either::Left((Ok(()), _)), next_cancel)) => {
+                    cancel = next_cancel;
+                }
+                Either::Right((_, _)) => {
+                    pong_slot.set(None);
+                    if frames.awaiting_pong.get() {
+                        let _ = socket.close();
+                        return;
+                    }
+                    return;
+                }
             }
         }
     });
@@ -300,17 +416,46 @@ mod tests {
     }
 
     #[test]
-    fn auth_ok_text_frame_emits_open_once_and_ignores_pongs_and_repeats() {
+    fn auth_ok_and_pong_frames_respect_state_and_size_cap() {
         let authenticated = Cell::new(false);
-        assert!(!handle_auth_text_frame(&authenticated, "pong"));
+        let awaiting_pong = Cell::new(true);
+        // Oversized text frames are dropped BEFORE invoking the allocator closure.
+        assert_eq!(
+            handle_text_frame(
+                &authenticated,
+                &awaiting_pong,
+                MAX_TEXT_FRAME_UNITS + 1,
+                || panic!("oversized text frame must not allocate"),
+            ),
+            TextOutcome::Ignored
+        );
+        // Pre-auth "pong" and wrong-case "OK" are ignored.
+        assert_eq!(
+            handle_text_frame(&authenticated, &awaiting_pong, 4, || "pong".into()),
+            TextOutcome::Ignored
+        );
+        assert!(awaiting_pong.get());
+        assert_eq!(
+            handle_text_frame(&authenticated, &awaiting_pong, 2, || "OK".into()),
+            TextOutcome::Ignored
+        );
         assert!(!authenticated.get());
-        assert!(!handle_auth_text_frame(&authenticated, "OK"));
-        assert!(!authenticated.get());
-        assert!(handle_auth_text_frame(&authenticated, "ok"));
+        // First "ok" authenticates.
+        assert_eq!(
+            handle_text_frame(&authenticated, &awaiting_pong, 2, || "ok".into()),
+            TextOutcome::Authenticated
+        );
         assert!(authenticated.get());
-        // Subsequent "ok" or "pong" frames are ignored.
-        assert!(!handle_auth_text_frame(&authenticated, "ok"));
-        assert!(!handle_auth_text_frame(&authenticated, "pong"));
+        // Repeated "ok" is ignored; post-auth "pong" clears awaiting_pong.
+        assert_eq!(
+            handle_text_frame(&authenticated, &awaiting_pong, 2, || "ok".into()),
+            TextOutcome::Ignored
+        );
+        assert_eq!(
+            handle_text_frame(&authenticated, &awaiting_pong, 4, || "pong".into()),
+            TextOutcome::Pong
+        );
+        assert!(!awaiting_pong.get());
     }
 
     #[test]
@@ -320,9 +465,12 @@ mod tests {
         state.binary(&mut tx, 0, || panic!("pre-auth frame read"));
         assert!(rx.try_recv().is_err());
         assert!(!state.overflow.get());
-        state.text(&mut tx, "ok");
-        state.text(&mut tx, "ok");
-        state.text(&mut tx, "pong");
+        assert_eq!(
+            state.text(&mut tx, 2, || "ok".into()),
+            TextOutcome::Authenticated
+        );
+        assert_eq!(state.text(&mut tx, 2, || "ok".into()), TextOutcome::Ignored);
+        assert_eq!(state.text(&mut tx, 4, || "pong".into()), TextOutcome::Pong);
         assert!(matches!(rx.try_recv(), Ok(Event::Open)));
         assert!(rx.try_recv().is_err());
         let bytes = Notification::default().encode_to_vec();
@@ -349,8 +497,8 @@ mod tests {
         let state = FrameState::default();
         let (mut tx, mut rx) = mpsc::channel(0);
         assert!(tx.try_send(Event::Resync).is_ok());
-        state.text(&mut tx, "ok");
-        state.text(&mut tx, "ok");
+        state.text(&mut tx, 2, || "ok".into());
+        state.text(&mut tx, 2, || "ok".into());
         assert!(matches!(
             futures::executor::block_on(state.next(&mut rx)),
             Event::Open

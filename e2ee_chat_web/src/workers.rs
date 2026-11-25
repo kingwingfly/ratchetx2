@@ -1,8 +1,8 @@
 //! The previews' web workers, of [`e2ee_chat_preview`], each started when a preview first needs
-//! it: PDF pages, Mermaid diagrams, and code, highlighted by four workers, a group of languages
-//! each. Both waiting for a worker to be ready and waiting for a call to answer are bounded by
-//! [`TIMEOUT`]; a stalled worker is terminated, failing its pending calls, and the next call
-//! starts a fresh one.
+//! it: PDF pages, Mermaid diagrams, audio tags, search, and code highlighted by four workers, a
+//! group of languages each. Calls to each worker are queued FIFO client-side so only the active
+//! head-of-line call arms its [`TIMEOUT`] guard; a stalled or failed worker is terminated, failing
+//! its pending calls, and the next call starts a fresh one.
 
 use std::{
     cell::{Cell, RefCell},
@@ -15,11 +15,11 @@ use e2ee_chat_preview::{
     audio::Tags,
     language::Language,
     rpc::{
-        Request, WirePayload, WorkerEvent, decode_audio_tags, decode_code_highlight,
-        decode_diagram_svg, decode_pdf_close, decode_pdf_open, decode_pdf_render,
-        decode_search_find, encode_request_frame,
+        AudioTagsCall, CodeHighlightCall, DiagramSvgCall, PdfCloseCall, PdfOpenCall, PdfRenderCall,
+        RpcCall, SearchFindCall, WirePayload, WorkerEvent, encode_request_frame,
     },
 };
+use futures_util::lock::Mutex;
 use js_sys::{Function, Promise};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -27,11 +27,22 @@ use web_sys::{Event, ImageData, MessageEvent};
 
 use crate::util::js_error;
 
-/// How long a worker may take to start or answer: drawing a page or highlighting a file of the
-/// most it highlights takes seconds.
+/// How long an active head-of-line call or worker start may take, in milliseconds.
 const TIMEOUT: i32 = 60_000;
 /// Call ID reserved for the worker's initial `READY` handshake.
 const READY_ID: u32 = 0;
+
+/// Advance a non-zero call ID, skipping [`READY_ID`] (`0`) on 32-bit wraparound.
+fn next_call_id(current: u32) -> u32 {
+    let next = current.wrapping_add(1);
+    if next == READY_ID { 1 } else { next }
+}
+
+/// Advance a non-zero worker start generation, skipping `0` on 32-bit wraparound.
+fn next_start_id(current: u32) -> u32 {
+    let next = current.wrapping_add(1);
+    if next == 0 { 1 } else { next }
+}
 
 /// Clears a browser timeout before dropping its closure, even if the awaiting future is cancelled.
 struct TimeoutGuard {
@@ -73,6 +84,18 @@ impl Drop for TimeoutGuard {
     }
 }
 
+/// Removes an in-flight call entry from [`Calls::pending`] if the awaiting future is dropped.
+struct PendingGuard {
+    calls: Rc<Calls>,
+    id: u32,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.calls.pending.borrow_mut().remove(&self.id);
+    }
+}
+
 /// A worker, started.
 struct Running {
     worker: web_sys::Worker,
@@ -80,14 +103,17 @@ struct Running {
     start: u32,
     /// Resolved once it listens: what it is sent before goes unheard.
     ready: Promise,
+    /// Client-side FIFO serializer so queued calls wait without arming premature timeouts.
+    queue: Rc<Mutex<()>>,
     calls: Rc<Calls>,
     // Its handlers, kept for as long as it runs.
     _on_message: Closure<dyn FnMut(MessageEvent)>,
+    _on_message_error: Closure<dyn FnMut(MessageEvent)>,
     _on_error: Closure<dyn FnMut(Event)>,
 }
 
-/// The calls a worker has yet to answer: how to resolve and reject each, by ID. The first, 0, is
-/// its being ready.
+/// The calls a worker has yet to answer: how to resolve and reject each, by ID. ID 0 is reserved
+/// for its initial `READY` handshake and is never reused after wraparound.
 #[derive(Default)]
 struct Calls {
     pending: RefCell<HashMap<u32, (Function, Function)>>,
@@ -96,9 +122,22 @@ struct Calls {
 }
 
 impl Calls {
+    /// Register the initial `READY` promise under [`READY_ID`].
+    fn add_ready(&self) -> Promise {
+        self.next.set(1);
+        Promise::new(&mut |resolve, reject| {
+            self.pending
+                .borrow_mut()
+                .insert(READY_ID, (resolve, reject));
+        })
+    }
+
     fn add(&self) -> (u32, Promise) {
-        let id = self.next.get();
-        self.next.set(id + 1);
+        let mut id = self.next.get();
+        if id == READY_ID {
+            id = 1;
+        }
+        self.next.set(next_call_id(id));
         let promise = Promise::new(&mut |resolve, reject| {
             self.pending.borrow_mut().insert(id, (resolve, reject));
         });
@@ -131,15 +170,16 @@ thread_local! {
     static STARTS: Cell<u32> = const { Cell::new(0) };
 }
 
-/// The worker `kind`, started if it is not running.
+/// The worker `kind`, started if it is not running (or if its previous instance was marked stopped).
 fn running(kind: Worker) -> Result<Rc<Running>, String> {
-    if let Some(running) = RUNNING.with(|running| running.borrow().get(&kind).cloned()) {
+    if let Some(running) = RUNNING.with(|running| running.borrow().get(&kind).cloned())
+        && running.calls.stopped.borrow().is_none()
+    {
         return Ok(running);
     }
     let worker = web_sys::Worker::new(kind.script()).map_err(js_error)?;
     let calls = Rc::new(Calls::default());
-    let (ready_id, ready) = calls.add();
-    debug_assert_eq!(ready_id, READY_ID);
+    let ready = calls.add_ready();
     let on_message = {
         let calls = calls.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(
@@ -153,27 +193,45 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
             },
         )
     };
+    let on_message_error = {
+        let calls = calls.clone();
+        Closure::<dyn FnMut(MessageEvent)>::new(move |_event: MessageEvent| {
+            // Mark stopped & fail pending synchronously so no same-tick call posts to this worker;
+            // terminate & drop closures on the next microtask to avoid dropping self inside handler.
+            calls.fail_all("the preview reply could not be decoded");
+            let calls = calls.clone();
+            spawn_local(
+                async move { stop(kind, &calls, "the preview reply could not be decoded") },
+            );
+        })
+    };
     let on_error = {
         let calls = calls.clone();
         Closure::<dyn FnMut(Event)>::new(move |event: Event| {
             event.prevent_default();
-            // Later, as stopping drops this handler.
+            // Synchronously mark stopped & reject pending callers before yielding, preventing
+            // same-tick posts to a crashed worker while deferring handler drop via `spawn_local`.
+            calls.fail_all("the preview failed");
             let calls = calls.clone();
             spawn_local(async move { stop(kind, &calls, "the preview failed") });
         })
     };
     worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    worker.set_onmessageerror(Some(on_message_error.as_ref().unchecked_ref()));
     worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     let start = STARTS.with(|starts| {
-        starts.set(starts.get() + 1);
-        starts.get()
+        let next = next_start_id(starts.get());
+        starts.set(next);
+        next
     });
     let running = Rc::new(Running {
         worker,
         start,
         ready,
+        queue: Rc::new(Mutex::new(())),
         calls,
         _on_message: on_message,
+        _on_message_error: on_message_error,
         _on_error: on_error,
     });
     RUNNING.with(|all| all.borrow_mut().insert(kind, running.clone()));
@@ -189,6 +247,7 @@ fn stop(kind: Worker, calls: &Rc<Calls>, reason: &str) {
     });
     if let Some(stopped) = stopped {
         stopped.worker.set_onmessage(None);
+        stopped.worker.set_onmessageerror(None);
         stopped.worker.set_onerror(None);
         stopped.worker.terminate();
     }
@@ -198,6 +257,7 @@ fn stop(kind: Worker, calls: &Rc<Calls>, reason: &str) {
 impl Drop for Running {
     fn drop(&mut self) {
         self.worker.set_onmessage(None);
+        self.worker.set_onmessageerror(None);
         self.worker.set_onerror(None);
     }
 }
@@ -207,12 +267,13 @@ fn failure(error: JsValue) -> String {
     error.as_string().unwrap_or_else(|| js_error(error))
 }
 
-/// Send a request to the worker. A document handle is valid only in the worker that opened it.
-async fn call(
-    kind: Worker,
+/// Send a typed [`RpcCall`] to its worker, queueing FIFO client-side so only the active
+/// head-of-line call arms a timeout guard.
+async fn call_typed<'a, C: RpcCall<'a>>(
     start: Option<u32>,
-    request: Request<&[u8], &str>,
-) -> Result<(JsValue, u32), String> {
+    call: C,
+) -> Result<(C::Reply, u32), String> {
+    let kind = call.worker();
     let running = match start {
         // What it opened went with the worker that opened it.
         Some(start) => RUNNING
@@ -221,6 +282,10 @@ async fn call(
             .ok_or("the preview restarted: open the file again")?,
         None => running(kind)?,
     };
+    let _turn = running.queue.lock().await;
+    if let Some(reason) = running.calls.stopped.borrow().clone() {
+        return Err(reason);
+    }
     {
         let _ready_timeout = running
             .calls
@@ -251,7 +316,11 @@ async fn call(
         return Err("the preview restarted: open the file again".to_string());
     }
     let (id, answer) = running.calls.add();
-    let payload: WirePayload = encode_request_frame(id, request);
+    let _pending_guard = PendingGuard {
+        calls: running.calls.clone(),
+        id,
+    };
+    let payload: WirePayload = encode_request_frame(id, call.into_request());
     let sent = match payload.transfer {
         Some(transfer) => running
             .worker
@@ -265,29 +334,35 @@ async fn call(
     let _call_timeout = TimeoutGuard::arm(kind, &running.calls, id, "the preview took too long");
     let answer = JsFuture::from(answer).await.map_err(failure);
     drop(_call_timeout);
-    Ok((answer?, running.start))
+    drop(_pending_guard);
+    let reply = C::decode_reply(answer?)?;
+    Ok((reply, running.start))
 }
 
 /// `text`, highlighted as `language`, as HTML: escaped text in spans.
 pub async fn highlight(language: &Language, text: &str) -> Result<String, String> {
-    let request = Request::Highlight {
-        language: language.name,
-        text,
-    };
-    let (reply, _) = call(Worker::Code(language.group), None, request).await?;
-    decode_code_highlight(reply)
+    let (html, _) = call_typed(
+        None,
+        CodeHighlightCall {
+            group: language.group,
+            language: language.name,
+            text,
+        },
+    )
+    .await?;
+    Ok(html)
 }
 
 /// The Mermaid diagram `source`, as SVG.
 pub async fn diagram(source: &str) -> Result<String, String> {
-    let (reply, _) = call(Worker::Diagram, None, Request::Svg(source)).await?;
-    decode_diagram_svg(reply)
+    let (svg, _) = call_typed(None, DiagramSvgCall(source)).await?;
+    Ok(svg)
 }
 
 /// What the tags of the audio `data` say of it, if it has any.
 pub async fn audio_tags(data: &[u8]) -> Result<Option<Tags>, String> {
-    let (reply, _) = call(Worker::Audio, None, Request::Tags(data)).await?;
-    decode_audio_tags(reply)
+    let (tags, _) = call_typed(None, AudioTagsCall(data)).await?;
+    Ok(tags)
 }
 
 /// The matches of `pattern` in `text`, a regular expression unless `regex` says otherwise,
@@ -299,14 +374,16 @@ pub async fn find(
     case: bool,
     regex: bool,
 ) -> Result<(Vec<(u32, u32)>, bool), String> {
-    let request = Request::Find {
-        text,
-        pattern,
-        case,
-        regex,
-    };
-    let (reply, _) = call(Worker::Search, None, request).await?;
-    let found = decode_search_find(reply)?;
+    let (found, _) = call_typed(
+        None,
+        SearchFindCall {
+            text,
+            pattern,
+            case,
+            regex,
+        },
+    )
+    .await?;
     Ok((found.matches, found.more))
 }
 
@@ -319,8 +396,7 @@ pub struct Pdf {
 
 /// Open the PDF `data`: the document, and its pages' sizes, in points.
 pub async fn open_pdf(data: &[u8]) -> Result<(Pdf, Vec<(f64, f64)>), String> {
-    let (reply, start) = call(Worker::Pdf, None, Request::Open(data)).await?;
-    let opened = decode_pdf_open(reply)?;
+    let (opened, start) = call_typed(None, PdfOpenCall(data)).await?;
     Ok((
         Pdf {
             start,
@@ -332,28 +408,43 @@ pub async fn open_pdf(data: &[u8]) -> Result<(Pdf, Vec<(f64, f64)>), String> {
 
 /// The page `index` of `pdf`, drawn `width` pixels wide.
 pub async fn render_pdf(pdf: Pdf, index: usize, width: u32) -> Result<ImageData, String> {
-    let request = Request::Render {
-        doc_id: pdf.id,
-        page: u32::try_from(index).map_err(|_| "invalid page index")?,
-        width,
-    };
-    let (reply, _) = call(Worker::Pdf, Some(pdf.start), request).await?;
-    let page = decode_pdf_render(reply)?;
-    ImageData::new_with_js_u8_clamped_array_and_sh(&page.pixels, page.width, page.height)
-        .map_err(js_error)
+    let page = u32::try_from(index).map_err(|_| "invalid page index")?;
+    let (rendered, _) = call_typed(
+        Some(pdf.start),
+        PdfRenderCall {
+            doc_id: pdf.id,
+            page,
+            width,
+        },
+    )
+    .await?;
+    ImageData::new_with_js_u8_clamped_array_and_sh(
+        &rendered.pixels,
+        rendered.width,
+        rendered.height,
+    )
+    .map_err(js_error)
 }
 
 /// Free `pdf`, if its worker still runs.
 pub fn close_pdf(pdf: Pdf) {
     spawn_local(async move {
-        if let Ok((reply, _)) = call(
-            Worker::Pdf,
-            Some(pdf.start),
-            Request::Close { doc_id: pdf.id },
-        )
-        .await
-        {
-            let _ = decode_pdf_close(reply);
-        }
+        let _ = call_typed(Some(pdf.start), PdfCloseCall { doc_id: pdf.id }).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_and_start_ids_wrap_without_reusing_zero() {
+        assert_eq!(next_call_id(1), 2);
+        assert_eq!(next_call_id(u32::MAX - 1), u32::MAX);
+        assert_eq!(next_call_id(u32::MAX), 1);
+        assert_ne!(next_call_id(u32::MAX), READY_ID);
+
+        assert_eq!(next_start_id(0), 1);
+        assert_eq!(next_start_id(u32::MAX), 1);
+    }
 }
