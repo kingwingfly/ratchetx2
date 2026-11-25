@@ -14,7 +14,7 @@ use super::common::{send, send_files_to};
 /// Desktop devices with a fine hovering pointer (mouse/trackpad) keep auto-focus so typing starts
 /// right away; touch-first portable devices (phones, tablets, 2-in-1s in tablet mode) skip
 /// auto-focus so the virtual keyboard does not pop up automatically.
-pub(super) fn should_autofocus_composer(hover_none: bool, pointer_coarse: bool) -> bool {
+fn should_autofocus_composer(hover_none: bool, pointer_coarse: bool) -> bool {
     !(hover_none || pointer_coarse)
 }
 
@@ -53,6 +53,9 @@ pub(super) fn Composer(
         }
     });
     let submit = move || {
+        if disabled.get_untracked() {
+            return;
+        }
         let message = text.get_untracked();
         if message.trim().is_empty() {
             return;

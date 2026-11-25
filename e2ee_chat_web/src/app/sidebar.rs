@@ -4,12 +4,12 @@ use session::PublicKey;
 use crate::{
     icon::{Icon, icon},
     state::{ClassicalPrompt, ContactView, Dialog, SecurityAlert},
-    util::{clock, hex, short},
+    util::{clock, short},
 };
 
 use super::{
-    common::{initials, lock, new_chat, open_chat},
-    ui,
+    common::{avatar_letters, lock, new_chat},
+    history, ui,
 };
 
 #[component]
@@ -78,7 +78,7 @@ pub(super) fn Sidebar() -> impl IntoView {
             </nav>
             <div class="sidebar-foot">
                 <span class="avatar">
-                    {move || me().map(|me| initials(&me.name)).unwrap_or_default()}
+                    {move || me().map(|me| avatar_letters(&me.name, &me.key)).unwrap_or_default()}
                 </span>
                 <div class="whoami">
                     <strong>
@@ -157,17 +157,8 @@ fn ChatItem(peer: PublicKey) -> impl IntoView {
     let ui = ui();
     let contact = Memo::new(move |_| ui.contact(&peer));
     let label = Memo::new(move |_| contact.with(|c| c.as_ref().map(ContactView::label)));
-    let letters = Memo::new(move |_| {
-        contact.with(|c| {
-            c.as_ref().map(|c| {
-                if c.name.is_empty() {
-                    hex(&peer[..1])
-                } else {
-                    initials(&c.name)
-                }
-            })
-        })
-    });
+    let letters =
+        Memo::new(move |_| contact.with(|c| c.as_ref().map(|c| avatar_letters(&c.name, &peer))));
     let meta = Memo::new(move |_| contact.with(|c| c.as_ref().map(chat_item_meta)));
     let unread = Memo::new(move |_| contact.with(|c| c.as_ref().map_or(0, |c| c.unread)));
     let when = Memo::new(move |_| {
@@ -183,7 +174,7 @@ fn ChatItem(peer: PublicKey) -> impl IntoView {
             class:warn=move || meta.with(|m| m.as_ref().is_some_and(|m| m.1))
             class:downgrade=move || meta.with(|m| m.as_ref().is_some_and(|m| m.2))
             class:active=move || ui.open.get() == Some(peer)
-            on:click=move |_| open_chat(Some(peer))
+            on:click=move |_| history::navigate(Some(peer))
         >
             <span class="avatar">{letters}</span>
             <span class="chat-text">
