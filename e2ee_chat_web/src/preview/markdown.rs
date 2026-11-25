@@ -527,9 +527,13 @@ fn without_notes(slide: &str) -> &str {
     let mut start = 0;
     for line in slide.split_inclusive('\n') {
         if !fence.is_fenced() {
-            let trimmed = line.trim_start();
-            if trimmed.len() >= 5 && trimmed[..5].eq_ignore_ascii_case("note:")
-                || trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("notes:")
+            let trimmed = line.trim_start().as_bytes();
+            if trimmed
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"note:"))
+                || trimmed
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"notes:"))
             {
                 return &slide[..start];
             }

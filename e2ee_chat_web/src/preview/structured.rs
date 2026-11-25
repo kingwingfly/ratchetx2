@@ -473,7 +473,11 @@ pub(super) fn events(text: &str) -> Cards {
 
 fn strip_mailto_prefix(value: &str) -> String {
     let trimmed = value.trim();
-    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("mailto:") {
+    if trimmed
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"mailto:"))
+    {
         trimmed[7..].to_string()
     } else {
         trimmed.to_string()

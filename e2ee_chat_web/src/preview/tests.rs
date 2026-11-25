@@ -1948,3 +1948,50 @@ fn deeply_nested_json_pretty_print_stays_bounded() {
     };
     assert!(text.len() <= TEXT_MAX);
 }
+
+#[test]
+fn slides_handles_multibyte_utf8_lines_without_panicking() {
+    // Multi-byte UTF-8 lines where byte offsets 5 and 6 fall inside a character.
+    let deck =
+        "日本語\n\néééé\n\n🎉🚀✨\n\nNotes: secret speaker notes\n---\n# Second\n\nNOTE: hidden";
+    let rendered = slides(deck);
+    assert_eq!(rendered.len(), 2);
+    assert!(rendered[0][0].contains("日本語"));
+    assert!(rendered[0][0].contains("éééé"));
+    assert!(rendered[0][0].contains("🎉🚀✨"));
+    assert!(!rendered[0][0].contains("secret speaker notes"));
+    assert!(rendered[1][0].contains("Second"));
+    assert!(!rendered[1][0].contains("hidden"));
+}
+
+#[test]
+fn events_handles_multibyte_utf8_organizer_and_attendee_without_panicking() {
+    // Byte offset 7 falls inside a multi-byte UTF-8 scalar in both ORGANIZER and ATTENDEE.
+    let ics = "\
+BEGIN:VCALENDAR\r\n\
+BEGIN:VEVENT\r\n\
+SUMMARY:会議\r\n\
+ORGANIZER:日本語テスト\r\n\
+ATTENDEE:🎉🚀✨テスト\r\n\
+ATTENDEE:MaIlTo:alice@example.com\r\n\
+END:VEVENT\r\n\
+END:VCALENDAR\r\n";
+    let cards = events(ics);
+    assert_eq!(cards.items.len(), 1);
+    assert_eq!(cards.items[0].title, "会議");
+    assert!(
+        cards.items[0]
+            .fields
+            .contains(&("Organizer", "日本語テスト".to_string()))
+    );
+    assert!(
+        cards.items[0]
+            .fields
+            .contains(&("Attendee", "🎉🚀✨テスト".to_string()))
+    );
+    assert!(
+        cards.items[0]
+            .fields
+            .contains(&("Attendee", "alice@example.com".to_string()))
+    );
+}
