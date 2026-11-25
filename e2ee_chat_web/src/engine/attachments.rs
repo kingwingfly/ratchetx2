@@ -148,6 +148,8 @@ impl Engine {
             prefix_hash: Sha256::digest([]).to_vec(),
             announced: false,
             history_index: 0,
+            upload_state: crate::vault::UPLOAD_STATE_STARTED,
+            sealed_chunk_hash: Vec::new(),
         };
         if let Err(e) = self.save_upload(&peer, &pending).await {
             let _ = upload.cancel(&Fetch::client(&server)).await;
@@ -217,7 +219,7 @@ impl Engine {
             name: file.name(),
             mime: file.type_(),
             size: file.size() as u64,
-            announced: true,
+            announced: false,
             history_index: contact.state.history_len,
             token: Vec::new(),
             key: Vec::new(),
@@ -225,6 +227,8 @@ impl Engine {
             encrypted: 0,
             prefix_hash: Vec::new(),
             expires: 0,
+            upload_state: crate::vault::UPLOAD_STATE_WAITING,
+            sealed_chunk_hash: Vec::new(),
         };
         // Kept first, so that no message waits for an upload that is not kept.
         inner
@@ -443,7 +447,9 @@ impl Engine {
             size: kept.size,
             uploaded: kept.uploaded,
             encrypted: kept.encrypted,
-            announced: kept.announced,
+            announced: true,
+            upload_state: crate::vault::UPLOAD_STATE_ANNOUNCED,
+            sealed_chunk_hash: Vec::new(),
         };
         // Kept under the server's ID first: if the message is not saved after, the upload is
         // there to cancel, rather than a message with nothing to download.
@@ -1523,6 +1529,7 @@ impl Engine {
         };
         self.ui.opening.set(Some(Opening {
             token,
+            peer,
             id,
             name: pointer.name.clone(),
             size: pointer.size,

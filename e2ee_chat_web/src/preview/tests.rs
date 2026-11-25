@@ -466,7 +466,7 @@ fn tables_cards_and_diffs() {
     let vcard = "BEGIN:VCARD\r\nVERSION:4.0\r\nN:Doe;Jane;;;\r\nTEL;TYPE=cell:+1 555\r\n\
                  ADR:;;1 Main St;Springfield;;12345;\r\n  USA\r\nEND:VCARD\r\n";
     assert_eq!(
-        contacts(vcard),
+        contacts(vcard).items,
         [Card {
             title: "Jane Doe".into(),
             fields: vec![
@@ -479,7 +479,7 @@ fn tables_cards_and_diffs() {
                LOCATION:Room 2\\, east\nBEGIN:VALARM\nDESCRIPTION:reminder\nEND:VALARM\n\
                END:VEVENT\nEND:VCALENDAR\n";
     assert_eq!(
-        events(ics),
+        events(ics).items,
         [Card {
             title: "Lab meeting".into(),
             fields: vec![
@@ -489,8 +489,9 @@ fn tables_cards_and_diffs() {
         }]
     );
 
-    let lines = diff("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n same\n");
-    let kinds: Vec<_> = lines.iter().map(|(kind, _)| *kind).collect();
+    let parsed_diff =
+        diff("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n same\n");
+    let kinds: Vec<_> = parsed_diff.lines.iter().map(|(kind, _)| *kind).collect();
     use DiffLine::*;
     assert_eq!(kinds, [File, File, File, Hunk, Removed, Added, Context]);
 }
@@ -511,12 +512,14 @@ fn archives_list_their_entries() {
                 Entry {
                     path: "docs/".into(),
                     size: 0,
-                    directory: true
+                    directory: true,
+                    note: None,
                 },
                 Entry {
                     path: "docs/a.txt".into(),
                     size: 5,
-                    directory: false
+                    directory: false,
+                    note: None,
                 },
             ],
             complete: true,
@@ -537,6 +540,7 @@ fn archives_list_their_entries() {
             path: "a.txt".into(),
             size: 5,
             directory: false,
+            note: None,
         }],
         complete: true,
     });
@@ -571,7 +575,8 @@ fn assert_sample_listing(data: &[u8]) {
             entries: vec![Entry {
                 path: "a.txt".into(),
                 size: 5,
-                directory: false
+                directory: false,
+                note: None,
             }],
             complete: true,
         })
@@ -1099,6 +1104,6 @@ fn vcard_unescaping_preserves_escaped_backslashes() {
     let Kind::Cards(cards) = kind("a.vcf", "text/vcard", vcard.as_bytes()) else {
         panic!("expected Cards preview");
     };
-    assert_eq!(cards.len(), 1);
-    assert_eq!(cards[0].fields[0].1, "C:\\notes\nLine2,a;b");
+    assert_eq!(cards.items.len(), 1);
+    assert_eq!(cards.items[0].fields[0].1, "C:\\notes\nLine2,a;b");
 }

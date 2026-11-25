@@ -20,6 +20,8 @@ pub struct Entry {
     pub path: String,
     pub size: u64,
     pub directory: bool,
+    /// Optional security/metadata indicator (e.g. symlink, hardlink, path traversal).
+    pub note: Option<String>,
 }
 
 struct CentralDirectory {
@@ -235,6 +237,7 @@ fn list_zip(mut archive: ::zip::ZipArchive<impl Read + Seek>) -> Option<Listing>
                 path: file.name().ok()?.into_owned(),
                 size: file.size(),
                 directory: file.is_dir(),
+                note: None,
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -258,6 +261,7 @@ pub(super) fn tar(reader: impl Read, limit: u64) -> Option<Listing> {
                 path: entry.path().ok()?.to_string_lossy().into_owned(),
                 size: entry.size(),
                 directory: entry.header().entry_type().is_dir(),
+                note: None,
             })
         });
         match entry {

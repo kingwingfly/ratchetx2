@@ -254,7 +254,12 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 progress.clear();
             }
         }
-        engine().new_chat_edited(current_key, current_name);
+        engine().new_chat_edited(
+            current_key,
+            current_name,
+            server_saved.get_value(),
+            pq_pinned,
+        );
     });
     let active_submit = StoredValue::new(None::<(u64, super::history::Reservation)>);
     on_cleanup(move || {
@@ -313,6 +318,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                     submit_id,
                     &draft.key,
                     draft.name.clone(),
+                    draft.server.as_deref(),
                     draft.pq_pinned,
                     draft.allow_classical,
                 )

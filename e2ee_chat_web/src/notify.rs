@@ -10,7 +10,8 @@ use std::{
     rc::Rc,
 };
 
-use futures::{StreamExt, channel::mpsc};
+use futures_channel::mpsc;
+use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};
 use prost::Message;
 use session::protocol::notify::{Notification, SubscribeRequest};

@@ -1,3 +1,74 @@
+/// Strictly validate highlighted HTML returned by the syntax-highlighting worker: only balanced
+/// `<span class="hl-[a-z0-9_-]+">` / `</span>` tags and entity-escaped text (no raw `<`, `>`, or
+/// malformed `&` entities).
+pub fn validate_highlight_html(html: &str) -> Result<(), String> {
+    const OPEN_PREFIX: &[u8] = b"<span class=\"hl-";
+    const CLOSE_TAG: &[u8] = b"</span>";
+
+    let bytes = html.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'<' => {
+                if bytes[i..].starts_with(CLOSE_TAG) {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| "unbalanced </span> in highlighted output".to_string())?;
+                    i += CLOSE_TAG.len();
+                } else if bytes[i..].starts_with(OPEN_PREFIX) {
+                    i += OPEN_PREFIX.len();
+                    let name_start = i;
+                    while i < bytes.len()
+                        && (bytes[i].is_ascii_lowercase()
+                            || bytes[i].is_ascii_digit()
+                            || bytes[i] == b'-'
+                            || bytes[i] == b'_')
+                    {
+                        i += 1;
+                    }
+                    if i == name_start || !bytes[i..].starts_with(b"\">") {
+                        return Err("unexpected span class in highlighted output".to_string());
+                    }
+                    i += 2;
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or_else(|| "excessive span nesting in highlighted output".to_string())?;
+                } else {
+                    return Err("unexpected HTML tag in highlighted output".to_string());
+                }
+            }
+            b'>' => return Err("unescaped '>' in highlighted output".to_string()),
+            b'&' => {
+                i += 1;
+                let semi = bytes[i..]
+                    .iter()
+                    .take(12)
+                    .position(|&b| b == b';')
+                    .ok_or_else(|| "unterminated HTML entity in highlighted output".to_string())?;
+                let entity = &bytes[i..i + semi];
+                let valid = if let Some(rest) = entity.strip_prefix(b"#x").or_else(|| entity.strip_prefix(b"#X")) {
+                    !rest.is_empty() && rest.iter().all(u8::is_ascii_hexdigit)
+                } else if let Some(rest) = entity.strip_prefix(b"#") {
+                    !rest.is_empty() && rest.iter().all(u8::is_ascii_digit)
+                } else {
+                    !entity.is_empty() && entity.iter().all(u8::is_ascii_alphanumeric)
+                };
+                if !valid {
+                    return Err("invalid HTML entity in highlighted output".to_string());
+                }
+                i += semi + 1;
+            }
+            _ => i += 1,
+        }
+    }
+    if depth != 0 {
+        return Err("unclosed <span> in highlighted output".to_string());
+    }
+    Ok(())
+}
+
 /// Validate an allowed link destination (`http://`, `https://`, `mailto:`, or `#` fragment) with
 /// no ASCII control characters, returning the trimmed URL with any scheme prefix normalized to
 /// lowercase (preserving case-sensitive path/query/fragment components).

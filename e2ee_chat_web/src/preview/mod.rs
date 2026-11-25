@@ -19,7 +19,8 @@ pub use e2ee_chat_preview::audio::Tags;
 use e2ee_chat_preview::language::{self, Language};
 use flate2::read::GzDecoder;
 pub use markdown::{markdown, slides};
-pub use structured::{Card, DiffLine, Table};
+pub use sanitize::validate_highlight_html;
+pub use structured::{Card, Cards, Diff, DiffLine, Table};
 
 /// The most bytes of text shown, ...
 pub const TEXT_MAX: usize = 5_000_000;
@@ -202,8 +203,8 @@ pub enum Kind {
     Table(Table),
     Archive(Listing),
     /// Contacts or events.
-    Cards(Vec<Card>),
-    Diff(Vec<(DiffLine, String)>),
+    Cards(Cards),
+    Diff(Diff),
     None,
 }
 

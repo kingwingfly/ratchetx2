@@ -18,7 +18,7 @@ use crate::vault::{
     ContactState, Farewell, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
 };
 use bytes::Bytes;
-use futures::future::{Either, select};
+use futures_util::future::{Either, select};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use prost::Message as _;

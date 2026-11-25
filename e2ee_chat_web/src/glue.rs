@@ -8,7 +8,7 @@ use std::{
     rc::Rc,
 };
 
-use futures::channel::oneshot;
+use futures_channel::oneshot;
 use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};

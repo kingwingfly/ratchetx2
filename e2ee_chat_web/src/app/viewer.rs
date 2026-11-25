@@ -907,13 +907,16 @@ fn archive_view(listing: preview::Listing) -> AnyView {
     .into_any()
 }
 
-fn cards_view(cards: Vec<preview::Card>) -> AnyView {
-    if cards.is_empty() {
+fn cards_view(cards: preview::Cards) -> AnyView {
+    if cards.items.is_empty() {
         return no_preview();
     }
+    let notice = cards.notice();
     view! {
         <div class="cards">
+            {notice.map(|notice| view! { <p class="preview-note">{notice}</p> })}
             {cards
+                .items
                 .into_iter()
                 .map(|card| {
                     let title = if card.title.is_empty() { "Untitled".to_string() } else { card.title };
@@ -936,23 +939,28 @@ fn cards_view(cards: Vec<preview::Card>) -> AnyView {
     .into_any()
 }
 
-fn diff_view(lines: Vec<(DiffLine, String)>) -> AnyView {
+fn diff_view(diff: preview::Diff) -> AnyView {
+    let notice = diff.notice();
     view! {
-        <pre class="code diff">
-            {lines
-                .into_iter()
-                .map(|(kind, line)| {
-                    let class = match kind {
-                        DiffLine::File => "diff-file",
-                        DiffLine::Hunk => "diff-hunk",
-                        DiffLine::Added => "diff-added",
-                        DiffLine::Removed => "diff-removed",
-                        DiffLine::Context => "diff-context",
-                    };
-                    view! { <span class=class>{line}</span> }
-                })
-                .collect_view()}
-        </pre>
+        <div class="diff-preview">
+            {notice.map(|notice| view! { <p class="preview-note">{notice}</p> })}
+            <pre class="code diff">
+                {diff
+                    .lines
+                    .into_iter()
+                    .map(|(kind, line)| {
+                        let class = match kind {
+                            DiffLine::File => "diff-file",
+                            DiffLine::Hunk => "diff-hunk",
+                            DiffLine::Added => "diff-added",
+                            DiffLine::Removed => "diff-removed",
+                            DiffLine::Context => "diff-context",
+                        };
+                        view! { <span class=class>{line}</span> }
+                    })
+                    .collect_view()}
+            </pre>
+        </div>
     }
     .into_any()
 }

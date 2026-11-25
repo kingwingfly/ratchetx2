@@ -4,8 +4,10 @@ use super::{CELLS_MAX, COLS_MAX, ROWS_MAX};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Table {
     pub rows: Vec<Vec<String>>,
-    /// Whether the table was truncated by [`ROWS_MAX`], [`COLS_MAX`], or [`CELLS_MAX`].
+    /// Whether the table was truncated by [`ROWS_MAX`], [`COLS_MAX`], [`CELLS_MAX`], or a parse error.
     pub more: bool,
+    /// Whether one or more rows were omitted due to [`ROWS_MAX`].
+    pub truncated_rows: bool,
     /// Whether one or more rows had more than [`COLS_MAX`] columns.
     pub truncated_columns: bool,
     /// Whether rendering stopped early due to [`CELLS_MAX`].
@@ -31,6 +33,44 @@ impl Table {
             parts.push(format!("the first {ROWS_MAX} rows"));
         }
         Some(format!("Only {} show.", parts.join(" and ")))
+    }
+}
+
+/// A bounded list of contact or event cards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cards {
+    pub items: Vec<Card>,
+    pub truncated_cards: bool,
+    pub truncated_fields: bool,
+}
+
+impl Cards {
+    pub fn notice(&self) -> Option<String> {
+        if !self.truncated_cards && !self.truncated_fields {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if self.truncated_cards {
+            parts.push(format!("the first {} entries", self.items.len()));
+        }
+        if self.truncated_fields {
+            parts.push("bounded fields per entry".to_string());
+        }
+        Some(format!("Only {} show.", parts.join(" with ")))
+    }
+}
+
+/// A bounded unified diff listing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diff {
+    pub lines: Vec<(DiffLine, String)>,
+    pub truncated: bool,
+}
+
+impl Diff {
+    pub fn notice(&self) -> Option<String> {
+        self.truncated
+            .then(|| format!("Only the first {} lines show.", self.lines.len()))
     }
 }
 
@@ -90,15 +130,17 @@ pub(super) fn table(text: &str, delimiter: u8) -> Table {
     Table {
         rows,
         more,
+        truncated_rows: false,
         truncated_columns,
         truncated_cells,
     }
 }
 
 /// The lines of the unified diff `text`, each with its kind.
-pub(super) fn diff(text: &str) -> Vec<(DiffLine, String)> {
+pub(super) fn diff(text: &str) -> Diff {
     let mut in_hunk = false;
-    text.lines()
+    let lines = text
+        .lines()
         .map(|line| {
             let kind = if line.starts_with("@@") {
                 in_hunk = true;
@@ -117,7 +159,11 @@ pub(super) fn diff(text: &str) -> Vec<(DiffLine, String)> {
             };
             (kind, line.to_string())
         })
-        .collect()
+        .collect();
+    Diff {
+        lines,
+        truncated: false,
+    }
 }
 
 /// The content lines of a vCard or iCalendar file: unfolded, each as its name, upper case, and
@@ -167,7 +213,7 @@ fn unescape_content_value(value: &str) -> String {
 }
 
 /// The contacts of the vCard file `text`.
-pub(super) fn contacts(text: &str) -> Vec<Card> {
+pub(super) fn contacts(text: &str) -> Cards {
     let mut cards = vec![];
     let mut card: Option<Card> = None;
     for (name, value) in content_lines(text) {
@@ -209,11 +255,15 @@ pub(super) fn contacts(text: &str) -> Vec<Card> {
             _ => {}
         }
     }
-    cards
+    Cards {
+        items: cards,
+        truncated_cards: false,
+        truncated_fields: false,
+    }
 }
 
 /// The events of the iCalendar file `text`, without their alarms.
-pub(super) fn events(text: &str) -> Vec<Card> {
+pub(super) fn events(text: &str) -> Cards {
     let mut cards = vec![];
     let mut card: Option<Card> = None;
     let mut nested = 0;
@@ -254,7 +304,11 @@ pub(super) fn events(text: &str) -> Vec<Card> {
             _ => {}
         }
     }
-    cards
+    Cards {
+        items: cards,
+        truncated_cards: false,
+        truncated_fields: false,
+    }
 }
 
 /// A structured value's parts, such as an address's, joined by commas, the empty ones left out.

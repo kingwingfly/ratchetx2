@@ -7,10 +7,8 @@ use std::{
     rc::Rc,
 };
 
-use futures::{
-    channel::oneshot,
-    future::{Either, select},
-};
+use futures_channel::oneshot;
+use futures_util::future::{Either, select};
 use js_sys::{ArrayBuffer, Uint8Array};
 use session::{
     ServerClock,

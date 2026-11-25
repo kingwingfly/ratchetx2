@@ -1434,9 +1434,11 @@ impl Engine {
         submission_id: u64,
         key: &str,
         name: String,
+        server: Option<&str>,
         pin_pq: bool,
         allow_classical: bool,
     ) -> Result<PublicKey, StartChatError> {
+        let _ = server;
         let peer = key_from_text(key)
             .ok_or_else(|| StartChatError::Other("that is not an identity key".into()))?;
         let name = name.trim().to_string();

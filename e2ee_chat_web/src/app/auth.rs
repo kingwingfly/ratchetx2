@@ -144,6 +144,7 @@ pub(super) fn SignInDialog() -> impl IntoView {
                                     id,
                                     &pending.key,
                                     pending.name.clone(),
+                                    pending.server.as_deref(),
                                     pending.pq_pinned,
                                     pending.allow_classical,
                                 )

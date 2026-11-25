@@ -33,9 +33,9 @@ use contact::{
     Contact, DisplayedEntry, FarewellMode, isolated_contact_views, restore_contacts,
     stored_contacts,
 };
-use futures::channel::oneshot;
-use futures::future::{Either, select};
-use futures::lock::Mutex;
+use futures_channel::oneshot;
+use futures_util::future::{Either, select};
+use futures_util::lock::Mutex;
 use handshake::encrypt_session_farewells;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -95,10 +95,7 @@ pub const INLINE_FILE_MAX: usize = 1 << 20;
 pub const MEDIA_INLINE_MAX: u64 = 8 << 20;
 /// The largest file to send: as many chunks as the server takes, unless it says otherwise.
 pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_CHUNKS as usize * CHUNK_SIZE;
-/// The most characters in this client's name. It goes in the greeting, the first message of each
-/// chat it starts, which the server takes up to 4 KiB of; at 4 bytes a character at most, this
-/// leaves the greeting far below that.
-pub const NAME_MAX: usize = 64;
+pub use crate::util::{NAME_MAX, sanitize_shared_name};
 
 /// `name`, trimmed, unless it is longer than [`NAME_MAX`].
 fn checked_name(name: &str) -> Result<String, String> {
@@ -107,46 +104,6 @@ fn checked_name(name: &str) -> Result<String, String> {
         return Err(format!("A name has at most {NAME_MAX} characters."));
     }
     Ok(name.to_string())
-}
-
-/// Normalize a suggested contact name for sharing/display: strip control and Unicode bidirectional
-/// formatting characters, collapse whitespace runs into single spaces, trim, and cap at
-/// [`NAME_MAX`] characters.
-pub fn sanitize_shared_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len().min(NAME_MAX * 4));
-    let mut count = 0usize;
-    let mut pending_space = false;
-    for ch in name.chars() {
-        if matches!(
-            ch,
-            '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-        ) {
-            continue;
-        }
-        if ch.is_whitespace() {
-            if count > 0 {
-                pending_space = true;
-            }
-            continue;
-        }
-        if ch.is_control() {
-            continue;
-        }
-        if pending_space {
-            if count + 2 > NAME_MAX {
-                break;
-            }
-            out.push(' ');
-            count += 1;
-            pending_space = false;
-        }
-        if count >= NAME_MAX {
-            break;
-        }
-        out.push(ch);
-        count += 1;
-    }
-    out
 }
 /// Milliseconds between asking for a chunk not uploaded yet, doubling up to the second...
 const POLL_CHUNK_MIN: i32 = 500;
@@ -787,8 +744,16 @@ impl Engine {
     }
 
     /// Update the live `NewChat` draft as the user edits key or name.
-    pub fn new_chat_edited(&self, key: String, name: String) {
-        self.sign_in_flow.borrow_mut().on_new_chat_edited(key, name);
+    pub fn new_chat_edited(
+        &self,
+        key: String,
+        name: String,
+        server: Option<String>,
+        pq_pinned: bool,
+    ) {
+        self.sign_in_flow
+            .borrow_mut()
+            .on_new_chat_edited(key, name, server, pq_pinned);
     }
 
     /// Clear the live `NewChat` draft tracker when `NewChat` unmounts.

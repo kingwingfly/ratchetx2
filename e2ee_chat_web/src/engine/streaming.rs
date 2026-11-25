@@ -7,7 +7,7 @@ use crate::glue::{MediaError, MediaRange, MediaRequest};
 use crate::state::Link;
 use crate::util::hex;
 use crate::{glue, preview};
-use futures::channel::oneshot;
+use futures_channel::oneshot;
 use leptos::prelude::*;
 use session::PublicKey;
 use session::attachment::CHUNK_SIZE;

@@ -104,6 +104,15 @@ pub const GREETING_DELIVERY_UNSENT: u32 = 1;
 pub const GREETING_DELIVERY_UNCERTAIN: u32 = 2;
 pub const GREETING_DELIVERY_CONFIRMED: u32 = 3;
 
+/// Explicit upload lifecycle state stored in [`PendingUpload::upload_state`].
+pub const UPLOAD_STATE_LEGACY: u32 = 0;
+/// Waiting for server sign-in under a client-generated placeholder ID.
+pub const UPLOAD_STATE_WAITING: u32 = 1;
+/// Started on the server, awaiting chat announcement.
+pub const UPLOAD_STATE_STARTED: u32 = 2;
+/// Started on the server and durably announced in chat history/outbox.
+pub const UPLOAD_STATE_ANNOUNCED: u32 = 3;
+
 /// AES-GCM nonce length.
 const NONCE_LEN: usize = <Aes256Gcm as AeadCore>::NonceSize::USIZE;
 
@@ -331,6 +340,33 @@ pub struct AppState {
     /// chat never reuses `session_seq = 1` against a peer who kept the old history.
     #[prost(uint64, tag = "13")]
     pub next_session_seq: u64,
+    /// Authenticated per-upload watermarks and hashes bound inside `STATE`, detecting partial
+    /// rollback of standalone `upload/<peer>/<id>` records.
+    #[prost(message, repeated, tag = "14")]
+    pub upload_checkpoints: Vec<UploadCheckpoint>,
+    /// Monotonic epoch bound into per-record AAD for newly sealed sidecar/outbox/upload records.
+    #[prost(uint64, tag = "15")]
+    pub record_epoch: u64,
+}
+
+/// Compact upload watermark authenticated inside `STATE` so partial rollback of an
+/// `upload/<peer>/<id>` record cannot supply stale `encrypted` / `prefix_hash` values on resume.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct UploadCheckpoint {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub id: Vec<u8>,
+    #[prost(uint32, tag = "3")]
+    pub uploaded: u32,
+    #[prost(uint32, tag = "4")]
+    pub encrypted: u32,
+    #[prost(bytes = "vec", tag = "5")]
+    pub prefix_hash: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub sealed_chunk_hash: Vec<u8>,
+    #[prost(uint32, tag = "7")]
+    pub upload_state: u32,
 }
 
 /// One encrypted inbox initial retained until a build with its suite (or restored contact) can
@@ -597,17 +633,39 @@ pub struct PendingUpload {
     /// upload started, which its message tells the peer; 0 if it did not.
     #[prost(uint64, tag = "13")]
     pub expires: u64,
+    /// Explicit upload lifecycle state (`UPLOAD_STATE_*`).
+    #[prost(uint32, tag = "14")]
+    pub upload_state: u32,
+    /// SHA-256 of chunk `uploaded` persisted before encrypting it (`encrypted == uploaded + 1`),
+    /// passed to `Upload::resume_with_digests` so resumed uploads verify exact plaintext identity.
+    #[prost(bytes = "vec", tag = "15")]
+    pub sealed_chunk_hash: Vec<u8>,
 }
 
 impl PendingUpload {
     /// Whether its upload started, so that the server has it, under its ID.
     pub fn started(&self) -> bool {
-        !self.token.is_empty()
+        match self.upload_state {
+            UPLOAD_STATE_WAITING => false,
+            UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED => !self.token.is_empty(),
+            _ => !self.token.is_empty(),
+        }
+    }
+
+    /// Whether the server-assigned attachment pointer has been durably announced in chat history.
+    pub fn is_announced(&self) -> bool {
+        match self.upload_state {
+            UPLOAD_STATE_WAITING | UPLOAD_STATE_STARTED => false,
+            UPLOAD_STATE_ANNOUNCED => true,
+            _ => self.announced && !self.token.is_empty(),
+        }
     }
 
     fn clear_secrets(&mut self) {
         self.token.zeroize();
         self.key.zeroize();
+        self.prefix_hash.zeroize();
+        self.sealed_chunk_hash.zeroize();
     }
 }
 
@@ -1287,6 +1345,48 @@ impl Vault {
         let name = upload_key(peer, &upload.id);
         let sealed = self.seal(&name, upload);
         self.write_upload(&name, Some(&sealed)).await
+    }
+
+    /// Atomically promote a waiting sign-in upload (`old_id`) into a server-started `new_upload`
+    /// together with the updated `state`, `deferred`, `entries`, and `outgoing` in a single
+    /// IndexedDB RW transaction (preventing orphaned uploads or stale placeholder pointers on crash).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn promote_upload<'a>(
+        &self,
+        state: &AppState,
+        deferred: &DeferredInitialsRecord,
+        peer: &PublicKey,
+        old_id: &[u8],
+        new_upload: &PendingUpload,
+        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+    ) -> Result<()> {
+        let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
+        let next_header = trusted.next_revision()?;
+        let next_header_bytes = next_header.encode_to_vec();
+        let sealed_state = self.seal_with_aad(&state_v2_aad(&next_header_bytes), state);
+        let new_name = upload_key(peer, &new_upload.id);
+        let sealed_upload = self.seal(&new_name, new_upload);
+        let old_name = upload_key(peer, old_id);
+        let write_res: Result<()> = (|| {
+            store.put(&bytes(&sealed_upload), Some(&new_name.as_str().into()))?;
+            if old_name != new_name {
+                store.delete(JsValue::from_str(&old_name))?;
+            }
+            self.put_entries(&store, entries)?;
+            self.put_outgoing(&store, outgoing)?;
+            self.put_deferred_initials(&store, deferred)?;
+            store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
+            store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
+            Ok(())
+        })();
+        if let Err(e) = write_res {
+            let _ = transaction.abort();
+            return Err(e);
+        }
+        commit(transaction).await?;
+        *self.header.borrow_mut() = next_header;
+        Ok(())
     }
 
     /// Forget the upload once cancelled or deleted from the server.
