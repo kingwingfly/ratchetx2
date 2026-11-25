@@ -49,7 +49,9 @@ jobs:
         with:
           persist-credentials: false
 
+      # `verify` already ran clippy, tests, docs, and `cargo publish --dry-run` credential-free;
+      # `--no-verify` avoids executing any build scripts or proc-macros with CARGO_REGISTRY_TOKEN set.
       - name: Publish ratchetx2
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO }}
-        run: .github/scripts/publish.sh ratchetx2
+        run: .github/scripts/publish.sh ratchetx2 --no-verify

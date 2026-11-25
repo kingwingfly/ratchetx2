@@ -3,12 +3,13 @@ set -euo pipefail
 
 export TERM="${TERM:-xterm-256color}"
 
-if [ "$#" -ne 1 ] || [ -z "$1" ]; then
-    echo "Usage: $0 <crate-name>" >&2
+if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+    echo "Usage: $0 <crate-name> [cargo-publish-args...]" >&2
     exit 2
 fi
 
 crate="$1"
+shift
 
 YELLOW=""
 RESET=""
@@ -23,4 +24,4 @@ run() {
     echo
 }
 
-run cargo publish --locked -p "$crate"
+run cargo publish --locked -p "$crate" "$@"
