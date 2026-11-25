@@ -1,16 +1,15 @@
 //! The v2 handshake, idempotent mailbox, and attachment stores over the Worker's Durable Objects,
 //! with large message contents and attachments' chunks in R2.
 //!
-//! Each store method is one call of one object, which serves it whole, so it is atomic, as the
-//! storage traits require. Large contents go to R2 before the DO append call; on an ambiguous DO
-//! RPC error the R2 object is intentionally NOT deleted (relying on R2 lifecycle/GC) so a committed
-//! message row can never be left pointing at a deleted blob. Only a definitive pre-commit
-//! rejection (`AppendOutcome::LimitExceeded`) deletes the staged R2 object.
+//! Each store method is one typed call of one object, which serves it whole, so it is atomic, as
+//! the storage traits require. Large contents go to R2 before the DO append call; on an ambiguous
+//! DO RPC error the R2 object is intentionally NOT deleted (relying on R2 lifecycle/GC) so a
+//! committed message row can never be left pointing at a deleted blob. Only a definitive
+//! pre-commit rejection (`AppendOutcome::LimitExceeded`) deletes the staged R2 object.
 
 use futures_util::{StreamExt, TryStreamExt, stream};
-use serde::de::DeserializeOwned;
 use storage::{
-    AttachmentId, Bytes, ClaimedPqBundle, Error, ErrorKind, LocalAttachmentStore,
+    AttachmentId, Bytes, ClaimOutcome, ClaimedPqBundle, Error, ErrorKind, LocalAttachmentStore,
     LocalIdempotentMailboxStore, LocalPqHandshakeStore, MAX_SAFE_INTEGER, PqLastResortCommitment,
     PqStorageSnapshot, PublicKey, PublishV2Record, PublishV2Status, RefillPrekeysRecord,
     RefillStatus, Result, StoredAttachment, StoredCapabilityManifest, StoredInitialMessageV2,
@@ -19,9 +18,9 @@ use storage::{
 use worker::{Bucket, Conditional, Env, console_error};
 
 use crate::objects::{
-    self, AppendOutcome, AttachmentCall, AttachmentRow, ClaimedBundleWire, Content, IdentityCall,
-    InitialMessageV2Wire, ManifestWire, PqCommitmentWire, PqPrekeyWire, PqSnapshotWire,
-    PublishV2Outcome, RefillOutcome, StoredRow,
+    self, AppendOutcome, AttachmentRpc, ClaimBundleOutcome, ClaimedBundleWire, Content,
+    IdentityRpc, InitialMessageV2Wire, ManifestWire, PqCommitmentWire, PqPrekeyWire,
+    PublishV2Outcome, RefillOutcome, rpc,
 };
 
 /// Contents larger than this go to R2; smaller ones stay in their object's row.
@@ -48,22 +47,18 @@ impl Store {
         })
     }
 
-    /// Make `call` of the object of `identity_key`.
-    async fn identity<T: DeserializeOwned>(
-        &self,
-        identity_key: &[u8],
-        call: &IdentityCall,
-    ) -> Result<T> {
+    /// Make typed `call` of the object of `identity_key`.
+    async fn identity<R: IdentityRpc>(&self, identity_key: &[u8], call: R) -> Result<R::Reply> {
         let stub = objects::identity(&self.env, identity_key).map_err(unavailable)?;
         objects::call(&stub, call).await.map_err(unavailable)
     }
 
-    /// Make `call` of the object of the attachment `id`.
-    async fn attachment_call<T: DeserializeOwned>(
+    /// Make typed `call` of the object of the attachment `id`.
+    async fn attachment_call<R: AttachmentRpc>(
         &self,
         id: &AttachmentId,
-        call: &AttachmentCall,
-    ) -> Result<T> {
+        call: R,
+    ) -> Result<R::Reply> {
         let stub = objects::attachment(&self.env, id).map_err(unavailable)?;
         objects::call(&stub, call).await.map_err(unavailable)
     }
@@ -98,7 +93,7 @@ impl Store {
                 "messages/{}/{}/{}",
                 hex(sender),
                 hex(recipient),
-                random_id()
+                random_id()?
             );
             self.bucket
                 .put(&object, content.to_vec())
@@ -136,6 +131,44 @@ impl Store {
             // committed the row before the response failed. R2 lifecycle rules GC true orphans.
             Err(e) => Err(e),
         }
+    }
+
+    async fn read_with_cap(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+        max_size: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let rows = self
+            .identity(
+                recipient,
+                rpc::Read {
+                    sender: sender.to_vec(),
+                    after,
+                    limit,
+                    max_size: max_size as u64,
+                },
+            )
+            .await?;
+        stream::iter(rows.into_iter().map(|row| async move {
+            let content = match row.content {
+                Content::Inline(content) => Some(Bytes::from(content)),
+                Content::Object(object) => self.object(&object).await?,
+            };
+            Ok(StoredMessage {
+                sender: *sender,
+                recipient: *recipient,
+                sequence: row.sequence,
+                header: Bytes::from(row.header),
+                content,
+                initial_message: row.initial_message.map(Bytes::from),
+            })
+        }))
+        .buffered(6)
+        .try_collect()
+        .await
     }
 }
 
@@ -217,6 +250,28 @@ fn pq_prekey_from_wire(wire: PqPrekeyWire) -> Result<StoredPqPrekey> {
     })
 }
 
+fn claimed_bundle_from_wire(
+    identity_key: &PublicKey,
+    wire: ClaimedBundleWire,
+) -> Result<ClaimedPqBundle> {
+    Ok(ClaimedPqBundle {
+        identity_key: *identity_key,
+        manifest: wire.manifest.map(manifest_from_wire).transpose()?,
+        signed_prekey: fixed(&wire.signed_prekey)?,
+        signed_prekey_signature: wire
+            .signed_prekey_signature
+            .as_deref()
+            .map(fixed)
+            .transpose()?,
+        one_time_prekey: wire.one_time_prekey.as_deref().map(fixed).transpose()?,
+        pq_last_resort: wire.pq_last_resort.map(pq_prekey_from_wire).transpose()?,
+        pq_one_time_prekey: wire
+            .pq_one_time_prekey
+            .map(pq_prekey_from_wire)
+            .transpose()?,
+    })
+}
+
 impl LocalPqHandshakeStore for Store {
     async fn publish_v2(&self, record: PublishV2Record) -> Result<PublishV2Status> {
         check_safe(record.timestamp)?;
@@ -224,23 +279,27 @@ impl LocalPqHandshakeStore for Store {
         check_safe(record.manifest.generation)?;
         check_safe(record.manifest.issued_at)?;
         check_safe(record.manifest.expires_at)?;
-        let call = IdentityCall::PublishV2 {
-            manifest: manifest_to_wire(&record.manifest),
-            signed_prekey_signature: record.signed_prekey_signature.map(|s| s.to_vec()),
-            one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
-            pq_last_resort: record
-                .pq_last_resort
-                .iter()
-                .map(pq_prekey_to_wire)
-                .collect(),
-            pq_one_time_prekeys: record
-                .pq_one_time_prekeys
-                .iter()
-                .map(pq_prekey_to_wire)
-                .collect(),
-            timestamp: record.timestamp,
-        };
-        let outcome: PublishV2Outcome = self.identity(&record.manifest.identity_key, &call).await?;
+        let outcome = self
+            .identity(
+                &record.manifest.identity_key,
+                rpc::PublishV2 {
+                    manifest: manifest_to_wire(&record.manifest),
+                    signed_prekey_signature: record.signed_prekey_signature.map(|s| s.to_vec()),
+                    one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
+                    pq_last_resort: record
+                        .pq_last_resort
+                        .iter()
+                        .map(pq_prekey_to_wire)
+                        .collect(),
+                    pq_one_time_prekeys: record
+                        .pq_one_time_prekeys
+                        .iter()
+                        .map(pq_prekey_to_wire)
+                        .collect(),
+                    timestamp: record.timestamp,
+                },
+            )
+            .await?;
         Ok(match outcome {
             PublishV2Outcome::Stored => PublishV2Status::Stored,
             PublishV2Outcome::StaleSequence => PublishV2Status::StaleSequence,
@@ -251,45 +310,51 @@ impl LocalPqHandshakeStore for Store {
     async fn refill_prekeys(&self, record: RefillPrekeysRecord) -> Result<RefillStatus> {
         check_safe(record.generation)?;
         check_safe(record.timestamp)?;
-        let call = IdentityCall::RefillPrekeys {
-            generation: record.generation,
-            one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
-            pq_one_time_prekeys: record
-                .pq_one_time_prekeys
-                .iter()
-                .map(pq_prekey_to_wire)
-                .collect(),
-            max_one_time_prekeys: record.max_one_time_prekeys as u64,
-            max_pq_one_time_prekeys: record.max_pq_one_time_prekeys as u64,
-            timestamp: record.timestamp,
-        };
-        let outcome: RefillOutcome = self.identity(&record.identity_key, &call).await?;
-        Ok(match outcome {
+        let outcome = self
+            .identity(
+                &record.identity_key,
+                rpc::RefillPrekeys {
+                    generation: record.generation,
+                    one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
+                    pq_one_time_prekeys: record
+                        .pq_one_time_prekeys
+                        .iter()
+                        .map(pq_prekey_to_wire)
+                        .collect(),
+                    max_one_time_prekeys: record.max_one_time_prekeys as u64,
+                    max_pq_one_time_prekeys: record.max_pq_one_time_prekeys as u64,
+                    timestamp: record.timestamp,
+                },
+            )
+            .await?;
+        match outcome {
             RefillOutcome::Stored {
                 classical_count,
                 pq_counts,
-            } => RefillStatus::Stored {
+            } => Ok(RefillStatus::Stored {
                 classical_count: classical_count as usize,
                 pq_counts: pq_counts
                     .into_iter()
                     .map(|(suite, count)| (suite, count as usize))
                     .collect(),
-            },
-            RefillOutcome::NotFound => RefillStatus::NotFound,
-            RefillOutcome::StaleGeneration => RefillStatus::StaleGeneration,
-            RefillOutcome::StaleTimestamp => RefillStatus::StaleTimestamp,
-            RefillOutcome::DuplicatePrekey => RefillStatus::DuplicatePrekey,
-            RefillOutcome::LimitExceeded => RefillStatus::LimitExceeded,
-        })
+            }),
+            RefillOutcome::NotFound => Ok(RefillStatus::NotFound),
+            RefillOutcome::StaleGeneration => Ok(RefillStatus::StaleGeneration),
+            RefillOutcome::StaleTimestamp => Ok(RefillStatus::StaleTimestamp),
+            RefillOutcome::DuplicatePrekey => Ok(RefillStatus::DuplicatePrekey),
+            RefillOutcome::LimitExceeded => Ok(RefillStatus::LimitExceeded),
+            RefillOutcome::SuiteNotOffered => Err(Error::new(
+                ErrorKind::InvalidArgument,
+                "PQ suite not offered by current manifest",
+            )),
+        }
     }
 
     async fn get_manifest(
         &self,
         identity_key: &PublicKey,
     ) -> Result<Option<StoredCapabilityManifest>> {
-        let wire: Option<ManifestWire> = self
-            .identity(identity_key, &IdentityCall::GetManifest)
-            .await?;
+        let wire = self.identity(identity_key, rpc::GetManifest).await?;
         wire.map(manifest_from_wire).transpose()
     }
 
@@ -298,33 +363,39 @@ impl LocalPqHandshakeStore for Store {
         identity_key: &PublicKey,
         preferred_suites: &[u8],
     ) -> Result<Option<ClaimedPqBundle>> {
-        let wire: Option<ClaimedBundleWire> = self
+        match self
+            .claim_bundle_checked(identity_key, preferred_suites, false)
+            .await?
+        {
+            ClaimOutcome::Claimed(bundle) => Ok(Some(*bundle)),
+            ClaimOutcome::NotFound | ClaimOutcome::PqDisabledForPqManifest => Ok(None),
+        }
+    }
+
+    async fn claim_bundle_checked(
+        &self,
+        identity_key: &PublicKey,
+        preferred_suites: &[u8],
+        reject_pq_on_manifest: bool,
+    ) -> Result<ClaimOutcome> {
+        let outcome = self
             .identity(
                 identity_key,
-                &IdentityCall::ClaimBundle {
+                rpc::ClaimBundleChecked {
                     preferred_suites: preferred_suites.to_vec(),
+                    reject_pq_on_manifest,
                 },
             )
             .await?;
-        let Some(wire) = wire else {
-            return Ok(None);
-        };
-        Ok(Some(ClaimedPqBundle {
-            identity_key: *identity_key,
-            manifest: wire.manifest.map(manifest_from_wire).transpose()?,
-            signed_prekey: fixed(&wire.signed_prekey)?,
-            signed_prekey_signature: wire
-                .signed_prekey_signature
-                .as_deref()
-                .map(fixed)
-                .transpose()?,
-            one_time_prekey: wire.one_time_prekey.as_deref().map(fixed).transpose()?,
-            pq_last_resort: wire.pq_last_resort.map(pq_prekey_from_wire).transpose()?,
-            pq_one_time_prekey: wire
-                .pq_one_time_prekey
-                .map(pq_prekey_from_wire)
-                .transpose()?,
-        }))
+        match outcome {
+            ClaimBundleOutcome::NotFound => Ok(ClaimOutcome::NotFound),
+            ClaimBundleOutcome::PqDisabledForPqManifest => {
+                Ok(ClaimOutcome::PqDisabledForPqManifest)
+            }
+            ClaimBundleOutcome::Claimed(wire) => Ok(ClaimOutcome::Claimed(Box::new(
+                claimed_bundle_from_wire(identity_key, *wire)?,
+            ))),
+        }
     }
 
     async fn add_initial_message_v2(
@@ -332,25 +403,28 @@ impl LocalPqHandshakeStore for Store {
         initial_message: StoredInitialMessageV2,
         limit: usize,
     ) -> Result<Option<u64>> {
-        let call = IdentityCall::AddInitialMessageV2 {
-            message: InitialMessageV2Wire {
-                id: 0,
-                version: initial_message.version,
-                sender: initial_message.sender.to_vec(),
-                ephemeral_key: initial_message.ephemeral_key.to_vec(),
-                signed_prekey: initial_message.signed_prekey.to_vec(),
-                one_time_prekey: initial_message.one_time_prekey.map(|k| k.to_vec()),
-                header: initial_message.header.to_vec(),
-                content: initial_message.content.to_vec(),
-                pq_suite: initial_message.pq_suite,
-                pq_last_resort: initial_message.pq_last_resort,
-                pq_prekey_id: initial_message.pq_prekey_id.map(|id| id.to_vec()),
-                pq_ciphertext: initial_message.pq_ciphertext.map(|ct| ct.to_vec()),
-                manifest_digest: initial_message.manifest_digest.map(|d| d.to_vec()),
+        self.identity(
+            &initial_message.recipient,
+            rpc::AddInitialMessageV2 {
+                message: InitialMessageV2Wire {
+                    id: 0,
+                    version: initial_message.version,
+                    sender: initial_message.sender.to_vec(),
+                    ephemeral_key: initial_message.ephemeral_key.to_vec(),
+                    signed_prekey: initial_message.signed_prekey.to_vec(),
+                    one_time_prekey: initial_message.one_time_prekey.map(|k| k.to_vec()),
+                    header: initial_message.header.to_vec(),
+                    content: initial_message.content.to_vec(),
+                    pq_suite: initial_message.pq_suite,
+                    pq_last_resort: initial_message.pq_last_resort,
+                    pq_prekey_id: initial_message.pq_prekey_id.map(|id| id.to_vec()),
+                    pq_ciphertext: initial_message.pq_ciphertext.map(|ct| ct.to_vec()),
+                    manifest_digest: initial_message.manifest_digest.map(|d| d.to_vec()),
+                },
+                limit: limit as u64,
             },
-            limit: limit as u64,
-        };
-        self.identity(&initial_message.recipient, &call).await
+        )
+        .await
     }
 
     async fn list_initial_messages(
@@ -358,10 +432,10 @@ impl LocalPqHandshakeStore for Store {
         recipient: &PublicKey,
         limit: usize,
     ) -> Result<Vec<StoredInitialMessageV2>> {
-        let wires: Vec<InitialMessageV2Wire> = self
+        let wires = self
             .identity(
                 recipient,
-                &IdentityCall::ListInitialMessages {
+                rpc::ListInitialMessages {
                     limit: limit as u64,
                 },
             )
@@ -393,19 +467,14 @@ impl LocalPqHandshakeStore for Store {
         for &id in ids {
             check_safe(id)?;
         }
-        let deleted: u64 = self
-            .identity(
-                recipient,
-                &IdentityCall::AckInitialMessages { ids: ids.to_vec() },
-            )
+        let deleted = self
+            .identity(recipient, rpc::AckInitialMessages { ids: ids.to_vec() })
             .await?;
         Ok(deleted as usize)
     }
 
     async fn pq_snapshot(&self, identity_key: &PublicKey) -> Result<PqStorageSnapshot> {
-        let wire: PqSnapshotWire = self
-            .identity(identity_key, &IdentityCall::PqSnapshot)
-            .await?;
+        let wire = self.identity(identity_key, rpc::PqSnapshot).await?;
         Ok(PqStorageSnapshot {
             manifest: wire.manifest.map(manifest_from_wire).transpose()?,
             classical_one_time_count: wire.classical_one_time_count as usize,
@@ -432,16 +501,20 @@ impl LocalIdempotentMailboxStore for Store {
         client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
         let (staged, size) = self.stage_content(sender, recipient, content).await?;
-        let call = IdentityCall::AppendIdempotent {
-            sender: sender.to_vec(),
-            header: header.to_vec(),
-            content: staged.clone(),
-            size,
-            initial_message: initial_message.map(|bytes| bytes.to_vec()),
-            delivery_hash: delivery_hash.map(Vec::from),
-            client_message_id: client_message_id.map(Vec::from),
-        };
-        let outcome = self.identity(recipient, &call).await;
+        let outcome = self
+            .identity(
+                recipient,
+                rpc::AppendIdempotent {
+                    sender: sender.to_vec(),
+                    header: header.to_vec(),
+                    content: staged.clone(),
+                    size,
+                    initial_message: initial_message.map(|bytes| bytes.to_vec()),
+                    delivery_hash: delivery_hash.map(Vec::from),
+                    client_message_id: client_message_id.map(Vec::from),
+                },
+            )
+            .await;
         self.finish_append(outcome, &staged).await
     }
 
@@ -455,24 +528,14 @@ impl LocalIdempotentMailboxStore for Store {
             return Ok(());
         }
         let hashes: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.to_vec()).collect();
-        let call = IdentityCall::DeliveredObjects {
-            sender: sender.to_vec(),
-            hashes: hashes.clone(),
-        };
-        let objects: Vec<String> = self.identity(recipient, &call).await?;
-        let objects = match delete_objects(&self.bucket, objects.clone()).await {
-            Ok(()) => objects,
-            Err(e) => {
-                console_error!("cannot delete the objects of delivered messages: {e}");
-                vec![]
-            }
-        };
-        let call = IdentityCall::DeleteDelivered {
-            sender: sender.to_vec(),
-            hashes,
-            objects,
-        };
-        self.identity(recipient, &call).await
+        self.identity(
+            recipient,
+            rpc::DeleteDeliveredAtomic {
+                sender: sender.to_vec(),
+                hashes,
+            },
+        )
+        .await
     }
 
     async fn read(
@@ -482,46 +545,45 @@ impl LocalIdempotentMailboxStore for Store {
         after: u64,
         limit: u32,
     ) -> Result<Vec<StoredMessage>> {
-        let call = IdentityCall::Read {
-            sender: sender.to_vec(),
+        self.read_with_cap(sender, recipient, after, limit, self.max_read_size)
+            .await
+    }
+
+    async fn read_bounded(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+        max_size: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        self.read_with_cap(
+            sender,
+            recipient,
             after,
             limit,
-            max_size: self.max_read_size as u64,
-        };
-        let rows: Vec<StoredRow> = self.identity(recipient, &call).await?;
-        stream::iter(rows.into_iter().map(|row| async move {
-            let content = match row.content {
-                Content::Inline(content) => Some(Bytes::from(content)),
-                Content::Object(object) => self.object(&object).await?,
-            };
-            Ok(StoredMessage {
-                sender: *sender,
-                recipient: *recipient,
-                sequence: row.sequence,
-                header: Bytes::from(row.header),
-                content,
-                initial_message: row.initial_message.map(Bytes::from),
-            })
-        }))
-        .buffered(6)
-        .try_collect()
+            max_size.min(self.max_read_size),
+        )
         .await
     }
 }
 
 impl LocalAttachmentStore for Store {
     async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool> {
-        let call = AttachmentCall::Add {
-            id: attachment.id.to_vec(),
-            chunks: attachment.chunks,
-            token_hash: attachment.token_hash.to_vec(),
-            delete_hash: attachment.delete_hash.to_vec(),
-        };
-        self.attachment_call(&attachment.id, &call).await
+        self.attachment_call(
+            &attachment.id,
+            rpc::AddAttachment {
+                id: attachment.id.to_vec(),
+                chunks: attachment.chunks,
+                token_hash: attachment.token_hash.to_vec(),
+                delete_hash: attachment.delete_hash.to_vec(),
+            },
+        )
+        .await
     }
 
     async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>> {
-        let row: Option<AttachmentRow> = self.attachment_call(id, &AttachmentCall::Get).await?;
+        let row = self.attachment_call(id, rpc::GetAttachment).await?;
         row.map(|row| {
             Ok(StoredAttachment {
                 id: fixed(&row.id)?,
@@ -546,9 +608,7 @@ impl LocalAttachmentStore for Store {
             .execute()
             .await
             .map_err(unavailable)?;
-        let noted: bool = self
-            .attachment_call(id, &AttachmentCall::Note { index })
-            .await?;
+        let noted = self.attachment_call(id, rpc::NoteChunk { index }).await?;
         if !noted {
             self.bucket.delete(&object).await.map_err(unavailable)?;
             return Err(Error::new(ErrorKind::Other, "the attachment was deleted"));
@@ -561,7 +621,7 @@ impl LocalAttachmentStore for Store {
     }
 
     async fn delete_attachment(&self, id: &AttachmentId) -> Result<()> {
-        self.attachment_call(id, &AttachmentCall::Delete).await
+        self.attachment_call(id, rpc::DeleteAttachment).await
     }
 }
 
@@ -578,9 +638,15 @@ pub(crate) async fn delete_objects(bucket: &Bucket, objects: Vec<String>) -> wor
     Ok(())
 }
 
-/// Lowercase hex.
+/// Pre-sized lowercase hex encoder with zero intermediate allocations.
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(LUT[(byte >> 4) as usize] as char);
+        out.push(LUT[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 pub(crate) fn decode_hex_fixed<const N: usize>(hex: &str) -> Option<[u8; N]> {
@@ -597,26 +663,31 @@ pub(crate) fn decode_hex_fixed<const N: usize>(hex: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-/// A random name, for an R2 object.
-fn random_id() -> String {
+/// A random 128-bit hex identifier for an R2 object.
+fn random_id() -> Result<String> {
     let mut bytes = [0; 16];
-    getrandom::fill(&mut bytes).expect("crypto.getRandomValues is available in Workers");
-    hex(&bytes)
+    getrandom::fill(&mut bytes).map_err(|e| {
+        console_error!("RNG failed generating R2 object ID: {e}");
+        Error::new(ErrorKind::Unavailable, "storage temporarily unavailable")
+    })?;
+    Ok(hex(&bytes))
 }
 
 /// A stored key or signature of `N` bytes.
 fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     bytes.try_into().map_err(|_| {
-        let error = format!("a stored key of {} bytes, not {N}", bytes.len());
-        console_error!("{error}");
-        Error::new(ErrorKind::Corrupt, error)
+        console_error!(
+            "corrupt stored key length: {} bytes, expected {N}",
+            bytes.len()
+        );
+        Error::new(ErrorKind::Corrupt, "corrupt stored record")
     })
 }
 
-/// A failed object or R2 call, logged, since clients only learn that the storage failed.
+/// A failed object or R2 call, logged internally while returning a generic message to clients.
 fn unavailable(error: worker::Error) -> Error {
     console_error!("storage failed: {error}");
-    Error::new(ErrorKind::Unavailable, error.to_string())
+    Error::new(ErrorKind::Unavailable, "storage temporarily unavailable")
 }
 
 #[cfg(test)]
@@ -624,7 +695,18 @@ mod tests {
     use super::{decode_hex_fixed, hex};
 
     #[test]
-    fn fixed_hex_decodes_keys_and_signatures() {
+    fn hex_encodes_all_byte_values_and_round_trips() {
+        assert_eq!(hex(&[]), "");
+        let all_bytes: [u8; 256] = std::array::from_fn(|i| i as u8);
+        let encoded = hex(&all_bytes);
+        assert_eq!(encoded.len(), 512);
+        assert!(
+            encoded
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        );
+        assert_eq!(decode_hex_fixed::<256>(&encoded), Some(all_bytes));
+
         let key = std::array::from_fn(|i| i as u8);
         assert_eq!(decode_hex_fixed::<32>(&hex(&key)), Some(key));
         assert_eq!(decode_hex_fixed::<64>(&"aB".repeat(64)), Some([0xab; 64]));

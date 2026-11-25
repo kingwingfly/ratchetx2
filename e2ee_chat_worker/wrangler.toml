@@ -4,10 +4,10 @@ compatibility_date = "2026-10-01"
 workers_dev = true
 preview_urls = false
 
-# Builds the web client into ../e2ee_chat_web/dist, then the Worker, passing WORKER_BUILD_ARGS
-# on to cargo, e.g. "--features conformance".
+# Builds the web client into ../e2ee_chat_web/dist, then the Worker.
+# Never splice ambient env vars here so `--features conformance` cannot leak into a deploy.
 [build]
-command = "cd ../e2ee_chat_web && trunk build --release && cd ../e2ee_chat_worker && worker-build --release $WORKER_BUILD_ARGS"
+command = "cd ../e2ee_chat_web && trunk build --release && cd ../e2ee_chat_worker && worker-build --release"
 watch_dir = ["src", "../e2ee_chat_web/src", "../e2ee_chat_web/index.html", "../e2ee_chat_web/style.css", "../e2ee_chat_web/_headers", "../e2ee_chat_preview/src"]
 
 # The web client. Files are served before the Worker runs; other paths, such as the Connect

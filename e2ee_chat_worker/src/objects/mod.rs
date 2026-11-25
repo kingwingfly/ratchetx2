@@ -6,20 +6,21 @@
 
 mod attachment;
 mod identity;
+pub(super) mod sql;
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use storage::MAX_SAFE_INTEGER;
 use worker::{
     Env, Error, Method, ObjectNamespace, Request, RequestInit, Response, Result, ScheduledTime,
-    SqlStorage, SqlStorageValue, Stub,
+    SqlStorage, Stub, console_error,
     js_sys::{self, Uint8Array},
 };
 
 pub use attachment::{Attachment, DEFAULT_FILE_RETENTION_DAYS};
 pub use identity::{
-    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SUBSCRIBE_AUDIENCE,
-    HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS, Identity,
+    HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SESSION_EXPIRES,
+    HEADER_SUBSCRIBE_AUDIENCE, HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS, Identity,
 };
+use sql::{params, query_one};
 
 /// The binding of the identities' namespace.
 const IDENTITIES: &str = "IDENTITIES";
@@ -47,6 +48,20 @@ fn stub(namespace: &ObjectNamespace, key: &[u8]) -> Result<Stub> {
     namespace.id_from_name(&crate::hex(key))?.get_stub()
 }
 
+/// Typed Durable Object RPC binding each request type to its exact reply type so postcard
+/// deserialization can never silently decode the wrong reply schema.
+pub trait RpcCall: Sized {
+    type Reply: Serialize + DeserializeOwned;
+
+    fn encode(self) -> Result<Vec<u8>>;
+}
+
+/// Marker for RPCs routed to an [`Identity`] Durable Object.
+pub trait IdentityRpc: RpcCall {}
+
+/// Marker for RPCs routed to an [`Attachment`] Durable Object.
+pub trait AttachmentRpc: RpcCall {}
+
 /// Outcome of an [`IdentityCall::AppendIdempotent`], distinguishing a definitive pre-commit
 /// rejection (safe to delete a staged R2 blob) from an ambiguous RPC error (must NOT delete the
 /// R2 blob).
@@ -56,8 +71,185 @@ pub enum AppendOutcome {
     Appended(u64),
     /// Deduplicated against a previously committed `client_message_id` (newly staged blob unused).
     Deduplicated(u64),
-    /// Rejected before commit because the per-queue row or byte quota would be exceeded.
+    /// Rejected before commit because per-queue or per-recipient row/byte quotas would be exceeded.
     LimitExceeded,
+}
+
+/// Typed request payloads for [`IdentityCall`] and [`AttachmentCall`].
+///
+/// Using newtype enum variants in [`IdentityCall`] and [`AttachmentCall`] keeps postcard wire
+/// encoding byte-for-byte identical to flat struct variants while statically associating each RPC
+/// with its exact reply type via [`RpcCall`].
+pub mod rpc {
+    use serde::{Deserialize, Serialize};
+
+    use super::{
+        AppendOutcome, AttachmentCall, AttachmentRow, AttachmentRpc, ClaimBundleOutcome,
+        ClaimedBundleWire, Content, IdentityCall, IdentityRpc, InitialMessageV2Wire, ManifestWire,
+        PqPrekeyWire, PqSnapshotWire, PublishV2Outcome, RefillOutcome, RpcCall, StoredRow,
+    };
+    use worker::{Error, Result};
+
+    fn encode_wire(value: &impl Serialize) -> Result<Vec<u8>> {
+        postcard::to_allocvec(value).map_err(|e| Error::RustError(e.to_string()))
+    }
+
+    macro_rules! impl_identity_rpc {
+        ($req:ident => $variant:ident, Reply = $reply:ty) => {
+            impl RpcCall for $req {
+                type Reply = $reply;
+
+                fn encode(self) -> Result<Vec<u8>> {
+                    encode_wire(&IdentityCall::$variant(self))
+                }
+            }
+
+            impl IdentityRpc for $req {}
+        };
+    }
+
+    macro_rules! impl_attachment_rpc {
+        ($req:ident => $variant:ident, Reply = $reply:ty) => {
+            impl RpcCall for $req {
+                type Reply = $reply;
+
+                fn encode(self) -> Result<Vec<u8>> {
+                    encode_wire(&AttachmentCall::$variant(self))
+                }
+            }
+
+            impl AttachmentRpc for $req {}
+        };
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct Read {
+        pub sender: Vec<u8>,
+        pub after: u64,
+        pub limit: u32,
+        pub max_size: u64,
+    }
+    impl_identity_rpc!(Read => Read, Reply = Vec<StoredRow>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct DeliveredObjects {
+        pub sender: Vec<u8>,
+        pub hashes: Vec<Vec<u8>>,
+    }
+    impl_identity_rpc!(DeliveredObjects => DeliveredObjects, Reply = Vec<String>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct DeleteDelivered {
+        pub sender: Vec<u8>,
+        pub hashes: Vec<Vec<u8>>,
+        pub objects: Vec<String>,
+    }
+    impl_identity_rpc!(DeleteDelivered => DeleteDelivered, Reply = ());
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct PublishV2 {
+        pub manifest: ManifestWire,
+        pub signed_prekey_signature: Option<Vec<u8>>,
+        pub one_time_prekeys: Vec<Vec<u8>>,
+        pub pq_last_resort: Vec<PqPrekeyWire>,
+        pub pq_one_time_prekeys: Vec<PqPrekeyWire>,
+        pub timestamp: u64,
+    }
+    impl_identity_rpc!(PublishV2 => PublishV2, Reply = PublishV2Outcome);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct RefillPrekeys {
+        pub generation: u64,
+        pub one_time_prekeys: Vec<Vec<u8>>,
+        pub pq_one_time_prekeys: Vec<PqPrekeyWire>,
+        pub max_one_time_prekeys: u64,
+        pub max_pq_one_time_prekeys: u64,
+        pub timestamp: u64,
+    }
+    impl_identity_rpc!(RefillPrekeys => RefillPrekeys, Reply = RefillOutcome);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct GetManifest;
+    impl_identity_rpc!(GetManifest => GetManifest, Reply = Option<ManifestWire>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct ClaimBundle {
+        pub preferred_suites: Vec<u8>,
+    }
+    impl_identity_rpc!(ClaimBundle => ClaimBundle, Reply = Option<ClaimedBundleWire>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct AddInitialMessageV2 {
+        pub message: InitialMessageV2Wire,
+        pub limit: u64,
+    }
+    impl_identity_rpc!(AddInitialMessageV2 => AddInitialMessageV2, Reply = Option<u64>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct ListInitialMessages {
+        pub limit: u64,
+    }
+    impl_identity_rpc!(ListInitialMessages => ListInitialMessages, Reply = Vec<InitialMessageV2Wire>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct AckInitialMessages {
+        pub ids: Vec<u64>,
+    }
+    impl_identity_rpc!(AckInitialMessages => AckInitialMessages, Reply = u64);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct PqSnapshot;
+    impl_identity_rpc!(PqSnapshot => PqSnapshot, Reply = PqSnapshotWire);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct AppendIdempotent {
+        pub sender: Vec<u8>,
+        pub header: Vec<u8>,
+        pub content: Content,
+        /// The content's length, wherever it is.
+        pub size: u64,
+        pub initial_message: Option<Vec<u8>>,
+        pub delivery_hash: Option<Vec<u8>>,
+        pub client_message_id: Option<Vec<u8>>,
+    }
+    impl_identity_rpc!(AppendIdempotent => AppendIdempotent, Reply = AppendOutcome);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct ClaimBundleChecked {
+        pub preferred_suites: Vec<u8>,
+        pub reject_pq_on_manifest: bool,
+    }
+    impl_identity_rpc!(ClaimBundleChecked => ClaimBundleChecked, Reply = ClaimBundleOutcome);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct DeleteDeliveredAtomic {
+        pub sender: Vec<u8>,
+        pub hashes: Vec<Vec<u8>>,
+    }
+    impl_identity_rpc!(DeleteDeliveredAtomic => DeleteDeliveredAtomic, Reply = ());
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct AddAttachment {
+        pub id: Vec<u8>,
+        pub chunks: u32,
+        pub token_hash: Vec<u8>,
+        pub delete_hash: Vec<u8>,
+    }
+    impl_attachment_rpc!(AddAttachment => Add, Reply = bool);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct GetAttachment;
+    impl_attachment_rpc!(GetAttachment => Get, Reply = Option<AttachmentRow>);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct NoteChunk {
+        pub index: u32,
+    }
+    impl_attachment_rpc!(NoteChunk => Note, Reply = bool);
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct DeleteAttachment;
+    impl_attachment_rpc!(DeleteAttachment => Delete, Reply = ());
 }
 
 /// What the Worker asks of an [`Identity`], about its identity's keys, inbox and the queues of
@@ -65,7 +257,7 @@ pub enum AppendOutcome {
 ///
 /// The five retired legacy v1 slots at tags `0..=4` are intentionally reserved so every surviving
 /// variant keeps its exact original postcard wire tag index (`5..=16`) during rolling deploys
-/// between older and newer Worker / Durable Object versions.
+/// between older and newer Worker / Durable Object versions. New calls append at `17+`.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum IdentityCall {
     /// Retired legacy v1 `Publish` slot (tag `0`), preserved for rolling-deploy wire compatibility.
@@ -83,70 +275,34 @@ pub enum IdentityCall {
     /// Retired legacy v1 `Append` slot (tag `4`), preserved for rolling-deploy wire compatibility.
     #[allow(dead_code)]
     RetiredAppendV1,
-    /// The messages of the queue from `sender` after `after`, at most `limit`, and at most
-    /// `max_size` bytes (header + initial_message + content) but for the first.
-    Read {
-        sender: Vec<u8>,
-        after: u64,
-        limit: u32,
-        max_size: u64,
-    },
-    /// The R2 objects of the messages from `sender` whose delivery hashes are among `hashes`.
-    DeliveredObjects {
-        sender: Vec<u8>,
-        hashes: Vec<Vec<u8>>,
-    },
-    /// Delete the messages from `sender` whose delivery hashes are among `hashes`: those without
-    /// R2 objects, and those whose objects are among `objects`, which went.
-    DeleteDelivered {
-        sender: Vec<u8>,
-        hashes: Vec<Vec<u8>>,
-        objects: Vec<String>,
-    },
-    /// Atomically publish a signed v2 CapabilityManifest and classical + PQ prekeys.
-    PublishV2 {
-        manifest: ManifestWire,
-        signed_prekey_signature: Option<Vec<u8>>,
-        one_time_prekeys: Vec<Vec<u8>>,
-        pq_last_resort: Vec<PqPrekeyWire>,
-        pq_one_time_prekeys: Vec<PqPrekeyWire>,
-        timestamp: u64,
-    },
-    /// Append classical OPKs and/or signed PQOPKs to the current generation without rotating SPK.
-    RefillPrekeys {
-        generation: u64,
-        one_time_prekeys: Vec<Vec<u8>>,
-        pq_one_time_prekeys: Vec<PqPrekeyWire>,
-        max_one_time_prekeys: u64,
-        max_pq_one_time_prekeys: u64,
-        timestamp: u64,
-    },
-    /// Non-consuming read of the stored CapabilityManifest.
-    GetManifest,
-    /// Atomically claim a bundle with preferred PQ suites (or classical fallback).
-    ClaimBundle { preferred_suites: Vec<u8> },
-    /// Insert a v1 or v2 initial message into the inbox, returning `Option<u64>` assigned ID.
-    AddInitialMessageV2 {
-        message: InitialMessageV2Wire,
-        limit: u64,
-    },
-    /// Non-destructively list up to `limit` pending initial messages (both v1 and v2).
-    ListInitialMessages { limit: u64 },
-    /// Delete only the specified initial message IDs, returning count deleted.
-    AckInitialMessages { ids: Vec<u64> },
-    /// Diagnostic snapshot of v2 PQ storage state.
-    PqSnapshot,
-    /// Idempotent append to the queue from `sender`. Answers [`AppendOutcome`].
-    AppendIdempotent {
-        sender: Vec<u8>,
-        header: Vec<u8>,
-        content: Content,
-        /// The content's length, wherever it is.
-        size: u64,
-        initial_message: Option<Vec<u8>>,
-        delivery_hash: Option<Vec<u8>>,
-        client_message_id: Option<Vec<u8>>,
-    },
+    /// Tag `5`: read queue messages after `after`, bounded by `limit` and `max_size`.
+    Read(rpc::Read),
+    /// Tag `6`: legacy rolling-deploy helper returning R2 object keys for delivered hashes.
+    DeliveredObjects(rpc::DeliveredObjects),
+    /// Tag `7`: legacy rolling-deploy helper deleting delivered rows after Worker R2 deletion.
+    DeleteDelivered(rpc::DeleteDelivered),
+    /// Tag `8`: atomically publish a signed v2 CapabilityManifest and classical + PQ prekeys.
+    PublishV2(rpc::PublishV2),
+    /// Tag `9`: append classical OPKs and/or signed PQOPKs to the current generation.
+    RefillPrekeys(rpc::RefillPrekeys),
+    /// Tag `10`: non-consuming read of the stored CapabilityManifest.
+    GetManifest(rpc::GetManifest),
+    /// Tag `11`: legacy rolling-deploy bundle claim without `reject_pq_on_manifest`.
+    ClaimBundle(rpc::ClaimBundle),
+    /// Tag `12`: insert a v1 or v2 initial message into the inbox.
+    AddInitialMessageV2(rpc::AddInitialMessageV2),
+    /// Tag `13`: non-destructively list up to `limit` pending initial messages.
+    ListInitialMessages(rpc::ListInitialMessages),
+    /// Tag `14`: delete specified initial message IDs, returning count deleted.
+    AckInitialMessages(rpc::AckInitialMessages),
+    /// Tag `15`: diagnostic snapshot of v2 PQ storage state.
+    PqSnapshot(rpc::PqSnapshot),
+    /// Tag `16`: idempotent append to the queue from `sender`.
+    AppendIdempotent(rpc::AppendIdempotent),
+    /// Tag `17`: atomically validate policy and claim a bundle.
+    ClaimBundleChecked(rpc::ClaimBundleChecked),
+    /// Tag `18`: atomically delete delivered queue rows and durably enqueue R2 object deletes.
+    DeleteDeliveredAtomic(rpc::DeleteDeliveredAtomic),
 }
 
 /// A message's content: in its row, or in R2 under a name.
@@ -214,6 +370,15 @@ pub enum RefillOutcome {
     StaleTimestamp,
     DuplicatePrekey,
     LimitExceeded,
+    /// PQ prekeys were supplied for a non-PQ manifest or an unoffered suite.
+    SuiteNotOffered,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum ClaimBundleOutcome {
+    NotFound,
+    PqDisabledForPqManifest,
+    Claimed(Box<ClaimedBundleWire>),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -255,19 +420,14 @@ pub struct PqSnapshotWire {
 /// What the Worker asks of an [`Attachment`].
 #[derive(Debug, Serialize, Deserialize)]
 pub enum AttachmentCall {
-    /// Keep the attachment `id`, unless kept already, until it expires. Answers whether it did.
-    Add {
-        id: Vec<u8>,
-        chunks: u32,
-        token_hash: Vec<u8>,
-        delete_hash: Vec<u8>,
-    },
-    /// The attachment, if kept. Answers an `Option<AttachmentRow>`.
-    Get,
-    /// Note that chunk `index` is in R2. Answers whether the attachment is still kept.
-    Note { index: u32 },
-    /// Delete the attachment and its chunks. Answers `()`.
-    Delete,
+    /// Tag `0`: keep the attachment `id`, unless kept already, until it expires.
+    Add(rpc::AddAttachment),
+    /// Tag `1`: the attachment, if kept and not expired.
+    Get(rpc::GetAttachment),
+    /// Tag `2`: note that chunk `index` is in R2.
+    Note(rpc::NoteChunk),
+    /// Tag `3`: delete the attachment and its chunks.
+    Delete(rpc::DeleteAttachment),
 }
 
 /// An attachment, as kept.
@@ -281,9 +441,9 @@ pub struct AttachmentRow {
     pub uploaded: u64,
 }
 
-/// Make `call` of the object `stub`, and decode its answer.
-pub async fn call<T: DeserializeOwned>(stub: &Stub, call: &impl Serialize) -> Result<T> {
-    let body = postcard::to_allocvec(call).map_err(|e| Error::RustError(e.to_string()))?;
+/// Make typed `call` of the object `stub`, and decode its statically paired reply type.
+pub async fn call<R: RpcCall>(stub: &Stub, call: R) -> Result<R::Reply> {
+    let body = call.encode()?;
     let request = Request::new_with_init(
         "https://object/call",
         RequestInit::new()
@@ -293,41 +453,44 @@ pub async fn call<T: DeserializeOwned>(stub: &Stub, call: &impl Serialize) -> Re
     let mut response = stub.fetch_with_request(request).await?;
     let answer = response.bytes().await?;
     if response.status_code() != 200 {
-        return Err(Error::RustError(
-            String::from_utf8_lossy(&answer).into_owned(),
-        ));
+        console_error!(
+            "durable object RPC returned HTTP {}: {}",
+            response.status_code(),
+            String::from_utf8_lossy(&answer)
+        );
+        return Err(Error::RustError("durable object call failed".into()));
     }
-    postcard::from_bytes(&answer).map_err(|e| Error::RustError(e.to_string()))
+    postcard::from_bytes(&answer).map_err(|e| {
+        console_error!("failed to decode durable object RPC reply: {e}");
+        Error::RustError("invalid durable object reply".into())
+    })
 }
 
 /// The call that `request`, to an object, carries.
 async fn decode<T: DeserializeOwned>(request: &mut Request) -> Result<T> {
     let body = request.bytes().await?;
-    postcard::from_bytes(&body).map_err(|e| Error::RustError(e.to_string()))
+    postcard::from_bytes(&body).map_err(|e| {
+        console_error!("failed to decode durable object RPC request: {e}");
+        Error::RustError("invalid internal request".into())
+    })
 }
 
-/// The response that answers a call with `answer`, or the error that failed it.
+/// The response that answers a typed [`RpcCall`] with `answer`, logging internal errors without
+/// returning raw SQL/R2/DO error strings in the HTTP body.
+fn answer_rpc<R: RpcCall>(value: Result<R::Reply>) -> Result<Response> {
+    answer(value)
+}
+
 fn answer<T: Serialize>(answer: Result<T>) -> Result<Response> {
     match answer.and_then(|answer| {
         postcard::to_allocvec(&answer).map_err(|e| Error::RustError(e.to_string()))
     }) {
         Ok(body) => Response::from_bytes(body),
-        Err(e) => Response::error(e.to_string(), 500),
+        Err(e) => {
+            console_error!("durable object handler failed: {e}");
+            Response::error("internal storage error", 500)
+        }
     }
-}
-
-/// Bind an integer, rejecting any value above [`MAX_SAFE_INTEGER`] (`2^53 - 1`) instead of
-/// silently clamping it.
-pub(super) fn checked_integer(value: u64) -> Result<SqlStorageValue> {
-    if value > MAX_SAFE_INTEGER {
-        return Err(Error::RustError("integer exceeds MAX_SAFE_INTEGER".into()));
-    }
-    Ok(SqlStorageValue::Integer(value as i64))
-}
-
-/// Bind bytes as a BLOB.
-fn blob(bytes: &[u8]) -> SqlStorageValue {
-    SqlStorageValue::Blob(bytes.to_vec())
 }
 
 /// An alarm at `at`, in milliseconds since the Unix epoch, or as late as one may be: a retention
@@ -340,12 +503,11 @@ fn alarm_at(at: u64) -> ScheduledTime {
 /// tables, so that a read of an object nothing was kept in, or whose data was deleted, e.g. a
 /// download of an attachment gone, which anyone may try, leaves no storage behind.
 fn has_table(sql: &SqlStorage, name: &str) -> Result<bool> {
-    let found: TablesRow = sql
-        .exec(
-            "SELECT count(*) AS tables FROM sqlite_master WHERE type = 'table' AND name = ?",
-            vec![name.into()],
-        )?
-        .one()?;
+    let found: TablesRow = query_one(
+        sql,
+        "SELECT count(*) AS tables FROM sqlite_master WHERE type = 'table' AND name = ?",
+        params![name]?,
+    )?;
     Ok(found.tables > 0)
 }
 
@@ -364,9 +526,8 @@ mod tests {
         bytes[0]
     }
 
-    #[test]
-    fn identity_call_postcard_tags_match_legacy_v1_wire_indices() {
-        let dummy_manifest = ManifestWire {
+    fn dummy_manifest() -> ManifestWire {
+        ManifestWire {
             audience: "relay.example".into(),
             identity_key: vec![1; 32],
             manifest_seq: 1,
@@ -380,8 +541,11 @@ mod tests {
             signed_prekey: vec![2; 32],
             pq_last_resort: vec![],
             signature: vec![3; 64],
-        };
-        let dummy_initial = InitialMessageV2Wire {
+        }
+    }
+
+    fn dummy_initial() -> InitialMessageV2Wire {
+        InitialMessageV2Wire {
             id: 0,
             version: 1,
             sender: vec![1; 32],
@@ -395,79 +559,94 @@ mod tests {
             pq_prekey_id: None,
             pq_ciphertext: None,
             manifest_digest: None,
-        };
+        }
+    }
 
-        let expected_tags: &[(IdentityCall, u8)] = &[
-            (IdentityCall::RetiredPublishV1, 0),
-            (IdentityCall::RetiredTakeBundleV1, 1),
-            (IdentityCall::RetiredAddInitialMessageV1, 2),
-            (IdentityCall::RetiredTakeInitialMessagesV1, 3),
-            (IdentityCall::RetiredAppendV1, 4),
+    #[test]
+    fn identity_call_postcard_tags_match_legacy_v1_wire_indices() {
+        let rpc_tags: &[(Vec<u8>, u8)] = &[
             (
-                IdentityCall::Read {
+                rpc::Read {
                     sender: vec![1; 32],
                     after: 0,
                     limit: 10,
                     max_size: 1024,
-                },
+                }
+                .encode()
+                .unwrap(),
                 5,
             ),
             (
-                IdentityCall::DeliveredObjects {
+                rpc::DeliveredObjects {
                     sender: vec![1; 32],
                     hashes: vec![],
-                },
+                }
+                .encode()
+                .unwrap(),
                 6,
             ),
             (
-                IdentityCall::DeleteDelivered {
+                rpc::DeleteDelivered {
                     sender: vec![1; 32],
                     hashes: vec![],
                     objects: vec![],
-                },
+                }
+                .encode()
+                .unwrap(),
                 7,
             ),
             (
-                IdentityCall::PublishV2 {
-                    manifest: dummy_manifest,
+                rpc::PublishV2 {
+                    manifest: dummy_manifest(),
                     signed_prekey_signature: None,
                     one_time_prekeys: vec![],
                     pq_last_resort: vec![],
                     pq_one_time_prekeys: vec![],
                     timestamp: 1,
-                },
+                }
+                .encode()
+                .unwrap(),
                 8,
             ),
             (
-                IdentityCall::RefillPrekeys {
+                rpc::RefillPrekeys {
                     generation: 1,
                     one_time_prekeys: vec![],
                     pq_one_time_prekeys: vec![],
                     max_one_time_prekeys: 100,
                     max_pq_one_time_prekeys: 100,
                     timestamp: 1,
-                },
+                }
+                .encode()
+                .unwrap(),
                 9,
             ),
-            (IdentityCall::GetManifest, 10),
+            (rpc::GetManifest.encode().unwrap(), 10),
             (
-                IdentityCall::ClaimBundle {
+                rpc::ClaimBundle {
                     preferred_suites: vec![1],
-                },
+                }
+                .encode()
+                .unwrap(),
                 11,
             ),
             (
-                IdentityCall::AddInitialMessageV2 {
-                    message: dummy_initial,
+                rpc::AddInitialMessageV2 {
+                    message: dummy_initial(),
                     limit: 10,
-                },
+                }
+                .encode()
+                .unwrap(),
                 12,
             ),
-            (IdentityCall::ListInitialMessages { limit: 10 }, 13),
-            (IdentityCall::AckInitialMessages { ids: vec![1] }, 14),
-            (IdentityCall::PqSnapshot, 15),
+            (rpc::ListInitialMessages { limit: 10 }.encode().unwrap(), 13),
             (
-                IdentityCall::AppendIdempotent {
+                rpc::AckInitialMessages { ids: vec![1] }.encode().unwrap(),
+                14,
+            ),
+            (rpc::PqSnapshot.encode().unwrap(), 15),
+            (
+                rpc::AppendIdempotent {
                     sender: vec![1; 32],
                     header: vec![],
                     content: Content::Inline(vec![]),
@@ -475,14 +654,39 @@ mod tests {
                     initial_message: None,
                     delivery_hash: None,
                     client_message_id: None,
-                },
+                }
+                .encode()
+                .unwrap(),
                 16,
+            ),
+            (
+                rpc::ClaimBundleChecked {
+                    preferred_suites: vec![1],
+                    reject_pq_on_manifest: true,
+                }
+                .encode()
+                .unwrap(),
+                17,
+            ),
+            (
+                rpc::DeleteDeliveredAtomic {
+                    sender: vec![1; 32],
+                    hashes: vec![],
+                }
+                .encode()
+                .unwrap(),
+                18,
             ),
         ];
 
-        for (call, expected_tag) in expected_tags {
-            assert_eq!(tag_byte(call), *expected_tag, "tag mismatch for {call:?}");
+        for (encoded, expected_tag) in rpc_tags {
+            assert_eq!(encoded[0], *expected_tag);
+            let decoded: IdentityCall = postcard::from_bytes(encoded).expect("decode IdentityCall");
+            assert_eq!(tag_byte(&decoded), *expected_tag);
         }
+        // Unit RPC variants must stay single-byte (identical to legacy unit enum variants).
+        assert_eq!(rpc::GetManifest.encode().unwrap(), vec![10]);
+        assert_eq!(rpc::PqSnapshot.encode().unwrap(), vec![15]);
 
         // Retired legacy v1 payloads from an older Worker (tag byte + legacy fields) decode cleanly
         // into the corresponding retired variants so the DO answers 501 instead of misdispatching.
@@ -497,21 +701,41 @@ mod tests {
             assert_eq!(tag_byte(&decoded), expected_discriminant);
         }
 
-        // Verify AppendOutcome and AttachmentCall tags also match archive/legacy-v1.
+        // Verify AppendOutcome, RefillOutcome, ClaimBundleOutcome, and AttachmentCall tags.
         assert_eq!(tag_byte(&AppendOutcome::Appended(1)), 0);
         assert_eq!(tag_byte(&AppendOutcome::Deduplicated(1)), 1);
         assert_eq!(tag_byte(&AppendOutcome::LimitExceeded), 2);
+
         assert_eq!(
-            tag_byte(&AttachmentCall::Add {
+            tag_byte(&RefillOutcome::Stored {
+                classical_count: 0,
+                pq_counts: vec![],
+            }),
+            0
+        );
+        assert_eq!(tag_byte(&RefillOutcome::NotFound), 1);
+        assert_eq!(tag_byte(&RefillOutcome::StaleGeneration), 2);
+        assert_eq!(tag_byte(&RefillOutcome::StaleTimestamp), 3);
+        assert_eq!(tag_byte(&RefillOutcome::DuplicatePrekey), 4);
+        assert_eq!(tag_byte(&RefillOutcome::LimitExceeded), 5);
+        assert_eq!(tag_byte(&RefillOutcome::SuiteNotOffered), 6);
+
+        assert_eq!(tag_byte(&ClaimBundleOutcome::NotFound), 0);
+        assert_eq!(tag_byte(&ClaimBundleOutcome::PqDisabledForPqManifest), 1);
+
+        assert_eq!(
+            rpc::AddAttachment {
                 id: vec![],
                 chunks: 1,
                 token_hash: vec![],
                 delete_hash: vec![],
-            }),
+            }
+            .encode()
+            .unwrap()[0],
             0
         );
-        assert_eq!(tag_byte(&AttachmentCall::Get), 1);
-        assert_eq!(tag_byte(&AttachmentCall::Note { index: 0 }), 2);
-        assert_eq!(tag_byte(&AttachmentCall::Delete), 3);
+        assert_eq!(rpc::GetAttachment.encode().unwrap(), vec![1]);
+        assert_eq!(rpc::NoteChunk { index: 0 }.encode().unwrap()[0], 2);
+        assert_eq!(rpc::DeleteAttachment.encode().unwrap(), vec![3]);
     }
 }
