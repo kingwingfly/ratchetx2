@@ -1,17 +1,17 @@
 use std::time::Duration;
 
-use leptos::{ev, html, prelude::*, task::spawn_local};
+use leptos::{ev, html, leptos_dom::helpers::TimeoutHandle, prelude::*, task::spawn_local};
 use session::PublicKey;
-use web_sys::{FileList, HtmlInputElement};
+use web_sys::{FileList, HtmlInputElement, Url};
 use zeroize::Zeroizing;
 
 use crate::{
     content,
-    engine::{Sending, build_invitation_link, invitation, origin, sanitize_shared_name},
+    engine::{Sending, build_invitation_link, invitation, origin},
     glue::copy,
     icon::{Icon, icon},
     state::{ClassicalPrompt, ContactView, Dialog, Me, ServerPqStatus, SharedContact, Ui},
-    util::{key_to_text, sleep},
+    util::{hex, key_to_text, sanitize_filename, sanitize_shared_name, sleep, validate_relay_url},
 };
 
 use super::{engine, ui};
@@ -70,6 +70,17 @@ pub(super) fn initials(label: &str) -> String {
         .collect()
 }
 
+/// An avatar's letters for a contact or user: initials of `name`, or the first byte of `peer`
+/// in hex when unnamed.
+pub(super) fn avatar_letters(name: &str, peer: &PublicKey) -> String {
+    let letters = initials(name);
+    if letters.is_empty() {
+        hex(&peer[..1])
+    } else {
+        letters
+    }
+}
+
 /// A file's extension, lowercase, for its card; `file` if it has none.
 pub(super) fn extension(name: &str) -> String {
     name.rsplit_once('.')
@@ -105,45 +116,6 @@ pub(super) fn act_while(
     });
 }
 
-pub(super) fn open_chat(peer: Option<PublicKey>) {
-    super::history::navigate(peer);
-}
-
-pub(super) fn reserve_chat_history() -> super::history::Reservation {
-    super::history::reserve()
-}
-
-pub(super) fn is_chat_history_owned(reservation: Option<super::history::Reservation>) -> bool {
-    super::history::is_reservation_owned(reservation)
-}
-
-pub(super) async fn commit_chat_history(
-    reservation: Option<super::history::Reservation>,
-    peer: PublicKey,
-) {
-    super::history::commit_reservation(reservation, peer).await;
-}
-
-pub(super) fn cancel_chat_history(reservation: Option<super::history::Reservation>) -> bool {
-    super::history::cancel_reservation(reservation)
-}
-
-pub(super) fn retain_chat_history(reservation: Option<super::history::Reservation>) -> bool {
-    super::history::retain_reservation(reservation)
-}
-
-pub(super) fn retain_active_chat_history_reservation() {
-    super::history::retain_active_reservation();
-}
-
-pub(super) fn cancel_retained_chat_history_reservation() {
-    super::history::cancel_retained_reservation();
-}
-
-pub(super) fn cancel_active_chat_history_reservation() {
-    super::history::cancel_active_reservation();
-}
-
 pub(super) fn new_chat() {
     ui().dialog.set(Some(Dialog::NewChat {
         key: String::new(),
@@ -159,7 +131,7 @@ pub(super) fn new_chat() {
 pub(super) fn open_new_chat_for_shared(card: &SharedContact) {
     ui().dialog.set(Some(Dialog::NewChat {
         key: key_to_text(&card.key),
-        name: card.name.clone(),
+        name: sanitize_shared_name(&card.name),
         server: None,
         pq_pinned: card.pq_pinned,
     }));
@@ -230,47 +202,142 @@ pub(super) async fn flash_copied(copied_gen: RwSignal<u32>) {
     });
 }
 
-/// `text` in a box, with a button beside it that copies it, `what` it is, e.g. "your key": a
-/// tick shows for a moment once it did, and a notice says if the browser would not.
+/// Trigger a browser download of `data` via `anchor`, sanitizing `filename` and revoking the
+/// temporary blob URL after a grace period. Returns `false` if the anchor is unmounted or blob
+/// creation fails.
+pub(super) fn download_blob(
+    data: &[u8],
+    mime: &str,
+    filename: &str,
+    anchor: NodeRef<html::A>,
+) -> bool {
+    let Some(anchor) = anchor.try_get_untracked().flatten() else {
+        return false;
+    };
+    let Some(url) = super::media::blob_url(data, mime) else {
+        return false;
+    };
+    let safe_name = sanitize_filename(filename);
+    anchor.set_href(&url);
+    anchor.set_download(&safe_name);
+    anchor.click();
+    let _ = anchor.remove_attribute("href");
+    let _ = anchor.remove_attribute("download");
+    set_timeout(
+        move || {
+            let _ = Url::revoke_object_url(&url);
+        },
+        Duration::from_secs(60),
+    );
+    true
+}
+
+/// A copy button showing a tick while `copied_gen != 0`, rendered either icon-only (`label == None`)
+/// or as a small labeled button (`label == Some((idle, done))`).
 #[component]
-pub(super) fn Copyable(text: String, what: &'static str) -> impl IntoView {
-    let copied_gen = RwSignal::new(0u32);
+pub(super) fn CopyFeedbackButton(
+    copied_gen: RwSignal<u32>,
+    #[prop(optional_no_strip)] title: Option<Signal<String>>,
+    #[prop(optional_no_strip)] label: Option<(&'static str, &'static str)>,
+    #[prop(optional_no_strip)] disabled: Option<Signal<bool>>,
+    on_click: impl Fn(ev::MouseEvent) + 'static,
+) -> impl IntoView {
     let copied = move || copied_gen.get() != 0;
-    let value = text.clone();
+    let class = if label.is_some() {
+        "btn small"
+    } else {
+        "btn icon"
+    };
+    let is_disabled = move || disabled.is_some_and(|d| d.get());
+    let tip = move || title.map(|t| t.get());
+    view! {
+        <button
+            type="button"
+            class=class
+            class:done=copied
+            title=tip
+            aria-label=tip
+            disabled=is_disabled
+            on:click=on_click
+        >
+            {move || icon(if copied() { Icon::Tick } else { Icon::Copy })}
+            {label.map(|(idle, done)| move || if copied() { done } else { idle })}
+        </button>
+    }
+}
+
+/// A button that copies `text` to the clipboard, flashing a tick for [`COPIED_SHOWN`] on success
+/// and notifying on refusal.
+#[component]
+pub(super) fn CopyButton(
+    text: Signal<String>,
+    what: &'static str,
+    #[prop(optional)] failure_notice: Option<&'static str>,
+    #[prop(optional)] label: Option<(&'static str, &'static str)>,
+    #[prop(optional_no_strip)] disabled: Option<Signal<bool>>,
+) -> impl IntoView {
+    let copied_gen = RwSignal::new(0u32);
     let on_click = move |_| {
-        let text = value.clone();
+        let value = text.get_untracked();
+        if value.is_empty() {
+            return;
+        }
         spawn_local(async move {
-            if !copy(&text).await {
-                ui().notify(format!(
-                    "The browser would not copy {what}; select it and copy it instead."
-                ));
+            if !copy(&value).await {
+                let notice = failure_notice.map_or_else(
+                    || format!("The browser would not copy {what}; select it and copy it instead."),
+                    str::to_string,
+                );
+                ui().notify(notice);
                 return;
             }
             flash_copied(copied_gen).await;
         });
     };
-    let label = move || {
-        if copied() {
-            "Copied".to_string()
-        } else {
-            format!("Copy {what}")
-        }
-    };
+    let title = label.is_none().then(|| {
+        Signal::derive(move || {
+            if copied_gen.get() != 0 {
+                "Copied".to_string()
+            } else {
+                format!("Copy {what}")
+            }
+        })
+    });
+    view! {
+        <CopyFeedbackButton copied_gen title label disabled on_click />
+    }
+}
+
+/// `text` in a `.key` box with a copy button (and optional extra action buttons) beside it.
+#[component]
+pub(super) fn CopyableField(
+    text: Signal<String>,
+    what: &'static str,
+    #[prop(optional)] disabled: Option<Signal<bool>>,
+    #[prop(optional)] extra: Option<Children>,
+) -> impl IntoView {
     view! {
         <div class="copyable">
-            <div class="key">{text}</div>
-            <button
-                type="button"
-                class="btn icon"
-                class:done=copied
-                title=label
-                aria-label=label
-                on:click=on_click
-            >
-                {move || icon(if copied() { Icon::Tick } else { Icon::Copy })}
-            </button>
+            <div class="key">{move || text.get()}</div>
+            {match extra {
+                Some(extra) => view! {
+                    <div class="copyable-actions">
+                        <CopyButton text what disabled />
+                        {extra()}
+                    </div>
+                }
+                .into_any(),
+                None => view! { <CopyButton text what disabled /> }.into_any(),
+            }}
         </div>
     }
+}
+
+/// `text` in a box, with a button beside it that copies it, `what` it is, e.g. "your key": a
+/// tick shows for a moment once it did, and a notice says if the browser would not.
+#[component]
+pub(super) fn Copyable(text: Signal<String>, what: &'static str) -> impl IntoView {
+    view! { <CopyableField text what /> }
 }
 
 /// This client's invitation link, with buttons to copy it or open its scannable QR code.
@@ -281,57 +348,28 @@ pub(super) fn InvitationLink(#[prop(default = false)] from_identity: bool) -> im
         ui.me
             .with(|me| me.as_ref().map(invitation_link).unwrap_or_default())
     });
-    let copied_gen = RwSignal::new(0u32);
-    let copied = move || copied_gen.get() != 0;
-    let on_copy = move |_| {
-        let text = link.get_untracked();
-        if text.is_empty() {
-            return;
-        }
-        spawn_local(async move {
-            if !copy(&text).await {
-                ui.notify(
-                    "The browser would not copy your invitation link; select it and copy it instead.",
-                );
-                return;
-            }
-            flash_copied(copied_gen).await;
-        });
-    };
-    let copy_label = move || {
-        if copied() {
-            "Copied".to_string()
-        } else {
-            "Copy your invitation link".to_string()
-        }
-    };
+    let empty = Signal::derive(move || link.with(String::is_empty));
     view! {
-        <div class="copyable">
-            <div class="key">{move || link.get()}</div>
-            <div class="copyable-actions">
-                <button
-                    type="button"
-                    class="btn icon"
-                    class:done=copied
-                    title=copy_label
-                    aria-label=copy_label
-                    disabled=move || link.with(String::is_empty)
-                    on:click=on_copy
-                >
-                    {move || icon(if copied() { Icon::Tick } else { Icon::Copy })}
-                </button>
-                <button
-                    type="button"
-                    class="btn icon"
-                    title="Share as QR code"
-                    aria-label="Share your invitation link as a QR code"
-                    disabled=move || link.with(String::is_empty)
-                    on:click=move |_| ui.dialog.set(Some(Dialog::InviteQr { from_identity }))
-                >
-                    {icon(Icon::QrCode)}
-                </button>
-            </div>
-        </div>
+        <CopyableField
+            text=link.into()
+            what="your invitation link"
+            disabled=empty
+            extra=Box::new(move || {
+                view! {
+                    <button
+                        type="button"
+                        class="btn icon"
+                        title="Share as QR code"
+                        aria-label="Share your invitation link as a QR code"
+                        disabled=move || empty.get()
+                        on:click=move |_| ui.dialog.set(Some(Dialog::InviteQr { from_identity }))
+                    >
+                        {icon(Icon::QrCode)}
+                    </button>
+                }
+                .into_any()
+            })
+        />
     }
 }
 
@@ -339,59 +377,33 @@ pub(super) fn InvitationLink(#[prop(default = false)] from_identity: bool) -> im
 #[component]
 pub(super) fn ContactKey(peer: PublicKey, can_share: Signal<bool>) -> impl IntoView {
     let ui = ui();
-    let text = key_to_text(&peer);
-    let copied_gen = RwSignal::new(0u32);
-    let copied = move || copied_gen.get() != 0;
-    let value = text.clone();
-    let on_copy = move |_| {
-        let text = value.clone();
-        spawn_local(async move {
-            if !copy(&text).await {
-                ui.notify("The browser would not copy their key; select it and copy it instead.");
-                return;
-            }
-            flash_copied(copied_gen).await;
-        });
-    };
-    let copy_label = move || {
-        if copied() {
-            "Copied".to_string()
-        } else {
-            "Copy their key".to_string()
-        }
-    };
+    let text = Signal::stored(key_to_text(&peer));
     view! {
-        <div class="copyable">
-            <div class="key">{text}</div>
-            <div class="copyable-actions">
-                <button
-                    type="button"
-                    class="btn icon"
-                    class:done=copied
-                    title=copy_label
-                    aria-label=copy_label
-                    on:click=on_copy
-                >
-                    {move || icon(if copied() { Icon::Tick } else { Icon::Copy })}
-                </button>
-                <Show when=move || can_share.get()>
-                    <button
-                        type="button"
-                        class="btn icon"
-                        title="Share contact to another chat"
-                        aria-label="Share this contact to another chat"
-                        on:click=move |_| {
-                            ui.dialog.set(Some(Dialog::ShareContact {
-                                subject: Some(peer),
-                                recipient: None,
-                            }));
-                        }
-                    >
-                        {icon(Icon::ShareContact)}
-                    </button>
-                </Show>
-            </div>
-        </div>
+        <CopyableField
+            text
+            what="their key"
+            extra=Box::new(move || {
+                view! {
+                    <Show when=move || can_share.get()>
+                        <button
+                            type="button"
+                            class="btn icon"
+                            title="Share contact to another chat"
+                            aria-label="Share this contact to another chat"
+                            on:click=move |_| {
+                                ui.dialog.set(Some(Dialog::ShareContact {
+                                    subject: Some(peer),
+                                    recipient: None,
+                                }));
+                            }
+                        >
+                            {icon(Icon::ShareContact)}
+                        </button>
+                    </Show>
+                }
+                .into_any()
+            })
+        />
     }
 }
 
@@ -401,10 +413,25 @@ pub(super) fn invitation_link(me: &Me) -> String {
     build_invitation_link(&origin(), me)
 }
 
-/// The server an invitation link in the page's address names, to create the vault on.
+/// Validate an optional server URL from an invitation link (must be `https://` or
+/// `http://localhost` / loopback with no credentials, path, query, or fragment).
+pub(super) fn validate_invited_server(server: Option<&str>) -> Option<String> {
+    validate_relay_url(server?).ok()
+}
+
+/// Extract and validate the server URL from an invitation `#chat=...&server=...` fragment.
+#[cfg(test)]
+pub(super) fn invited_server_from_hash(hash: &str) -> Option<String> {
+    match crate::engine::parse_invitation_hash(hash)? {
+        Dialog::NewChat { server, .. } => validate_invited_server(server.as_deref()),
+        _ => None,
+    }
+}
+
+/// The validated server an invitation link in the page's address names, to create the vault on.
 pub(super) fn invited_server() -> Option<String> {
     match invitation()? {
-        Dialog::NewChat { server, .. } => server,
+        Dialog::NewChat { server, .. } => validate_invited_server(server.as_deref()),
         _ => None,
     }
 }
@@ -568,33 +595,93 @@ pub(super) fn ToggleSwitch(
 /// How long a button that asks to be pressed again, to be sure, waits for it.
 pub(super) const ASKED_SHOWN: Duration = Duration::from_secs(6);
 
-#[cfg(test)]
-mod tests {
-    use crate::state::{ContactView, SecurityAlert, SecurityView};
+/// Two-step confirmation guard that arms on the first click, auto-disarms after [`ASKED_SHOWN`],
+/// and cancels its pending timeout on explicit disarm or component unmount.
+#[derive(Clone, Copy)]
+pub(super) struct ConfirmGuard {
+    armed: RwSignal<bool>,
+    timer: StoredValue<Option<TimeoutHandle>, LocalStorage>,
+}
 
-    use super::{
-        ClassicalPrompt, can_allow_classical, default_shared_contact_name, shareable_contacts,
-        shared_contact_pq_pinned, writable_recipients,
-    };
+impl ConfirmGuard {
+    pub(super) fn new() -> Self {
+        let guard = Self {
+            armed: RwSignal::new(false),
+            timer: StoredValue::new_local(None),
+        };
+        on_cleanup(move || guard.clear_timer());
+        guard
+    }
 
-    fn make_contact(byte: u8, name: &str) -> ContactView {
-        ContactView {
-            peer: [byte; 32],
-            name: name.to_string(),
-            request: false,
-            hello_name: String::new(),
-            unread: 0,
-            last_activity: 0,
-            security: SecurityView::default(),
-            has_active_session: false,
-            pq_pinned: false,
-            peer_pq_capable: false,
-            allow_classical_exception: false,
-            downgrade_detected: false,
-            alert: SecurityAlert::None,
-            classical_prompt: ClassicalPrompt::None,
+    pub(super) fn is_armed(self) -> bool {
+        self.armed.get()
+    }
+
+    fn clear_timer(self) {
+        if let Some(handle) = self.timer.try_update_value(Option::take).flatten() {
+            handle.clear();
         }
     }
+
+    pub(super) fn disarm(self) {
+        self.clear_timer();
+        let _ = self.armed.try_set(false);
+    }
+
+    pub(super) fn arm(self) {
+        self.clear_timer();
+        let _ = self.armed.try_set(true);
+        if let Ok(handle) = set_timeout_with_handle(
+            move || {
+                let _ = self.timer.try_set_value(None);
+                let _ = self.armed.try_set(false);
+            },
+            ASKED_SHOWN,
+        ) {
+            let _ = self.timer.try_set_value(Some(handle));
+        }
+    }
+
+    /// Arm on the first click and return `false`; disarm and return `true` when clicked while armed.
+    pub(super) fn confirm_or_arm(self) -> bool {
+        if self.armed.get_untracked() {
+            self.disarm();
+            true
+        } else {
+            self.arm();
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
+    use crate::state::{SecurityAlert, SecurityView};
+
+    ContactView {
+        peer: [byte; 32],
+        name: name.to_string(),
+        request: false,
+        hello_name: String::new(),
+        unread: 0,
+        last_activity: 0,
+        security: SecurityView::default(),
+        has_active_session: false,
+        pq_pinned: false,
+        peer_pq_capable: false,
+        allow_classical_exception: false,
+        downgrade_detected: false,
+        alert: SecurityAlert::None,
+        classical_prompt: ClassicalPrompt::None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ClassicalPrompt, can_allow_classical, default_shared_contact_name, make_contact,
+        shareable_contacts, shared_contact_pq_pinned, writable_recipients,
+    };
 
     #[test]
     fn classical_approval_requires_a_prompt_and_strict_mode_off() {

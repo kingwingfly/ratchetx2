@@ -1,5 +1,6 @@
 //! Durable outgoing messages, delivery updates and session replacement recovery.
 
+use super::attachments::ServerDeleteJob;
 use super::contact::{forget_told, keep_last};
 use super::{
     Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ProtocolRpcScope, origin, records,
@@ -10,8 +11,8 @@ use crate::state::{Delivery, MessageView, Step, Ui};
 use crate::util::{describe, now, short};
 use crate::vault::{
     Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, Outgoing,
-    OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
+    ContactState, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, Outgoing, OutgoingRecord,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
     SECURITY_ALERT_PQ_REQUIRED, SealedEvents, history_key, outbox_key,
 };
 use leptos::prelude::*;
@@ -64,6 +65,7 @@ impl Engine {
         }
         let mut changed = false;
         let mut result = Ok(());
+        let mut server_deletes: Vec<ServerDeleteJob> = vec![];
         // Completed outbox items (with their original `Outgoing` so M-18 can keep any item whose
         // history entry failed to read from IndexedDB instead of deleting its outbox record).
         // Items stay in `contact.state.outbox` until the atomic `save_with` below commits (or
@@ -111,13 +113,28 @@ impl Engine {
                         for idx in &failed_indices {
                             self.release(peer, *idx);
                         }
-                        self.cancel_uploads_for_failed(inner, peer, &failed_indices)
-                            .await;
+                        server_deletes.extend(
+                            self.prepare_cancel_uploads_for_failed(inner, peer, &failed_indices)
+                                .await,
+                        );
                         self.ui
                             .notify(format!("messages could not be sent: {reason}"));
                         if self.ui.open.get_untracked() == Some(*peer) {
                             self.show_history(inner, peer).await;
                         }
+                        changed = true;
+                    }
+                    Ok(SealOutcome::CorruptDropped(dropped_index, history)) => {
+                        self.release(peer, dropped_index);
+                        server_deletes.extend(
+                            self.prepare_cancel_uploads_for_failed(inner, peer, &[dropped_index])
+                                .await,
+                        );
+                        self.ui.log(format!(
+                            "Dropped corrupt pending message #{dropped_index} for {}: outbox record could not be recovered",
+                            short(peer)
+                        ));
+                        self.show_changes(inner, peer, &history);
                         changed = true;
                     }
                     Ok(SealOutcome::UpdateRequired(reason)) => {
@@ -134,6 +151,45 @@ impl Engine {
             }
             let record = match inner.vault.outgoing(peer, outgoing.history_index).await {
                 Ok(record) => record,
+                Err(crate::vault::Error::Corrupt(reason)) => {
+                    match inner
+                        .recover_corrupt_outbox(peer, outgoing.history_index)
+                        .await
+                    {
+                        Ok(CorruptOutboxRecovery::Rebuilt(_)) => {
+                            self.ui.log(format!(
+                                "Rebuilt corrupt outbox record #{} for {} ({reason})",
+                                outgoing.history_index,
+                                short(peer)
+                            ));
+                            changed = true;
+                            continue;
+                        }
+                        Ok(CorruptOutboxRecovery::Dropped { history }) => {
+                            self.release(peer, outgoing.history_index);
+                            server_deletes.extend(
+                                self.prepare_cancel_uploads_for_failed(
+                                    inner,
+                                    peer,
+                                    &[outgoing.history_index],
+                                )
+                                .await,
+                            );
+                            self.ui.log(format!(
+                                "Dropped corrupt outbox record #{} for {} ({reason})",
+                                outgoing.history_index,
+                                short(peer)
+                            ));
+                            self.show_changes(inner, peer, &history);
+                            changed = true;
+                            continue;
+                        }
+                        Err(e) => {
+                            result = Err(e);
+                            break;
+                        }
+                    }
+                }
                 Err(e) => {
                     result = Err(describe(&e));
                     break;
@@ -142,35 +198,23 @@ impl Engine {
             // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE transmitting a message that can carry a
             // previously unsent initial greeting so a lost response still notifies an established
             // peer on deletion without carrying the unconfirmed greeting.
-            let promoted_from_unsent = inner
-                .contacts
-                .iter()
-                .any(|c| c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT);
-            if promoted_from_unsent {
-                let snapshot = inner.contact(peer).map(|c| c.snapshot());
-                if let Some(contact) = inner.contact(peer) {
-                    contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-                }
-                if let Err(e) = inner.save(&[]).await {
-                    if let Some(snapshot) = snapshot {
-                        let _ = inner.roll_back(peer, snapshot);
-                    }
-                    result = Err(describe(&e));
+            let push_res = match inner
+                .transmit_with_greeting_delivery(peer, false, false, async |inner| {
+                    let Some(contact) = inner.contact(peer) else {
+                        return Err(session::Error::from(ErrorKind::NotFound));
+                    };
+                    contact.session.push_v2(record.to_push()).await.map(|_| ())
+                })
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    result = Err(e);
                     break;
                 }
-            }
-            let Some(contact) = inner.contact(peer) else {
-                break;
             };
-            let push_res = contact.session.push_v2(record.to_push()).await.map(|_| ());
-            if let Err(ref e) = push_res
-                && e.is_server_refusal()
-                && promoted_from_unsent
-            {
-                if let Some(contact) = inner.contact(peer) {
-                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                }
-                let _ = inner.save_state().await;
+            if inner.contact(peer).is_none() {
+                break;
             }
             let step = match push_res {
                 Ok(()) => {
@@ -275,8 +319,10 @@ impl Engine {
                     .map(|(index, _)| *index)
                     .collect();
                 if !refused_indices.is_empty() {
-                    self.cancel_uploads_for_failed(inner, peer, &refused_indices)
-                        .await;
+                    server_deletes.extend(
+                        self.prepare_cancel_uploads_for_failed(inner, peer, &refused_indices)
+                            .await,
+                    );
                 }
             }
         }
@@ -287,6 +333,10 @@ impl Engine {
                 Ok(told) => changed |= told,
                 Err(e) => result = Err(e),
             }
+        }
+        drop(guard);
+        if !server_deletes.is_empty() {
+            self.finish_server_deletes(peer, server_deletes).await;
         }
         result.map(|()| changed)
     }
@@ -329,52 +379,34 @@ impl Engine {
                 else {
                     return Ok(false);
                 };
-                let snapshot = contact.snapshot();
-                let message = contact
-                    .session
-                    .encrypt(&events.to_bytes())
-                    .map_err(|e| describe(&e))?;
-                let sealed = SealedEvents {
-                    record: Some(OutgoingRecord::sealed(message)),
-                    session: active.unwrap_or_default(),
-                    events: Some(events),
-                };
-                contact.state.sealed_events = Some(sealed.clone());
-                if let Err(e) = inner.save(&[]).await {
-                    inner.roll_back(peer, snapshot)?;
-                    return Err(describe(&e));
-                }
-                sealed
+                inner
+                    .with_contact_tx(peer, async |inner| {
+                        let contact = inner
+                            .contact(peer)
+                            .ok_or_else(|| "no such chat".to_string())?;
+                        let message = contact
+                            .session
+                            .encrypt(&events.to_bytes())
+                            .map_err(|e| describe(&e))?;
+                        let sealed = SealedEvents {
+                            record: Some(OutgoingRecord::sealed(message)),
+                            session: active.unwrap_or_default(),
+                            events: Some(events),
+                        };
+                        contact.state.sealed_events = Some(sealed.clone());
+                        inner.save(&[]).await.map_err(|e| describe(&e))?;
+                        Ok::<_, String>(sealed)
+                    })
+                    .await?
             }
         };
-        let promoted_from_unsent = inner
-            .contacts
-            .iter()
-            .any(|c| c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT);
-        if promoted_from_unsent {
-            let snapshot = inner.contact(peer).map(|c| c.snapshot());
-            if let Some(contact) = inner.contact(peer) {
-                contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-            }
-            if let Err(e) = inner.save(&[]).await {
-                if let Some(snapshot) = snapshot {
-                    inner.roll_back(peer, snapshot)?;
-                }
-                return Err(describe(&e));
-            }
-        }
-        let contact = inner.contact(peer).ok_or("no such chat")?;
         let message = sealed.record.unwrap_or_default().to_push();
-        let push_res = contact.session.push_v2(message).await;
-        if let Err(ref e) = push_res
-            && e.is_server_refusal()
-            && promoted_from_unsent
-        {
-            if let Some(contact) = inner.contact(peer) {
-                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-            }
-            let _ = inner.save_state().await;
-        }
+        let push_res = inner
+            .transmit_with_greeting_delivery(peer, false, false, async |inner| {
+                let contact = inner.contact(peer).ok_or(ErrorKind::NotFound)?;
+                contact.session.push_v2(message).await
+            })
+            .await?;
         match push_res {
             Ok(_) => {}
             // The chat waits for the sign-in, as a message refused for it does, rather than
@@ -388,22 +420,24 @@ impl Engine {
                 return Err(describe(&e));
             }
         }
-        let contact = inner.contact(peer).ok_or("no such chat")?;
         // Those told since it was encrypted stay, to go in the next. Persist immediately after
         // clearing `sealed_events` so reload never re-pushes already-sent events.
-        let snapshot = contact.snapshot();
-        contact.mark_greeting_confirmed();
-        contact.state.sealed_events = None;
-        if let (Some(events), Some(told)) = (&mut contact.state.events, &sealed.events) {
-            forget_told(events, told);
-        }
-        if contact.state.events.as_ref().is_some_and(Events::is_empty) {
-            contact.state.events = None;
-        }
-        if let Err(e) = inner.save(&[]).await {
-            inner.roll_back(peer, snapshot)?;
-            return Err(describe(&e));
-        }
+        inner
+            .with_contact_tx(peer, async |inner| {
+                let contact = inner
+                    .contact(peer)
+                    .ok_or_else(|| "no such chat".to_string())?;
+                contact.mark_greeting_confirmed();
+                contact.state.sealed_events = None;
+                if let (Some(events), Some(told)) = (&mut contact.state.events, &sealed.events) {
+                    forget_told(events, told);
+                }
+                if contact.state.events.as_ref().is_some_and(Events::is_empty) {
+                    contact.state.events = None;
+                }
+                inner.save(&[]).await.map_err(|e| describe(&e))
+            })
+            .await?;
         Ok(true)
     }
 
@@ -415,37 +449,31 @@ impl Engine {
         peer: &PublicKey,
         index: u64,
     ) -> Result<(), String> {
-        let contact = inner.contact(peer).ok_or("no such chat")?;
-        let snapshot = contact.snapshot();
-        contact
-            .state
-            .outbox
-            .retain(|outgoing| outgoing.history_index != index);
-        let mut entries = BTreeMap::new();
-        let failed = match inner
-            .step(peer, &mut entries, [(index, Step::Refused)])
-            .await
-        {
-            Ok(()) => {
+        let changed = inner
+            .with_contact_tx(peer, async |inner| {
+                let contact = inner
+                    .contact(peer)
+                    .ok_or_else(|| "no such chat".to_string())?;
+                contact
+                    .state
+                    .outbox
+                    .retain(|outgoing| outgoing.history_index != index);
+                let mut entries = BTreeMap::new();
+                inner
+                    .step(peer, &mut entries, [(index, Step::Refused)])
+                    .await
+                    .map_err(|e| describe(&e))?;
                 let changed: Vec<_> = entries.into_iter().collect();
                 inner
                     .save_with(&records(peer, &changed), &[(outbox_key(peer, index), None)])
                     .await
-                    .map(|()| changed)
-            }
-            Err(e) => Err(e),
-        };
-        match failed {
-            Ok(changed) => {
-                self.release(peer, index);
-                self.show_changes(inner, peer, &changed);
-                Ok(())
-            }
-            Err(e) => {
-                inner.roll_back(peer, snapshot)?;
-                Err(describe(&e))
-            }
-        }
+                    .map_err(|e| describe(&e))?;
+                Ok::<_, String>(changed)
+            })
+            .await?;
+        self.release(peer, index);
+        self.show_changes(inner, peer, &changed);
+        Ok(())
     }
 }
 
@@ -457,8 +485,19 @@ enum SealOutcome {
     Paused,
     /// Permanently failed to start a session (e.g. peer has no keys); outbox entries marked failed.
     Failed(String, Vec<u64>),
+    /// Unrecoverable corrupt outbox record was dropped and its history entry marked failed.
+    CorruptDropped(u64, Vec<(u64, HistoryEntry)>),
     /// Server rejected the v2 protocol (`ErrorKind::Unimplemented`); prompt the user to refresh.
     UpdateRequired(String),
+}
+
+/// Result of [`Inner::recover_corrupt_outbox`].
+pub(super) enum CorruptOutboxRecovery {
+    /// Rebuilt unsealed content bytes from `history`/`file` and reset the outbox item to unsealed.
+    Rebuilt(Vec<u8>),
+    /// Original history content was missing or corrupt too: dropped the outbox item and marked its
+    /// history entry `Failed` so subsequent sends are unblocked.
+    Dropped { history: Vec<(u64, HistoryEntry)> },
 }
 
 impl Inner {
@@ -479,44 +518,46 @@ impl Inner {
             return Err("approve classical encryption or upgrade to post-quantum first".into());
         }
         // If saving fails, the message is forgotten: it never left.
-        let snapshot = contact.snapshot();
-        let index = contact.next_history_index().map_err(str::to_string)?;
-        contact.mark_index_acked(index);
-        // Encrypted as it goes, once its place in the chat is known, see `flush`.
-        let record = OutgoingRecord {
-            message: None,
-            content: content.to_bytes(),
-            delivery_hash: vec![],
-        };
-        contact.state.last_activity = now();
-        contact.state.outbox.push(Outgoing {
-            history_index: index,
-            sealed: false,
-            clock: 0,
-            awaits_upload,
-        });
-        let entry = HistoryEntry {
-            outgoing: true,
-            at: now(),
-            content: Some(Content {
-                kind: Some(content),
-                ..Content::default()
-            }),
-            delivery: Delivery::Pending.into(),
-            ..HistoryEntry::default()
-        };
-        let view = contact.message(index, entry.clone());
-        let saved = self
-            .save_with(
-                &[(history_key(peer, index), entry)],
-                &[(outbox_key(peer, index), Some(record))],
-            )
-            .await;
-        if let Err(e) = saved {
-            self.roll_back(peer, snapshot)?;
-            return Err(describe(&e));
-        }
-        Ok(view)
+        self.with_contact_tx(peer, async |inner| {
+            let contact = inner
+                .contact(peer)
+                .ok_or_else(|| "no such chat".to_string())?;
+            let index = contact.next_history_index().map_err(str::to_string)?;
+            contact.mark_index_acked(index);
+            // Encrypted as it goes, once its place in the chat is known, see `flush`.
+            let record = OutgoingRecord {
+                message: None,
+                content: content.to_bytes(),
+                delivery_hash: vec![],
+            };
+            contact.state.last_activity = now();
+            contact.state.outbox.push(Outgoing {
+                history_index: index,
+                sealed: false,
+                clock: 0,
+                awaits_upload,
+            });
+            let entry = HistoryEntry {
+                outgoing: true,
+                at: now(),
+                content: Some(Content {
+                    kind: Some(content),
+                    ..Content::default()
+                }),
+                delivery: Delivery::Pending.into(),
+                ..HistoryEntry::default()
+            };
+            let view = contact.message(index, entry.clone());
+            inner
+                .save_with(
+                    &[(history_key(peer, index), entry)],
+                    &[(outbox_key(peer, index), Some(record))],
+                )
+                .await
+                .map_err(|e| describe(&e))?;
+            Ok(view)
+        })
+        .await
     }
 
     /// Encrypt the next message waiting to `peer`, now that it goes, at the next place in the
@@ -561,20 +602,14 @@ impl Inner {
                         self.roll_back(peer, snapshot)?;
                         return Err(describe(&e));
                     }
-                    match self.client.send_prepared_initiate_v2(&outgoing).await {
-                        Ok(()) => {
-                            if let Some(contact) = self.contact(peer) {
-                                contact.mark_greeting_confirmed();
-                            }
-                            let _ = self.save_state().await;
-                        }
-                        Err(e) if e.is_server_refusal() => {
-                            if let Some(contact) = self.contact(peer) {
-                                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                            }
-                            let _ = self.save_state().await;
-                        }
-                        Err(_) => {}
+                    if let Ok(Err(e)) = self
+                        .transmit_with_greeting_delivery(peer, true, true, async |inner| {
+                            inner.client.send_prepared_initiate_v2(&outgoing).await
+                        })
+                        .await
+                        && should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e)
+                    {
+                        return Ok(SealOutcome::UpdateRequired(describe(&e)));
                     }
                 }
                 Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
@@ -648,36 +683,125 @@ impl Inner {
             return Ok(SealOutcome::Ready);
         };
         let index = contact.state.outbox[next].history_index;
-        let mut content = self
-            .vault
-            .outgoing(peer, index)
-            .await
-            .map_err(|e| describe(&e))?
-            .content;
-        let contact = self.contact(peer).ok_or("no such chat")?;
-        let snapshot = contact.snapshot();
-        let clock = contact.state.clock.saturating_add(1);
-        stamp(&mut content, clock);
-        let sealed = contact
-            .session
-            .encrypt(&content)
-            .map_err(|e| describe(&e))?;
-        contact.state.clock = clock;
-        let outgoing = &mut contact.state.outbox[next];
-        (outgoing.sealed, outgoing.clock) = (true, clock);
-        let record = OutgoingRecord::sealed(sealed);
-        if let Err(e) = self
-            .save_with(&[], &[(outbox_key(peer, index), Some(record))])
-            .await
-        {
-            self.roll_back(peer, snapshot)?;
-            return Err(describe(&e));
-        }
+        let mut content = match self.vault.outgoing(peer, index).await {
+            Ok(record) => record.content,
+            Err(crate::vault::Error::Corrupt(_)) => {
+                match self.recover_corrupt_outbox(peer, index).await? {
+                    CorruptOutboxRecovery::Rebuilt(bytes) => bytes,
+                    CorruptOutboxRecovery::Dropped { history } => {
+                        return Ok(SealOutcome::CorruptDropped(index, history));
+                    }
+                }
+            }
+            Err(e) => return Err(describe(&e)),
+        };
+        self.with_contact_tx(peer, async |inner| {
+            let contact = inner
+                .contact(peer)
+                .ok_or_else(|| "no such chat".to_string())?;
+            let Some(next) = contact
+                .state
+                .outbox
+                .iter()
+                .position(|outgoing| outgoing.history_index == index && !outgoing.sealed)
+            else {
+                return Ok(());
+            };
+            let clock = contact.state.clock.saturating_add(1);
+            stamp(&mut content, clock);
+            let sealed = contact
+                .session
+                .encrypt(&content)
+                .map_err(|e| describe(&e))?;
+            contact.state.clock = clock;
+            let outgoing = &mut contact.state.outbox[next];
+            (outgoing.sealed, outgoing.clock) = (true, clock);
+            let record = OutgoingRecord::sealed(sealed);
+            inner
+                .save_with(&[], &[(outbox_key(peer, index), Some(record))])
+                .await
+                .map_err(|e| describe(&e))
+        })
+        .await?;
         Ok(SealOutcome::Ready)
     }
 }
 
 impl<V: HistoryStore> Inner<V> {
+    /// Recover from a missing or corrupt `outbox/<peer>/<index>` record instead of permanently
+    /// wedging all subsequent sends to `peer`: rebuild an unsealed outbox record from
+    /// `vault.entry` + `vault.content` when intact, otherwise mark the history entry `Failed` and
+    /// drop the corrupt outbox item.
+    pub(super) async fn recover_corrupt_outbox(
+        &mut self,
+        peer: &PublicKey,
+        index: u64,
+    ) -> Result<CorruptOutboxRecovery, String> {
+        let entry = match self.vault.entry(peer, index).await {
+            Ok(entry) => entry,
+            Err(crate::vault::Error::Corrupt(_)) => None,
+            Err(e) => return Err(describe(&e)),
+        };
+        let content = match &entry {
+            Some(entry) => match self.vault.content(peer, index, entry).await {
+                Ok(content) => content,
+                Err(crate::vault::Error::Corrupt(_)) => None,
+                Err(e) => return Err(describe(&e)),
+            },
+            None => None,
+        };
+        match (entry, content) {
+            (Some(_), Some(kind)) => {
+                let bytes = kind.to_bytes();
+                let rebuilt = OutgoingRecord {
+                    message: None,
+                    content: bytes.clone(),
+                    delivery_hash: vec![],
+                };
+                self.with_contact_tx(peer, async |inner| {
+                    let contact = inner
+                        .contact(peer)
+                        .ok_or_else(|| "no such chat".to_string())?;
+                    if let Some(outgoing) = contact
+                        .state
+                        .outbox
+                        .iter_mut()
+                        .find(|o| o.history_index == index)
+                    {
+                        outgoing.sealed = false;
+                        outgoing.clock = 0;
+                    }
+                    inner
+                        .save_with(&[], &[(outbox_key(peer, index), Some(rebuilt))])
+                        .await
+                        .map_err(|e| describe(&e))
+                })
+                .await?;
+                Ok(CorruptOutboxRecovery::Rebuilt(bytes))
+            }
+            (entry, _) => {
+                let history = match entry {
+                    Some(mut entry) => {
+                        entry.set_delivery(Delivery::Failed);
+                        vec![(index, entry)]
+                    }
+                    None => vec![],
+                };
+                self.with_contact_tx(peer, async |inner| {
+                    let contact = inner
+                        .contact(peer)
+                        .ok_or_else(|| "no such chat".to_string())?;
+                    contact.state.outbox.retain(|o| o.history_index != index);
+                    inner
+                        .save_with(&records(peer, &history), &[(outbox_key(peer, index), None)])
+                        .await
+                        .map_err(|e| describe(&e))
+                })
+                .await?;
+                Ok(CorruptOutboxRecovery::Dropped { history })
+            }
+        }
+    }
     /// Fail the messages waiting to `peer`, as they cannot go, for `reason`, returning `reason`
     /// together with the failed history indices so callers can release held/upload state.
     pub(super) async fn fail_waiting(
@@ -703,13 +827,17 @@ impl<V: HistoryStore> Inner<V> {
             .map(|index| (outbox_key(peer, *index), None))
             .collect();
         let entries: Vec<_> = entries.into_iter().collect();
-        let contact = self.contact(peer).ok_or("no such chat")?;
-        let snapshot = contact.snapshot();
-        contact.state.outbox.retain(|outgoing| outgoing.sealed);
-        if let Err(e) = self.save_with(&records(peer, &entries), &gone).await {
-            self.roll_back(peer, snapshot)?;
-            return Err(describe(&e));
-        }
+        self.with_contact_tx(peer, async |inner| {
+            let contact = inner
+                .contact(peer)
+                .ok_or_else(|| "no such chat".to_string())?;
+            contact.state.outbox.retain(|outgoing| outgoing.sealed);
+            inner
+                .save_with(&records(peer, &entries), &gone)
+                .await
+                .map_err(|e| describe(&e))
+        })
+        .await?;
         Ok((reason, waiting))
     }
 
@@ -785,22 +913,15 @@ impl<V: HistoryStore> Inner<V> {
         if !contact.state.needs_requeue_sealed && !retired {
             return Ok(None);
         }
-        let snapshot = contact.snapshot();
-        let outcome = match self.requeue_sealed(peer).await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                self.roll_back(peer, snapshot)?;
-                return Err(e);
-            }
-        };
-        if let Err(e) = self
-            .save_with(&records(peer, &outcome.history), &outcome.outbox)
-            .await
-        {
-            self.roll_back(peer, snapshot)?;
-            return Err(describe(&e));
-        }
-        Ok(Some(outcome))
+        self.with_contact_tx(peer, async |inner| {
+            let outcome = inner.requeue_sealed(peer).await?;
+            inner
+                .save_with(&records(peer, &outcome.history), &outcome.outbox)
+                .await
+                .map_err(|e| describe(&e))?;
+            Ok(Some(outcome))
+        })
+        .await
     }
 
     /// Re-encrypt every sealed outbox item after an active session replacement.

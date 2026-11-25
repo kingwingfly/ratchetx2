@@ -1,41 +1,34 @@
-use session::PqSuite;
+use e2ee_chat_preview::rpc::{DIAGRAM_SOURCE_MAX, HIGHLIGHT_MAX};
+use session::{PqSuite, PublicKey};
 
 use crate::{
-    state::{ClassicalPrompt, ContactView, SecurityAlert, SecurityView},
-    util::{hex, key_to_text, key_to_url},
+    preview::validate_highlight_html,
+    state::{ClassicalPrompt, SecurityAlert, SecurityView, ServerPqStatus},
+    util::{hex, key_to_text, key_to_url, sanitize_filename, sanitize_shared_name},
 };
 
 use super::{
-    chat::{contact_can_upgrade_to_pq, security_badge_parts},
-    composer::should_autofocus_composer,
+    chat::{contact_can_upgrade_to_pq, security_badge_parts, upload_percent},
+    common::{
+        avatar_letters, extension, initials, invited_server_from_hash, make_contact,
+        validate_invited_server,
+    },
+    dialogs::effective_invite_context,
     files::file_status_suffix,
     history::{ChatHistory, HistoryOp, MAX_ENTRIES, Reservation, Transition, UiAction},
+    media::duration,
+    pdf::{MAX_PDF_PAGES, cap_pdf_pages, pdf_aspect_ratio},
+    settings::{server_pq_pill, strict_pq_toggle_disabled},
     sidebar::chat_item_meta,
-    viewer::preview_fragment_candidates,
+    viewer::{
+        EnhancePlan, MAX_ENHANCE_BLOCKS, plan_enhance_block, preview_fragment_candidates,
+        sanitize_archive_path,
+    },
 };
-
-fn sample_contact() -> ContactView {
-    ContactView {
-        peer: [7; 32],
-        name: "Alice".to_string(),
-        request: false,
-        hello_name: String::new(),
-        unread: 0,
-        last_activity: 0,
-        security: SecurityView::default(),
-        has_active_session: false,
-        pq_pinned: false,
-        peer_pq_capable: false,
-        allow_classical_exception: false,
-        downgrade_detected: false,
-        alert: SecurityAlert::None,
-        classical_prompt: ClassicalPrompt::None,
-    }
-}
 
 #[test]
 fn retired_pq_pinned_session_shows_neutral_ended_badge_and_not_classical() {
-    let mut contact = sample_contact();
+    let mut contact = make_contact(7, "Alice");
     contact.pq_pinned = true;
     contact.has_active_session = false;
     contact.security = SecurityView::default();
@@ -62,7 +55,7 @@ fn retired_pq_pinned_session_shows_neutral_ended_badge_and_not_classical() {
 
 #[test]
 fn retired_unpinned_session_shows_neutral_ended_badge() {
-    let contact = sample_contact();
+    let contact = make_contact(7, "Alice");
 
     let (class, compact, title) = security_badge_parts(&contact, false);
     assert_eq!(class, "sec-badge neutral");
@@ -83,7 +76,7 @@ fn retired_unpinned_session_shows_neutral_ended_badge() {
 
 #[test]
 fn downgrade_takes_precedence_even_without_active_session() {
-    let mut contact = sample_contact();
+    let mut contact = make_contact(7, "Alice");
     contact.pq_pinned = true;
     contact.downgrade_detected = true;
 
@@ -95,14 +88,14 @@ fn downgrade_takes_precedence_even_without_active_session() {
 
 #[test]
 fn active_sessions_show_pq_or_classical_badges_and_upgrade_rules() {
-    let mut classical = sample_contact();
+    let mut classical = make_contact(7, "Alice");
     classical.has_active_session = true;
     let (class, label, _) = security_badge_parts(&classical, false);
     assert_eq!(class, "sec-badge classical");
     assert_eq!(label, "Classical only");
     assert!(contact_can_upgrade_to_pq(&classical));
 
-    let mut pq = sample_contact();
+    let mut pq = make_contact(7, "Alice");
     pq.has_active_session = true;
     pq.pq_pinned = true;
     pq.security = SecurityView {
@@ -118,7 +111,7 @@ fn active_sessions_show_pq_or_classical_badges_and_upgrade_rules() {
     assert_eq!(detailed, "Quantum-resistant · ML-KEM-1024 + PQ Ratchet");
     assert!(!contact_can_upgrade_to_pq(&pq));
 
-    let mut quarantined = sample_contact();
+    let mut quarantined = make_contact(7, "Alice");
     quarantined.has_active_session = true;
     quarantined.classical_prompt = ClassicalPrompt::InboundQuarantined {
         peer_was_pq_pinned: false,
@@ -138,9 +131,7 @@ fn active_sessions_show_pq_or_classical_badges_and_upgrade_rules() {
 
 #[test]
 fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
-    // Accepted quarantined chat -> warn style + "classical chat (quarantined)".
-    let mut accepted_q = sample_contact();
-    accepted_q.request = false;
+    let mut accepted_q = make_contact(7, "Alice");
     accepted_q.classical_prompt = ClassicalPrompt::InboundQuarantined {
         peer_was_pq_pinned: false,
     };
@@ -154,7 +145,6 @@ fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
         )
     );
 
-    // Unaccepted quarantined request -> warn style + "classical request (quarantined)".
     let mut request_q = accepted_q.clone();
     request_q.request = true;
     assert_eq!(
@@ -167,7 +157,6 @@ fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
         )
     );
 
-    // Downgraded + quarantined -> danger style.
     let mut downgrade_q = accepted_q;
     downgrade_q.downgrade_detected = true;
     assert_eq!(
@@ -180,8 +169,7 @@ fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
         )
     );
 
-    // Outbound classical approval prompt -> warn style.
-    let mut outbound = sample_contact();
+    let mut outbound = make_contact(7, "Alice");
     outbound.classical_prompt = ClassicalPrompt::Outbound {
         peer_signed_off: true,
     };
@@ -190,14 +178,13 @@ fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
         (false, true, false, "classical approval needed".to_string())
     );
 
-    // Security alerts -> warn style.
-    let mut expired = sample_contact();
+    let mut expired = make_contact(7, "Alice");
     expired.alert = SecurityAlert::ManifestExpired;
     assert_eq!(
         chat_item_meta(&expired),
         (false, true, false, "peer PQ manifest expired".to_string())
     );
-    let mut strict = sample_contact();
+    let mut strict = make_contact(7, "Alice");
     strict.alert = SecurityAlert::PqRequired;
     assert_eq!(
         chat_item_meta(&strict),
@@ -219,7 +206,6 @@ fn file_status_suffix_distinguishes_local_cancelled_waiting_and_malformed() {
         file_status_suffix(false, true, false, false, true),
         Some("no longer on the server")
     );
-    // Cancelled / failed sign-in-held upload must NOT show "waiting to upload".
     assert_eq!(
         file_status_suffix(false, false, true, false, true),
         Some("upload cancelled")
@@ -228,26 +214,11 @@ fn file_status_suffix_distinguishes_local_cancelled_waiting_and_malformed() {
         file_status_suffix(false, false, false, true, true),
         Some("on server")
     );
-    // Outgoing unuploaded non-failed attachment -> waiting to upload.
     assert_eq!(
         file_status_suffix(false, false, false, false, true),
         Some("waiting to upload")
     );
-    // Malformed incoming remote pointer -> no misleading "waiting to upload".
     assert_eq!(file_status_suffix(false, false, false, false, false), None);
-}
-
-#[test]
-fn composer_autofocus_is_disabled_on_portable_touch_devices() {
-    // Desktop / laptop (hover-capable fine pointer): keep autofocus.
-    assert!(should_autofocus_composer(false, false));
-    // Phones and tablets (neither hover nor fine pointer): skip autofocus so the virtual keyboard
-    // does not pop up automatically on entering a chat.
-    assert!(!should_autofocus_composer(true, true));
-    // Coarse primary pointer alone (e.g. touch device reporting hover support): skip autofocus.
-    assert!(!should_autofocus_composer(false, true));
-    // Non-hovering primary input alone (e.g. stylus-only portable device): skip autofocus.
-    assert!(!should_autofocus_composer(true, false));
 }
 
 #[test]
@@ -272,66 +243,484 @@ fn preview_fragment_candidates_decodes_percent_encoded_ids() {
 }
 
 #[test]
-fn chat_history_open_and_back_gesture_returns_to_list_without_leaking_peer_key() {
-    let alice = [0xA1; 32];
-    let mut history = ChatHistory::new("sess01".to_string(), None, String::new());
+fn sanitize_filename_strips_bidi_controls_separators_reserved_names_and_caps_length() {
+    // BiDi RLO extension spoofing (`invoice_\u{202E}fdp.exe` renders visually as `invoice_exe.pdf`).
+    assert_eq!(
+        sanitize_filename("invoice_\u{202E}fdp.exe"),
+        "invoice_fdp.exe"
+    );
+    // Isolates, ZWJ, BOM, and ASCII control chars stripped; spaces collapsed.
+    assert_eq!(
+        sanitize_filename("\u{FEFF}a\u{2066}\u{200D}b\x00\n\r\tc\x07.txt"),
+        "abc.txt"
+    );
+    assert_eq!(sanitize_filename("a   b\u{00A0}\u{00A0}c.txt"), "a b c.txt");
+    // Path separators and filesystem-unsafe characters replaced with `_` (leading dots trimmed).
+    assert_eq!(
+        sanitize_filename("../../etc/passwd:evil*?\"<>|\\x"),
+        "_.._etc_passwd_evil_______x"
+    );
+    // Leading/trailing dots and spaces stripped; empty/dots-only falls back to `"file"`.
+    assert_eq!(sanitize_filename("  ...report.pdf...  "), "report.pdf");
+    assert_eq!(sanitize_filename("...   ..."), "file");
+    assert_eq!(sanitize_filename("\u{202E}\x00"), "file");
+    // Windows reserved device names guarded (case-insensitive, with or without extension).
+    assert_eq!(sanitize_filename("CON"), "_CON");
+    assert_eq!(sanitize_filename("nul.txt"), "_nul.txt");
+    assert_eq!(sanitize_filename("com1.pdf"), "_com1.pdf");
+    assert_eq!(sanitize_filename("LPT9"), "_LPT9");
+    assert_eq!(sanitize_filename("console.txt"), "console.txt");
+    // Length cap preserves reasonable extension.
+    let long = format!("{}.tar.gz", "a".repeat(250));
+    let capped = sanitize_filename(&long);
+    assert!(capped.chars().count() <= 200);
+    assert!(capped.ends_with(".gz"));
+    // Shared-name sanitizer also strips BiDi overrides and control chars.
+    assert_eq!(sanitize_shared_name("Alice\u{202E}\x07  Bob"), "Alice Bob");
+}
 
-    // Entering a chat from the chat list tags the list entry and pushes an opaque chat token
-    // (never leaking the peer's public key).
-    let entered = history.user_open(alice, "");
-    let (list_token, chat_token) = match entered {
+#[test]
+fn invited_server_validates_relay_urls_and_rejects_unsafe_schemes() {
+    let key = key_to_url(&[0xAB; 32]);
+    // Valid HTTPS origins (canonicalized, default port & trailing slash stripped).
+    assert_eq!(
+        validate_invited_server(Some("https://relay.example.com:443/")),
+        Some("https://relay.example.com".to_string())
+    );
+    assert_eq!(
+        validate_invited_server(Some("https://relay.example.com:8443")),
+        Some("https://relay.example.com:8443".to_string())
+    );
+    // Localhost and loopback HTTP allowed for local dev.
+    assert_eq!(
+        validate_invited_server(Some("http://localhost:8787")),
+        Some("http://localhost:8787".to_string())
+    );
+    assert_eq!(
+        validate_invited_server(Some("http://127.0.0.1:8787/")),
+        Some("http://127.0.0.1:8787".to_string())
+    );
+    assert_eq!(
+        validate_invited_server(Some("http://[::1]:8787")),
+        Some("http://[::1]:8787".to_string())
+    );
+    // Plaintext non-localhost HTTP, WS, JS, credentials, paths, queries, fragments, bare hosts rejected.
+    for bad in [
+        "",
+        "   ",
+        "http://evil.example",
+        "http://localhost.evil.example",
+        "ws://relay.example",
+        "wss://relay.example",
+        "javascript:alert(1)",
+        "data:text/html,hi",
+        "relay.example",
+        "https://user:pass@relay.example",
+        "https://relay.example/api",
+        "https://relay.example/?x=1",
+        "https://relay.example/#frag",
+    ] {
+        assert_eq!(
+            validate_invited_server(Some(bad)),
+            None,
+            "expected {bad:?} to be rejected"
+        );
+    }
+    // End-to-end fragment parsing + validation.
+    let valid_hash = format!("#chat={key}&server=https%3A%2F%2Fother.example%3A443%2F&pq=1");
+    assert_eq!(
+        invited_server_from_hash(&valid_hash),
+        Some("https://other.example".to_string())
+    );
+    let bad_hash = format!("#chat={key}&server=http%3A%2F%2Fattacker.example");
+    assert_eq!(invited_server_from_hash(&bad_hash), None);
+}
+
+#[test]
+fn pdf_aspect_ratio_clamps_extremes_and_pages_cap_truncates_safely() {
+    assert_eq!(pdf_aspect_ratio(595.5, 842.0), "595.5 / 842");
+    assert_eq!(pdf_aspect_ratio(10.0, 100.0), "10 / 100");
+    assert_eq!(pdf_aspect_ratio(100.0, 10.0), "100 / 10");
+    // Extreme aspect ratios clamped to 0.1..=10.0.
+    assert_eq!(pdf_aspect_ratio(1.0, 1e7), "1 / 10");
+    assert_eq!(pdf_aspect_ratio(1e7, 1.0), "10 / 1");
+    // Non-positive, NaN, infinite, and overflowing/underflowing ratios fall back to US Letter.
+    for (w, h) in [
+        (0.0, 842.0),
+        (595.0, 0.0),
+        (-10.0, 842.0),
+        (f64::NAN, 842.0),
+        (f64::INFINITY, 842.0),
+        (1e308, 1e-308),
+        (1e-308, 1e308),
+    ] {
+        assert_eq!(
+            pdf_aspect_ratio(w, h),
+            "612 / 792",
+            "expected fallback for ({w}, {h})"
+        );
+    }
+    // Page count cap.
+    let small = vec![(612.0, 792.0); 5];
+    let (kept, total) = cap_pdf_pages(small);
+    assert_eq!(kept.len(), 5);
+    assert_eq!(total, 5);
+
+    let bomb = vec![(612.0, 792.0); MAX_PDF_PAGES + 123];
+    let (kept, total) = cap_pdf_pages(bomb);
+    assert_eq!(kept.len(), MAX_PDF_PAGES);
+    assert_eq!(total, MAX_PDF_PAGES + 123);
+}
+
+#[test]
+fn new_chat_key_edit_clears_invited_server_and_pq_pin() {
+    let alice = [0x11; 32];
+    let bob = [0x22; 32];
+    let alice_url = key_to_url(&alice);
+    let alice_std = key_to_text(&alice);
+    let bob_std = key_to_text(&bob);
+
+    // Exact match preserves both invited server and PQ pin.
+    assert_eq!(
+        effective_invite_context(&alice_url, &alice_url, Some("https://other.example"), true),
+        (Some("https://other.example".to_string()), true)
+    );
+    // Re-encoding the same key (URL-safe -> standard base64 + whitespace) still matches.
+    assert_eq!(
+        effective_invite_context(
+            &alice_url,
+            &format!("  {alice_std}  "),
+            Some("https://other.example"),
+            true
+        ),
+        (Some("https://other.example".to_string()), true)
+    );
+    // Replacing the key with another peer's key clears both server and pq_pinned.
+    assert_eq!(
+        effective_invite_context(&alice_url, &bob_std, Some("https://other.example"), true),
+        (None, false)
+    );
+    // Clearing or typing an invalid key clears both server and pq_pinned.
+    assert_eq!(
+        effective_invite_context(&alice_url, "", Some("https://other.example"), true),
+        (None, false)
+    );
+    assert_eq!(
+        effective_invite_context(&alice_url, "not-a-key", Some("https://other.example"), true),
+        (None, false)
+    );
+    // Manual "New chat" with empty invited key never inherits invite metadata.
+    assert_eq!(
+        effective_invite_context("", &alice_std, Some("https://other.example"), true),
+        (None, false)
+    );
+}
+
+#[test]
+fn settings_server_pq_pill_and_strict_pq_toggle_rules() {
+    let (cls, label, tip) = server_pq_pill(&ServerPqStatus::Enabled {
+        suites: vec![PqSuite::MlKem1024, PqSuite::MlKem768],
+        pq_ratchet: true,
+    });
+    assert_eq!((cls, label), ("sec-badge pq", "Server: PQ ready"));
+    assert!(tip.contains("ML-KEM-1024, ML-KEM-768"));
+    assert!(tip.contains("continuous re-keying"));
+
+    let (cls, label, tip) = server_pq_pill(&ServerPqStatus::Enabled {
+        suites: vec![],
+        pq_ratchet: false,
+    });
+    assert_eq!((cls, label), ("sec-badge pq", "Server: PQ ready"));
+    assert!(tip.contains("enabled"));
+    assert!(!tip.contains("continuous re-keying"));
+
+    assert_eq!(
+        server_pq_pill(&ServerPqStatus::Disabled).0,
+        "sec-badge classical"
+    );
+    assert_eq!(
+        server_pq_pill(&ServerPqStatus::AudienceMismatch).0,
+        "sec-badge danger"
+    );
+    assert_eq!(
+        server_pq_pill(&ServerPqStatus::Unknown).0,
+        "sec-badge neutral"
+    );
+
+    // Strict PQ toggle rules:
+    assert!(!strict_pq_toggle_disabled(false, true, false, false));
+    assert!(strict_pq_toggle_disabled(true, true, false, false));
+    assert!(strict_pq_toggle_disabled(false, false, false, false));
+    assert!(strict_pq_toggle_disabled(false, false, false, true));
+    // When server has PQ disabled, user cannot turn strict PQ on, but CAN still turn it off.
+    assert!(strict_pq_toggle_disabled(false, true, true, false));
+    assert!(!strict_pq_toggle_disabled(false, true, true, true));
+}
+
+#[test]
+fn common_avatar_letters_initials_and_extension_edge_cases() {
+    let peer = [0xA1; 32];
+    assert_eq!(initials(""), "");
+    assert_eq!(initials("   "), "");
+    assert_eq!(initials("Alice"), "A");
+    assert_eq!(initials("Alice Bob Carol"), "AB");
+    assert_eq!(initials("Élodie 张"), "É张");
+
+    // Unnamed or whitespace-only peer uses first hex byte (not `initials(&short(&peer))` = "ac").
+    assert_eq!(avatar_letters("", &peer), "a1");
+    assert_eq!(avatar_letters("   ", &peer), "a1");
+    assert_eq!(avatar_letters("Alice Smith", &peer), "AS");
+
+    assert_eq!(extension("README"), "file");
+    assert_eq!(extension("trailing."), "file");
+    assert_eq!(extension(".gitignore"), "gitignore");
+    assert_eq!(extension("ARCHIVE.TAR.GZ"), "gz");
+    assert_eq!(extension("photo.JPEG"), "jpeg");
+}
+
+#[test]
+fn media_duration_handles_edge_cases() {
+    assert_eq!(duration(0.0), "0:00");
+    assert_eq!(duration(-5.0), "0:00");
+    assert_eq!(duration(f64::NAN), "0:00");
+    assert_eq!(duration(f64::INFINITY), "0:00");
+    assert_eq!(duration(f64::NEG_INFINITY), "0:00");
+    assert_eq!(duration(5.4), "0:05");
+    assert_eq!(duration(59.6), "1:00");
+    assert_eq!(duration(60.0), "1:00");
+    assert_eq!(duration(3599.6), "1:00:00");
+    assert_eq!(duration(3661.0), "1:01:01");
+    assert!(duration(1e30).contains(':'));
+}
+
+#[test]
+fn viewer_enhance_budget_and_highlight_validation_work() {
+    // Unknown language is ignored cleanly (`None`).
+    assert_eq!(plan_enhance_block("unknown-lang-xyz", 10, 0), None);
+    // Mermaid within and over DIAGRAM_SOURCE_MAX.
+    assert_eq!(
+        plan_enhance_block("mermaid", DIAGRAM_SOURCE_MAX, 0),
+        Some(EnhancePlan::Diagram)
+    );
+    assert_eq!(
+        plan_enhance_block("MERMAID", DIAGRAM_SOURCE_MAX + 1, 0),
+        Some(EnhancePlan::Skip("diagram source is too large"))
+    );
+    // Code block within and over HIGHLIGHT_MAX.
+    assert!(matches!(
+        plan_enhance_block("rust", HIGHLIGHT_MAX, 0),
+        Some(EnhancePlan::Highlight(_))
+    ));
+    assert_eq!(
+        plan_enhance_block("rust", HIGHLIGHT_MAX + 1, 0),
+        Some(EnhancePlan::Skip("code block is too large to highlight"))
+    );
+    // Document-wide block count cap.
+    assert_eq!(
+        plan_enhance_block("rust", 16, MAX_ENHANCE_BLOCKS),
+        Some(EnhancePlan::Skip("too many enhanced blocks in document"))
+    );
+    assert_eq!(
+        plan_enhance_block("mermaid", 16, MAX_ENHANCE_BLOCKS),
+        Some(EnhancePlan::Skip("too many enhanced blocks in document"))
+    );
+
+    // Highlighted HTML validation rejects XSS/unexpected tags while allowing arborium spans.
+    assert!(validate_highlight_html("<span class=\"hl-keyword\">fn</span> main() &amp;").is_ok());
+    assert!(validate_highlight_html("<img src=x onerror=alert(1)>").is_err());
+    assert!(validate_highlight_html("<span class=\"hl-keyword\" onclick=\"x\">a</span>").is_err());
+    assert!(validate_highlight_html("<span class=\"hl-keyword\">unclosed").is_err());
+
+    // Archive path display strips BiDi/controls while preserving directory slashes.
+    assert_eq!(
+        sanitize_archive_path("dir/\u{202E}file\x00.txt"),
+        "dir/file.txt"
+    );
+}
+
+#[test]
+fn upload_percent_clamps_and_avoids_overflow() {
+    assert_eq!(upload_percent(0, 0), 0);
+    assert_eq!(upload_percent(50, 100), 50);
+    // XHR framing overhead can report done > size; percentage must stay within 0..=100.
+    assert_eq!(upload_percent(120, 100), 100);
+    assert_eq!(upload_percent(u64::MAX, u64::MAX), 100);
+    assert_eq!(upload_percent((u64::MAX - 1) / 2, u64::MAX - 1), 50);
+}
+
+// ---------------------------------------------------------------------------
+// ChatHistory state-machine harness and behavioral suite
+// ---------------------------------------------------------------------------
+
+struct HistoryHarness {
+    history: ChatHistory,
+}
+
+impl HistoryHarness {
+    fn new(session: &str) -> Self {
+        Self {
+            history: ChatHistory::new(session.to_string(), None, String::new()),
+        }
+    }
+
+    fn reloaded(session: &str, state: Option<&str>, hash: &str) -> Self {
+        Self {
+            history: ChatHistory::new(session.to_string(), state, hash.to_string()),
+        }
+    }
+
+    fn transition(ui: UiAction, dismiss_startup: bool) -> Transition {
         Transition {
-            history:
+            history: None,
+            ui,
+            dismiss_startup,
+            fallback_active: None,
+        }
+    }
+
+    fn open_push(&mut self, peer: PublicKey, hash: &str) -> (Option<String>, String) {
+        match self.history.user_open(peer, hash) {
+            Transition {
+                history:
+                    Some(HistoryOp::Push {
+                        tag_list,
+                        chat_token,
+                    }),
+                ui: UiAction::Open(p),
+                ..
+            } if p == peer => (tag_list, chat_token),
+            other => panic!("expected Push + Open({peer:?}), got {other:?}"),
+        }
+    }
+
+    fn open_replace(&mut self, peer: PublicKey, hash: &str) -> String {
+        match self.history.user_open(peer, hash) {
+            Transition {
+                history: Some(HistoryOp::Replace(token)),
+                ui: UiAction::Open(p),
+                ..
+            } if p == peer => token,
+            other => panic!("expected Replace + Open({peer:?}), got {other:?}"),
+        }
+    }
+
+    fn open_back(&mut self, peer: PublicKey, hash: &str) -> u64 {
+        match self.history.user_open(peer, hash) {
+            Transition {
+                history: Some(HistoryOp::Back(attempt)),
+                ui: UiAction::None,
+                ..
+            } => attempt,
+            other => panic!("expected Back for open({peer:?}), got {other:?}"),
+        }
+    }
+
+    fn close_back(&mut self) -> u64 {
+        match self.history.user_close() {
+            Transition {
+                history: Some(HistoryOp::Back(attempt)),
+                ui: UiAction::None,
+                ..
+            } => attempt,
+            other => panic!("expected Back for user_close(), got {other:?}"),
+        }
+    }
+
+    fn tag_frag(&mut self, hash: &str) -> String {
+        match self.history.on_popstate(None, hash, false, |_| true) {
+            Transition {
+                history: Some(HistoryOp::Tag(tag)),
+                ui: UiAction::None,
+                ..
+            } => tag,
+            other => panic!("expected Tag for fragment {hash:?}, got {other:?}"),
+        }
+    }
+
+    fn pop(&mut self, state: Option<&str>, hash: &str) -> Transition {
+        self.history.on_popstate(state, hash, false, |_| true)
+    }
+
+    fn pop_peer(&mut self, state: Option<&str>, hash: &str, only: PublicKey) -> Transition {
+        self.history.on_popstate(state, hash, false, |p| *p == only)
+    }
+
+    fn assert_pop_back(&mut self, state: Option<&str>, hash: &str) {
+        assert!(matches!(
+            self.pop(state, hash),
+            Transition {
+                history: Some(HistoryOp::Back(_)),
+                ui: UiAction::None,
+                ..
+            }
+        ));
+    }
+
+    fn reserve_push(&mut self, hash: &str) -> (Reservation, Option<String>, String) {
+        match self.history.reserve(hash) {
+            (
+                res @ Reservation::Pushed(_),
                 Some(HistoryOp::Push {
-                    tag_list: Some(list_token),
+                    tag_list,
                     chat_token,
                 }),
-            ui: UiAction::Open(peer),
-            ..
-        } => {
-            assert_eq!(peer, alice);
-            (list_token, chat_token)
+            ) => (res, tag_list, chat_token),
+            other => panic!("expected (Pushed, Some(Push)), got {other:?}"),
         }
-        other => panic!("expected Push with list tag + Open(alice), got {other:?}"),
-    };
+    }
+
+    fn reserve_unpushed(&mut self, hash: &str) -> Reservation {
+        match self.history.reserve(hash) {
+            (res @ Reservation::Unpushed { .. }, None) => res,
+            other => panic!("expected (Unpushed, None), got {other:?}"),
+        }
+    }
+
+    fn abort_back_replace(
+        &mut self,
+        attempt: u64,
+        state: Option<&str>,
+        hash: &str,
+        peer: PublicKey,
+    ) -> String {
+        match self
+            .history
+            .on_back_aborted(attempt, state, hash, |p| *p == peer)
+        {
+            Transition {
+                history: Some(HistoryOp::Replace(tok)),
+                ui: UiAction::Open(p),
+                ..
+            } if p == peer => tok,
+            other => panic!("expected Replace + Open({peer:?}), got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn chat_history_open_and_back_gesture_returns_to_list_without_leaking_peer_key() {
+    let alice = [0xA1; 32];
+    let mut h = HistoryHarness::new("sess01");
+
+    let (list_token, chat_token) = h.open_push(alice, "");
+    let list_token = list_token.expect("initial list tag");
     assert_eq!(list_token, "ratchetx2-list:sess01");
     assert!(chat_token.starts_with("ratchetx2-chat:sess01:"));
     assert!(!chat_token.contains(&hex(&alice)));
     assert!(!chat_token.contains(&key_to_text(&alice)));
     assert!(!chat_token.contains(&key_to_url(&alice)));
 
-    // System "go back" gesture pops back to the tagged list entry -> closes chat and returns to
-    // chat list without issuing an extra `history.back()`.
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::Close, false)
     );
-
-    // Browser Forward gesture onto the chat token reopens Alice while the contact still exists.
     assert_eq!(
-        history.on_popstate(Some(&chat_token), "", false, |p| *p == alice),
-        Transition {
-            history: None,
-            ui: UiAction::Open(alice),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop_peer(Some(&chat_token), "", alice),
+        HistoryHarness::transition(UiAction::Open(alice), false)
     );
-
-    // Going back again returns to the chat list cleanly.
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::Close, false)
     );
 }
 
@@ -339,204 +728,74 @@ fn chat_history_open_and_back_gesture_returns_to_list_without_leaking_peer_key()
 fn chat_history_tracks_manual_fragments_including_empty_hash_so_close_and_switch_reach_list() {
     let alice = [0xA2; 32];
     let bob = [0xB2; 32];
-    let mut history = ChatHistory::new("sess-frag".to_string(), None, String::new());
+    let mut h = HistoryHarness::new("sess-frag");
 
-    let (list_token, alice_token) = match history.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_token),
-                    chat_token,
-                }),
-            ..
-        } => (list_token, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
+    let (list_token, alice_token) = h.open_push(alice, "");
+    let list_token = list_token.expect("list tag");
 
-    // Manual `#one` then `#` (empty hash, null state) stacked above Alice must BOTH be treated as
-    // fragment entries (NOT the tagged list entry!) and stamped with chat-bound fragment markers so
-    // Alice stays open and stepping Back between fragments preserves exact depth.
-    let frag_one = match history.on_popstate(None, "#one", false, |_| true) {
-        Transition {
-            history: Some(HistoryOp::Tag(tag)),
-            ui: UiAction::None,
-            ..
-        } => tag,
-        other => panic!("expected Tag for #one fragment, got {other:?}"),
-    };
-    assert!(frag_one.starts_with("ratchetx2-frag:sess-frag:"));
-    assert!(frag_one.ends_with(":1"));
-    let frag_empty = match history.on_popstate(None, "", false, |_| true) {
-        Transition {
-            history: Some(HistoryOp::Tag(tag)),
-            ui: UiAction::None,
-            ..
-        } => tag,
-        other => panic!("expected Tag for empty-# fragment, got {other:?}"),
-    };
+    // Both `#one` and empty `#` above Alice are tagged as fragments (never confused with list).
+    let frag_one = h.tag_frag("#one");
+    assert!(frag_one.starts_with("ratchetx2-frag:sess-frag:") && frag_one.ends_with(":1"));
+    let frag_empty = h.tag_frag("");
     assert!(frag_empty.ends_with(":2"));
 
-    // Stepping Back manually from `#` (`depth 2`) to `#one` (`depth 1`) keeps Alice open with
-    // exact depth 1; in-app Close then unwinds `#one` -> `alice_token` -> tagged list entry.
+    // Stepping back from `#` (depth 2) to `#one` (depth 1) keeps Alice open; Close unwinds both.
     assert_eq!(
-        history.on_popstate(Some(&frag_one), "#one", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&frag_one), "#one"),
+        HistoryHarness::transition(UiAction::None, false)
     );
-    assert!(matches!(
-        history.user_close(),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert!(matches!(
-        history.on_popstate(Some(&alice_token), "", false, |_| true),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
+    h.close_back();
+    h.assert_pop_back(Some(&alice_token), "");
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::Close, false)
     );
 
-    // Direct Forward-menu jump from the list straight to `#one` resolves its underlying chat slot
-    // and reopens Alice without overwriting `#one` with a list token.
+    // Direct Forward-menu jump to `#one` reopens Alice; switching to Bob then clicking Close
+    // before unwind settles redirects traversal to close to list.
     assert_eq!(
-        history.on_popstate(Some(&frag_one), "#one", false, |p| *p == alice),
-        Transition {
-            history: None,
-            ui: UiAction::Open(alice),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop_peer(Some(&frag_one), "#one", alice),
+        HistoryHarness::transition(UiAction::Open(alice), false)
     );
-    // Clicking Switch to Bob from `#one` starts unwinding `#one`; clicking Close BEFORE that
-    // unwind settles redirects the traversal to close all the way to the list (not reopen Alice).
+    h.open_back(bob, "#one");
+    assert_eq!(
+        h.history.user_close(),
+        HistoryHarness::transition(UiAction::None, false)
+    );
     assert!(matches!(
-        history.user_open(bob, "#one"),
+        h.pop_peer(Some(&alice_token), "", alice),
         Transition {
             history: Some(HistoryOp::Back(_)),
             ui: UiAction::None,
             ..
         }
     ));
-    assert_eq!(
-        history.user_close(),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-    assert!(matches!(
-        history.on_popstate(Some(&alice_token), "", false, |p| *p == alice),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert_eq!(
-        history
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
+    assert_eq!(h.pop(Some(&list_token), "").ui, UiAction::Close);
 
-    // Peer switch while on `#frag` unwinds `#frag` back onto `alice_token` and replaces it in
-    // place with Bob so one Back from Bob returns straight to the tagged list.
-    let alice_token_2 = match history.user_open(alice, "") {
-        Transition {
-            history: Some(HistoryOp::Push { chat_token, .. }),
-            ..
-        } => chat_token,
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let frag_two = match history.on_popstate(None, "#frag", false, |_| true) {
-        Transition {
-            history: Some(HistoryOp::Tag(tag)),
-            ..
-        } => tag,
-        other => panic!("expected Tag for #frag, got {other:?}"),
-    };
-    let switch_attempt = match history.user_open(bob, "#frag") {
-        Transition {
-            history: Some(HistoryOp::Back(attempt)),
-            ui: UiAction::None,
-            ..
-        } => attempt,
-        other => panic!("expected Back, got {other:?}"),
-    };
-    // If that fragment unwind times out while still on the fragment token, recovery recognizes
-    // the fragment and replaces it in place with Bob instead of tagging it as a list and pushing.
+    // Timed-out fragment unwind replaces fragment in place with Bob.
+    let _ = h.open_push(alice, "");
+    let frag_two = h.tag_frag("#frag");
+    let switch_attempt = h.open_back(bob, "#frag");
+    h.abort_back_replace(switch_attempt, Some(&frag_two), "#frag", bob);
+    assert_eq!(h.pop(Some(&list_token), "").ui, UiAction::Close);
+
+    // Normal peer switch unwinds `#frag` onto `alice_token_3` and replaces it with Bob.
+    let (_, alice_token_3) = h.open_push(alice, "");
+    let _ = h.tag_frag("#frag");
+    h.open_back(bob, "#frag");
     assert!(matches!(
-        history.on_back_aborted(switch_attempt, Some(&frag_two), "#frag", |p| *p == bob),
+        h.pop_peer(Some(&alice_token_3), "", bob),
         Transition {
             history: Some(HistoryOp::Replace(_)),
             ui: UiAction::Open(p),
             ..
         } if p == bob
     ));
-    assert_eq!(
-        history
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
-    // Normal (non-timed-out) peer switch unwinds `#frag` onto `alice_token_2` and replaces it.
-    let alice_token_3 = match history.user_open(alice, "") {
-        Transition {
-            history: Some(HistoryOp::Push { chat_token, .. }),
-            ..
-        } => chat_token,
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let _ = history.on_popstate(None, "#frag", false, |_| true);
-    assert!(matches!(
-        history.user_open(bob, "#frag"),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert!(matches!(
-        history.on_popstate(Some(&alice_token_3), "", false, |p| *p == bob),
-        Transition {
-            history: Some(HistoryOp::Replace(_)),
-            ui: UiAction::Open(p),
-            ..
-        } if p == bob
-    ));
-    let _ = alice_token_2;
-    assert_eq!(
-        history
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
+    assert_eq!(h.pop(Some(&list_token), "").ui, UiAction::Close);
 
-    // Navigating to `#other` while on the list tags that new list entry immediately; jumping back
-    // via browser Back menu from a chat to an earlier list entry `/` (tagged on initial load OR
-    // even untagged if initial tagging failed) closes the chat instead of mistaking `/` for a
-    // fragment above the chat!
+    // Navigating to `#other` on the list tags it; jumping back via Back menu to `/` closes chat.
     assert_eq!(
-        history.on_popstate(None, "#other", false, |_| true),
+        h.pop(None, "#other"),
         Transition {
             history: Some(HistoryOp::Tag(list_token.clone())),
             ui: UiAction::Close,
@@ -544,102 +803,42 @@ fn chat_history_tracks_manual_fragments_including_empty_hash_so_close_and_switch
             fallback_active: None,
         }
     );
-    assert!(matches!(
-        history.user_open(alice, "#other"),
-        Transition {
-            history: Some(HistoryOp::Push { tag_list: None, .. }),
-            ui: UiAction::Open(p),
-            ..
-        } if p == alice
-    ));
-    // Jump via Back menu straight to the earlier tagged `/` list entry -> closes Alice cleanly.
-    assert_eq!(
-        history
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
+    let (tag_list, _) = h.open_push(alice, "#other");
+    assert_eq!(tag_list, None);
+    assert_eq!(h.pop(Some(&list_token), "").ui, UiAction::Close);
 
-    // Even if tagging the initial `/` list entry failed (`on_list_tag_failed("")`), jumping back
-    // from a chat opened on `#one` straight to untagged `/` (`None`, `""`) still closes the chat
-    // instead of keeping it open and letting in-app Close leave the site!
-    let mut untagged_root = ChatHistory::new("sess-untagged".to_string(), None, String::new());
-    let init_tag = untagged_root
+    // Even if initial `/` tagging failed, jumping back from chat on `#one` to untagged `/` closes.
+    let mut untagged = HistoryHarness::new("sess-untagged");
+    let init_tag = untagged
+        .history
         .tag_current_list_entry()
-        .expect("initial tag op");
-    untagged_root.on_write_failed(&init_tag, None, "");
-    let _ = untagged_root.on_popstate(None, "#one", false, |_| true);
-    let _ = untagged_root.user_open(alice, "#one");
-    assert_eq!(
-        untagged_root.on_popstate(None, "", false, |_| true).ui,
-        UiAction::Close
-    );
+        .expect("initial tag");
+    untagged.history.on_write_failed(&init_tag, None, "");
+    let _ = untagged.pop(None, "#one");
+    let _ = untagged.history.user_open(alice, "#one");
+    assert_eq!(untagged.pop(None, "").ui, UiAction::Close);
 }
 
 #[test]
 fn chat_history_switching_chats_replaces_single_entry_so_one_back_returns_to_list() {
     let alice = [0x11; 32];
     let bob = [0x22; 32];
-    let mut history = ChatHistory::new("sess02".to_string(), None, String::new());
+    let mut h = HistoryHarness::new("sess02");
 
-    // First chat pushes onto the stack.
-    let list_token = match history.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_token),
-                    ..
-                }),
-            ui: UiAction::Open(p),
-            ..
-        } if p == alice => list_token,
-        other => panic!("expected Push + Open(alice), got {other:?}"),
-    };
-
-    // Clicking the already-open chat does not push or replace history.
+    let (list_token, _) = h.open_push(alice, "");
+    let list_token = list_token.expect("list tag");
     assert_eq!(
-        history.user_open(alice, ""),
-        Transition {
-            history: None,
-            ui: UiAction::Open(alice),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.history.user_open(alice, ""),
+        HistoryHarness::transition(UiAction::Open(alice), false)
     );
-
-    // Switching directly to Bob replaces the current chat entry instead of stacking entries.
-    let bob_token = match history.user_open(bob, "") {
-        Transition {
-            history: Some(HistoryOp::Replace(token)),
-            ui: UiAction::Open(p),
-            ..
-        } => {
-            assert_eq!(p, bob);
-            token
-        }
-        other => panic!("expected Replace + Open(bob), got {other:?}"),
-    };
-
-    // One Back gesture returns directly to the chat list.
+    let bob_token = h.open_replace(bob, "");
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::Close, false)
     );
-
-    // Forward returns to Bob (the last chat on that entry).
     assert_eq!(
-        history.on_popstate(Some(&bob_token), "", false, |p| *p == bob),
-        Transition {
-            history: None,
-            ui: UiAction::Open(bob),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop_peer(Some(&bob_token), "", bob),
+        HistoryHarness::transition(UiAction::Open(bob), false)
     );
 }
 
@@ -647,78 +846,37 @@ fn chat_history_switching_chats_replaces_single_entry_so_one_back_returns_to_lis
 fn chat_history_in_app_back_prevents_double_back_and_rolls_back_failed_deferred_push_to_list() {
     let alice = [0x33; 32];
     let bob = [0x44; 32];
-    let mut history = ChatHistory::new("sess03".to_string(), None, String::new());
+    let mut h = HistoryHarness::new("sess03");
 
-    let list_token = match history.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_token),
-                    ..
-                }),
-            ..
-        } => list_token,
-        other => panic!("expected Push, got {other:?}"),
-    };
+    let (list_token, _) = h.open_push(alice, "");
+    let list_token = list_token.expect("list tag");
 
-    // First click on in-app Back issues a single `history.back()`.
-    assert!(matches!(
-        history.user_close(),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    // Rapid second click before `popstate` arrives must be ignored (never exit the site).
+    h.close_back();
     assert_eq!(
-        history.user_close(),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.history.user_close(),
+        HistoryHarness::transition(UiAction::None, false)
+    );
+    assert_eq!(
+        h.history.user_open(bob, ""),
+        HistoryHarness::transition(UiAction::None, false)
     );
 
-    // Opening Bob while `history.back()` is still settling defers Bob until `popstate` lands.
-    assert_eq!(
-        history.user_open(bob, ""),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-
-    // Once `popstate(list)` lands on the list entry, Bob is pushed with `fallback_active == None`.
-    let deferred = history.on_popstate(Some(&list_token), "", false, |p| *p == bob);
+    let deferred = h.pop_peer(Some(&list_token), "", bob);
     assert_eq!(deferred.fallback_active, None);
     let push_op = match deferred {
         Transition {
             history: Some(op @ HistoryOp::Push { .. }),
             ui: UiAction::Open(p),
             ..
-        } => {
-            assert_eq!(p, bob);
-            op
-        }
+        } if p == bob => op,
         other => panic!("expected Push + Open(bob), got {other:?}"),
     };
 
-    // If that deferred push fails or is throttled, rolling back restores the list entry (`None`),
-    // NOT Alice's old entry — so in-app Close closes directly without calling `history.back()`
-    // from the list and leaving the site.
-    history.on_write_failed(&push_op, deferred.fallback_active, "");
+    h.history
+        .on_write_failed(&push_op, deferred.fallback_active, "");
     assert_eq!(
-        history.user_close(),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.history.user_close(),
+        HistoryHarness::transition(UiAction::Close, false)
     );
 }
 
@@ -726,213 +884,106 @@ fn chat_history_in_app_back_prevents_double_back_and_rolls_back_failed_deferred_
 fn chat_history_deleting_open_chat_pops_entry_without_trapping_forward() {
     let alice = [0x55; 32];
     let bob = [0x56; 32];
-    let mut history = ChatHistory::new("sess04".to_string(), None, String::new());
+    let mut h = HistoryHarness::new("sess04");
 
-    let (list_token, chat_token) = match history.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_token),
-                    chat_token,
-                }),
-            ..
-        } => (list_token, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
+    let (list_token, chat_token) = h.open_push(alice, "");
+    let list_token = list_token.expect("list tag");
 
-    // Deleting Alice closes `ui.open` externally -> pops the chat history entry.
     assert!(matches!(
-        history.on_ui_closed(alice),
+        h.history.on_ui_closed(alice),
         Some(HistoryOp::Back(_))
     ));
-    // Popstate arrives back on the list.
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| false),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.history
+            .on_popstate(Some(&list_token), "", false, |_| false),
+        HistoryHarness::transition(UiAction::Close, false)
     );
-
-    // Pressing browser Forward onto Alice's now-deleted token stays on the list and marks the
-    // slot reusable WITHOUT calling `history.back()`, so any later Forward pages remain reachable.
     assert_eq!(
-        history.on_popstate(Some(&chat_token), "", false, |_| false),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.history
+            .on_popstate(Some(&chat_token), "", false, |_| false),
+        HistoryHarness::transition(UiAction::Close, false)
     );
-    // Opening Bob from that stale slot reuses it via `Replace` (no extra Back stop stacked).
-    assert!(matches!(
-        history.user_open(bob, ""),
-        Transition {
-            history: Some(HistoryOp::Replace(_)),
-            ui: UiAction::Open(p),
-            ..
-        } if p == bob
-    ));
+    let _ = h.open_replace(bob, "");
 }
 
 #[test]
 fn chat_history_reservation_handles_back_dismissal_ownership_transfer_and_unwind_retry() {
     let alice = [0x88; 32];
     let bob = [0x89; 32];
-    let mut history = ChatHistory::new("sess-res".to_string(), None, String::new());
+    let mut h = HistoryHarness::new("sess-res");
 
-    // Submitting NewChat on the list reserves an opaque entry immediately during the user gesture.
-    let (reservation, list_token, chat_token) = match history.reserve("") {
-        (
-            res @ Reservation::Pushed(_),
-            Some(HistoryOp::Push {
-                tag_list: Some(list_token),
-                chat_token,
-            }),
-        ) => (res, list_token, chat_token),
-        other => panic!("expected (Pushed, Some(Push)), got {other:?}"),
-    };
-    // Committing binds that reserved token directly to Alice without pushing another entry.
+    let (reservation, list_token, chat_token) = h.reserve_push("");
+    let list_token = list_token.expect("list tag");
     assert_eq!(
-        history.commit_reservation(Some(reservation), alice, ""),
-        Transition {
-            history: None,
-            ui: UiAction::Open(alice),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.history.commit_reservation(Some(reservation), alice, ""),
+        HistoryHarness::transition(UiAction::Open(alice), false)
     );
-    // Back returns to list, Forward reopens Alice via the reserved token.
+    assert_eq!(h.pop(Some(&list_token), "").ui, UiAction::Close);
     assert_eq!(
-        history
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
-    assert_eq!(
-        history
-            .on_popstate(Some(&chat_token), "", false, |p| *p == alice)
-            .ui,
+        h.pop_peer(Some(&chat_token), "", alice).ui,
         UiAction::Open(alice)
     );
+    assert_eq!(h.pop(Some(&list_token), "").ui, UiAction::Close);
+
+    // Back popping an active reservation dismisses startup and invalidates late commit.
+    let (res_back, _, _) = h.reserve_push("");
     assert_eq!(
-        history
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::None, true)
+    );
+    assert_eq!(
+        h.history.commit_reservation(Some(res_back), alice, ""),
+        HistoryHarness::transition(UiAction::None, false)
     );
 
-    // User Back popping a reservation while NewChat is still waiting on the relay dismisses the
-    // startup dialog immediately AND causes a late commit to be ignored.
-    let (res_back, _) = history.reserve("");
+    // Reserving again beneath `#under` transfers ownership and revokes old reservation.
+    let (res_old, _, _) = h.reserve_push("");
+    let _ = h.tag_frag("#under");
+    let (res_new, op_new) = h.history.reserve("#under");
+    assert!(matches!(res_new, Reservation::Pushed(_)) && op_new.is_none());
+    assert!(!h.history.is_reservation_owned(Some(res_old)));
+    assert!(h.history.is_reservation_owned(Some(res_new)));
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: true,
-            fallback_active: None,
-        }
+        h.history.commit_reservation(Some(res_old), alice, "#under"),
+        HistoryHarness::transition(UiAction::None, false)
     );
-    assert_eq!(
-        history.commit_reservation(Some(res_back), alice, ""),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-
-    // Submitting a second peer while a reserved slot is active (even beneath a manual `#fragment`!)
-    // transfers ownership of the reserved slot so the older submission is immediately revoked.
-    let (res_old, _) = history.reserve("");
-    let _ = history.on_popstate(None, "#under", false, |_| true);
-    let (res_new, op_new) = history.reserve("#under");
-    assert!(matches!(res_new, Reservation::Pushed(_)));
-    assert_eq!(op_new, None);
-    assert!(!history.is_reservation_owned(Some(res_old)));
-    assert!(history.is_reservation_owned(Some(res_new)));
-    assert_eq!(
-        history.commit_reservation(Some(res_old), alice, "#under"),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-    assert_eq!(history.cancel_reservation(Some(res_old)), (false, None));
-    // Unwind `#under` back to list via `cancel_active_reservation`.
+    assert_eq!(h.history.cancel_reservation(Some(res_old)), (false, None));
     assert!(matches!(
-        history.cancel_active_reservation(),
+        h.history.cancel_active_reservation(),
         Some(HistoryOp::Back(_))
     ));
-    let _ = history.on_popstate(Some(&list_token), "", false, |_| true);
+    let _ = h.pop(Some(&list_token), "");
 
-    // Clicking "Allow classical" retry while a failed first submit's programmatic `UnwindToList`
-    // is still settling keeps the retry valid when the unwind's `popstate` lands.
-    let (res_first, _) = history.reserve("");
-    let (still_owned, unwind_op) = history.cancel_reservation(Some(res_first));
-    assert!(still_owned);
-    assert!(matches!(unwind_op, Some(HistoryOp::Back(_))));
-    let (res_retry, retry_op) = history.reserve("");
-    assert!(matches!(res_retry, Reservation::Unpushed { .. }));
-    assert_eq!(retry_op, None);
-    // Programmatic unwind finishes -> preserves the form (`dismiss_startup: false`) AND does NOT
-    // supersede `res_retry`.
+    // Retry during settling programmatic `UnwindToList` survives unwind settlement.
+    let (res_first, _, _) = h.reserve_push("");
+    let (still_owned, unwind_op) = h.history.cancel_reservation(Some(res_first));
+    assert!(still_owned && matches!(unwind_op, Some(HistoryOp::Back(_))));
+    let res_retry = h.reserve_unpushed("");
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::None, false)
     );
-    // Retry succeeds -> pushes and opens Alice cleanly!
     assert!(matches!(
-        history.commit_reservation(Some(res_retry), alice, ""),
+        h.history.commit_reservation(Some(res_retry), alice, ""),
         Transition {
             history: Some(HistoryOp::Push { .. }),
             ui: UiAction::Open(p),
             ..
         } if p == alice
     ));
-    let _ = history.on_popstate(Some(&list_token), "", false, |_| true);
+    let _ = h.pop(Some(&list_token), "");
 
-    // If a manual `#frag` is pushed while a reserved submission is waiting on the relay:
-    // 1. Stepping Back off `#frag` onto the live reservation token keeps the reservation intact.
-    // 2. Committing while still on `#frag` unwinds the fragment and opens Bob cleanly.
-    let (res_frag, frag_token) = match history.reserve("") {
-        (res @ Reservation::Pushed(_), Some(HistoryOp::Push { chat_token, .. })) => {
-            (res, chat_token)
-        }
-        other => panic!("expected (Pushed, Push), got {other:?}"),
-    };
+    // Manual fragment above reservation: stepping back keeps it; committing unwinds fragment.
+    let (res_frag, _, frag_token) = h.reserve_push("");
+    assert_eq!(h.pop(None, "#frag").ui, UiAction::None);
     assert_eq!(
-        history.on_popstate(None, "#frag", false, |_| true).ui,
-        UiAction::None
+        h.pop(Some(&frag_token), ""),
+        HistoryHarness::transition(UiAction::None, false)
     );
-    assert_eq!(
-        history.on_popstate(Some(&frag_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-    assert!(history.is_reservation_owned(Some(res_frag)));
-    assert_eq!(
-        history.on_popstate(None, "#frag2", false, |_| true).ui,
-        UiAction::None
-    );
+    assert!(h.history.is_reservation_owned(Some(res_frag)));
+    assert_eq!(h.pop(None, "#frag2").ui, UiAction::None);
     assert!(matches!(
-        history.commit_reservation(Some(res_frag), bob, "#frag2"),
+        h.history.commit_reservation(Some(res_frag), bob, "#frag2"),
         Transition {
             history: Some(HistoryOp::Back(_)),
             ui: UiAction::None,
@@ -940,79 +991,54 @@ fn chat_history_reservation_handles_back_dismissal_ownership_transfer_and_unwind
         }
     ));
     assert!(matches!(
-        history.on_popstate(Some(&frag_token), "", false, |p| *p == bob),
+        h.pop_peer(Some(&frag_token), "", bob),
         Transition {
             history: Some(HistoryOp::Replace(_)),
             ui: UiAction::Open(p),
             ..
         } if p == bob
     ));
-    let _ = history.on_popstate(Some(&list_token), "", false, |_| true);
+    let _ = h.pop(Some(&list_token), "");
 
-    // Native Escape / OS dialog close cancels and unwinds the active pushed reservation so late
-    // relay completion cannot open the dismissed chat.
-    let (res_esc, _) = history.reserve("");
+    // Native Escape cancels and unwinds active reservation.
+    let (res_esc, _, _) = h.reserve_push("");
     assert!(matches!(
-        history.cancel_active_reservation(),
+        h.history.cancel_active_reservation(),
         Some(HistoryOp::Back(_))
     ));
-    assert!(!history.is_reservation_owned(Some(res_esc)));
+    assert!(!h.history.is_reservation_owned(Some(res_esc)));
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::None, false)
     );
     assert_eq!(
-        history.commit_reservation(Some(res_esc), alice, "").ui,
+        h.history.commit_reservation(Some(res_esc), alice, "").ui,
         UiAction::None
     );
 
-    // Submitting SignIn/NewChat from an ALREADY-OPEN chat gets `Reservation::Unpushed`: pressing
-    // browser Back closes the chat AND dismisses/cancels the startup modal (`dismiss_startup: true`).
-    let alice_live_token = match history.user_open(alice, "") {
-        Transition {
-            history: Some(HistoryOp::Push { chat_token, .. }),
-            ..
-        } => chat_token,
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let (res_unpushed, op_unpushed) = history.reserve("");
-    assert!(matches!(res_unpushed, Reservation::Unpushed { .. }));
-    assert_eq!(op_unpushed, None);
+    // Unpushed reservation from an already-open chat closes chat AND dismisses startup on Back.
+    let (_, alice_live_token) = h.open_push(alice, "");
+    let res_unpushed = h.reserve_unpushed("");
     assert_eq!(
-        history.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: true,
-            fallback_active: None,
-        }
+        h.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::Close, true)
     );
-    assert!(!history.is_reservation_owned(Some(res_unpushed)));
+    assert!(!h.history.is_reservation_owned(Some(res_unpushed)));
     assert_eq!(
-        history.commit_reservation(Some(res_unpushed), bob, "").ui,
+        h.history.commit_reservation(Some(res_unpushed), bob, "").ui,
         UiAction::None
     );
 
-    // If a reservation push fails on the list (giving `Unpushed`) and the user takes browser
-    // Forward onto a live chat (`alice_live_token`), the superseded startup is ALSO cancelled and
-    // dismissed (`dismiss_startup: true`) alongside `Open(alice)`.
-    let (_, failed_op) = history.reserve("");
-    let failed_res = history.on_reserve_push_failed(failed_op.as_ref().expect("push op"), "");
+    // Failed push converted to Unpushed is also dismissed on Forward onto a live chat.
+    let (_, failed_op) = h.history.reserve("");
+    let failed_res = h
+        .history
+        .on_reserve_push_failed(failed_op.as_ref().expect("push op"), "");
     assert_eq!(
-        history.on_popstate(Some(&alice_live_token), "", false, |p| *p == alice),
-        Transition {
-            history: None,
-            ui: UiAction::Open(alice),
-            dismiss_startup: true,
-            fallback_active: None,
-        }
+        h.pop_peer(Some(&alice_live_token), "", alice),
+        HistoryHarness::transition(UiAction::Open(alice), true)
     );
-    assert!(!history.is_reservation_owned(Some(failed_res)));
+    assert!(!h.history.is_reservation_owned(Some(failed_res)));
 }
 
 #[test]
@@ -1020,124 +1046,44 @@ fn chat_history_reuses_pre_reload_slot_reconciles_locked_back_and_honors_back_af
     let alice = [0x91; 32];
     let bob = [0x92; 32];
 
-    // Reloading/locking while a chat token is in `history.state` starts in `Reusable` mode: the
-    // first chat open replaces in place rather than stacking another Back stop.
-    let mut reloaded = ChatHistory::new(
-        "new-sess".to_string(),
-        Some("ratchetx2-chat:old-sess:7"),
-        String::new(),
-    );
-    assert!(matches!(
-        reloaded.user_open(alice, ""),
-        Transition {
-            history: Some(HistoryOp::Replace(_)),
-            ui: UiAction::Open(p),
-            ..
-        } if p == alice
-    ));
-    // One Back gesture returns directly to the list (pre-reload null/old list state).
-    assert_eq!(
-        reloaded.on_popstate(None, "", false, |_| true).ui,
-        UiAction::Close
-    );
+    let mut reloaded = HistoryHarness::reloaded("new-sess", Some("ratchetx2-chat:old-sess:7"), "");
+    let _ = reloaded.open_replace(alice, "");
+    assert_eq!(reloaded.pop(None, "").ui, UiAction::Close);
 
-    // If the user reloads on a chat token and steps Back to the list WHILE LOCKED, locked
-    // `popstate` clears the reusable slot so the first chat opened after unlock pushes above the
-    // list instead of replacing it (ensuring Back returns to the list, not off the site).
-    let mut locked_back = ChatHistory::new(
-        "locked-sess".to_string(),
-        Some("ratchetx2-chat:old-sess:9"),
-        String::new(),
-    );
+    let mut locked_back =
+        HistoryHarness::reloaded("locked-sess", Some("ratchetx2-chat:old-sess:9"), "");
     assert!(matches!(
-        locked_back.on_locked_popstate(Some("ratchetx2-list:old-sess")),
+        locked_back
+            .history
+            .on_locked_popstate(Some("ratchetx2-list:old-sess")),
         Some(HistoryOp::Tag(tag)) if tag == "ratchetx2-list:locked-sess"
     ));
-    assert!(matches!(
-        locked_back.user_open(alice, ""),
-        Transition {
-            history: Some(HistoryOp::Push { tag_list: None, .. }),
-            ui: UiAction::Open(p),
-            ..
-        } if p == alice
-    ));
+    let (tag_list, _) = locked_back.open_push(alice, "");
+    assert_eq!(tag_list, None);
 
-    // If the timeout fires before a slow `history.back()` dispatches `popstate`:
-    // 1. UI closes directly;
-    // 2. Late `popstate(list)` lands cleanly AND Forward onto `alice_token` STILL reopens Alice!
-    let mut slow_back = ChatHistory::new("sess-slow".to_string(), None, String::new());
-    let (list_token, alice_token) = match slow_back.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_token),
-                    chat_token,
-                }),
-            ..
-        } => (list_token, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let attempt = match slow_back.user_close() {
-        Transition {
-            history: Some(HistoryOp::Back(attempt)),
-            ui: UiAction::None,
-            ..
-        } => attempt,
-        other => panic!("expected Back, got {other:?}"),
-    };
+    // Slow `history.back()` timeout closes UI directly; late popstate and Forward still work.
+    let mut slow = HistoryHarness::new("sess-slow");
+    let (list_token, alice_token) = slow.open_push(alice, "");
+    let list_token = list_token.expect("list tag");
+    let attempt = slow.close_back();
     assert_eq!(
-        slow_back.on_back_aborted(attempt, Some(&alice_token), "", |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        slow.history
+            .on_back_aborted(attempt, Some(&alice_token), "", |_| true),
+        HistoryHarness::transition(UiAction::Close, false)
     );
+    assert_eq!(slow.pop(Some(&list_token), "").ui, UiAction::Close);
     assert_eq!(
-        slow_back
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
-    assert_eq!(
-        slow_back.on_popstate(Some(&alice_token), "", false, |p| *p == alice),
-        Transition {
-            history: None,
-            ui: UiAction::Open(alice),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        slow.pop_peer(Some(&alice_token), "", alice),
+        HistoryHarness::transition(UiAction::Open(alice), false)
     );
 
-    // If `history.back()` was ignored while the user switched to Bob, timeout recovery opens Bob
-    // via `Replace`, and a subsequent genuine browser Back returns to the list on the FIRST
-    // gesture (never undone or re-pushed!).
-    let attempt2 = match slow_back.user_close() {
-        Transition {
-            history: Some(HistoryOp::Back(a)),
-            ..
-        } => a,
-        other => panic!("expected Back, got {other:?}"),
-    };
-    assert_eq!(slow_back.user_open(bob, "").ui, UiAction::None);
-    let recovered = slow_back.on_back_aborted(attempt2, Some(&alice_token), "", |p| *p == bob);
-    assert!(matches!(
-        recovered,
-        Transition {
-            history: Some(HistoryOp::Replace(_)),
-            ui: UiAction::Open(p),
-            ..
-        } if p == bob
-    ));
+    // Ignored Back while switching to Bob recovers via Replace; next Back closes directly.
+    let attempt2 = slow.close_back();
+    assert_eq!(slow.history.user_open(bob, "").ui, UiAction::None);
+    slow.abort_back_replace(attempt2, Some(&alice_token), "", bob);
     assert_eq!(
-        slow_back.on_popstate(Some(&list_token), "", false, |p| *p == bob),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        slow.pop_peer(Some(&list_token), "", bob),
+        HistoryHarness::transition(UiAction::Close, false)
     );
 }
 
@@ -1145,439 +1091,209 @@ fn chat_history_reuses_pre_reload_slot_reconciles_locked_back_and_honors_back_af
 fn chat_history_rebinds_failed_replace_and_handles_failed_push_and_open() {
     let alice = [0x66; 32];
     let bob = [0x77; 32];
-    let mut history = ChatHistory::new("current-sess".to_string(), None, String::new());
+    let mut h = HistoryHarness::new("current-sess");
 
-    // If `pushState` fails/is silently ignored, rolling back ensures in-app Back closes directly
-    // instead of calling `history.back()` and exiting the site.
-    let pushed = history.user_open(alice, "");
+    let pushed = h.history.user_open(alice, "");
     let op = pushed.history.expect("push op");
-    history.on_write_failed(&op, pushed.fallback_active, "");
+    h.history.on_write_failed(&op, pushed.fallback_active, "");
     assert_eq!(
-        history.user_close(),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.history.user_close(),
+        HistoryHarness::transition(UiAction::Close, false)
     );
 
-    // Open Alice successfully, then switch to Bob with a failed/ignored `replaceState`: the
-    // surviving token (`alice_token`) must rebind to Bob so Forward and `on_ui_closed(bob)` match
-    // the displayed chat.
     let list_token = "ratchetx2-list:current-sess";
-    let alice_token = match history.user_open(alice, "") {
-        Transition {
-            history: Some(HistoryOp::Push { chat_token, .. }),
-            ..
-        } => chat_token,
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let replace = history.user_open(bob, "");
+    let (_, alice_token) = h.open_push(alice, "");
+    let replace = h.history.user_open(bob, "");
     let replace_op = replace.history.expect("replace op");
-    history.on_write_failed(&replace_op, replace.fallback_active, "");
-    // Back -> Forward onto the surviving token reopens Bob (the displayed chat), NOT Alice.
+    h.history
+        .on_write_failed(&replace_op, replace.fallback_active, "");
+    assert_eq!(h.pop(Some(list_token), "").ui, UiAction::Close);
     assert_eq!(
-        history
-            .on_popstate(Some(list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
+        h.pop_peer(Some(&alice_token), "", bob),
+        HistoryHarness::transition(UiAction::Open(bob), false)
     );
-    assert_eq!(
-        history.on_popstate(Some(&alice_token), "", false, |p| *p == bob),
-        Transition {
-            history: None,
-            ui: UiAction::Open(bob),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-    // Deleting Bob still pops the surviving entry.
     assert!(matches!(
-        history.on_ui_closed(bob),
+        h.history.on_ui_closed(bob),
         Some(HistoryOp::Back(_))
     ));
-    let _ = history.on_popstate(Some(list_token), "", false, |_| true);
+    let _ = h.pop(Some(list_token), "");
 
-    // If opening a peer fails (`OpenOutcome::Ignored`), reconcile back to actual_open.
-    let _ = history.user_open(alice, "");
+    let _ = h.open_push(alice, "");
     assert!(matches!(
-        history.on_open_failed(alice, None).history,
+        h.history.on_open_failed(alice, None).history,
         Some(HistoryOp::Back(_))
     ));
-    assert_eq!(
-        history
-            .on_popstate(Some(list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
-    let _ = history.user_open(alice, "");
-    let _ = history.user_open(bob, "");
+    assert_eq!(h.pop(Some(list_token), "").ui, UiAction::Close);
+    let _ = h.open_push(alice, "");
+    let _ = h.open_replace(bob, "");
     assert!(matches!(
-        history.on_open_failed(bob, Some(alice)).history,
+        h.history.on_open_failed(bob, Some(alice)).history,
         Some(HistoryOp::Replace(_))
     ));
 }
 
 #[test]
 fn chat_history_bounds_cached_forward_entries() {
-    let mut history = ChatHistory::new("bounded".to_string(), None, String::new());
+    let mut h = HistoryHarness::new("bounded");
     let first_peer = [0x01; 32];
-    let (list_token, first_token) = match history.user_open(first_peer, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_token),
-                    chat_token,
-                }),
-            ..
-        } => (list_token, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
+    let (list_token, first_token) = h.open_push(first_peer, "");
+    let list_token = list_token.expect("list tag");
+
     let mut last_token = String::new();
     let mut last_peer = first_peer;
     for i in 1..=(MAX_ENTRIES + 5) {
         last_peer = [(i as u8).wrapping_add(2); 32];
-        if let Transition {
-            history: Some(HistoryOp::Replace(token)),
-            ..
-        } = history.user_open(last_peer, "")
-        {
-            last_token = token;
-        }
+        last_token = h.open_replace(last_peer, "");
     }
-    // Return to list.
+    assert_eq!(h.pop(Some(&list_token), "").ui, UiAction::Close);
     assert_eq!(
-        history
-            .on_popstate(Some(&list_token), "", false, |_| true)
-            .ui,
-        UiAction::Close
+        h.pop(Some(&last_token), ""),
+        HistoryHarness::transition(UiAction::Open(last_peer), false)
     );
-    // Latest entry is retained.
     assert_eq!(
-        history.on_popstate(Some(&last_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Open(last_peer),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-    // Evicted oldest entry stays closed on the list without bouncing Forward backward.
-    assert_eq!(
-        history.on_popstate(Some(&first_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&first_token), ""),
+        HistoryHarness::transition(UiAction::Close, false)
     );
 }
 
 #[test]
-fn chat_history_retains_slot_across_retries_rebinds_fragments_and_handles_pre_reload_frags() {
+fn chat_history_retains_slot_across_retries_and_unpushed_startup() {
+    let alice = [0xA1; 32];
+
+    // Retained pushed slot is reused across retries and unwound on modal cancel or Back.
+    let mut ret = HistoryHarness::new("sess-retain");
+    let (res1, list_token, _) = ret.reserve_push("");
+    let list_token = list_token.expect("list tag");
+    assert!(ret.history.retain_reservation(Some(res1)));
+    assert!(!ret.history.is_reservation_owned(Some(res1)));
+    let (res2, retry_op) = ret.history.reserve("");
+    assert!(matches!(res2, Reservation::Pushed(_)) && retry_op.is_none());
+    assert_eq!(
+        ret.history.commit_reservation(Some(res2), alice, ""),
+        HistoryHarness::transition(UiAction::Open(alice), false)
+    );
+    let _ = ret.pop(Some(&list_token), "");
+
+    let (res3, _, _) = ret.reserve_push("");
+    ret.history.retain_active_reservation();
+    assert!(!ret.history.is_reservation_owned(Some(res3)));
+    assert!(matches!(
+        ret.history.cancel_retained_reservation(),
+        Some(HistoryOp::Back(_))
+    ));
+    let _ = ret.pop(Some(&list_token), "");
+    let (res4, _, _) = ret.reserve_push("");
+    assert!(ret.history.retain_reservation(Some(res4)));
+    assert_eq!(
+        ret.pop(Some(&list_token), ""),
+        HistoryHarness::transition(UiAction::None, true)
+    );
+
+    // Retained unpushed startup from an open chat still dismisses on Back; `on_peer_deleted`
+    // invalidates cached Forward tokens even after returning to the list.
+    let mut open_retry = HistoryHarness::new("sess-open-retry");
+    let (or_list, or_alice) = open_retry.open_push(alice, "");
+    let or_list = or_list.expect("list tag");
+    let unpushed_res = open_retry.reserve_unpushed("");
+    assert!(open_retry.history.retain_reservation(Some(unpushed_res)));
+    assert_eq!(
+        open_retry.pop(Some(&or_list), ""),
+        HistoryHarness::transition(UiAction::Close, true)
+    );
+    open_retry.history.on_peer_deleted(alice);
+    assert_eq!(
+        open_retry.pop_peer(Some(&or_alice), "", alice),
+        HistoryHarness::transition(UiAction::Close, false)
+    );
+}
+
+#[test]
+fn chat_history_rebinds_fragments_on_replace_and_timeout_recovery() {
     let alice = [0xA1; 32];
     let bob = [0xB2; 32];
 
-    // 1. Retaining a pushed reservation across retryable errors and `NewChat <-> SignIn` handoffs
-    // keeps the submit-gesture entry with zero `history.back()` in flight; closing the modal
-    // unwinds the retained slot cleanly.
-    let mut ret = ChatHistory::new("sess-retain".to_string(), None, String::new());
-    let (res1, list_token) = match ret.reserve("") {
-        (
-            res @ Reservation::Pushed(_),
-            Some(HistoryOp::Push {
-                tag_list: Some(list_token),
-                ..
-            }),
-        ) => (res, list_token),
-        other => panic!("expected pushed reservation, got {other:?}"),
-    };
-    assert!(ret.retain_reservation(Some(res1)));
-    assert!(!ret.is_reservation_owned(Some(res1)));
-    // Retry (e.g. "Allow classical" or SignIn submit) reuses the gesture-pushed slot immediately!
-    let (res2, retry_op) = ret.reserve("");
-    assert!(matches!(res2, Reservation::Pushed(_)));
-    assert_eq!(retry_op, None);
+    // Replacing Alice with Bob rebinds Forward fragment markers to Bob; deleting Bob invalidates them.
+    let mut h = HistoryHarness::new("sess-slot");
+    let (list_tok, alice_tok) = h.open_push(alice, "");
+    let list_tok = list_tok.expect("list tag");
+    let frag_tok = h.tag_frag("#one");
+    assert_eq!(h.pop(Some(&alice_tok), "").ui, UiAction::Open(alice));
+    let bob_tok = h.open_replace(bob, "");
+    assert_eq!(h.pop(Some(&list_tok), "").ui, UiAction::Close);
     assert_eq!(
-        ret.commit_reservation(Some(res2), alice, ""),
-        Transition {
-            history: None,
-            ui: UiAction::Open(alice),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        h.pop(Some(&frag_tok), "#one"),
+        HistoryHarness::transition(UiAction::Open(bob), false)
     );
-    let _ = ret.on_popstate(Some(&list_token), "", false, |_| true);
-
-    // Dismissing SignIn back to NewChat retains the slot, and cancelling NewChat unwinds it;
-    // browser Back popping a retained slot dismisses the startup dialog.
-    let (res3, _) = ret.reserve("");
-    ret.retain_active_reservation();
-    assert!(!ret.is_reservation_owned(Some(res3)));
+    assert_eq!(h.pop(Some(&bob_tok), "").ui, UiAction::Open(bob));
     assert!(matches!(
-        ret.cancel_retained_reservation(),
+        h.history.on_ui_closed(bob),
         Some(HistoryOp::Back(_))
     ));
-    let _ = ret.on_popstate(Some(&list_token), "", false, |_| true);
-    let (res4, _) = ret.reserve("");
-    assert!(ret.retain_reservation(Some(res4)));
+    let _ = h.pop(Some(&list_tok), "");
     assert_eq!(
-        ret.on_popstate(Some(&list_token), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::None,
-            dismiss_startup: true,
-            fallback_active: None,
-        }
-    );
-
-    // 2. Replacing Alice with Bob keeps any Forward fragment marker (`#one`) bound to Bob so a
-    // direct Forward-menu jump from the list opens Bob, not Alice, and deleting Bob invalidates it.
-    let mut frag_rebind = ChatHistory::new("sess-slot".to_string(), None, String::new());
-    let (list_tok, alice_tok) = match frag_rebind.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_tok),
-                    chat_token,
-                }),
-            ..
-        } => (list_tok, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let frag_tok = match frag_rebind.on_popstate(None, "#one", false, |_| true) {
-        Transition {
-            history: Some(HistoryOp::Tag(tag)),
-            ui: UiAction::None,
-            ..
-        } => tag,
-        other => panic!("expected Tag, got {other:?}"),
-    };
-    // Back to Alice, switch to Bob, Back to list.
-    assert_eq!(
-        frag_rebind
-            .on_popstate(Some(&alice_tok), "", false, |_| true)
-            .ui,
-        UiAction::Open(alice)
-    );
-    let bob_tok = match frag_rebind.user_open(bob, "") {
-        Transition {
-            history: Some(HistoryOp::Replace(tok)),
-            ui: UiAction::Open(p),
-            ..
-        } => {
-            assert_eq!(p, bob);
-            tok
-        }
-        other => panic!("expected Replace(bob), got {other:?}"),
-    };
-    assert_eq!(
-        frag_rebind
-            .on_popstate(Some(&list_tok), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
-    // Direct Forward-menu jump straight to `#one` must open Bob (the surviving peer on this slot)!
-    assert_eq!(
-        frag_rebind.on_popstate(Some(&frag_tok), "#one", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Open(bob),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-    // Stepping back onto Bob's slot keeps Bob open, and deleting Bob invalidates `#one`.
-    assert_eq!(
-        frag_rebind
-            .on_popstate(Some(&bob_tok), "", false, |_| true)
-            .ui,
-        UiAction::Open(bob)
-    );
-    assert!(matches!(
-        frag_rebind.on_ui_closed(bob),
-        Some(HistoryOp::Back(_))
-    ));
-    let _ = frag_rebind.on_popstate(Some(&list_tok), "", false, |_| true);
-    assert_eq!(
-        frag_rebind
-            .on_popstate(Some(&frag_tok), "#one", false, |p| *p == alice)
-            .ui,
+        h.pop_peer(Some(&frag_tok), "#one", alice).ui,
         UiAction::Close
     );
 
-    // 3. Ignored Back while switching from Alice+#one to Bob preserves `fragment_depth = 1` when
-    // replacing `#one` with Bob AND stores that depth with Bob's replacement token, so BOTH an
-    // immediate in-app Close AND a later Forward onto Bob's token -> in-app Close step past Alice's
-    // underlying entry all the way back to the list instead of reopening Alice.
-    let mut frag_timeout = ChatHistory::new("sess-ft".to_string(), None, String::new());
-    let (ft_list, ft_alice) = match frag_timeout.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_tok),
-                    chat_token,
-                }),
-            ..
-        } => (list_tok, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let ft_frag = match frag_timeout.on_popstate(None, "#one", false, |_| true) {
-        Transition {
-            history: Some(HistoryOp::Tag(tag)),
-            ..
-        } => tag,
-        other => panic!("expected Tag, got {other:?}"),
-    };
-    let switch_attempt = match frag_timeout.user_open(bob, "#one") {
-        Transition {
-            history: Some(HistoryOp::Back(attempt)),
-            ui: UiAction::None,
-            ..
-        } => attempt,
-        other => panic!("expected Back, got {other:?}"),
-    };
-    let ft_bob =
-        match frag_timeout.on_back_aborted(switch_attempt, Some(&ft_frag), "#one", |_| true) {
-            Transition {
-                history: Some(HistoryOp::Replace(tok)),
-                ui: UiAction::Open(p),
-                ..
-            } => {
-                assert_eq!(p, bob);
-                tok
-            }
-            other => panic!("expected Replace(bob), got {other:?}"),
-        };
-    // Next in-app Close pops Bob -> lands on `ft_alice` -> MUST step back again -> lands on list!
-    assert!(matches!(
-        frag_timeout.user_close(),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert!(matches!(
-        frag_timeout.on_popstate(Some(&ft_alice), "", false, |_| true),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
+    // Timeout recovery while switching from `#one` preserves fragment depth for both immediate
+    // in-app Close and a later Forward -> in-app Close.
+    let mut ft = HistoryHarness::new("sess-ft");
+    let (ft_list, ft_alice) = ft.open_push(alice, "");
+    let ft_list = ft_list.expect("list tag");
+    let ft_frag = ft.tag_frag("#one");
+    let attempt = ft.open_back(bob, "#one");
+    let ft_bob = ft.abort_back_replace(attempt, Some(&ft_frag), "#one", bob);
+    ft.close_back();
+    ft.assert_pop_back(Some(&ft_alice), "");
     assert_eq!(
-        frag_timeout.on_popstate(Some(&ft_list), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        ft.pop(Some(&ft_list), ""),
+        HistoryHarness::transition(UiAction::Close, false)
     );
-    // Navigating Forward straight back to Bob's Back-recovered token restores `depth = 1`, so
-    // in-app Close STILL steps past `ft_alice` back to `ft_list`!
     assert_eq!(
-        frag_timeout.on_popstate(Some(&ft_bob), "#one", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Open(bob),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        ft.pop(Some(&ft_bob), "#one"),
+        HistoryHarness::transition(UiAction::Open(bob), false)
     );
-    assert!(matches!(
-        frag_timeout.user_close(),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert!(matches!(
-        frag_timeout.on_popstate(Some(&ft_alice), "", false, |_| true),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert_eq!(
-        frag_timeout
-            .on_popstate(Some(&ft_list), "", false, |_| true)
-            .ui,
-        UiAction::Close
-    );
+    ft.close_back();
+    ft.assert_pop_back(Some(&ft_alice), "");
+    assert_eq!(ft.pop(Some(&ft_list), "").ui, UiAction::Close);
 
-    // 4. Starting New Chat from an already-open chat gets `Reservation::Unpushed`; retaining it
-    // across `NewChat -> SignIn` still keeps the startup modal bound to browser Back so Back both
-    // closes the underlying chat AND dismisses `SignIn`.
-    let mut open_retry = ChatHistory::new("sess-open-retry".to_string(), None, String::new());
-    let (or_list, or_alice) = match open_retry.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_tok),
-                    chat_token,
-                }),
-            ..
-        } => (list_tok, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let (unpushed_res, unpushed_op) = open_retry.reserve("");
-    assert!(matches!(unpushed_res, Reservation::Unpushed { .. }));
-    assert_eq!(unpushed_op, None);
-    assert!(open_retry.retain_reservation(Some(unpushed_res)));
+    // Native browser Back off a depth-2 recovered token skips underlying fragment + chat entries.
+    let mut rec = HistoryHarness::new("sess-rec-native");
+    let (rec_list, alice_tok) = rec.open_push(alice, "");
+    let rec_list = rec_list.expect("list tag");
+    let frag1 = rec.tag_frag("#s1");
+    let frag2 = rec.tag_frag("#s2");
+    let attempt = rec.open_back(bob, "#s2");
+    let bob_rec = rec.abort_back_replace(attempt, Some(&frag2), "#s2", bob);
+    let _ = rec.tag_frag("#s3");
     assert_eq!(
-        open_retry.on_popstate(Some(&or_list), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: true,
-            fallback_active: None,
-        }
+        rec.pop(Some(&bob_rec), "#s2"),
+        HistoryHarness::transition(UiAction::Open(bob), false)
     );
-    // Deleting Alice AFTER navigating Back to the list still invalidates `or_alice` via
-    // `on_peer_deleted` so Forward onto `or_alice` cannot open a later new chat with Alice!
-    open_retry.on_peer_deleted(alice);
+    rec.assert_pop_back(Some(&frag1), "#s1");
+    rec.assert_pop_back(Some(&alice_tok), "");
     assert_eq!(
-        open_retry.on_popstate(Some(&or_alice), "", false, |p| *p == alice),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        rec.pop(Some(&rec_list), ""),
+        HistoryHarness::transition(UiAction::Close, false)
     );
+}
 
-    // 5. Reloading/locking on a pre-reload fragment token (`ratchetx2-frag:old-sess:...`) does NOT
-    // tag the fragment as a list entry; opening a chat unwinds the pre-reload fragments onto the
-    // pre-reload chat slot and replaces it in place.
-    let mut pre_frag = ChatHistory::new(
-        "new-sess".to_string(),
-        Some("ratchetx2-frag:old-sess:7:2"),
-        "#two".to_string(),
-    );
-    assert_eq!(pre_frag.tag_current_list_entry(), None);
-    // Navigating across pre-reload fragments while locked also never tags them as list entries.
+#[test]
+fn chat_history_handles_pre_reload_fragments_and_startup_modal_back_edges() {
+    let alice = [0xA1; 32];
+    let bob = [0xB2; 32];
+
+    // Reloading on a pre-reload fragment token never tags it as a list entry and unwinds cleanly.
+    let mut pre = HistoryHarness::reloaded("new-sess", Some("ratchetx2-frag:old-sess:7:2"), "#two");
+    assert_eq!(pre.history.tag_current_list_entry(), None);
     assert_eq!(
-        pre_frag.on_locked_popstate(Some("ratchetx2-frag:old-sess:7:1")),
+        pre.history
+            .on_locked_popstate(Some("ratchetx2-frag:old-sess:7:1")),
         None
     );
-    // Unlocking and opening Alice unwinds the remaining pre-reload fragment onto the pre-reload
-    // chat slot and replaces it in place.
+    pre.open_back(alice, "#one");
     assert!(matches!(
-        pre_frag.user_open(alice, "#one"),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert!(matches!(
-        pre_frag.on_popstate(Some("ratchetx2-chat:old-sess:7"), "", false, |_| true),
+        pre.pop(Some("ratchetx2-chat:old-sess:7"), ""),
         Transition {
             history: Some(HistoryOp::Replace(_)),
             ui: UiAction::Open(p),
@@ -1585,177 +1301,46 @@ fn chat_history_retains_slot_across_retries_rebinds_fragments_and_handles_pre_re
         } if p == alice
     ));
     assert_eq!(
-        pre_frag
-            .on_popstate(Some("ratchetx2-list:old-sess"), "", false, |_| true)
-            .ui,
+        pre.pop(Some("ratchetx2-list:old-sess"), "").ui,
         UiAction::Close
     );
 
-    // 6. Browser Back from an open chat while an unreserved idle `NewChat` or background `SignIn`
-    // modal is open (`startup_dialog_open == true`) MUST still dismiss the startup dialog and
-    // discard its pending draft alongside closing the chat.
-    let mut unreserved_back = ChatHistory::new("sess-unres".to_string(), None, String::new());
-    let unres_list = match unreserved_back.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_tok),
-                    ..
-                }),
-            ..
-        } => list_tok,
-        other => panic!("expected Push, got {other:?}"),
-    };
+    // Browser Back from an open chat while an unreserved startup modal is open dismisses it.
+    let mut unres = HistoryHarness::new("sess-unres");
+    let (unres_list, _) = unres.open_push(alice, "");
+    let unres_list = unres_list.expect("list tag");
     assert_eq!(
-        unreserved_back.on_popstate(Some(&unres_list), "", true, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: true,
-            fallback_active: None,
-        }
+        unres
+            .history
+            .on_popstate(Some(&unres_list), "", true, |_| true),
+        HistoryHarness::transition(UiAction::Close, true)
     );
 
-    // 7. A NewChat / SignIn form (and any Unpushed reservation) opened while an earlier in-app
-    // Close (`BackGoal::CloseToList`) is still settling MUST survive that Close's list `popstate`,
-    // whereas a subsequent native browser Back DOES dismiss the form.
-    let mut close_then_startup =
-        ChatHistory::new("sess-close-startup".to_string(), None, String::new());
-    let close_list = match close_then_startup.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_tok),
-                    ..
-                }),
-            ..
-        } => list_tok,
-        other => panic!("expected Push, got {other:?}"),
-    };
-    assert!(matches!(
-        close_then_startup.user_close(),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    // User clicks NewChat and submits on desktop while the in-app Close is still settling.
-    let (startup_res, reserve_op) = close_then_startup.reserve("");
-    assert!(matches!(startup_res, Reservation::Unpushed { .. }));
-    assert_eq!(reserve_op, None);
-    // Earlier in-app Close now settles onto the list entry: closes the chat pane, but MUST NOT
-    // dismiss the newer startup form or invalidate its Unpushed reservation.
+    // A startup form opened while an earlier in-app Close is settling survives that Close's popstate.
+    let mut close_startup = HistoryHarness::new("sess-close-startup");
+    let (close_list, _) = close_startup.open_push(alice, "");
+    let close_list = close_list.expect("list tag");
+    close_startup.close_back();
+    let startup_res = close_startup.reserve_unpushed("");
     assert_eq!(
-        close_then_startup.on_popstate(Some(&close_list), "", true, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
+        close_startup
+            .history
+            .on_popstate(Some(&close_list), "", true, |_| true),
+        HistoryHarness::transition(UiAction::Close, false)
     );
-    assert!(close_then_startup.is_reservation_owned(Some(startup_res)));
-    // Committing the surviving reservation pushes Bob cleanly above the list.
+    assert!(
+        close_startup
+            .history
+            .is_reservation_owned(Some(startup_res))
+    );
     assert!(matches!(
-        close_then_startup.commit_reservation(Some(startup_res), bob, ""),
+        close_startup
+            .history
+            .commit_reservation(Some(startup_res), bob, ""),
         Transition {
             history: Some(HistoryOp::Push { .. }),
             ui: UiAction::Open(p),
             ..
         } if p == bob
     ));
-
-    // 8. Native browser Back directly off a fragment-recovered chat token (created when switching
-    // peers from `#fragment` timed out) skips the underlying duplicate chat/fragment entries so
-    // the first Back gesture closes the chat instead of reopening the same peer.
-    let mut rec_native = ChatHistory::new("sess-rec-native".to_string(), None, String::new());
-    let (rec_list, alice_tok) = match rec_native.user_open(alice, "") {
-        Transition {
-            history:
-                Some(HistoryOp::Push {
-                    tag_list: Some(list_tok),
-                    chat_token,
-                }),
-            ..
-        } => (list_tok, chat_token),
-        other => panic!("expected Push, got {other:?}"),
-    };
-    let frag1 = match rec_native.on_popstate(None, "#s1", false, |_| true) {
-        Transition {
-            history: Some(HistoryOp::Tag(tok)),
-            ..
-        } => tok,
-        other => panic!("expected Tag for #s1, got {other:?}"),
-    };
-    let frag2 = match rec_native.on_popstate(None, "#s2", false, |_| true) {
-        Transition {
-            history: Some(HistoryOp::Tag(tok)),
-            ..
-        } => tok,
-        other => panic!("expected Tag for #s2, got {other:?}"),
-    };
-    // Switch to Bob from #s2; unwind times out -> Bob replaces #s2 at depth 2.
-    let attempt = match rec_native.user_open(bob, "#s2") {
-        Transition {
-            history: Some(HistoryOp::Back(attempt)),
-            ..
-        } => attempt,
-        other => panic!("expected Back, got {other:?}"),
-    };
-    let bob_recovered = match rec_native.on_back_aborted(attempt, Some(&frag2), "#s2", |_| true) {
-        Transition {
-            history: Some(HistoryOp::Replace(tok)),
-            ui: UiAction::Open(p),
-            ..
-        } if p == bob => tok,
-        other => panic!("expected Replace with Bob, got {other:?}"),
-    };
-    // Visiting a new fragment `#s3` above the recovered Bob and pressing Back returns to Bob.
-    assert!(matches!(
-        rec_native.on_popstate(None, "#s3", false, |_| true),
-        Transition {
-            history: Some(HistoryOp::Tag(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    assert_eq!(
-        rec_native.on_popstate(Some(&bob_recovered), "#s2", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Open(bob),
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
-    // Now native Back steps off `bob_recovered` (depth 2) onto `frag1` (depth 1): MUST emit
-    // `Back` to skip `frag1` and `alice_tok` all the way to the chat list.
-    assert!(matches!(
-        rec_native.on_popstate(Some(&frag1), "#s1", false, |_| true),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    // Follow-up hop lands on `alice_tok` (depth 0) with 1 hop remaining -> emits final `Back`.
-    assert!(matches!(
-        rec_native.on_popstate(Some(&alice_tok), "", false, |_| true),
-        Transition {
-            history: Some(HistoryOp::Back(_)),
-            ui: UiAction::None,
-            ..
-        }
-    ));
-    // Final hop lands on the list and closes Bob.
-    assert_eq!(
-        rec_native.on_popstate(Some(&rec_list), "", false, |_| true),
-        Transition {
-            history: None,
-            ui: UiAction::Close,
-            dismiss_startup: false,
-            fallback_active: None,
-        }
-    );
 }

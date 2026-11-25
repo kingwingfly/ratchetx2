@@ -1,7 +1,7 @@
 //! Encryption settings, classical approvals and post-quantum upgrades.
 
 use super::contact::FarewellMode;
-use super::handshake::encrypt_session_farewells;
+use super::handshake::{PublishError, encrypt_session_farewells};
 use super::outbox::RequeueOutcome;
 use super::{Engine, HistoryStore, Inner, PqSaveOutcome, ProtocolRpcScope, records};
 use crate::content::{Content, Kind, stamp};
@@ -10,9 +10,9 @@ use crate::transport::Fetch;
 use crate::util::{describe, now, short};
 use crate::vault::{
     CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry,
-    PendingPqRollback, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
-    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED, history_key,
+    ContactState, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, PendingPqRollback,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
+    SECURITY_ALERT_PQ_REQUIRED, history_key,
 };
 use leptos::prelude::*;
 use session::{ErrorKind, PqConfig, PublicKey, Session, SessionState};
@@ -57,20 +57,7 @@ impl Engine {
         self.ui.contacts.set(inner.views());
 
         // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.
-        let outcome = match self.publish_full(inner, true).await {
-            Ok(()) => Ok(PqSaveOutcome::Published),
-            Err(error) if error.rejects_settings() => {
-                let mut message = error.message;
-                if error.kind == Some(ErrorKind::PqRequired) {
-                    message =
-                        format!("Cannot require post-quantum encryption on this server. {message}");
-                }
-                Err(message)
-            }
-            Err(error) if error.needs_sign_in() => Ok(PqSaveOutcome::SavedLocallyNeedsSignIn),
-            Err(error) if error.kind.is_some() => Ok(PqSaveOutcome::SavedLocallyPendingPublish),
-            Err(error) => Err(error.message),
-        };
+        let outcome = classify_set_pq_publish_result(self.publish_full(inner, true).await);
         drop(guard);
         if changed && outcome.is_ok() {
             self.wake();
@@ -259,19 +246,7 @@ impl Engine {
                 // Lifting quarantine makes both the newly released message AND any messages
                 // already displayed on the prior session while quarantined eligible for read
                 // receipts immediately.
-                if super::is_page_visible() {
-                    let needs_reload = !self.is_history_loaded_for(peer)
-                        || inner.saved_late.contains(&peer)
-                        || inner.unsaved.iter().any(|(p, _)| *p == peer);
-                    if needs_reload && self.show_history(inner, &peer).await {
-                        inner.saved_late.retain(|saved| *saved != peer);
-                    }
-                    if self.acknowledge_displayed_window(inner, &peer)
-                        && let Err(e) = inner.save_state().await
-                    {
-                        self.ui.notify(describe(&e));
-                    }
-                }
+                self.reconcile_open_chat_read(inner, &peer, false).await;
             }
             self.ui.contacts.set(inner.views());
         }
@@ -436,7 +411,9 @@ impl Engine {
         if let Some(contact) = inner.contact(&peer) {
             was_quarantined = contact.state.quarantined;
             contact.clear_quarantine_and_alerts();
-            contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+            // Persist `GREETING_DELIVERY_UNCERTAIN` directly in the single atomic commit below so
+            // we transmit immediately after without a redundant second full-state save.
+            contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
             contact.state.sealed_events = None;
             if old_was_request_or_quarantined {
                 contact.state.fallback_farewells.clear();
@@ -485,54 +462,21 @@ impl Engine {
         if let Some(view) = added_view {
             self.show_new(inner, &peer, vec![view]);
         }
-        if was_quarantined && self.ui.open.get_untracked() == Some(peer) && super::is_page_visible()
+        if was_quarantined {
+            self.reconcile_open_chat_read(inner, &peer, false).await;
+        }
+        if let Ok(Err(e)) = inner
+            .transmit_with_greeting_delivery(&peer, true, true, async |inner| {
+                inner.client.send_prepared_initiate_v2(&outgoing).await
+            })
+            .await
         {
-            let needs_reload = !self.is_history_loaded_for(peer)
-                || inner.saved_late.contains(&peer)
-                || inner.unsaved.iter().any(|(p, _)| *p == peer);
-            if needs_reload && self.show_history(inner, &peer).await {
-                inner.saved_late.retain(|saved| *saved != peer);
-            }
-            if self.acknowledge_displayed_window(inner, &peer)
-                && let Err(e) = inner.save_state().await
-            {
-                self.ui.notify(describe(&e));
-            }
-        }
-        let mut ready_to_send = true;
-        if let Some(contact) = inner.contact(&peer) {
-            contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-        }
-        if let Err(e) = inner.save(&[]).await {
-            ready_to_send = false;
-            if let Some(contact) = inner.contact(&peer) {
-                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-            }
+            self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
             self.ui.log(format!(
                 "upgraded session with {} saved locally; initial message will carry on next send: {}",
                 short(&peer),
                 describe(&e)
             ));
-        }
-        if ready_to_send {
-            if let Err(e) = inner.client.send_prepared_initiate_v2(&outgoing).await {
-                if e.is_server_refusal() {
-                    if let Some(contact) = inner.contact(&peer) {
-                        contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                    }
-                    let _ = inner.save_state().await;
-                }
-                self.ui.log(format!(
-                    "upgraded session with {} saved locally; initial message will carry on next send: {}",
-                    short(&peer),
-                    describe(&e)
-                ));
-            } else if inner
-                .contact(&peer)
-                .is_some_and(super::contact::Contact::mark_greeting_confirmed)
-            {
-                let _ = inner.save_state().await;
-            }
         }
         self.ui.contacts.set(inner.views());
         self.ui.log(format!(
@@ -581,17 +525,20 @@ impl Engine {
                     .first()
                     .is_some_and(|o| !o.awaits_upload);
             if use_flush {
-                let snapshot = contact.snapshot();
-                contact.state.security_alert = SECURITY_ALERT_NONE;
-                contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                contact
-                    .session
-                    .peer_pq_state_mut()
-                    .clear_classical_exception();
-                if let Err(e) = inner.save(&[]).await {
-                    inner.roll_back(&peer, snapshot)?;
-                    return Err(describe(&e));
-                }
+                inner
+                    .with_contact_tx(&peer, async |inner| {
+                        let contact = inner
+                            .contact(&peer)
+                            .ok_or_else(|| "no such chat".to_string())?;
+                        contact.state.security_alert = SECURITY_ALERT_NONE;
+                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                        contact
+                            .session
+                            .peer_pq_state_mut()
+                            .clear_classical_exception();
+                        inner.save(&[]).await.map_err(|e| describe(&e))
+                    })
+                    .await?;
                 self.ui.contacts.set(inner.views());
             }
             use_flush
@@ -601,6 +548,29 @@ impl Engine {
         } else {
             self.upgrade_to_pq(peer).await
         }
+    }
+}
+
+/// Map the result of `publish_full` during [`Engine::set_pq_config`] to a user-facing
+/// [`PqSaveOutcome`] or error, ensuring definitive `Unimplemented` refusals return `Err` instead
+/// of `SavedLocallyPendingPublish`.
+pub(super) fn classify_set_pq_publish_result(
+    res: Result<(), PublishError>,
+) -> Result<PqSaveOutcome, String> {
+    match res {
+        Ok(()) => Ok(PqSaveOutcome::Published),
+        Err(error) if error.rejects_settings() => {
+            let mut message = error.message;
+            if error.kind == Some(ErrorKind::PqRequired) {
+                message =
+                    format!("Cannot require post-quantum encryption on this server. {message}");
+            }
+            Err(message)
+        }
+        Err(error) if error.is_unimplemented() => Err(error.message),
+        Err(error) if error.needs_sign_in() => Ok(PqSaveOutcome::SavedLocallyNeedsSignIn),
+        Err(error) if error.kind.is_some() => Ok(PqSaveOutcome::SavedLocallyPendingPublish),
+        Err(error) => Err(error.message),
     }
 }
 
@@ -727,6 +697,7 @@ impl<V: HistoryStore> Inner<V> {
         let changed = previous != config;
         let previous_needs_publish = self.state.needs_publish;
         let previous_rollback = self.state.pending_pq_rollback.clone();
+        let previous_pending_flags = self.pending_pq_contact_flags.clone();
         validate_pq_config_for_server(&config, &self.server_pq)?;
         let clear_pq_required = previous.strict_pq && !config.strict_pq;
         let clear_classical_approval = previous.pq_enabled && !config.pq_enabled;
@@ -744,10 +715,20 @@ impl<V: HistoryStore> Inner<V> {
                         let mut modified = false;
                         if clear_pq_required && prev_alert == SECURITY_ALERT_PQ_REQUIRED {
                             contact.state.security_alert = SECURITY_ALERT_NONE;
+                            self.pending_pq_contact_flags
+                                .entry(contact.peer)
+                                .or_default()
+                                .0
+                                .get_or_insert(prev_alert);
                             modified = true;
                         }
                         if clear_classical_approval && prev_approval != CLASSICAL_APPROVAL_NONE {
                             contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                            self.pending_pq_contact_flags
+                                .entry(contact.peer)
+                                .or_default()
+                                .1
+                                .get_or_insert(prev_approval);
                             modified = true;
                         }
                         modified.then_some((idx, prev_alert, prev_approval))
@@ -768,6 +749,7 @@ impl<V: HistoryStore> Inner<V> {
                 .map_err(|e| describe(&e))?;
             self.state.needs_publish = previous_needs_publish;
             self.state.pending_pq_rollback = previous_rollback;
+            self.pending_pq_contact_flags = previous_pending_flags;
             for (idx, prev_alert, prev_approval) in previous_contact_flags {
                 if let Some(contact) = self.contacts.get_mut(idx) {
                     contact.state.security_alert = prev_alert;

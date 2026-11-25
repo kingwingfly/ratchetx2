@@ -1,30 +1,36 @@
+use super::attachments::{ResumeVerifier, expected_chunk_len, upload_of_with_digests};
 use super::contact::{
-    accept_contact_request_state, contact_state_is_new_quarantined, place_of,
+    accept_contact_request_state, contact_state_is_new_quarantined, insert_acked_range, place_of,
     record_quarantined_initial_state, restore_contacts, stored_contacts,
 };
 use super::handshake::{
     DEFERRED_REPLAY_WINDOW_MS, Incoming, InitialBatch, JoinCarriedOutcome, PublishError,
-    merge_legacy_deferred_initials, preserved_deferred_prekeys, prune_invalid_inbox_acks,
-    refill_batch_counts, sanitize_deferred_initials, stage_carried_initials, stage_inbox_ack,
+    backfill_carried_timestamps_for_contacts, merge_legacy_deferred_initials,
+    preserved_deferred_prekeys, prune_invalid_inbox_acks, refill_batch_counts,
+    sanitize_deferred_initials, stage_carried_initials, stage_inbox_ack,
+    validate_start_chat_server,
 };
+use super::outbox::CorruptOutboxRecovery;
 use super::settings::{
-    describe_upgrade_pq_error, finalize_upgrade_to_pq_request_state, validate_pq_config_for_server,
+    classify_set_pq_publish_result, describe_upgrade_pq_error,
+    finalize_upgrade_to_pq_request_state, validate_pq_config_for_server,
 };
+use super::streaming::stream_mime;
 use super::sync::{farewell_push_v2_request, resolve_stalled_peer};
 use super::{
-    AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, OpenTracker,
-    ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash,
-    build_invitation_link, checked_name, normalize_update_reason, parse_invitation_hash,
-    sanitize_shared_name, should_require_update_for_rpc,
+    EVENTS_KEPT, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, OpenTracker,
+    PqSaveOutcome, ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, Sending,
+    StartChatError, build_invitation_link, checked_name, normalize_update_reason,
+    parse_invitation_hash, same_server, sanitize_shared_name, should_require_update_for_rpc,
 };
-use crate::content::{Contact as WireContact, Content, Kind};
-use crate::state::{Body, Delivery, Dialog, Me, ServerPqStatus, SharedContact, Ui};
+use crate::content::{Contact as WireContact, Content, Events, Kind};
+use crate::state::{Body, Delivery, Dialog, Me, Opening, ServerPqStatus, SharedContact, Step, Ui};
 use crate::transport::{Connect, Fetch};
-use crate::util::{hex, key_from_text, key_to_url, short};
+use crate::util::{hex, key_from_text, key_to_url, short, validate_relay_url};
 use crate::vault::{
     AppState, Awaiting, CarriedDeferredTimestamp, ContactState, DeferredInitial,
-    DeferredInitialsRecord, Farewell, HistoryEntry, Outgoing, OutgoingRecord, history_key,
-    outbox_key,
+    DeferredInitialsRecord, Farewell, HistoryEntry, Outgoing, OutgoingRecord, PendingUpload,
+    UPLOAD_STATE_STARTED, history_key, outbox_key,
 };
 use bytes::Bytes;
 use leptos::prelude::GetUntracked;
@@ -301,34 +307,6 @@ fn describe_upgrade_pq_error_maps_plain_english_and_prioritizes_server_disabled(
 }
 
 #[test]
-fn attachment_cache_keys_isolate_peer_and_key() {
-    let peer_a = [0x11u8; 32];
-    let peer_b = [0x22u8; 32];
-    let shared_id = [0x99u8; 16];
-    let key_1 = [0x01u8; 32];
-    let key_2 = [0x02u8; 32];
-
-    let k_a1: AttachmentKey = (peer_a, shared_id, attachment_key_hash(&key_1));
-    let k_a2: AttachmentKey = (peer_a, shared_id, attachment_key_hash(&key_2));
-    let k_b1: AttachmentKey = (peer_b, shared_id, attachment_key_hash(&key_1));
-    assert_ne!(
-        k_a1, k_a2,
-        "same peer+id with different keys must not collide"
-    );
-    assert_ne!(
-        k_a1, k_b1,
-        "same id+key across different peers must not collide"
-    );
-    assert_ne!(k_a2, k_b1);
-
-    let c_a1: ChunkOf = (peer_a, shared_id, attachment_key_hash(&key_1), 0);
-    let c_a2: ChunkOf = (peer_a, shared_id, attachment_key_hash(&key_2), 0);
-    let c_b1: ChunkOf = (peer_b, shared_id, attachment_key_hash(&key_1), 0);
-    assert_ne!(c_a1, c_a2);
-    assert_ne!(c_a1, c_b1);
-}
-
-#[test]
 fn quarantined_primary_survives_second_initial_and_blocks_accept() {
     // Brand-new quarantined classical contact created on first initial message.
     let mut state = ContactState {
@@ -373,36 +351,6 @@ fn quarantined_primary_survives_second_initial_and_blocks_accept() {
     assert!(accept_contact_request_state(&mut state, "  Alice  ").is_ok());
     assert!(!state.request);
     assert_eq!(state.name, "Alice");
-}
-
-#[test]
-fn farewell_push_v2_preserves_carried_initial_message_v2() {
-    let pq_initial = WireInitialMessageV2 {
-        id: 0,
-        version: 2,
-        identity_key: Bytes::from(vec![0x11; 32]),
-        pq_suite: PqConfig::default_suite().as_u8() as u32,
-        pq_prekey_id: Bytes::from(vec![0x33; 32]),
-        pq_ciphertext: Bytes::from(vec![0x44; 64]),
-        ..WireInitialMessageV2::default()
-    };
-    let req = PushV2Request {
-        sender: Bytes::from(vec![0x11; 32]),
-        recipient: Bytes::from(vec![0x22; 32]),
-        message: None,
-        initial_message: Some(pq_initial.clone()),
-        delivery_hash: Bytes::new(),
-        client_message_id: Bytes::from(vec![0xAB; 16]),
-    };
-    let farewell = Farewell {
-        push: None,
-        client_message_id: vec![0xAB; 16],
-        push_v2: req.encode_to_vec(),
-    };
-    assert_eq!(farewell.recipient().as_deref(), Some([0x22; 32].as_slice()));
-    let decoded = PushV2Request::decode(farewell.push_v2.as_slice()).expect("decode push_v2");
-    assert_eq!(decoded.initial_message, Some(pq_initial));
-    assert_eq!(decoded.client_message_id.as_ref(), &[0xAB; 16]);
 }
 
 #[test]
@@ -750,13 +698,7 @@ fn isolated_peer_blocks_both_handshake_directions_until_forgotten() {
             matches!(inner.check_outgoing_peer(&peer), Err(super::StartChatError::Other(reason)) if reason.contains("isolated"))
         );
         let prekeys = proto::ClientState::from(inner.client.state());
-        engine.process_initial(
-            &mut inner,
-            &peer,
-            &message,
-            false,
-            &mut InitialBatch::default(),
-        );
+        engine.process_initial(&mut inner, &peer, &message, &mut InitialBatch::default());
         assert!(
             engine
                 .join_carried(&mut inner, &peer)
@@ -791,13 +733,7 @@ fn isolated_peer_blocks_both_handshake_directions_until_forgotten() {
         assert!(inner.isolated_contacts.is_empty());
         assert!(inner.isolated_views().is_empty());
         assert!(inner.check_outgoing_peer(&peer).is_ok());
-        engine.process_initial(
-            &mut inner,
-            &peer,
-            &message,
-            false,
-            &mut InitialBatch::default(),
-        );
+        engine.process_initial(&mut inner, &peer, &message, &mut InitialBatch::default());
         assert_eq!(inner.contacts.len(), 1);
         assert_eq!(inner.contacts[0].state.history_len, 1);
         assert_eq!(inner.state.used_one_time_prekeys, 1);
@@ -851,7 +787,7 @@ fn corrupt_duplicate_before_healthy_row_keeps_healthy_contact_active() {
         assert_eq!(inner.contacts[0].state.name, "Alice");
         assert_eq!(inner.contacts[0].state.history_len, 5);
         let mut batch = InitialBatch::default();
-        engine.process_initial(&mut inner, &peer, &message, false, &mut batch);
+        engine.process_initial(&mut inner, &peer, &message, &mut batch);
         assert_eq!(inner.contacts[0].state.name, "Alice");
         assert!(inner.contacts[0].session.peer_pq_state().pq_pinned);
     });
@@ -1971,7 +1907,6 @@ fn permanently_invalid_classical_initial_is_staged_for_ack() {
             messages: vec![Incoming::try_from(&wire).unwrap()],
             malformed_ids: vec![],
         },
-        None,
         &mut batch,
     );
     assert_eq!(inner.state.pending_inbox_acks, vec![41]);
@@ -2121,7 +2056,6 @@ fn deferred_inbox_ack_waits_for_durable_ciphertext_and_survives_restart() {
                 messages: vec![message.clone(), message],
                 malformed_ids: vec![],
             },
-            None,
             &mut batch,
         );
         assert!(inner.needs_save());
@@ -2152,7 +2086,7 @@ fn deferred_inbox_ack_waits_for_durable_ciphertext_and_survives_restart() {
         assert_eq!(inner.state.pending_inbox_acks, [77]);
         assert!(
             engine
-                .replay_deferred_initials(&mut inner, None)
+                .replay_deferred_initials(&mut inner)
                 .await
                 .unwrap()
                 .is_none()
@@ -2188,7 +2122,7 @@ fn full_deferred_inbox_dedups_distinct_relay_ids_and_leaves_new_ciphertext_on_se
             malformed_ids: vec![],
         };
         let mut batch = InitialBatch::default();
-        engine.process_inbox_messages(&mut inner, listed(1..=100), None, &mut batch);
+        engine.process_inbox_messages(&mut inner, listed(1..=100), &mut batch);
         engine.save_initial_batch(&mut inner, batch).await.unwrap();
         inner
             .ack_persisted_inbox(async |_, _, ids| {
@@ -2215,7 +2149,6 @@ fn full_deferred_inbox_dedups_distinct_relay_ids_and_leaves_new_ciphertext_on_se
                 messages: vec![retransmitted, distinct_new],
                 malformed_ids: vec![],
             },
-            None,
             &mut batch,
         );
         engine.save_initial_batch(&mut inner, batch).await.unwrap();
@@ -2266,7 +2199,6 @@ fn pq_incompatible_isolated_contact_defers_greetings_while_corrupt_contact_acks(
                 messages: vec![msg_from_pq_peer, msg_from_corrupt_peer],
                 malformed_ids: vec![],
             },
-            None,
             &mut batch,
         );
         // Greeting from the PQ-isolated contact is DEFERRED (acked only after durable save);
@@ -2282,7 +2214,7 @@ fn pq_incompatible_isolated_contact_defers_greetings_while_corrupt_contact_acks(
         engine.save_initial_batch(&mut inner, batch).await.unwrap();
         assert!(
             engine
-                .replay_deferred_initials(&mut inner, None)
+                .replay_deferred_initials(&mut inner)
                 .await
                 .unwrap()
                 .is_none()
@@ -2493,12 +2425,7 @@ fn pq_build_replays_deferred_inbox_ciphertext_once_after_reload() {
 
         let mut inner = reload(inner.vault);
         inner.vault.fail_save.set(true);
-        assert!(
-            engine
-                .replay_deferred_initials(&mut inner, None)
-                .await
-                .is_err()
-        );
+        assert!(engine.replay_deferred_initials(&mut inner).await.is_err());
         assert_eq!(inner.vault.deferred.borrow().entries.len(), 1);
         assert!(inner.vault.entries.borrow().is_empty());
 
@@ -2506,7 +2433,7 @@ fn pq_build_replays_deferred_inbox_ciphertext_once_after_reload() {
         let mut inner = reload(inner.vault);
         assert!(
             engine
-                .replay_deferred_initials(&mut inner, None)
+                .replay_deferred_initials(&mut inner)
                 .await
                 .unwrap()
                 .is_some()
@@ -2514,7 +2441,7 @@ fn pq_build_replays_deferred_inbox_ciphertext_once_after_reload() {
         let mut inner = reload(inner.vault);
         assert!(
             engine
-                .replay_deferred_initials(&mut inner, None)
+                .replay_deferred_initials(&mut inner)
                 .await
                 .unwrap()
                 .is_none()
@@ -2635,56 +2562,7 @@ fn open_tracker_invalidates_only_deleted_peer_tracks_deletion_and_checks_settlem
 }
 
 #[test]
-fn read_displayed_acknowledges_only_newly_displayed_entries_and_idle_dismiss_does_not_leak() {
-    // `read_displayed` decrements only the newly displayed entries' unread count and drains only
-    // their clocks from `unseen`, preserving earlier undisplayed messages (e.g. after a history
-    // load failure or pending `saved_late` reload).
-    let client = Client::new(Fetch::client(TEST_SERVER));
-    let peer = Client::new(Fetch::client(TEST_SERVER)).identity_key();
-    let mut inner = load_contacts(&client, vec![stored_contact(client.identity_key(), peer)]);
-    let contact = inner.contact(&peer).unwrap();
-    let (_, earlier) = contact
-        .add_received(
-            Content {
-                clock: 10,
-                kind: Some(Kind::Text("earlier".into())),
-                events: None,
-            },
-            false,
-        )
-        .unwrap();
-    let (_, newer) = contact
-        .add_received(
-            Content {
-                clock: 20,
-                kind: Some(Kind::Text("newer".into())),
-                events: None,
-            },
-            false,
-        )
-        .unwrap();
-    assert_eq!(contact.state.unread, 2);
-    assert_eq!(contact.state.unseen, vec![10, 20]);
-    assert_eq!(
-        super::handshake::entry_read_tracking(&earlier),
-        (true, Some(10))
-    );
-    let (counts_unread, clock) = super::handshake::entry_read_tracking(&newer);
-    assert_eq!((counts_unread, clock), (true, Some(20)));
-    assert!(
-        contact.acknowledge_entries(&[super::contact::DisplayedEntry {
-            index: 1,
-            counts_unread,
-            clock,
-        }])
-    );
-    assert_eq!(contact.state.unread, 1);
-    assert_eq!(contact.state.unseen, vec![10]);
-    assert_eq!(
-        contact.state.events.as_ref().map(|e| e.read.clone()),
-        Some(vec![20])
-    );
-
+fn idle_sign_in_dismiss_does_not_leak_and_live_submissions_are_ref_counted() {
     // Dismissing an idle SignInDialog after NewChat's original task already finished must not
     // retain stale cancellation IDs in `Engine::cancelled_submissions`.
     let engine = Engine::new(Ui::new());
@@ -2738,14 +2616,51 @@ fn unannounced_greeting_suppresses_farewell_and_displayed_window_reconciles_accu
             contact.state.greeting_delivery,
             GREETING_DELIVERY_LEGACY_UNKNOWN
         );
+        // Without a carried initial message, legacy unknown sends a normal farewell.
+        assert!(!contact.has_carried_initial());
+        assert_eq!(contact.farewell_mode(), FarewellMode::Normal);
+        // With a carried initial message, legacy unknown strips the initial (`WithoutInitial`).
+        let mut carried_recipient = Client::new(Fetch::client(TEST_SERVER));
+        let carried_peer = carried_recipient.identity_key();
+        let published = carried_recipient
+            .prepare_publish_v2("chat.example", 1, 1)
+            .unwrap();
+        let p = &published.request;
+        let bundle = protocol::handshake_v2::ClaimBundleResponse {
+            signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+            signed_prekey_signature: p.signed_prekey_signature.clone(),
+            one_time_prekey: p.one_time_prekeys.first().cloned(),
+            pq_last_resort: p.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: p.pq_one_time_prekeys.first().cloned(),
+            manifest: p.manifest.clone(),
+        };
+        carried_recipient.commit_publish_v2(published);
+        let mut carried_sender =
+            Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
+        let prepared = futures::executor::block_on(carried_sender.prepare_initiate_v2(
+            "chat.example",
+            &carried_peer,
+            &Default::default(),
+            &Kind::Text("hello".into()).to_bytes(),
+            Fetch::client(TEST_SERVER),
+        ))
+        .unwrap();
+        let legacy_carried_contact = super::contact::Contact {
+            peer: carried_peer,
+            session: prepared.session,
+            deferred_carried: 0,
+            state: ContactState {
+                peer: carried_peer.to_vec(),
+                greeting_delivery: GREETING_DELIVERY_LEGACY_UNKNOWN,
+                ..ContactState::default()
+            },
+        };
+        assert!(legacy_carried_contact.has_carried_initial());
         assert_eq!(
-            contact.farewell_mode(),
-            if contact.has_carried_initial() {
-                FarewellMode::WithoutInitial
-            } else {
-                FarewellMode::Normal
-            }
+            legacy_carried_contact.farewell_mode(),
+            FarewellMode::WithoutInitial
         );
+
         contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
         assert_eq!(contact.farewell_mode(), FarewellMode::Suppress);
         contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
@@ -3285,31 +3200,6 @@ fn resolve_stalled_pauses_existing_quarantined_contacts_and_session_seq_is_monot
     let hello = inner.client.make_hello("Alice".to_string(), second);
     assert_eq!(hello.session_seq, second);
 
-    // Quarantined contact high-water mark accounts for both active_peer_session_seq and
-    // already-held `quarantined_session.active_peer_session_seq`.
-    let contact = inner.contact(&peer).unwrap();
-    contact.state.quarantined = true;
-    contact.state.quarantined_primary = true;
-    let mut held = session::proto::SessionState::default();
-    held.active_peer_session_seq = 42;
-    contact.state.quarantined_session = Some(held);
-    let high_water = contact
-        .session
-        .peer_session_seq()
-        .max(if contact.is_new_quarantined() {
-            contact.session.active_peer_session_seq()
-        } else {
-            0
-        })
-        .max(
-            contact
-                .state
-                .quarantined_session
-                .as_ref()
-                .map_or(0, |s| s.active_peer_session_seq),
-        );
-    assert_eq!(high_water, 42);
-
     // E3: `stage_carried_initials` skips a classical carried initial whose ephemeral key matches
     // an already-held `quarantined_session.id`, preventing a re-quarantine/re-stage loop.
     let classical_wire = session::protocol::handshake_v2::InitialMessageV2 {
@@ -3335,4 +3225,701 @@ fn resolve_stalled_pauses_existing_quarantined_contacts_and_session_seq_is_monot
         q_state.pending_carried_initials.is_empty(),
         "already-quarantined classical initial must not be re-staged"
     );
+}
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[test]
+fn process_initial_enforces_quarantine_session_seq_high_water_mark() {
+    use session::protocol::handshake_v2::ClaimBundleResponse;
+
+    futures::executor::block_on(async {
+        let mut recipient = Client::new(Fetch::client(TEST_SERVER));
+        recipient
+            .set_pq_config(PqConfig {
+                pq_enabled: true,
+                strict_pq: false,
+                ..PqConfig::default()
+            })
+            .unwrap();
+        let published = recipient.prepare_publish_v2("chat.example", 4, 0).unwrap();
+        let p = published.request.clone();
+        let make_classical_bundle = |opk_idx: usize| ClaimBundleResponse {
+            signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+            signed_prekey_signature: p.signed_prekey_signature.clone(),
+            one_time_prekey: p.one_time_prekeys.get(opk_idx).cloned(),
+            pq_last_resort: None,
+            pq_one_time_prekey: None,
+            manifest: p.manifest.clone(),
+        };
+        recipient.commit_publish_v2(published);
+
+        let make_classical_initial = |sender_proto: &proto::ClientState,
+                                      opk_idx: usize,
+                                      seq: u64| {
+            let bundle = make_classical_bundle(opk_idx);
+            let mut sender = Client::restore(
+                ConnectClient::new(BundleResponse("/ClaimBundle", bundle)),
+                ClientState::try_from(sender_proto).unwrap(),
+            );
+            sender
+                .set_pq_config(PqConfig {
+                    pq_enabled: false,
+                    pq_ratchet_enabled: false,
+                    strict_pq: false,
+                    ..PqConfig::default()
+                })
+                .unwrap();
+            let greeting = Kind::Hello(sender.make_hello(format!("seq-{seq}"), seq)).to_bytes();
+            let peer_id = recipient.identity_key();
+            async move {
+                let prepared = sender
+                    .prepare_initiate_v2(
+                        "chat.example",
+                        &peer_id,
+                        &Default::default(),
+                        &greeting,
+                        (),
+                    )
+                    .await
+                    .unwrap();
+                assert!(!prepared.security.is_pq);
+                let msg = Incoming::try_from(prepared.request.message.as_ref().unwrap()).unwrap();
+                (sender.identity_key(), msg, greeting)
+            }
+        };
+
+        let sender_base = Client::new(Fetch::client(TEST_SERVER));
+        let sender_proto = proto::ClientState::from(sender_base.state());
+
+        let (peer, init_42, greeting_42) = make_classical_initial(&sender_proto, 0, 42).await;
+        let (_, init_30, _) = make_classical_initial(&sender_proto, 1, 30).await;
+        let (_, init_50, greeting_50) = make_classical_initial(&sender_proto, 2, 50).await;
+        let (_, init_45, _) = make_classical_initial(&sender_proto, 3, 45).await;
+
+        let engine = Engine::new(Ui::new());
+        let mut inner = load_contacts(&recipient, vec![]);
+
+        // 1. First classical initial creates a brand-new quarantined primary contact at seq 42.
+        let mut batch = InitialBatch::default();
+        engine.process_initial(&mut inner, &peer, &init_42, &mut batch);
+        let contact = inner.contact(&peer).expect("quarantined contact created");
+        assert!(contact.is_new_quarantined());
+        assert_eq!(contact.session.active_peer_session_seq(), 42);
+        assert_eq!(contact.state.quarantined_first_message, greeting_42);
+        assert!(contact.state.quarantined_session.is_none());
+
+        // 2. Stale classical initial (seq 30 <= 42) is rejected against primary high-water mark.
+        engine.process_initial(&mut inner, &peer, &init_30, &mut batch);
+        let contact = inner.contact(&peer).unwrap();
+        assert!(contact.state.quarantined_session.is_none());
+        assert_eq!(contact.state.quarantined_first_message, greeting_42);
+
+        // 3. Newer classical initial (seq 50 > 42) updates the held quarantined session.
+        engine.process_initial(&mut inner, &peer, &init_50, &mut batch);
+        let contact = inner.contact(&peer).unwrap();
+        assert!(contact.is_new_quarantined());
+        assert_eq!(
+            contact
+                .state
+                .quarantined_session
+                .as_ref()
+                .map(|s| s.active_peer_session_seq),
+            Some(50)
+        );
+        assert_eq!(contact.state.quarantined_first_message, greeting_50);
+
+        // 4. Stale classical initial (seq 45 <= 50) is rejected against held quarantined high-water.
+        engine.process_initial(&mut inner, &peer, &init_45, &mut batch);
+        let contact = inner.contact(&peer).unwrap();
+        assert_eq!(
+            contact
+                .state
+                .quarantined_session
+                .as_ref()
+                .map(|s| s.active_peer_session_seq),
+            Some(50)
+        );
+        assert_eq!(contact.state.quarantined_first_message, greeting_50);
+    });
+}
+
+#[test]
+fn same_server_normalizes_default_ports_and_validate_relay_url_rejects_unsafe() {
+    assert!(same_server(
+        "https://chat.example.com:443",
+        "https://chat.example.com"
+    ));
+    assert!(same_server(
+        "https://CHAT.EXAMPLE.COM:443/",
+        "https://chat.example.com"
+    ));
+    assert!(same_server("http://localhost:80", "http://localhost"));
+    assert!(!same_server(
+        "https://chat.example.com:8443",
+        "https://chat.example.com"
+    ));
+    assert!(!same_server(
+        "http://chat.example.com",
+        "https://chat.example.com"
+    ));
+    assert!(!same_server("", ""));
+    assert!(!same_server("not-a-url", "not-a-url"));
+
+    assert_eq!(
+        validate_relay_url("https://CHAT.example.com:443/").as_deref(),
+        Ok("https://chat.example.com")
+    );
+    assert_eq!(
+        validate_relay_url("http://localhost:8080/").as_deref(),
+        Ok("http://localhost:8080")
+    );
+    assert_eq!(
+        validate_relay_url("http://127.0.0.1:8787").as_deref(),
+        Ok("http://127.0.0.1:8787")
+    );
+    for bad in [
+        "",
+        "http://evil.example.com",
+        "ws://chat.example.com",
+        "wss://chat.example.com",
+        "javascript:alert(1)",
+        "https://user:pass@chat.example.com",
+        "https://chat.example.com/path",
+        "https://chat.example.com/?q=1",
+        "https://chat.example.com/#frag",
+    ] {
+        assert!(validate_relay_url(bad).is_err(), "expected Err for {bad:?}");
+    }
+}
+
+#[test]
+fn sanitize_shared_name_strips_unicode_format_bidi_controls_and_hello_and_invite_names() {
+    // Strips Unicode Format (Cf) including BiDi overrides/isolates, ZWJ/ZWNJ, BOM, tag chars,
+    // and Control (Cc) characters.
+    let spoofing = "Al\u{200D}i\u{200C}ce\u{FEFF}\u{202E}txt.exe\u{2066}\u{E0061}\u{0007}  \tBob";
+    assert_eq!(sanitize_shared_name(spoofing), "Alicetxt.exe Bob");
+
+    // `Contact::add_received` sanitizes `Hello.name` into `hello_name` and `Contact::message`.
+    let (mut inner, peer) = unlocked_client();
+    let contact = inner.contact(&peer).unwrap();
+    let (idx, entry) = contact
+        .add_received(
+            Content {
+                clock: 1,
+                kind: Some(Kind::Hello(Hello {
+                    name: "  Mallory\u{202E}Admin\u{200B}\x00 ".into(),
+                    ..Hello::default()
+                })),
+                events: None,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(contact.state.hello_name, "MalloryAdmin");
+    assert_eq!(
+        contact.message(idx, entry).body,
+        Body::Hello("MalloryAdmin".into())
+    );
+
+    // `parse_invitation_hash` sanitizes percent-encoded BiDi/control characters in `#name=`.
+    let key = key_to_url(&[0x55u8; 32]);
+    let hash = format!("#chat={key}&name=Bob%E2%80%AE%07%20%20Dev&pq=1");
+    assert_eq!(
+        parse_invitation_hash(&hash),
+        Some(Dialog::NewChat {
+            key,
+            name: "Bob Dev".to_string(),
+            server: None,
+            pq_pinned: true,
+        })
+    );
+}
+
+#[test]
+fn acked_ranges_caps_at_events_kept_by_coalescing_oldest_gaps() {
+    let mut ranges = Vec::new();
+    // Insert `EVENTS_KEPT + 25` disjoint single-index ranges (`[0,1), [2,3), [4,5), ...`).
+    for i in 0..(EVENTS_KEPT as u64 + 25) {
+        let start = i * 2;
+        insert_acked_range(&mut ranges, start, start + 1);
+        assert!(
+            ranges.len() <= EVENTS_KEPT,
+            "acked_ranges exceeded EVENTS_KEPT ({} > {})",
+            ranges.len(),
+            EVENTS_KEPT
+        );
+    }
+    assert_eq!(ranges.len(), EVENTS_KEPT);
+    // Oldest 25 gaps coalesced into ranges[0] = [0, 51), preserving every acknowledged index.
+    assert_eq!(ranges[0].start, 0);
+    assert_eq!(ranges[0].end, 51);
+    assert_eq!(ranges.last().unwrap().start, (EVENTS_KEPT as u64 + 24) * 2);
+}
+
+#[test]
+fn contact_told_bounds_dedups_and_settles_sealed_pending_outbox_entries() {
+    let (mut inner, peer) = unlocked_client();
+    let contact = inner.contact(&peer).unwrap();
+    contact.state.awaiting = vec![
+        Awaiting {
+            place: 10,
+            history_index: 1,
+            read: false,
+            attachment: false,
+        },
+        Awaiting {
+            place: 20,
+            history_index: 2,
+            read: false,
+            attachment: true,
+        },
+    ];
+    // Sealed pending outbox entries (push succeeded on relay, ack lost locally) + unsealed entry.
+    contact.state.outbox = vec![
+        Outgoing {
+            history_index: 3,
+            sealed: true,
+            clock: 30,
+            awaits_upload: false,
+        },
+        Outgoing {
+            history_index: 4,
+            sealed: true,
+            clock: 40,
+            awaits_upload: false,
+        },
+        Outgoing {
+            history_index: 5,
+            sealed: false,
+            clock: 0,
+            awaits_upload: false,
+        },
+    ];
+
+    // Flood incoming receipt list with duplicates + > EVENTS_KEPT clocks: clocks beyond
+    // `EVENTS_KEPT` are capped, duplicates are deduplicated, and sealed outbox clocks 30 & 40
+    // settle cleanly without dropping receipts.
+    let mut read_clocks = vec![10, 10, 20, 30, 30];
+    read_clocks.extend(1_000..(1_000 + EVENTS_KEPT as u64 + 50));
+    let events = Events {
+        read: read_clocks,
+        downloaded: vec![40, 40],
+    };
+    let outcome = contact.told(&events);
+    assert_eq!(
+        outcome.steps,
+        vec![
+            (1, Step::Read),
+            (2, Step::Read),
+            (3, Step::Read),
+            (4, Step::Downloaded),
+        ]
+    );
+    assert_eq!(outcome.settled_outbox, vec![(3, 30), (4, 40)]);
+    assert_eq!(contact.state.read_by_peer, 40);
+    // Sealed outbox entries 3 and 4 are retired; unsealed entry 5 stays queued.
+    assert_eq!(contact.state.outbox.len(), 1);
+    assert_eq!(contact.state.outbox[0].history_index, 5);
+    // Attachment #2 and tentatively tracked #3 remain in `awaiting` with `read = true` so peer
+    // chat deletion will never requeue them, while a later `Downloaded` receipt still settles #3.
+    assert!(contact.state.awaiting.iter().all(|a| a.read));
+    let dl = contact.told(&Events {
+        read: vec![],
+        downloaded: vec![20, 30],
+    });
+    assert_eq!(dl.steps, vec![(2, Step::Downloaded), (3, Step::Downloaded)]);
+    assert!(contact.state.awaiting.is_empty());
+
+    // `tell_downloaded` deduplicates repeated final-chunk notifications.
+    assert!(contact.tell_downloaded(77));
+    assert!(!contact.tell_downloaded(77));
+    assert_eq!(
+        contact.state.events.as_ref().map(|e| e.downloaded.clone()),
+        Some(vec![77])
+    );
+}
+
+#[test]
+fn stream_mime_accepts_codec_params_and_rejects_non_media_or_malformed() {
+    assert_eq!(stream_mime("video/mp4; codecs=avc1"), "video/mp4");
+    assert_eq!(stream_mime("audio/webm; codecs=opus"), "audio/webm");
+    assert_eq!(
+        stream_mime("VIDEO/MP4; codecs=\"avc1.42E01E, mp4a.40.2\""),
+        "video/mp4"
+    );
+    assert_eq!(
+        stream_mime("text/html; codecs=avc1"),
+        "application/octet-stream"
+    );
+    assert_eq!(
+        stream_mime("application/javascript"),
+        "application/octet-stream"
+    );
+    assert_eq!(stream_mime("video/mp4; bad"), "application/octet-stream");
+    assert_eq!(
+        stream_mime("video/mp4; codecs=\"bad\r\nheader: 1\""),
+        "application/octet-stream"
+    );
+}
+
+#[test]
+fn start_chat_rejects_foreign_and_invalid_relay_before_contact_lookup() {
+    assert!(validate_start_chat_server(None, "https://chat.example.com").is_ok());
+    assert!(validate_start_chat_server(Some("  "), "https://chat.example.com").is_ok());
+    assert!(
+        validate_start_chat_server(
+            Some("https://CHAT.example.com:443/"),
+            "https://chat.example.com"
+        )
+        .is_ok()
+    );
+    let foreign = validate_start_chat_server(
+        Some("https://other.example.com"),
+        "https://chat.example.com",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(foreign, StartChatError::Other(ref msg) if msg.contains("different server")),
+        "{foreign:?}"
+    );
+    let invalid =
+        validate_start_chat_server(Some("ws://chat.example.com"), "https://chat.example.com")
+            .unwrap_err();
+    assert!(
+        matches!(invalid, StartChatError::Other(ref msg) if msg.contains("Invalid invitation server")),
+        "{invalid:?}"
+    );
+}
+
+#[test]
+fn settings_unimplemented_returns_err_and_rollback_preserves_contact_flags() {
+    // 1. Definitive `ErrorKind::Unimplemented` returns `Err(message)`, NOT SavedLocallyPendingPublish.
+    let unimpl = PublishError::transmitted(
+        protocol::Error::new(protocol::ErrorKind::Unimplemented, "upgrade client").into(),
+    );
+    let err = classify_set_pq_publish_result(Err(unimpl)).unwrap_err();
+    assert!(err.contains("upgrade client"), "{err}");
+
+    let transient = PublishError::transmitted(session::Error::from(ErrorKind::Server));
+    assert_eq!(
+        classify_set_pq_publish_result(Err(transient)),
+        Ok(PqSaveOutcome::SavedLocallyPendingPublish)
+    );
+    let sign_in = PublishError::transmitted(
+        protocol::Error::from(protocol::ErrorKind::SignInRequired).into(),
+    );
+    assert_eq!(
+        classify_set_pq_publish_result(Err(sign_in)),
+        Ok(PqSaveOutcome::SavedLocallyNeedsSignIn)
+    );
+
+    // 2. Rejected PQ settings rollback restores per-contact `security_alert` and
+    // `classical_approval_needed` flags cleared by `save_pq_config`.
+    #[cfg(any(feature = "ml-kem-768", feature = "ml-kem-1024"))]
+    futures::executor::block_on(async {
+        use crate::vault::{
+            CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, SECURITY_ALERT_NONE,
+            SECURITY_ALERT_PQ_REQUIRED,
+        };
+
+        let engine = Engine::new(Ui::new());
+        let (mut inner, peer) = unlocked_client();
+        inner
+            .client
+            .set_pq_config(PqConfig {
+                pq_enabled: true,
+                strict_pq: true,
+                ..PqConfig::default()
+            })
+            .unwrap();
+        {
+            let contact = inner.contact(&peer).unwrap();
+            contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+            contact.state.classical_approval_needed = CLASSICAL_APPROVAL_LEGACY;
+        }
+        inner.save(&[]).await.unwrap();
+
+        inner
+            .save_pq_config(PqConfig {
+                pq_enabled: false,
+                strict_pq: false,
+                pq_ratchet_enabled: false,
+                ..PqConfig::default()
+            })
+            .await
+            .unwrap();
+        {
+            let contact = inner.contact(&peer).unwrap();
+            assert_eq!(contact.state.security_alert, SECURITY_ALERT_NONE);
+            assert_eq!(
+                contact.state.classical_approval_needed,
+                CLASSICAL_APPROVAL_NONE
+            );
+        }
+
+        let refusal =
+            PublishError::transmitted(protocol::Error::from(protocol::ErrorKind::Malformed).into());
+        assert!(
+            engine
+                .finish_publish_rollback(&mut inner, refusal, true)
+                .await
+                .unwrap_err()
+                .rejects_settings()
+        );
+        let contact = inner.contact(&peer).unwrap();
+        assert_eq!(contact.state.security_alert, SECURITY_ALERT_PQ_REQUIRED);
+        assert_eq!(
+            contact.state.classical_approval_needed,
+            CLASSICAL_APPROVAL_LEGACY
+        );
+    });
+}
+
+#[test]
+fn unlock_backfills_carried_timestamps_for_restored_contacts() {
+    #[cfg_attr(feature = "ml-kem-1024", allow(unused_mut))]
+    let (mut inner, peer) = unlocked_client();
+    let spk = [0x44u8; 32];
+    // Encode an unsupported-suite carried initial (in PQ builds, pick a suite if unsupported, or
+    // verify zero-timestamp backfill on existing `CarriedDeferredTimestamp` entries as well).
+    let mut timestamps = vec![CarriedDeferredTimestamp {
+        signed_prekey: spk.to_vec(),
+        deferred_at: 0,
+    }];
+    assert!(backfill_carried_timestamps_for_contacts(
+        &mut timestamps,
+        inner.contacts.iter(),
+        12_345,
+    ));
+    assert_eq!(timestamps[0].deferred_at, 12_345);
+    assert!(!backfill_carried_timestamps_for_contacts(
+        &mut timestamps,
+        inner.contacts.iter(),
+        99_999,
+    ));
+
+    #[cfg(not(feature = "ml-kem-1024"))]
+    {
+        let wire = unsupported_wire_initial(peer, 0);
+        let carried = protocol::mailbox_v2::encode_carried_initial(&wire)
+            .unwrap()
+            .to_vec();
+        inner.contacts[0]
+            .state
+            .pending_carried_initials
+            .push(carried);
+        let mut missing = Vec::new();
+        assert!(backfill_carried_timestamps_for_contacts(
+            &mut missing,
+            inner.contacts.iter(),
+            55_000,
+        ));
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].signed_prekey, vec![0x66; 32]);
+        assert_eq!(missing[0].deferred_at, 55_000);
+    }
+    let _ = peer;
+}
+
+#[test]
+fn is_cancelled_and_delete_purge_sending_and_opening_state() {
+    use leptos::prelude::Set;
+
+    let ui = Ui::new();
+    let engine = Engine::new(ui);
+    let peer_a = [0x11u8; 32];
+    let peer_b = [0x22u8; 32];
+    let id_a = [0xAAu8; 16];
+    let id_b = [0xBBu8; 16];
+
+    assert!(!engine.is_cancelled(&id_a));
+    engine.cancelled.borrow_mut().insert(id_a);
+    assert!(engine.is_cancelled(&id_a));
+    assert!(!engine.is_cancelled(&id_b));
+
+    engine
+        .sending
+        .borrow_mut()
+        .push_back(Sending::Content(peer_a, Kind::Text("stale".into())));
+    engine
+        .sending
+        .borrow_mut()
+        .push_back(Sending::Content(peer_b, Kind::Text("keep".into())));
+    ui.opening.set(Some(Opening {
+        token: 7,
+        peer: peer_a,
+        id: id_a,
+        name: "doc.pdf".into(),
+        size: 1024,
+        done: 0,
+        waiting: false,
+    }));
+
+    engine.purge_peer_transient_state(&peer_a);
+    assert_eq!(engine.sending.borrow().len(), 1);
+    assert_eq!(engine.sending.borrow()[0].peer(), peer_b);
+    assert!(ui.opening.get_untracked().is_none());
+
+    // Purging `peer_a` when `ui.opening` belongs to `peer_b` leaves `peer_b`'s opening intact.
+    ui.opening.set(Some(Opening {
+        token: 8,
+        peer: peer_b,
+        id: id_b,
+        name: "keep.pdf".into(),
+        size: 2048,
+        done: 0,
+        waiting: false,
+    }));
+    engine.purge_peer_transient_state(&peer_a);
+    assert_eq!(ui.opening.get_untracked().map(|o| o.peer), Some(peer_b));
+}
+
+#[test]
+fn expected_chunk_len_validates_non_last_and_last_chunk_boundaries() {
+    use session::attachment::CHUNK_SIZE;
+
+    assert_eq!(expected_chunk_len(0, 0, 1), Some(0));
+    assert_eq!(expected_chunk_len(0, 0, 0), None);
+    assert_eq!(expected_chunk_len(123, 0, 1), Some(123));
+    assert_eq!(
+        expected_chunk_len(CHUNK_SIZE as u64, 0, 1),
+        Some(CHUNK_SIZE)
+    );
+    assert_eq!(
+        expected_chunk_len(CHUNK_SIZE as u64 + 1, 0, 2),
+        Some(CHUNK_SIZE)
+    );
+    assert_eq!(expected_chunk_len(CHUNK_SIZE as u64 + 1, 1, 2), Some(1));
+    assert_eq!(expected_chunk_len(CHUNK_SIZE as u64 + 1, 2, 2), None);
+    // Spoofed chunk count exceeding total_size is rejected.
+    assert_eq!(expected_chunk_len(100, 0, 2), None);
+    assert_eq!(expected_chunk_len(100, 1, 2), None);
+}
+
+#[test]
+fn resume_verifier_checks_prefix_and_sealed_chunk_hash_and_guards_upload_digests() {
+    use session::attachment::CHUNK_SIZE;
+    use sha2::{Digest, Sha256};
+
+    let chunk0 = vec![0x11u8; CHUNK_SIZE];
+    let chunk1 = vec![0x22u8; 512];
+    let total_size = (chunk0.len() + chunk1.len()) as u64;
+    let mut prefix = Sha256::new();
+    prefix.update(&chunk0);
+    prefix.update(&chunk1);
+    let prefix_hash = prefix.finalize().to_vec();
+    let sealed_chunk_hash = Sha256::digest(&chunk1).to_vec();
+
+    let pending = PendingUpload {
+        id: vec![0xAA; 16],
+        token: vec![0xBB; 16],
+        key: vec![0xCC; 32],
+        name: "clip.mp4".into(),
+        mime: "video/mp4".into(),
+        size: total_size,
+        uploaded: 1,
+        encrypted: 2,
+        prefix_hash,
+        announced: true,
+        history_index: 0,
+        expires: 0,
+        upload_state: UPLOAD_STATE_STARTED,
+        sealed_chunk_hash,
+    };
+
+    // Valid resume returns verified chunk 1 bytes + digest; `Upload` allows encrypting identical
+    // chunk 1, rejects modified chunk 1 with `NonceReuse`, and rejects already-uploaded chunk 0.
+    let mut verifier = ResumeVerifier::new(&pending, total_size).unwrap();
+    verifier.push_chunk(chunk0.clone()).unwrap();
+    verifier.push_chunk(chunk1.clone()).unwrap();
+    let verified = verifier.finish().unwrap();
+    assert_eq!(
+        verified.verified_chunks.get(&1).map(|v| v.as_slice()),
+        Some(chunk1.as_slice())
+    );
+    let upload = upload_of_with_digests(&pending, verified.digests).unwrap();
+    assert!(upload.try_encrypt(1, &chunk1).is_ok());
+    let mut tampered = chunk1.clone();
+    tampered[0] ^= 0xFF;
+    assert_eq!(
+        upload.try_encrypt(1, &tampered).unwrap_err().kind(),
+        ErrorKind::NonceReuse
+    );
+    assert_eq!(
+        upload.try_encrypt(0, &chunk0).unwrap_err().kind(),
+        ErrorKind::NonceReuse
+    );
+
+    // Tampered chunk 1 fails `ResumeVerifier` immediately on `sealed_chunk_hash` mismatch.
+    let mut bad_verifier = ResumeVerifier::new(&pending, total_size).unwrap();
+    bad_verifier.push_chunk(chunk0).unwrap();
+    assert!(bad_verifier.push_chunk(tampered).is_err());
+
+    // Wrong file size is rejected upfront.
+    assert!(ResumeVerifier::new(&pending, total_size + 1).is_err());
+}
+
+#[test]
+fn recover_corrupt_outbox_rebuilds_from_history_or_drops_and_marks_failed() {
+    futures::executor::block_on(async {
+        let (mut inner, peer) = unlocked_client();
+        inner.contacts[0].state.outbox =
+            vec![waiting(0, true), waiting(1, true), waiting(2, false)];
+        inner
+            .vault
+            .entries
+            .borrow_mut()
+            .insert(history_key(&peer, 0), history("recoverable message"));
+        // Entry 1 has missing content (unrecoverable), so it must be dropped & marked Failed.
+        inner.vault.entries.borrow_mut().insert(
+            history_key(&peer, 1),
+            HistoryEntry {
+                outgoing: true,
+                delivery: Delivery::Pending.into(),
+                content: None,
+                ..Default::default()
+            },
+        );
+        inner.save(&[]).await.unwrap();
+
+        match inner.recover_corrupt_outbox(&peer, 0).await.unwrap() {
+            CorruptOutboxRecovery::Rebuilt(bytes) => {
+                assert_eq!(bytes, Kind::Text("recoverable message".into()).to_bytes());
+            }
+            CorruptOutboxRecovery::Dropped { .. } => panic!("expected rebuild from intact history"),
+        }
+        assert!(!inner.contacts[0].state.outbox[0].sealed);
+        assert_eq!(inner.contacts[0].state.outbox[0].clock, 0);
+        assert!(
+            inner
+                .vault
+                .outbox
+                .borrow()
+                .contains_key(&outbox_key(&peer, 0))
+        );
+
+        match inner.recover_corrupt_outbox(&peer, 1).await.unwrap() {
+            CorruptOutboxRecovery::Dropped { history } => {
+                assert_eq!(history.len(), 1);
+                assert_eq!(history[0].0, 1);
+                assert_eq!(history[0].1.delivery(), Delivery::Failed);
+            }
+            CorruptOutboxRecovery::Rebuilt(_) => {
+                panic!("expected drop when history content absent")
+            }
+        }
+        assert_eq!(
+            inner.contacts[0]
+                .state
+                .outbox
+                .iter()
+                .map(|o| o.history_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert_eq!(
+            inner.vault.entries.borrow()[&history_key(&peer, 1)].delivery(),
+            Delivery::Failed
+        );
+    });
 }

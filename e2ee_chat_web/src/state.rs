@@ -392,6 +392,7 @@ pub struct RemoteFile {
 pub struct Opening {
     /// Monotonic preview-request token binding progress and completion strictly to this request.
     pub token: u64,
+    pub peer: PublicKey,
     pub id: [u8; 16],
     pub name: String,
     pub size: u64,
@@ -595,10 +596,18 @@ impl SignInFlow {
     }
 
     /// Keep the live `NewChat` draft in sync as the user edits inputs.
-    pub fn on_new_chat_edited(&mut self, key: String, name: String) {
+    pub fn on_new_chat_edited(
+        &mut self,
+        key: String,
+        name: String,
+        server: Option<String>,
+        pq_pinned: bool,
+    ) {
         if let Some(active) = &mut self.active_new_chat {
             active.key = key;
             active.name = name;
+            active.server = server;
+            active.pq_pinned = pq_pinned;
         }
     }
 
@@ -955,17 +964,25 @@ impl Ui {
 
     /// Show `text` in the notice for a few seconds.
     pub fn notify(&self, text: impl Into<String>) {
-        let id = now();
-        self.notice.set(Some((id, text.into())));
+        thread_local! {
+            static NEXT_NOTICE_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        }
+        let id = NEXT_NOTICE_ID.with(|next| {
+            let id = next.get().wrapping_add(1).max(1);
+            next.set(id);
+            id
+        });
+        let _ = self.notice.try_set(Some((id, text.into())));
         #[cfg(target_arch = "wasm32")]
         {
             let notice = self.notice;
             set_timeout(
                 move || {
                     if notice
-                        .with_untracked(|notice| notice.as_ref().is_some_and(|(n, _)| *n == id))
+                        .try_with_untracked(|notice| notice.as_ref().is_some_and(|(n, _)| *n == id))
+                        == Some(true)
                     {
-                        notice.set(None);
+                        let _ = notice.try_set(None);
                     }
                 },
                 Duration::from_secs(6),
@@ -1152,7 +1169,7 @@ mod tests {
         let mut flow = SignInFlow::default();
         flow.on_new_chat_mounted("peer-key-123".into(), "Alice".into(), None, true);
         // User edits the peer's display name before background `publish()` returns 403.
-        flow.on_new_chat_edited("peer-key-123".into(), "Alice Work".into());
+        flow.on_new_chat_edited("peer-key-123".into(), "Alice Work".into(), None, true);
 
         // Background refusal switches cleanly to SignIn while capturing the edited draft.
         assert_eq!(

@@ -22,10 +22,11 @@ use crate::state::{
     UnavailableReason, UploadState, order, order_rows,
 };
 use crate::transport::{Connect, Fetch};
-use crate::util::{describe, js_error, key_to_url, percent_decode, short, size_u64, sleep};
+use crate::util::{describe, js_error, key_to_url, short, size_u64, sleep};
 use crate::vault::{
     AppState, CarriedDeferredTimestamp, ContactState, DeferredInitial, DeferredInitialsRecord,
-    HistoryEntry, OutgoingRecord, Vault, history_key,
+    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, OutgoingRecord,
+    PendingUpload, Vault, history_key,
 };
 use crate::{content, glue, transport};
 use attachments::upload_of;
@@ -33,9 +34,9 @@ use contact::{
     Contact, DisplayedEntry, FarewellMode, isolated_contact_views, restore_contacts,
     stored_contacts,
 };
-use futures::channel::oneshot;
-use futures::future::{Either, select};
-use futures::lock::Mutex;
+use futures_channel::oneshot;
+use futures_util::future::{Either, select};
+use futures_util::lock::Mutex;
 use handshake::encrypt_session_farewells;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -95,10 +96,7 @@ pub const INLINE_FILE_MAX: usize = 1 << 20;
 pub const MEDIA_INLINE_MAX: u64 = 8 << 20;
 /// The largest file to send: as many chunks as the server takes, unless it says otherwise.
 pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_CHUNKS as usize * CHUNK_SIZE;
-/// The most characters in this client's name. It goes in the greeting, the first message of each
-/// chat it starts, which the server takes up to 4 KiB of; at 4 bytes a character at most, this
-/// leaves the greeting far below that.
-pub const NAME_MAX: usize = 64;
+pub use crate::util::{NAME_MAX, sanitize_shared_name};
 
 /// `name`, trimmed, unless it is longer than [`NAME_MAX`].
 fn checked_name(name: &str) -> Result<String, String> {
@@ -107,46 +105,6 @@ fn checked_name(name: &str) -> Result<String, String> {
         return Err(format!("A name has at most {NAME_MAX} characters."));
     }
     Ok(name.to_string())
-}
-
-/// Normalize a suggested contact name for sharing/display: strip control and Unicode bidirectional
-/// formatting characters, collapse whitespace runs into single spaces, trim, and cap at
-/// [`NAME_MAX`] characters.
-pub fn sanitize_shared_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len().min(NAME_MAX * 4));
-    let mut count = 0usize;
-    let mut pending_space = false;
-    for ch in name.chars() {
-        if matches!(
-            ch,
-            '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
-        ) {
-            continue;
-        }
-        if ch.is_whitespace() {
-            if count > 0 {
-                pending_space = true;
-            }
-            continue;
-        }
-        if ch.is_control() {
-            continue;
-        }
-        if pending_space {
-            if count + 2 > NAME_MAX {
-                break;
-            }
-            out.push(' ');
-            count += 1;
-            pending_space = false;
-        }
-        if count >= NAME_MAX {
-            break;
-        }
-        out.push(ch);
-        count += 1;
-    }
-    out
 }
 /// Milliseconds between asking for a chunk not uploaded yet, doubling up to the second...
 const POLL_CHUNK_MIN: i32 = 500;
@@ -191,6 +149,9 @@ const EVENTS_KEPT: usize = 1_000;
 pub struct Engine {
     ui: Ui,
     inner: Mutex<Option<Inner>>,
+    /// Single-unlock / single-create re-entrancy guard preventing overlapping unlocks or
+    /// duplicate sync/notification/service-worker loops.
+    unlocking: Cell<bool>,
     /// Sync now, e.g. after sending, as a reply may follow.
     wake: Cell<bool>,
     /// The files of the uploads started or resumed on this page, keyed by `(peer, id, key_hash)`,
@@ -210,8 +171,9 @@ pub struct Engine {
     /// The attachments playing as they are fetched, by the tokens of their URLs.
     streams: RefCell<HashMap<String, Stream>>,
     /// The chunks the streams decrypted last, keyed by `(peer, id, key_hash, index)`, oldest
-    /// first, shared only across streams with matching peer, attachment ID, and key.
-    decrypted: RefCell<VecDeque<(ChunkOf, Rc<Vec<u8>>)>>,
+    /// first, shared only across streams with matching peer, attachment ID, and key; zeroized on
+    /// eviction/drop.
+    decrypted: RefCell<VecDeque<(ChunkOf, DecryptedChunk)>>,
     /// The chunks the streams are fetching, keyed by `(peer, id, key_hash, index)`, with what
     /// waits for each, woken once it is done.
     loading: RefCell<HashMap<ChunkOf, Vec<oneshot::Sender<()>>>>,
@@ -403,6 +365,9 @@ pub(crate) type AttachmentKey = (PublicKey, [u8; 16], [u8; 32]);
 /// Cache key binding a stream chunk to its exact `(peer, attachment_id, key_hash, chunk_index)`.
 pub(crate) type ChunkOf = (PublicKey, [u8; 16], [u8; 32], u32);
 
+/// Shared decrypted stream chunk buffer, zeroized on drop when the last reference clears.
+pub type DecryptedChunk = Rc<Zeroizing<Vec<u8>>>;
+
 /// Result of saving post-quantum encryption preferences in [`Engine::set_pq_config`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PqSaveOutcome {
@@ -421,6 +386,14 @@ pub enum PqSaveOutcome {
 pub enum Sending {
     Content(PublicKey, Kind),
     File(PublicKey, web_sys::File),
+}
+
+impl Sending {
+    pub(super) fn peer(&self) -> PublicKey {
+        match self {
+            Self::Content(peer, _) | Self::File(peer, _) => *peer,
+        }
+    }
 }
 
 /// The unlocked client.
@@ -449,6 +422,9 @@ struct Inner<V = Vault> {
     isolated_contacts: Vec<ContactState>,
     /// History namespaces reserved by unreadable contacts with no healthy active record.
     isolated_peers: HashSet<PublicKey>,
+    /// Per-contact `(security_alert, classical_approval_needed)` flags cleared during a pending
+    /// `PqConfig` edit so a definitive server refusal restores them alongside `pending_pq_rollback`.
+    pending_pq_contact_flags: HashMap<PublicKey, (Option<u32>, Option<u32>)>,
     /// A non-rollbackable state change still needs a successful transaction.
     unsaved_state: bool,
     /// Inbox IDs to commit with their deferred ciphertext before they become eligible for ack.
@@ -500,6 +476,7 @@ impl Engine {
         let engine = Rc::new(Self {
             ui,
             inner: Mutex::new(None),
+            unlocking: Cell::new(false),
             wake: Cell::new(false),
             files: RefCell::default(),
             running: RefCell::default(),
@@ -575,6 +552,7 @@ impl Engine {
 
     /// Send what was sent, a message at a time, until none is left.
     async fn drain(self: Rc<Self>) {
+        let _guard = scopeguard::guard((), |()| self.draining.set(false));
         loop {
             let Some(next) = self.sending.borrow_mut().pop_front() else {
                 break;
@@ -587,7 +565,6 @@ impl Engine {
                 self.ui.notify(e);
             }
         }
-        self.draining.set(false);
     }
 
     /// Send `file` to `peer`: a small one in its message, a larger one as an attachment.
@@ -622,18 +599,37 @@ impl Engine {
         self.ui
     }
 
-    /// Who this browser is signed in to the server as, if anyone, which storing files there
-    /// takes.
-    pub async fn signed_in(&self) -> Result<Option<SignIn>, String> {
+    /// Query `/auth` without side effects.
+    async fn check_signed_in(&self) -> Result<Option<SignIn>, String> {
         let server = self.server().await?;
         let (status, answer) = transport::call(&server, "GET", "/auth", None).await?;
         if status != 200 {
             return Err(format!("the server answered {status}"));
         }
-        let signed_in = SignIn::from_json(&answer);
-        // Signed in meanwhile, e.g. on another of the server's pages: publishing goes again.
-        if signed_in.is_some() && self.publish_waits_sign_in.replace(false) {
-            self.wake();
+        Ok(SignIn::from_json(&answer))
+    }
+
+    /// Resume held peers, pending prekey publishing, and waiting uploads after observing a valid
+    /// server sign-in (either via [`sign_in`](Self::sign_in) or an external sign-in discovered by
+    /// [`signed_in`](Self::signed_in)).
+    fn resume_after_sign_in(&self) {
+        self.waits_sign_in.borrow_mut().clear();
+        self.sign_in_flow.borrow_mut().reset_declined();
+        self.publish_waits_sign_in.set(false);
+        self.wake();
+    }
+
+    /// Who this browser is signed in to the server as, if anyone, which storing files there
+    /// takes. If an external sign-in is observed (e.g. on another of the server's pages), resumes
+    /// held peers, prekey publishing, and waiting uploads.
+    pub async fn signed_in(self: &Rc<Self>) -> Result<Option<SignIn>, String> {
+        let signed_in = self.check_signed_in().await?;
+        if signed_in.is_some() {
+            self.resume_after_sign_in();
+            let engine = self.clone();
+            spawn_local(async move {
+                engine.start_waiting_uploads().await;
+            });
         }
         Ok(signed_in)
     }
@@ -658,12 +654,10 @@ impl Engine {
             status => return Err(format!("The server answered {status}.")),
         }
         // Unless the browser refused the cookie, e.g. as it blocks the server's cookies.
-        let signed_in = self.signed_in().await?.ok_or(
+        let signed_in = self.check_signed_in().await?.ok_or(
             "This browser kept no sign-in for the server: it may block the server's cookies.",
         )?;
-        self.waits_sign_in.borrow_mut().clear();
-        self.sign_in_flow.borrow_mut().reset_declined();
-        self.publish_waits_sign_in.set(false);
+        self.resume_after_sign_in();
         self.start_waiting_uploads().await;
         self.wake();
         Ok(signed_in)
@@ -787,8 +781,16 @@ impl Engine {
     }
 
     /// Update the live `NewChat` draft as the user edits key or name.
-    pub fn new_chat_edited(&self, key: String, name: String) {
-        self.sign_in_flow.borrow_mut().on_new_chat_edited(key, name);
+    pub fn new_chat_edited(
+        &self,
+        key: String,
+        name: String,
+        server: Option<String>,
+        pq_pinned: bool,
+    ) {
+        self.sign_in_flow
+            .borrow_mut()
+            .on_new_chat_edited(key, name, server, pq_pinned);
     }
 
     /// Clear the live `NewChat` draft tracker when `NewChat` unmounts.
@@ -1016,16 +1018,31 @@ impl Engine {
         server: String,
         pq_enabled: bool,
     ) -> Result<(), String> {
-        let server = server.trim().trim_end_matches('/').to_string();
-        // The page's own server is saved as empty, so the vault follows the page.
-        let server = if server == origin() {
-            String::new()
+        if self.unlocking.replace(true) {
+            return Err("The vault is already being opened.".to_string());
+        }
+        let _unlock_guard = scopeguard::guard((), |()| self.unlocking.set(false));
+        if self.inner.lock().await.is_some() {
+            return Err("The vault is already unlocked.".to_string());
+        }
+        let raw_server = server.trim();
+        let current_origin = origin();
+        let (server, address) = if raw_server.is_empty() {
+            let canonical = crate::util::validate_relay_url(&current_origin)?;
+            (String::new(), canonical)
         } else {
-            server
+            let canonical = crate::util::validate_relay_url(raw_server)?;
+            // The page's own server is saved as empty, so the vault follows the page.
+            let stored = if same_server(&canonical, &current_origin) {
+                String::new()
+            } else {
+                canonical.clone()
+            };
+            (stored, canonical)
         };
-        let address = address(&server);
-        let audience = expected_audience_from_url(&address)
-            .map_err(|_| "Enter a valid http:// or https:// server address.".to_string())?;
+        let audience = expected_audience_from_url(&address).map_err(|_| {
+            "Enter a valid https:// (or http://localhost) server address.".to_string()
+        })?;
         let mut client =
             Client::new(Fetch::client(&address)).with_clock(transport::clock(&address));
         let mut pq_config = PqConfig::default();
@@ -1064,6 +1081,13 @@ impl Engine {
 
     /// Unlock the vault with `passphrase`.
     pub async fn unlock(self: &Rc<Self>, passphrase: Zeroizing<String>) -> Result<(), String> {
+        if self.unlocking.replace(true) {
+            return Err("The vault is already being opened.".to_string());
+        }
+        let _unlock_guard = scopeguard::guard((), |()| self.unlocking.set(false));
+        if self.inner.lock().await.is_some() {
+            return Err("The vault is already unlocked.".to_string());
+        }
         let (vault, mut state, mut deferred) = Vault::unlock(passphrase.as_bytes())
             .await
             .map_err(|e| describe(&e))?;
@@ -1082,13 +1106,19 @@ impl Engine {
             &client.identity_key(),
             &address,
         );
+        let now_ms = crate::util::now();
         let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
         let migrated_deferred = handshake::merge_legacy_deferred_initials(
             &mut deferred.entries,
             std::mem::take(&mut state.deferred_initials),
         );
         let (pruned_deferred, modified_deferred) =
-            handshake::sanitize_deferred_initials(&mut deferred.entries, crate::util::now());
+            handshake::sanitize_deferred_initials(&mut deferred.entries, now_ms);
+        let backfilled_carried_ts = handshake::backfill_carried_timestamps_for_contacts(
+            &mut deferred.carried_timestamps,
+            contacts.iter(),
+            now_ms,
+        );
         let pruned_carried_ts = handshake::prune_carried_timestamps_for_contacts(
             &mut deferred.carried_timestamps,
             contacts.iter(),
@@ -1117,6 +1147,7 @@ impl Engine {
             || pruned_deferred > 0
             || modified_deferred
             || migrated_deferred
+            || backfilled_carried_ts
             || pruned_carried_ts > 0
         {
             inner.unsaved_state = true;
@@ -1189,7 +1220,13 @@ impl Engine {
             }
             Err(e) => self.ui.notify(describe(&e)),
         }
-        *self.inner.lock().await = Some(inner);
+        {
+            let mut slot = self.inner.lock().await;
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(inner);
+        }
         if let Some(dialog) = invitation() {
             forget_invitation();
             // Proactively check `/auth` (bounded by a short timeout so offline unlock never hangs)
@@ -1511,7 +1548,14 @@ impl Engine {
         if read && let Err(e) = self.flush(&peer).await {
             self.ui.link.set(Link::Offline(e));
         }
-        OpenOutcome::Opened
+        let current = self.open_tracker.get();
+        if current.was_deleted(generation) {
+            OpenOutcome::Ignored
+        } else if !current.is_current(generation) {
+            OpenOutcome::Superseded
+        } else {
+            OpenOutcome::Opened
+        }
     }
 
     /// Load up to `limit` entries immediately before `before` for `peer`, ordered for display,
@@ -1714,6 +1758,49 @@ impl Engine {
         Ok(prepended)
     }
 
+    /// Reload the currently open chat's history when needed (e.g. after a prior history-load
+    /// failure, `saved_late` / staged `unsaved` entries, or `force_reload`), then acknowledge
+    /// whatever entries are displayed on a visible, non-quarantined screen and persist state.
+    /// Returns `true` if unread/receipt state changed.
+    async fn reconcile_open_chat_read(
+        &self,
+        inner: &mut Inner,
+        peer: &PublicKey,
+        force_reload: bool,
+    ) -> bool {
+        if self.ui.open.get_untracked() != Some(*peer) {
+            return false;
+        }
+        if !force_reload && !is_page_visible() {
+            return false;
+        }
+        let needs_reload = force_reload
+            || !self.is_history_loaded_for(*peer)
+            || inner.saved_late.contains(peer)
+            || inner.unsaved.iter().any(|(p, _)| p == peer);
+        if needs_reload {
+            if self.show_history(inner, peer).await {
+                inner.saved_late.retain(|saved| saved != peer);
+            } else if force_reload
+                && self.ui.open.get_untracked() == Some(*peer)
+                && inner.contact(peer).is_some()
+            {
+                inner.saved_late.push(*peer);
+                return false;
+            }
+        }
+        if self.ui.open.get_untracked() != Some(*peer) || !is_page_visible() {
+            return false;
+        }
+        if !self.acknowledge_displayed_window(inner, peer) {
+            return false;
+        }
+        if let Err(e) = inner.save_state().await {
+            self.ui.notify(describe(&e));
+        }
+        true
+    }
+
     /// Count the displayed messages of the chat with `peer` as read, e.g. back on the page with
     /// the chat open: if full history is not yet displayed (e.g. after a history-load failure or
     /// pending `saved_late` / staged `unsaved` entries), reload history first and acknowledge only
@@ -1728,22 +1815,8 @@ impl Engine {
         let Some(inner) = guard.as_mut() else {
             return;
         };
-        let needs_reload = !self.is_history_loaded_for(peer)
-            || inner.saved_late.contains(&peer)
-            || inner.unsaved.iter().any(|(p, _)| *p == peer);
-        if needs_reload {
-            if self.show_history(inner, &peer).await {
-                inner.saved_late.retain(|saved| *saved != peer);
-            }
-            if self.ui.open.get_untracked() != Some(peer) || !is_page_visible() {
-                return;
-            }
-        }
-        if !self.acknowledge_displayed_window(inner, &peer) {
+        if !self.reconcile_open_chat_read(inner, &peer, false).await {
             return;
-        }
-        if let Err(e) = inner.save_state().await {
-            self.ui.notify(describe(&e));
         }
         self.ui.contacts.set(inner.views());
         drop(guard);
@@ -1758,13 +1831,15 @@ impl Engine {
         {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
-            let contact = inner.contact(&peer).ok_or("no such chat")?;
-            let snapshot = contact.snapshot();
-            contact.accept_request(&name)?;
-            if let Err(e) = inner.save(&[]).await {
-                inner.roll_back(&peer, snapshot)?;
-                return Err(describe(&e));
-            }
+            inner
+                .with_contact_tx(&peer, async |inner| {
+                    let contact = inner
+                        .contact(&peer)
+                        .ok_or_else(|| "no such chat".to_string())?;
+                    contact.accept_request(&name)?;
+                    inner.save(&[]).await.map_err(|e| describe(&e))
+                })
+                .await?;
             self.ui.contacts.set(inner.views());
         }
         // The peer learns what was read of the request.
@@ -1784,26 +1859,49 @@ impl Engine {
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
-        let contact = inner.contact(&peer).ok_or("no such chat")?;
-        let snapshot = contact.snapshot();
-        change(contact);
-        if let Err(e) = inner.save(&[]).await {
-            inner.roll_back(&peer, snapshot)?;
-            return Err(describe(&e));
-        }
+        inner
+            .with_contact_tx(&peer, async |inner| {
+                let contact = inner
+                    .contact(&peer)
+                    .ok_or_else(|| "no such chat".to_string())?;
+                change(contact);
+                inner.save(&[]).await.map_err(|e| describe(&e))
+            })
+            .await?;
         self.ui.contacts.set(inner.views());
         Ok(())
+    }
+
+    /// Purge in-flight queued sends and viewer attachment opening state for a deleted `peer`.
+    pub(super) fn purge_peer_transient_state(&self, peer: &PublicKey) {
+        self.sending
+            .borrow_mut()
+            .retain(|item| item.peer() != *peer);
+        if self
+            .ui
+            .opening
+            .with_untracked(|opening| opening.as_ref().is_some_and(|o| o.peer == *peer))
+        {
+            self.ui.opening.set(None);
+        }
     }
 
     /// Delete the chat with `peer` and its history. The server knows nothing of it: what it keeps
     /// of the chat goes as it is delivered, or expires; but for its uploads that went up and
     /// have not finished, which it deletes, as they never can now.
     pub async fn delete(&self, peer: PublicKey) -> Result<(), String> {
+        self.delete_inner(peer, false).await
+    }
+
+    async fn delete_inner(&self, peer: PublicKey, require_isolated: bool) -> Result<(), String> {
         if !crate::glue::owns_lock() {
             return Err("page is closing; tab lock released".into());
         }
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
+        if require_isolated && !inner.is_isolated_peer(&peer) {
+            return Err("That contact is no longer isolated.".to_string());
+        }
         // Read before anything changes, as the vault forgets them with the chat: cancel any
         // started upload that is still shown, running, or unannounced (leaving already-finished
         // uploads whose vault cleanup raced deletion intact), and mark every vaulted upload ID
@@ -1831,7 +1929,7 @@ impl Engine {
                 let id_running = <[u8; 16]>::try_from(pending.id.as_slice())
                     .is_ok_and(|id| running.contains(&id));
                 pending.started()
-                    && (shown.contains(&pending.id) || id_running || !pending.announced)
+                    && (shown.contains(&pending.id) || id_running || !pending.is_announced())
             })
             .filter_map(|(_, pending)| Some((pending.name.clone(), upload_of(&pending).ok()?)))
             .collect();
@@ -1880,29 +1978,15 @@ impl Engine {
                 .max(contact.session.next_session_seq());
         }
         state.contacts.retain(|contact| contact.peer != peer);
-        state.farewells.extend(farewell.clone());
+        state.farewells.extend(farewell);
         let deferred = inner.deferred_record_without_peer(&peer);
-        let unsaved = inner
-            .unsaved
-            .iter()
-            .filter(|(unsaved, _)| *unsaved != peer)
-            .map(|(_, record)| record);
-        let unsaved_outbox = inner
-            .unsaved_outbox
-            .iter()
-            .filter(|(unsaved, _)| *unsaved != peer)
-            .map(|(_, record)| record);
-        if let Err(e) = inner
-            .vault
-            .forget(&state, &deferred, &peer, unsaved, unsaved_outbox)
-            .await
-        {
+        let was_isolated = inner.is_isolated_peer(&peer);
+        if let Err(e) = inner.forget_peer(&peer, state, deferred).await {
             if let Some(snapshot) = snapshot {
                 inner.roll_back(&peer, snapshot)?;
             }
             return Err(describe(&e));
         }
-        inner.state.next_session_seq = state.next_session_seq;
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
         // chat, which `may_keep` now tells them is gone.
         upload_ids.extend(self.ui.uploads.with_untracked(|uploads| {
@@ -1916,6 +2000,7 @@ impl Engine {
             self.cancelled.borrow_mut().insert(id);
             self.remove_attachment_caches(&peer, &id);
         }
+        self.purge_peer_transient_state(&peer);
         self.files.borrow_mut().retain(|(p, _, _), _| *p != peer);
         self.decrypted
             .borrow_mut()
@@ -1938,22 +2023,6 @@ impl Engine {
         // Nor does what waited for a sign-in, which would otherwise hold up a chat started
         // again with the peer, or go to it.
         self.waits_sign_in.borrow_mut().remove(&peer);
-        let was_isolated = inner.is_isolated_peer(&peer);
-        inner.contacts.retain(|contact| contact.peer != peer);
-        inner.forget_isolated_peer(&peer);
-        inner.deferred_initials = deferred.entries;
-        inner.carried_deferred_timestamps = deferred.carried_timestamps;
-        inner.finish_state_save(state.pending_inbox_acks);
-        // The other chats' records left unsaved were saved with it, and show at the next sync.
-        inner.saved_late.extend(
-            inner
-                .unsaved
-                .drain(..)
-                .map(|(unsaved, _)| unsaved)
-                .filter(|unsaved| *unsaved != peer),
-        );
-        inner.unsaved_outbox.clear();
-        inner.state.farewells.extend(farewell);
         self.wake();
         // Only invalidate a queued open targeting the deleted peer; preserve queued navigation to
         // a different peer started while the vault deletion was committing.
@@ -2006,14 +2075,7 @@ impl Engine {
     /// that peer key) after explicit user confirmation. Refuses to delete an active healthy chat.
     pub async fn delete_isolated(&self, raw_peer: Vec<u8>) -> Result<(), String> {
         if let Ok(peer) = PublicKey::try_from(raw_peer.as_slice()) {
-            {
-                let guard = self.inner.lock().await;
-                let inner = guard.as_ref().ok_or("locked")?;
-                if !inner.is_isolated_peer(&peer) {
-                    return Err("That contact is no longer isolated.".to_string());
-                }
-            }
-            return self.delete(peer).await;
+            return self.delete_inner(peer, true).await;
         }
         let mut guard = self.inner.lock().await;
         let inner = guard.as_mut().ok_or("locked")?;
@@ -2090,6 +2152,119 @@ impl HistoryStore for Vault {
     }
 }
 
+impl Inner {
+    /// Atomically promote a waiting sign-in upload (`old_id`) into a server-started `new_upload`
+    /// together with the updated state, deferred record, history entries, and outbox records in
+    /// one IndexedDB transaction.
+    pub(super) async fn promote_upload_with(
+        &mut self,
+        peer: &PublicKey,
+        old_id: &[u8],
+        new_upload: &PendingUpload,
+        entries: &[(String, HistoryEntry)],
+        outgoing: &[(String, Option<OutgoingRecord>)],
+    ) -> crate::vault::Result<()> {
+        let unsaved = self.unsaved.iter().map(|(_, record)| record);
+        let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
+        let state = self.app_state();
+        let deferred = self.deferred_record();
+        if !crate::glue::owns_lock() {
+            return Err(crate::vault::Error::Storage(
+                "page is closing; tab lock released".into(),
+            ));
+        }
+        self.vault
+            .promote_upload(
+                &state,
+                &deferred,
+                peer,
+                old_id,
+                new_upload,
+                unsaved.chain(entries),
+                unsaved_outbox.chain(outgoing),
+            )
+            .await?;
+        self.finish_state_save(state.pending_inbox_acks);
+        self.saved_late
+            .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
+        self.unsaved_outbox.clear();
+        Ok(())
+    }
+
+    /// Persist deletion of `peer` (and any pending records of other chats) via `Vault::forget`
+    /// and update all in-memory peer/state tracking atomically on success.
+    pub(super) async fn forget_peer(
+        &mut self,
+        peer: &PublicKey,
+        state: AppState,
+        deferred: DeferredInitialsRecord,
+    ) -> crate::vault::Result<()> {
+        let unsaved = self
+            .unsaved
+            .iter()
+            .filter(|(unsaved, _)| unsaved != peer)
+            .map(|(_, record)| record);
+        let unsaved_outbox = self
+            .unsaved_outbox
+            .iter()
+            .filter(|(unsaved, _)| unsaved != peer)
+            .map(|(_, record)| record);
+        self.vault
+            .forget(&state, &deferred, peer, unsaved, unsaved_outbox)
+            .await?;
+        self.state.next_session_seq = state.next_session_seq;
+        self.state.farewells = state.farewells;
+        self.contacts.retain(|contact| contact.peer != *peer);
+        self.forget_isolated_peer(peer);
+        self.pending_pq_contact_flags.remove(peer);
+        self.deferred_initials = deferred.entries;
+        self.carried_deferred_timestamps = deferred.carried_timestamps;
+        self.finish_state_save(state.pending_inbox_acks);
+        self.saved_late.extend(
+            self.unsaved
+                .drain(..)
+                .map(|(unsaved, _)| unsaved)
+                .filter(|unsaved| unsaved != peer),
+        );
+        self.unsaved_outbox.clear();
+        Ok(())
+    }
+
+    /// Locate a history entry carrying attachment `id` (checking `hint_index` first, then scanning
+    /// history backwards in `HISTORY_SHOWN` pages).
+    pub(super) async fn find_attachment_entry(
+        &self,
+        peer: &PublicKey,
+        hint_index: Option<u64>,
+        id: &[u8],
+    ) -> crate::vault::Result<Option<(u64, HistoryEntry)>> {
+        let matches_id = |entry: &HistoryEntry| {
+            matches!(
+                entry.content.as_ref().and_then(|content| content.kind.as_ref()),
+                Some(Kind::Attachment(pointer)) if pointer.id == id
+            )
+        };
+        if let Some(index) = hint_index
+            && let Some(entry) = self.vault.entry(peer, index).await?.filter(matches_id)
+        {
+            return Ok(Some((index, entry)));
+        }
+        let mut end = self
+            .contacts
+            .iter()
+            .find(|contact| contact.peer == *peer)
+            .map_or(0, |contact| contact.state.history_len);
+        while end > 0 {
+            let page = self.vault.history(peer, end, HISTORY_SHOWN).await?;
+            if let Some(found) = page.into_iter().rev().find(|(_, entry)| matches_id(entry)) {
+                return Ok(Some(found));
+            }
+            end = end.saturating_sub(HISTORY_SHOWN);
+        }
+        Ok(None)
+    }
+}
+
 impl<V: HistoryStore> Inner<V> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2123,6 +2298,7 @@ impl<V: HistoryStore> Inner<V> {
             contacts,
             isolated_contacts,
             isolated_peers,
+            pending_pq_contact_flags: HashMap::new(),
             server_pq: ServerPqStatus::Unknown,
             last_server_classical_opks: None,
             last_server_pq_opks: None,
@@ -2327,6 +2503,74 @@ impl<V: HistoryStore> Inner<V> {
         isolated_contact_views(&self.isolated_contacts, &self.client.identity_key())
     }
 
+    /// Snapshot `peer`'s session and contact state, execute `op`, and roll back to the snapshot on
+    /// `Err` so failed mutations or storage commits never leave partial state in memory.
+    pub(super) async fn with_contact_tx<T>(
+        &mut self,
+        peer: &PublicKey,
+        op: impl AsyncFnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let snapshot = self.contact(peer).map(|c| c.snapshot());
+        match op(self).await {
+            Ok(value) => Ok(value),
+            Err(err) => {
+                if let Some(snapshot) = snapshot {
+                    self.roll_back(peer, snapshot)?;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Coordinate `GREETING_DELIVERY_{UNSENT,UNCERTAIN,CONFIRMED}` transitions around a network
+    /// transmission for `peer`:
+    /// - When `!already_uncertain` and `greeting_delivery == GREETING_DELIVERY_UNSENT`, persists
+    ///   `GREETING_DELIVERY_UNCERTAIN` before transmitting (rolling back if that save fails).
+    /// - On `Ok` with `confirm_on_ok`, marks greeting confirmed and saves state.
+    /// - On a definitive server refusal (`e.is_server_refusal()`), reverts to
+    ///   `GREETING_DELIVERY_UNSENT` and saves state so deleting the chat suppresses farewells.
+    pub(super) async fn transmit_with_greeting_delivery<T>(
+        &mut self,
+        peer: &PublicKey,
+        already_uncertain: bool,
+        confirm_on_ok: bool,
+        transmit: impl AsyncFnOnce(&mut Self) -> session::Result<T>,
+    ) -> Result<session::Result<T>, String> {
+        let promoted_from_unsent = !already_uncertain
+            && self
+                .contacts
+                .iter()
+                .any(|c| c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT);
+        if promoted_from_unsent {
+            self.with_contact_tx(peer, async |inner| {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                }
+                inner.save(&[]).await.map_err(|e| describe(&e))
+            })
+            .await?;
+        }
+        let result = transmit(self).await;
+        match &result {
+            Ok(_) if confirm_on_ok => {
+                if self
+                    .contact(peer)
+                    .is_some_and(Contact::mark_greeting_confirmed)
+                {
+                    let _ = self.save_state().await;
+                }
+            }
+            Err(e) if e.is_server_refusal() && (already_uncertain || promoted_from_unsent) => {
+                if let Some(contact) = self.contact(peer) {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                }
+                let _ = self.save_state().await;
+            }
+            _ => {}
+        }
+        Ok(result)
+    }
+
     /// Undo the changes to the contact `peer` since `snapshot`, after saving them failed, so
     /// that what is kept in memory is what the vault has.
     fn roll_back(
@@ -2511,24 +2755,22 @@ fn address(server: &str) -> String {
     }
 }
 
-/// Whether `a` and `b` are the address of one server.
+/// Whether `a` and `b` resolve to the same HTTP/HTTPS origin (normalizing default ports such as
+/// `https://host:443` == `https://host`, scheme/host case, and trailing slashes).
 pub fn same_server(a: &str, b: &str) -> bool {
-    a.trim_end_matches('/')
-        .eq_ignore_ascii_case(b.trim_end_matches('/'))
+    let (Ok(url_a), Ok(url_b)) = (url::Url::parse(a.trim()), url::Url::parse(b.trim())) else {
+        return false;
+    };
+    let (origin_a, origin_b) = (url_a.origin(), url_b.origin());
+    origin_a.is_tuple() && origin_a == origin_b
 }
 
-/// Percent-encode a URI component (RFC 3986 unreserved characters preserved), pure Rust for native tests.
-fn percent_encode(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
+/// RFC 3986 unreserved-preserving percent-encoding set for invitation fragment parameters.
+const INVITE_ENCODE_SET: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~');
 
 /// Whether invitation links for `me` include `&pq=1` (local PQ enabled and server has not disabled
 /// post-quantum encryption).
@@ -2547,10 +2789,16 @@ pub fn build_invitation_link(page_origin: &str, me: &Me) -> String {
         key_to_url(&me.key)
     );
     if !me.name.is_empty() {
-        link.push_str(&format!("&name={}", percent_encode(&me.name)));
+        link.push_str(&format!(
+            "&name={}",
+            percent_encoding::utf8_percent_encode(&me.name, INVITE_ENCODE_SET)
+        ));
     }
     if !same_server(&me.server, page_origin) {
-        link.push_str(&format!("&server={}", percent_encode(&me.server)));
+        link.push_str(&format!(
+            "&server={}",
+            percent_encoding::utf8_percent_encode(&me.server, INVITE_ENCODE_SET)
+        ));
     }
     if invitation_pins_pq(me) {
         link.push_str("&pq=1");
@@ -2558,7 +2806,8 @@ pub fn build_invitation_link(page_origin: &str, me: &Me) -> String {
     link
 }
 
-/// Parse a `#chat=<key>&name=<name>&server=<server>&pq=1` fragment into a `Dialog::NewChat`.
+/// Parse a `#chat=<key>&name=<name>&server=<server>&pq=1` fragment into a `Dialog::NewChat`,
+/// sanitizing any suggested `name` with [`sanitize_shared_name`].
 pub fn parse_invitation_hash(hash: &str) -> Option<Dialog> {
     let mut key = None;
     let mut name = String::new();
@@ -2567,8 +2816,19 @@ pub fn parse_invitation_hash(hash: &str) -> Option<Dialog> {
     for pair in hash.trim_start_matches('#').split('&') {
         match pair.split_once('=') {
             Some(("chat", value)) if !value.is_empty() => key = Some(value.to_string()),
-            Some(("name", value)) => name = percent_decode(value).unwrap_or_default(),
-            Some(("server", value)) => server = percent_decode(value),
+            Some(("name", value)) => {
+                if let Ok(decoded) = percent_encoding::percent_decode_str(value).decode_utf8() {
+                    name = sanitize_shared_name(&decoded);
+                } else {
+                    name.clear();
+                }
+            }
+            Some(("server", value)) => {
+                server = percent_encoding::percent_decode_str(value)
+                    .decode_utf8()
+                    .ok()
+                    .map(std::borrow::Cow::into_owned);
+            }
             Some(("pq", value)) => {
                 pq_pinned = value == "1" || value.eq_ignore_ascii_case("true");
             }

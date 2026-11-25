@@ -8,11 +8,14 @@ use leptos::{html, prelude::*, task::spawn_local};
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{
     CanvasRenderingContext2d, HtmlCanvasElement, IntersectionObserver, IntersectionObserverEntry,
-    IntersectionObserverInit,
+    IntersectionObserverInit, ResizeObserver,
 };
 
 use crate::{util::js_error, workers};
 
+pub(super) const MAX_PDF_PAGES: usize = e2ee_chat_preview::rpc::MAX_PAGES;
+const PDF_MIN_ASPECT_RATIO: f64 = 0.1;
+const PDF_MAX_ASPECT_RATIO: f64 = 10.0;
 const PDF_PAGE_BUFFER: usize = 2;
 const PDF_MAX_ACTIVE_CANVASES: usize = 9;
 const PDF_MAX_IN_FLIGHT_RENDERS: usize = 1;
@@ -93,13 +96,28 @@ struct RenderJob {
     pdf: workers::Pdf,
     canvas: HtmlCanvasElement,
     mounted: StoredValue<bool>,
+    request_token: StoredValue<Option<u64>>,
     drawn: RwSignal<bool>,
     error: RwSignal<Option<String>>,
 }
 
 impl RenderJob {
-    fn is_mounted(&self) -> bool {
-        self.mounted.try_get_value() == Some(true) && self.canvas.is_connected()
+    fn is_current(&self, token: u64) -> bool {
+        self.mounted.try_get_value() == Some(true)
+            && self.canvas.is_connected()
+            && self.request_token.try_get_value().flatten() == Some(token)
+    }
+}
+
+/// RAII wrapper keeping a `ResizeObserver` and its JS callback alive until dropped.
+struct ResizeObserverGuard {
+    observer: ResizeObserver,
+    _callback: Closure<dyn FnMut(js_sys::Array)>,
+}
+
+impl Drop for ResizeObserverGuard {
+    fn drop(&mut self) {
+        self.observer.disconnect();
     }
 }
 
@@ -111,11 +129,23 @@ fn pump_renders(scheduler: RenderQueue) {
             .try_update_value(PdfRenderScheduler::next_dispatch)
             .flatten()
         {
-            if job.is_mounted() {
-                let result = draw_page(job.pdf, page, &job.canvas, job.mounted).await;
-                if job.is_mounted() {
+            if job.is_current(token) {
+                let result = draw_page(
+                    job.pdf,
+                    page,
+                    &job.canvas,
+                    job.mounted,
+                    job.request_token,
+                    token,
+                )
+                .await;
+                if job.is_current(token) {
                     match result {
-                        Ok(()) => job.drawn.set(true),
+                        Ok(true) => {
+                            job.error.set(None);
+                            job.drawn.set(true);
+                        }
+                        Ok(false) => {}
                         Err(e) => job.error.set(Some(e)),
                     }
                 }
@@ -125,11 +155,27 @@ fn pump_renders(scheduler: RenderQueue) {
     });
 }
 
-fn pdf_aspect_ratio(width: f64, height: f64) -> String {
-    if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 {
-        format!("{width} / {height}")
+/// Truncate a PDF's page list to [`MAX_PDF_PAGES`], returning `(kept_pages, original_total)`.
+pub(super) fn cap_pdf_pages<T>(mut pages: Vec<T>) -> (Vec<T>, usize) {
+    let total = pages.len();
+    pages.truncate(MAX_PDF_PAGES);
+    (pages, total)
+}
+
+pub(super) fn pdf_aspect_ratio(width: f64, height: f64) -> String {
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return "612 / 792".to_string();
+    }
+    let ratio = width / height;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return "612 / 792".to_string();
+    }
+    if ratio < PDF_MIN_ASPECT_RATIO {
+        "1 / 10".to_string()
+    } else if ratio > PDF_MAX_ASPECT_RATIO {
+        "10 / 1".to_string()
     } else {
-        "612 / 792".to_string()
+        format!("{width} / {height}")
     }
 }
 
@@ -166,6 +212,7 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
     let container = NodeRef::<html::Div>::new();
     let pdf_handle = StoredValue::new_local(None::<workers::Pdf>);
     let pages = RwSignal::new(Vec::<(usize, f64, f64)>::new());
+    let truncated_total = RwSignal::new(None::<usize>);
     let active_window = RwSignal::new(0..0);
     let scheduler = RenderQueue::new_local(PdfRenderScheduler::new(PDF_MAX_IN_FLIGHT_RENDERS));
     let failed = RwSignal::new(None::<String>);
@@ -237,6 +284,10 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
                     return;
                 }
                 pdf_handle.set_value(Some(pdf));
+                let (dims, total_pages) = cap_pdf_pages(dims);
+                if total_pages > dims.len() {
+                    truncated_total.set(Some(total_pages));
+                }
                 let initial = pdf_active_window(
                     dims.len(),
                     &BTreeSet::new(),
@@ -272,6 +323,15 @@ pub(super) fn PdfView(data: Arc<Vec<u8>>) -> impl IntoView {
     });
     view! {
         <div class="pdf" node_ref=container>
+            {move || {
+                truncated_total.get().map(|total| {
+                    view! {
+                        <p class="preview-note">
+                            {format!("Showing the first {MAX_PDF_PAGES} of {total} pages.")}
+                        </p>
+                    }
+                })
+            }}
             <For
                 each=move || pages.get()
                 key=|(index, _, _)| *index
@@ -339,43 +399,68 @@ fn PdfPageSlot(
 fn PdfPageCanvas(pdf: workers::Pdf, index: usize, scheduler: RenderQueue) -> impl IntoView {
     let canvas = NodeRef::<html::Canvas>::new();
     let element = StoredValue::new_local(None::<HtmlCanvasElement>);
+    let resize_guard = StoredValue::new_local(None::<ResizeObserverGuard>);
     let mounted = StoredValue::new(true);
     let request_token = StoredValue::new(None::<u64>);
+    let last_width = StoredValue::new(0i32);
     let drawn = RwSignal::new(false);
     let error = RwSignal::new(None::<String>);
+    let enqueue_if_sized = move |canvas_el: &HtmlCanvasElement| {
+        if mounted.try_get_value() != Some(true) || !canvas_el.is_connected() {
+            return;
+        }
+        let css_width = canvas_el.client_width();
+        if css_width <= 0 || last_width.try_get_value() == Some(css_width) {
+            return;
+        }
+        last_width.try_set_value(css_width);
+        if let Some(prev) = request_token.try_get_value().flatten() {
+            scheduler.try_update_value(|s| s.cancel(index, prev));
+        }
+        let job = RenderJob {
+            pdf,
+            canvas: canvas_el.clone(),
+            mounted,
+            request_token,
+            drawn,
+            error,
+        };
+        if let Some(token) = scheduler
+            .try_update_value(|s| s.enqueue(index, job))
+            .flatten()
+        {
+            request_token.try_set_value(Some(token));
+            pump_renders(scheduler);
+        }
+    };
     Effect::new(move || {
+        resize_guard.set_value(None);
         let Some(canvas_el) = canvas.get() else {
             return;
         };
         element.set_value(Some(canvas_el.clone()));
-        let needs_layout = canvas_el.client_width() == 0;
-        let render = move || {
-            if mounted.try_get_value() != Some(true) || !canvas_el.is_connected() {
-                return;
-            }
-            let job = RenderJob {
-                pdf,
-                canvas: canvas_el,
-                mounted,
-                drawn,
-                error,
-            };
-            if let Some(token) = scheduler
-                .try_update_value(|s| s.enqueue(index, job))
-                .flatten()
-            {
-                request_token.set_value(Some(token));
-                pump_renders(scheduler);
-            }
-        };
-        if needs_layout {
-            request_animation_frame(render);
+        let observed = canvas_el.clone();
+        let on_resize = Closure::<dyn FnMut(js_sys::Array)>::new(move |_entries: js_sys::Array| {
+            enqueue_if_sized(&observed);
+        });
+        if let Ok(observer) = ResizeObserver::new(on_resize.as_ref().unchecked_ref()) {
+            observer.observe(&canvas_el);
+            resize_guard.set_value(Some(ResizeObserverGuard {
+                observer,
+                _callback: on_resize,
+            }));
+            enqueue_if_sized(&canvas_el);
         } else {
-            render();
+            // Fallback when ResizeObserver is unavailable: render once layout settles.
+            enqueue_if_sized(&canvas_el);
+            if last_width.try_get_value() == Some(0) {
+                request_animation_frame(move || enqueue_if_sized(&canvas_el));
+            }
         }
     });
     on_cleanup(move || {
         mounted.try_set_value(false);
+        resize_guard.try_set_value(None);
         if let Some(token) = request_token.try_get_value().flatten() {
             scheduler.try_update_value(|s| s.cancel(index, token));
         }
@@ -402,20 +487,30 @@ fn PdfPageCanvas(pdf: workers::Pdf, index: usize, scheduler: RenderQueue) -> imp
 }
 
 /// Draw page `index` of `pdf` onto `canvas`, as sharp as the screen shows it, at most twice as
-/// sharp as CSS pixels.
+/// sharp as CSS pixels. Returns `Ok(true)` when pixels were painted, or `Ok(false)` when skipped
+/// due to zero width or supersession.
 async fn draw_page(
     pdf: workers::Pdf,
     index: usize,
     canvas: &HtmlCanvasElement,
     mounted: StoredValue<bool>,
-) -> Result<(), String> {
+    request_token: StoredValue<Option<u64>>,
+    token: u64,
+) -> Result<bool, String> {
+    let css_width = canvas.client_width();
+    if css_width <= 0 {
+        return Ok(false);
+    }
     let ratio = web_sys::window()
         .map_or(1.0, |window| window.device_pixel_ratio())
-        .min(2.0);
-    let width = (f64::from(canvas.client_width()) * ratio).round().max(1.0) as u32;
+        .clamp(1.0, 2.0);
+    let width = (f64::from(css_width) * ratio).round().max(1.0) as u32;
     let image = workers::render_pdf(pdf, index, width).await?;
-    if mounted.try_get_value() != Some(true) || !canvas.is_connected() {
-        return Ok(());
+    if mounted.try_get_value() != Some(true)
+        || !canvas.is_connected()
+        || request_token.try_get_value().flatten() != Some(token)
+    {
+        return Ok(false);
     }
     canvas.set_width(image.width());
     canvas.set_height(image.height());
@@ -424,7 +519,8 @@ async fn draw_page(
         .map_err(js_error)?
         .ok_or("no 2D context")?
         .unchecked_into();
-    context.put_image_data(&image, 0.0, 0.0).map_err(js_error)
+    context.put_image_data(&image, 0.0, 0.0).map_err(js_error)?;
+    Ok(true)
 }
 
 #[cfg(test)]

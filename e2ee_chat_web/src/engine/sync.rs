@@ -15,10 +15,10 @@ use crate::state::{Link, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, monotonic_now_ms, now, sleep};
 use crate::vault::{
-    ContactState, Farewell, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
+    ContactState, Farewell, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, outbox_key,
 };
 use bytes::Bytes;
-use futures::future::{Either, select};
+use futures_util::future::{Either, select};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use prost::Message as _;
@@ -128,7 +128,7 @@ impl Engine {
                     };
                     inner
                         .client
-                        .subscription_for_audience(&inner.server)
+                        .subscription_for_audience(&inner.audience)
                         .map_err(|e| describe(&e))
                         .and_then(|request| Subscription::open(&inner.server, &request))
                 };
@@ -346,23 +346,13 @@ impl Engine {
             if let Some(open) = self.ui.open.get_untracked()
                 && late.contains(&open)
             {
-                if self.show_history(inner, &open).await {
-                    if self.acknowledge_displayed_window(inner, &open)
-                        && let Err(e) = inner.save_state().await
-                    {
-                        self.ui.notify(describe(&e));
-                    }
-                } else if self.ui.open.get_untracked() == Some(open)
-                    && inner.contact(&open).is_some()
-                {
-                    inner.saved_late.push(open);
-                }
+                self.reconcile_open_chat_read(inner, &open, true).await;
             }
             self.ui.contacts.set(inner.views());
         }
         // Defer read receipts until `save_initial_batch` confirms the chat is still open and
         // visible after persistence, since `close_chat` can run without waiting for `inner`.
-        let replayed = self.replay_deferred_initials(inner, None).await?;
+        let replayed = self.replay_deferred_initials(inner).await?;
         let pending: Vec<_> = inner
             .contacts
             .iter()
@@ -477,8 +467,10 @@ impl Engine {
             let mut stalled = false;
             let mut carried_initials = vec![];
             let mut deleted = false;
-            // What the peer told of this client's messages, by their history entries.
+            // What the peer told of this client's messages, by their history entries, plus any
+            // sealed pending outbox entries settled directly by a receipt after a lost push ack.
             let mut steps = vec![];
+            let mut settled_outbox = vec![];
             for message in page {
                 if message.is_evicted() {
                     evicted += 1;
@@ -521,7 +513,9 @@ impl Engine {
                     contact.mark_greeting_confirmed();
                 }
                 if let Some(events) = content.events.take() {
-                    steps.extend(contact.told(&events));
+                    let told = contact.told(&events);
+                    steps.extend(told.steps);
+                    settled_outbox.extend(told.settled_outbox);
                     if content.kind.is_none() {
                         continue;
                     }
@@ -572,11 +566,38 @@ impl Engine {
             // other, what was encrypted on it, and what the peer never read if it deleted the
             // chat, waits for a new one.
             let mut changed = BTreeMap::new();
+            let mut settled_non_attachments = vec![];
             let moved = match inner.step(peer, &mut changed, steps).await {
-                Ok(()) if deleted || needs_new_session(inner, peer) => {
-                    inner.requeue(peer, deleted, &changed).await
+                Ok(()) => {
+                    for &(history_index, clock) in &settled_outbox {
+                        if let Some(entry) = changed.get_mut(&history_index) {
+                            if entry.place == 0 {
+                                entry.place = clock;
+                                entry.content.get_or_insert_default().clock = clock;
+                            }
+                            let is_attachment = matches!(
+                                entry.content.as_ref().and_then(|c| c.kind.as_ref()),
+                                Some(Kind::Attachment(_))
+                            );
+                            if !is_attachment {
+                                settled_non_attachments.push(history_index);
+                            }
+                        }
+                    }
+                    if !settled_non_attachments.is_empty()
+                        && let Some(contact) = inner.contact(peer)
+                    {
+                        contact
+                            .state
+                            .awaiting
+                            .retain(|a| !settled_non_attachments.contains(&a.history_index));
+                    }
+                    if deleted || needs_new_session(inner, peer) {
+                        inner.requeue(peer, deleted, &changed).await
+                    } else {
+                        Ok(RequeueOutcome::default())
+                    }
                 }
-                Ok(()) => Ok(RequeueOutcome::default()),
                 Err(e) => Err(describe(&e)),
             };
             let requeued = match moved {
@@ -586,6 +607,10 @@ impl Engine {
                     return Err(e);
                 }
             };
+            let mut outbox_updates = requeued.outbox.clone();
+            for &(history_index, _) in &settled_outbox {
+                outbox_updates.push((outbox_key(peer, history_index), None));
+            }
             changed.extend(requeued.history.iter().cloned());
             let changed: Vec<_> = changed.into_iter().collect();
             let records: Vec<_> = records(peer, &entries)
@@ -598,7 +623,7 @@ impl Engine {
                     snapshot,
                     &carried_initials,
                     &records,
-                    &requeued.outbox,
+                    &outbox_updates,
                 )
                 .await?;
             requeued.log_missing(&self.ui, peer);

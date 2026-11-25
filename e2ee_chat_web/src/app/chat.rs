@@ -8,17 +8,17 @@ use crate::{
         Body, ClassicalPrompt, ContactView, Delivery, Dialog, MessageRow, SecurityAlert,
         SharedContact, UploadState, UploadView,
     },
-    util::{clock, hex, short},
+    util::{clock, hex, sanitize_filename, sanitize_shared_name, short},
 };
 
 use super::{
     common::{
-        AllowClassical, act, act_while, can_allow_classical, extension, initials, open_chat,
+        AllowClassical, act, act_while, avatar_letters, can_allow_classical, extension,
         open_new_chat_for_shared, pq_available, pq_retry_ready, server_pq_disabled,
         strict_pq_enabled, upgrade_disabled_tip,
     },
     composer::Composer,
-    engine,
+    engine, history,
     media::{InlineMedia, Source, file_card, inline_media},
     ui,
 };
@@ -134,11 +134,17 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                     class="btn icon quiet back"
                     title="Back to the chats"
                     aria-label="Back to the chats"
-                    on:click=move |_| open_chat(None)
+                    on:click=move |_| history::navigate(None)
                 >
                     {icon(Icon::Back)}
                 </button>
-                <span class="avatar">{move || initials(&label())}</span>
+                <span class="avatar">
+                    {move || {
+                        contact()
+                            .map(|c| avatar_letters(&c.name, &peer))
+                            .unwrap_or_else(|| hex(&peer[..1]))
+                    }}
+                </span>
                 <div class="pane-title">
                     <strong>{label}</strong>
                     <div class="pane-sub">
@@ -166,7 +172,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                     class="btn icon quiet close"
                     title="Close the chat"
                     aria-label="Close the chat"
-                    on:click=move |_| open_chat(None)
+                    on:click=move |_| history::navigate(None)
                 >
                     {icon(Icon::Close)}
                 </button>
@@ -548,10 +554,17 @@ fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
         if let Some(list) = list.get() {
             // Unless the chat went meanwhile.
             request_animation_frame(move || {
-                if follow.try_get_value() == Some(true) {
-                    list.set_scroll_top(list.scroll_height());
-                } else if let Some(anchor) = restore_anchor {
-                    restore_visible_anchor(&list, &anchor);
+                if !list.is_connected() {
+                    return;
+                }
+                match follow.try_get_value() {
+                    Some(true) => list.set_scroll_top(list.scroll_height()),
+                    Some(false) => {
+                        if let Some(anchor) = restore_anchor {
+                            restore_visible_anchor(&list, &anchor);
+                        }
+                    }
+                    None => {}
                 }
             });
         }
@@ -655,11 +668,15 @@ fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>
         }
         Body::Contact(card) => view! { <ContactCard chat_peer card /> }.into_any(),
         Body::Hello(name) => {
-            let note = move || match (outgoing, name.is_empty()) {
+            let clean_name = sanitize_shared_name(&name);
+            let note = move || match (outgoing, clean_name.is_empty()) {
                 (true, _) => format!("You started this chat · {time}"),
                 (false, true) => format!("{} started this chat · {time}", label.get()),
                 (false, false) => {
-                    format!("{} started this chat, as “{name}” · {time}", label.get())
+                    format!(
+                        "{} started this chat, as “{clean_name}” · {time}",
+                        label.get()
+                    )
                 }
             };
             return view! { <div class="note" data-index=index>{note}</div> }.into_any();
@@ -709,26 +726,27 @@ fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>
     let held = outgoing.then(|| {
         let cancelling = RwSignal::new(false);
         move || {
-            let peer = ui.open.get()?;
-            ui.held.with(|held| held.contains(&(peer, index))).then(|| {
-                view! {
-                    <button
-                        type="button"
-                        class="btn icon quiet cancel-held"
-                        title="Cancel it, so that what was sent after it goes"
-                        aria-label="Cancel it"
-                        disabled=move || cancelling.get()
-                        on:click=move |_| {
-                            act_while(
-                                cancelling,
-                                async move { engine().cancel_held(peer, index).await },
-                            )
-                        }
-                    >
-                        {icon(Icon::Close)}
-                    </button>
-                }
-            })
+            ui.held
+                .with(|held| held.contains(&(chat_peer, index)))
+                .then(|| {
+                    view! {
+                        <button
+                            type="button"
+                            class="btn icon quiet cancel-held"
+                            title="Cancel it, so that what was sent after it goes"
+                            aria-label="Cancel it"
+                            disabled=move || cancelling.get()
+                            on:click=move |_| {
+                                act_while(
+                                    cancelling,
+                                    async move { engine().cancel_held(chat_peer, index).await },
+                                )
+                            }
+                        >
+                            {icon(Icon::Close)}
+                        </button>
+                    }
+                })
         }
     });
     view! {
@@ -765,17 +783,14 @@ fn ContactCard(chat_peer: PublicKey, card: SharedContact) -> impl IntoView {
     let ui = ui();
     let key = card.key;
     let pq_pinned = card.pq_pinned;
-    let letters = if card.name.is_empty() {
-        hex(&key[..1])
-    } else {
-        initials(&card.name)
-    };
-    let title = if card.name.is_empty() {
+    let clean_name = sanitize_shared_name(&card.name);
+    let letters = avatar_letters(&clean_name, &key);
+    let title = if clean_name.is_empty() {
         short(&key)
     } else {
-        card.name.clone()
+        clean_name.clone()
     };
-    let subtitle = if card.name.is_empty() {
+    let subtitle = if clean_name.is_empty() {
         "Shared contact".to_string()
     } else {
         short(&key)
@@ -805,7 +820,7 @@ fn ContactCard(chat_peer: PublicKey, card: SharedContact) -> impl IntoView {
                         } else {
                             "Open chat"
                         };
-                        let saved_note = (!existing.name.is_empty() && existing.name != card.name)
+                        let saved_note = (!existing.name.is_empty() && existing.name != clean_name)
                             .then(|| format!("Saved as {}", existing.name));
                         view! {
                             {saved_note.map(|note| {
@@ -814,7 +829,7 @@ fn ContactCard(chat_peer: PublicKey, card: SharedContact) -> impl IntoView {
                             <button
                                 type="button"
                                 class="btn small"
-                                on:click=move |_| open_chat(Some(key))
+                                on:click=move |_| history::navigate(Some(key))
                             >
                                 {action_label}
                             </button>
@@ -837,6 +852,14 @@ fn ContactCard(chat_peer: PublicKey, card: SharedContact) -> impl IntoView {
             </div>
         </div>
     }
+}
+
+/// Upload completion percentage clamped to `0..=100` without overflowing for large files.
+pub(super) fn upload_percent(done: u64, size: u64) -> u64 {
+    if size == 0 {
+        return 0;
+    }
+    ((u128::from(done) * 100) / u128::from(size)).min(100) as u64
 }
 
 /// The uploads to `peer`: how far each got, and the means to go on with it or cancel it.
@@ -862,7 +885,7 @@ fn Uploads(peer: PublicKey) -> impl IntoView {
 fn upload_row(initial: UploadView) -> impl IntoView {
     let ui = ui();
     let (peer, id) = (initial.peer, initial.id);
-    let name = initial.name.clone();
+    let name = sanitize_filename(&initial.name);
     let live = Memo::new(move |_| {
         ui.uploads.with(|uploads| {
             uploads
@@ -874,7 +897,7 @@ fn upload_row(initial: UploadView) -> impl IntoView {
     });
     let status = move || {
         let upload = live.get();
-        let percent = upload.done * 100 / upload.size.max(1);
+        let percent = upload_percent(upload.done, upload.size);
         match &upload.state {
             UploadState::Running => format!("uploading · {percent}%"),
             UploadState::Checking => format!("{percent}% · checking the file…"),
