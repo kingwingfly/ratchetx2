@@ -132,7 +132,7 @@ fn legacy_skipped_chain_layouts_preserve_delayed_messages() {
     bob.decrypt(&next).unwrap();
 
     // The six-field layout also predates the eviction field on each skipped chain.
-    let hk = bob.ratchet.header_key_receiver().unwrap();
+    let hk = *bob.ratchet.header_key_receiver().unwrap();
     let keys = BTreeMap::from([(0u64, *bob.skipped_message_keys.get(&hk, 0).unwrap())]);
     let chains = [(hk, keys, 0usize)];
     let old_skipped = (chains.as_slice(),);

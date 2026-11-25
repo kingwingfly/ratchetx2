@@ -30,6 +30,9 @@ pub const MAX_CLOCK_SKEW: u64 = 5 * 60 * 1000;
 /// are rejected rather than clamped.
 pub const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 
+/// Maximum length in bytes of a canonical relay audience string (`host[:port]`).
+pub const MAX_AUDIENCE_LENGTH: usize = 1024;
+
 /// A canonical relay host and optional port, normalized with the original URL's scheme.
 /// Keep this value when signing or verifying multiple requests for the same relay. For
 /// example, `http://relay.example:443` retains its port after the scheme is removed.
@@ -128,18 +131,23 @@ pub fn normalize_audience(raw: &str) -> Result<String> {
         _ => (authority, ""),
     };
     let host = url::Host::parse(host).map_err(|_| ErrorKind::Malformed)?;
-    if port.is_empty() {
-        return Ok(host.to_string());
-    }
-    if !port.bytes().all(|b| b.is_ascii_digit()) {
+    let normalized = if port.is_empty() {
+        host.to_string()
+    } else {
+        if !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(ErrorKind::Malformed.into());
+        }
+        let port: u16 = port.parse().map_err(|_| ErrorKind::Malformed)?;
+        if Some(port) == default_port || (default_port.is_none() && matches!(port, 80 | 443)) {
+            host.to_string()
+        } else {
+            format!("{host}:{port}")
+        }
+    };
+    if normalized.len() > MAX_AUDIENCE_LENGTH {
         return Err(ErrorKind::Malformed.into());
     }
-    let port: u16 = port.parse().map_err(|_| ErrorKind::Malformed)?;
-    if Some(port) == default_port || (default_port.is_none() && matches!(port, 80 | 443)) {
-        Ok(host.to_string())
-    } else {
-        Ok(format!("{host}:{port}"))
-    }
+    Ok(normalized)
 }
 
 /// Read a fixed-size bytes field, such as a 32-byte key.
@@ -149,13 +157,104 @@ pub fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     bytes.try_into().map_err(|_| ErrorKind::Malformed.into())
 }
 
-/// Validates that a 32-byte key is a canonical non-zero Curve25519 encoding.
+/// Validates that a 32-byte key is a canonical, prime-order Curve25519 public key.
 #[cfg(any(feature = "server", feature = "pq"))]
 pub(crate) fn check_canonical_key(key: &x3dh::PublicKey) -> Result<()> {
-    if !xeddsa::is_canonical_public_key(key) || *key == [0u8; xeddsa::PUBLIC_KEY_LENGTH] {
+    if !xeddsa::is_canonical_public_key(key) {
         return Err(ErrorKind::Malformed.into());
     }
+    xeddsa::XEdDSAPublicKey::new(key).map_err(|_| ErrorKind::Malformed)?;
     Ok(())
+}
+
+/// Verifies that an incoming `actual` audience string is non-empty, within
+/// [`MAX_AUDIENCE_LENGTH`], and matches the canonicalized `expected_audience`.
+#[cfg(feature = "pq")]
+pub(crate) fn verify_audience(actual: &str, expected_audience: &str) -> Result<()> {
+    let expected = NormalizedAudience::parse(expected_audience)?;
+    if actual.is_empty() || actual.len() > MAX_AUDIENCE_LENGTH {
+        return Err(ErrorKind::Malformed.into());
+    }
+    if actual != expected.as_str() {
+        return Err(ErrorKind::InvalidSignature.into());
+    }
+    Ok(())
+}
+
+/// Small checked cursor for building canonical domain-separated signing transcripts across
+/// `handshake_v2`, `mailbox_v2`, and `notify`.
+pub(crate) struct SigningBuf(Vec<u8>);
+
+impl SigningBuf {
+    pub(crate) fn with_domain(domain: &[u8], extra_capacity: usize) -> Self {
+        let mut buf = Vec::with_capacity(domain.len().saturating_add(extra_capacity));
+        buf.extend_from_slice(domain);
+        Self(buf)
+    }
+
+    #[cfg(feature = "pq")]
+    pub(crate) fn push_u8(&mut self, value: u8) {
+        self.0.push(value);
+    }
+
+    #[cfg(feature = "pq")]
+    pub(crate) fn push_u32_be(&mut self, value: u32) {
+        self.0.extend_from_slice(&value.to_be_bytes());
+    }
+
+    #[cfg(feature = "pq")]
+    pub(crate) fn push_u64_be(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_be_bytes());
+    }
+
+    pub(crate) fn push_u64_le(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+
+    pub(crate) fn push_bytes(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+
+    #[cfg(feature = "pq")]
+    pub(crate) fn push_len_bytes_be(&mut self, bytes: &[u8]) -> Result<()> {
+        let len = u32::try_from(bytes.len()).map_err(|_| ErrorKind::Malformed)?;
+        self.0.extend_from_slice(&len.to_be_bytes());
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn push_len_bytes_le(&mut self, bytes: &[u8]) -> Result<()> {
+        let len = u32::try_from(bytes.len()).map_err(|_| ErrorKind::Malformed)?;
+        self.0.extend_from_slice(&len.to_le_bytes());
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    #[cfg(feature = "pq")]
+    pub(crate) fn push_audience_be(&mut self, audience: &str) -> Result<()> {
+        if audience.is_empty() || audience.len() > MAX_AUDIENCE_LENGTH {
+            return Err(ErrorKind::Malformed.into());
+        }
+        self.push_len_bytes_be(audience.as_bytes())
+    }
+
+    pub(crate) fn push_audience_le(&mut self, audience: &str) -> Result<()> {
+        if audience.is_empty() || audience.len() > MAX_AUDIENCE_LENGTH {
+            return Err(ErrorKind::Malformed.into());
+        }
+        self.push_len_bytes_le(audience.as_bytes())
+    }
+
+    #[cfg(feature = "pq")]
+    pub(crate) fn push_count_be(&mut self, count: usize) -> Result<()> {
+        let count = u32::try_from(count).map_err(|_| ErrorKind::Malformed)?;
+        self.0.extend_from_slice(&count.to_be_bytes());
+        Ok(())
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.0
+    }
 }
 
 /// Validates that `timestamp` does not exceed [`MAX_SAFE_INTEGER`].
@@ -207,6 +306,18 @@ pub(crate) fn verify_recent(
     Ok(identity_key)
 }
 
+#[cfg(all(test, any(feature = "server", feature = "pq")))]
+pub(crate) fn test_public_key(seed: u8) -> x3dh::PublicKey {
+    assert_ne!(seed, 0, "seed must be non-zero");
+    let mut scalar = [0u8; 32];
+    scalar[0] = seed;
+    scalar[1] = seed.wrapping_mul(37);
+    xeddsa::XEdDSAPrivateKey::from_bytes(scalar)
+        .expect("canonical non-zero scalar")
+        .compute_public_key()
+        .to_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,27 +341,72 @@ mod tests {
             assert_eq!(normalize_audience(input).unwrap(), expected);
             assert_eq!(NormalizedAudience::parse(input).unwrap().as_str(), expected);
         }
-        assert_eq!(
-            normalize_audience("münchen.example:8443").unwrap(),
-            "xn--mnchen-3ya.example:8443"
-        );
-        assert_eq!(
-            normalize_audience("example.com/path?to=https://example.org").unwrap(),
-            "example.com"
-        );
+        for (input, expected) in [
+            ("chat.example.com", "chat.example.com"),
+            ("  Chat.Example.COM  ", "chat.example.com"),
+            ("chat.example.com:8787", "chat.example.com:8787"),
+            ("chat.example.com:08787", "chat.example.com:8787"),
+            ("chat.example.com:443", "chat.example.com"),
+            ("chat.example.com:80", "chat.example.com"),
+            ("chat.example.com:0443", "chat.example.com"),
+            ("chat.example.com:0080", "chat.example.com"),
+            ("chat.example.com:", "chat.example.com"),
+            ("chat.example.com/some/path?q=1#frag", "chat.example.com"),
+            ("https://chat.example.com", "chat.example.com"),
+            ("HTTPS://CHAT.EXAMPLE.COM:443/", "chat.example.com"),
+            ("HTTPS://Chat.Example.com:0443/api", "chat.example.com"),
+            ("HTTP://localhost:80/", "localhost"),
+            ("HTTP://localhost:0080/path", "localhost"),
+            ("http://localhost:8787/", "localhost:8787"),
+            (
+                "WSS://Chat.Example.com:443/notifications",
+                "chat.example.com",
+            ),
+            ("WS://localhost:80/notifications", "localhost"),
+            ("http://[0:0::1]:8787", "[::1]:8787"),
+            ("https://[0:0::1]:0443/", "[::1]"),
+            ("[0:0::1]:443", "[::1]"),
+            ("[0:0::1]:80", "[::1]"),
+            ("[2001:0DB8:0000::1]:08443", "[2001:db8::1]:8443"),
+            ("[::1]:", "[::1]"),
+            ("münchen.example:8443", "xn--mnchen-3ya.example:8443"),
+            ("example.com/path?to=https://example.org", "example.com"),
+        ] {
+            assert_eq!(
+                normalize_audience(input).unwrap(),
+                expected,
+                "input: {input:?}"
+            );
+        }
+        let oversized = format!("{}.example", "a".repeat(MAX_AUDIENCE_LENGTH));
         for bad in [
+            "",
+            "   ",
             "xn--.example",
             "https://example.com/a\0b",
             "example.com\u{7f}",
             "ex%00ample.com",
             "https://user@example.com",
+            "https://user:pass@chat.example.com",
+            "user@chat.example.com",
             "ftp://example.com",
+            "chat.example.com:99999",
+            "chat.example.com:-1",
+            "chat.example.com:+443",
+            "chat.example.com:abc",
+            ":8787",
+            "http://",
+            "[::1",
             "example.com]",
             "[::1]x",
+            "::1",
+            "chat example.com",
+            oversized.as_str(),
         ] {
             assert_eq!(
                 normalize_audience(bad).unwrap_err().kind(),
-                ErrorKind::Malformed
+                ErrorKind::Malformed,
+                "expected error for {bad:?}"
             );
         }
     }

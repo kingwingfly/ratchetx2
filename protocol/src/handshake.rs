@@ -326,9 +326,11 @@ mod server {
 
         /// Bob's bundle, with one of his one-time prekeys, which is removed.
         async fn fetch_bundle(&self, request: FetchBundleRequest) -> Result<FetchBundleResponse> {
+            let identity_key = fixed(&request.identity_key)?;
+            check_canonical_key(&identity_key)?;
             let (bundle, one_time_prekey) = self
                 .store
-                .take_bundle(&fixed(&request.identity_key)?)
+                .take_bundle(&identity_key)
                 .await?
                 .ok_or(ErrorKind::NotFound)?;
             Ok(FetchBundleResponse::from(&PrekeyBundle {
@@ -347,7 +349,10 @@ mod server {
             let message = request.message.as_ref().ok_or(ErrorKind::Malformed)?;
             let first_message = message.first_message.clone().ok_or(ErrorKind::Malformed)?;
             if first_message.header.len() > MAX_HEADER_SIZE
-                || first_message.header.len() + first_message.content.len()
+                || first_message
+                    .header
+                    .len()
+                    .saturating_add(first_message.content.len())
                     > self.limits.max_first_message_size
             {
                 return Err(ErrorKind::LimitExceeded.into());
@@ -421,15 +426,17 @@ mod server {
         async fn publish_checks_the_signed_prekey() {
             let server = HandshakeServer::new(MemoryStore::default());
             let bob = XEdDSAPrivateKey::generate();
+            let spk = crate::test_public_key(3);
+            let opk = crate::test_public_key(4);
             let mut prekeys = PublishedPrekeys {
-                signed_prekey: [3; 32],
-                signed_prekey_signature: bob.sign([3; 32]),
-                one_time_prekeys: vec![[4; 32]],
+                signed_prekey: spk,
+                signed_prekey_signature: bob.sign(spk),
+                one_time_prekeys: vec![opk],
             };
             let request = PublishRequest::sign(&bob, &prekeys, 1).unwrap();
             server.publish(request).await.unwrap();
             // A signed request, whose signed prekey is not signed by the identity key.
-            prekeys.signed_prekey_signature = bob.sign([9; 32]);
+            prekeys.signed_prekey_signature = bob.sign(crate::test_public_key(9));
             let request = PublishRequest::sign(&bob, &prekeys, 2).unwrap();
             assert_eq!(
                 server.publish(request).await.unwrap_err().kind(),
@@ -446,14 +453,20 @@ mod server {
                 })
                 .build();
             let bob = XEdDSAPrivateKey::generate();
+            let spk = crate::test_public_key(3);
+            let prekeys = PublishedPrekeys {
+                signed_prekey: spk,
+                signed_prekey_signature: bob.sign(spk),
+                one_time_prekeys: vec![],
+            };
             let request = |first_message| SendInitialMessageRequest {
                 recipient: Bytes::copy_from_slice(&bob.compute_public_key().to_bytes()),
                 message: Some(InitialMessage {
                     first_message,
                     ..InitialMessage::from(&x3dh::InitialMessage {
-                        identity_key: [1; 32],
-                        ephemeral_key: [2; 32],
-                        signed_prekey: [3; 32],
+                        identity_key: crate::test_public_key(1),
+                        ephemeral_key: crate::test_public_key(2),
+                        signed_prekey: spk,
                         one_time_prekey: None,
                     })
                 }),
@@ -462,6 +475,20 @@ mod server {
                 header: Bytes::from_static(b"head"),
                 content: Bytes::from_static(b"body"),
             };
+            // Unregistered recipient cannot receive initial messages.
+            assert_eq!(
+                server
+                    .send_initial_message(request(Some(first_message.clone())))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::NotFound
+            );
+            // Publish Bob's bundle so Bob is registered.
+            server
+                .publish(PublishRequest::sign(&bob, &prekeys, 1).unwrap())
+                .await
+                .unwrap();
             // Without one, or with one too large, it is refused.
             assert_eq!(
                 server
@@ -502,10 +529,12 @@ mod server {
         async fn rejects_unsafe_and_future_timestamps_and_duplicate_opks() {
             let server = HandshakeServer::new(MemoryStore::default());
             let bob = XEdDSAPrivateKey::generate();
+            let spk = crate::test_public_key(3);
+            let opk = crate::test_public_key(4);
             let prekeys = PublishedPrekeys {
-                signed_prekey: [3; 32],
-                signed_prekey_signature: bob.sign([3; 32]),
-                one_time_prekeys: vec![[4; 32]],
+                signed_prekey: spk,
+                signed_prekey_signature: bob.sign(spk),
+                one_time_prekeys: vec![opk],
             };
             // Timestamp above MAX_SAFE_INTEGER is rejected as Malformed.
             let over_safe =
@@ -542,7 +571,7 @@ mod server {
             );
             // Duplicate OPKs are rejected.
             let dup = PublishedPrekeys {
-                one_time_prekeys: vec![[4; 32], [4; 32]],
+                one_time_prekeys: vec![opk, opk],
                 ..prekeys
             };
             let dup_req = PublishRequest::sign(&bob, &dup, now_millis()).unwrap();

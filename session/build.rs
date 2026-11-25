@@ -1,7 +1,3 @@
-// Cargo enables the optional compiler with `protox` even when there are no state protos to build.
-#[cfg(all(feature = "protox", not(feature = "prost")))]
-use protox as _;
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
     // With `prost`, generate the states' messages.
@@ -48,7 +44,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "protox")]
         config.compile_fds(protox::compile(protos, includes)?)?;
         #[cfg(not(feature = "protox"))]
-        config.compile_protos(&protos, &includes)?;
+        {
+            use protox as _;
+            config.compile_protos(&protos, &includes)?;
+        }
     }
     Ok(())
 }

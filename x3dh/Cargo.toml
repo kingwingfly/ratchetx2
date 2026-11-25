@@ -11,6 +11,7 @@ publish = false
 [dependencies]
 getrandom = "0.4"
 hkdf = "0.13"
+hmac = { version = "0.13", features = ["zeroize"] }
 ml-kem = { version = "0.3", default-features = false, features = ["zeroize"], optional = true }
 prost = { version = "0.14", optional = true }
 rkyv = { version = "0.8", optional = true }

@@ -1,8 +1,8 @@
 //! In-memory backend.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "pq")]
-use std::{collections::HashSet, time::Duration};
+use std::time::Duration;
 
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -18,9 +18,9 @@ use crate::{
 };
 #[cfg(feature = "pq")]
 use crate::{
-    ClaimedPqBundle, IdempotentMailboxStore, PqHandshakeStore, PqPrekeyId, PqStorageSnapshot,
-    PublishV2Record, PublishV2Status, RefillPrekeysRecord, RefillStatus, StoredCapabilityManifest,
-    StoredInitialMessageV2, StoredPqPrekey,
+    ClaimOutcome, ClaimedPqBundle, IdempotentMailboxStore, PqHandshakeStore, PqPrekeyId,
+    PqStorageSnapshot, PublishV2Record, PublishV2Status, RefillPrekeysRecord, RefillStatus,
+    StoredCapabilityManifest, StoredInitialMessageV2, StoredPqPrekey,
 };
 #[allow(deprecated)]
 use crate::{HandshakeStore, MailboxStore};
@@ -31,6 +31,9 @@ pub const DEFAULT_DEDUP_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Maximum retained client-message IDs per sender and recipient.
 #[cfg(feature = "pq")]
 pub const DEFAULT_MAX_DEDUP_TOMBSTONES: usize = 4096;
+/// Maximum number of distinct `(sender, recipient)` deduplication buckets retained globally.
+#[cfg(feature = "pq")]
+pub const DEFAULT_MAX_DEDUP_BUCKETS: usize = 4096;
 
 #[cfg(feature = "pq")]
 const DEDUP_SWEEP_BUDGET: usize = 8;
@@ -40,6 +43,7 @@ const DEDUP_SWEEP_BUDGET: usize = 8;
 struct DedupLimits {
     ttl: Duration,
     max_per_queue: usize,
+    max_buckets: usize,
 }
 
 #[cfg(feature = "pq")]
@@ -48,6 +52,7 @@ impl Default for DedupLimits {
         Self {
             ttl: DEFAULT_DEDUP_TTL,
             max_per_queue: DEFAULT_MAX_DEDUP_TOMBSTONES,
+            max_buckets: DEFAULT_MAX_DEDUP_BUCKETS,
         }
     }
 }
@@ -64,6 +69,8 @@ struct Tombstone {
 #[derive(Debug)]
 struct DedupBucket {
     entries: VecDeque<Tombstone>,
+    /// O(1) lookup index from `client_message_id` to its committed sequence number.
+    index: HashMap<[u8; 16], u64>,
     sweep_index: usize,
 }
 
@@ -82,10 +89,37 @@ impl MemoryStore {
     /// A zero TTL or cap disables deduplication.
     pub fn with_dedup_limits(ttl: Duration, max_per_queue: usize) -> Self {
         Self {
-            dedup: DedupLimits { ttl, max_per_queue },
+            dedup: DedupLimits {
+                ttl,
+                max_per_queue,
+                max_buckets: DEFAULT_MAX_DEDUP_BUCKETS,
+            },
             ..Self::default()
         }
     }
+
+    /// Create a store with custom retry window, per-queue tombstone cap, and global bucket cap.
+    pub fn with_dedup_limits_and_buckets(
+        ttl: Duration,
+        max_per_queue: usize,
+        max_buckets: usize,
+    ) -> Self {
+        Self {
+            dedup: DedupLimits {
+                ttl,
+                max_per_queue,
+                max_buckets,
+            },
+            ..Self::default()
+        }
+    }
+}
+
+/// Bounded message queue for one `(sender, recipient)` pair, tracking its total bytes in O(1).
+#[derive(Debug, Default)]
+struct Queue {
+    messages: Vec<Queued>,
+    total_bytes: u64,
 }
 
 #[derive(Debug, Default)]
@@ -98,8 +132,8 @@ struct Inner {
     one_time_prekeys: HashMap<PublicKey, VecDeque<PublicKey>>,
     /// Per-identity inboxes holding both classical v1 and (when `pq`) v2 initial messages.
     inboxes: HashMap<PublicKey, Inbox>,
-    /// Mailbox queues per `(sender, recipient)`.
-    queues: HashMap<(PublicKey, PublicKey), Vec<Queued>>,
+    /// Non-empty mailbox queues per `(sender, recipient)`.
+    queues: HashMap<(PublicKey, PublicKey), Queue>,
     /// The last sequence number of each queue, which goes on once its messages are deleted.
     last_sequences: HashMap<(PublicKey, PublicKey), u64>,
     /// Attachments and their uploaded chunks.
@@ -173,9 +207,9 @@ fn message_bytes(header: &Bytes, content: &Bytes, initial_message: Option<&Bytes
 }
 
 impl Inner {
-    fn has_identity(&self, identity_key: &PublicKey) -> bool {
-        let classical =
-            self.bundles.contains_key(identity_key) || self.inboxes.contains_key(identity_key);
+    /// Whether `identity_key` has registered prekeys (a v1 bundle or v2 capability manifest).
+    fn has_registered_identity(&self, identity_key: &PublicKey) -> bool {
+        let classical = self.bundles.contains_key(identity_key);
         #[cfg(feature = "pq")]
         {
             classical || self.manifests.contains_key(identity_key)
@@ -199,13 +233,9 @@ impl Inner {
         let incoming_bytes = message_bytes(&header, &content, initial_message.as_ref());
         let key = (*sender, *recipient);
         if let Some(queue) = self.queues.get(&key) {
-            if queue.len() >= MAX_QUEUE_MESSAGES {
-                return Err(ErrorKind::LimitExceeded.into());
-            }
-            let current_bytes: u64 = queue
-                .iter()
-                .fold(0u64, |acc, q| acc.saturating_add(q.bytes));
-            if current_bytes.saturating_add(incoming_bytes) > MAX_QUEUE_BYTES {
+            if queue.messages.len() >= MAX_QUEUE_MESSAGES
+                || queue.total_bytes.saturating_add(incoming_bytes) > MAX_QUEUE_BYTES
+            {
                 return Err(ErrorKind::LimitExceeded.into());
             }
         } else if incoming_bytes > MAX_QUEUE_BYTES {
@@ -226,7 +256,9 @@ impl Inner {
             content: Some(content),
             initial_message,
         };
-        self.queues.entry(key).or_default().push(Queued {
+        let queue = self.queues.entry(key).or_default();
+        queue.total_bytes = queue.total_bytes.saturating_add(incoming_bytes);
+        queue.messages.push(Queued {
             message,
             delivery_hash,
             bytes: incoming_bytes,
@@ -240,12 +272,29 @@ impl Inner {
         recipient: &PublicKey,
         hashes: &[[u8; 32]],
     ) {
-        if let Some(queue) = self.queues.get_mut(&(*sender, *recipient)) {
-            queue.retain(|queued| {
-                !queued
-                    .delivery_hash
-                    .is_some_and(|hash| hashes.contains(&hash))
+        if hashes.is_empty() {
+            return;
+        }
+        let key = (*sender, *recipient);
+        let Some(queue) = self.queues.get_mut(&key) else {
+            return;
+        };
+        let hash_set: Option<HashSet<[u8; 32]>> =
+            (hashes.len() > 4).then(|| hashes.iter().copied().collect());
+        let mut removed_bytes = 0u64;
+        queue.messages.retain(|queued| {
+            let remove = queued.delivery_hash.is_some_and(|hash| match &hash_set {
+                Some(set) => set.contains(&hash),
+                None => hashes.contains(&hash),
             });
+            if remove {
+                removed_bytes = removed_bytes.saturating_add(queued.bytes);
+            }
+            !remove
+        });
+        queue.total_bytes = queue.total_bytes.saturating_sub(removed_bytes);
+        if queue.messages.is_empty() {
+            self.queues.remove(&key);
         }
     }
 
@@ -255,17 +304,29 @@ impl Inner {
         recipient: &PublicKey,
         after: u64,
         limit: u32,
+        max_bytes: Option<usize>,
     ) -> Vec<StoredMessage> {
         let Some(queue) = self.queues.get(&(*sender, *recipient)) else {
             return vec![];
         };
         // In order, with gaps where messages were delivered or expired.
-        let start = queue.partition_point(|queued| queued.message.sequence <= after);
-        queue[start..]
-            .iter()
-            .take(limit as usize)
-            .map(|queued| queued.message.clone())
-            .collect()
+        let start = queue
+            .messages
+            .partition_point(|queued| queued.message.sequence <= after);
+        let max_bytes = max_bytes.map(|m| m as u64);
+        let mut out = Vec::new();
+        let mut bytes = 0u64;
+        for queued in queue.messages[start..].iter().take(limit as usize) {
+            bytes = bytes.saturating_add(queued.bytes);
+            if let Some(cap) = max_bytes
+                && !out.is_empty()
+                && bytes > cap
+            {
+                break;
+            }
+            out.push(queued.message.clone());
+        }
+        out
     }
 }
 
@@ -322,14 +383,21 @@ impl HandshakeStore for MemoryStore {
         limit: usize,
     ) -> Result<bool> {
         let mut inner = self.inner.lock();
+        if !inner.has_registered_identity(&initial_message.recipient) {
+            return Err(ErrorKind::NotFound.into());
+        }
         let inbox = inner.inboxes.entry(initial_message.recipient).or_default();
         if inbox.initial_messages.len() >= limit {
             return Ok(false);
         }
-        inbox.next_id += 1;
-        let id = inbox.next_id;
+        let next_id = inbox
+            .next_id
+            .checked_add(1)
+            .filter(|&id| id <= MAX_SAFE_INTEGER)
+            .ok_or(ErrorKind::LimitExceeded)?;
+        inbox.next_id = next_id;
         inbox.initial_messages.push(InboxEntry {
-            id,
+            id: next_id,
             version: 1,
             classical: initial_message,
             #[cfg(feature = "pq")]
@@ -354,7 +422,7 @@ impl HandshakeStore for MemoryStore {
         check_safe_int(timestamp)?;
         let mut inner = self.inner.lock();
         // Do not allocate persistent inbox state for unknown identities.
-        if !inner.has_identity(recipient) {
+        if !inner.has_registered_identity(recipient) {
             return Ok(Some(vec![]));
         }
         let inbox = inner.inboxes.entry(*recipient).or_default();
@@ -565,8 +633,27 @@ impl PqHandshakeStore for MemoryStore {
         identity_key: &PublicKey,
         preferred_suites: &[u8],
     ) -> Result<Option<ClaimedPqBundle>> {
+        match self
+            .claim_bundle_checked(identity_key, preferred_suites, false)
+            .await?
+        {
+            ClaimOutcome::Claimed(bundle) => Ok(Some(*bundle)),
+            ClaimOutcome::NotFound | ClaimOutcome::PqDisabledForPqManifest => Ok(None),
+        }
+    }
+
+    async fn claim_bundle_checked(
+        &self,
+        identity_key: &PublicKey,
+        preferred_suites: &[u8],
+        reject_pq_on_manifest: bool,
+    ) -> Result<ClaimOutcome> {
         let mut inner = self.inner.lock();
         if let Some(manifest) = inner.manifests.get(identity_key).cloned() {
+            if reject_pq_on_manifest && manifest.pq_enabled {
+                return Ok(ClaimOutcome::PqDisabledForPqManifest);
+            }
+
             let signed_prekey_signature = if manifest.strict_pq {
                 None
             } else {
@@ -576,39 +663,63 @@ impl PqHandshakeStore for MemoryStore {
                     .filter(|b| b.signed_prekey == manifest.signed_prekey)
                     .map(|b| b.signed_prekey_signature)
             };
+
+            let chosen_suite = if manifest.pq_enabled && !preferred_suites.is_empty() {
+                preferred_suites.iter().copied().find(|suite| {
+                    manifest.offered_suites.contains(suite)
+                        && inner
+                            .pq_last_resort
+                            .get(identity_key)
+                            .is_some_and(|m| m.contains_key(suite))
+                })
+            } else {
+                None
+            };
+
+            // Determine whether this claim yields a usable handshake bundle BEFORE popping any
+            // classical or PQ one-time prekey:
+            // - strict_pq requires a mutually negotiated PQ suite.
+            // - a PQ-ON peer with non-empty caller suites and no mutual suite must not burn OPKs.
+            // - a classical claim (no mutual PQ suite) requires a matching raw SPK signature.
+            let can_pop_opk =
+                if manifest.strict_pq || (manifest.pq_enabled && !preferred_suites.is_empty()) {
+                    chosen_suite.is_some()
+                } else {
+                    signed_prekey_signature.is_some()
+                };
+
+            if !can_pop_opk {
+                return Ok(ClaimOutcome::Claimed(Box::new(ClaimedPqBundle {
+                    identity_key: *identity_key,
+                    signed_prekey: manifest.signed_prekey,
+                    manifest: Some(manifest),
+                    signed_prekey_signature,
+                    one_time_prekey: None,
+                    pq_last_resort: None,
+                    pq_one_time_prekey: None,
+                })));
+            }
+
+            let (pq_last_resort, pq_one_time_prekey) = if let Some(suite) = chosen_suite {
+                let lr = inner
+                    .pq_last_resort
+                    .get(identity_key)
+                    .and_then(|m| m.get(&suite))
+                    .cloned();
+                let pq_opk = inner.pq_one_time.get_mut(identity_key).and_then(|q| {
+                    let idx = q.iter().position(|k| k.suite == suite)?;
+                    q.remove(idx)
+                });
+                (lr, pq_opk)
+            } else {
+                (None, None)
+            };
             let one_time_prekey = inner
                 .one_time_prekeys
                 .get_mut(identity_key)
                 .and_then(VecDeque::pop_front);
 
-            let (pq_last_resort, pq_one_time_prekey) =
-                if manifest.pq_enabled && !preferred_suites.is_empty() {
-                    let chosen_suite = preferred_suites.iter().copied().find(|suite| {
-                        manifest.offered_suites.contains(suite)
-                            && inner
-                                .pq_last_resort
-                                .get(identity_key)
-                                .is_some_and(|m| m.contains_key(suite))
-                    });
-                    if let Some(suite) = chosen_suite {
-                        let lr = inner
-                            .pq_last_resort
-                            .get(identity_key)
-                            .and_then(|m| m.get(&suite))
-                            .cloned();
-                        let pq_opk = inner.pq_one_time.get_mut(identity_key).and_then(|q| {
-                            let idx = q.iter().position(|k| k.suite == suite)?;
-                            q.remove(idx)
-                        });
-                        (lr, pq_opk)
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (None, None)
-                };
-
-            return Ok(Some(ClaimedPqBundle {
+            return Ok(ClaimOutcome::Claimed(Box::new(ClaimedPqBundle {
                 identity_key: *identity_key,
                 signed_prekey: manifest.signed_prekey,
                 manifest: Some(manifest),
@@ -616,18 +727,18 @@ impl PqHandshakeStore for MemoryStore {
                 one_time_prekey,
                 pq_last_resort,
                 pq_one_time_prekey,
-            }));
+            })));
         }
 
         // Graceful fallback for classical-only v1 users.
         let Some(bundle) = inner.bundles.get(identity_key).cloned() else {
-            return Ok(None);
+            return Ok(ClaimOutcome::NotFound);
         };
         let one_time_prekey = inner
             .one_time_prekeys
             .get_mut(identity_key)
             .and_then(VecDeque::pop_front);
-        Ok(Some(ClaimedPqBundle {
+        Ok(ClaimOutcome::Claimed(Box::new(ClaimedPqBundle {
             identity_key: *identity_key,
             manifest: None,
             signed_prekey: bundle.signed_prekey,
@@ -635,7 +746,7 @@ impl PqHandshakeStore for MemoryStore {
             one_time_prekey,
             pq_last_resort: None,
             pq_one_time_prekey: None,
-        }))
+        })))
     }
 
     async fn add_initial_message_v2(
@@ -644,6 +755,9 @@ impl PqHandshakeStore for MemoryStore {
         limit: usize,
     ) -> Result<Option<u64>> {
         let mut inner = self.inner.lock();
+        if !inner.has_registered_identity(&initial_message.recipient) {
+            return Err(ErrorKind::NotFound.into());
+        }
         let inbox = inner.inboxes.entry(initial_message.recipient).or_default();
         if inbox.initial_messages.len() >= limit {
             return Ok(None);
@@ -711,14 +825,19 @@ impl PqHandshakeStore for MemoryStore {
         for &id in ids {
             check_safe_int(id)?;
         }
+        if ids.is_empty() {
+            return Ok(0);
+        }
         let mut inner = self.inner.lock();
         let Some(inbox) = inner.inboxes.get_mut(recipient) else {
             return Ok(0);
         };
         let before = inbox.initial_messages.len();
-        inbox
-            .initial_messages
-            .retain(|entry| !ids.contains(&entry.id));
+        let id_set: Option<HashSet<u64>> = (ids.len() > 4).then(|| ids.iter().copied().collect());
+        inbox.initial_messages.retain(|entry| match &id_set {
+            Some(set) => !set.contains(&entry.id),
+            None => !ids.contains(&entry.id),
+        });
         Ok(before - inbox.initial_messages.len())
     }
 
@@ -807,12 +926,24 @@ impl MailboxStore for MemoryStore {
         Ok(self
             .inner
             .lock()
-            .read_inner(sender, recipient, after, limit))
+            .read_inner(sender, recipient, after, limit, None))
     }
 }
 
 #[cfg(feature = "pq")]
 impl Inner {
+    /// Remove a dedup bucket by key and update the swap-remove sweep index.
+    fn remove_dedup_bucket(&mut self, key: &(PublicKey, PublicKey)) {
+        let Some(bucket) = self.mailbox_dedup.remove(key) else {
+            return;
+        };
+        let index = bucket.sweep_index;
+        self.dedup_keys.swap_remove(index);
+        if let Some(moved) = self.dedup_keys.get(index) {
+            self.mailbox_dedup.get_mut(moved).unwrap().sweep_index = index;
+        }
+    }
+
     /// Expire the oldest tombstones. Return true if this removed the bucket.
     fn prune_dedup(&mut self, key: &(PublicKey, PublicKey), now: Instant, ttl: Duration) -> bool {
         let Some(bucket) = self.mailbox_dedup.get_mut(key) else {
@@ -823,17 +954,14 @@ impl Inner {
             .front()
             .is_some_and(|entry| now.duration_since(entry.inserted) >= ttl)
         {
-            bucket.entries.pop_front();
+            if let Some(expired) = bucket.entries.pop_front() {
+                bucket.index.remove(&expired.id);
+            }
         }
         if !bucket.entries.is_empty() {
             return false;
         }
-        let index = bucket.sweep_index;
-        self.mailbox_dedup.remove(key);
-        self.dedup_keys.swap_remove(index);
-        if let Some(moved) = self.dedup_keys.get(index) {
-            self.mailbox_dedup.get_mut(moved).unwrap().sweep_index = index;
-        }
+        self.remove_dedup_bucket(key);
         true
     }
 
@@ -864,7 +992,8 @@ impl IdempotentMailboxStore for MemoryStore {
         client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
         let mut inner = self.inner.lock();
-        let dedup_enabled = !self.dedup.ttl.is_zero() && self.dedup.max_per_queue > 0;
+        let dedup_enabled =
+            !self.dedup.ttl.is_zero() && self.dedup.max_per_queue > 0 && self.dedup.max_buckets > 0;
         if !dedup_enabled {
             return inner.append_inner(
                 sender,
@@ -881,9 +1010,9 @@ impl IdempotentMailboxStore for MemoryStore {
         inner.prune_dedup(&key, now, self.dedup.ttl);
         if let Some(id) = client_message_id
             && let Some(bucket) = inner.mailbox_dedup.get(&key)
-            && let Some(entry) = bucket.entries.iter().find(|entry| entry.id == id)
+            && let Some(&seq) = bucket.index.get(&id)
         {
-            return Ok(entry.sequence);
+            return Ok(seq);
         }
         let seq = inner.append_inner(
             sender,
@@ -894,6 +1023,14 @@ impl IdempotentMailboxStore for MemoryStore {
             delivery_hash,
         )?;
         if let Some(id) = client_message_id {
+            if !inner.mailbox_dedup.contains_key(&key)
+                && inner.mailbox_dedup.len() >= self.dedup.max_buckets
+                && !inner.dedup_keys.is_empty()
+            {
+                let cursor = inner.dedup_sweep_cursor % inner.dedup_keys.len();
+                let victim = inner.dedup_keys[cursor];
+                inner.remove_dedup_bucket(&victim);
+            }
             let Inner {
                 mailbox_dedup,
                 dedup_keys,
@@ -905,21 +1042,26 @@ impl IdempotentMailboxStore for MemoryStore {
                 dedup_keys.push(key);
                 DedupBucket {
                     entries: VecDeque::new(),
+                    index: HashMap::new(),
                     sweep_index,
                 }
             });
-            let entries = &mut bucket.entries;
-            if entries.len() == self.dedup.max_per_queue {
-                // Prefer the oldest delivered message. Queue rows are sorted by sequence.
-                let queue = &queues[&key];
-                let oldest_delivered = entries.iter().position(|entry| {
-                    queue
-                        .binary_search_by_key(&entry.sequence, |row| row.message.sequence)
-                        .is_err()
+            if bucket.entries.len() == self.dedup.max_per_queue {
+                // Prefer evicting the oldest delivered message. Queue rows are sorted by sequence.
+                let oldest_delivered = queues.get(&key).map_or(Some(0), |queue| {
+                    bucket.entries.iter().position(|entry| {
+                        queue
+                            .messages
+                            .binary_search_by_key(&entry.sequence, |row| row.message.sequence)
+                            .is_err()
+                    })
                 });
-                entries.remove(oldest_delivered.unwrap_or(0));
+                if let Some(evicted) = bucket.entries.remove(oldest_delivered.unwrap_or(0)) {
+                    bucket.index.remove(&evicted.id);
+                }
             }
-            entries.push_back(Tombstone {
+            bucket.index.insert(id, seq);
+            bucket.entries.push_back(Tombstone {
                 id,
                 sequence: seq,
                 inserted: now,
@@ -950,7 +1092,21 @@ impl IdempotentMailboxStore for MemoryStore {
         Ok(self
             .inner
             .lock()
-            .read_inner(sender, recipient, after, limit))
+            .read_inner(sender, recipient, after, limit, None))
+    }
+
+    async fn read_bounded(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+        max_size: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        Ok(self
+            .inner
+            .lock()
+            .read_inner(sender, recipient, after, limit, Some(max_size)))
     }
 }
 
@@ -976,7 +1132,7 @@ impl AttachmentStore for MemoryStore {
 
     async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
         let mut inner = self.inner.lock();
-        let (attachment, chunks) = inner.attachments.get_mut(id).ok_or(ErrorKind::Other)?;
+        let (attachment, chunks) = inner.attachments.get_mut(id).ok_or(ErrorKind::NotFound)?;
         chunks.entry(index).or_insert(data);
         attachment.uploaded |= crate::uploaded_bit(index);
         Ok(())
@@ -1414,6 +1570,188 @@ mod test {
                     .len(),
                 2
             );
+        });
+    }
+
+    #[cfg(feature = "pq")]
+    #[test]
+    fn claim_bundle_preserves_opks_on_strict_pq_and_suite_mismatch() {
+        futures::executor::block_on(async {
+            let store = MemoryStore::default();
+            let bob = [0x22; 32];
+            let pq_key = |suite: u8, tag: u8| StoredPqPrekey {
+                suite,
+                id: [tag; 32],
+                encapsulation_key: Bytes::from(vec![tag; if suite == 1 { 1568 } else { 1184 }]),
+                signature: [tag; 64],
+            };
+            let manifest = StoredCapabilityManifest {
+                audience: "chat.example".to_string(),
+                identity_key: bob,
+                manifest_seq: 1,
+                generation: 1,
+                issued_at: 1000,
+                expires_at: 100_000,
+                pq_enabled: true,
+                strict_pq: true,
+                pq_ratchet_supported: true,
+                offered_suites: vec![1],
+                signed_prekey: [0x23; 32],
+                pq_last_resort: vec![crate::PqLastResortCommitment {
+                    suite: 1,
+                    prekey_id: [0xA1; 32],
+                }],
+                signature: [0x55; 64],
+            };
+            assert_eq!(
+                store
+                    .publish_v2(PublishV2Record {
+                        manifest,
+                        signed_prekey_signature: None,
+                        one_time_prekeys: vec![[0x40; 32], [0x41; 32]],
+                        pq_last_resort: vec![pq_key(1, 0xA1)],
+                        pq_one_time_prekeys: vec![pq_key(1, 0xB1)],
+                        timestamp: 1001,
+                    })
+                    .await
+                    .unwrap(),
+                PublishV2Status::Stored
+            );
+
+            // Empty preferred_suites on strict_pq MUST NOT burn classical OPKs or PQOPKs.
+            let empty_claim = store.claim_bundle(&bob, &[]).await.unwrap().unwrap();
+            assert_eq!(empty_claim.one_time_prekey, None);
+            assert_eq!(empty_claim.pq_last_resort, None);
+            assert_eq!(empty_claim.pq_one_time_prekey, None);
+            assert_eq!(
+                store
+                    .pq_snapshot(&bob)
+                    .await
+                    .unwrap()
+                    .classical_one_time_count,
+                2
+            );
+
+            // Disjoint suite [2] on strict_pq MUST NOT burn classical OPKs or PQOPKs.
+            let disjoint_claim = store.claim_bundle(&bob, &[2]).await.unwrap().unwrap();
+            assert_eq!(disjoint_claim.one_time_prekey, None);
+            assert_eq!(disjoint_claim.pq_last_resort, None);
+            assert_eq!(
+                store
+                    .pq_snapshot(&bob)
+                    .await
+                    .unwrap()
+                    .classical_one_time_count,
+                2
+            );
+
+            // Atomic pq_enabled=false rejection MUST NOT burn any OPKs.
+            assert_eq!(
+                store.claim_bundle_checked(&bob, &[1], true).await.unwrap(),
+                ClaimOutcome::PqDisabledForPqManifest
+            );
+            assert_eq!(
+                store
+                    .pq_snapshot(&bob)
+                    .await
+                    .unwrap()
+                    .classical_one_time_count,
+                2
+            );
+
+            // Matching suite [1] pops both classical OPK and PQOPK atomically.
+            let matched = store.claim_bundle(&bob, &[1]).await.unwrap().unwrap();
+            assert_eq!(matched.one_time_prekey, Some([0x40; 32]));
+            assert_eq!(matched.pq_one_time_prekey, Some(pq_key(1, 0xB1)));
+            assert_eq!(
+                store
+                    .pq_snapshot(&bob)
+                    .await
+                    .unwrap()
+                    .classical_one_time_count,
+                1
+            );
+        });
+    }
+
+    #[test]
+    fn memory_store_rejects_unregistered_inboxes_prunes_empty_queues_and_returns_not_found() {
+        futures::executor::block_on(async {
+            let store = MemoryStore::default();
+            let ghost = [0xAA; 32];
+            let alice = [0xBB; 32];
+
+            // Unregistered recipient cannot allocate an inbox.
+            assert_eq!(
+                store
+                    .add_initial_message(
+                        StoredInitialMessage {
+                            sender: alice,
+                            recipient: ghost,
+                            ephemeral_key: [1; 32],
+                            signed_prekey: [2; 32],
+                            one_time_prekey: None,
+                            header: Bytes::from_static(b"h"),
+                            content: Bytes::from_static(b"c"),
+                        },
+                        10,
+                    )
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::NotFound
+            );
+            assert!(store.inner.lock().inboxes.is_empty());
+
+            // Deleting all messages from a queue prunes the empty queue entry while preserving
+            // monotonic sequence numbers.
+            let seq1 = MailboxStore::append(
+                &store,
+                &alice,
+                &ghost,
+                Bytes::from_static(b"h1"),
+                Bytes::from_static(b"c1"),
+                None,
+                Some([0x11; 32]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(seq1, 1);
+            MailboxStore::delete_delivered(&store, &alice, &ghost, &[[0x11; 32]])
+                .await
+                .unwrap();
+            assert!(!store.inner.lock().queues.contains_key(&(alice, ghost)));
+            let seq2 = MailboxStore::append(
+                &store,
+                &alice,
+                &ghost,
+                Bytes::from_static(b"h2"),
+                Bytes::from_static(b"c2"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(seq2, 2);
+
+            // Missing/deleted attachment returns NotFound on put_chunk.
+            assert_eq!(
+                store
+                    .put_chunk(&[0x55; 16], 0, Bytes::from_static(b"0123456789abcdef"))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::NotFound
+            );
+
+            #[cfg(feature = "pq")]
+            {
+                let bounded = MemoryStore::with_dedup_limits_and_buckets(DEFAULT_DEDUP_TTL, 4, 2);
+                for i in 0u8..5 {
+                    append_id(&bounded, &([1; 32], [i; 32]), Some(1)).await;
+                }
+                assert!(bounded.inner.lock().mailbox_dedup.len() <= 2);
+            }
         });
     }
 }

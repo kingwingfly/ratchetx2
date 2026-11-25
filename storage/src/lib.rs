@@ -274,6 +274,9 @@ pub enum ErrorKind {
     /// An argument violates storage bounds (e.g. an integer exceeding [`MAX_SAFE_INTEGER`]).
     #[error("invalid storage argument")]
     InvalidArgument,
+    /// The referenced record (e.g. an identity or attachment) does not exist.
+    #[error("not found")]
+    NotFound,
     /// Any other error; see its [`source`](std::error::Error::source).
     #[error("storage error")]
     Other,

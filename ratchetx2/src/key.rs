@@ -65,6 +65,11 @@ impl DhPrivateKey {
         Ok(key)
     }
 
+    /// Constant-time equality on the private key bytes.
+    pub(crate) fn ct_eq(&self, other: &Self) -> subtle::Choice {
+        self.0.ct_eq(&other.0)
+    }
+
     /// The private key's bytes.
     #[cfg(feature = "prost")]
     pub(crate) fn as_bytes(&self) -> &[u8; DH_KEY_LENGTH] {

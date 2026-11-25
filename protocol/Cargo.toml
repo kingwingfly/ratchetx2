@@ -17,7 +17,7 @@ prost = "0.14"
 rkyv = { version = "0.8", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
-sha2 = { version = "0.11", optional = true }
+sha2 = { version = "0.11", features = ["zeroize"], optional = true }
 storage = { path = "../storage", default-features = false, optional = true }
 subtle = { version = "2.6", optional = true }
 thiserror = "2.0"
@@ -26,6 +26,7 @@ url = { version = "2", default-features = false }
 web-time = { version = "1.1", optional = true }
 x3dh = { path = "../x3dh" }
 xeddsa = { path = "../xeddsa" }
+zeroize = { version = "1.9", features = ["derive"] }
 
 [build-dependencies]
 prost-build = "0.14"

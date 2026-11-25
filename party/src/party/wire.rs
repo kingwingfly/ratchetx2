@@ -19,6 +19,60 @@ use super::{KemRatchet, PqSuite};
 
 const VERSION: u8 = 2;
 const CLASSICAL: u8 = 0;
+/// Maximum number of unknown extension fields accepted when deserializing a human-readable Party.
+const MAX_EXTENSION_FIELDS: usize = 32;
+/// Maximum byte length of an unknown extension field name.
+const MAX_EXTENSION_NAME_LEN: usize = 128;
+/// Maximum byte length of `Party.associated_data` when deserializing with Serde.
+const MAX_ASSOCIATED_DATA_LEN: usize = 4096;
+
+fn deserialize_bounded_ad<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> core::result::Result<Vec<u8>, D::Error> {
+    struct BoundedBytesVisitor;
+
+    impl<'de> de::Visitor<'de> for BoundedBytesVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "at most {MAX_ASSOCIATED_DATA_LEN} bytes")
+        }
+
+        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> core::result::Result<Vec<u8>, E> {
+            if v.len() > MAX_ASSOCIATED_DATA_LEN {
+                return Err(E::invalid_length(v.len(), &self));
+            }
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> core::result::Result<Vec<u8>, E> {
+            if v.len() > MAX_ASSOCIATED_DATA_LEN {
+                return Err(E::invalid_length(v.len(), &self));
+            }
+            Ok(v)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> core::result::Result<Vec<u8>, A::Error> {
+            let cap = seq.size_hint().unwrap_or(0).min(MAX_ASSOCIATED_DATA_LEN);
+            let mut out = Vec::with_capacity(cap);
+            while let Some(byte) = seq.next_element::<u8>()? {
+                if out.len() >= MAX_ASSOCIATED_DATA_LEN {
+                    return Err(de::Error::invalid_length(
+                        MAX_ASSOCIATED_DATA_LEN + 1,
+                        &self,
+                    ));
+                }
+                out.push(byte);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedBytesVisitor)
+}
 const FIELDS: &[&str] = &[
     "version",
     "capability",
@@ -89,6 +143,7 @@ struct PartyWire {
     previous_chain_length: u64,
     message_number_sender: u64,
     message_number_receiver: u64,
+    #[serde(deserialize_with = "deserialize_bounded_ad")]
     associated_data: Vec<u8>,
     #[serde(default, deserialize_with = "present")]
     current_chain_evicted: Option<EvictedSet>,
@@ -97,7 +152,7 @@ struct PartyWire {
 }
 
 // Serde's derived struct reader rejects repeated known fields. Preserve its handling of
-// future map fields while also rejecting repeated names among those extensions.
+// future map fields while bounding extension count and key length and rejecting duplicates.
 struct NamedFields<A> {
     map: A,
     extensions: HashSet<String>,
@@ -113,10 +168,18 @@ impl<'de, A: MapAccess<'de>> MapAccess<'de> for NamedFields<A> {
         let Some(name) = self.map.next_key::<String>()? else {
             return Ok(None);
         };
-        let field = seed.deserialize(name.as_str().into_deserializer())?;
-        if !FIELDS.contains(&name.as_str()) && !self.extensions.insert(name) {
-            return Err(de::Error::custom("duplicate party extension field"));
+        if !FIELDS.contains(&name.as_str()) {
+            if name.len() > MAX_EXTENSION_NAME_LEN {
+                return Err(de::Error::custom("party extension field name too long"));
+            }
+            if self.extensions.len() >= MAX_EXTENSION_FIELDS {
+                return Err(de::Error::custom("too many party extension fields"));
+            }
+            if !self.extensions.insert(name.clone()) {
+                return Err(de::Error::custom("duplicate party extension field"));
+            }
         }
+        let field = seed.deserialize(name.as_str().into_deserializer())?;
         Ok(Some(field))
     }
 

@@ -19,6 +19,9 @@ pub const PQ_PREKEY_ID_LENGTH: usize = 32;
 pub const PQ_SEED_LENGTH: usize = 64;
 /// Length of an ML-KEM shared secret.
 pub const PQ_SHARED_SECRET_LENGTH: usize = 32;
+/// Maximum byte length of any supported ML-KEM encapsulation key or ciphertext (ML-KEM-1024).
+#[cfg(feature = "serde")]
+pub(crate) const MAX_PQ_BYTES: usize = 1568;
 /// Protocol version bound into PQXDH transcripts and initial messages.
 pub const PQXDH_VERSION: u32 = 2;
 /// Length of PQXDH associated data: `IK_A || IK_B || TH` (96 bytes).
@@ -98,6 +101,14 @@ impl PqSuite {
     }
 }
 
+#[cfg(feature = "rkyv")]
+pub(crate) fn archived_suite(suite: &ArchivedPqSuite) -> PqSuite {
+    match suite {
+        ArchivedPqSuite::MlKem1024 => PqSuite::MlKem1024,
+        ArchivedPqSuite::MlKem768 => PqSuite::MlKem768,
+    }
+}
+
 /// Computes the deterministic 32-byte identifier for a post-quantum prekey:
 /// `SHA-256(b"pqxdh.v1/id\0" || [suite] || ek)`.
 pub fn pq_prekey_id(suite: u8, ek: &[u8]) -> PqPrekeyId {
@@ -108,42 +119,63 @@ pub fn pq_prekey_id(suite: u8, ek: &[u8]) -> PqPrekeyId {
     hasher.finalize().into()
 }
 
-/// Builds the domain-separated XEdDSA signing input for a last-resort PQSPK:
-/// `b"pqxdh.v1/pqspk\0" || [suite] || ek`.
-pub fn pq_spk_signing_input(suite: u8, ek: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PQ_SPK_DOMAIN.len() + 1 + ek.len());
-    out.extend_from_slice(PQ_SPK_DOMAIN);
+fn pq_signing_input(domain: &[u8], suite: u8, ek: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(domain.len() + 1 + ek.len());
+    out.extend_from_slice(domain);
     out.push(suite);
     out.extend_from_slice(ek);
     out
+}
+
+fn sign_pq_key(
+    domain: &[u8],
+    identity: &XEdDSAPrivateKey,
+    suite: PqSuite,
+    ek: &[u8],
+) -> Result<Signature> {
+    if ek.len() != suite.ek_len() {
+        return Err(ErrorKind::InvalidPublicKey.into());
+    }
+    Ok(identity.try_sign(pq_signing_input(domain, suite.as_u8(), ek))?)
+}
+
+fn verify_pq_key_signature(
+    domain: &[u8],
+    identity_key: &PublicKey,
+    suite: u8,
+    ek: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    let suite_enum = PqSuite::from_u8(suite).ok_or(ErrorKind::UnsupportedSuite)?;
+    if ek.len() != suite_enum.ek_len() {
+        return Err(ErrorKind::InvalidPublicKey.into());
+    }
+    XEdDSAPublicKey::new(identity_key)?.verify(pq_signing_input(domain, suite, ek), signature)?;
+    Ok(())
+}
+
+/// Builds the domain-separated XEdDSA signing input for a last-resort PQSPK:
+/// `b"pqxdh.v1/pqspk\0" || [suite] || ek`.
+pub fn pq_spk_signing_input(suite: u8, ek: &[u8]) -> Vec<u8> {
+    pq_signing_input(PQ_SPK_DOMAIN, suite, ek)
 }
 
 /// Builds the domain-separated XEdDSA signing input for a one-time PQOPK:
 /// `b"pqxdh.v1/pqopk\0" || [suite] || ek`.
 pub fn pq_opk_signing_input(suite: u8, ek: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(PQ_OPK_DOMAIN.len() + 1 + ek.len());
-    out.extend_from_slice(PQ_OPK_DOMAIN);
-    out.push(suite);
-    out.extend_from_slice(ek);
-    out
+    pq_signing_input(PQ_OPK_DOMAIN, suite, ek)
 }
 
 /// Signs a last-resort PQSPK encapsulation key with `identity` under the `pqxdh.v1/pqspk\0`
 /// domain separator, after checking that `ek.len()` matches `suite.ek_len()`.
 pub fn sign_pq_spk(identity: &XEdDSAPrivateKey, suite: PqSuite, ek: &[u8]) -> Result<Signature> {
-    if ek.len() != suite.ek_len() {
-        return Err(ErrorKind::InvalidPublicKey.into());
-    }
-    Ok(identity.sign(pq_spk_signing_input(suite.as_u8(), ek)))
+    sign_pq_key(PQ_SPK_DOMAIN, identity, suite, ek)
 }
 
 /// Signs a one-time PQOPK encapsulation key with `identity` under the `pqxdh.v1/pqopk\0`
 /// domain separator, after checking that `ek.len()` matches `suite.ek_len()`.
 pub fn sign_pq_opk(identity: &XEdDSAPrivateKey, suite: PqSuite, ek: &[u8]) -> Result<Signature> {
-    if ek.len() != suite.ek_len() {
-        return Err(ErrorKind::InvalidPublicKey.into());
-    }
-    Ok(identity.sign(pq_opk_signing_input(suite.as_u8(), ek)))
+    sign_pq_key(PQ_OPK_DOMAIN, identity, suite, ek)
 }
 
 /// Verifies a last-resort PQSPK XEdDSA signature under `pqxdh.v1/pqspk\0`, checking that `suite`
@@ -155,12 +187,7 @@ pub fn verify_pq_spk_signature(
     ek: &[u8],
     signature: &[u8],
 ) -> Result<()> {
-    let suite_enum = PqSuite::from_u8(suite).ok_or(ErrorKind::UnsupportedSuite)?;
-    if ek.len() != suite_enum.ek_len() {
-        return Err(ErrorKind::InvalidPublicKey.into());
-    }
-    XEdDSAPublicKey::new(identity_key)?.verify(pq_spk_signing_input(suite, ek), signature)?;
-    Ok(())
+    verify_pq_key_signature(PQ_SPK_DOMAIN, identity_key, suite, ek, signature)
 }
 
 /// Verifies a one-time PQOPK XEdDSA signature under `pqxdh.v1/pqopk\0`, checking that `suite`
@@ -172,21 +199,78 @@ pub fn verify_pq_opk_signature(
     ek: &[u8],
     signature: &[u8],
 ) -> Result<()> {
-    let suite_enum = PqSuite::from_u8(suite).ok_or(ErrorKind::UnsupportedSuite)?;
-    if ek.len() != suite_enum.ek_len() {
-        return Err(ErrorKind::InvalidPublicKey.into());
-    }
-    XEdDSAPublicKey::new(identity_key)?.verify(pq_opk_signing_input(suite, ek), signature)?;
-    Ok(())
+    verify_pq_key_signature(PQ_OPK_DOMAIN, identity_key, suite, ek, signature)
 }
+
+#[cfg(feature = "serde")]
+pub(crate) fn deserialize_bounded_bytes<'de, D, const MAX: usize>(
+    deserializer: D,
+) -> core::result::Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedBytesVisitor<const MAX: usize>;
+
+    impl<'de, const MAX: usize> serde::de::Visitor<'de> for BoundedBytesVisitor<MAX> {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "at most {MAX} bytes")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> core::result::Result<Vec<u8>, E> {
+            if v.len() > MAX {
+                return Err(E::invalid_length(v.len(), &self));
+            }
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(
+            self,
+            v: Vec<u8>,
+        ) -> core::result::Result<Vec<u8>, E> {
+            if v.len() > MAX {
+                return Err(E::invalid_length(v.len(), &self));
+            }
+            Ok(v)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> core::result::Result<Vec<u8>, A::Error> {
+            let cap = seq.size_hint().unwrap_or(0).min(MAX);
+            let mut out = Vec::with_capacity(cap);
+            while let Some(byte) = seq.next_element::<u8>()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                out.push(byte);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedBytesVisitor::<MAX>)
+}
+
+#[cfg(feature = "rkyv")]
+#[derive(Debug, thiserror::Error)]
+#[error("invalid post-quantum wire payload length or identifier")]
+struct InvalidArchivedPqWire;
 
 /// A published post-quantum prekey (either a last-resort PQSPK or a one-time PQOPK), signed by
 /// Bob's identity key under its role-specific domain separator.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "RawPublishedPqPrekey")
+)]
 #[cfg_attr(
     feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
+    rkyv(bytecheck(verify))
 )]
 pub struct PublishedPqPrekey {
     /// The ML-KEM suite.
@@ -199,6 +283,53 @@ pub struct PublishedPqPrekey {
     /// [`pq_opk_signing_input`] (if one-time).
     #[cfg_attr(feature = "serde", serde(with = "serde_big_array::BigArray"))]
     pub signature: Signature,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(rename = "PublishedPqPrekey")]
+struct RawPublishedPqPrekey {
+    suite: PqSuite,
+    id: PqPrekeyId,
+    #[serde(deserialize_with = "deserialize_bounded_bytes::<_, MAX_PQ_BYTES>")]
+    encapsulation_key: Vec<u8>,
+    #[serde(with = "serde_big_array::BigArray")]
+    signature: Signature,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawPublishedPqPrekey> for PublishedPqPrekey {
+    type Error = crate::Error;
+
+    fn try_from(raw: RawPublishedPqPrekey) -> Result<Self> {
+        if raw.encapsulation_key.len() != raw.suite.ek_len()
+            || pq_prekey_id(raw.suite.as_u8(), &raw.encapsulation_key) != raw.id
+        {
+            return Err(ErrorKind::InvalidPublicKey.into());
+        }
+        Ok(Self {
+            suite: raw.suite,
+            id: raw.id,
+            encapsulation_key: raw.encapsulation_key,
+            signature: raw.signature,
+        })
+    }
+}
+
+#[cfg(feature = "rkyv")]
+unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedPublishedPqPrekey
+where
+    C: rkyv::rancor::Fallible + ?Sized,
+    C::Error: rkyv::rancor::Source,
+{
+    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
+        let suite = archived_suite(&self.suite);
+        let ek = self.encapsulation_key.as_slice();
+        if ek.len() != suite.ek_len() || pq_prekey_id(suite.as_u8(), ek) != self.id {
+            rkyv::rancor::fail!(InvalidArchivedPqWire);
+        }
+        Ok(())
+    }
 }
 
 /// Keys Bob publishes after `LocalPrekeys::generate_pq` or `LocalPrekeys::extend_pq`.
@@ -214,10 +345,15 @@ pub struct PublishedPqPrekeys {
 
 /// Bob's post-quantum prekey bundle, as Alice receives it to start a PQXDH session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "RawPqPrekeyBundle")
+)]
 #[cfg_attr(
     feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
+    rkyv(bytecheck(verify))
 )]
 pub struct PqPrekeyBundle {
     /// Bob's classical signed prekey.
@@ -242,12 +378,68 @@ pub struct PqPrekeyBundle {
     pub pq_last_resort: bool,
 }
 
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(rename = "PqPrekeyBundle")]
+struct RawPqPrekeyBundle {
+    signed_prekey: PublicKey,
+    #[serde(with = "opt_signature_serde")]
+    signed_prekey_signature: Option<Signature>,
+    one_time_prekey: Option<PublicKey>,
+    pq_suite: PqSuite,
+    #[serde(deserialize_with = "deserialize_bounded_bytes::<_, MAX_PQ_BYTES>")]
+    pq_prekey: Vec<u8>,
+    #[serde(with = "serde_big_array::BigArray")]
+    pq_prekey_signature: Signature,
+    pq_last_resort: bool,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawPqPrekeyBundle> for PqPrekeyBundle {
+    type Error = crate::Error;
+
+    fn try_from(raw: RawPqPrekeyBundle) -> Result<Self> {
+        if raw.pq_prekey.len() != raw.pq_suite.ek_len() {
+            return Err(ErrorKind::InvalidPublicKey.into());
+        }
+        Ok(Self {
+            signed_prekey: raw.signed_prekey,
+            signed_prekey_signature: raw.signed_prekey_signature,
+            one_time_prekey: raw.one_time_prekey,
+            pq_suite: raw.pq_suite,
+            pq_prekey: raw.pq_prekey,
+            pq_prekey_signature: raw.pq_prekey_signature,
+            pq_last_resort: raw.pq_last_resort,
+        })
+    }
+}
+
+#[cfg(feature = "rkyv")]
+unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedPqPrekeyBundle
+where
+    C: rkyv::rancor::Fallible + ?Sized,
+    C::Error: rkyv::rancor::Source,
+{
+    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
+        let suite = archived_suite(&self.pq_suite);
+        if self.pq_prekey.len() != suite.ek_len() {
+            rkyv::rancor::fail!(InvalidArchivedPqWire);
+        }
+        Ok(())
+    }
+}
+
 /// Alice's post-quantum initial message to Bob, which lets him derive the same PQXDH secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(try_from = "RawPqInitialMessage")
+)]
 #[cfg_attr(
     feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
+    rkyv(bytecheck(verify))
 )]
 pub struct PqInitialMessage {
     /// PQXDH protocol version ([`PQXDH_VERSION`] = 2).
@@ -268,6 +460,59 @@ pub struct PqInitialMessage {
     pub pq_prekey_id: PqPrekeyId,
     /// ML-KEM ciphertext (`pq_suite.ct_len()` bytes).
     pub pq_ciphertext: Vec<u8>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(rename = "PqInitialMessage")]
+struct RawPqInitialMessage {
+    version: u32,
+    identity_key: PublicKey,
+    ephemeral_key: PublicKey,
+    signed_prekey: PublicKey,
+    one_time_prekey: Option<PublicKey>,
+    pq_suite: PqSuite,
+    pq_last_resort: bool,
+    pq_prekey_id: PqPrekeyId,
+    #[serde(deserialize_with = "deserialize_bounded_bytes::<_, MAX_PQ_BYTES>")]
+    pq_ciphertext: Vec<u8>,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<RawPqInitialMessage> for PqInitialMessage {
+    type Error = crate::Error;
+
+    fn try_from(raw: RawPqInitialMessage) -> Result<Self> {
+        if raw.pq_ciphertext.len() != raw.pq_suite.ct_len() {
+            return Err(ErrorKind::InvalidCiphertext.into());
+        }
+        Ok(Self {
+            version: raw.version,
+            identity_key: raw.identity_key,
+            ephemeral_key: raw.ephemeral_key,
+            signed_prekey: raw.signed_prekey,
+            one_time_prekey: raw.one_time_prekey,
+            pq_suite: raw.pq_suite,
+            pq_last_resort: raw.pq_last_resort,
+            pq_prekey_id: raw.pq_prekey_id,
+            pq_ciphertext: raw.pq_ciphertext,
+        })
+    }
+}
+
+#[cfg(feature = "rkyv")]
+unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedPqInitialMessage
+where
+    C: rkyv::rancor::Fallible + ?Sized,
+    C::Error: rkyv::rancor::Source,
+{
+    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
+        let suite = archived_suite(&self.pq_suite);
+        if self.pq_ciphertext.len() != suite.ct_len() {
+            rkyv::rancor::fail!(InvalidArchivedPqWire);
+        }
+        Ok(())
+    }
 }
 
 /// The outcome of PQXDH, the same for Alice and Bob.
@@ -303,6 +548,10 @@ pub(crate) struct PqPrekeySecret {
     #[zeroize(skip)]
     pub(crate) suite: PqSuite,
     #[zeroize(skip)]
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_bounded_bytes::<_, MAX_PQ_BYTES>")
+    )]
     pub(crate) ek: Vec<u8>,
     #[cfg_attr(feature = "serde", serde(with = "seed64_serde"))]
     #[cfg_attr(feature = "rkyv", rkyv(with = Seed64Def))]

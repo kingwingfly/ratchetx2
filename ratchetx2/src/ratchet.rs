@@ -7,7 +7,7 @@ use core::fmt;
 
 use dh_root::DhRootRatchet;
 use message::MessageRatchet;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
 use crate::error::MalformedState;
@@ -16,17 +16,66 @@ use crate::{
     key::{DH_KEY_LENGTH, DhPrivateKey, HeaderKey, MessageKey, SharedKeys},
 };
 
+/// Which message chain the next DH-root ratchet step establishes.
+///
+/// Unifies the previously coupled `dh_step_updates_sender` and `dh_root.update_private_key`
+/// flags so inconsistent boolean combinations are unrepresentable in memory:
+/// - [`NextStep::UpdateSender`]: next DH step updates the sending chain without rotating the
+///   local DH private key.
+/// - [`NextStep::UpdateReceiver`]: next DH step updates the receiving chain and rotates the
+///   local DH private key afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
+enum NextStep {
+    UpdateSender,
+    UpdateReceiver,
+}
+
+impl NextStep {
+    #[cfg(any(feature = "serde", feature = "prost"))]
+    const fn from_updates_sender(updates_sender: bool) -> Self {
+        if updates_sender {
+            Self::UpdateSender
+        } else {
+            Self::UpdateReceiver
+        }
+    }
+
+    const fn updates_sender(self) -> bool {
+        matches!(self, Self::UpdateSender)
+    }
+
+    const fn rotates_private_key(self) -> bool {
+        matches!(self, Self::UpdateReceiver)
+    }
+
+    const fn flip(self) -> Self {
+        match self {
+            Self::UpdateSender => Self::UpdateReceiver,
+            Self::UpdateReceiver => Self::UpdateSender,
+        }
+    }
+}
+
+#[cfg(feature = "rkyv")]
+impl ArchivedNextStep {
+    const fn to_next_step(&self) -> NextStep {
+        match self {
+            Self::UpdateSender => NextStep::UpdateSender,
+            Self::UpdateReceiver => NextStep::UpdateReceiver,
+        }
+    }
+}
+
 /// Double ratchet. See the example in [`document`](crate::document).
 ///
 /// With the `serde` or `rkyv` feature, it serializes with all its keys, and with `prost` it
 /// converts to and from `proto::Ratchet`, so a session can be kept between runs: keep the output
 /// secret.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde::Serialize, serde::Deserialize),
-    serde(try_from = "RatchetUnchecked")
-)]
 #[cfg_attr(
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
@@ -36,39 +85,63 @@ pub struct Ratchet {
     dh_root: DhRootRatchet,
     message_ratchet_sender: MessageRatchet,
     message_ratchet_receiver: MessageRatchet,
-    /// - true: next dh step will update message_ratchet_sender
-    /// - false: next dh step will update message_ratchet_receiver
-    dh_step_updates_sender: bool,
+    #[zeroize(skip)]
+    next_step: NextStep,
 }
 
-/// Validate state-machine invariants shared across `Ratchet` and `ArchivedRatchet`.
+/// Validate chain-presence invariants shared across `Ratchet` and `ArchivedRatchet`.
 #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
-fn validate_ratchet_invariants(
-    update_private_key: bool,
-    dh_step_updates_sender: bool,
+fn validate_chain_invariants(
+    next_step: NextStep,
     has_sender_chain: bool,
     has_receiver_chain: bool,
 ) -> Result<(), MalformedState> {
-    if update_private_key != !dh_step_updates_sender {
-        return Err(MalformedState);
+    match next_step {
+        NextStep::UpdateSender if !has_receiver_chain => Err(MalformedState),
+        NextStep::UpdateReceiver if !has_sender_chain && has_receiver_chain => Err(MalformedState),
+        _ => Ok(()),
     }
-    if dh_step_updates_sender && !has_receiver_chain {
-        return Err(MalformedState);
-    }
-    if !dh_step_updates_sender && !has_sender_chain && has_receiver_chain {
-        return Err(MalformedState);
-    }
-    Ok(())
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+#[serde(rename = "Ratchet")]
+struct RatchetWireRef<'a> {
+    dh_root: dh_root::DhRootRatchetWireRef<'a>,
+    message_ratchet_sender: &'a MessageRatchet,
+    message_ratchet_receiver: &'a MessageRatchet,
+    dh_step_updates_sender: bool,
 }
 
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 #[serde(rename = "Ratchet")]
 struct RatchetUnchecked {
-    dh_root: DhRootRatchet,
+    dh_root: dh_root::DhRootRatchetWire,
     message_ratchet_sender: MessageRatchet,
     message_ratchet_receiver: MessageRatchet,
     dh_step_updates_sender: bool,
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for Ratchet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let wire = RatchetWireRef {
+            dh_root: self.dh_root.as_wire(self.next_step.rotates_private_key()),
+            message_ratchet_sender: &self.message_ratchet_sender,
+            message_ratchet_receiver: &self.message_ratchet_receiver,
+            dh_step_updates_sender: self.next_step.updates_sender(),
+        };
+        wire.serialize(serializer)
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Ratchet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RatchetUnchecked::deserialize(deserializer)?;
+        Self::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -76,11 +149,15 @@ impl TryFrom<RatchetUnchecked> for Ratchet {
     type Error = MalformedState;
 
     fn try_from(raw: RatchetUnchecked) -> Result<Self, Self::Error> {
+        let (dh_root, update_private_key) = DhRootRatchet::from_wire(raw.dh_root);
+        if update_private_key != !raw.dh_step_updates_sender {
+            return Err(MalformedState);
+        }
         let ratchet = Self {
-            dh_root: raw.dh_root,
+            dh_root,
             message_ratchet_sender: raw.message_ratchet_sender,
             message_ratchet_receiver: raw.message_ratchet_receiver,
-            dh_step_updates_sender: raw.dh_step_updates_sender,
+            next_step: NextStep::from_updates_sender(raw.dh_step_updates_sender),
         };
         ratchet.validate()?;
         Ok(ratchet)
@@ -91,21 +168,21 @@ impl TryFrom<RatchetUnchecked> for Ratchet {
 impl ArchivedRatchet {
     /// Whether the next DH step establishes the sending chain.
     pub fn dh_step_updates_sender(&self) -> bool {
-        self.dh_step_updates_sender
+        self.next_step.to_next_step().updates_sender()
     }
 
     /// Current sending header key of the archived ratchet, if a sending chain is established.
-    pub fn header_key_sender(&self) -> Option<HeaderKey> {
+    pub fn header_key_sender(&self) -> Option<Zeroizing<HeaderKey>> {
         self.message_ratchet_sender.header_key()
     }
 
     /// Current receiving header key of the archived ratchet, if a receiving chain is established.
-    pub fn header_key_receiver(&self) -> Option<HeaderKey> {
+    pub fn header_key_receiver(&self) -> Option<Zeroizing<HeaderKey>> {
         self.message_ratchet_receiver.header_key()
     }
 
     /// Next receiving header key of the archived ratchet.
-    pub fn next_header_key_receiver(&self) -> HeaderKey {
+    pub fn next_header_key_receiver(&self) -> Zeroizing<HeaderKey> {
         self.message_ratchet_receiver.next_header_key()
     }
 }
@@ -118,9 +195,8 @@ where
 {
     fn verify(&self, _context: &mut C) -> Result<(), C::Error> {
         use rkyv::rancor::Source;
-        validate_ratchet_invariants(
-            self.dh_root.update_private_key(),
-            self.dh_step_updates_sender,
+        validate_chain_invariants(
+            self.next_step.to_next_step(),
             self.message_ratchet_sender.has_chain(),
             self.message_ratchet_receiver.has_chain(),
         )
@@ -136,24 +212,34 @@ impl fmt::Debug for Ratchet {
 }
 
 impl PartialEq for Ratchet {
-    /// Alice and Bob have the same DhRootRatchet,
-    /// and Alice's message sending ratchet is the same as Bob's message receiving ratchet,
-    /// so is Alice's receiving ratchet and Bob's sending ratchet.
+    /// Standard reflexive, constant-time fieldwise equality between two ratchet states.
     ///
-    /// So, two Ratchets A and B are Eq only if they have the same DhRootRatchet,
-    /// A's sending ratchet equals B's receiving ratchet, and A's receiving ratchet equals B's
-    /// sending ratchet.
+    /// To check whether Alice and Bob hold complementary paired states, use
+    /// [`Ratchet::is_paired_with`].
     fn eq(&self, other: &Self) -> bool {
-        self.dh_root == other.dh_root
-            && self.message_ratchet_sender == other.message_ratchet_receiver
-            && self.message_ratchet_receiver == other.message_ratchet_sender
+        self.next_step == other.next_step
+            && self.dh_root == other.dh_root
+            && self.message_ratchet_sender == other.message_ratchet_sender
+            && self.message_ratchet_receiver == other.message_ratchet_receiver
     }
 }
 
+impl Eq for Ratchet {}
+
 impl Ratchet {
+    /// Whether `self` and `peer` are synchronized complementary sides of the same ratchet:
+    /// matching root key, opposite next-step roles, and `self`'s sending/receiving message
+    /// chains matching `peer`'s receiving/sending chains respectively.
+    pub fn is_paired_with(&self, peer: &Self) -> bool {
+        self.next_step != peer.next_step
+            && bool::from(self.dh_root.root_key_ct_eq(&peer.dh_root))
+            && self.message_ratchet_sender == peer.message_ratchet_receiver
+            && self.message_ratchet_receiver == peer.message_ratchet_sender
+    }
+
     /// Whether the next DH step establishes the sending chain.
     pub fn dh_step_updates_sender(&self) -> bool {
-        self.dh_step_updates_sender
+        self.next_step.updates_sender()
     }
 
     /// New a party who sends message first, from the shared `keys`.
@@ -164,7 +250,7 @@ impl Ratchet {
             dh_root: DhRootRatchet::alice(keys.secret_key),
             message_ratchet_sender: MessageRatchet::empty(keys.header_key_alice),
             message_ratchet_receiver: MessageRatchet::empty(keys.header_key_bob),
-            dh_step_updates_sender: true,
+            next_step: NextStep::UpdateSender,
         };
         this.step_dh_root(public_key)?;
         Ok(this)
@@ -182,7 +268,7 @@ impl Ratchet {
             dh_root: DhRootRatchet::bob(keys.secret_key, private_key),
             message_ratchet_sender: MessageRatchet::empty(keys.header_key_bob),
             message_ratchet_receiver: MessageRatchet::empty(keys.header_key_alice),
-            dh_step_updates_sender: false,
+            next_step: NextStep::UpdateReceiver,
         }
     }
 
@@ -192,12 +278,12 @@ impl Ratchet {
     }
 
     /// Get current message sending HeaderKey; None until the sending chain is set up.
-    pub fn header_key_sender(&self) -> Option<HeaderKey> {
+    pub fn header_key_sender(&self) -> Option<Zeroizing<HeaderKey>> {
         self.message_ratchet_sender.header_key()
     }
 
     /// Get current message receiving HeaderKey; None until the receiving chain is set up.
-    pub fn header_key_receiver(&self) -> Option<HeaderKey> {
+    pub fn header_key_receiver(&self) -> Option<Zeroizing<HeaderKey>> {
         self.message_ratchet_receiver.header_key()
     }
 
@@ -205,21 +291,21 @@ impl Ratchet {
     /// Classically, if failed with current HeaderKey when decrypting enc-header,
     /// one should try next HeaderKey, if succeed, do DhRootRatchet step and cache MessageKey
     /// for future (for it's message out of order).
-    pub fn next_header_key_receiver(&self) -> HeaderKey {
-        self.message_ratchet_receiver.next_header_key
+    pub fn next_header_key_receiver(&self) -> Zeroizing<HeaderKey> {
+        self.message_ratchet_receiver.next_header_key()
     }
 
     /// Perform ratchet step on message sending ratchet.
     /// Updating message sending ratchet's ChainKey, and return MessageKey;
     /// None until the sending chain is set up.
-    pub fn step_message_ratchet_sender(&mut self) -> Option<MessageKey> {
+    pub fn step_message_ratchet_sender(&mut self) -> Option<Zeroizing<MessageKey>> {
         self.message_ratchet_sender.step()
     }
 
     /// Perform ratchet step on message receiving ratchet.
     /// Update message receiving ratchet's ChainKey, and return MessageKey;
     /// None until the receiving chain is set up.
-    pub fn step_message_ratchet_receiver(&mut self) -> Option<MessageKey> {
+    pub fn step_message_ratchet_receiver(&mut self) -> Option<Zeroizing<MessageKey>> {
         self.message_ratchet_receiver.step()
     }
 
@@ -232,9 +318,6 @@ impl Ratchet {
     /// so in this implementation, dh-root step will update message sending and receiving chain in rotation.
     ///
     /// In other words, dh-root should step twice when receiving next-header-key encrypted header.
-    ///
-    /// Additionally, by doing so, it's more convenient to check whether states of parties are matching
-    /// when writing tests.
     ///
     /// On an invalid peer public key, returns an error and leaves the state unchanged.
     pub fn step_dh_root(&mut self, public_key: &[u8]) -> Result<(), CryptoError> {
@@ -255,16 +338,20 @@ impl Ratchet {
         public_key: &[u8],
         extra_secret: &[u8],
     ) -> Result<(), CryptoError> {
-        let (chain_key, next_header_key) = self.dh_root.step_with(public_key, extra_secret)?;
-        match self.dh_step_updates_sender {
-            true => {
+        let (chain_key, next_header_key) = self.dh_root.step_with(
+            public_key,
+            extra_secret,
+            self.next_step.rotates_private_key(),
+        )?;
+        match self.next_step {
+            NextStep::UpdateSender => {
                 self.message_ratchet_sender = MessageRatchet::from_key(
                     chain_key,
                     self.message_ratchet_sender.next_header_key,
                     next_header_key,
                 )
             }
-            false => {
+            NextStep::UpdateReceiver => {
                 self.message_ratchet_receiver = MessageRatchet::from_key(
                     chain_key,
                     self.message_ratchet_receiver.next_header_key,
@@ -272,16 +359,15 @@ impl Ratchet {
                 )
             }
         }
-        self.dh_step_updates_sender = !self.dh_step_updates_sender;
+        self.next_step = self.next_step.flip();
         Ok(())
     }
 
     /// Validate internal state-machine invariants.
     #[cfg(any(feature = "serde", feature = "prost"))]
     pub(crate) fn validate(&self) -> Result<(), MalformedState> {
-        validate_ratchet_invariants(
-            self.dh_root.update_private_key(),
-            self.dh_step_updates_sender,
+        validate_chain_invariants(
+            self.next_step,
             self.message_ratchet_sender.has_chain(),
             self.message_ratchet_receiver.has_chain(),
         )
@@ -292,10 +378,14 @@ impl Ratchet {
 impl From<&Ratchet> for crate::proto::Ratchet {
     fn from(ratchet: &Ratchet) -> Self {
         Self {
-            dh_root: Some((&ratchet.dh_root).into()),
+            dh_root: Some(
+                ratchet
+                    .dh_root
+                    .to_proto(ratchet.next_step.rotates_private_key()),
+            ),
             sender: Some((&ratchet.message_ratchet_sender).into()),
             receiver: Some((&ratchet.message_ratchet_receiver).into()),
-            dh_step_updates_sender: ratchet.dh_step_updates_sender,
+            dh_step_updates_sender: ratchet.next_step.updates_sender(),
         }
     }
 }
@@ -307,15 +397,20 @@ impl TryFrom<&crate::proto::Ratchet> for Ratchet {
     fn try_from(ratchet: &crate::proto::Ratchet) -> Result<Self, Self::Error> {
         use crate::error::MalformedState;
 
+        let (dh_root, update_private_key) =
+            DhRootRatchet::from_proto(ratchet.dh_root.as_ref().ok_or(MalformedState)?)?;
+        if update_private_key != !ratchet.dh_step_updates_sender {
+            return Err(MalformedState);
+        }
         let restored = Self {
-            dh_root: ratchet.dh_root.as_ref().ok_or(MalformedState)?.try_into()?,
+            dh_root,
             message_ratchet_sender: ratchet.sender.as_ref().ok_or(MalformedState)?.try_into()?,
             message_ratchet_receiver: ratchet
                 .receiver
                 .as_ref()
                 .ok_or(MalformedState)?
                 .try_into()?,
-            dh_step_updates_sender: ratchet.dh_step_updates_sender,
+            next_step: NextStep::from_updates_sender(ratchet.dh_step_updates_sender),
         };
         restored.validate()?;
         Ok(restored)
@@ -331,6 +426,86 @@ mod test {
             secret_key: [1; 32],
             header_key_alice: [2; 32],
             header_key_bob: [3; 32],
+        }
+    }
+
+    #[test]
+    fn shared_keys_from_secret_kat() {
+        let derived = SharedKeys::from_secret(&[0x42; 32]);
+        // Verify deterministic HKDF-SHA256 derivation against independent extraction/expansion.
+        let (_, hkdf) = hkdf::Hkdf::<sha2::Sha256>::extract(Some(&[0u8; 32]), &[0x42u8; 32]);
+        let mut expected = [0u8; 96];
+        hkdf.expand(b"ratchetx2.v1", &mut expected).unwrap();
+        assert_eq!(derived.secret_key, expected[0..32]);
+        assert_eq!(derived.header_key_alice, expected[32..64]);
+        assert_eq!(derived.header_key_bob, expected[64..96]);
+        // Distinct keys from distinct inputs.
+        let other = SharedKeys::from_secret(&[0x43; 32]);
+        assert_ne!(derived.secret_key, other.secret_key);
+    }
+
+    #[test]
+    fn partial_eq_is_reflexive_and_is_paired_with_checks_peer_complement() {
+        let keys = test_keys();
+        let mut bob = Ratchet::bob(&keys, DhPrivateKey::generate());
+        let alice = Ratchet::alice(&keys, &bob.public_key()).unwrap();
+
+        // Standard reflexivity on Ratchet.
+        assert_eq!(alice, alice);
+        assert_eq!(bob, bob);
+        assert_ne!(alice, bob);
+        assert!(!alice.is_paired_with(&alice));
+        assert!(!alice.is_paired_with(&bob));
+
+        // After Bob receives Alice's first message, they are paired (complementary, not equal).
+        bob.step_dh_root(&alice.public_key()).unwrap();
+        assert_eq!(bob, bob);
+        assert_ne!(alice, bob);
+        assert!(alice.is_paired_with(&bob));
+        assert!(bob.is_paired_with(&alice));
+
+        // Unrelated session with different root key is NOT paired.
+        let other_keys = SharedKeys::from_secret(&[0x99; 32]);
+        let other_bob = Ratchet::bob(&other_keys, DhPrivateKey::generate());
+        assert!(!alice.is_paired_with(&other_bob));
+    }
+
+    #[test]
+    fn multi_turn_ratchet_derives_matching_keys() {
+        let keys = SharedKeys::from_secret(&[0x11; 32]);
+        let mut bob = Ratchet::bob(&keys, DhPrivateKey::generate());
+        let mut alice = Ratchet::alice(&keys, &bob.public_key()).unwrap();
+
+        // Turn 0: Alice -> Bob
+        bob.step_dh_root(&alice.public_key()).unwrap();
+        assert!(alice.is_paired_with(&bob));
+        assert_eq!(alice.header_key_sender(), bob.header_key_receiver());
+        for _ in 0..3 {
+            assert_eq!(
+                alice.step_message_ratchet_sender().unwrap(),
+                bob.step_message_ratchet_receiver().unwrap()
+            );
+        }
+
+        // Subsequent alternating turns: Bob -> Alice -> Bob -> Alice
+        for turn in 0..4 {
+            let (sender, receiver) = if turn % 2 == 0 {
+                (&mut bob, &mut alice)
+            } else {
+                (&mut alice, &mut bob)
+            };
+            let peer_pub = receiver.public_key();
+            sender.step_dh_root(&peer_pub).unwrap();
+            let sender_pub = sender.public_key();
+            receiver.step_dh_root(&sender_pub).unwrap();
+            assert!(sender.is_paired_with(receiver));
+            assert_eq!(sender.header_key_sender(), receiver.header_key_receiver());
+            for _ in 0..2 {
+                assert_eq!(
+                    sender.step_message_ratchet_sender().unwrap(),
+                    receiver.step_message_ratchet_receiver().unwrap()
+                );
+            }
         }
     }
 
@@ -405,26 +580,32 @@ mod test {
         let keys = test_keys();
         let mut bob_classic = Ratchet::bob(&keys, DhPrivateKey::generate());
         let mut alice_classic = Ratchet::alice(&keys, &bob_classic.public_key()).unwrap();
-        let mut bob_hybrid = bob_classic.clone();
-        let mut alice_hybrid = alice_classic.clone();
+        let mut bob_empty = bob_classic.clone();
 
-        // Empty extra_secret matches classical step_dh_root bit-for-bit.
+        // Empty extra_secret matches classical step_dh_root bit-for-bit on the exact same DH input.
         bob_classic
             .step_dh_root(&alice_classic.public_key())
             .unwrap();
-        bob_hybrid
-            .step_dh_root_with(&alice_hybrid.public_key(), &[])
+        bob_empty
+            .step_dh_root_with(&alice_classic.public_key(), &[])
             .unwrap();
-        assert_eq!(alice_classic, bob_classic);
-        assert_eq!(alice_hybrid, bob_hybrid);
+        assert!(alice_classic.is_paired_with(&bob_classic));
+        assert!(alice_classic.is_paired_with(&bob_empty));
         let mk_c = bob_classic.step_message_ratchet_receiver().unwrap();
-        let mk_h = bob_hybrid.step_message_ratchet_receiver().unwrap();
-        assert_eq!(mk_c, mk_h);
+        let mk_e = bob_empty.step_message_ratchet_receiver().unwrap();
+        assert_eq!(mk_c, mk_e);
         assert_eq!(alice_classic.step_message_ratchet_sender().unwrap(), mk_c);
-        assert_eq!(alice_hybrid.step_message_ratchet_sender().unwrap(), mk_h);
 
-        // Non-empty extra_secret keeps Alice & Bob synchronized and domain-separated from classical.
+        // Clone AFTER Bob's initial receiving step so every branch starts from the EXACT same
+        // DH keypairs (and Bob's send step does NOT rotate his DH private key).
+        let mut bob_hybrid = bob_classic.clone();
+        let mut alice_hybrid = alice_classic.clone();
+        let mut bob_hybrid_other = bob_classic.clone();
+        assert_eq!(bob_classic.public_key(), bob_hybrid.public_key());
+
         let pq_secret = [0xA5u8; 32];
+        let other_pq_secret = [0x5Au8; 32];
+
         bob_classic
             .step_dh_root(&alice_classic.public_key())
             .unwrap();
@@ -438,14 +619,25 @@ mod test {
         alice_hybrid
             .step_dh_root_with(&bob_hybrid.public_key(), &pq_secret)
             .unwrap();
-        assert_eq!(alice_hybrid, bob_hybrid);
+        assert!(alice_hybrid.is_paired_with(&bob_hybrid));
+
+        bob_hybrid_other
+            .step_dh_root_with(&alice_hybrid.public_key(), &other_pq_secret)
+            .unwrap();
+
+        // All three branches used the identical DH pair (bob_classic.public_key() == bob_hybrid.public_key()).
+        assert_eq!(bob_classic.public_key(), bob_hybrid.public_key());
+        assert_eq!(bob_classic.public_key(), bob_hybrid_other.public_key());
 
         let mk_bob = bob_hybrid.step_message_ratchet_sender().unwrap();
         let mk_alice = alice_hybrid.step_message_ratchet_receiver().unwrap();
         assert_eq!(mk_bob, mk_alice);
 
         let mk_classic = bob_classic.step_message_ratchet_sender().unwrap();
+        let mk_other = bob_hybrid_other.step_message_ratchet_sender().unwrap();
         assert_ne!(mk_bob, mk_classic);
+        assert_ne!(mk_bob, mk_other);
+        assert_ne!(mk_classic, mk_other);
     }
 
     /// `ratchet` saved and restored, once through each format enabled.
@@ -470,19 +662,22 @@ mod test {
         let keys = test_keys();
         let mut bob = Ratchet::bob(&keys, DhPrivateKey::generate());
         let alice = Ratchet::alice(&keys, &bob.public_key()).unwrap();
-        // Bob's chains are still unset.
+        // Bob's chains are still unset, and each restored snapshot equals the original.
         for restored in restored(&bob) {
+            assert_eq!(restored, bob);
             assert_eq!(restored.header_key_sender(), None);
             assert_eq!(restored.header_key_receiver(), None);
         }
 
         bob.step_dh_root(&alice.public_key()).unwrap();
-        for (mut alice, mut bob) in restored(&alice).into_iter().zip(restored(&bob)) {
-            assert_eq!(alice, bob);
+        for (mut alice_r, mut bob_r) in restored(&alice).into_iter().zip(restored(&bob)) {
+            assert_eq!(alice_r, alice);
+            assert_eq!(bob_r, bob);
+            assert!(alice_r.is_paired_with(&bob_r));
             // So is which chain the next steps update, and with which keys.
-            bob.step_dh_root(&alice.public_key()).unwrap();
-            alice.step_dh_root(&bob.public_key()).unwrap();
-            assert_eq!(alice, bob);
+            bob_r.step_dh_root(&alice_r.public_key()).unwrap();
+            alice_r.step_dh_root(&bob_r.public_key()).unwrap();
+            assert!(alice_r.is_paired_with(&bob_r));
         }
     }
 
@@ -527,7 +722,7 @@ mod test {
         {
             // Construct an invalid Ratchet directly and verify rkyv bytecheck rejects it.
             let mut invalid = alice.clone();
-            invalid.dh_step_updates_sender = true;
+            invalid.next_step = NextStep::UpdateSender;
             let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&invalid).unwrap();
             assert!(rkyv::from_bytes::<Ratchet, rkyv::rancor::Error>(&bytes).is_err());
         }

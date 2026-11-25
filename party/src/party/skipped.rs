@@ -175,9 +175,88 @@ impl EvictionState for EvictedSet {
 }
 
 #[cfg(feature = "serde")]
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> core::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T, const MAX: usize>(core::marker::PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedVecVisitor<T, MAX>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a sequence of at most {MAX} items")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> core::result::Result<Vec<T>, A::Error> {
+            let cap = seq.size_hint().unwrap_or(0).min(MAX);
+            let mut out = Vec::with_capacity(cap);
+            while let Some(item) = seq.next_element::<T>()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(core::marker::PhantomData))
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_bounded_vecdeque<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> core::result::Result<VecDeque<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedDequeVisitor<T, const MAX: usize>(core::marker::PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedDequeVisitor<T, MAX>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = VecDeque<T>;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a sequence of at most {MAX} items")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> core::result::Result<VecDeque<T>, A::Error> {
+            let cap = seq.size_hint().unwrap_or(0).min(MAX);
+            let mut out = VecDeque::with_capacity(cap);
+            while let Some(item) = seq.next_element::<T>()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                out.push_back(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedDequeVisitor::<T, MAX>(core::marker::PhantomData))
+}
+
+#[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 #[serde(rename = "EvictedSet")]
 struct EvictedSetUnchecked {
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_EVICTED_RANGES>")]
     ranges: Vec<(u64, u64)>,
     collapsed_below: u64,
 }
@@ -251,6 +330,10 @@ where
             let mut guard = KeyMapGuard(BTreeMap::new());
             while let Some((number, value)) = map.next_entry::<u64, MessageKey>()? {
                 let mut value = Zeroizing::new(value);
+                if guard.0.len() >= SKIP_MAX as usize {
+                    value.zeroize();
+                    return Err(serde::de::Error::custom("too many skipped message keys"));
+                }
                 if guard.0.contains_key(&number) {
                     value.zeroize();
                     return Err(serde::de::Error::custom("duplicate skipped message number"));
@@ -307,20 +390,20 @@ impl ZeroizeOnDrop for SkippedChain {}
 
 impl SkippedChain {
     /// No keys yet, in the peer's current chain, whose header key is `header_key`.
-    pub(super) fn new(header_key: HeaderKey) -> Self {
+    pub(super) fn new(header_key: Zeroizing<HeaderKey>) -> Self {
         Self {
-            header_key,
+            header_key: *header_key,
             keys: BTreeMap::new(),
             age: 0,
             evicted: EvictedSet::default(),
         }
     }
 
-    pub(super) fn insert(&mut self, message_number: u64, message_key: MessageKey) {
+    pub(super) fn insert(&mut self, message_number: u64, message_key: Zeroizing<MessageKey>) {
         if let Some(existing) = self.keys.get_mut(&message_number) {
             existing.zeroize();
         }
-        self.keys.insert(message_number, message_key);
+        self.keys.insert(message_number, *message_key);
     }
 }
 
@@ -374,8 +457,8 @@ impl SkippedKeys {
     }
 
     /// The header keys of the chains with keys left.
-    pub(super) fn header_keys(&self) -> impl Iterator<Item = HeaderKey> + '_ {
-        self.chains.iter().map(|chain| chain.header_key)
+    pub(super) fn header_keys(&self) -> impl Iterator<Item = &HeaderKey> + '_ {
+        self.chains.iter().map(|chain| &chain.header_key)
     }
 
     /// The key of message `message_number` in the chain of `header_key`, if it was skipped.
@@ -614,6 +697,7 @@ impl Drop for LegacySkippedChain {
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 pub(super) struct LegacySkippedKeys {
+    #[serde(deserialize_with = "deserialize_bounded_vecdeque::<_, _, MAX_SKIPPED_CHAINS>")]
     chains: VecDeque<LegacySkippedChain>,
 }
 
@@ -639,6 +723,7 @@ impl From<LegacySkippedKeys> for SkippedKeys {
 #[derive(serde::Deserialize)]
 #[serde(rename = "SkippedKeys")]
 struct SkippedKeysUnchecked {
+    #[serde(deserialize_with = "deserialize_bounded_vecdeque::<_, _, MAX_SKIPPED_CHAINS>")]
     chains: VecDeque<SkippedChain>,
 }
 
@@ -827,9 +912,9 @@ mod test {
 
     /// Keys for `message_numbers` in the chain of header key `[header_key; 32]`.
     fn chain(header_key: u8, message_numbers: Range<u64>) -> SkippedChain {
-        let mut chain = SkippedChain::new([header_key; 32]);
+        let mut chain = SkippedChain::new(Zeroizing::new([header_key; 32]));
         for message_number in message_numbers {
-            chain.insert(message_number, [message_number as u8; 32]);
+            chain.insert(message_number, Zeroizing::new([message_number as u8; 32]));
         }
         chain
     }
@@ -847,7 +932,10 @@ mod test {
         assert_eq!(skipped.get(&[1; 32], 3), None);
         assert_eq!(skipped.get(&[2; 32], 0), None);
         // An empty chain is not kept.
-        assert_eq!(skipped.header_keys().collect::<Vec<_>>(), [[1; 32]]);
+        assert_eq!(
+            skipped.header_keys().copied().collect::<Vec<_>>(),
+            [[1; 32]]
+        );
 
         skipped.remove(&[1; 32], 5);
         skipped.remove(&[1; 32], 5);

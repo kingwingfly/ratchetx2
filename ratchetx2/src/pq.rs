@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 use ml_kem::MlKem768;
 #[cfg(feature = "ml-kem-1024")]
 use ml_kem::MlKem1024;
-use ml_kem::{B32, Decapsulate, DecapsulationKey, EncapsulationKey, KeyExport, Seed};
+use ml_kem::{B32, Decapsulate, DecapsulationKey, EncapsulationKey, KeyExport, Seed, TryKeyInit};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -25,6 +25,9 @@ pub const KEM_SEED_LENGTH: usize = 64;
 pub const KEM_KEY_ID_LENGTH: usize = 16;
 /// Length of an ML-KEM shared secret in bytes.
 pub const KEM_SHARED_SECRET_LENGTH: usize = 32;
+/// Maximum byte length of any supported ML-KEM encapsulation key or ciphertext (ML-KEM-1024).
+#[cfg(feature = "serde")]
+const MAX_KEM_BYTES: usize = 1568;
 /// Zeroizing 32-byte ML-KEM shared secret.
 pub type KemSharedSecret = Zeroizing<[u8; KEM_SHARED_SECRET_LENGTH]>;
 /// Maximum number of concurrent pending local KEM offers retained per session.
@@ -325,6 +328,89 @@ impl fmt::Debug for PendingOffer {
     }
 }
 
+#[cfg(feature = "serde")]
+fn deserialize_bounded_bytes<'de, D, const MAX: usize>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BoundedBytesVisitor<const MAX: usize>;
+
+    impl<'de, const MAX: usize> serde::de::Visitor<'de> for BoundedBytesVisitor<MAX> {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "at most {MAX} bytes")
+        }
+
+        fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            if v.len() > MAX {
+                return Err(E::invalid_length(v.len(), &self));
+            }
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: serde::de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            if v.len() > MAX {
+                return Err(E::invalid_length(v.len(), &self));
+            }
+            Ok(v)
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            let cap = seq.size_hint().unwrap_or(0).min(MAX);
+            let mut out = Vec::with_capacity(cap);
+            while let Some(byte) = seq.next_element::<u8>()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                out.push(byte);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedBytesVisitor::<MAX>)
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_bounded_vecdeque<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> Result<VecDeque<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedDequeVisitor<T, const MAX: usize>(core::marker::PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedDequeVisitor<T, MAX>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = VecDeque<T>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a sequence of at most {MAX} items")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<VecDeque<T>, A::Error> {
+            let cap = seq.size_hint().unwrap_or(0).min(MAX);
+            let mut out = VecDeque::with_capacity(cap);
+            while let Some(item) = seq.next_element::<T>()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                out.push_back(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedDequeVisitor::<T, MAX>(core::marker::PhantomData))
+}
+
 /// Ciphertext retransmitted on every message of the current sending chain.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -334,6 +420,10 @@ impl fmt::Debug for PendingOffer {
 )]
 struct ActiveSendCt {
     ek_id: [u8; KEM_KEY_ID_LENGTH],
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_bounded_bytes::<_, MAX_KEM_BYTES>")
+    )]
     ct: Vec<u8>,
 }
 
@@ -355,6 +445,10 @@ impl fmt::Debug for ActiveSendCt {
 )]
 struct PeerPendingEk {
     ek_id: [u8; KEM_KEY_ID_LENGTH],
+    #[cfg_attr(
+        feature = "serde",
+        serde(deserialize_with = "deserialize_bounded_bytes::<_, MAX_KEM_BYTES>")
+    )]
     ek: Vec<u8>,
 }
 
@@ -364,6 +458,16 @@ impl fmt::Debug for PeerPendingEk {
             .field("ek_id", &self.ek_id)
             .field("ek_len", &self.ek.len())
             .finish()
+    }
+}
+
+/// Digest pin of the `(ek_id, SHA-256(ct))` observed at the start of the current receiving chain.
+type RecvCtPin = Option<([u8; KEM_KEY_ID_LENGTH], [u8; 32])>;
+
+fn header_ct_pin(header: &KemHeader) -> RecvCtPin {
+    match (header.ek_id, header.ct.as_deref()) {
+        (Some(ek_id), Some(ct)) => Some((ek_id, Sha256::digest(ct).into())),
+        _ => None,
     }
 }
 
@@ -398,6 +502,17 @@ pub struct KemRatchet {
     messages_since_rekey: u64,
     turns_since_rekey: u64,
     initial_offer_needed: bool,
+    /// Transient in-memory cache of the active offer's expanded encapsulation key so repeated
+    /// `prepare_send` calls do not re-expand from seed. Skipped on serialization to keep wire
+    /// state seed-only and postcard-compatible.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "rkyv", rkyv(with = rkyv::with::Skip))]
+    active_offer_ek: Option<([u8; KEM_KEY_ID_LENGTH], Vec<u8>)>,
+    /// Transient pin of the `(ek_id, SHA-256(ct))` seen on the current receiving chain so
+    /// mid-chain retransmissions with a mismatched `ek_id` or `ct` are rejected.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    #[cfg_attr(feature = "rkyv", rkyv(with = rkyv::with::Skip))]
+    current_recv_ct_pin: Option<RecvCtPin>,
 }
 
 impl Zeroize for KemRatchet {
@@ -422,6 +537,12 @@ impl Zeroize for KemRatchet {
         self.messages_since_rekey.zeroize();
         self.turns_since_rekey.zeroize();
         self.initial_offer_needed.zeroize();
+        if let Some((id, ek)) = self.active_offer_ek.as_mut() {
+            id.zeroize();
+            ek.zeroize();
+        }
+        self.active_offer_ek = None;
+        self.current_recv_ct_pin = None;
     }
 }
 
@@ -473,6 +594,8 @@ impl KemRatchet {
             messages_since_rekey: 0,
             turns_since_rekey: 0,
             initial_offer_needed: true,
+            active_offer_ek: None,
+            current_recv_ct_pin: None,
         }
     }
 
@@ -518,12 +641,20 @@ impl KemRatchet {
         let ek = if let Some(ek) = fresh_ek {
             Some(ek)
         } else if let Some(active_id) = self.active_offer_id {
-            let offer = self
-                .pending_offers
-                .iter()
-                .find(|offer| offer.id == active_id)
-                .ok_or(CryptoError)?;
-            Some(expand_ek(self.suite, offer.seed.as_bytes()))
+            if let Some((cached_id, cached_ek)) = &self.active_offer_ek
+                && *cached_id == active_id
+            {
+                Some(cached_ek.clone())
+            } else {
+                let offer = self
+                    .pending_offers
+                    .iter()
+                    .find(|offer| offer.id == active_id)
+                    .ok_or(CryptoError)?;
+                let expanded = expand_ek(self.suite, offer.seed.as_bytes());
+                self.active_offer_ek = Some((active_id, expanded.clone()));
+                Some(expanded)
+            }
         } else {
             None
         };
@@ -560,49 +691,81 @@ impl KemRatchet {
     ///   chain). The resulting ciphertext is stored for outbound messages on the new sending
     ///   chain.
     ///
-    /// Call on a cloned [`KemRatchet`] and commit only after message AEAD verification succeeds.
+    /// All fallible decapsulation and encapsulation operations complete before `self` is mutated,
+    /// so an error always leaves `self` untouched. Call on a cloned [`KemRatchet`] and commit
+    /// only after message AEAD verification succeeds.
     pub fn receive_chain_step(
         &mut self,
         header: &KemHeader,
     ) -> Result<(Option<KemSharedSecret>, Option<KemSharedSecret>), CryptoError> {
         self.validate_incoming_header(header)?;
 
-        // 1. Receiver DH step: decapsulate peer ciphertext if present.
-        let recv_secret = if let (Some(ct), Some(ek_id)) = (&header.ct, header.ek_id) {
+        // 1. Compute receiver decapsulation without mutating `self`.
+        let recv_outcome = if let (Some(ct), Some(ek_id)) = (&header.ct, header.ek_id) {
             let pos = self
                 .pending_offers
                 .iter()
                 .position(|offer| offer.id == ek_id)
                 .ok_or(CryptoError)?;
             let ss = decapsulate(self.suite, self.pending_offers[pos].seed.as_bytes(), ct)?;
+            Some((pos, ek_id, ss))
+        } else {
+            None
+        };
+
+        // 2. Determine which peer encapsulation key will be encapsulated for our next sending
+        // chain, and perform the fallible encapsulation BEFORE mutating `self`.
+        let incoming_peer_ek = header.ek.as_deref().and_then(|ek| {
+            let ek_id = kem_key_id(self.suite, ek);
+            if self.encapsulated_ek_ids.contains(&ek_id) {
+                None
+            } else {
+                Some((ek_id, ek))
+            }
+        });
+        let encap_target: Option<([u8; KEM_KEY_ID_LENGTH], &[u8])> =
+            incoming_peer_ek.or_else(|| {
+                self.peer_pending_ek
+                    .as_ref()
+                    .map(|pending| (pending.ek_id, pending.ek.as_slice()))
+            });
+        let send_outcome = match encap_target {
+            Some((ek_id, ek)) => {
+                let (ct, ss) = encapsulate(self.suite, ek)?;
+                Some((ActiveSendCt { ek_id, ct }, ss))
+            }
+            None => None,
+        };
+
+        // 3. All fallible operations succeeded; commit state mutations atomically.
+        let recv_secret = if let Some((pos, ek_id, ss)) = recv_outcome {
             // Removing drops PendingOffer -> KemSeed::drop zeroizes the 64-byte seed.
             self.pending_offers.remove(pos);
             if self.active_offer_id == Some(ek_id) {
                 self.active_offer_id = None;
+                self.active_offer_ek = None;
             }
             Some(ss)
         } else {
             None
         };
 
-        // 2. Record any newly offered peer encapsulation key.
-        if let Some(ek) = &header.ek {
-            self.record_peer_ek(ek);
-        }
-
-        // 3. Sender DH step: starting a brand-new sending chain replaces any prior send ct.
-        self.active_send_ct = None;
-        let send_secret = if let Some(peer_ek) = self.peer_pending_ek.take() {
-            let (ct, ss) = encapsulate(self.suite, &peer_ek.ek)?;
-            self.active_send_ct = Some(ActiveSendCt {
-                ek_id: peer_ek.ek_id,
-                ct,
-            });
-            self.record_encapsulated_ek_id(peer_ek.ek_id);
-            Some(ss)
-        } else {
-            None
+        self.peer_pending_ek = None;
+        let send_secret = match send_outcome {
+            Some((active, ss)) => {
+                let ek_id = active.ek_id;
+                self.active_send_ct = Some(active);
+                self.record_encapsulated_ek_id(ek_id);
+                Some(ss)
+            }
+            None => {
+                self.active_send_ct = None;
+                None
+            }
         };
+
+        // Pin the chain-start `(ek_id, ct)` for subsequent messages on this receiving chain.
+        self.current_recv_ct_pin = Some(header_ct_pin(header));
 
         // 4. Update rekey cadence state.
         if recv_secret.is_some() || send_secret.is_some() {
@@ -619,12 +782,32 @@ impl KemRatchet {
 
     /// Process an incoming [`KemHeader`] on the current receiving chain (no DH step).
     ///
-    /// Validates the PQ fields, queues any new peer encapsulation key for our next sending chain,
-    /// and updates the message counter. Retransmitted ciphertexts belonging to the current chain
-    /// are validated structurally without attempting a second decapsulation.
+    /// Validates the PQ fields, verifies that any retransmitted ciphertext and `ek_id` match the
+    /// chain-start ciphertext observed for this receiving chain, queues any new peer encapsulation
+    /// key for our next sending chain, and updates the message counter.
     ///
     /// Call on a cloned [`KemRatchet`] and commit only after message AEAD verification succeeds.
     pub fn receive_current_chain(&mut self, header: &KemHeader) -> Result<(), CryptoError> {
+        self.validate_incoming_header(header)?;
+        let pin = header_ct_pin(header);
+        match self.current_recv_ct_pin {
+            Some(expected) if expected != pin => return Err(CryptoError),
+            None => self.current_recv_ct_pin = Some(pin),
+            Some(_) => {}
+        }
+        if let Some(ek) = &header.ek {
+            self.record_peer_ek(ek);
+        }
+        self.messages_since_rekey = self.messages_since_rekey.saturating_add(1);
+        Ok(())
+    }
+
+    /// Process an incoming [`KemHeader`] on a decrypted skipped (out-of-order) message: validates
+    /// the PQ fields, queues any newly observed peer encapsulation key so PQ-PCS is not delayed,
+    /// and accounts for the message in the rekey cadence.
+    ///
+    /// Call on a cloned [`KemRatchet`] and commit only after message AEAD verification succeeds.
+    pub fn receive_skipped_header(&mut self, header: &KemHeader) -> Result<(), CryptoError> {
         self.validate_incoming_header(header)?;
         if let Some(ek) = &header.ek {
             self.record_peer_ek(ek);
@@ -662,6 +845,7 @@ impl KemRatchet {
         }
         self.pending_offers.push_back(PendingOffer { id, seed });
         self.active_offer_id = Some(id);
+        self.active_offer_ek = Some((id, ek.clone()));
         self.initial_offer_needed = false;
         Ok((id, ek))
     }
@@ -789,39 +973,40 @@ fn validate_kem_ratchet_state<'a>(
     Ok(())
 }
 
+/// Dispatches an operation over the compiled [`PqSuite`] parameter sets without duplicating
+/// `MlKem1024`/`MlKem768` arms.
+macro_rules! dispatch_suite {
+    ($suite:expr, |$k:ident| $body:expr) => {
+        match $suite {
+            #[cfg(feature = "ml-kem-1024")]
+            PqSuite::MlKem1024 => {
+                type $k = MlKem1024;
+                $body
+            }
+            #[cfg(feature = "ml-kem-768")]
+            PqSuite::MlKem768 => {
+                type $k = MlKem768;
+                $body
+            }
+        }
+    };
+}
+
 /// Expand a 64-byte FIPS 203 `(d, z)` seed into its encoded encapsulation key bytes.
 fn expand_ek(suite: PqSuite, seed: &[u8; KEM_SEED_LENGTH]) -> Vec<u8> {
     let seed = Zeroizing::new(Seed::from(*seed));
-    match suite {
-        #[cfg(feature = "ml-kem-1024")]
-        PqSuite::MlKem1024 => {
-            let dk = DecapsulationKey::<MlKem1024>::from_seed(*seed);
-            dk.encapsulation_key().to_bytes().as_slice().to_vec()
-        }
-        #[cfg(feature = "ml-kem-768")]
-        PqSuite::MlKem768 => {
-            let dk = DecapsulationKey::<MlKem768>::from_seed(*seed);
-            dk.encapsulation_key().to_bytes().as_slice().to_vec()
-        }
-    }
+    dispatch_suite!(suite, |K| {
+        let dk = DecapsulationKey::<K>::from_seed(*seed);
+        dk.encapsulation_key().to_bytes().as_slice().to_vec()
+    })
 }
 
 /// Validate an encoded ML-KEM encapsulation key (exact length + FIPS 203 modulus check).
 fn validate_ek(suite: PqSuite, ek: &[u8]) -> Result<(), CryptoError> {
-    match suite {
-        #[cfg(feature = "ml-kem-1024")]
-        PqSuite::MlKem1024 => {
-            let arr = ek.try_into().map_err(|_| CryptoError)?;
-            EncapsulationKey::<MlKem1024>::new(arr).map_err(|_| CryptoError)?;
-            Ok(())
-        }
-        #[cfg(feature = "ml-kem-768")]
-        PqSuite::MlKem768 => {
-            let arr = ek.try_into().map_err(|_| CryptoError)?;
-            EncapsulationKey::<MlKem768>::new(arr).map_err(|_| CryptoError)?;
-            Ok(())
-        }
-    }
+    dispatch_suite!(suite, |K| {
+        EncapsulationKey::<K>::new_from_slice(ek).map_err(|_| CryptoError)?;
+        Ok(())
+    })
 }
 
 /// Encapsulate a fresh shared secret to an encoded ML-KEM encapsulation key.
@@ -831,28 +1016,14 @@ fn encapsulate(
 ) -> Result<(Vec<u8>, Zeroizing<[u8; KEM_SHARED_SECRET_LENGTH]>), CryptoError> {
     let mut m = Zeroizing::new(B32::default());
     getrandom::fill(m.as_mut_slice()).map_err(|_| CryptoError)?;
-    match suite {
-        #[cfg(feature = "ml-kem-1024")]
-        PqSuite::MlKem1024 => {
-            let arr = ek.try_into().map_err(|_| CryptoError)?;
-            let ek = EncapsulationKey::<MlKem1024>::new(arr).map_err(|_| CryptoError)?;
-            let (ct, mut ss) = ek.encapsulate_deterministic(&m);
-            let mut out = Zeroizing::new([0u8; KEM_SHARED_SECRET_LENGTH]);
-            out.copy_from_slice(ss.as_slice());
-            ss.zeroize();
-            Ok((ct.as_slice().to_vec(), out))
-        }
-        #[cfg(feature = "ml-kem-768")]
-        PqSuite::MlKem768 => {
-            let arr = ek.try_into().map_err(|_| CryptoError)?;
-            let ek = EncapsulationKey::<MlKem768>::new(arr).map_err(|_| CryptoError)?;
-            let (ct, mut ss) = ek.encapsulate_deterministic(&m);
-            let mut out = Zeroizing::new([0u8; KEM_SHARED_SECRET_LENGTH]);
-            out.copy_from_slice(ss.as_slice());
-            ss.zeroize();
-            Ok((ct.as_slice().to_vec(), out))
-        }
-    }
+    dispatch_suite!(suite, |K| {
+        let ek = EncapsulationKey::<K>::new_from_slice(ek).map_err(|_| CryptoError)?;
+        let (ct, mut ss) = ek.encapsulate_deterministic(&m);
+        let mut out = Zeroizing::new([0u8; KEM_SHARED_SECRET_LENGTH]);
+        out.copy_from_slice(ss.as_slice());
+        ss.zeroize();
+        Ok((ct.as_slice().to_vec(), out))
+    })
 }
 
 /// Decapsulate an ML-KEM ciphertext using a 64-byte `(d, z)` seed.
@@ -862,26 +1033,14 @@ fn decapsulate(
     ct: &[u8],
 ) -> Result<Zeroizing<[u8; KEM_SHARED_SECRET_LENGTH]>, CryptoError> {
     let seed = Zeroizing::new(Seed::from(*seed));
-    match suite {
-        #[cfg(feature = "ml-kem-1024")]
-        PqSuite::MlKem1024 => {
-            let dk = DecapsulationKey::<MlKem1024>::from_seed(*seed);
-            let mut ss = dk.decapsulate_slice(ct).map_err(|_| CryptoError)?;
-            let mut out = Zeroizing::new([0u8; KEM_SHARED_SECRET_LENGTH]);
-            out.copy_from_slice(ss.as_slice());
-            ss.zeroize();
-            Ok(out)
-        }
-        #[cfg(feature = "ml-kem-768")]
-        PqSuite::MlKem768 => {
-            let dk = DecapsulationKey::<MlKem768>::from_seed(*seed);
-            let mut ss = dk.decapsulate_slice(ct).map_err(|_| CryptoError)?;
-            let mut out = Zeroizing::new([0u8; KEM_SHARED_SECRET_LENGTH]);
-            out.copy_from_slice(ss.as_slice());
-            ss.zeroize();
-            Ok(out)
-        }
-    }
+    dispatch_suite!(suite, |K| {
+        let dk = DecapsulationKey::<K>::from_seed(*seed);
+        let mut ss = dk.decapsulate_slice(ct).map_err(|_| CryptoError)?;
+        let mut out = Zeroizing::new([0u8; KEM_SHARED_SECRET_LENGTH]);
+        out.copy_from_slice(ss.as_slice());
+        ss.zeroize();
+        Ok(out)
+    })
 }
 
 #[cfg(feature = "serde")]
@@ -891,10 +1050,12 @@ struct KemRatchetUnchecked {
     suite: PqSuite,
     rekey_messages: u64,
     rekey_turns: u64,
+    #[serde(deserialize_with = "deserialize_bounded_vecdeque::<_, _, MAX_PENDING_OFFERS>")]
     pending_offers: VecDeque<PendingOffer>,
     active_offer_id: Option<[u8; KEM_KEY_ID_LENGTH]>,
     active_send_ct: Option<ActiveSendCt>,
     peer_pending_ek: Option<PeerPendingEk>,
+    #[serde(deserialize_with = "deserialize_bounded_vecdeque::<_, _, MAX_ENCAPSULATED_HISTORY>")]
     encapsulated_ek_ids: VecDeque<[u8; KEM_KEY_ID_LENGTH]>,
     messages_since_rekey: u64,
     turns_since_rekey: u64,
@@ -918,6 +1079,8 @@ impl TryFrom<KemRatchetUnchecked> for KemRatchet {
             messages_since_rekey: raw.messages_since_rekey,
             turns_since_rekey: raw.turns_since_rekey,
             initial_offer_needed: raw.initial_offer_needed,
+            active_offer_ek: None,
+            current_recv_ct_pin: None,
         };
         ratchet.validate()?;
         Ok(ratchet)
@@ -1059,6 +1222,8 @@ impl TryFrom<&crate::proto::KemRatchet> for KemRatchet {
             messages_since_rekey: proto.messages_since_rekey,
             turns_since_rekey: proto.turns_since_rekey,
             initial_offer_needed: proto.initial_offer_needed,
+            active_offer_ek: None,
+            current_recv_ct_pin: None,
         };
         restored.validate()?;
         Ok(restored)
@@ -1181,7 +1346,7 @@ mod test {
             assert!(recv_ss.is_none());
             assert!(send_ss.is_some());
             bob.step_dh_root(&alice.public_key()).unwrap();
-            assert_eq!(alice, bob);
+            assert!(alice.is_paired_with(&bob));
             bob.step_dh_root_with(&alice.public_key(), send_ss.as_deref().unwrap())
                 .unwrap();
 
@@ -1197,7 +1362,7 @@ mod test {
             alice
                 .step_dh_root_with(&bob.public_key(), recv_ss.as_deref().unwrap())
                 .unwrap();
-            assert_eq!(alice, bob);
+            assert!(alice.is_paired_with(&bob));
             // Alice consumed her initial pending offer on commit.
             assert_eq!(alice_kem.pending_offer_count(), 0);
             alice
@@ -1211,8 +1376,127 @@ mod test {
             assert!(send_ss.is_some());
             bob.step_dh_root_with(&alice.public_key(), recv_ss.as_deref().unwrap())
                 .unwrap();
-            assert_eq!(alice, bob);
+            assert!(alice.is_paired_with(&bob));
             assert_eq!(bob_kem.pending_offer_count(), 0);
+        }
+    }
+
+    #[test]
+    fn mid_chain_ct_pin_rejects_mismatch_and_malformed_headers() {
+        for suite in enabled_suites() {
+            let mut alice = KemRatchet::new(suite);
+            let mut bob = KemRatchet::new(suite);
+            let h_a0 = alice.prepare_send().unwrap();
+            bob.receive_chain_step(&h_a0).unwrap();
+            let h_b0 = bob.prepare_send().unwrap();
+            let h_b1 = bob.prepare_send().unwrap();
+
+            // Alice receives B0 on a new chain, pinning B0's (ek_id, ct).
+            let (recv_ss, _) = alice.receive_chain_step(&h_b0).unwrap();
+            assert!(recv_ss.is_some());
+            // Replaying B0 on another chain step fails because offer was consumed.
+            assert_eq!(alice.receive_chain_step(&h_b0).unwrap_err(), CryptoError);
+            // Unknown ek_id also fails cleanly without mutating state.
+            let mut unknown_id = h_b0.clone();
+            unknown_id.ek_id = Some([0xFF; KEM_KEY_ID_LENGTH]);
+            assert_eq!(
+                alice.receive_chain_step(&unknown_id).unwrap_err(),
+                CryptoError
+            );
+
+            // Legitimate retransmission on current chain succeeds.
+            alice.receive_current_chain(&h_b1).unwrap();
+
+            // Mid-chain mismatch on ek_id or ct bytes MUST be rejected.
+            let mut mismatched_id = h_b1.clone();
+            mismatched_id.ek_id = Some([0xEE; KEM_KEY_ID_LENGTH]);
+            assert_eq!(
+                alice.receive_current_chain(&mismatched_id).unwrap_err(),
+                CryptoError
+            );
+            let mut mismatched_ct = h_b1.clone();
+            mismatched_ct.ct.as_mut().unwrap()[0] ^= 0x01;
+            assert_eq!(
+                alice.receive_current_chain(&mismatched_ct).unwrap_err(),
+                CryptoError
+            );
+            let stripped_ct = KemHeader::default();
+            assert_eq!(
+                alice.receive_current_chain(&stripped_ct).unwrap_err(),
+                CryptoError
+            );
+
+            // Malformed headers: suite without ek/ct, ct without ek_id, wrong suite, bad ct len.
+            let suite_only = KemHeader {
+                suite: Some(suite.id()),
+                ..KemHeader::default()
+            };
+            assert_eq!(
+                alice.receive_current_chain(&suite_only).unwrap_err(),
+                CryptoError
+            );
+            let ct_without_id = KemHeader {
+                suite: Some(suite.id()),
+                ct: h_b1.ct.clone(),
+                ..KemHeader::default()
+            };
+            assert_eq!(
+                alice.receive_current_chain(&ct_without_id).unwrap_err(),
+                CryptoError
+            );
+            let mut wrong_suite = h_b1.clone();
+            wrong_suite.suite = Some(99);
+            assert_eq!(
+                alice.receive_current_chain(&wrong_suite).unwrap_err(),
+                CryptoError
+            );
+            let mut short_ct = h_b1.clone();
+            short_ct.ct.as_mut().unwrap().pop();
+            assert_eq!(
+                alice.receive_current_chain(&short_ct).unwrap_err(),
+                CryptoError
+            );
+        }
+    }
+
+    #[test]
+    fn default_cadence_and_skipped_header_ek_recording() {
+        for suite in enabled_suites() {
+            let mut alice = KemRatchet::new(suite);
+            let mut bob = KemRatchet::new(suite);
+            assert_eq!(alice.config(), KemRatchetConfig::default());
+
+            // Initial offer on first send; second send reuses cached ek without regenerating.
+            let h_a0 = alice.prepare_send().unwrap();
+            let h_a1 = alice.prepare_send().unwrap();
+            assert_eq!(h_a0.ek, h_a1.ek);
+
+            // Bob records Alice's offer arriving only via a skipped message.
+            let mut bob_skipped = KemRatchet::new(suite);
+            bob_skipped.receive_skipped_header(&h_a0).unwrap();
+            // On Bob's next chain step (even with empty header), Bob encapsulates to Alice's ek!
+            let (recv_ss, send_ss) = bob_skipped
+                .receive_chain_step(&KemHeader::default())
+                .unwrap();
+            assert!(recv_ss.is_none());
+            assert!(send_ss.is_some());
+
+            // Default cadence: after initial exchange, no offer is emitted for < 4 turns / < 20 msgs.
+            bob.receive_chain_step(&h_a0).unwrap();
+            let h_b0 = bob.prepare_send().unwrap();
+            assert!(h_b0.ek.is_none());
+            alice.receive_chain_step(&h_b0).unwrap();
+            let h_a2 = alice.prepare_send().unwrap();
+            assert!(h_a2.ek.is_none());
+
+            // After DEFAULT_REKEY_TURNS empty turns without a KEM mix, a fresh offer triggers.
+            for _ in 0..DEFAULT_REKEY_TURNS {
+                let h_empty = KemHeader::default();
+                let (r, s) = bob.receive_chain_step(&h_empty).unwrap();
+                assert!(r.is_none() && s.is_none());
+            }
+            let h_rekey = bob.prepare_send().unwrap();
+            assert!(h_rekey.ek.is_some());
         }
     }
 
@@ -1273,6 +1557,12 @@ mod test {
                 let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
                 value["active_offer_id"] = serde_json::to_value([0u8; 16]).unwrap();
                 assert!(serde_json::from_value::<KemRatchet>(value).is_err());
+
+                // Oversized encapsulated_ek_ids fails bounded Serde deserialization.
+                let mut oversized: serde_json::Value = serde_json::from_str(&json).unwrap();
+                oversized["encapsulated_ek_ids"] =
+                    serde_json::to_value(vec![[1u8; 16]; MAX_ENCAPSULATED_HISTORY + 1]).unwrap();
+                assert!(serde_json::from_value::<KemRatchet>(oversized).is_err());
             }
 
             #[cfg(feature = "rkyv")]
@@ -1282,6 +1572,18 @@ mod test {
                     rkyv::from_bytes::<KemRatchet, rkyv::rancor::Error>(&bytes).unwrap();
                 let (ss, _) = restored.receive_chain_step(&h_b0).unwrap();
                 assert!(ss.is_some());
+
+                // Corrupted offer id fails rkyv Verify.
+                let mut bad_offer = alice.clone();
+                bad_offer.pending_offers[0].id[0] ^= 0xFF;
+                let bad_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bad_offer).unwrap();
+                assert!(rkyv::from_bytes::<KemRatchet, rkyv::rancor::Error>(&bad_bytes).is_err());
+
+                // Dangling active_offer_id fails rkyv Verify.
+                let mut bad_active = alice.clone();
+                bad_active.active_offer_id = Some([0xAA; KEM_KEY_ID_LENGTH]);
+                let bad_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bad_active).unwrap();
+                assert!(rkyv::from_bytes::<KemRatchet, rkyv::rancor::Error>(&bad_bytes).is_err());
             }
 
             #[cfg(feature = "prost")]

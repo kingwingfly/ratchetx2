@@ -12,6 +12,7 @@ const STATE: [&str; 3] = [
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=build.rs");
     let mut protos = vec!["proto/party.proto"];
     let mut includes = vec!["proto"];
     let mut config = prost_build::Config::new();
