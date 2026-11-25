@@ -37,7 +37,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ])
         .message_attribute(
             ".content.v1.AttachmentPointer",
-            "#[derive(::zeroize::Zeroize)]",
+            "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
         )
         .field_attribute(
             ".notify.v1.SubscribeRequest.audience",

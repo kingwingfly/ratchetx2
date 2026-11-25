@@ -306,7 +306,7 @@ pub(crate) fn verify_recent(
     Ok(identity_key)
 }
 
-#[cfg(all(test, any(feature = "server", feature = "pq")))]
+#[cfg(all(test, feature = "server"))]
 pub(crate) fn test_public_key(seed: u8) -> x3dh::PublicKey {
     assert_ne!(seed, 0, "seed must be non-zero");
     let mut scalar = [0u8; 32];

@@ -1343,7 +1343,7 @@ mod test {
         assert_eq!(got.data, Bytes::from_static(chunk_payload));
         client
             .delete_attachment(DeleteAttachmentRequest {
-                id: started.id,
+                id: started.id.clone(),
                 token: delete_token,
             })
             .await

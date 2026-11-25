@@ -45,6 +45,40 @@ pub const ID_LENGTH: usize = 16;
 /// Length of an upload or delete token.
 pub const TOKEN_LENGTH: usize = 16;
 
+/// Zeroizes the backing buffer of `bytes` in place when uniquely owned (including prost-decoded
+/// and [`bytes::Bytes::copy_from_slice`] allocations). Static or still-shared handles are detached
+/// without panicking.
+fn zeroize_bytes(bytes: &mut bytes::Bytes) {
+    let owned = core::mem::take(bytes);
+    if let Ok(mut buf) = owned.try_into_mut() {
+        zeroize::Zeroize::zeroize(buf.as_mut());
+    }
+}
+
+impl Drop for StartUploadResponse {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.upload_token);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for StartUploadResponse {}
+
+impl Drop for PutChunkRequest {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.upload_token);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for PutChunkRequest {}
+
+impl Drop for DeleteAttachmentRequest {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.token);
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for DeleteAttachmentRequest {}
+
 impl fmt::Debug for StartUploadResponse {
     /// Redacts `upload_token`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -251,7 +285,7 @@ mod server {
 
         /// Store a chunk, if the upload token is the attachment's and the chunk is not stored
         /// already: one uploaded again keeps its first copy.
-        async fn put_chunk(&self, request: PutChunkRequest) -> Result<PutChunkResponse> {
+        async fn put_chunk(&self, mut request: PutChunkRequest) -> Result<PutChunkResponse> {
             if request.data.len() > MAX_CHUNK_SIZE {
                 return Err(ErrorKind::LimitExceeded.into());
             }
@@ -264,8 +298,9 @@ mod server {
             if attachment.was_uploaded(request.index) {
                 return Ok(PutChunkResponse {});
             }
+            let data = core::mem::take(&mut request.data);
             self.store
-                .put_chunk(&attachment.id, request.index, request.data)
+                .put_chunk(&attachment.id, request.index, data)
                 .await?;
             Ok(PutChunkResponse {})
         }
@@ -568,8 +603,8 @@ mod server {
             assert_eq!(
                 racing
                     .put_chunk(PutChunkRequest {
-                        id: s1.id,
-                        upload_token: s1.upload_token,
+                        id: s1.id.clone(),
+                        upload_token: s1.upload_token.clone(),
                         index: 0,
                         data: Bytes::from_static(&[0xEF; MIN_CHUNK_SIZE]),
                     })
@@ -594,7 +629,7 @@ mod server {
             assert_eq!(
                 racing_get
                     .get_chunk(GetChunkRequest {
-                        id: s2.id,
+                        id: s2.id.clone(),
                         index: 0,
                     })
                     .await
@@ -638,5 +673,46 @@ mod server {
                 ErrorKind::Malformed
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod token_zeroize_tests {
+    use bytes::Bytes;
+    use prost::Message as _;
+    use zeroize::ZeroizeOnDrop;
+
+    use super::*;
+
+    #[test]
+    fn token_messages_implement_zeroize_on_drop_and_wipe_unique_buffers() {
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<StartUploadResponse>();
+        assert_zeroize_on_drop::<PutChunkRequest>();
+        assert_zeroize_on_drop::<DeleteAttachmentRequest>();
+
+        // Uniquely owned Bytes (copy_from_slice) and prost-decoded Bytes convert into BytesMut
+        // in place, so `zeroize_bytes` overwrites the backing token memory.
+        let mut owned = Bytes::copy_from_slice(&[0xAA; TOKEN_LENGTH]);
+        let clone = owned.clone();
+        drop(clone);
+        assert!(owned.clone().try_into_mut().is_err());
+        let unique = core::mem::take(&mut owned);
+        assert!(unique.try_into_mut().is_ok());
+
+        let encoded = StartUploadResponse {
+            id: Bytes::copy_from_slice(&[0x11; ID_LENGTH]),
+            upload_token: Bytes::copy_from_slice(&[0xBB; TOKEN_LENGTH]),
+            expires: 42,
+        }
+        .encode_to_vec();
+        let mut decoded = StartUploadResponse::decode(encoded.as_slice()).unwrap();
+        let decoded_token = core::mem::take(&mut decoded.upload_token);
+        assert!(decoded_token.try_into_mut().is_ok());
+
+        // Static buffers detach cleanly without panicking.
+        let mut static_bytes = Bytes::from_static(&[0xCC; TOKEN_LENGTH]);
+        zeroize_bytes(&mut static_bytes);
+        assert!(static_bytes.is_empty());
     }
 }
