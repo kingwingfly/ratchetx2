@@ -584,6 +584,14 @@ impl Contact {
                     pointer,
                     clock,
                 }),
+                Some(Kind::Contact(contact)) => match contact.key.try_into() {
+                    Ok(key) => Body::Contact(crate::state::SharedContact {
+                        key,
+                        name: super::sanitize_shared_name(&contact.name),
+                        pq_pinned: contact.pq_pinned,
+                    }),
+                    Err(_) => Body::Unknown,
+                },
                 None => Body::Unknown,
             }
         };

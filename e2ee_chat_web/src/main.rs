@@ -8,6 +8,7 @@ mod glue;
 mod icon;
 mod notify;
 mod preview;
+mod qr;
 mod search;
 mod state;
 mod transport;

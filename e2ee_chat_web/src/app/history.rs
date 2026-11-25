@@ -1609,7 +1609,18 @@ fn close_chat_overlays(ui: Ui, keep_peer: Option<PublicKey>) {
     let stale_dialog = ui.dialog.with_untracked(|dialog| {
         matches!(
             dialog,
-            Some(Dialog::Contact(peer) | Dialog::Files(peer)) if Some(*peer) != keep_peer
+            Some(
+                Dialog::Contact(peer)
+                    | Dialog::Files(peer)
+                    | Dialog::ShareContact {
+                        subject: Some(peer),
+                        ..
+                    }
+                    | Dialog::ShareContact {
+                        recipient: Some(peer),
+                        ..
+                    }
+            ) if Some(*peer) != keep_peer
         )
     });
     if stale_dialog {

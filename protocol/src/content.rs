@@ -104,7 +104,7 @@ impl Kind {
     pub fn is_readable(&self) -> bool {
         matches!(
             self,
-            Self::Text(_) | Self::Image(_) | Self::File(_) | Self::Attachment(_)
+            Self::Text(_) | Self::Image(_) | Self::File(_) | Self::Attachment(_) | Self::Contact(_)
         )
     }
 }
@@ -170,5 +170,18 @@ mod test {
         };
         let encoded = Kind::Hello(pq_hello.clone()).to_bytes();
         assert_eq!(Kind::from_bytes(&encoded), Some(Kind::Hello(pq_hello)));
+    }
+
+    #[test]
+    fn shared_contact_round_trips_and_is_readable() {
+        let contact = Contact {
+            key: vec![0x42; 32],
+            name: "Alice".into(),
+            pq_pinned: true,
+        };
+        let kind = Kind::Contact(contact);
+        assert!(kind.is_readable());
+        let encoded = kind.to_bytes();
+        assert_eq!(Kind::from_bytes(&encoded), Some(kind));
     }
 }

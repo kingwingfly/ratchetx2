@@ -30,7 +30,7 @@ use crate::{
 
 use self::{
     chat::ChatPane,
-    common::{Copyable, invitation_link, new_chat, send_files_to},
+    common::{Copyable, InvitationLink, new_chat, send_files_to},
     dialogs::VaultDialog,
     sidebar::Sidebar,
     viewer::Viewer,
@@ -297,10 +297,7 @@ fn Welcome() -> impl IntoView {
                     <div class="section-label">"Your identity key"</div>
                     {move || view! { <Copyable text=key() what="your key" /> }}
                     <div class="section-label">"Your invitation link"</div>
-                    {move || {
-                        let link = ui.me.get().as_ref().map(invitation_link).unwrap_or_default();
-                        view! { <Copyable text=link what="your invitation link" /> }
-                    }}
+                    <InvitationLink />
                     <div class="row">
                         <button class="btn primary" on:click=move |_| new_chat()>
                             {icon(Icon::Compose)}

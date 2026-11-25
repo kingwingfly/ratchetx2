@@ -15,10 +15,10 @@ use super::{
     AttachmentKey, ChunkOf, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, OpenTracker,
     ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, attachment_key_hash,
     build_invitation_link, checked_name, normalize_update_reason, parse_invitation_hash,
-    should_require_update_for_rpc,
+    sanitize_shared_name, should_require_update_for_rpc,
 };
-use crate::content::{Content, Kind};
-use crate::state::{Delivery, Dialog, Me, ServerPqStatus, Ui};
+use crate::content::{Contact as WireContact, Content, Kind};
+use crate::state::{Body, Delivery, Dialog, Me, ServerPqStatus, SharedContact, Ui};
 use crate::transport::{Connect, Fetch};
 use crate::util::{hex, key_from_text, key_to_url, short};
 use crate::vault::{
@@ -55,6 +55,71 @@ fn names_have_at_most_name_max_characters() {
         ..Hello::default()
     });
     assert!(greeting.to_bytes().len() < 512);
+}
+
+#[test]
+fn shared_contact_sanitizes_names_and_validates_key_length() {
+    assert_eq!(sanitize_shared_name("  Alice\n\tBob\x00  "), "Alice Bob");
+    assert_eq!(
+        sanitize_shared_name("Alice\u{202E}boB\u{2066}x\u{2069}"),
+        "AliceboBx"
+    );
+    // Trailing whitespace right at the `NAME_MAX` boundary is never preserved.
+    let boundary = format!("{} tail", "a".repeat(NAME_MAX - 1));
+    assert_eq!(sanitize_shared_name(&boundary), "a".repeat(NAME_MAX - 1));
+    assert_eq!(
+        sanitize_shared_name(&"😀".repeat(NAME_MAX + 5))
+            .chars()
+            .count(),
+        NAME_MAX
+    );
+
+    let (mut inner, bob_peer) = unlocked_client();
+    let carol_key = [0x99u8; 32];
+    let contact = inner.contact(&bob_peer).expect("bob exists");
+
+    let valid_entry = HistoryEntry {
+        outgoing: false,
+        at: 1_000,
+        place: 1,
+        content: Some(Content {
+            clock: 1,
+            kind: Some(Kind::Contact(WireContact {
+                key: carol_key.to_vec(),
+                name: "  Carol\nDev\x07 ".to_string(),
+                pq_pinned: true,
+            })),
+            events: None,
+        }),
+        ..HistoryEntry::default()
+    };
+    let view = contact.message(0, valid_entry);
+    assert_eq!(
+        view.body,
+        Body::Contact(SharedContact {
+            key: carol_key,
+            name: "Carol Dev".to_string(),
+            pq_pinned: true,
+        })
+    );
+
+    // Malformed key length (!= 32 bytes) falls back cleanly to `Body::Unknown`.
+    let bad_entry = HistoryEntry {
+        outgoing: false,
+        at: 1_001,
+        place: 2,
+        content: Some(Content {
+            clock: 2,
+            kind: Some(Kind::Contact(WireContact {
+                key: vec![0xAA; 16],
+                name: "Short Key".to_string(),
+                pq_pinned: false,
+            })),
+            events: None,
+        }),
+        ..HistoryEntry::default()
+    };
+    assert_eq!(contact.message(1, bad_entry).body, Body::Unknown);
 }
 
 #[test]

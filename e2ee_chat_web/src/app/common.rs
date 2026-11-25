@@ -7,11 +7,11 @@ use zeroize::Zeroizing;
 
 use crate::{
     content,
-    engine::{Sending, build_invitation_link, invitation, origin},
+    engine::{Sending, build_invitation_link, invitation, origin, sanitize_shared_name},
     glue::copy,
     icon::{Icon, icon},
-    state::{ClassicalPrompt, Dialog, Me, ServerPqStatus, Ui},
-    util::sleep,
+    state::{ClassicalPrompt, ContactView, Dialog, Me, ServerPqStatus, SharedContact, Ui},
+    util::{key_to_text, sleep},
 };
 
 use super::{engine, ui};
@@ -153,6 +153,57 @@ pub(super) fn new_chat() {
     }));
 }
 
+/// Open `NewChat` pre-filled from a shared contact card so the recipient can review and start.
+/// Uses standard base64 (`key_to_text`) so the pre-filled key matches `Identity` and `ContactInfo`
+/// verbatim if verified visually.
+pub(super) fn open_new_chat_for_shared(card: &SharedContact) {
+    ui().dialog.set(Some(Dialog::NewChat {
+        key: key_to_text(&card.key),
+        name: card.name.clone(),
+        server: None,
+        pq_pinned: card.pq_pinned,
+    }));
+}
+
+/// Whether sharing `subject` should pin post-quantum encryption for the recipient.
+pub(super) fn shared_contact_pq_pinned(subject: &ContactView, server_pq_disabled: bool) -> bool {
+    !server_pq_disabled
+        && (subject.pq_pinned
+            || subject.peer_pq_capable
+            || (subject.has_active_session && subject.security.is_pq))
+}
+
+/// Default editable display name when sharing `subject`: local nickname, or their greeting name.
+pub(super) fn default_shared_contact_name(subject: &ContactView) -> String {
+    let raw = if subject.name.is_empty() {
+        &subject.hello_name
+    } else {
+        &subject.name
+    };
+    sanitize_shared_name(raw)
+}
+
+/// Accepted contacts eligible to be shared to another peer (excluding `exclude`).
+pub(super) fn shareable_contacts(contacts: &[ContactView], exclude: PublicKey) -> Vec<ContactView> {
+    contacts
+        .iter()
+        .filter(|contact| !contact.request && contact.peer != exclude)
+        .cloned()
+        .collect()
+}
+
+/// Accepted, unquarantined chats eligible to receive a shared contact (excluding `exclude`).
+pub(super) fn writable_recipients(
+    contacts: &[ContactView],
+    exclude: PublicKey,
+) -> Vec<ContactView> {
+    contacts
+        .iter()
+        .filter(|contact| !contact.request && !contact.is_quarantined() && contact.peer != exclude)
+        .cloned()
+        .collect()
+}
+
 /// Lock the vault: the page starts over, keeping nothing in memory.
 pub(super) fn lock() {
     let _ = window().location().reload();
@@ -161,11 +212,30 @@ pub(super) fn lock() {
 /// How long a copy button shows that it copied, in milliseconds.
 const COPIED_SHOWN: i32 = 1_500;
 
+/// Flash a copied-tick generation signal for [`COPIED_SHOWN`] without panicking if the owning
+/// component unmounts while the clipboard promise or timer is pending.
+pub(super) async fn flash_copied(copied_gen: RwSignal<u32>) {
+    let Some(next) = copied_gen.try_update(|slot| {
+        let next = slot.wrapping_add(1).max(1);
+        *slot = next;
+        next
+    }) else {
+        return;
+    };
+    sleep(COPIED_SHOWN).await;
+    let _ = copied_gen.try_update(|slot| {
+        if *slot == next {
+            *slot = 0;
+        }
+    });
+}
+
 /// `text` in a box, with a button beside it that copies it, `what` it is, e.g. "your key": a
 /// tick shows for a moment once it did, and a notice says if the browser would not.
 #[component]
 pub(super) fn Copyable(text: String, what: &'static str) -> impl IntoView {
-    let copied = RwSignal::new(false);
+    let copied_gen = RwSignal::new(0u32);
+    let copied = move || copied_gen.get() != 0;
     let value = text.clone();
     let on_click = move |_| {
         let text = value.clone();
@@ -176,13 +246,11 @@ pub(super) fn Copyable(text: String, what: &'static str) -> impl IntoView {
                 ));
                 return;
             }
-            copied.set(true);
-            sleep(COPIED_SHOWN).await;
-            copied.try_set(false);
+            flash_copied(copied_gen).await;
         });
     };
     let label = move || {
-        if copied.get() {
+        if copied() {
             "Copied".to_string()
         } else {
             format!("Copy {what}")
@@ -194,13 +262,135 @@ pub(super) fn Copyable(text: String, what: &'static str) -> impl IntoView {
             <button
                 type="button"
                 class="btn icon"
-                class:done=move || copied.get()
+                class:done=copied
                 title=label
                 aria-label=label
                 on:click=on_click
             >
-                {move || icon(if copied.get() { Icon::Tick } else { Icon::Copy })}
+                {move || icon(if copied() { Icon::Tick } else { Icon::Copy })}
             </button>
+        </div>
+    }
+}
+
+/// This client's invitation link, with buttons to copy it or open its scannable QR code.
+#[component]
+pub(super) fn InvitationLink(#[prop(default = false)] from_identity: bool) -> impl IntoView {
+    let ui = ui();
+    let link = Memo::new(move |_| {
+        ui.me
+            .with(|me| me.as_ref().map(invitation_link).unwrap_or_default())
+    });
+    let copied_gen = RwSignal::new(0u32);
+    let copied = move || copied_gen.get() != 0;
+    let on_copy = move |_| {
+        let text = link.get_untracked();
+        if text.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            if !copy(&text).await {
+                ui.notify(
+                    "The browser would not copy your invitation link; select it and copy it instead.",
+                );
+                return;
+            }
+            flash_copied(copied_gen).await;
+        });
+    };
+    let copy_label = move || {
+        if copied() {
+            "Copied".to_string()
+        } else {
+            "Copy your invitation link".to_string()
+        }
+    };
+    view! {
+        <div class="copyable">
+            <div class="key">{move || link.get()}</div>
+            <div class="copyable-actions">
+                <button
+                    type="button"
+                    class="btn icon"
+                    class:done=copied
+                    title=copy_label
+                    aria-label=copy_label
+                    disabled=move || link.with(String::is_empty)
+                    on:click=on_copy
+                >
+                    {move || icon(if copied() { Icon::Tick } else { Icon::Copy })}
+                </button>
+                <button
+                    type="button"
+                    class="btn icon"
+                    title="Share as QR code"
+                    aria-label="Share your invitation link as a QR code"
+                    disabled=move || link.with(String::is_empty)
+                    on:click=move |_| ui.dialog.set(Some(Dialog::InviteQr { from_identity }))
+                >
+                    {icon(Icon::QrCode)}
+                </button>
+            </div>
+        </div>
+    }
+}
+
+/// A peer's identity key, with a button to copy it and (for accepted chats) share it to another chat.
+#[component]
+pub(super) fn ContactKey(peer: PublicKey, can_share: Signal<bool>) -> impl IntoView {
+    let ui = ui();
+    let text = key_to_text(&peer);
+    let copied_gen = RwSignal::new(0u32);
+    let copied = move || copied_gen.get() != 0;
+    let value = text.clone();
+    let on_copy = move |_| {
+        let text = value.clone();
+        spawn_local(async move {
+            if !copy(&text).await {
+                ui.notify("The browser would not copy their key; select it and copy it instead.");
+                return;
+            }
+            flash_copied(copied_gen).await;
+        });
+    };
+    let copy_label = move || {
+        if copied() {
+            "Copied".to_string()
+        } else {
+            "Copy their key".to_string()
+        }
+    };
+    view! {
+        <div class="copyable">
+            <div class="key">{text}</div>
+            <div class="copyable-actions">
+                <button
+                    type="button"
+                    class="btn icon"
+                    class:done=copied
+                    title=copy_label
+                    aria-label=copy_label
+                    on:click=on_copy
+                >
+                    {move || icon(if copied() { Icon::Tick } else { Icon::Copy })}
+                </button>
+                <Show when=move || can_share.get()>
+                    <button
+                        type="button"
+                        class="btn icon"
+                        title="Share contact to another chat"
+                        aria-label="Share this contact to another chat"
+                        on:click=move |_| {
+                            ui.dialog.set(Some(Dialog::ShareContact {
+                                subject: Some(peer),
+                                recipient: None,
+                            }));
+                        }
+                    >
+                        {icon(Icon::ShareContact)}
+                    </button>
+                </Show>
+            </div>
         </div>
     }
 }
@@ -380,7 +570,31 @@ pub(super) const ASKED_SHOWN: Duration = Duration::from_secs(6);
 
 #[cfg(test)]
 mod tests {
-    use super::{ClassicalPrompt, can_allow_classical};
+    use crate::state::{ContactView, SecurityAlert, SecurityView};
+
+    use super::{
+        ClassicalPrompt, can_allow_classical, default_shared_contact_name, shareable_contacts,
+        shared_contact_pq_pinned, writable_recipients,
+    };
+
+    fn make_contact(byte: u8, name: &str) -> ContactView {
+        ContactView {
+            peer: [byte; 32],
+            name: name.to_string(),
+            request: false,
+            hello_name: String::new(),
+            unread: 0,
+            last_activity: 0,
+            security: SecurityView::default(),
+            has_active_session: false,
+            pq_pinned: false,
+            peer_pq_capable: false,
+            allow_classical_exception: false,
+            downgrade_detected: false,
+            alert: SecurityAlert::None,
+            classical_prompt: ClassicalPrompt::None,
+        }
+    }
 
     #[test]
     fn classical_approval_requires_a_prompt_and_strict_mode_off() {
@@ -399,5 +613,44 @@ mod tests {
         }
         assert!(!can_allow_classical(ClassicalPrompt::None, false));
         assert!(!can_allow_classical(ClassicalPrompt::None, true));
+    }
+
+    #[test]
+    fn shared_contact_helpers_enforce_pq_pinning_and_eligibility() {
+        let mut alice = make_contact(1, "Alice");
+        alice.pq_pinned = true;
+        assert!(shared_contact_pq_pinned(&alice, false));
+        assert!(!shared_contact_pq_pinned(&alice, true));
+
+        let mut bob = make_contact(2, "");
+        bob.hello_name = "  Bob\nSmith\x07  ".to_string();
+        bob.has_active_session = true;
+        bob.security.is_pq = true;
+        assert!(shared_contact_pq_pinned(&bob, false));
+        assert_eq!(default_shared_contact_name(&bob), "Bob Smith");
+
+        let classical = make_contact(3, "Carol");
+        assert!(!shared_contact_pq_pinned(&classical, false));
+
+        let mut request = make_contact(4, "Dave");
+        request.request = true;
+
+        let mut quarantined = make_contact(5, "Eve");
+        quarantined.classical_prompt = ClassicalPrompt::InboundQuarantined {
+            peer_was_pq_pinned: true,
+        };
+
+        let all = vec![alice, bob, classical, request, quarantined];
+        let subjects: Vec<u8> = shareable_contacts(&all, [1; 32])
+            .into_iter()
+            .map(|c| c.peer[0])
+            .collect();
+        assert_eq!(subjects, vec![2, 3, 5]);
+
+        let recipients: Vec<u8> = writable_recipients(&all, [1; 32])
+            .into_iter()
+            .map(|c| c.peer[0])
+            .collect();
+        assert_eq!(recipients, vec![2, 3]);
     }
 }

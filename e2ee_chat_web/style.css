@@ -36,7 +36,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
    in green. Safari, which has no scrollbar-color, takes its own pseudo-elements instead. */
 :root { scrollbar-color: var(--line-strong) transparent; }
 * { scrollbar-width: thin; }
-:where(.chats, .messages, .welcome, .activity, .viewer-content, .markdown pre, .slides .enhanced, .composer textarea):hover { scrollbar-color: var(--accent-line) transparent; }
+:where(.chats, .messages, .welcome, .activity, .share-list, .viewer-content, .markdown pre, .slides .enhanced, .composer textarea):hover { scrollbar-color: var(--accent-line) transparent; }
 @supports not (scrollbar-color: auto) {
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
@@ -61,7 +61,7 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .btn.small .glyph { width: 16px; height: 16px; }
 .btn.icon { flex: none; justify-content: center; width: 36px; height: 36px; padding: 0; }
 .btn.icon.small { width: 30px; height: 30px; }
-.btn.icon.done { color: var(--accent); border-color: var(--accent-line); }
+.btn.done { color: var(--accent); border-color: var(--accent-line); }
 /* A button that reads as a link, within text. */
 .link { padding: 0; border: 0; background: none; color: var(--accent); font: inherit; text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
 .link:disabled { color: var(--muted); text-decoration: none; cursor: default; }
@@ -175,6 +175,18 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .file-icon { flex: none; max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); font-size: 11px; color: var(--accent); border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 6px; }
 .file-card strong { display: block; max-width: min(260px, 100%); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
 .file-card span { font-size: 12px; color: var(--muted); }
+/* A shared peer card in a chat, with a direct action to open or start a chat. */
+.contact-card { width: min(300px, 100%); padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; border: 1px solid var(--line); border-radius: 12px; background: var(--raised); }
+.message.me .contact-card { border-color: var(--accent-line); background: var(--raised-strong); }
+.contact-card-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.contact-card-head .avatar { flex: none; }
+.contact-card-info { flex: 1; min-width: 0; }
+.contact-card-info strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-bright); font-weight: 550; }
+.contact-card-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; margin-top: 2px; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.contact-card-foot { display: flex; align-items: center; justify-content: flex-end; gap: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.message.me .contact-card-foot { border-top-color: var(--accent-line); }
+.contact-card-note { font-size: 12px; color: var(--muted); }
+.contact-card-note.saved { margin-right: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .uploads { display: flex; flex-direction: column; gap: 6px; padding: 0 18px; }
 .uploads:has(.upload) { padding-block: 8px; border-top: 1px solid var(--line); }
 .upload { display: flex; align-items: center; gap: 10px; }
@@ -197,9 +209,10 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .welcome p { margin: 0; color: var(--muted); line-height: 1.7; }
 .section-label { margin-bottom: 8px; font-size: 12px; color: var(--muted); }
 .key { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--sunken); color: var(--accent); font-family: var(--mono); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; user-select: all; }
-/* A key or a link, with the button that copies it beside it. */
+/* A key or a link, with action buttons beside it. */
 .copyable { display: flex; align-items: flex-start; gap: 8px; }
 .copyable .key { flex: 1; min-width: 0; }
+.copyable-actions { display: flex; align-items: center; gap: 8px; flex: none; }
 /* As tall as a line of the box. */
 .copyable .btn.icon { width: 41px; height: 41px; }
 .copyable + .section-label { margin-top: 16px; }
@@ -286,6 +299,26 @@ dialog::backdrop { background: #020706d9; backdrop-filter: blur(4px); }
 .modal .hint { margin: 6px 0 0; font-size: 12px; }
 .modal .warning { margin: 12px 0 0; color: var(--danger); overflow-wrap: anywhere; }
 .actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+/* Invitation QR code dialog. */
+.qr-stage { display: flex; flex-direction: column; align-items: center; gap: 12px; margin: 10px 0 8px; }
+.qr-card { width: min(260px, 100%); aspect-ratio: 1; border: 1px solid var(--line-strong); border-radius: 12px; background: #fff; overflow: hidden; box-shadow: 0 8px 32px #0006; }
+.qr-svg { display: block; width: 100%; height: 100%; }
+.qr-bg { fill: #fff; }
+.qr-fg { fill: #000; }
+.qr-caption { display: flex; align-items: center; justify-content: center; flex-wrap: wrap; gap: 6px 10px; max-width: 100%; text-align: center; }
+.qr-who { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.qr-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 4px; }
+/* Share contact dialog picker. */
+.share-preview { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.share-list { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); }
+.share-option { width: 100%; display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid transparent; border-radius: 8px; background: none; text-align: left; cursor: pointer; }
+.share-option:hover { background: var(--raised); }
+.share-option.selected { border-color: var(--accent-line); background: var(--raised-strong); }
+.share-option .avatar, .share-preview .avatar { flex: none; width: 34px; height: 34px; font-size: 12px; }
+.share-option-text { flex: 1; min-width: 0; }
+.share-option-text strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-bright); font-weight: 500; }
+.share-option-text span { display: block; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.modal p.share-empty { margin: 12px 10px; text-align: center; font-size: 13px; color: var(--muted); }
 /* A chat's files: shelves by sort, then months, newest first. */
 .modal.wide { width: 760px; }
 .shelves { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -497,10 +530,12 @@ pre.code { margin: 0; padding: 24px; font-family: var(--mono); font-size: 13px; 
   .pane-title .sec-badge { font-size: 10px; padding: 1px 6px; }
   .messages { padding: 14px 10px; }
   .message { max-width: 88%; }
-  .composer { padding: 10px; }
+  .composer { padding: 10px; gap: 6px; }
+  .composer .btn.icon { width: 36px; height: 36px; }
   .viewer { width: 100vw; height: 100dvh; max-width: 100vw; max-height: 100dvh; border-radius: 0; }
 }
 @media (max-width: 480px) {
   .key.safety { grid-template-columns: repeat(2, max-content); justify-content: space-around; gap: 4px 16px; }
+  .copyable-actions { flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

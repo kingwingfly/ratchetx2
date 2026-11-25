@@ -9,12 +9,12 @@ use std::{
 };
 
 use futures::channel::oneshot;
-use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Uint8Array};
+use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{
-    AbortController, AbortSignal, Clipboard, MessageEvent, MessagePort, Navigator,
-    PageTransitionEvent, ServiceWorkerContainer,
+    AbortController, AbortSignal, Blob, BlobPropertyBag, Clipboard, MessageEvent, MessagePort,
+    Navigator, PageTransitionEvent, ServiceWorkerContainer,
 };
 
 #[wasm_bindgen]
@@ -601,6 +601,35 @@ pub async fn copy(text: &str) -> bool {
         return false;
     };
     JsFuture::from(clipboard.write_text(text)).await.is_ok()
+}
+
+/// Start copying PNG `bytes` to the clipboard synchronously within a user gesture, returning the
+/// pending clipboard write promise if `navigator.clipboard.write` and `ClipboardItem` are present.
+pub fn start_copy_png(bytes: &[u8]) -> Option<Promise> {
+    let clipboard = navigator().optional_clipboard().ok().flatten()?;
+    let window = web_sys::window()?;
+    let clipboard_item_ctor = Reflect::get(&window, &JsValue::from_str("ClipboardItem"))
+        .ok()?
+        .dyn_into::<Function>()
+        .ok()?;
+    let write_fn = Reflect::get(&clipboard, &JsValue::from_str("write"))
+        .ok()?
+        .dyn_into::<Function>()
+        .ok()?;
+
+    let parts = Array::of1(&Uint8Array::from(bytes));
+    let options = BlobPropertyBag::new();
+    options.set_type("image/png");
+    let blob = Blob::new_with_u8_array_sequence_and_options(&parts, &options).ok()?;
+
+    let entry = Object::new();
+    Reflect::set(&entry, &JsValue::from_str("image/png"), &blob).ok()?;
+    let item = Reflect::construct(&clipboard_item_ctor, &Array::of1(&entry)).ok()?;
+    write_fn
+        .call1(&clipboard, &Array::of1(&item))
+        .ok()?
+        .dyn_into::<Promise>()
+        .ok()
 }
 
 /// Register the service worker that streams media, `media-worker.js`, if the browser has them.

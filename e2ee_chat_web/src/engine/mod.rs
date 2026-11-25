@@ -108,6 +108,46 @@ fn checked_name(name: &str) -> Result<String, String> {
     }
     Ok(name.to_string())
 }
+
+/// Normalize a suggested contact name for sharing/display: strip control and Unicode bidirectional
+/// formatting characters, collapse whitespace runs into single spaces, trim, and cap at
+/// [`NAME_MAX`] characters.
+pub fn sanitize_shared_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(NAME_MAX * 4));
+    let mut count = 0usize;
+    let mut pending_space = false;
+    for ch in name.chars() {
+        if matches!(
+            ch,
+            '\u{061C}' | '\u{200E}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        ) {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if count > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        if pending_space {
+            if count + 2 > NAME_MAX {
+                break;
+            }
+            out.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        if count >= NAME_MAX {
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
 /// Milliseconds between asking for a chunk not uploaded yet, doubling up to the second...
 const POLL_CHUNK_MIN: i32 = 500;
 const POLL_CHUNK_MAX: i32 = 4_000;
@@ -2490,6 +2530,14 @@ fn percent_encode(input: &str) -> String {
     out
 }
 
+/// Whether invitation links for `me` include `&pq=1` (local PQ enabled and server has not disabled
+/// post-quantum encryption).
+pub fn invitation_pins_pq(me: &Me) -> bool {
+    me.pq_config.pq_enabled
+        && !me.pq_config.offered_suites().is_empty()
+        && me.server_pq != ServerPqStatus::Disabled
+}
+
 /// Build an invitation link for `me` relative to `page_origin`, appending `&pq=1` when local PQ
 /// is enabled and the server has not disabled post-quantum encryption.
 pub fn build_invitation_link(page_origin: &str, me: &Me) -> String {
@@ -2504,10 +2552,7 @@ pub fn build_invitation_link(page_origin: &str, me: &Me) -> String {
     if !same_server(&me.server, page_origin) {
         link.push_str(&format!("&server={}", percent_encode(&me.server)));
     }
-    if me.pq_config.pq_enabled
-        && !me.pq_config.offered_suites().is_empty()
-        && me.server_pq != ServerPqStatus::Disabled
-    {
+    if invitation_pins_pq(me) {
         link.push_str("&pq=1");
     }
     link

@@ -6,15 +6,16 @@ use crate::{
     icon::{Icon, icon},
     state::{
         Body, ClassicalPrompt, ContactView, Delivery, Dialog, MessageRow, SecurityAlert,
-        UploadState, UploadView,
+        SharedContact, UploadState, UploadView,
     },
-    util::{clock, short},
+    util::{clock, hex, short},
 };
 
 use super::{
     common::{
         AllowClassical, act, act_while, can_allow_classical, extension, initials, open_chat,
-        pq_available, pq_retry_ready, server_pq_disabled, strict_pq_enabled, upgrade_disabled_tip,
+        open_new_chat_for_shared, pq_available, pq_retry_ready, server_pq_disabled,
+        strict_pq_enabled, upgrade_disabled_tip,
     },
     composer::Composer,
     engine,
@@ -605,17 +606,17 @@ fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
             <For
                 each=move || ui.messages.get()
                 key=|message| message.index
-                children=move |message| message_item(message, label)
+                children=move |message| message_item(peer, message, label)
             />
         </div>
     }
 }
 
-/// A message, as a bubble, an image, a file or a note.
+/// A message, as a bubble, an image, a file, a shared contact card, or a note.
 /// The notes name the peer by `label`, which changes once a request is accepted.
 /// Delivery ticks and held-attachment pointer upgrades update via per-row reactive signals in O(1)
 /// without rescanning `ui.messages` or remounting active `<InlineMedia>` players.
-fn message_item(message: MessageRow, label: Signal<String>) -> AnyView {
+fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>) -> AnyView {
     let ui = ui();
     let index = message.index;
     let outgoing = message.outgoing;
@@ -652,6 +653,7 @@ fn message_item(message: MessageRow, label: Signal<String>) -> AnyView {
             })
             .into_any()
         }
+        Body::Contact(card) => view! { <ContactCard chat_peer card /> }.into_any(),
         Body::Hello(name) => {
             let note = move || match (outgoing, name.is_empty()) {
                 (true, _) => format!("You started this chat · {time}"),
@@ -755,6 +757,86 @@ fn message_item(message: MessageRow, label: Signal<String>) -> AnyView {
         </div>
     }
     .into_any()
+}
+
+/// A peer's identity shared in a chat, with a direct action to open or start a chat with them.
+#[component]
+fn ContactCard(chat_peer: PublicKey, card: SharedContact) -> impl IntoView {
+    let ui = ui();
+    let key = card.key;
+    let pq_pinned = card.pq_pinned;
+    let letters = if card.name.is_empty() {
+        hex(&key[..1])
+    } else {
+        initials(&card.name)
+    };
+    let title = if card.name.is_empty() {
+        short(&key)
+    } else {
+        card.name.clone()
+    };
+    let subtitle = if card.name.is_empty() {
+        "Shared contact".to_string()
+    } else {
+        short(&key)
+    };
+    view! {
+        <div class="contact-card">
+            <div class="contact-card-head">
+                <span class="avatar">{letters}</span>
+                <div class="contact-card-info">
+                    <strong>{title}</strong>
+                    <div class="contact-card-meta">
+                        <span>{subtitle}</span>
+                        {pq_pinned.then(|| view! { <span class="sec-badge pq">"PQ pinned"</span> })}
+                    </div>
+                </div>
+            </div>
+            <div class="contact-card-foot">
+                {move || {
+                    let is_me = ui.me.with(|me| me.as_ref().is_some_and(|me| me.key == key));
+                    if is_me {
+                        view! { <span class="contact-card-note">"Your identity"</span> }.into_any()
+                    } else if key == chat_peer {
+                        view! { <span class="contact-card-note">"This chat"</span> }.into_any()
+                    } else if let Some(existing) = ui.contact(&key) {
+                        let action_label = if existing.request {
+                            "View request"
+                        } else {
+                            "Open chat"
+                        };
+                        let saved_note = (!existing.name.is_empty() && existing.name != card.name)
+                            .then(|| format!("Saved as {}", existing.name));
+                        view! {
+                            {saved_note.map(|note| {
+                                view! { <span class="contact-card-note saved">{note}</span> }
+                            })}
+                            <button
+                                type="button"
+                                class="btn small"
+                                on:click=move |_| open_chat(Some(key))
+                            >
+                                {action_label}
+                            </button>
+                        }
+                        .into_any()
+                    } else {
+                        let card = card.clone();
+                        view! {
+                            <button
+                                type="button"
+                                class="btn primary small"
+                                on:click=move |_| open_new_chat_for_shared(&card)
+                            >
+                                "Start chat"
+                            </button>
+                        }
+                        .into_any()
+                    }
+                }}
+            </div>
+        </div>
+    }
 }
 
 /// The uploads to `peer`: how far each got, and the means to go on with it or cancel it.

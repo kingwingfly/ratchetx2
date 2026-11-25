@@ -27,6 +27,8 @@ message Content {
     // The sender deleted the chat, and its session with it: the recipient's next message
     // starts a new session, which comes to the sender as a new chat.
     Deleted deleted = 6;
+    // A peer's public identity shared by the sender so the recipient can start a chat with them.
+    Contact contact = 9;
   }
   // What the sender did with the recipient's messages since it last told.
   Events events = 8;
@@ -90,3 +92,13 @@ message AttachmentPointer {
 // That the sender deleted the chat. Its recipient sends again, on a new session, what the sender
 // never read.
 message Deleted {}
+
+// A peer's public identity shared in a chat so the recipient can start a chat with them.
+message Contact {
+  // Their 32-byte identity public key.
+  bytes key = 1;
+  // A suggested display name; empty if none.
+  string name = 2;
+  // Whether the sharer knows this peer to be post-quantum capable (like `&pq=1` in an invitation).
+  bool pq_pinned = 3;
+}

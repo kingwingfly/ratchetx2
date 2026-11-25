@@ -1,10 +1,18 @@
+use std::time::Duration;
+
 use leptos::{ev, html, prelude::*, task::spawn_local};
 use session::{PublicKey, safety_number};
+use wasm_bindgen_futures::JsFuture;
+use web_sys::Url;
 
 use crate::{
-    engine::{NAME_MAX, StartChatError, same_server},
-    state::{ClassicalPrompt, Dialog, PendingNewChat, Phase},
-    util::{key_from_text, key_to_text, short},
+    content,
+    engine::{NAME_MAX, StartChatError, invitation_pins_pq, same_server, sanitize_shared_name},
+    glue::{copy, start_copy_png},
+    icon::{Icon, icon},
+    qr::{QUIET_ZONE, QrCode},
+    state::{ClassicalPrompt, ContactView, Dialog, PendingNewChat, Phase},
+    util::{hex, key_from_text, key_to_text, short},
 };
 
 use super::{
@@ -12,15 +20,18 @@ use super::{
     auth::{CreateVault, Elsewhere, SignInDialog, Unavailable, UnlockVault},
     chat::{contact_can_upgrade_to_pq, security_badge},
     common::{
-        AllowClassical, Copyable, Progress, act_while, can_allow_classical,
-        cancel_active_chat_history_reservation, cancel_chat_history,
+        AllowClassical, ContactKey, Copyable, InvitationLink, Progress, act_while,
+        can_allow_classical, cancel_active_chat_history_reservation, cancel_chat_history,
         cancel_retained_chat_history_reservation, close_dialog, commit_chat_history,
-        invitation_link, is_chat_history_owned, pq_available, reserve_chat_history,
-        retain_active_chat_history_reservation, retain_chat_history, server_pq_disabled,
-        strict_pq_enabled, upgrade_disabled_tip,
+        default_shared_contact_name, flash_copied, initials, invitation_link,
+        is_chat_history_owned, pq_available, reserve_chat_history,
+        retain_active_chat_history_reservation, retain_chat_history, send, server_pq_disabled,
+        shareable_contacts, shared_contact_pq_pinned, strict_pq_enabled, upgrade_disabled_tip,
+        writable_recipients,
     },
     engine,
     files::FileBrowser,
+    media::blob_url,
     settings::Settings,
     ui,
 };
@@ -150,10 +161,17 @@ pub(super) fn VaultDialog() -> impl IntoView {
                     }),
                 ) => view! { <NewChat key name server pq_pinned /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Identity)) => view! { <Identity /> }.into_any(),
+                (Phase::Unlocked, Some(Dialog::InviteQr { from_identity })) => {
+                    view! { <InviteQr from_identity /> }.into_any()
+                }
                 (Phase::Unlocked, Some(Dialog::Settings)) => view! { <Settings /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Contact(peer))) => {
                     view! { <ContactInfo peer /> }.into_any()
                 }
+                (
+                    Phase::Unlocked,
+                    Some(Dialog::ShareContact { subject, recipient }),
+                ) => view! { <ShareContact subject recipient /> }.into_any(),
                 (Phase::Unlocked, Some(Dialog::Files(peer))) => {
                     view! { <FileBrowser peer /> }.into_any()
                 }
@@ -487,16 +505,13 @@ fn Identity() -> impl IntoView {
         <form on:submit=submit>
             <h2>"Your identity"</h2>
             <p>
-                "Others start a chat with your identity key, or by opening your invitation "
-                "link. Both are public: only this browser can answer."
+                "Others start a chat with your identity key, or by opening or scanning your "
+                "invitation link. Both are public: only this browser can answer."
             </p>
             <label>"Identity key"</label>
             <Copyable text=key_to_text(&me.key) what="your key" />
             <label>"Invitation link"</label>
-            {move || {
-                let link = ui.me.get().as_ref().map(invitation_link).unwrap_or_default();
-                view! { <Copyable text=link what="your invitation link" /> }
-            }}
+            <InvitationLink from_identity=true />
             <label for="my-name">"Your name, which new chats see"</label>
             <input id="my-name" autocomplete="nickname" maxlength=NAME_MAX bind:value=name />
             <div class="actions">
@@ -698,7 +713,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                     .collect_view()}
             </div>
             <label>"Their identity key"</label>
-            <Copyable text=key_to_text(&peer) what="their key" />
+            <ContactKey peer can_share=Signal::derive(move || !is_request()) />
             <label for="contact-name">"Their name, for you"</label>
             <input
                 id="contact-name"
@@ -736,6 +751,480 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         </form>
     }
     .into_any()
+}
+
+#[component]
+fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> impl IntoView {
+    let ui = ui();
+    let from_contact_info = subject.is_some() && recipient.is_none();
+    let picked = RwSignal::new(None::<PublicKey>);
+    let query = RwSignal::new(String::new());
+    let initial_name = subject
+        .and_then(|peer| ui.contact(&peer))
+        .map(|contact| default_shared_contact_name(&contact))
+        .unwrap_or_default();
+    let shared_name = RwSignal::new(initial_name);
+
+    let candidates = Memo::new(move |_| {
+        ui.contacts.with(|contacts| match (subject, recipient) {
+            (Some(subject_peer), None) => writable_recipients(contacts, subject_peer),
+            (None, Some(recipient_peer)) => shareable_contacts(contacts, recipient_peer),
+            _ => Vec::new(),
+        })
+    });
+    let filtered_peers = Memo::new(move |_| {
+        let needle = query.get().trim().to_lowercase();
+        let list = candidates.get();
+        list.into_iter()
+            .filter(|contact| {
+                needle.is_empty()
+                    || contact.label().to_lowercase().contains(&needle)
+                    || short(&contact.peer).to_lowercase().contains(&needle)
+            })
+            .map(|contact| contact.peer)
+            .collect::<Vec<_>>()
+    });
+    // Only treat a picked peer as active while it remains visible in the current filtered list so
+    // pressing Enter or clicking Share can never send to/for a hidden selection.
+    let selected_peer = Memo::new(move |_| {
+        picked
+            .get()
+            .filter(|peer| filtered_peers.with(|list| list.contains(peer)))
+    });
+    let active_subject = move || subject.or_else(|| selected_peer.get());
+    let active_recipient = move || recipient.or_else(|| selected_peer.get());
+    let will_pin_pq = Memo::new(move |_| {
+        active_subject()
+            .and_then(|peer| ui.contact(&peer))
+            .is_some_and(|contact| shared_contact_pq_pinned(&contact, server_pq_disabled(ui)))
+    });
+    let can_submit = move || {
+        let (Some(subject_peer), Some(recipient_peer)) = (active_subject(), active_recipient())
+        else {
+            return false;
+        };
+        subject_peer != recipient_peer
+            && ui
+                .contact(&subject_peer)
+                .is_some_and(|contact| !contact.request)
+            && ui
+                .contact(&recipient_peer)
+                .is_some_and(|contact| !contact.request && !contact.is_quarantined())
+    };
+
+    let submit = move |event: ev::SubmitEvent| {
+        event.prevent_default();
+        let (Some(subject_peer), Some(recipient_peer)) = (
+            subject.or_else(|| selected_peer.get_untracked()),
+            recipient.or_else(|| selected_peer.get_untracked()),
+        ) else {
+            return;
+        };
+        if subject_peer == recipient_peer {
+            return;
+        }
+        let Some(subject_contact) = ui.contact(&subject_peer) else {
+            ui.notify("That contact is no longer in your chats.");
+            return;
+        };
+        if subject_contact.request {
+            ui.notify("Accept that chat request before sharing it.");
+            return;
+        }
+        let Some(recipient_contact) = ui.contact(&recipient_peer) else {
+            ui.notify("That recipient chat is no longer available.");
+            return;
+        };
+        if recipient_contact.request || recipient_contact.is_quarantined() {
+            ui.notify("Accept or clear quarantine on that chat before sharing a contact to it.");
+            return;
+        }
+        let name = sanitize_shared_name(&shared_name.get_untracked());
+        let pq_pinned = shared_contact_pq_pinned(&subject_contact, server_pq_disabled(ui));
+        send(
+            recipient_peer,
+            content::Kind::Contact(content::Contact {
+                key: subject_peer.to_vec(),
+                name,
+                pq_pinned,
+            }),
+        );
+        close_dialog();
+        ui.notify(format!(
+            "Shared {} with {}.",
+            subject_contact.label(),
+            recipient_contact.label(),
+        ));
+    };
+
+    let avatar_letters = |contact: &ContactView| {
+        if contact.name.is_empty() {
+            hex(&contact.peer[..1])
+        } else {
+            initials(&contact.name)
+        }
+    };
+
+    let title = if from_contact_info {
+        "Share contact"
+    } else {
+        "Share a contact"
+    };
+    let intro = move || match (subject, recipient) {
+        (Some(subject_peer), None) => {
+            let who = ui
+                .contact(&subject_peer)
+                .map(|c| c.label())
+                .unwrap_or_else(|| short(&subject_peer));
+            format!(
+                "Send {who}'s public identity key to another chat so they can start an encrypted chat."
+            )
+        }
+        (None, Some(recipient_peer)) => {
+            let who = ui
+                .contact(&recipient_peer)
+                .map(|c| c.label())
+                .unwrap_or_else(|| short(&recipient_peer));
+            format!(
+                "Send a contact's public identity key to {who} so they can start an encrypted chat."
+            )
+        }
+        _ => String::new(),
+    };
+
+    view! {
+        <form on:submit=submit>
+            <h2>{title}</h2>
+            <p>{intro}</p>
+            {move || {
+                subject.and_then(|peer| ui.contact(&peer)).map(|contact| {
+                    let letters = avatar_letters(&contact);
+                    let pq = shared_contact_pq_pinned(&contact, server_pq_disabled(ui));
+                    view! {
+                        <div class="share-preview">
+                            <span class="avatar">{letters}</span>
+                            <div class="share-option-text">
+                                <strong>{contact.label()}</strong>
+                                <span>{short(&contact.peer)}</span>
+                            </div>
+                            {pq.then(|| view! { <span class="sec-badge pq">"PQ pinned"</span> })}
+                        </div>
+                    }
+                })
+            }}
+            <label>{if from_contact_info { "Send to" } else { "Contact to share" }}</label>
+            <Show when=move || candidates.with(|list| list.len() > 5)>
+                <input
+                    type="search"
+                    placeholder="Filter chats…"
+                    autocomplete="off"
+                    bind:value=query
+                    on:keydown=move |ev: ev::KeyboardEvent| {
+                        if ev.key() == "Enter" {
+                            ev.prevent_default();
+                        }
+                    }
+                />
+            </Show>
+            <div class="share-list" role="listbox" aria-label=if from_contact_info { "Choose a chat" } else { "Choose a contact" }>
+                <For
+                    each=move || filtered_peers.get()
+                    key=|peer| *peer
+                    children=move |peer| {
+                        let live = Memo::new(move |_| ui.contact(&peer));
+                        view! {
+                            <button
+                                type="button"
+                                class="share-option"
+                                class:selected=move || selected_peer.get() == Some(peer)
+                                role="option"
+                                aria-selected=move || if selected_peer.get() == Some(peer) { "true" } else { "false" }
+                                on:click=move |_| {
+                                    let changed = picked.get_untracked() != Some(peer);
+                                    picked.set(Some(peer));
+                                    if !from_contact_info && changed {
+                                        let next_name = ui
+                                            .contact(&peer)
+                                            .map(|c| default_shared_contact_name(&c))
+                                            .unwrap_or_default();
+                                        shared_name.set(next_name);
+                                    }
+                                }
+                            >
+                                <span class="avatar">
+                                    {move || {
+                                        live.with(|c| {
+                                            c.as_ref()
+                                                .map(avatar_letters)
+                                                .unwrap_or_else(|| hex(&peer[..1]))
+                                        })
+                                    }}
+                                </span>
+                                <span class="share-option-text">
+                                    <strong>
+                                        {move || {
+                                            live.with(|c| {
+                                                c.as_ref()
+                                                    .map(ContactView::label)
+                                                    .unwrap_or_else(|| short(&peer))
+                                            })
+                                        }}
+                                    </strong>
+                                    <span>{short(&peer)}</span>
+                                </span>
+                                {move || {
+                                    let c = live.get()?;
+                                    if from_contact_info {
+                                        Some(security_badge(&c, false))
+                                    } else if shared_contact_pq_pinned(&c, server_pq_disabled(ui)) {
+                                        Some(
+                                            view! { <span class="sec-badge pq">"PQ pinned"</span> }
+                                                .into_any(),
+                                        )
+                                    } else {
+                                        None
+                                    }
+                                }}
+                            </button>
+                        }
+                    }
+                />
+                <Show when=move || filtered_peers.with(Vec::is_empty)>
+                    <p class="share-empty">
+                        {move || {
+                            if !candidates.with(Vec::is_empty) {
+                                "No matching chats."
+                            } else if from_contact_info {
+                                "No eligible chats to share with yet."
+                            } else {
+                                "No other contacts to share yet."
+                            }
+                        }}
+                    </p>
+                </Show>
+            </div>
+            <Show when=move || active_subject().is_some()>
+                <label for="share-name">"Name to share (optional)"</label>
+                <input
+                    id="share-name"
+                    autocomplete="off"
+                    maxlength=NAME_MAX
+                    placeholder="Leave blank to share key only"
+                    bind:value=shared_name
+                />
+                <Show when=move || will_pin_pq.get()>
+                    <p class="pq-pin-hint">
+                        <span class="sec-badge pq">"PQ pinned"</span>
+                        " Includes post-quantum pinning so their new chat refuses classical downgrades."
+                    </p>
+                </Show>
+            </Show>
+            <div class="actions">
+                {subject.filter(|_| from_contact_info).map(|peer| {
+                    view! {
+                        <button
+                            type="button"
+                            class="btn aside"
+                            on:click=move |_| ui.dialog.set(Some(Dialog::Contact(peer)))
+                        >
+                            "Back"
+                        </button>
+                    }
+                })}
+                <button type="button" class="btn" on:click=move |_| close_dialog()>
+                    "Cancel"
+                </button>
+                <button type="submit" class="btn primary" disabled=move || !can_submit()>
+                    "Share"
+                </button>
+            </div>
+        </form>
+    }
+}
+
+#[component]
+fn InviteQr(from_identity: bool) -> impl IntoView {
+    let ui = ui();
+    let link = Memo::new(move |_| {
+        ui.me
+            .with(|me| me.as_ref().map(invitation_link).unwrap_or_default())
+    });
+    let qr = Memo::new(move |_| {
+        let current = link.get();
+        (!current.is_empty()).then(|| QrCode::encode_text(&current))
+    });
+    let has_qr = move || qr.with(|code| matches!(code, Some(Ok(_))));
+    let copied_link_gen = RwSignal::new(0u32);
+    let copied_image_gen = RwSignal::new(0u32);
+    let download_anchor = NodeRef::<html::A>::new();
+
+    let on_copy_link = move |_| {
+        let text = link.get_untracked();
+        if text.is_empty() {
+            return;
+        }
+        spawn_local(async move {
+            if !copy(&text).await {
+                ui.notify(
+                    "The browser would not copy your invitation link; copy it from Your identity instead.",
+                );
+                return;
+            }
+            flash_copied(copied_link_gen).await;
+        });
+    };
+
+    let on_copy_image = move |_| {
+        let Some(png) = qr.with_untracked(|code| match code {
+            Some(Ok(code)) => Some(code.to_export_png()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let promise = start_copy_png(&png);
+        spawn_local(async move {
+            let ok = match promise {
+                Some(promise) => JsFuture::from(promise).await.is_ok(),
+                None => false,
+            };
+            if !ok {
+                ui.notify(
+                    "The browser would not copy the QR code image; download the PNG instead.",
+                );
+                return;
+            }
+            flash_copied(copied_image_gen).await;
+        });
+    };
+
+    let on_download = move |_| {
+        let Some(anchor) = download_anchor.try_get_untracked().flatten() else {
+            return;
+        };
+        let Some(png) = qr.with_untracked(|code| match code {
+            Some(Ok(code)) => Some(code.to_export_png()),
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(url) = blob_url(&png, "image/png") else {
+            ui.notify("Could not prepare the QR code image for download.");
+            return;
+        };
+        anchor.set_href(&url);
+        anchor.set_download("ratchetx2-invite.png");
+        anchor.click();
+        let _ = anchor.remove_attribute("href");
+        let _ = anchor.remove_attribute("download");
+        set_timeout(
+            move || {
+                let _ = Url::revoke_object_url(&url);
+            },
+            Duration::from_secs(60),
+        );
+    };
+
+    view! {
+        <div class="qr-dialog">
+            <h2>"Invitation QR code"</h2>
+            <p>"Scan this code to open your invitation link and start an encrypted chat."</p>
+            <div class="qr-stage">
+                {move || match qr.get() {
+                    Some(Ok(code)) => {
+                        let total = code.total_size(QUIET_ZONE);
+                        let view_box = format!("0 0 {total} {total}");
+                        let path = code.svg_path(QUIET_ZONE);
+                        view! {
+                            <div class="qr-card">
+                                <svg
+                                    class="qr-svg"
+                                    viewBox=view_box
+                                    shape-rendering="crispEdges"
+                                    role="img"
+                                    aria-label="QR code for your invitation link"
+                                >
+                                    <rect class="qr-bg" width=total height=total />
+                                    <path class="qr-fg" d=path />
+                                </svg>
+                            </div>
+                        }
+                        .into_any()
+                    }
+                    Some(Err(_)) => view! {
+                        <p class="error" role="alert">
+                            "Your invitation link is too long to encode as a QR code."
+                        </p>
+                    }
+                    .into_any(),
+                    None => ().into_any(),
+                }}
+                {move || {
+                    ui.me.get().map(|me| {
+                        let has_pq = invitation_pins_pq(&me);
+                        let who = if me.name.is_empty() {
+                            short(&me.key)
+                        } else {
+                            format!("{} · {}", me.name, short(&me.key))
+                        };
+                        view! {
+                            <div class="qr-caption">
+                                <span class="qr-who">{who}</span>
+                                {has_pq.then(|| view! { <span class="sec-badge pq">"PQ pinned"</span> })}
+                            </div>
+                        }
+                    })
+                }}
+            </div>
+            <div class="qr-actions">
+                <button
+                    type="button"
+                    class="btn small"
+                    class:done=move || copied_link_gen.get() != 0
+                    disabled=move || link.with(String::is_empty)
+                    on:click=on_copy_link
+                >
+                    {move || icon(if copied_link_gen.get() != 0 { Icon::Tick } else { Icon::Copy })}
+                    {move || if copied_link_gen.get() != 0 { "Copied link" } else { "Copy link" }}
+                </button>
+                <button
+                    type="button"
+                    class="btn small"
+                    class:done=move || copied_image_gen.get() != 0
+                    disabled=move || !has_qr()
+                    on:click=on_copy_image
+                >
+                    {move || icon(if copied_image_gen.get() != 0 { Icon::Tick } else { Icon::Copy })}
+                    {move || if copied_image_gen.get() != 0 { "Copied image" } else { "Copy image" }}
+                </button>
+                <button
+                    type="button"
+                    class="btn small"
+                    disabled=move || !has_qr()
+                    on:click=on_download
+                >
+                    {icon(Icon::Download)}
+                    "Download PNG"
+                </button>
+            </div>
+            <a hidden node_ref=download_anchor></a>
+            <div class="actions">
+                {from_identity.then(|| {
+                    view! {
+                        <button
+                            type="button"
+                            class="btn aside"
+                            on:click=move |_| ui.dialog.set(Some(Dialog::Identity))
+                        >
+                            "Back"
+                        </button>
+                    }
+                })}
+                <button type="button" class="btn primary" on:click=move |_| close_dialog()>
+                    "Close"
+                </button>
+            </div>
+        </div>
+    }
 }
 
 #[component]

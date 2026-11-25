@@ -25,6 +25,10 @@ pub enum Icon {
     Download,
     /// Two sheets, one over the other.
     Copy,
+    /// Three finder squares and data modules: a QR code.
+    QrCode,
+    /// A person with an arrow: share a contact to another chat.
+    ShareContact,
     Tick,
     /// Play: an upload goes on.
     Resume,
@@ -126,6 +130,21 @@ impl Icon {
             Self::Copy => &[
                 "M11 9h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-8a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2z",
                 "M15 9V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h4",
+            ],
+            Self::QrCode => &[
+                "M3 3h6v6H3z",
+                "M15 3h6v6h-6z",
+                "M3 15h6v6H3z",
+                "M15 15h2v2",
+                "M21 15v.01",
+                "M15 21v.01",
+                "M19 21h2v-2",
+            ],
+            Self::ShareContact => &[
+                "M9 11.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z",
+                "M3 20a6 6 0 0 1 12 0",
+                "M16 11h5",
+                "M18.5 8.5 21 11l-2.5 2.5",
             ],
             Self::Tick => &["M4 12.5l5 5L20 6.5"],
             Self::Resume => &["M7 4.5v15l12-7.5z"],

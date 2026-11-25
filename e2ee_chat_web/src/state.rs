@@ -325,6 +325,14 @@ impl Delivery {
     }
 }
 
+/// A peer shared inside a chat message so the recipient can start or open a chat with them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SharedContact {
+    pub key: PublicKey,
+    pub name: String,
+    pub pq_pinned: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     Text(String),
@@ -332,6 +340,8 @@ pub enum Body {
     File(LocalFile),
     /// A file sent as an attachment, which opening fetches unless it is kept here already.
     Remote(RemoteFile),
+    /// A peer's public identity shared in the chat.
+    Contact(SharedContact),
     /// A greeting, which starts a session; the name the sender goes by.
     Hello(String),
     /// The peer deleted the chat.
@@ -446,10 +456,17 @@ pub enum Dialog {
     },
     /// This client's identity key, invitation link, and name.
     Identity,
+    /// A scannable QR code for this client's invitation link.
+    InviteQr { from_identity: bool },
     /// Post-quantum encryption preferences and server sign-in status.
     Settings,
     /// A contact's name, key, security level, and safety number; for a request, accept or delete it.
     Contact(PublicKey),
+    /// Share one peer's public identity into another peer's chat (`subject` or `recipient` pre-filled).
+    ShareContact {
+        subject: Option<PublicKey>,
+        recipient: Option<PublicKey>,
+    },
     /// The files of the chat with a peer.
     Files(PublicKey),
     /// Sign in to the server, which keeps files only for those who do.
@@ -680,8 +697,10 @@ impl SignInFlow {
             }
             Some(
                 Dialog::Identity
+                | Dialog::InviteQr { .. }
                 | Dialog::Settings
                 | Dialog::Contact(_)
+                | Dialog::ShareContact { .. }
                 | Dialog::Files(_)
                 | Dialog::Activity,
             ) => None,
@@ -1153,9 +1172,30 @@ mod tests {
             })
         );
 
-        // Other dialogs (Identity, Settings, Contact, Files) are never hijacked by background refusals.
+        // Other dialogs (Identity, InviteQr, Settings, Contact, Files) are never hijacked by background refusals.
         assert_eq!(
             flow.on_ask_sign_in(Some(&Dialog::Identity), true, true),
+            None
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(
+                Some(&Dialog::InviteQr {
+                    from_identity: false,
+                }),
+                true,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(
+                Some(&Dialog::ShareContact {
+                    subject: Some([1; 32]),
+                    recipient: None,
+                }),
+                true,
+                true,
+            ),
             None
         );
         assert_eq!(
