@@ -3,8 +3,8 @@
 //! Markdown as HTML, slides, tables, listings of archives, and cards of contacts and events.
 //!
 //! Every file comes from a peer: Markdown's raw HTML shows as written text, its links go only to
-//! the web or mail, and its images only come from `data:` URLs; the page's Content-Security-Policy
-//! stops the rest.
+//! the web or mail, and its images only come from raster `data:` URLs; the page's
+//! Content-Security-Policy stops the rest.
 
 mod archive;
 mod markdown;
@@ -17,21 +17,31 @@ mod tests;
 pub use archive::{Entry, Listing};
 pub use e2ee_chat_preview::audio::Tags;
 use e2ee_chat_preview::language::{self, Language};
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 pub use markdown::{markdown, slides};
+#[allow(unused_imports)] // Re-exported for syntax-highlight validation in `app::viewer`.
 pub use sanitize::validate_highlight_html;
+#[allow(unused_imports)] // `Card` is part of the public `Cards` preview API.
 pub use structured::{Card, Cards, Diff, DiffLine, Table};
 
 /// The most bytes of text shown, ...
 pub const TEXT_MAX: usize = 5_000_000;
 /// ... and highlighted, which takes a while.
 pub const HIGHLIGHT_MAX: usize = 1_000_000;
+/// The most bytes of SVG rendered as an image preview.
+pub const SVG_MAX: usize = 2 << 20;
 /// The most rows of a table shown, ...
 pub const ROWS_MAX: usize = 1_000;
 /// ... the most columns per row of a table shown, ...
 pub const COLS_MAX: usize = 100;
 /// ... the most cells of a table shown in total, ...
 pub const CELLS_MAX: usize = 20_000;
+/// ... the most lines of a unified diff shown, ...
+pub const DIFF_LINES_MAX: usize = 20_000;
+/// ... the most contact or calendar cards shown, ...
+pub const CARDS_MAX: usize = 500;
+/// ... the most fields shown per contact or calendar card, ...
+pub const CARD_FIELDS_MAX: usize = 64;
 /// ... and entries of an archive.
 pub const ENTRIES_MAX: usize = 10_000;
 /// The most bytes a gzipped tar archive is unpacked to, to list it: listing reads through every
@@ -39,6 +49,48 @@ pub const ENTRIES_MAX: usize = 10_000;
 pub const UNPACKED_MAX: u64 = 64 << 20;
 /// The most bytes of ZIP central directory metadata indexed for a listing.
 pub const ZIP_CENTRAL_DIR_MAX: u64 = 8 << 20;
+
+/// Prefix length inspected for UTF-8 text classification and `<svg` tag sniffing.
+const SNIFF_PREFIX_MAX: usize = 8 * 1024;
+
+/// Shared bounded counter used across preview parsers to cap items, fields, cells, or bytes.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PreviewBudget {
+    used: usize,
+    limit: usize,
+    truncated: bool,
+}
+
+impl PreviewBudget {
+    pub(super) const fn new(limit: usize) -> Self {
+        Self {
+            used: 0,
+            limit,
+            truncated: false,
+        }
+    }
+
+    pub(super) fn take(&mut self, amount: usize) -> bool {
+        match self.used.checked_add(amount) {
+            Some(next) if next <= self.limit => {
+                self.used = next;
+                true
+            }
+            _ => {
+                self.truncated = true;
+                false
+            }
+        }
+    }
+
+    pub(super) fn try_push(&mut self) -> bool {
+        self.take(1)
+    }
+
+    pub(super) const fn is_truncated(&self) -> bool {
+        self.truncated
+    }
+}
 
 /// Office documents, which show no preview, not even as the archives some of them are.
 const OFFICE: [&str; 13] = [
@@ -84,6 +136,50 @@ pub enum Sort {
     Other = 7,
 }
 
+/// Extract the lowercase MIME essence (`type/subtype`), stripping any `;param=...` parameters.
+fn base_mime(mime: &str) -> String {
+    mime.split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+}
+
+/// Check whether `data` starts with valid NUL-free UTF-8 text within its first [`SNIFF_PREFIX_MAX`]
+/// bytes, tolerating a multi-byte character split cleanly across the prefix boundary.
+fn is_utf8_text_prefix(data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let sample = &data[..data.len().min(SNIFF_PREFIX_MAX)];
+    if sample.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        Err(err) => sample.len() < data.len() && err.error_len().is_none(),
+    }
+}
+
+/// Decode the valid UTF-8 prefix of `data` (up to [`SNIFF_PREFIX_MAX`] bytes), returning `None`
+/// if `data` contains NUL bytes or invalid UTF-8 in that prefix.
+fn utf8_prefix(data: &[u8]) -> Option<&str> {
+    if data.is_empty() {
+        return None;
+    }
+    let sample = &data[..data.len().min(SNIFF_PREFIX_MAX)];
+    if sample.contains(&0) {
+        return None;
+    }
+    match std::str::from_utf8(sample) {
+        Ok(text) => Some(text),
+        Err(err) if sample.len() < data.len() && err.error_len().is_none() => {
+            std::str::from_utf8(&sample[..err.valid_up_to()]).ok()
+        }
+        Err(_) => None,
+    }
+}
+
 /// The sort of `data`, the file `name` of the MIME type `mime` by its sender: by its content
 /// first, for the formats with a signature known here, as the sender's name and type are only
 /// hints; then by its name, then by its type. `data` is empty if its bytes are not here, as for
@@ -93,7 +189,7 @@ pub fn sort(name: &str, mime: &str, data: &[u8]) -> Sort {
     let extension = lower
         .rsplit_once('.')
         .map_or("", |(_, extension)| extension);
-    let mime = mime.to_lowercase();
+    let mime = base_mime(mime);
     if let Some(media) = media_mime(&lower, &mime, data) {
         return media_sort(media);
     }
@@ -142,8 +238,11 @@ pub fn sort(name: &str, mime: &str, data: &[u8]) -> Sort {
         _ => {}
     }
     // Any other text is a document, as its sender wrote it.
-    let text = !data.is_empty() && std::str::from_utf8(data).is_ok_and(|text| !text.contains('\0'));
-    if text { Sort::Document } else { Sort::Other }
+    if is_utf8_text_prefix(data) {
+        Sort::Document
+    } else {
+        Sort::Other
+    }
 }
 
 /// The sort of media of the MIME type `mime`.
@@ -172,7 +271,7 @@ pub fn media_mime(name: &str, mime: &str, data: &[u8]) -> Option<&'static str> {
 
 /// Media without a signature known here, as the sender's browser named them.
 fn hinted_media(mime: &str) -> Option<Kind> {
-    Some(match mime.to_lowercase().as_str() {
+    Some(match base_mime(mime).as_str() {
         "video/mp4" => Kind::Video("video/mp4"),
         "video/webm" => Kind::Video("video/webm"),
         "audio/mpeg" => Kind::Audio("audio/mpeg"),
@@ -294,9 +393,93 @@ fn code(text: String, language: Option<&'static Language>) -> Kind {
     Kind::Code { text, language }
 }
 
+/// Validate a Windows/OS2 BMP header (14-byte file header + known DIB header size, plane count,
+/// valid bits-per-pixel, and consistent file size / pixel data offset) so plain text starting
+/// with `"BM"` is never misclassified as an image.
+fn is_bmp(data: &[u8]) -> bool {
+    if data.len() < 26 || !data.starts_with(b"BM") {
+        return false;
+    }
+    let file_size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
+    let reserved = &data[6..10];
+    let pixel_offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]);
+    let dib_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
+    if reserved != [0, 0, 0, 0] {
+        return false;
+    }
+    if !matches!(dib_size, 12 | 40 | 52 | 56 | 64 | 108 | 124) {
+        return false;
+    }
+    let header_end = 14u32.saturating_add(dib_size);
+    if data.len() < header_end as usize || file_size < header_end || pixel_offset < header_end {
+        return false;
+    }
+    if pixel_offset > file_size {
+        return false;
+    }
+    let (planes, bpp) = if dib_size == 12 {
+        (
+            u16::from_le_bytes([data[22], data[23]]),
+            u16::from_le_bytes([data[24], data[25]]),
+        )
+    } else {
+        (
+            u16::from_le_bytes([data[26], data[27]]),
+            u16::from_le_bytes([data[28], data[29]]),
+        )
+    };
+    planes == 1 && matches!(bpp, 1 | 2 | 4 | 8 | 16 | 24 | 32)
+}
+
+/// Validate an ID3v2 header (10 bytes: `"ID3"`, version `2..=4`, non-0xFF revision, valid version
+/// flags, and 4 synchsafe size bytes `< 0x80`) so text starting with `"ID3"` is not misclassified.
+fn is_id3v2(data: &[u8]) -> bool {
+    if data.len() < 10 || !data.starts_with(b"ID3") {
+        return false;
+    }
+    let version = data[3];
+    let revision = data[4];
+    let flags = data[5];
+    let valid_flags = match version {
+        2 => flags & 0x3F == 0,
+        3 => flags & 0x1F == 0,
+        4 => flags & 0x0F == 0,
+        _ => return false,
+    };
+    revision != 0xFF && valid_flags && data[6..10].iter().all(|&b| b < 0x80)
+}
+
+/// Validate an Ogg page header (version `0`, valid `header_type` with BOS flag set on page 0,
+/// and complete segment lacing table) so text starting with `"OggS"` is not misclassified.
+fn is_ogg(data: &[u8]) -> bool {
+    if data.len() < 28 || !data.starts_with(b"OggS") {
+        return false;
+    }
+    let version = data[4];
+    let header_type = data[5];
+    let page_segments = usize::from(data[26]);
+    version == 0
+        && header_type & !0x07 == 0
+        && header_type & 0x02 != 0
+        && page_segments > 0
+        && data.len() >= 27 + page_segments
+}
+
+/// Validate a FLAC stream marker followed by the mandatory 34-byte STREAMINFO metadata block so
+/// text starting with `"fLaC"` is not misclassified.
+fn is_flac(data: &[u8]) -> bool {
+    if data.len() < 42 || !data.starts_with(b"fLaC") {
+        return false;
+    }
+    let block_type = data[4] & 0x7F;
+    let block_len =
+        (usize::from(data[5]) << 16) | (usize::from(data[6]) << 8) | usize::from(data[7]);
+    block_type == 0 && block_len == 34
+}
+
 /// The MIME type of the image `data`, the file `name`, if the browser shows it: PNG, JPEG, GIF,
-/// WebP, AVIF, BMP and ICO by their first bytes, and SVG by its name and tag. An SVG shows as an
-/// image only, where its scripts do not run.
+/// WebP, AVIF, BMP and ICO by their first bytes, and bounded SVG by its name and prefix tag. An
+/// SVG shows as an image only, where its scripts do not run.
 pub fn image_mime(name: &str, data: &[u8]) -> Option<&'static str> {
     if let Some(mime) = crate::content::image_type(data) {
         return Some(mime);
@@ -317,10 +500,11 @@ pub fn image_mime(name: &str, data: &[u8]) -> Option<&'static str> {
             b'f' | b's',
             ..,
         ] => Some("image/avif"),
-        [b'B', b'M', ..] if data.len() > 26 => Some("image/bmp"),
+        _ if is_bmp(data) => Some("image/bmp"),
         [0, 0, 1, 0, count, ..] if *count > 0 => Some("image/x-icon"),
-        _ if name.to_lowercase().ends_with(".svg")
-            && std::str::from_utf8(data).is_ok_and(|text| text.contains("<svg")) =>
+        _ if data.len() <= SVG_MAX
+            && name.to_lowercase().ends_with(".svg")
+            && utf8_prefix(data).is_some_and(|prefix| prefix.contains("<svg")) =>
         {
             Some("image/svg+xml")
         }
@@ -338,9 +522,9 @@ fn sniff(name: &str, data: &[u8]) -> Option<Kind> {
     }
     Some(match data {
         [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] => Kind::Archive(archive::zip(data)?),
-        [0x1F, 0x8B, ..] => Kind::Archive(archive::tar(GzDecoder::new(data), UNPACKED_MAX)?),
-        // Already as large as it gets, and listed as fast as it is read.
-        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(archive::tar(data, u64::MAX)?),
+        [0x1F, 0x8B, ..] => Kind::Archive(archive::tar(MultiGzDecoder::new(data), UNPACKED_MAX)?),
+        // Uncompressed tar: seek over entry payloads in O(1).
+        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(archive::tar_slice(data)?),
         _ => return None,
     })
 }
@@ -363,9 +547,14 @@ fn sniff_media(name: &str, data: &[u8]) -> Option<Kind> {
         },
         [0x1A, 0x45, 0xDF, 0xA3, ..] if has(b"webm") => Kind::Video("video/webm"),
         [0x1A, 0x45, 0xDF, 0xA3, ..] => Kind::Video("video/x-matroska"),
-        [b'O', b'g', b'g', b'S', ..] if has(b"theora") => Kind::Video("video/ogg"),
-        [b'O', b'g', b'g', b'S', ..] => Kind::Audio("audio/ogg"),
-        [b'f', b'L', b'a', b'C', ..] => Kind::Audio("audio/flac"),
+        _ if is_ogg(data) => {
+            if has(b"theora") {
+                Kind::Video("video/ogg")
+            } else {
+                Kind::Audio("audio/ogg")
+            }
+        }
+        _ if is_flac(data) => Kind::Audio("audio/flac"),
         [
             b'R',
             b'I',
@@ -381,7 +570,7 @@ fn sniff_media(name: &str, data: &[u8]) -> Option<Kind> {
             b'E',
             ..,
         ] => Kind::Audio("audio/wav"),
-        [b'I', b'D', b'3', ..] => Kind::Audio("audio/mpeg"),
+        _ if is_id3v2(data) => Kind::Audio("audio/mpeg"),
         // ADTS AAC, then MPEG audio frames.
         [0xFF, second, ..] if second & 0xF6 == 0xF0 => Kind::Audio("audio/aac"),
         [0xFF, second, ..] if second & 0xE0 == 0xE0 && second & 0x06 != 0 => {
