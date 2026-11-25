@@ -9,7 +9,7 @@ use crate::state::{
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, now, short};
 use crate::vault::{
-    CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
+    Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
     ContactState, GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_LEGACY_UNKNOWN,
     GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, IndexRange,
     SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
@@ -95,6 +95,15 @@ pub(super) enum FarewellMode {
     Normal,
 }
 
+/// Result of [`Contact::told`]: history delivery steps plus any sealed pending outbox entries
+/// settled directly by a peer receipt after a lost push acknowledgement.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(super) struct ToldOutcome {
+    pub(super) steps: Vec<(u64, Step)>,
+    /// `(history_index, clock)` pairs for sealed outbox entries removed after matching a receipt.
+    pub(super) settled_outbox: Vec<(u64, u64)>,
+}
+
 /// Read-tracking metadata for one history entry currently rendered on screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct DisplayedEntry {
@@ -108,6 +117,18 @@ fn acked_ranges_contain(ranges: &[IndexRange], index: u64) -> bool {
     ranges
         .get(pos)
         .is_some_and(|r| r.start <= index && index < r.end)
+}
+
+/// Bound `ranges` to at most [`EVENTS_KEPT`] disjoint intervals by coalescing the oldest gap(s)
+/// so alternating acked/unacked entries cannot grow `AppState` unboundedly.
+fn cap_acked_ranges(ranges: &mut Vec<IndexRange>) {
+    if ranges.len() <= EVENTS_KEPT {
+        return;
+    }
+    let excess = ranges.len() - EVENTS_KEPT;
+    let merged_end = ranges[excess].end;
+    ranges[0].end = merged_end;
+    ranges.drain(1..=excess);
 }
 
 fn coalesce_acked_ranges(ranges: &mut Vec<IndexRange>) {
@@ -126,6 +147,7 @@ fn coalesce_acked_ranges(ranges: &mut Vec<IndexRange>) {
         }
     }
     ranges.truncate(write + 1);
+    cap_acked_ranges(ranges);
 }
 
 pub(super) fn insert_acked_range(ranges: &mut Vec<IndexRange>, start: u64, end: u64) {
@@ -135,6 +157,7 @@ pub(super) fn insert_acked_range(ranges: &mut Vec<IndexRange>, start: u64, end: 
     if let Some(last) = ranges.last_mut() {
         if start > last.end {
             ranges.push(IndexRange { start, end });
+            cap_acked_ranges(ranges);
             return;
         }
         if start >= last.start {
@@ -155,6 +178,7 @@ fn merge_acked_batch(ranges: &mut Vec<IndexRange>, batch: Vec<IndexRange>) {
     }
     if ranges.is_empty() {
         *ranges = batch;
+        cap_acked_ranges(ranges);
         return;
     }
     // Fast path: the entire sorted batch lies at or after the tail range.
@@ -170,6 +194,7 @@ fn merge_acked_batch(ranges: &mut Vec<IndexRange>, batch: Vec<IndexRange>) {
                 ranges.push(range);
             }
         }
+        cap_acked_ranges(ranges);
         return;
     }
     ranges.extend(batch);
@@ -345,7 +370,7 @@ impl Contact {
         self.state.peer_last = place;
         match &content.kind {
             Some(Kind::Hello(hello)) => {
-                self.state.hello_name = hello.name.clone();
+                self.state.hello_name = super::sanitize_shared_name(&hello.name);
                 self.mark_index_acked(index);
             }
             _ if !open => self.state.unread = self.state.unread.saturating_add(1),
@@ -375,8 +400,22 @@ impl Contact {
     /// Tell the peer that its message at `clock` was read.
     fn tell_read(&mut self, clock: u64) {
         let events = self.state.events.get_or_insert_default();
-        events.read.push(clock);
-        keep_last(&mut events.read);
+        if !events.read.contains(&clock) {
+            events.read.push(clock);
+            keep_last(&mut events.read);
+        }
+    }
+
+    /// Tell the peer that its attachment at `clock` was downloaded, deduplicating repeated
+    /// notifications (e.g. concurrent final stream chunks). Returns `true` if queued anew.
+    pub(super) fn tell_downloaded(&mut self, clock: u64) -> bool {
+        let events = self.state.events.get_or_insert_default();
+        if events.downloaded.contains(&clock) {
+            return false;
+        }
+        events.downloaded.push(clock);
+        keep_last(&mut events.downloaded);
+        true
     }
 
     /// Record that history entry `index` does not require future unread acknowledgment (outgoing,
@@ -485,35 +524,83 @@ impl Contact {
     }
 
     /// Take what the peer told of this client's messages: those it names that wait for it move
-    /// on, and are forgotten once they wait for nothing more. Returns their steps, by history
-    /// entry.
-    pub(super) fn told(&mut self, events: &Events) -> Vec<(u64, Step)> {
-        let mut steps = vec![];
-        for (clocks, step) in [
-            (&events.read, Step::Read),
-            (&events.downloaded, Step::Downloaded),
-        ] {
-            for clock in clocks {
-                let Some(at) = self
-                    .state
-                    .awaiting
-                    .iter()
-                    .position(|awaiting| awaiting.place == *clock)
-                else {
-                    continue;
-                };
-                // Read, or downloaded, which it opened to: what the peer writes next goes after.
-                self.state.read_by_peer = self.state.read_by_peer.max(*clock);
-                let awaiting = &mut self.state.awaiting[at];
-                steps.push((awaiting.history_index, step));
-                if step == Step::Read && awaiting.attachment {
-                    awaiting.read = true;
-                } else {
-                    self.state.awaiting.remove(at);
-                }
-            }
+    /// on, and are forgotten once they wait for nothing more.
+    ///
+    /// Caps and deduplicates incoming receipt clocks to [`EVENTS_KEPT`] and matches both
+    /// `awaiting` and sealed pending `outbox` entries (in case a push succeeded on the relay but
+    /// its reply was lost) in O(N + M) time.
+    pub(super) fn told(&mut self, events: &Events) -> ToldOutcome {
+        let read_set: HashSet<u64> = events.read.iter().copied().take(EVENTS_KEPT).collect();
+        let downloaded_set: HashSet<u64> = events
+            .downloaded
+            .iter()
+            .copied()
+            .take(EVENTS_KEPT)
+            .collect();
+        let mut steps = Vec::new();
+        let mut settled_outbox = Vec::new();
+        if read_set.is_empty() && downloaded_set.is_empty() {
+            return ToldOutcome {
+                steps,
+                settled_outbox,
+            };
         }
-        steps
+        self.state.awaiting.retain_mut(|awaiting| {
+            let was_read = read_set.contains(&awaiting.place);
+            let was_downloaded = downloaded_set.contains(&awaiting.place);
+            if !was_read && !was_downloaded {
+                return true;
+            }
+            // Read, or downloaded, which it opened to: what the peer writes next goes after.
+            self.state.read_by_peer = self.state.read_by_peer.max(awaiting.place);
+            if was_read {
+                steps.push((awaiting.history_index, Step::Read));
+                awaiting.read = true;
+            }
+            if was_downloaded {
+                steps.push((awaiting.history_index, Step::Downloaded));
+                return false;
+            }
+            awaiting.attachment
+        });
+        let mut newly_awaiting = Vec::new();
+        self.state.outbox.retain(|outgoing| {
+            if !outgoing.sealed || outgoing.clock == 0 {
+                return true;
+            }
+            let was_read = read_set.contains(&outgoing.clock);
+            let was_downloaded = downloaded_set.contains(&outgoing.clock);
+            if !was_read && !was_downloaded {
+                return true;
+            }
+            self.state.read_by_peer = self.state.read_by_peer.max(outgoing.clock);
+            settled_outbox.push((outgoing.history_index, outgoing.clock));
+            if was_read {
+                steps.push((outgoing.history_index, Step::Read));
+            }
+            if was_downloaded {
+                steps.push((outgoing.history_index, Step::Downloaded));
+            } else {
+                // Tentatively retain for a subsequent `Downloaded` receipt in case this entry is
+                // an attachment; `read = true` ensures peer chat deletion will not requeue it,
+                // and `receive()` prunes non-attachments once the history entry is loaded.
+                newly_awaiting.push(Awaiting {
+                    place: outgoing.clock,
+                    history_index: outgoing.history_index,
+                    read: true,
+                    attachment: true,
+                });
+            }
+            false
+        });
+        if !newly_awaiting.is_empty() {
+            self.state.awaiting.extend(newly_awaiting);
+            keep_last(&mut self.state.awaiting);
+        }
+        ToldOutcome {
+            steps,
+            settled_outbox,
+        }
     }
 
     /// History entry `index`, as shown.
@@ -576,7 +663,7 @@ impl Contact {
                     )
                 }
                 Some(Kind::File(content)) => file(content.name, content.mime, content.data),
-                Some(Kind::Hello(hello)) => Body::Hello(hello.name),
+                Some(Kind::Hello(hello)) => Body::Hello(super::sanitize_shared_name(&hello.name)),
                 Some(Kind::Deleted(_)) => Body::Deleted,
                 Some(Kind::Attachment(pointer)) => Body::Remote(RemoteFile {
                     peer: self.peer,

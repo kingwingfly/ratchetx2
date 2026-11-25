@@ -723,7 +723,6 @@ pub type MediaReply<'a> = Result<(u64, u64, &'a str, &'a [u8]), MediaError>;
 
 impl MediaRequest {
     /// Whether the service worker signalled that the underlying fetch request was aborted.
-    #[allow(dead_code)] // Used by streaming range cancellation when wired.
     pub fn is_aborted(&self) -> bool {
         self.aborted.get()
     }
