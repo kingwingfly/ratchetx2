@@ -803,15 +803,18 @@ impl KemRatchet {
     }
 
     /// Process an incoming [`KemHeader`] on a decrypted skipped (out-of-order) message: validates
-    /// the PQ fields, queues any newly observed peer encapsulation key so PQ-PCS is not delayed,
-    /// and accounts for the message in the rekey cadence.
+    /// the PQ fields and accounts for the message in the rekey cadence without adopting `header.ek`.
+    ///
+    /// A skipped message is strictly older than a message already received from the peer. Because
+    /// [`prepare_send`](Self::prepare_send) retransmits the active offer on every message until it
+    /// is acknowledged or superseded, any `ek` carried by a skipped message is already known,
+    /// superseded by a fresher offer, or evicted from the peer's bounded `pending_offers` ring;
+    /// adopting it could overwrite a fresher offer or cause encapsulation to an evicted/consumed
+    /// peer key (`InvalidHeader` on the next chain).
     ///
     /// Call on a cloned [`KemRatchet`] and commit only after message AEAD verification succeeds.
     pub fn receive_skipped_header(&mut self, header: &KemHeader) -> Result<(), CryptoError> {
         self.validate_incoming_header(header)?;
-        if let Some(ek) = &header.ek {
-            self.record_peer_ek(ek);
-        }
         self.messages_since_rekey = self.messages_since_rekey.saturating_add(1);
         Ok(())
     }
@@ -1460,7 +1463,7 @@ mod test {
     }
 
     #[test]
-    fn default_cadence_and_skipped_header_ek_recording() {
+    fn default_cadence_and_skipped_header_ignores_stale_ek() {
         for suite in enabled_suites() {
             let mut alice = KemRatchet::new(suite);
             let mut bob = KemRatchet::new(suite);
@@ -1471,15 +1474,24 @@ mod test {
             let h_a1 = alice.prepare_send().unwrap();
             assert_eq!(h_a0.ek, h_a1.ek);
 
-            // Bob records Alice's offer arriving only via a skipped message.
+            // Skipped headers validate PQ fields and bump message cadence, but NEVER adopt a
+            // stale/delayed `ek` into `peer_pending_ek` (neither when empty nor when fresher
+            // offers are pending).
             let mut bob_skipped = KemRatchet::new(suite);
             bob_skipped.receive_skipped_header(&h_a0).unwrap();
-            // On Bob's next chain step (even with empty header), Bob encapsulates to Alice's ek!
+            assert_eq!(bob_skipped.messages_since_rekey, 1);
+            assert!(bob_skipped.peer_pending_ek.is_none());
+            let mut malformed = h_a0.clone();
+            malformed.suite = Some(99);
+            assert_eq!(
+                bob_skipped.receive_skipped_header(&malformed).unwrap_err(),
+                CryptoError
+            );
             let (recv_ss, send_ss) = bob_skipped
                 .receive_chain_step(&KemHeader::default())
                 .unwrap();
             assert!(recv_ss.is_none());
-            assert!(send_ss.is_some());
+            assert!(send_ss.is_none());
 
             // Default cadence: after initial exchange, no offer is emitted for < 4 turns / < 20 msgs.
             bob.receive_chain_step(&h_a0).unwrap();

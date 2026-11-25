@@ -47,6 +47,9 @@ pub const SKIP_MAX: u64 = 1024;
 /// kept; a message delayed longer cannot be decrypted.
 pub const MAX_SKIPPED_CHAINS: usize = 5;
 
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+const _: () = assert!(ratchetx2::pq::MAX_ENCAPSULATED_HISTORY > MAX_SKIPPED_CHAINS);
+
 /// The party who participates in the E2EE chat: encrypts and decrypts messages, without I/O.
 /// See the example in the [crate docs](crate).
 ///
@@ -1734,64 +1737,71 @@ mod test {
         }
 
         #[test]
-        fn pq_skipped_message_records_peer_ek_and_mid_chain_ct_mismatch_rejected() {
+        fn pq_delayed_evicted_offer_never_breaks_session_and_mid_chain_ct_mismatch_rejected() {
             for suite in enabled_suites() {
-                let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::default());
-                // Establish initial session so both sides finish initial offer/encap.
+                // Case 1 (pending fresher offer present) and Case 2 (post-encapsulation `None`
+                // pending slot): peer creates E1 on a delayed message, calls `force_rekey` x4
+                // (evicting E1 from MAX_PENDING_OFFERS = 4), then delayed message carrying E1
+                // arrives out of order. Neither case may overwrite/adopt evicted E1, and replies
+                // MUST continue round-tripping cleanly.
+                for reply_before_delayed in [false, true] {
+                    let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::default());
+                    let a0 = alice.encrypt(b"a0").unwrap();
+                    assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
+                    let b0 = bob.encrypt(b"b0").unwrap();
+                    assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
+
+                    // Alice starts a new chain with E1 on a delayed message, then calls
+                    // `force_rekey` x4 so E1 is evicted from Alice's `pending_offers` ring!
+                    let a_lead = alice.encrypt(b"a-lead").unwrap();
+                    assert_eq!(bob.decrypt(&a_lead).unwrap(), b"a-lead");
+
+                    let evicted_id = alice.kem_ratchet.as_mut().unwrap().force_rekey().unwrap();
+                    let a_delayed_e1 = alice.encrypt(b"a-delayed-e1").unwrap();
+                    let mut latest_id = evicted_id;
+                    for _ in 0..ratchetx2::pq::MAX_PENDING_OFFERS {
+                        latest_id = alice.kem_ratchet.as_mut().unwrap().force_rekey().unwrap();
+                    }
+                    assert_ne!(evicted_id, latest_id);
+                    let a_latest = alice.encrypt(b"a-latest-e5").unwrap();
+                    // Bob receives `a_latest` (queuing `latest_id` via `receive_current_chain`).
+                    assert_eq!(bob.decrypt(&a_latest).unwrap(), b"a-latest-e5");
+
+                    if reply_before_delayed {
+                        // Advance through a turn so Bob consumes `latest_id` and `peer_pending_ek`
+                        // becomes `None` BEFORE `a_delayed_e1` arrives out of order!
+                        let b1 = bob.encrypt(b"b1").unwrap();
+                        assert_eq!(alice.decrypt(&b1).unwrap(), b"b1");
+                        let a_turn2 = alice.encrypt(b"a-turn2").unwrap();
+                        assert_eq!(bob.decrypt(&a_turn2).unwrap(), b"a-turn2");
+                        let b2 = bob.encrypt(b"b2").unwrap();
+                        assert_eq!(alice.decrypt(&b2).unwrap(), b"b2");
+                    }
+
+                    // Now delayed `a_delayed_e1` (carrying evicted E1) arrives out of order!
+                    assert_eq!(bob.decrypt(&a_delayed_e1).unwrap(), b"a-delayed-e1");
+
+                    // Round-trip replies MUST still succeed (never encapsulating evicted E1)!
+                    for turn in 0..2 {
+                        let a_msg = alice.encrypt(format!("after-a-{turn}").as_bytes()).unwrap();
+                        assert_eq!(
+                            bob.decrypt(&a_msg).unwrap(),
+                            format!("after-a-{turn}").as_bytes()
+                        );
+                        let b_msg = bob.encrypt(format!("after-b-{turn}").as_bytes()).unwrap();
+                        assert_eq!(
+                            alice.decrypt(&b_msg).unwrap(),
+                            format!("after-b-{turn}").as_bytes()
+                        );
+                    }
+                }
+
+                // Mid-chain ct/ek_id mismatch on current chain is rejected.
+                let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::every_turn());
                 let a0 = alice.encrypt(b"a0").unwrap();
                 assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
                 let b0 = bob.encrypt(b"b0").unwrap();
                 assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
-
-                // Alice sends a1 (no offer), forces rekey so a2 carries a fresh ek, then a3 (same ek),
-                // then Bob receives a1, skips a2, and receives a3 without ek? Better:
-                // Alice sends a1 (no ek), forces rekey -> a2 (carries ek), then Bob receives a1,
-                // skips a2 -> wait: a3 also carries active offer ek. To have ek ONLY on a skipped
-                // message, have Alice send a1 (with forced ek), then Bob replies on a later chain
-                // AFTER a1 was skipped!
-                // Even simpler: Alice forces rekey -> sends a1 (carries ek_new), then Alice receives
-                // b1 (new chain) before Bob saw a1; Bob decrypts a2 (later chain without ek_new), then
-                // receives delayed a1 (skipped!). Bob MUST record ek_new from a1 so his next reply
-                // encapsulates to ek_new!
-                let forced_id = alice.kem_ratchet.as_mut().unwrap().force_rekey().unwrap();
-                let a1_with_ek = alice.encrypt(b"a1-with-ek").unwrap();
-                // Bob receives a2 (skipping a1_with_ek) -> wait: a2 also carries ek_new; instead
-                // let Bob receive a1_no_ek? No: if Bob receives a0_plain first, then Alice forces
-                // rekey for a1_with_ek, then Bob receives a2 (skipping a1_with_ek): both carry ek.
-                // Let's test directly that `receive_skipped` calls `receive_skipped_header`:
-                // Bob decrypts a0_later first (skipping a1_with_ek if a1 was sent first and a2
-                // cleared offer).
-                let a2 = alice.encrypt(b"a2").unwrap();
-                // Strip ek from a2's header on the wire? No, test directly via a separate fresh
-                // rekey after a1: Bob decrypts a2 (which carries ek), wait — that already records ek.
-                // Instead, have Alice send a1_plain (no ek), then force_rekey -> a2_with_ek,
-                // then bob decrypts a2_with_ek? No, we want the skipped message to carry a NEW ek!
-                // Have Alice force_rekey (id1) -> send a1 (carries id1), then force_rekey (id2) ->
-                // send a2 (carries id2). Bob receives a2 (records id2), replies b1 (encapsulates id2),
-                // then receives delayed a1 (skipped, carries id1!). Bob's kem_ratchet now queues id1!
-                let _ = a2;
-                let id2 = alice.kem_ratchet.as_mut().unwrap().force_rekey().unwrap();
-                assert_ne!(forced_id, id2);
-                let a_latest = alice.encrypt(b"a-latest").unwrap();
-                assert_eq!(bob.decrypt(&a_latest).unwrap(), b"a-latest");
-                let b_reply = bob.encrypt(b"b-reply").unwrap();
-                assert_eq!(alice.decrypt(&b_reply).unwrap(), b"b-reply");
-
-                // Now delayed `a1_with_ek` (carrying `forced_id`) arrives via `receive_skipped`!
-                assert_eq!(bob.decrypt(&a1_with_ek).unwrap(), b"a1-with-ek");
-                // Alice sends next chain (empty KEM header); Bob's next reply MUST encapsulate `forced_id`!
-                let a_next = alice.encrypt(b"a-next").unwrap();
-                assert_eq!(bob.decrypt(&a_next).unwrap(), b"a-next");
-                let b_next = bob.encrypt(b"b-next").unwrap();
-                let alice_next_hk = alice.ratchet.next_header_key_receiver();
-                let b_next_header = alice.open_header(&alice_next_hk, &b_next).unwrap().unwrap();
-                assert_eq!(
-                    b_next_header.pq_key_id.as_deref(),
-                    Some(forced_id.as_slice())
-                );
-                assert_eq!(alice.decrypt(&b_next).unwrap(), b"b-next");
-
-                // Mid-chain ct/ek_id mismatch on current chain is rejected.
                 let b_follow = bob.encrypt(b"b-follow").unwrap();
                 let alice_cur_hk = alice.ratchet.header_key_receiver().unwrap();
                 let forged = reencrypt_header(&alice, &alice_cur_hk, &b_follow, |h| {

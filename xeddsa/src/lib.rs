@@ -306,7 +306,8 @@ impl XEdDSAPrivateKey {
                 .finalize()
                 .into(),
         );
-        let s = *r + h * *private_key;
+        let h_a = Zeroizing::new(h * *private_key);
+        let s = *r + *h_a;
         Some(Signature::from_components(r_.to_bytes(), s.to_bytes()).to_bytes())
     }
 }
