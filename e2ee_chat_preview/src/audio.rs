@@ -145,12 +145,6 @@ fn parse_id3v2_ext_header(data: &[u8], pos: usize, major: u8, tag_size: u32) -> 
         // indicates 4-byte CRC), 4-byte `padding_size`, optional 4-byte CRC. `lofty 0.25.5`
         // runs its v2.4 extended-header parser on v2.3 and never skips `padding_size` or the v2.3
         // CRC, so any v2.3 extended header that passes `lofty`'s size check desyncs the reader.
-        let crc_len = if ext_hdr[0] & 0x80 != 0 { 4usize } else { 0 };
-        let spec_total = 4usize.saturating_add(ext_size as usize);
-        let min_spec = 4 + 2 + 4 + crc_len;
-        if spec_total < min_spec || spec_total != lofty_len {
-            return Id3v2ExtHeader::Desync;
-        }
         return Id3v2ExtHeader::Desync;
     }
 

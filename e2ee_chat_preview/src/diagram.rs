@@ -428,8 +428,28 @@ fn strip_css_comments_lower(css: &str) -> String {
     out.to_ascii_lowercase()
 }
 
-/// Returns `true` if CSS/attribute text contains an `@import`, `javascript:`, `vbscript:`, or
-/// remote `url(http...)` / `url(//...)` reference.
+/// Returns `true` if a whitespace-stripped, lowercased `data:` URI uses an allowed raster image
+/// MIME type (`png`, `jpeg`, `gif`, `webp`, `avif`, `bmp`).
+fn is_allowed_raster_data_uri(compact_lower: &str) -> bool {
+    let Some(rest) = compact_lower.strip_prefix("data:") else {
+        return false;
+    };
+    const ALLOWED: &[&str] = &[
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/avif",
+        "image/bmp",
+    ];
+    ALLOWED.iter().any(|mime| {
+        rest.strip_prefix(mime)
+            .is_some_and(|after| after.starts_with(';') || after.starts_with(','))
+    })
+}
+
+/// Returns `true` if CSS/attribute text contains an `@import`, `javascript:`, `vbscript:`,
+/// script-capable `data:` URI, or remote/non-raster `url(...)` reference.
 fn contains_unsafe_css_or_url(raw: &str) -> bool {
     let decoded = decode_xml_entities(raw);
     let stripped = strip_css_comments_lower(&decoded);
@@ -440,6 +460,12 @@ fn contains_unsafe_css_or_url(raw: &str) -> bool {
     if compact.contains("javascript:")
         || compact.contains("vbscript:")
         || compact.contains("data:text/html")
+        || compact.contains("data:image/svg+xml")
+        || compact.contains("data:application/xhtml+xml")
+        || compact.contains("data:text/xml")
+        || compact.contains("data:application/xml")
+        || compact.contains("data:text/javascript")
+        || compact.contains("data:application/javascript")
         || compact.contains("@import")
         || compact.contains("expression(")
     {
@@ -454,7 +480,7 @@ fn contains_unsafe_css_or_url(raw: &str) -> bool {
             || trimmed.starts_with("//")
             || trimmed.starts_with("javascript:")
             || trimmed.starts_with("vbscript:")
-            || trimmed.starts_with("data:text/html")
+            || (trimmed.starts_with("data:") && !is_allowed_raster_data_uri(trimmed))
         {
             return true;
         }
@@ -505,11 +531,9 @@ fn validate_safe_svg(svg: &str) -> Result<(), String> {
             continue;
         }
         if bytes[lt..].starts_with(b"<!") {
-            let Some(close) = svg[lt + 2..].find('>') else {
-                return Err("unclosed XML declaration in SVG".to_string());
-            };
-            i = lt + 2 + close + 1;
-            continue;
+            // Reject `<!DOCTYPE`, `<!ENTITY`, and any other markup declaration (only `<!--` and
+            // `<![CDATA[` above are allowed) to prevent DTD entity expansion / XXE bypasses.
+            return Err("disallowed XML declaration in SVG".to_string());
         }
 
         // Find end of tag respecting single/double quotes.
@@ -579,11 +603,12 @@ fn validate_safe_svg(svg: &str) -> Result<(), String> {
                 .name
                 .rsplit_once(':')
                 .map_or(attr.name, |(_, local)| local);
-            if local_attr.len() > 2
-                && local_attr[..2].eq_ignore_ascii_case("on")
-                && local_attr[2..]
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            let local_bytes = local_attr.as_bytes();
+            if local_bytes.len() > 2
+                && local_bytes[..2].eq_ignore_ascii_case(b"on")
+                && local_bytes[2..]
+                    .iter()
+                    .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
             {
                 return Err(format!("disallowed event attribute `{}` in SVG", attr.name));
             }
@@ -602,7 +627,7 @@ fn validate_safe_svg(svg: &str) -> Result<(), String> {
                     || compact.starts_with("//")
                     || compact.starts_with("javascript:")
                     || compact.starts_with("vbscript:")
-                    || compact.starts_with("data:text/html")
+                    || (compact.starts_with("data:") && !is_allowed_raster_data_uri(&compact))
                 {
                     return Err(format!(
                         "disallowed remote or active `{}` in SVG",
@@ -722,8 +747,10 @@ mod tests {
     #[test]
     fn validate_safe_svg_rejects_active_content_and_remote_urls() {
         assert!(
-            validate_safe_svg(r##"<svg viewBox="0 0 10 10"><style>.a{fill:url(#g)}</style><use href="#g"/></svg>"##)
-                .is_ok()
+            validate_safe_svg(
+                r##"<svg viewBox="0 0 10 10" 日="1" 🚀="2"><style>.a{fill:url(#g)}</style><use href="#g"/><image href="data:image/png;base64,iVBORw0KGgo="/></svg>"##
+            )
+            .is_ok()
         );
         for unsafe_svg in [
             r#"<svg><script>alert(1)</script></svg>"#,
@@ -734,6 +761,13 @@ mod tests {
             r#"<svg><a href="javascript:alert(1)">x</a></svg>"#,
             r#"<svg><a xlink:href="&#106;avascript:alert(1)">x</a></svg>"#,
             r#"<svg><image href="https://evil.example/track.png"/></svg>"#,
+            r#"<svg><image href="data:image/svg+xml,<svg onload=alert(1)/>"/></svg>"#,
+            r#"<svg><a xlink:href="data:application/xhtml+xml;base64,PHg+"/></svg>"#,
+            r#"<svg><a href="data:text/xml;base64,PHg+"/></svg>"#,
+            r#"<svg><a href="data:application/xml;base64,PHg+"/></svg>"#,
+            r#"<svg><style>.a{background:url(data:image/svg+xml;base64,PHN2Zz4=)}</style></svg>"#,
+            r#"<!DOCTYPE svg [ <!ENTITY x "<script>alert(1)</script>"> ]><svg>&x;</svg>"#,
+            r#"<!DOCTYPE svg SYSTEM "https://evil.example/xxe.dtd"><svg/>"#,
             r#"<svg><style>@import url("https://evil.example/a.css");</style></svg>"#,
             r#"<svg><style>.a{background:url(http://evil.example/x.png)}</style></svg>"#,
             r#"<svg><rect style="fill: url(https://evil.example/x)"/></svg>"#,

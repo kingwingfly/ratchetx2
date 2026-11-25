@@ -293,6 +293,7 @@ group!(
     }
     embeds {
         "elixir" => ["python"],
+        "haskell" => ["python"],
     }
 );
 
