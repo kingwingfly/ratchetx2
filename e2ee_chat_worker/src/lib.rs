@@ -557,10 +557,17 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
     if !upgrade.is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket")) {
         return with_security_headers(Response::error("expected a WebSocket", 426)?);
     }
-    // Validate Origin on WebSocket upgrades whenever a browser sends one (CSWSH defense).
-    if let Some(origin) = request.headers().get("origin")?
-        && !auth::ws_origin_matches(&origin, &url)
-    {
+    // Validate Origin on WebSocket upgrades whenever a browser sends one (CSWSH defense),
+    // allowing `Sec-Fetch-Site: same-origin` (e.g. `trunk serve` dev proxy) and `SERVER_ID`.
+    let origin = request.headers().get("origin")?;
+    let sec_fetch_site = request.headers().get("sec-fetch-site")?;
+    let configured_server_id = env.var("SERVER_ID").ok().map(|v| v.to_string());
+    if !auth::ws_upgrade_origin_allowed(
+        origin.as_deref(),
+        sec_fetch_site.as_deref(),
+        &url,
+        configured_server_id.as_deref(),
+    ) {
         return with_security_headers(Response::error("cross-origin WebSocket refused", 403)?);
     }
 

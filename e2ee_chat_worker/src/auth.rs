@@ -200,6 +200,60 @@ pub(crate) fn ws_origin_matches(origin: &str, target: &Url) -> bool {
         && parsed.port_or_known_default() == target.port_or_known_default()
 }
 
+/// Returns `true` iff a WebSocket upgrade passes Origin validation:
+/// - Non-browser clients omitting `Origin` are allowed.
+/// - Browser same-origin requests (`Sec-Fetch-Site: same-origin`, including dev proxies such as
+///   `trunk serve`) are allowed.
+/// - Otherwise `Origin` must match either `request_url` or the configured `SERVER_ID` (keeping
+///   scheme requirements intact so an `http://` origin cannot match an `https://` server).
+pub(crate) fn ws_upgrade_origin_allowed(
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    request_url: &Url,
+    configured_server_id: Option<&str>,
+) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    if sec_fetch_site == Some("same-origin") {
+        return true;
+    }
+    if ws_origin_matches(origin, request_url) {
+        return true;
+    }
+    let Some(server_id) = configured_server_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    if server_id.contains("://") {
+        return Url::parse(server_id).is_ok_and(|url| ws_origin_matches(origin, &url));
+    }
+    let Ok(parsed_origin) = Url::parse(origin) else {
+        return false;
+    };
+    let expected_scheme = match request_url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
+    };
+    if !matches!(parsed_origin.scheme(), "http" | "https")
+        || parsed_origin.scheme() != expected_scheme
+    {
+        return false;
+    }
+    let Ok(origin_audience) =
+        protocol::normalize_audience(&parsed_origin.origin().ascii_serialization())
+    else {
+        return false;
+    };
+    let Ok(expected_audience) = protocol::normalize_audience(server_id) else {
+        return false;
+    };
+    origin_audience == expected_audience
+}
+
 fn client_ip_key(request: &Request) -> String {
     let header = request.headers().get("CF-Connecting-IP").ok().flatten();
     normalize_client_ip_key(header.as_deref())
@@ -536,6 +590,54 @@ mod tests {
         assert!(!ws_origin_matches("https://evil.example", &https_url));
         assert!(!ws_origin_matches("wss://chat.example", &wss_url));
         assert!(!ws_origin_matches("null", &https_url));
+
+        // WebSocket upgrade policy: allows omitted Origin, Sec-Fetch-Site: same-origin (e.g.
+        // trunk serve dev proxy), exact request URL match, or configured SERVER_ID match.
+        let wrangler_dev = Url::parse("http://localhost:8787/notifications?identity=00").unwrap();
+        assert!(ws_upgrade_origin_allowed(None, None, &https_url, None));
+        assert!(ws_upgrade_origin_allowed(
+            Some("http://localhost:8080"),
+            Some("same-origin"),
+            &wrangler_dev,
+            None
+        ));
+        assert!(!ws_upgrade_origin_allowed(
+            Some("http://localhost:8080"),
+            Some("cross-site"),
+            &wrangler_dev,
+            None
+        ));
+        assert!(ws_upgrade_origin_allowed(
+            Some("https://public.example"),
+            None,
+            &https_url,
+            Some("https://public.example")
+        ));
+        assert!(ws_upgrade_origin_allowed(
+            Some("https://public.example"),
+            None,
+            &https_url,
+            Some("public.example")
+        ));
+        // Scheme downgrade against SERVER_ID is rejected.
+        assert!(!ws_upgrade_origin_allowed(
+            Some("http://public.example"),
+            None,
+            &https_url,
+            Some("https://public.example")
+        ));
+        assert!(!ws_upgrade_origin_allowed(
+            Some("http://public.example"),
+            None,
+            &https_url,
+            Some("public.example")
+        ));
+        assert!(!ws_upgrade_origin_allowed(
+            Some("https://evil.example"),
+            Some("cross-site"),
+            &https_url,
+            Some("https://public.example")
+        ));
     }
 
     #[test]

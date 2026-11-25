@@ -67,6 +67,13 @@ fn resolve_alarm_update(
     }
 }
 
+/// Computes the retry deadline for queued `pending_r2_deletes` rows based on the oldest queued
+/// row's age (`oldest + RETRY_ALARM`), clamped to `>= now_ms`, so unrelated alarm recomputations
+/// never keep pushing R2 retries out indefinitely.
+fn pending_r2_deadline(oldest_created_at: Option<u64>, now_ms: u64) -> Option<u64> {
+    oldest_created_at.map(|ts| ts.saturating_add(RETRY_ALARM).max(now_ms))
+}
+
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(extends = worker::worker_sys::DurableObjectStorage, js_name = DurableObjectStorage)]
@@ -119,7 +126,9 @@ impl DurableObject for Identity {
         if let Err(e) = self.run_alarm().await {
             console_error!("identity alarm failed, scheduling retry: {e}");
             let retry_at = Date::now().as_millis().saturating_add(RETRY_ALARM);
-            if let Err(arm_err) = self.state.storage().set_alarm(alarm_at(retry_at)).await {
+            // Use PullEarlier semantics so a retry never pushes back an earlier deadline (e.g. a
+            // 5 s pending-socket close or dedup expiry) armed meanwhile.
+            if let Err(arm_err) = self.update_alarm(AlarmUpdate::PullEarlier(retry_at)).await {
                 console_error!("cannot re-arm identity alarm after error: {arm_err}");
             }
         }
@@ -507,13 +516,13 @@ impl Identity {
 
             let pending_r2 =
                 if r2_retry.is_none() && self.has_v2_table(&sql, "pending_r2_deletes")? {
-                    query_opt::<OldestRow>(
+                    let oldest = query_opt::<OldestRow>(
                         &sql,
                         "SELECT min(created_at) AS oldest FROM pending_r2_deletes",
                         vec![],
                     )?
-                    .and_then(|row| row.oldest)
-                    .map(|_| Date::now().as_millis().saturating_add(RETRY_ALARM))
+                    .and_then(|row| row.oldest);
+                    pending_r2_deadline(oldest, Date::now().as_millis())
                 } else {
                     None
                 };
@@ -646,6 +655,22 @@ mod tests {
         assert_eq!(
             resolve_alarm_update(AlarmUpdate::Recompute { r2_retry: None }, Some(1_000), None),
             None
+        );
+    }
+
+    #[test]
+    fn pending_r2_deadline_tracks_oldest_row_age_and_clamps_to_now() {
+        assert_eq!(pending_r2_deadline(None, 10_000), None);
+        // Unrelated recompute 5 s after enqueue keeps the original created_at + RETRY_ALARM deadline.
+        assert_eq!(
+            pending_r2_deadline(Some(1_000), 6_000),
+            Some(1_000 + RETRY_ALARM)
+        );
+        // Overdue rows clamp to `now` instead of scheduling in the past.
+        let overdue_now = 1_000 + RETRY_ALARM + 50_000;
+        assert_eq!(
+            pending_r2_deadline(Some(1_000), overdue_now),
+            Some(overdue_now)
         );
     }
 }

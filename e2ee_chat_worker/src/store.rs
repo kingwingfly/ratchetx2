@@ -53,6 +53,21 @@ impl Store {
         objects::call(&stub, call).await.map_err(unavailable)
     }
 
+    /// Make typed `call` of the object of `identity_key`, returning `Ok(None)` if an older
+    /// Durable Object rejected the newly introduced wire tag during a rolling deploy.
+    async fn identity_or_unsupported<R: IdentityRpc>(
+        &self,
+        identity_key: &[u8],
+        call: R,
+    ) -> Result<Option<R::Reply>> {
+        let stub = objects::identity(&self.env, identity_key).map_err(unavailable)?;
+        match objects::call_raw(&stub, call).await {
+            Ok(reply) => Ok(Some(reply)),
+            Err(err) if err.is_unsupported_call() => Ok(None),
+            Err(err) => Err(unavailable(err.into_worker_error())),
+        }
+    }
+
     /// Make typed `call` of the object of the attachment `id`.
     async fn attachment_call<R: AttachmentRpc>(
         &self,
@@ -378,24 +393,52 @@ impl LocalPqHandshakeStore for Store {
         preferred_suites: &[u8],
         reject_pq_on_manifest: bool,
     ) -> Result<ClaimOutcome> {
-        let outcome = self
-            .identity(
+        if let Some(outcome) = self
+            .identity_or_unsupported(
                 identity_key,
                 rpc::ClaimBundleChecked {
                     preferred_suites: preferred_suites.to_vec(),
                     reject_pq_on_manifest,
                 },
             )
-            .await?;
-        match outcome {
-            ClaimBundleOutcome::NotFound => Ok(ClaimOutcome::NotFound),
-            ClaimBundleOutcome::PqDisabledForPqManifest => {
-                Ok(ClaimOutcome::PqDisabledForPqManifest)
-            }
-            ClaimBundleOutcome::Claimed(wire) => Ok(ClaimOutcome::Claimed(Box::new(
-                claimed_bundle_from_wire(identity_key, *wire)?,
-            ))),
+            .await?
+        {
+            return match outcome {
+                ClaimBundleOutcome::NotFound => Ok(ClaimOutcome::NotFound),
+                ClaimBundleOutcome::PqDisabledForPqManifest => {
+                    Ok(ClaimOutcome::PqDisabledForPqManifest)
+                }
+                ClaimBundleOutcome::Claimed(wire) => Ok(ClaimOutcome::Claimed(Box::new(
+                    claimed_bundle_from_wire(identity_key, *wire)?,
+                ))),
+            };
         }
+        // Rolling-deploy fallback for older DO instances that do not recognize tag 17 yet:
+        // pre-check `get_manifest` when `reject_pq_on_manifest` is set, then call tag 11.
+        if reject_pq_on_manifest
+            && self
+                .get_manifest(identity_key)
+                .await?
+                .is_some_and(|manifest| manifest.pq_enabled)
+        {
+            return Ok(ClaimOutcome::PqDisabledForPqManifest);
+        }
+        let wire = self
+            .identity(
+                identity_key,
+                rpc::ClaimBundle {
+                    preferred_suites: preferred_suites.to_vec(),
+                },
+            )
+            .await?;
+        let Some(wire) = wire else {
+            return Ok(ClaimOutcome::NotFound);
+        };
+        let claimed = claimed_bundle_from_wire(identity_key, wire)?;
+        if reject_pq_on_manifest && claimed.manifest.as_ref().is_some_and(|m| m.pq_enabled) {
+            return Ok(ClaimOutcome::PqDisabledForPqManifest);
+        }
+        Ok(ClaimOutcome::Claimed(Box::new(claimed)))
     }
 
     async fn add_initial_message_v2(
@@ -528,11 +571,42 @@ impl LocalIdempotentMailboxStore for Store {
             return Ok(());
         }
         let hashes: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.to_vec()).collect();
+        if self
+            .identity_or_unsupported(
+                recipient,
+                rpc::DeleteDeliveredAtomic {
+                    sender: sender.to_vec(),
+                    hashes: hashes.clone(),
+                },
+            )
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        // Rolling-deploy fallback for older DO instances that do not recognize tag 18 yet:
+        // call tags 6 + 7, propagating any R2 deletion failure BEFORE SQL deletion so client
+        // receipts are never silently dropped.
+        let objects = self
+            .identity(
+                recipient,
+                rpc::DeliveredObjects {
+                    sender: sender.to_vec(),
+                    hashes: hashes.clone(),
+                },
+            )
+            .await?;
+        if !objects.is_empty() {
+            delete_objects(&self.bucket, objects.clone())
+                .await
+                .map_err(unavailable)?;
+        }
         self.identity(
             recipient,
-            rpc::DeleteDeliveredAtomic {
+            rpc::DeleteDelivered {
                 sender: sender.to_vec(),
                 hashes,
+                objects,
             },
         )
         .await

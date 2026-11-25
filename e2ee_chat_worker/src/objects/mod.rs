@@ -441,29 +441,72 @@ pub struct AttachmentRow {
     pub uploaded: u64,
 }
 
-/// Make typed `call` of the object `stub`, and decode its statically paired reply type.
-pub async fn call<R: RpcCall>(stub: &Stub, call: R) -> Result<R::Reply> {
-    let body = call.encode()?;
+/// Error returned by [`call_raw`], preserving the DO HTTP status and response body so callers
+/// can detect rolling-deploy wire-tag mismatches against older Durable Object instances.
+pub enum RpcError {
+    Status { status: u16, body: String },
+    Other(Error),
+}
+
+impl RpcError {
+    /// Whether this error indicates an older Durable Object failed to decode a newly added
+    /// [`IdentityCall`] enum variant (rolling deploy before the DO restarts).
+    ///
+    /// Current DOs return HTTP 400 on decode errors and HTTP 500 with `"internal storage error"`
+    /// on handler failures; older DOs propagate postcard decode errors from `fetch()` as HTTP 500
+    /// with a postcard error body (not `"internal storage error"`).
+    pub fn is_unsupported_call(&self) -> bool {
+        match self {
+            Self::Status { status: 400, .. } => true,
+            Self::Status { status: 500, body } => body.trim() != "internal storage error",
+            _ => false,
+        }
+    }
+
+    pub fn into_worker_error(self) -> Error {
+        match self {
+            Self::Status { status, body } => {
+                console_error!("durable object RPC returned HTTP {status}: {body}");
+                Error::RustError("durable object call failed".into())
+            }
+            Self::Other(error) => error,
+        }
+    }
+}
+
+/// Make typed `call` of the object `stub`, preserving non-200 HTTP status for fallback handling.
+pub async fn call_raw<R: RpcCall>(stub: &Stub, call: R) -> std::result::Result<R::Reply, RpcError> {
+    let body = call.encode().map_err(RpcError::Other)?;
     let request = Request::new_with_init(
         "https://object/call",
         RequestInit::new()
             .with_method(Method::Post)
             .with_body(Some(Uint8Array::from(body.as_slice()).into())),
-    )?;
-    let mut response = stub.fetch_with_request(request).await?;
-    let answer = response.bytes().await?;
-    if response.status_code() != 200 {
-        console_error!(
-            "durable object RPC returned HTTP {}: {}",
-            response.status_code(),
-            String::from_utf8_lossy(&answer)
-        );
-        return Err(Error::RustError("durable object call failed".into()));
+    )
+    .map_err(RpcError::Other)?;
+    let mut response = stub
+        .fetch_with_request(request)
+        .await
+        .map_err(RpcError::Other)?;
+    let answer = response.bytes().await.map_err(RpcError::Other)?;
+    let status = response.status_code();
+    if status != 200 {
+        return Err(RpcError::Status {
+            status,
+            body: String::from_utf8_lossy(&answer).into_owned(),
+        });
     }
     postcard::from_bytes(&answer).map_err(|e| {
         console_error!("failed to decode durable object RPC reply: {e}");
-        Error::RustError("invalid durable object reply".into())
+        RpcError::Other(Error::RustError("invalid durable object reply".into()))
     })
+}
+
+/// Make typed `call` of the object `stub`, and decode its statically paired reply type.
+pub async fn call<R: RpcCall>(stub: &Stub, call: R) -> Result<R::Reply> {
+    call_raw(stub, call)
+        .await
+        .map_err(RpcError::into_worker_error)
 }
 
 /// The call that `request`, to an object, carries.
@@ -737,5 +780,38 @@ mod tests {
         assert_eq!(rpc::GetAttachment.encode().unwrap(), vec![1]);
         assert_eq!(rpc::NoteChunk { index: 0 }.encode().unwrap()[0], 2);
         assert_eq!(rpc::DeleteAttachment.encode().unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn rpc_error_classifies_rolling_deploy_unsupported_calls() {
+        assert!(
+            RpcError::Status {
+                status: 400,
+                body: "malformed internal request".into(),
+            }
+            .is_unsupported_call()
+        );
+        assert!(
+            RpcError::Status {
+                status: 500,
+                body: "Found an unknown enum variant".into(),
+            }
+            .is_unsupported_call()
+        );
+        assert!(
+            !RpcError::Status {
+                status: 500,
+                body: "internal storage error".into(),
+            }
+            .is_unsupported_call()
+        );
+        assert!(
+            !RpcError::Status {
+                status: 503,
+                body: "overloaded".into(),
+            }
+            .is_unsupported_call()
+        );
+        assert!(!RpcError::Other(Error::RustError("network".into())).is_unsupported_call());
     }
 }
