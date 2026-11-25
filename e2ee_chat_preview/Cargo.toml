@@ -16,49 +16,59 @@ pdf = ["dep:hayro"]
 audio = ["dep:lofty"]
 search = ["dep:regex"]
 diagram = ["dep:merman", "dep:serde_json"]
-code = [
+code-web = [
     "dep:arborium",
-    "dep:arborium-bash",
-    "dep:arborium-c",
-    "dep:arborium-c-sharp",
-    "dep:arborium-cpp",
     "dep:arborium-css",
-    "dep:arborium-dart",
-    "dep:arborium-diff",
-    "dep:arborium-dockerfile",
-    "dep:arborium-elixir",
-    "dep:arborium-go",
-    "dep:arborium-haskell",
     "dep:arborium-html",
-    "dep:arborium-ini",
-    "dep:arborium-java",
     "dep:arborium-javascript",
     "dep:arborium-jsdoc",
     "dep:arborium-json",
-    "dep:arborium-julia",
-    "dep:arborium-kotlin",
-    "dep:arborium-lua",
-    "dep:arborium-make",
     "dep:arborium-markdown",
-    "dep:arborium-nix",
-    "dep:arborium-ocaml",
     "dep:arborium-php",
-    "dep:arborium-proto",
-    "dep:arborium-python",
-    "dep:arborium-ruby",
-    "dep:arborium-rust",
-    "dep:arborium-scala",
     "dep:arborium-scss",
     "dep:arborium-sql",
-    "dep:arborium-swift",
     "dep:arborium-toml",
     "dep:arborium-tsx",
     "dep:arborium-typescript",
     "dep:arborium-vue",
     "dep:arborium-xml",
     "dep:arborium-yaml",
+]
+code-systems = [
+    "dep:arborium",
+    "dep:arborium-bash",
+    "dep:arborium-c",
+    "dep:arborium-cpp",
+    "dep:arborium-diff",
+    "dep:arborium-dockerfile",
+    "dep:arborium-go",
+    "dep:arborium-ini",
+    "dep:arborium-lua",
+    "dep:arborium-make",
+    "dep:arborium-nix",
+    "dep:arborium-proto",
+    "dep:arborium-rust",
     "dep:arborium-zig",
 ]
+code-apps = [
+    "dep:arborium",
+    "dep:arborium-c-sharp",
+    "dep:arborium-dart",
+    "dep:arborium-java",
+    "dep:arborium-kotlin",
+    "dep:arborium-scala",
+    "dep:arborium-swift",
+]
+code-scripts = [
+    "dep:arborium",
+    "dep:arborium-elixir",
+    "dep:arborium-haskell",
+    "dep:arborium-julia",
+    "dep:arborium-ocaml",
+    "dep:arborium-python",
+    "dep:arborium-ruby",
+]
+code = ["code-web", "code-systems", "code-apps", "code-scripts"]
 # The postMessage codec is shared by the page and workers.
 rpc = ["dep:js-sys", "dep:wasm-bindgen"]
 worker = ["rpc", "dep:console_error_panic_hook", "dep:web-sys"]
@@ -110,7 +120,7 @@ console_error_panic_hook = { version = "0.1", optional = true }
 hayro = { version = "0.9", optional = true }
 js-sys = { version = "0.3", optional = true }
 lofty = { version = "0.25", optional = true }
-regex = { version = "1.13", optional = true }
+regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"], optional = true }
 # Without the ELK layout, which is under the EPL-2.0.
 merman = { version = "0.10", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape", "math"], optional = true }
 serde_json = { version = "1", optional = true }
@@ -136,16 +146,16 @@ required-features = ["diagram", "worker"]
 
 [[bin]]
 name = "preview_code_web"
-required-features = ["code", "worker"]
+required-features = ["code-web", "worker"]
 
 [[bin]]
 name = "preview_code_systems"
-required-features = ["code", "worker"]
+required-features = ["code-systems", "worker"]
 
 [[bin]]
 name = "preview_code_apps"
-required-features = ["code", "worker"]
+required-features = ["code-apps", "worker"]
 
 [[bin]]
 name = "preview_code_scripts"
-required-features = ["code", "worker"]
+required-features = ["code-scripts", "worker"]

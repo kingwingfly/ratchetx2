@@ -2,10 +2,12 @@ use js_sys::{Array, ArrayBuffer, Float64Array, Uint8Array, Uint8ClampedArray, Ui
 use wasm_bindgen::{JsCast, JsValue};
 
 use super::{
-    Method, PdfOpened, RenderedPage, Request, Response, SearchFound, Tags, pack_pairs,
-    unpack_pairs, whole_u16, whole_u32,
+    DIAGRAM_SVG_MAX, MATCHES_MAX, MAX_PAGES, MAX_PDF_BYTES, MAX_PDF_PIXELS, MAX_PDF_SIDE, Method,
+    PdfOpened, RenderedPage, Request, Response, SearchFound, Tags, pack_pairs, unpack_pairs,
+    whole_u16, whole_u32,
 };
 use crate::READY;
+use crate::audio::{COVER_MAX, MAX_AUDIO_BYTES, is_image_mime};
 
 /// A `postMessage` value and the backing buffers whose ownership moves with it.
 pub struct WirePayload {
@@ -106,51 +108,48 @@ fn number(value: JsValue) -> Result<u32, String> {
         .ok_or_else(|| "expected a whole u32".to_string())
 }
 
-fn bytes(value: JsValue) -> Result<Vec<u8>, String> {
-    Ok(value
+fn bytes_capped(value: JsValue, max_len: usize) -> Result<Vec<u8>, String> {
+    let array = value
         .dyn_into::<Uint8Array>()
-        .map_err(|_| "expected a Uint8Array")?
-        .to_vec())
+        .map_err(|_| "expected a Uint8Array")?;
+    if array.length() as usize > max_len {
+        return Err(format!("byte array exceeds limit of {max_len} bytes"));
+    }
+    Ok(array.to_vec())
 }
 
-/// An incoming request envelope. Read the ID first so even an unknown method or malformed
-/// argument can receive an error reply with its original ID.
+/// An incoming request envelope. Validate the `u32` ID first so even an unknown method or
+/// malformed argument can receive an error reply with its original ID.
 pub struct RequestFrame {
-    /// Echo this value in the reply. The web client uses a `u32`.
-    pub id: JsValue,
+    /// Echo this value in the reply.
+    pub id: u32,
     frame: Array,
 }
 
 impl RequestFrame {
     pub fn decode(data: JsValue) -> Result<Self, String> {
         let frame = array(data)?;
-        if frame.length() == 0 {
-            return Err("missing request ID".into());
+        if frame.length() < 2 {
+            return Err("missing request ID or method".into());
         }
-        Ok(Self {
-            id: frame.get(0),
-            frame,
-        })
+        let id = number(frame.get(0))?;
+        Ok(Self { id, frame })
     }
 
-    pub(crate) fn method_name(&self) -> Result<String, String> {
-        string(self.frame.get(1))
-    }
-
-    // The original public worker::serve callback accepts a method name and an argument array.
-    #[cfg(feature = "worker")]
-    pub(crate) fn raw_arguments(&self) -> Array {
-        self.frame.slice(2, self.frame.length())
+    /// Decode only the method tag, allowing callers to reject unsupported methods before copying
+    /// any large byte arguments out of JavaScript.
+    pub fn method(&self) -> Result<Method, String> {
+        let name = string(self.frame.get(1))?;
+        Method::parse(&name).ok_or_else(|| format!("no method {name}"))
     }
 
     /// Decode the method and its positional arguments into owned Rust values.
     pub fn request(&self) -> Result<Request, String> {
-        let name = self.method_name()?;
-        let method = Method::parse(&name).ok_or_else(|| format!("no method {name}"))?;
+        let method = self.method()?;
         Ok(match method {
             Method::Open => {
                 let [data] = fields(&self.frame, 2)?;
-                Request::Open(bytes(data)?)
+                Request::Open(bytes_capped(data, MAX_PDF_BYTES)?)
             }
             Method::Render => {
                 let [doc_id, page, width] = fields(&self.frame, 2)?;
@@ -168,7 +167,7 @@ impl RequestFrame {
             }
             Method::Tags => {
                 let [data] = fields(&self.frame, 2)?;
-                Request::Tags(bytes(data)?)
+                Request::Tags(bytes_capped(data, MAX_AUDIO_BYTES)?)
             }
             Method::Find => {
                 let [text, pattern, case, regex] = fields(&self.frame, 2)?;
@@ -289,9 +288,16 @@ pub fn decode_pdf_open(value: JsValue) -> Result<PdfOpened, String> {
     let sizes = sizes
         .dyn_into::<Float64Array>()
         .map_err(|_| "expected a Float64Array of page sizes")?;
+    let len = sizes.length() as usize;
+    if len > MAX_PAGES * 2 {
+        return Err(format!("PDF exceeds maximum page count of {MAX_PAGES}"));
+    }
+    if !len.is_multiple_of(2) {
+        return Err("expected an even number of page size coordinates".into());
+    }
     Ok(PdfOpened {
         doc_id,
-        sizes: unpack_pairs(&sizes.to_vec()),
+        sizes: unpack_pairs(&sizes.to_vec())?,
     })
 }
 
@@ -302,10 +308,15 @@ pub fn decode_pdf_render(value: JsValue) -> Result<RenderedPage<Uint8ClampedArra
     let pixels = pixels
         .dyn_into::<Uint8ClampedArray>()
         .map_err(|_| "expected Uint8ClampedArray pixels")?;
-    let byte_len = width
-        .checked_mul(height)
-        .and_then(|area| area.checked_mul(4));
-    if width == 0 || height == 0 || byte_len != Some(pixels.length()) {
+    let area = u64::from(width) * u64::from(height);
+    let byte_len = width.checked_mul(height).and_then(|px| px.checked_mul(4));
+    if width == 0
+        || height == 0
+        || width > MAX_PDF_SIDE
+        || height > MAX_PDF_SIDE
+        || area > u64::from(MAX_PDF_PIXELS)
+        || byte_len != Some(pixels.length())
+    {
         return Err("pixel buffer does not match the page dimensions".into());
     }
     Ok(RenderedPage {
@@ -341,7 +352,11 @@ pub fn decode_audio_tags(value: JsValue) -> Result<Option<Tags>, String> {
         let cover = if mime.is_null() && cover.is_null() {
             None
         } else {
-            Some((string(mime)?, bytes(cover)?))
+            let mime = string(mime)?;
+            if !is_image_mime(&mime) {
+                return Err("unsupported cover image MIME type".into());
+            }
+            Some((mime, bytes_capped(cover, COVER_MAX)?))
         };
         Ok(Tags {
             title: nullable(title, string)?,
@@ -363,15 +378,26 @@ pub fn decode_search_find(value: JsValue) -> Result<SearchFound, String> {
     let matches = matches
         .dyn_into::<Uint32Array>()
         .map_err(|_| "expected a Uint32Array of search offsets")?;
+    let len = matches.length() as usize;
+    if len > MATCHES_MAX * 2 {
+        return Err(format!("search reply exceeds {MATCHES_MAX} matches"));
+    }
+    if !len.is_multiple_of(2) {
+        return Err("expected an even number of search offsets".into());
+    }
     Ok(SearchFound {
-        matches: unpack_pairs(&matches.to_vec()),
+        matches: unpack_pairs(&matches.to_vec())?,
         more: boolean(more)?,
     })
 }
 
 /// Read the SVG returned by the diagram worker.
 pub fn decode_diagram_svg(value: JsValue) -> Result<String, String> {
-    string(value)
+    let svg = string(value)?;
+    if svg.len() > DIAGRAM_SVG_MAX {
+        return Err("the rendered diagram is too large".into());
+    }
+    Ok(svg)
 }
 
 /// Read the highlighted HTML returned by a code worker.

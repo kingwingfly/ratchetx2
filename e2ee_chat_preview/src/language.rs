@@ -106,9 +106,11 @@ pub const LANGUAGES: &[Language] = &[
     language("julia", Scripts, &["jl"], &[], &[]),
 ];
 
-/// The language of the file `name`, by its whole name, then its extension.
+/// The language of the file `name`, by its whole base name (ignoring any `/` or `\` directory
+/// prefix), then its extension.
 pub fn of_file(name: &str) -> Option<&'static Language> {
-    let lower = name.to_lowercase();
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let lower = base.to_lowercase();
     let file = lower.as_str();
     LANGUAGES
         .iter()
@@ -149,8 +151,14 @@ mod tests {
     fn files() {
         assert_eq!(of_file("main.rs").map(|l| l.name), Some("rust"));
         assert_eq!(of_file("Makefile").map(|l| l.name), Some("make"));
+        assert_eq!(of_file("src/Makefile").map(|l| l.name), Some("make"));
+        assert_eq!(of_file(r"a\b\Cargo.lock").map(|l| l.name), Some("toml"));
+        assert_eq!(of_file("/abs/path/App.TSX").map(|l| l.name), Some("tsx"));
         assert_eq!(of_file("Cargo.lock").map(|l| l.name), Some("toml"));
         assert_eq!(of_file("App.TSX").map(|l| l.name), Some("tsx"));
+        // Directory paths ending in a separator have no file base name.
+        assert_eq!(of_file("dir.rs/"), None);
+        assert_eq!(of_file(r"dir.rs\"), None);
         // A name without an extension is no language, though it is an extension's.
         assert_eq!(of_file("go"), None);
         assert_eq!(of_file("notes.txt"), None);
