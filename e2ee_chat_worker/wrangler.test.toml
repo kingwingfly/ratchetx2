@@ -1,0 +1,32 @@
+name = "e2ee-chat-test"
+main = "build/worker/shim.mjs"
+compatibility_date = "2026-10-01"
+
+# Test-only configuration for local `workerd` (`@cloudflare/vitest-pool-workers`) integration tests.
+# Explicitly omits `[build]`, `[assets]`, and `[secrets] required` so `--features conformance`
+# builds can never leak into production deploys and Miniflare accepts test values via `[vars]`.
+
+[[r2_buckets]]
+binding = "BUCKET"
+bucket_name = "e2ee-chat-test"
+
+[[durable_objects.bindings]]
+name = "IDENTITIES"
+class_name = "Identity"
+
+[[durable_objects.bindings]]
+name = "ATTACHMENTS"
+class_name = "Attachment"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Identity", "Attachment"]
+
+[vars]
+RETENTION_DAYS = "30"
+FILE_RETENTION_DAYS = "90"
+SESSION_DAYS = "30"
+PQ_ENABLED = "true"
+PASSWORD = "test-server-password"
+AUTH_KEY = "test-cookie-signing-key-for-workerd"
+CONFORMANCE_TOKEN = "test-conformance-token"
