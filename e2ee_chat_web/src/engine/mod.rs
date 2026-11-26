@@ -1101,11 +1101,29 @@ impl Engine {
             ClientState::try_from(&client).map_err(|e| describe(&e))?,
         )
         .with_clock(transport::clock(&address));
-        let (contacts, isolated_contacts, warnings) = restore_contacts(
+        let (mut contacts, isolated_contacts, warnings) = restore_contacts(
             std::mem::take(&mut state.contacts),
             &client.identity_key(),
             &address,
         );
+        let me = client.identity_key();
+        let mut backfilled_last_messages = false;
+        for contact in &mut contacts {
+            if contact.state.history_len > 0
+                && contact.state.last_message.is_none()
+                && let Ok(mut entries) = vault
+                    .history(&contact.peer, contact.state.history_len, 16)
+                    .await
+            {
+                if let Some(preview) = contact::latest_entry_preview(&entries, &me, &contact.peer) {
+                    contact.state.last_message = Some(preview);
+                    backfilled_last_messages = true;
+                }
+                for (_, entry) in &mut entries {
+                    entry.zeroize_secrets();
+                }
+            }
+        }
         let now_ms = crate::util::now();
         let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
         let migrated_deferred = handshake::merge_legacy_deferred_initials(
@@ -1149,6 +1167,7 @@ impl Engine {
             || migrated_deferred
             || backfilled_carried_ts
             || pruned_carried_ts > 0
+            || backfilled_last_messages
         {
             inner.unsaved_state = true;
         }

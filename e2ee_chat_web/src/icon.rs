@@ -44,6 +44,10 @@ pub enum Icon {
     Document,
     /// A chat's files.
     Folder,
+    /// A framed landscape: photo/image.
+    Photo,
+    /// A camera frame: video.
+    Video,
     /// Two notes: audio.
     Music,
     /// A bin: delete.
@@ -113,6 +117,16 @@ impl Icon {
             Self::Folder => {
                 &["M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"]
             }
+            Self::Photo => &[
+                "M5 5h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2z",
+                "M8.5 10.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3z",
+                "M21 15l-4.5-4.5L9 18",
+                "M12 15l-2.5-2.5L5 17",
+            ],
+            Self::Video => &[
+                "M4 7h10a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2z",
+                "M16 10.5l5-2.5v8l-5-2.5z",
+            ],
             Self::Music => &[
                 "M9 18V5l12-2v13",
                 "M9 18a3 3 0 1 1-6 0 3 3 0 0 1 6 0z",

@@ -547,6 +547,7 @@ impl Inner {
                 delivery: Delivery::Pending.into(),
                 ..HistoryEntry::default()
             };
+            contact.record_last_message(&entry);
             let view = contact.message(index, entry.clone());
             inner
                 .save_with(

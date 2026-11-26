@@ -100,7 +100,16 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .chat-item.active { background: var(--raised-strong); }
 .chat-text { min-width: 0; }
 .chat-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-bright); font-weight: 500; }
-.chat-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; color: var(--muted); }
+.chat-sub { display: flex; align-items: center; gap: 5px; min-width: 0; font-size: 12px; color: var(--muted); }
+.chat-sub-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-you { flex: none; color: var(--faint); font-size: 11px; }
+.chat-kind-badge { flex: none; display: inline-flex; align-items: center; gap: 3px; padding: 0 5px; border: 1px solid var(--accent-line); border-radius: 5px; background: var(--raised); color: var(--accent); font-size: 10px; font-weight: 550; line-height: 1.55; white-space: nowrap; }
+.chat-kind-badge .glyph { flex: none; width: 11px; height: 11px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.chat-kind-badge.neutral { border-color: var(--line-strong); color: var(--muted); }
+.chat-kind-badge.warn { border-color: var(--warn-line); background: var(--warn-bg); color: var(--warn); }
+.chat-item.active .chat-kind-badge { background: var(--surface); }
+.chat-item.active .chat-kind-badge.warn { background: var(--warn-bg); }
+.chat-item.unread .chat-sub { color: var(--text); }
 .chat-item.request .chat-sub { color: var(--accent); }
 .chat-item.warn .chat-sub { color: var(--warn); }
 .chat-item.downgrade .chat-sub { color: var(--danger); }
@@ -209,11 +218,11 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .welcome p { margin: 0; color: var(--muted); line-height: 1.7; }
 .section-label { margin-bottom: 8px; font-size: 12px; color: var(--muted); }
 .key { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--sunken); color: var(--accent); font-family: var(--mono); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; user-select: all; }
-/* A key or a link, with action buttons beside it. */
-.copyable { display: flex; align-items: flex-start; gap: 8px; }
-.copyable .key { flex: 1; min-width: 0; }
+/* A key or a link, clipped to one line, with matching-height action buttons beside it. */
+.copyable { display: flex; align-items: center; gap: 8px; }
+.copyable .key { flex: 1; min-width: 0; height: 41px; padding: 0 12px; line-height: 39px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
 .copyable-actions { display: flex; align-items: center; gap: 8px; flex: none; }
-/* As tall as a line of the box. */
+/* Same height as the single-line key/link box. */
 .copyable .btn.icon { width: 41px; height: 41px; }
 .copyable + .section-label { margin-top: 16px; }
 .key.safety { display: grid; grid-template-columns: repeat(4, max-content); justify-content: space-between; gap: 2px 12px; color: var(--text-bright); font-size: 14px; letter-spacing: 2px; }
@@ -558,6 +567,5 @@ pre.code { margin: 0; padding: 24px; font-family: var(--mono); font-size: 13px; 
 }
 @media (max-width: 480px) {
   .key.safety { grid-template-columns: repeat(2, max-content); justify-content: space-around; gap: 4px 16px; }
-  .copyable-actions { flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

@@ -17,12 +17,33 @@ pub const NAME_MAX: usize = 64;
 /// (`Cc`) characters, collapse whitespace runs into single spaces, trim, and cap at [`NAME_MAX`]
 /// characters.
 pub fn sanitize_shared_name(name: &str) -> String {
-    let mut out = String::with_capacity(name.len().min(NAME_MAX * 4));
+    collapse_inline_text(name, NAME_MAX, false, false)
+}
+
+/// Normalize untrusted message text into a safe, single-line sidebar preview capped at `max_chars`
+/// Unicode scalar values (appending `…` when truncated). Strips Unicode control (`Cc`) and format
+/// (`Cf`, including BiDi overrides/isolates, BOM, and tag characters) while preserving ZWJ (`U+200D`)
+/// so multi-codepoint emoji render intact, and collapses whitespace runs into single ASCII spaces.
+pub fn sanitize_preview_text(text: &str, max_chars: usize) -> String {
+    collapse_inline_text(text, max_chars, true, true)
+}
+
+fn collapse_inline_text(
+    input: &str,
+    max_chars: usize,
+    preserve_zwj: bool,
+    ellipsis: bool,
+) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(input.len().min(max_chars.saturating_mul(4)));
     let mut count = 0usize;
     let mut pending_space = false;
-    for ch in name.chars() {
+    let mut truncated = false;
+    for ch in input.chars() {
         let cat = get_general_category(ch);
-        if cat == GeneralCategory::Format {
+        if cat == GeneralCategory::Format && !(preserve_zwj && ch == '\u{200D}') {
             continue;
         }
         if ch.is_whitespace() {
@@ -35,18 +56,29 @@ pub fn sanitize_shared_name(name: &str) -> String {
             continue;
         }
         if pending_space {
-            if count + 2 > NAME_MAX {
+            if count + 2 > max_chars {
+                truncated = true;
                 break;
             }
             out.push(' ');
             count += 1;
             pending_space = false;
         }
-        if count >= NAME_MAX {
+        if count >= max_chars {
+            truncated = true;
             break;
         }
         out.push(ch);
         count += 1;
+    }
+    if ellipsis && truncated {
+        if count >= max_chars {
+            out.pop();
+        }
+        while out.ends_with(' ') {
+            out.pop();
+        }
+        out.push('…');
     }
     out
 }

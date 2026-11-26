@@ -3923,3 +3923,255 @@ fn recover_corrupt_outbox_rebuilds_from_history_or_drops_and_marks_failed() {
         );
     });
 }
+
+#[test]
+fn last_message_preview_formats_sanitizes_and_orders_all_entry_kinds() {
+    use super::contact::{LAST_MESSAGE_PREVIEW_MAX_CHARS, latest_entry_preview, preview_for_entry};
+    use crate::content::{AttachmentPointer, Contact as SharedContactProto, Deleted, File};
+    use crate::state::{LastMessage, LastMessageKind};
+    use session::protocol::content::Hello;
+
+    let entry_of = |outgoing: bool, kind: Option<Kind>| HistoryEntry {
+        outgoing,
+        content: Some(Content {
+            clock: 1,
+            kind,
+            events: None,
+        }),
+        ..HistoryEntry::default()
+    };
+    let expected = |kind: LastMessageKind, outgoing: bool, text: &str| {
+        Some(LastMessage {
+            kind,
+            outgoing,
+            text: text.to_string(),
+        })
+    };
+
+    // Text: whitespace collapse, BiDi/control stripping, ZWJ emoji preserved, outgoing flag, truncation.
+    assert_eq!(
+        preview_for_entry(&entry_of(
+            false,
+            Some(Kind::Text(
+                "  Hello\n\tworld \u{202E}rtl\x07 👩\u{200D}💻  ".into()
+            ))
+        ))
+        .to_view(),
+        expected(LastMessageKind::Text, false, "Hello world rtl 👩\u{200D}💻")
+    );
+    assert_eq!(
+        preview_for_entry(&entry_of(true, Some(Kind::Text("On my way".into())))).to_view(),
+        expected(LastMessageKind::Text, true, "On my way")
+    );
+    // Plain text mimicking media labels stays strictly `LastMessageKind::Text` (cannot spoof badges).
+    assert_eq!(
+        preview_for_entry(&entry_of(
+            false,
+            Some(Kind::Text("Photo - super girl.jpeg".into()))
+        ))
+        .to_view(),
+        expected(LastMessageKind::Text, false, "Photo - super girl.jpeg")
+    );
+    assert_eq!(
+        preview_for_entry(&entry_of(false, Some(Kind::Text("   \n\t  ".into())))).to_view(),
+        expected(LastMessageKind::Text, false, "")
+    );
+    let long = preview_for_entry(&entry_of(true, Some(Kind::Text("a".repeat(200)))))
+        .to_view()
+        .expect("long text preview");
+    assert_eq!(long.kind, LastMessageKind::Text);
+    assert!(long.outgoing);
+    assert!(long.text.ends_with('…'));
+    assert_eq!(long.text.chars().count(), LAST_MESSAGE_PREVIEW_MAX_CHARS);
+
+    // Media, inline files (both live bytes and vaulted `file > 0` + `entry.media`), attachments, contacts.
+    assert_eq!(
+        preview_for_entry(&entry_of(true, Some(Kind::Image(vec![1, 2, 3])))).to_view(),
+        expected(LastMessageKind::Image, true, "")
+    );
+    let mut vaulted_video = entry_of(
+        false,
+        Some(Kind::File(File {
+            name: "clip_\u{202E}gpj.mp4".into(),
+            mime: String::new(),
+            data: Vec::new(),
+        })),
+    );
+    vaulted_video.file = 4096;
+    vaulted_video.media = "video/mp4".into();
+    assert_eq!(
+        preview_for_entry(&vaulted_video).to_view(),
+        expected(LastMessageKind::Video, false, "clip_gpj.mp4")
+    );
+
+    assert_eq!(
+        preview_for_entry(&entry_of(
+            true,
+            Some(Kind::Attachment(AttachmentPointer {
+                id: vec![1; 16],
+                key: vec![2; 32],
+                size: 1024,
+                name: "report.pdf".into(),
+                mime: "application/pdf".into(),
+                expires: 0,
+            }))
+        ))
+        .to_view(),
+        expected(LastMessageKind::File, true, "report.pdf")
+    );
+    assert_eq!(
+        preview_for_entry(&entry_of(
+            false,
+            Some(Kind::Attachment(AttachmentPointer {
+                id: vec![1; 16],
+                key: vec![2; 32],
+                size: 1024,
+                name: "track.flac".into(),
+                mime: "audio/flac".into(),
+                expires: 0,
+            }))
+        ))
+        .to_view(),
+        expected(LastMessageKind::Audio, false, "track.flac")
+    );
+    assert_eq!(
+        preview_for_entry(&entry_of(
+            true,
+            Some(Kind::Contact(SharedContactProto {
+                key: vec![0xab; 32],
+                name: "Bob\u{202E}".into(),
+                pq_pinned: true,
+            }))
+        ))
+        .to_view(),
+        expected(LastMessageKind::Contact, true, "Bob")
+    );
+    // Malformed shared-contact keys fall back to `Unknown` just like `Contact::message()`.
+    assert_eq!(
+        preview_for_entry(&entry_of(
+            false,
+            Some(Kind::Contact(SharedContactProto {
+                key: vec![0xab; 4],
+                name: "Spoof".into(),
+                pq_pinned: false,
+            }))
+        ))
+        .to_view(),
+        expected(LastMessageKind::Unknown, false, "")
+    );
+
+    // Notes: Hello, Deleted, Evicted, Unknown.
+    assert_eq!(
+        preview_for_entry(&entry_of(true, Some(Kind::Hello(Hello::default())))).to_view(),
+        expected(LastMessageKind::Hello, true, "")
+    );
+    assert_eq!(
+        preview_for_entry(&entry_of(false, Some(Kind::Hello(Hello::default())))).to_view(),
+        expected(LastMessageKind::Hello, false, "")
+    );
+    assert_eq!(
+        preview_for_entry(&entry_of(false, Some(Kind::Deleted(Deleted {})))).to_view(),
+        expected(LastMessageKind::Deleted, false, "")
+    );
+    let evicted = HistoryEntry {
+        evicted: true,
+        ..HistoryEntry::default()
+    };
+    assert_eq!(
+        preview_for_entry(&evicted).to_view(),
+        expected(LastMessageKind::Evicted, false, "")
+    );
+    assert_eq!(
+        preview_for_entry(&entry_of(false, None)).to_view(),
+        expected(LastMessageKind::Unknown, false, "")
+    );
+
+    // `latest_entry_preview` picks the bottom-most message in chat display order.
+    let me = [1u8; 32];
+    let peer = [2u8; 32];
+    let mut older_stamped = entry_of(false, Some(Kind::Text("earlier".into())));
+    older_stamped.place = 5;
+    let mut newer_stamped = entry_of(false, Some(Kind::Text("newer".into())));
+    newer_stamped.place = 8;
+    assert_eq!(
+        latest_entry_preview(
+            &[(0, newer_stamped.clone()), (1, older_stamped.clone())],
+            &me,
+            &peer
+        )
+        .and_then(|rec| rec.to_view()),
+        expected(LastMessageKind::Text, false, "newer")
+    );
+    let pending_outgoing = entry_of(true, Some(Kind::Text("sending now".into())));
+    assert_eq!(
+        latest_entry_preview(&[(0, newer_stamped), (1, pending_outgoing)], &me, &peer)
+            .and_then(|rec| rec.to_view()),
+        expected(LastMessageKind::Text, true, "sending now")
+    );
+}
+
+#[test]
+fn contact_updates_and_zeroizes_last_message_on_send_receive_and_evict() {
+    use crate::state::{LastMessage, LastMessageKind};
+    use session::protocol::content::Hello;
+
+    let (mut inner, _peer) = unlocked_client();
+    let contact = &mut inner.contacts[0];
+
+    let outgoing = history("first outbound");
+    contact.record_last_message(&outgoing);
+    assert_eq!(
+        contact.view().last_message,
+        Some(LastMessage {
+            kind: LastMessageKind::Text,
+            outgoing: true,
+            text: "first outbound".into(),
+        })
+    );
+
+    contact
+        .add_received(
+            Content {
+                clock: 2,
+                kind: Some(Kind::Text("peer reply".into())),
+                events: None,
+            },
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        contact.view().last_message,
+        Some(LastMessage {
+            kind: LastMessageKind::Text,
+            outgoing: false,
+            text: "peer reply".into(),
+        })
+    );
+
+    contact.add_evicted().unwrap();
+    assert_eq!(
+        contact.view().last_message,
+        Some(LastMessage {
+            kind: LastMessageKind::Evicted,
+            outgoing: false,
+            text: String::new(),
+        })
+    );
+
+    let mut fresh = ContactState::default();
+    let _ =
+        finalize_upgrade_to_pq_request_state(&mut fresh, Kind::Hello(Hello::default()), 1, 1234);
+    assert_eq!(
+        fresh.last_message.as_ref().and_then(|m| m.to_view()),
+        Some(LastMessage {
+            kind: LastMessageKind::Hello,
+            outgoing: true,
+            text: String::new(),
+        })
+    );
+
+    // Zeroize wipes text, kind, outgoing, and clears the Option.
+    contact.record_last_message(&outgoing);
+    contact.state.zeroize_secrets();
+    assert!(contact.state.last_message.is_none());
+}

@@ -155,15 +155,6 @@ pub(super) fn default_shared_contact_name(subject: &ContactView) -> String {
     sanitize_shared_name(raw)
 }
 
-/// Accepted contacts eligible to be shared to another peer (excluding `exclude`).
-pub(super) fn shareable_contacts(contacts: &[ContactView], exclude: PublicKey) -> Vec<ContactView> {
-    contacts
-        .iter()
-        .filter(|contact| !contact.request && contact.peer != exclude)
-        .cloned()
-        .collect()
-}
-
 /// Accepted, unquarantined chats eligible to receive a shared contact (excluding `exclude`).
 pub(super) fn writable_recipients(
     contacts: &[ContactView],
@@ -318,7 +309,7 @@ pub(super) fn CopyableField(
 ) -> impl IntoView {
     view! {
         <div class="copyable">
-            <div class="key">{move || text.get()}</div>
+            <div class="key" title=move || text.get()>{move || text.get()}</div>
             {match extra {
                 Some(extra) => view! {
                     <div class="copyable-actions">
@@ -388,13 +379,10 @@ pub(super) fn ContactKey(peer: PublicKey, can_share: Signal<bool>) -> impl IntoV
                         <button
                             type="button"
                             class="btn icon"
-                            title="Share contact to another chat"
-                            aria-label="Share this contact to another chat"
+                            title="Share this contact"
+                            aria-label="Share this contact"
                             on:click=move |_| {
-                                ui.dialog.set(Some(Dialog::ShareContact {
-                                    subject: Some(peer),
-                                    recipient: None,
-                                }));
+                                ui.dialog.set(Some(Dialog::ShareContact(peer)));
                             }
                         >
                             {icon(Icon::ShareContact)}
@@ -665,6 +653,7 @@ pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
         hello_name: String::new(),
         unread: 0,
         last_activity: 0,
+        last_message: None,
         security: SecurityView::default(),
         has_active_session: false,
         pq_pinned: false,
@@ -680,7 +669,7 @@ pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
 mod tests {
     use super::{
         ClassicalPrompt, can_allow_classical, default_shared_contact_name, make_contact,
-        shareable_contacts, shared_contact_pq_pinned, writable_recipients,
+        shared_contact_pq_pinned, writable_recipients,
     };
 
     #[test]
@@ -728,12 +717,6 @@ mod tests {
         };
 
         let all = vec![alice, bob, classical, request, quarantined];
-        let subjects: Vec<u8> = shareable_contacts(&all, [1; 32])
-            .into_iter()
-            .map(|c| c.peer[0])
-            .collect();
-        assert_eq!(subjects, vec![2, 3, 5]);
-
         let recipients: Vec<u8> = writable_recipients(&all, [1; 32])
             .into_iter()
             .map(|c| c.peer[0])

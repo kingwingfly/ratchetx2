@@ -645,6 +645,7 @@ pub(super) fn finalize_upgrade_to_pq_request_state(
         };
         state.history_len = 1;
         state.last_activity = at;
+        state.last_message = Some(super::contact::preview_for_entry(&entry));
         Some((0, entry))
     } else {
         None
