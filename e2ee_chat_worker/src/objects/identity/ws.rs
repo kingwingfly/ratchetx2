@@ -11,12 +11,12 @@ use sha2::{Digest, Sha256};
 use storage::MAX_SAFE_INTEGER;
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use worker::{
-    Date, Request, Response, Result, SqlStorage, WebSocket, WebSocketIncomingMessage,
-    WebSocketPair, console_error, js_sys,
+    Date, Request, Response, Result, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    console_error, js_sys,
 };
 
-use super::{AlarmUpdate, Identity, rows::CountRow, schema::SCHEMA_SEEN_SUBSCRIBES};
-use crate::objects::sql::{exec, params, query_one};
+use super::{AlarmUpdate, Identity, IdentityStore, rows::CountRow, schema::SCHEMA_SEEN_SUBSCRIBES};
+use crate::objects::sql::{SqlExec, params};
 
 /// Internal header set to `"1"` when deployment password auth is satisfied (either `PASSWORD`
 /// is not configured, or the request carried a valid sign-in cookie).
@@ -74,7 +74,8 @@ extern "C" {
     ) -> std::result::Result<Option<js_sys::Date>, JsValue>;
 }
 
-enum SubscribeRecordOutcome {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubscribeRecordOutcome {
     Fresh,
     Replayed,
     CapacityExceeded,
@@ -106,6 +107,13 @@ fn subscribe_replay_key(identity: &[u8; 32], audience: &str, timestamp: u64) -> 
     hasher.update(audience.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     crate::hex(&hasher.finalize())
+}
+
+/// Last millisecond at which a subscription signed at `timestamp` can still verify.
+fn subscribe_replay_expiry(timestamp: u64) -> u64 {
+    timestamp
+        .saturating_add(MAX_CLOCK_SKEW)
+        .min(MAX_SAFE_INTEGER)
 }
 
 /// Validates a first-frame [`SubscribeRequest`]: requires an audience-bound v2 request
@@ -200,20 +208,70 @@ impl WsAttachment {
     }
 }
 
-fn check_subscribe_capacity(sql: &SqlStorage, replay_key: &str) -> Result<SubscribeRecordOutcome> {
-    let existing: CountRow = query_one(
-        sql,
+fn check_subscribe_capacity<S: SqlExec>(
+    sql: &S,
+    replay_key: &str,
+) -> Result<SubscribeRecordOutcome> {
+    let existing: CountRow = sql.query_one(
         "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
         params![replay_key]?,
     )?;
     if existing.count > 0 {
         return Ok(SubscribeRecordOutcome::Replayed);
     }
-    let total: CountRow = query_one(sql, "SELECT count(*) AS count FROM seen_subscribes", vec![])?;
+    let total: CountRow = sql.query_one("SELECT count(*) AS count FROM seen_subscribes", vec![])?;
     if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
         return Ok(SubscribeRecordOutcome::CapacityExceeded);
     }
     Ok(SubscribeRecordOutcome::Fresh)
+}
+
+impl<S: SqlExec> IdentityStore<'_, S> {
+    /// Removes expired replay keys (`expires_at < now_ms`).
+    pub(super) fn prune_seen_subscribes(&self, now_ms: u64) -> Result<()> {
+        self.sql.exec(
+            "DELETE FROM seen_subscribes WHERE expires_at < ?",
+            params![now_ms]?,
+        )
+    }
+
+    /// Initializes `seen_subscribes`, prunes expired entries, and checks replay & capacity before
+    /// the DO arms the expiry alarm.
+    pub(super) fn precheck_subscribe_replay(
+        &self,
+        replay_key: &str,
+        now_ms: u64,
+    ) -> Result<SubscribeRecordOutcome> {
+        let precheck = self.sql.transaction_sync(|sql| {
+            sql.exec_batch(SCHEMA_SEEN_SUBSCRIBES)?;
+            sql.exec(
+                "DELETE FROM seen_subscribes WHERE expires_at < ?",
+                params![now_ms]?,
+            )?;
+            check_subscribe_capacity(sql, replay_key)
+        })?;
+        self.cache.seen_subscribes_ready.set(true);
+        Ok(precheck)
+    }
+
+    /// Re-verifies replay & capacity and records `(replay_key, expires_at)` atomically.
+    pub(super) fn commit_subscribe_replay(
+        &self,
+        replay_key: &str,
+        expires_at: u64,
+    ) -> Result<SubscribeRecordOutcome> {
+        self.sql.transaction_sync(|sql| {
+            let outcome = check_subscribe_capacity(sql, replay_key)?;
+            if !matches!(outcome, SubscribeRecordOutcome::Fresh) {
+                return Ok(outcome);
+            }
+            sql.exec(
+                "INSERT INTO seen_subscribes (sig_hash, expires_at) VALUES (?, ?)",
+                params![replay_key, expires_at]?,
+            )?;
+            Ok(SubscribeRecordOutcome::Fresh)
+        })
+    }
 }
 
 impl Identity {
@@ -336,19 +394,9 @@ impl Identity {
         timestamp: u64,
         now_ms: u64,
     ) -> Result<SubscribeRecordOutcome> {
-        let expires_at = timestamp
-            .saturating_add(MAX_CLOCK_SKEW)
-            .min(MAX_SAFE_INTEGER);
-        let precheck = self.transaction_sync(|sql| {
-            sql.exec(SCHEMA_SEEN_SUBSCRIBES, None)?;
-            exec(
-                sql,
-                "DELETE FROM seen_subscribes WHERE expires_at < ?",
-                params![now_ms]?,
-            )?;
-            check_subscribe_capacity(sql, replay_key)
-        })?;
-        self.seen_subscribes_ready.set(true);
+        let expires_at = subscribe_replay_expiry(timestamp);
+        let precheck =
+            self.with_store(|store| store.precheck_subscribe_replay(replay_key, now_ms))?;
         if !matches!(precheck, SubscribeRecordOutcome::Fresh) {
             return Ok(precheck);
         }
@@ -356,18 +404,7 @@ impl Identity {
         // an unexpiring `seen_subscribes` record behind.
         self.update_alarm(AlarmUpdate::PullEarlier(expires_at.saturating_add(1)))
             .await?;
-        self.transaction_sync(|sql| {
-            let outcome = check_subscribe_capacity(sql, replay_key)?;
-            if !matches!(outcome, SubscribeRecordOutcome::Fresh) {
-                return Ok(outcome);
-            }
-            exec(
-                sql,
-                "INSERT INTO seen_subscribes (sig_hash, expires_at) VALUES (?, ?)",
-                params![replay_key, expires_at]?,
-            )?;
-            Ok(SubscribeRecordOutcome::Fresh)
-        })
+        self.with_store(|store| store.commit_subscribe_replay(replay_key, expires_at))
     }
 
     /// Accepts a WebSocket connection for first-frame audience-bound v2 authentication.
@@ -665,5 +702,117 @@ mod tests {
         assert_ne!(k1, subscribe_replay_key(&id_b, "relay.example", 1_000));
         assert_ne!(k1, subscribe_replay_key(&id_a, "other.example", 1_000));
         assert_ne!(k1, subscribe_replay_key(&id_a, "relay.example", 1_001));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod native_sqlite_tests {
+        use super::*;
+        use crate::objects::identity::TestIdentity;
+
+        fn record(
+            env: &TestIdentity,
+            key: &str,
+            timestamp: u64,
+            now_ms: u64,
+        ) -> SubscribeRecordOutcome {
+            let store = env.store();
+            let pre = store.precheck_subscribe_replay(key, now_ms).unwrap();
+            if pre != SubscribeRecordOutcome::Fresh {
+                return pre;
+            }
+            store
+                .commit_subscribe_replay(key, subscribe_replay_expiry(timestamp))
+                .unwrap()
+        }
+
+        #[test]
+        fn seen_subscribes_rejects_replays_and_prunes_at_expiry_boundary() {
+            let env = TestIdentity::new(50_000);
+            let ts = 10_000;
+            let expires_at = subscribe_replay_expiry(ts);
+
+            assert!(!env.store().has_seen_subscribes().unwrap());
+            assert_eq!(record(&env, "sig-1", ts, ts), SubscribeRecordOutcome::Fresh);
+            assert!(env.cache.seen_subscribes_ready.get());
+            assert!(env.store().has_seen_subscribes().unwrap());
+
+            // Exact replay before and at `expires_at` is rejected.
+            assert_eq!(
+                record(&env, "sig-1", ts, ts + 100),
+                SubscribeRecordOutcome::Replayed
+            );
+            assert_eq!(
+                record(&env, "sig-1", ts, expires_at),
+                SubscribeRecordOutcome::Replayed
+            );
+
+            // 1 ms past `expires_at`, precheck prunes the expired row so key becomes Fresh again.
+            assert_eq!(
+                record(&env, "sig-1", expires_at + 1, expires_at + 1),
+                SubscribeRecordOutcome::Fresh
+            );
+
+            // Standalone alarm prune deletes only strictly expired entries (`expires_at < now_ms`).
+            let next_exp = subscribe_replay_expiry(expires_at + 1);
+            env.store().prune_seen_subscribes(next_exp).unwrap();
+            let still_there: CountRow = env
+                .sql
+                .query_one("SELECT count(*) AS count FROM seen_subscribes", vec![])
+                .unwrap();
+            assert_eq!(still_there.count, 1);
+
+            env.store().prune_seen_subscribes(next_exp + 1).unwrap();
+            let gone: CountRow = env
+                .sql
+                .query_one("SELECT count(*) AS count FROM seen_subscribes", vec![])
+                .unwrap();
+            assert_eq!(gone.count, 0);
+        }
+
+        #[test]
+        fn seen_subscribes_enforces_table_cap_and_reclaims_space_on_expiry() {
+            let env = TestIdentity::new(50_000);
+            let base_ts = 100_000;
+
+            // Fill table to MAX_SEEN_SUBSCRIBES (256) with staggered timestamps.
+            for i in 0..MAX_SEEN_SUBSCRIBES {
+                let key = format!("key-{i:04}");
+                let ts = base_ts + i as u64;
+                assert_eq!(
+                    record(&env, &key, ts, base_ts),
+                    SubscribeRecordOutcome::Fresh
+                );
+            }
+
+            // Replaying an existing key at cap still classifies as Replayed (checked before cap).
+            assert_eq!(
+                record(&env, "key-0000", base_ts, base_ts),
+                SubscribeRecordOutcome::Replayed
+            );
+
+            // A 257th distinct key while all 256 are unexpired fails closed with CapacityExceeded.
+            assert_eq!(
+                record(&env, "key-overflow", base_ts, base_ts),
+                SubscribeRecordOutcome::CapacityExceeded
+            );
+
+            // Advance now_ms past key-0000's expiry (base_ts + MAX_CLOCK_SKEW + 1):
+            // precheck prunes key-0000, freeing 1 slot so key-overflow succeeds!
+            let after_first_expiry = subscribe_replay_expiry(base_ts) + 1;
+            assert_eq!(
+                record(&env, "key-overflow", after_first_expiry, after_first_expiry),
+                SubscribeRecordOutcome::Fresh
+            );
+            // Table is now back at MAX_SEEN_SUBSCRIBES (256), so another new key hits cap again.
+            assert_eq!(
+                record(
+                    &env,
+                    "key-overflow-2",
+                    after_first_expiry,
+                    after_first_expiry
+                ),
+                SubscribeRecordOutcome::CapacityExceeded
+            );
+        }
     }
 }

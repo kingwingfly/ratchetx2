@@ -11,7 +11,7 @@ pub(super) mod sql;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use worker::{
     Env, Error, Method, ObjectNamespace, Request, RequestInit, Response, Result, ScheduledTime,
-    SqlStorage, Stub, console_error,
+    Stub, console_error,
     js_sys::{self, Uint8Array},
 };
 
@@ -20,7 +20,7 @@ pub use identity::{
     HEADER_DEPLOYMENT_AUTH, HEADER_PENDING_IDENTITY, HEADER_SESSION_EXPIRES,
     HEADER_SUBSCRIBE_AUDIENCE, HEADER_SUBSCRIBE_SIG, HEADER_SUBSCRIBE_TS, Identity,
 };
-use sql::{params, query_one};
+use sql::{SqlExec, params};
 
 /// The binding of the identities' namespace.
 const IDENTITIES: &str = "IDENTITIES";
@@ -545,9 +545,8 @@ fn alarm_at(at: u64) -> ScheduledTime {
 /// Whether the object's table `name` is there. Only what keeps something creates its object's
 /// tables, so that a read of an object nothing was kept in, or whose data was deleted, e.g. a
 /// download of an attachment gone, which anyone may try, leaves no storage behind.
-fn has_table(sql: &SqlStorage, name: &str) -> Result<bool> {
-    let found: TablesRow = query_one(
-        sql,
+fn has_table<S: SqlExec + ?Sized>(sql: &S, name: &str) -> Result<bool> {
+    let found: TablesRow = sql.query_one(
         "SELECT count(*) AS tables FROM sqlite_master WHERE type = 'table' AND name = ?",
         params![name]?,
     )?;

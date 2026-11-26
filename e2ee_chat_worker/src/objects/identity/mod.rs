@@ -15,17 +15,15 @@ use std::{cell::Cell, collections::HashMap};
 
 use protocol::notify::Notification;
 use storage::MAX_SAFE_INTEGER;
-use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use worker::{
-    Date, DurableObject, Env, Error, Method, Request, Response, Result, SqlStorage, State,
-    WebSocket, WebSocketIncomingMessage, WebSocketRequestResponsePair, console_error,
-    durable_object,
+    Date, DurableObject, Env, Error, Method, Request, Response, Result, State, WebSocket,
+    WebSocketIncomingMessage, WebSocketRequestResponsePair, console_error, durable_object,
 };
 
 use super::{
     AppendOutcome, ClaimBundleOutcome, IdentityCall, RETRY_ALARM, RefillOutcome, alarm_at,
     answer_rpc, decode, rpc,
-    sql::{exec, params, query, query_opt},
+    sql::{SqlExec, WorkerSql, params},
 };
 use rows::{DeletedSenderBytesRow, ExpiredObjectRow, OldestRow, PendingObjectRow};
 pub use ws::{
@@ -39,6 +37,190 @@ const ALARM_R2_BATCH: u64 = 500;
 const ALARM_NEXT_BATCH_DELAY_MS: u64 = 5_000;
 /// How long messages and initial messages are kept, unless the `RETENTION_DAYS` variable says.
 pub const DEFAULT_RETENTION_DAYS: u64 = 30;
+
+/// Per-instance schema readiness cache shared between [`Identity`] and [`IdentityStore`].
+#[derive(Default)]
+pub(crate) struct SchemaCache {
+    pub(super) schema_ready: Cell<bool>,
+    pub(super) seen_subscribes_ready: Cell<bool>,
+}
+
+/// SQL-backed core of [`Identity`], parameterized over [`SqlExec`] and timestamps so native
+/// SQLite tests can drive every query, constraint, counter, budget, and rollback deterministically.
+pub(crate) struct IdentityStore<'a, S: SqlExec> {
+    pub(super) sql: &'a S,
+    pub(super) cache: &'a SchemaCache,
+    pub(super) retention_ms: u64,
+}
+
+impl<'a, S: SqlExec> IdentityStore<'a, S> {
+    pub(crate) fn new(sql: &'a S, cache: &'a SchemaCache, retention_ms: u64) -> Self {
+        Self {
+            sql,
+            cache,
+            retention_ms,
+        }
+    }
+
+    fn list_pending_r2_deletes(&self, limit: u64) -> Result<Vec<String>> {
+        let rows: Vec<PendingObjectRow> = self.sql.query(
+            "SELECT object FROM pending_r2_deletes ORDER BY created_at LIMIT ?",
+            params![limit]?,
+        )?;
+        Ok(rows.into_iter().map(|row| row.object).collect())
+    }
+
+    /// Expires inline messages, inbox rows, and orphan PQ initial metadata atomically while
+    /// updating O(1) queue and recipient counters.
+    fn expire_inline_and_initials(&self, now_ms: u64) -> Result<()> {
+        let before = now_ms.saturating_sub(self.retention_ms);
+        self.sql.transaction_sync(|sql| {
+            let deleted_inline: Vec<DeletedSenderBytesRow> = sql.query(
+                "DELETE FROM messages WHERE created_at < ? AND object IS NULL \
+                 RETURNING sender, (length(header) + size + coalesce(length(initial_message), 0)) AS bytes",
+                params![before]?,
+            )?;
+            apply_deleted_usage(sql, deleted_inline)?;
+            sql.exec(
+                "DELETE FROM initial_messages WHERE created_at < ?",
+                params![before]?,
+            )?;
+            Self::cleanup_orphan_pq_initials_sql(sql)
+        })
+    }
+
+    /// Lists up to `limit` expired R2-backed message rows ready for R2 object deletion.
+    fn list_expired_r2_messages(&self, now_ms: u64, limit: u64) -> Result<Vec<ExpiredObjectRow>> {
+        let before = now_ms.saturating_sub(self.retention_ms);
+        self.sql.query(
+            "SELECT sender, sequence, object FROM messages \
+             WHERE created_at < ? AND object IS NOT NULL LIMIT ?",
+            params![before, limit]?,
+        )
+    }
+
+    /// Batch-deletes expired R2-backed message rows in a single `json_each` statement and updates
+    /// O(1) queue and recipient counters atomically.
+    fn delete_expired_r2_messages(&self, rows: &[ExpiredObjectRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let pairs_json = expired_pairs_json(rows);
+        self.sql.transaction_sync(|sql| {
+            let deleted_r2: Vec<DeletedSenderBytesRow> = sql.query(
+                "DELETE FROM messages \
+                 WHERE (sender, sequence) IN ( \
+                     SELECT unhex(json_extract(value, '$[0]')), \
+                            CAST(json_extract(value, '$[1]') AS INTEGER) \
+                     FROM json_each(?) \
+                 ) \
+                 RETURNING sender, (length(header) + size + coalesce(length(initial_message), 0)) AS bytes",
+                params![pairs_json]?,
+            )?;
+            apply_deleted_usage(sql, deleted_r2)
+        })
+    }
+
+    /// Computes the earliest upcoming expiry across all indexed tables and live WebSockets.
+    fn compute_earliest_deadline(
+        &self,
+        now_ms: u64,
+        r2_retry: Option<u64>,
+        socket_at: Option<u64>,
+    ) -> Result<Option<u64>> {
+        let has_core = self.has_tables()?;
+        let retention = self.retention_ms;
+
+        let (inline_at, object_at, initial_at, pending_r2_at, dedup_at) = if has_core {
+            // Split into two partial-indexed `min()` queries (`messages_inline_by_age` and
+            // `messages_object_by_age`) so neither query defeats the index with `WHERE ? OR ...`.
+            let inline = self
+                .sql
+                .query_opt::<OldestRow>(
+                    "SELECT min(created_at) AS oldest FROM messages WHERE object IS NULL",
+                    vec![],
+                )?
+                .and_then(|row| row.oldest)
+                .map(|ts| ts.saturating_add(retention).saturating_add(1));
+
+            let object = if r2_retry.is_none() {
+                self.sql
+                    .query_opt::<OldestRow>(
+                        "SELECT min(created_at) AS oldest FROM messages WHERE object IS NOT NULL",
+                        vec![],
+                    )?
+                    .and_then(|row| row.oldest)
+                    .map(|ts| ts.saturating_add(retention).saturating_add(1))
+            } else {
+                None
+            };
+
+            let initial = self
+                .sql
+                .query_opt::<OldestRow>(
+                    "SELECT min(created_at) AS oldest FROM initial_messages",
+                    vec![],
+                )?
+                .and_then(|row| row.oldest)
+                .map(|ts| ts.saturating_add(retention).saturating_add(1));
+
+            let pending_r2 =
+                if r2_retry.is_none() && self.has_v2_table(self.sql, "pending_r2_deletes")? {
+                    let oldest = self
+                        .sql
+                        .query_opt::<OldestRow>(
+                            "SELECT min(created_at) AS oldest FROM pending_r2_deletes",
+                            vec![],
+                        )?
+                        .and_then(|row| row.oldest);
+                    pending_r2_deadline(oldest, now_ms)
+                } else {
+                    None
+                };
+
+            let dedup = if self.has_v2_table(self.sql, "mailbox_dedup")? {
+                self.sql
+                    .query_opt::<OldestRow>(
+                        "SELECT min(expires_at) AS oldest FROM mailbox_dedup",
+                        vec![],
+                    )?
+                    .and_then(|row| row.oldest)
+            } else {
+                None
+            };
+
+            (inline, object, initial, pending_r2, dedup)
+        } else {
+            (None, None, None, None, None)
+        };
+
+        let subscribe_at = if self.has_seen_subscribes()? {
+            self.sql
+                .query_opt::<OldestRow>(
+                    "SELECT min(expires_at) AS oldest FROM seen_subscribes",
+                    vec![],
+                )?
+                .and_then(|row| row.oldest)
+                .map(|ts| ts.saturating_add(1))
+        } else {
+            None
+        };
+
+        Ok([
+            r2_retry,
+            inline_at,
+            object_at,
+            initial_at,
+            pending_r2_at,
+            dedup_at,
+            subscribe_at,
+            socket_at,
+        ]
+        .into_iter()
+        .flatten()
+        .min())
+    }
+}
 
 /// Alarm scheduling mode for [`Identity::update_alarm`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,24 +256,11 @@ fn pending_r2_deadline(oldest_created_at: Option<u64>, now_ms: u64) -> Option<u6
     oldest_created_at.map(|ts| ts.saturating_add(RETRY_ALARM).max(now_ms))
 }
 
-#[wasm_bindgen]
-extern "C" {
-    #[wasm_bindgen(extends = worker::worker_sys::DurableObjectStorage, js_name = DurableObjectStorage)]
-    type TransactionalStorage;
-
-    #[wasm_bindgen(method, catch, js_name = transactionSync)]
-    fn storage_transaction_sync(
-        this: &TransactionalStorage,
-        callback: &mut dyn FnMut() -> std::result::Result<(), JsValue>,
-    ) -> std::result::Result<JsValue, JsValue>;
-}
-
 #[durable_object]
 pub struct Identity {
     state: State,
     env: Env,
-    schema_ready: Cell<bool>,
-    seen_subscribes_ready: Cell<bool>,
+    cache: SchemaCache,
 }
 
 impl DurableObject for Identity {
@@ -103,8 +272,7 @@ impl DurableObject for Identity {
         Self {
             state,
             env,
-            schema_ready: Cell::new(false),
-            seen_subscribes_ready: Cell::new(false),
+            cache: SchemaCache::default(),
         }
     }
 
@@ -161,37 +329,6 @@ impl DurableObject for Identity {
 }
 
 impl Identity {
-    fn sql(&self) -> SqlStorage {
-        self.state.storage().sql()
-    }
-
-    fn transaction_sync<T>(&self, f: impl FnOnce(&SqlStorage) -> Result<T>) -> Result<T> {
-        let storage = self.state.storage();
-        let sql = storage.sql();
-        let raw: &TransactionalStorage = storage.as_raw().unchecked_ref();
-        let mut output = None;
-        let mut operation = Some(f);
-        let transaction = raw.storage_transaction_sync(&mut || {
-            let run = operation
-                .take()
-                .ok_or_else(|| JsValue::from_str("transaction already ran"))?;
-            let result = run(&sql);
-            let failed = result.is_err();
-            output = Some(result);
-            if failed {
-                // Throw across the JS boundary so SQLite rolls back every statement.
-                return Err(JsValue::from_str("transaction rollback"));
-            }
-            Ok(())
-        });
-        match (transaction, output) {
-            (_, Some(Err(error))) => Err(error),
-            (Err(error), _) => Err(error.into()),
-            (Ok(_), Some(Ok(value))) => Ok(value),
-            (Ok(_), None) => Err(Error::RustError("transaction callback did not run".into())),
-        }
-    }
-
     /// How long what was never delivered is kept, in milliseconds.
     fn retention(&self) -> u64 {
         crate::millis(crate::period(
@@ -201,31 +338,41 @@ impl Identity {
         ))
     }
 
+    pub(super) fn with_store<T>(
+        &self,
+        f: impl FnOnce(&IdentityStore<'_, WorkerSql<'_>>) -> Result<T>,
+    ) -> Result<T> {
+        let sql = self.state.storage().sql();
+        let worker_sql = WorkerSql(&self.state, &sql);
+        let store = IdentityStore::new(&worker_sql, &self.cache, self.retention());
+        f(&store)
+    }
+
     async fn run_alarm(&self) -> Result<()> {
         let now = Date::now().as_millis();
         // Always prune timed-out pending sockets and session-expired sockets even when the DO has
         // no SQLite tables yet.
         self.prune_sockets(now);
 
-        let sql = self.sql();
-        let has_core = self.has_tables()?;
-        let has_seen = self.has_seen_subscribes(&sql)?;
+        let (has_core, has_seen) = self.with_store(|store| {
+            let has_core = store.has_tables()?;
+            let has_seen = store.has_seen_subscribes()?;
+            if has_seen {
+                store.prune_seen_subscribes(now)?;
+            }
+            if has_core {
+                store.ensure_v2_tables()?;
+                store.expire_dedup(now)?;
+            }
+            Ok((has_core, has_seen))
+        })?;
         if !has_core && !has_seen {
             return self
                 .update_alarm(AlarmUpdate::Recompute { r2_retry: None })
                 .await;
         }
-        if has_seen {
-            exec(
-                &sql,
-                "DELETE FROM seen_subscribes WHERE expires_at < ?",
-                params![now]?,
-            )?;
-        }
         let mut r2_delay: Option<u64> = None;
         if has_core {
-            self.ensure_v2_tables()?;
-            self.expire_dedup(now)?;
             let pending_delay = self.drain_pending_r2_deletes().await?;
             // Expire inline messages and initial messages unconditionally; only run an expired-R2
             // batch when `pending_r2_deletes` did not exhaust the R2 batch/retry budget.
@@ -241,16 +388,10 @@ impl Identity {
 
     /// Drains up to [`ALARM_R2_BATCH`] durably queued delivered R2 deletes.
     async fn drain_pending_r2_deletes(&self) -> Result<Option<u64>> {
-        let sql = self.sql();
-        let rows: Vec<PendingObjectRow> = query(
-            &sql,
-            "SELECT object FROM pending_r2_deletes ORDER BY created_at LIMIT ?",
-            params![ALARM_R2_BATCH]?,
-        )?;
-        if rows.is_empty() {
+        let objects = self.with_store(|store| store.list_pending_r2_deletes(ALARM_R2_BATCH))?;
+        if objects.is_empty() {
             return Ok(None);
         }
-        let objects: Vec<String> = rows.into_iter().map(|row| row.object).collect();
         let deleted = match self.env.bucket(crate::BUCKET) {
             Ok(bucket) => crate::store::delete_objects(&bucket, objects.clone()).await,
             Err(e) => Err(e),
@@ -259,47 +400,20 @@ impl Identity {
             console_error!("cannot delete queued R2 objects in alarm: {e}");
             return Ok(Some(RETRY_ALARM));
         }
-        let objects_json =
-            serde_json::to_string(&objects).map_err(|e| Error::RustError(e.to_string()))?;
-        exec(
-            &sql,
-            "DELETE FROM pending_r2_deletes WHERE object IN (SELECT value FROM json_each(?))",
-            params![objects_json]?,
-        )?;
+        self.with_store(|store| store.clear_pending_r2_deletes(&objects))?;
         Ok((objects.len() as u64 >= ALARM_R2_BATCH).then_some(ALARM_NEXT_BATCH_DELAY_MS))
     }
 
     /// Delete expired inline messages, expired inbox rows, and (unless `skip_r2`) one batch of
     /// expired R2-backed messages. Updates O(1) queue and recipient counters atomically.
     async fn expire_messages(&self, now: u64, skip_r2: bool) -> Result<Option<u64>> {
-        let before = now.saturating_sub(self.retention());
-        self.transaction_sync(|sql| {
-            let deleted_inline: Vec<DeletedSenderBytesRow> = query(
-                sql,
-                "DELETE FROM messages WHERE created_at < ? AND object IS NULL \
-                 RETURNING sender, (length(header) + size + coalesce(length(initial_message), 0)) AS bytes",
-                params![before]?,
-            )?;
-            apply_deleted_usage(sql, deleted_inline)?;
-            exec(
-                sql,
-                "DELETE FROM initial_messages WHERE created_at < ?",
-                params![before]?,
-            )?;
-            Self::cleanup_orphan_pq_initials_sql(sql)
-        })?;
+        self.with_store(|store| store.expire_inline_and_initials(now))?;
 
         if skip_r2 {
             return Ok(None);
         }
 
-        let sql = self.sql();
-        let rows: Vec<ExpiredObjectRow> = query(
-            &sql,
-            "SELECT sender, sequence, object FROM messages \
-             WHERE created_at < ? AND object IS NOT NULL LIMIT ?",
-            params![before, ALARM_R2_BATCH]?,
-        )?;
+        let rows = self.with_store(|store| store.list_expired_r2_messages(now, ALARM_R2_BATCH))?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -313,22 +427,7 @@ impl Identity {
             return Ok(Some(RETRY_ALARM));
         }
 
-        // Batch-delete all expired rows in a single SQL statement instead of up to 500 DELETEs.
-        let pairs_json = expired_pairs_json(&rows);
-        self.transaction_sync(|sql| {
-            let deleted_r2: Vec<DeletedSenderBytesRow> = query(
-                sql,
-                "DELETE FROM messages \
-                 WHERE (sender, sequence) IN ( \
-                     SELECT unhex(json_extract(value, '$[0]')), \
-                            CAST(json_extract(value, '$[1]') AS INTEGER) \
-                     FROM json_each(?) \
-                 ) \
-                 RETURNING sender, (length(header) + size + coalesce(length(initial_message), 0)) AS bytes",
-                params![pairs_json]?,
-            )?;
-            apply_deleted_usage(sql, deleted_r2)
-        })?;
+        self.with_store(|store| store.delete_expired_r2_messages(&rows))?;
         Ok((rows.len() as u64 >= ALARM_R2_BATCH).then_some(ALARM_NEXT_BATCH_DELAY_MS))
     }
 
@@ -346,46 +445,66 @@ impl Identity {
             | IdentityCall::RetiredAppendV1 => {
                 Response::error("legacy v1 IdentityCall is retired", 501)
             }
-            IdentityCall::Read(req) => {
-                answer_rpc::<rpc::Read>(self.read(&req.sender, req.after, req.limit, req.max_size))
-            }
+            IdentityCall::Read(req) => answer_rpc::<rpc::Read>(self.with_store(|store| {
+                store.read(
+                    &req.sender,
+                    req.after,
+                    req.limit,
+                    req.max_size,
+                    Date::now().as_millis(),
+                )
+            })),
             IdentityCall::DeliveredObjects(req) => answer_rpc::<rpc::DeliveredObjects>(
-                self.delivered_objects(&req.sender, &req.hashes),
+                self.with_store(|store| store.delivered_objects(&req.sender, &req.hashes)),
             ),
-            IdentityCall::DeleteDelivered(req) => answer_rpc::<rpc::DeleteDelivered>(
-                self.delete_delivered(&req.sender, &req.hashes, &req.objects),
-            ),
+            IdentityCall::DeleteDelivered(req) => {
+                answer_rpc::<rpc::DeleteDelivered>(self.with_store(|store| {
+                    store.delete_delivered(&req.sender, &req.hashes, &req.objects)
+                }))
+            }
             IdentityCall::DeleteDeliveredAtomic(req) => answer_rpc::<rpc::DeleteDeliveredAtomic>(
                 self.delete_delivered_atomic(&req.sender, &req.hashes).await,
             ),
             IdentityCall::PublishV2(req) => {
-                self.ensure_v2_tables()?;
-                answer_rpc::<rpc::PublishV2>(self.publish_v2(
-                    &req.manifest,
-                    req.signed_prekey_signature.as_deref(),
-                    &req.one_time_prekeys,
-                    &req.pq_last_resort,
-                    &req.pq_one_time_prekeys,
-                    req.timestamp,
-                ))
+                self.with_store(|store| store.ensure_v2_tables())?;
+                answer_rpc::<rpc::PublishV2>(self.with_store(|store| {
+                    store.publish_v2(
+                        &req.manifest,
+                        req.signed_prekey_signature.as_deref(),
+                        &req.one_time_prekeys,
+                        &req.pq_last_resort,
+                        &req.pq_one_time_prekeys,
+                        req.timestamp,
+                    )
+                }))
             }
             IdentityCall::RefillPrekeys(req) => {
-                if !self.has_tables()? {
+                if !self.with_store(|store| store.has_tables())? {
                     return answer_rpc::<rpc::RefillPrekeys>(Ok(RefillOutcome::NotFound));
                 }
-                self.ensure_v2_tables()?;
-                answer_rpc::<rpc::RefillPrekeys>(self.refill_prekeys(
-                    req.generation,
-                    &req.one_time_prekeys,
-                    &req.pq_one_time_prekeys,
-                    req.max_one_time_prekeys,
-                    req.max_pq_one_time_prekeys,
-                    req.timestamp,
-                ))
+                self.with_store(|store| store.ensure_v2_tables())?;
+                answer_rpc::<rpc::RefillPrekeys>(self.with_store(|store| {
+                    store.refill_prekeys(
+                        req.generation,
+                        &req.one_time_prekeys,
+                        &req.pq_one_time_prekeys,
+                        req.max_one_time_prekeys,
+                        req.max_pq_one_time_prekeys,
+                        req.timestamp,
+                    )
+                }))
             }
-            IdentityCall::GetManifest(_) => answer_rpc::<rpc::GetManifest>(self.get_manifest()),
+            IdentityCall::GetManifest(_) => {
+                answer_rpc::<rpc::GetManifest>(self.with_store(|store| store.get_manifest()))
+            }
             IdentityCall::ClaimBundle(req) => {
-                let outcome = self.claim_bundle_checked(&req.preferred_suites, false);
+                let outcome = self.with_store(|store| {
+                    store.claim_bundle_checked(
+                        &req.preferred_suites,
+                        false,
+                        Date::now().as_millis(),
+                    )
+                });
                 let legacy = outcome.map(|o| match o {
                     ClaimBundleOutcome::Claimed(bundle) => Some(*bundle),
                     ClaimBundleOutcome::NotFound | ClaimBundleOutcome::PqDisabledForPqManifest => {
@@ -394,38 +513,53 @@ impl Identity {
                 });
                 answer_rpc::<rpc::ClaimBundle>(legacy)
             }
-            IdentityCall::ClaimBundleChecked(req) => answer_rpc::<rpc::ClaimBundleChecked>(
-                self.claim_bundle_checked(&req.preferred_suites, req.reject_pq_on_manifest),
-            ),
+            IdentityCall::ClaimBundleChecked(req) => {
+                answer_rpc::<rpc::ClaimBundleChecked>(self.with_store(|store| {
+                    store.claim_bundle_checked(
+                        &req.preferred_suites,
+                        req.reject_pq_on_manifest,
+                        Date::now().as_millis(),
+                    )
+                }))
+            }
             IdentityCall::AddInitialMessageV2(req) => {
-                self.ensure_v2_tables()?;
+                self.with_store(|store| store.ensure_v2_tables())?;
                 self.schedule_message_expiry(false).await?;
-                let added = self.add_initial_message_v2(&req.message, req.limit);
+                let added = self.with_store(|store| {
+                    store.add_initial_message_v2(&req.message, req.limit, Date::now().as_millis())
+                });
                 if matches!(added, Ok(Some(_))) {
                     self.notify(&Notification::initial_message());
                 }
                 answer_rpc::<rpc::AddInitialMessageV2>(added)
             }
             IdentityCall::ListInitialMessages(req) => {
-                answer_rpc::<rpc::ListInitialMessages>(self.list_initial_messages(req.limit))
+                answer_rpc::<rpc::ListInitialMessages>(self.with_store(|store| {
+                    store.list_initial_messages(req.limit, Date::now().as_millis())
+                }))
             }
-            IdentityCall::AckInitialMessages(req) => {
-                answer_rpc::<rpc::AckInitialMessages>(self.ack_initial_messages(&req.ids))
-            }
-            IdentityCall::PqSnapshot(_) => answer_rpc::<rpc::PqSnapshot>(self.pq_snapshot()),
+            IdentityCall::AckInitialMessages(req) => answer_rpc::<rpc::AckInitialMessages>(
+                self.with_store(|store| store.ack_initial_messages(&req.ids)),
+            ),
+            IdentityCall::PqSnapshot(_) => answer_rpc::<rpc::PqSnapshot>(
+                self.with_store(|store| store.pq_snapshot(Date::now().as_millis())),
+            ),
             IdentityCall::AppendIdempotent(req) => {
-                self.ensure_v2_tables()?;
+                self.with_store(|store| store.ensure_v2_tables())?;
                 self.schedule_message_expiry(req.client_message_id.is_some())
                     .await?;
-                let appended = self.append(
-                    &req.sender,
-                    &req.header,
-                    &req.content,
-                    req.size,
-                    req.initial_message.as_deref(),
-                    req.delivery_hash.as_deref(),
-                    req.client_message_id.as_deref(),
-                );
+                let appended = self.with_store(|store| {
+                    store.append(
+                        &req.sender,
+                        &req.header,
+                        &req.content,
+                        req.size,
+                        req.initial_message.as_deref(),
+                        req.delivery_hash.as_deref(),
+                        req.client_message_id.as_deref(),
+                        Date::now().as_millis(),
+                    )
+                });
                 if matches!(appended, Ok(AppendOutcome::Appended(_)))
                     && let Ok(sender) = <[u8; 32]>::try_from(req.sender.as_slice())
                 {
@@ -468,7 +602,11 @@ impl Identity {
                 Ok(())
             }
             AlarmUpdate::Recompute { r2_retry } => {
-                let earliest = self.compute_earliest_deadline(r2_retry)?;
+                let socket_at = self.next_socket_deadline();
+                let now_ms = Date::now().as_millis();
+                let earliest = self.with_store(|store| {
+                    store.compute_earliest_deadline(now_ms, r2_retry, socket_at)
+                })?;
                 if let Some(target) = resolve_alarm_update(update, None, earliest) {
                     storage.set_alarm(alarm_at(target)).await?;
                 }
@@ -476,104 +614,9 @@ impl Identity {
             }
         }
     }
-
-    /// Computes the earliest upcoming expiry across all indexed tables and live WebSockets.
-    fn compute_earliest_deadline(&self, r2_retry: Option<u64>) -> Result<Option<u64>> {
-        let sql = self.sql();
-        let has_core = self.has_tables()?;
-        let retention = self.retention();
-
-        let (inline_at, object_at, initial_at, pending_r2_at, dedup_at) = if has_core {
-            // Split into two partial-indexed `min()` queries (`messages_inline_by_age` and
-            // `messages_object_by_age`) so neither query defeats the index with `WHERE ? OR ...`.
-            let inline = query_opt::<OldestRow>(
-                &sql,
-                "SELECT min(created_at) AS oldest FROM messages WHERE object IS NULL",
-                vec![],
-            )?
-            .and_then(|row| row.oldest)
-            .map(|ts| ts.saturating_add(retention).saturating_add(1));
-
-            let object = if r2_retry.is_none() {
-                query_opt::<OldestRow>(
-                    &sql,
-                    "SELECT min(created_at) AS oldest FROM messages WHERE object IS NOT NULL",
-                    vec![],
-                )?
-                .and_then(|row| row.oldest)
-                .map(|ts| ts.saturating_add(retention).saturating_add(1))
-            } else {
-                None
-            };
-
-            let initial = query_opt::<OldestRow>(
-                &sql,
-                "SELECT min(created_at) AS oldest FROM initial_messages",
-                vec![],
-            )?
-            .and_then(|row| row.oldest)
-            .map(|ts| ts.saturating_add(retention).saturating_add(1));
-
-            let pending_r2 =
-                if r2_retry.is_none() && self.has_v2_table(&sql, "pending_r2_deletes")? {
-                    let oldest = query_opt::<OldestRow>(
-                        &sql,
-                        "SELECT min(created_at) AS oldest FROM pending_r2_deletes",
-                        vec![],
-                    )?
-                    .and_then(|row| row.oldest);
-                    pending_r2_deadline(oldest, Date::now().as_millis())
-                } else {
-                    None
-                };
-
-            let dedup = if self.has_v2_table(&sql, "mailbox_dedup")? {
-                query_opt::<OldestRow>(
-                    &sql,
-                    "SELECT min(expires_at) AS oldest FROM mailbox_dedup",
-                    vec![],
-                )?
-                .and_then(|row| row.oldest)
-            } else {
-                None
-            };
-
-            (inline, object, initial, pending_r2, dedup)
-        } else {
-            (None, None, None, None, None)
-        };
-
-        let subscribe_at = if self.has_seen_subscribes(&sql)? {
-            query_opt::<OldestRow>(
-                &sql,
-                "SELECT min(expires_at) AS oldest FROM seen_subscribes",
-                vec![],
-            )?
-            .and_then(|row| row.oldest)
-            .map(|ts| ts.saturating_add(1))
-        } else {
-            None
-        };
-
-        let socket_at = self.next_socket_deadline();
-
-        Ok([
-            r2_retry,
-            inline_at,
-            object_at,
-            initial_at,
-            pending_r2_at,
-            dedup_at,
-            subscribe_at,
-            socket_at,
-        ]
-        .into_iter()
-        .flatten()
-        .min())
-    }
 }
 
-fn apply_deleted_usage(sql: &SqlStorage, deleted: Vec<DeletedSenderBytesRow>) -> Result<()> {
+fn apply_deleted_usage<S: SqlExec>(sql: &S, deleted: Vec<DeletedSenderBytesRow>) -> Result<()> {
     if deleted.is_empty() {
         return Ok(());
     }
@@ -606,6 +649,35 @@ fn expired_pairs_json(rows: &[ExpiredObjectRow]) -> String {
     }
     out.push(']');
     out
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(super) struct TestIdentity {
+    pub(super) sql: crate::objects::sql::TestSql,
+    pub(super) cache: SchemaCache,
+    pub(super) retention_ms: u64,
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl TestIdentity {
+    pub(super) fn new(retention_ms: u64) -> Self {
+        Self {
+            sql: crate::objects::sql::TestSql::in_memory(),
+            cache: SchemaCache::default(),
+            retention_ms,
+        }
+    }
+
+    pub(super) fn store(&self) -> IdentityStore<'_, crate::objects::sql::TestSql> {
+        IdentityStore::new(&self.sql, &self.cache, self.retention_ms)
+    }
+
+    pub(super) fn store_with_cache<'a>(
+        &'a self,
+        cache: &'a SchemaCache,
+    ) -> IdentityStore<'a, crate::objects::sql::TestSql> {
+        IdentityStore::new(&self.sql, cache, self.retention_ms)
+    }
 }
 
 #[cfg(test)]
@@ -672,5 +744,78 @@ mod tests {
             pending_r2_deadline(Some(1_000), overdue_now),
             Some(overdue_now)
         );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod native_sqlite_tests {
+        use super::*;
+        use crate::objects::Content;
+
+        #[test]
+        fn compute_earliest_deadline_picks_minimum_across_tables_and_respects_r2_retry() {
+            let retention = 100_000;
+            let env = TestIdentity::new(retention);
+            let store = env.store();
+
+            // Unallocated DB with no sockets returns None without creating tables.
+            assert_eq!(
+                store.compute_earliest_deadline(1_000, None, None).unwrap(),
+                None
+            );
+            assert!(!store.has_tables().unwrap());
+
+            store.ensure_v2_tables().unwrap();
+
+            // Inline message at t = 10_000 -> deadline 110_001.
+            store
+                .append(
+                    &[1u8; 32],
+                    b"hdr",
+                    &Content::Inline(b"body".to_vec()),
+                    4,
+                    None,
+                    None,
+                    None,
+                    10_000,
+                )
+                .unwrap();
+            assert_eq!(
+                store.compute_earliest_deadline(10_000, None, None).unwrap(),
+                Some(10_000 + retention + 1)
+            );
+
+            // Older R2 object at t = 5_000 -> deadline 105_001 beats inline unless r2_retry set.
+            store
+                .append(
+                    &[2u8; 32],
+                    b"hdr",
+                    &Content::Object("messages/obj-1".into()),
+                    1024,
+                    None,
+                    None,
+                    None,
+                    5_000,
+                )
+                .unwrap();
+            assert_eq!(
+                store.compute_earliest_deadline(10_000, None, None).unwrap(),
+                Some(5_000 + retention + 1)
+            );
+            // When r2_retry is set (e.g. 200_000), object expiry is suppressed so inline (110_001) wins.
+            assert_eq!(
+                store
+                    .compute_earliest_deadline(10_000, Some(200_000), None)
+                    .unwrap(),
+                Some(10_000 + retention + 1)
+            );
+
+            // An earlier socket deadline wins over everything.
+            assert_eq!(
+                store
+                    .compute_earliest_deadline(10_000, None, Some(20_000))
+                    .unwrap(),
+                Some(20_000)
+            );
+        }
     }
 }
