@@ -117,3 +117,6 @@ futures.workspace = true
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 png = "0.18"
 rqrr = "0.10"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

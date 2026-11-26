@@ -2852,3 +2852,487 @@ mod tests {
         assert_eq!(listed[0].1.id, good_id);
     }
 }
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use wasm_bindgen_test::*;
+
+    use super::*;
+    use crate::content::File;
+
+    struct LockReleaseGuard {
+        previous: bool,
+    }
+
+    impl LockReleaseGuard {
+        fn released() -> Self {
+            let previous = crate::glue::set_lock_released_for_test(true);
+            Self { previous }
+        }
+    }
+
+    impl Drop for LockReleaseGuard {
+        fn drop(&mut self) {
+            crate::glue::set_lock_released_for_test(self.previous);
+        }
+    }
+
+    async fn ensure_real_web_lock() {
+        if crate::glue::owns_lock() {
+            return;
+        }
+        let status = crate::glue::take_lock("e2ee-chat").await;
+        assert_eq!(
+            status,
+            crate::glue::LockStatus::Acquired,
+            "expected real browser Web Lock acquisition"
+        );
+        assert!(crate::glue::owns_lock());
+    }
+
+    fn raw_local_storage_anchor() -> Option<String> {
+        web_sys::window()
+            .expect("browser window")
+            .local_storage()
+            .expect("localStorage access")
+            .expect("localStorage available")
+            .get_item(ROLLBACK_ANCHOR_KEY)
+            .expect("localStorage get_item")
+    }
+
+    async fn raw_idb_get(name: &str) -> Option<Vec<u8>> {
+        let db = open().await.expect("open IndexedDB");
+        get(&db, name).await.expect("get record from IndexedDB")
+    }
+
+    async fn raw_idb_put(records: &[(&str, &[u8])]) {
+        let db = open().await.expect("open IndexedDB");
+        let tx = db
+            .transaction(&[STORE], TransactionMode::ReadWrite)
+            .expect("open RW tx");
+        let store = tx.object_store(STORE).expect("open records store");
+        for (name, data) in records {
+            store
+                .put(&bytes(data), Some(&(*name).into()))
+                .expect("put raw record");
+        }
+        commit(tx).await.expect("commit raw IDB writes");
+    }
+
+    async fn raw_idb_keys() -> Vec<String> {
+        let db = open().await.expect("open IndexedDB");
+        let tx = db
+            .transaction(&[STORE], TransactionMode::ReadOnly)
+            .expect("open RO tx");
+        let store = tx.object_store(STORE).expect("open records store");
+        store
+            .get_all_keys(None, None)
+            .expect("get_all_keys request")
+            .await
+            .expect("get_all_keys await")
+            .into_iter()
+            .filter_map(|k| k.as_string())
+            .collect()
+    }
+
+    async fn clean_browser_vault() {
+        ensure_real_web_lock().await;
+        Vault::destroy().await.expect("Vault::destroy");
+        assert!(!Vault::exists().await.expect("Vault::exists"));
+        assert!(raw_local_storage_anchor().is_none());
+        assert!(raw_idb_keys().await.is_empty());
+    }
+
+    #[wasm_bindgen_test]
+    async fn vault_create_save_reopen_wrong_passphrase_and_web_locks() {
+        clean_browser_vault().await;
+
+        // Real browser Web Lock exclusivity: a second acquisition attempt while held fails closed.
+        let contended = crate::glue::take_lock("e2ee-chat").await;
+        assert_eq!(contended, crate::glue::LockStatus::HeldElsewhere);
+        assert!(crate::glue::owns_lock());
+
+        // Simulating `pagehide` lock release must fail closed on all vault mutations/unlocks.
+        {
+            let _released = LockReleaseGuard::released();
+            assert!(!crate::glue::owns_lock());
+            assert!(matches!(
+                Vault::create(b"locked-out", &AppState::default()).await,
+                Err(Error::Storage(_))
+            ));
+            assert!(matches!(
+                Vault::unlock(b"locked-out").await,
+                Err(Error::Storage(_))
+            ));
+            assert!(matches!(Vault::destroy().await, Err(Error::Storage(_))));
+        }
+        assert!(crate::glue::owns_lock());
+
+        // First-boot Vault::create writes IDB records and the localStorage rollback anchor.
+        let initial_state = AppState {
+            name: "Alice".to_string(),
+            server: "https://chat.example.com".to_string(),
+            ..AppState::default()
+        };
+        let vault = Vault::create(b"correct-horse-battery", &initial_state)
+            .await
+            .expect("Vault::create");
+        assert!(Vault::exists().await.expect("Vault::exists"));
+
+        let created_salt_hash = salt_fingerprint(&vault.header.borrow().salt);
+        let anchor_after_create = RollbackAnchor::parse(
+            &raw_local_storage_anchor().expect("rollback anchor written on create"),
+        )
+        .expect("parse rollback anchor");
+        assert_eq!(
+            anchor_after_create,
+            RollbackAnchor {
+                migrated_v2: true,
+                max_revision: 1,
+                salt_hash: created_salt_hash.clone(),
+            }
+        );
+
+        // Save updated state, deferred sidecar, history (text + file), and an outgoing record.
+        let peer: PublicKey = [0x42u8; 32];
+        let updated_state = AppState {
+            name: "Alice Updated".to_string(),
+            server: "https://relay.example.com".to_string(),
+            pending_inbox_acks: vec![7, 11],
+            ..initial_state
+        };
+        let deferred = DeferredInitialsRecord {
+            entries: vec![],
+            carried_timestamps: vec![CarriedDeferredTimestamp {
+                signed_prekey: vec![0x33; 32],
+                deferred_at: 1_700_000_000_555,
+            }],
+        };
+        let text_entry = HistoryEntry {
+            outgoing: true,
+            at: 1_700_000_001_000,
+            content: Some(Content {
+                clock: 1,
+                kind: Some(Kind::Text("hello real indexeddb".to_string())),
+                ..Content::default()
+            }),
+            delivery: Delivery::Pending.into(),
+            place: 1,
+            ..HistoryEntry::default()
+        };
+        let file_bytes = b"encrypted file record payload".to_vec();
+        let file_entry = HistoryEntry {
+            outgoing: false,
+            at: 1_700_000_002_000,
+            content: Some(Content {
+                clock: 2,
+                kind: Some(Kind::File(File {
+                    name: "note.txt".to_string(),
+                    mime: "text/plain".to_string(),
+                    data: file_bytes.clone(),
+                })),
+                ..Content::default()
+            }),
+            delivery: Delivery::Received.into(),
+            place: 2,
+            ..HistoryEntry::default()
+        };
+        let entries = [(peer, 0u64, text_entry), (peer, 1u64, file_entry)];
+        let outgoing_rec = OutgoingRecord {
+            message: None,
+            content: b"pending outbox bytes".to_vec(),
+            delivery_hash: vec![0xAB; 32],
+        };
+        let outgoing = [(peer, 0u64, Some(outgoing_rec.clone()))];
+
+        vault
+            .save(&updated_state, &deferred, &entries, &outgoing)
+            .await
+            .expect("vault.save");
+        let anchor_after_save = RollbackAnchor::parse(
+            &raw_local_storage_anchor().expect("rollback anchor updated on save"),
+        )
+        .expect("parse rollback anchor after save");
+        assert_eq!(anchor_after_save.max_revision, 2);
+        assert_eq!(anchor_after_save.salt_hash, created_salt_hash);
+        drop(vault);
+
+        // Wrong passphrase fails cleanly without disturbing stored records.
+        assert!(matches!(
+            Vault::unlock(b"wrong-passphrase").await,
+            Err(Error::WrongPassphrase)
+        ));
+
+        // Correct passphrase reopens the vault and decrypts state, sidecar, history, file, outbox.
+        let (reopened, restored_state, restored_deferred) = Vault::unlock(b"correct-horse-battery")
+            .await
+            .expect("Vault::unlock with correct passphrase");
+        assert_eq!(restored_state.name, "Alice Updated");
+        assert_eq!(restored_state.server, "https://relay.example.com");
+        assert_eq!(restored_state.pending_inbox_acks, vec![7, 11]);
+        assert_eq!(restored_state.record_epoch, 1);
+        assert_eq!(restored_deferred, deferred);
+
+        let history = reopened
+            .history(&peer, 2, 10)
+            .await
+            .expect("read history from IDB");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].0, 0);
+        assert_eq!(history[1].0, 1);
+        assert_eq!(
+            history[0].1.content.as_ref().and_then(|c| c.kind.as_ref()),
+            Some(&Kind::Text("hello real indexeddb".to_string()))
+        );
+        assert_eq!(history[1].1.file, file_bytes.len() as u64);
+        assert_eq!(
+            reopened.file(&peer, 1).await.expect("read file record"),
+            file_bytes
+        );
+        let restored_kind = reopened
+            .content(&peer, 1, &history[1].1)
+            .await
+            .expect("read content with file bytes");
+        assert_eq!(
+            restored_kind,
+            Some(Kind::File(File {
+                name: "note.txt".to_string(),
+                mime: "text/plain".to_string(),
+                data: file_bytes,
+            }))
+        );
+        assert_eq!(
+            reopened
+                .outgoing(&peer, 0)
+                .await
+                .expect("read outgoing record"),
+            outgoing_rec
+        );
+
+        drop(reopened);
+        clean_browser_vault().await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn vault_rejects_incompatible_header_version_pre_kdf() {
+        clean_browser_vault().await;
+
+        // Unrecognized future header version with absurd Argon2 memory must fail pre-KDF.
+        let future_v3 = VaultHeader {
+            salt: vec![0x11; 16],
+            memory: u32::MAX,
+            iterations: ARGON2_DEFAULT_ITERATIONS,
+            parallelism: ARGON2_DEFAULT_PARALLELISM,
+            version: 3,
+            revision: 1,
+        };
+        raw_idb_put(&[
+            (HEADER, &future_v3.encode_to_vec()),
+            (STATE, b"unauthenticated-placeholder"),
+        ])
+        .await;
+        match Vault::unlock(b"any-passphrase").await {
+            Err(Error::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("unsupported vault version 3"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            Err(err) => panic!("expected Corrupt for unsupported version 3, got Err({err:?})"),
+            Ok(_) => panic!("expected Corrupt for unsupported version 3, got Ok"),
+        }
+
+        // Unrecognized arbitrary version with otherwise valid KDF params also fails pre-KDF.
+        let unknown_v99 = VaultHeader {
+            salt: vec![0x22; 16],
+            memory: ARGON2_DEFAULT_MEMORY,
+            iterations: ARGON2_DEFAULT_ITERATIONS,
+            parallelism: ARGON2_DEFAULT_PARALLELISM,
+            version: 99,
+            revision: 1,
+        };
+        raw_idb_put(&[
+            (HEADER, &unknown_v99.encode_to_vec()),
+            (STATE, b"unauthenticated-placeholder"),
+        ])
+        .await;
+        match Vault::unlock(b"any-passphrase").await {
+            Err(Error::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("unsupported vault version 99"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            Err(err) => panic!("expected Corrupt for unsupported version 99, got Err({err:?})"),
+            Ok(_) => panic!("expected Corrupt for unsupported version 99, got Ok"),
+        }
+
+        // Current version with invalid revision 0 also fails pre-KDF.
+        let zero_rev_v2 = VaultHeader {
+            salt: vec![0x33; 16],
+            memory: ARGON2_DEFAULT_MEMORY,
+            iterations: ARGON2_DEFAULT_ITERATIONS,
+            parallelism: ARGON2_DEFAULT_PARALLELISM,
+            version: VAULT_VERSION_V2,
+            revision: 0,
+        };
+        raw_idb_put(&[
+            (HEADER, &zero_rev_v2.encode_to_vec()),
+            (STATE, b"unauthenticated-placeholder"),
+        ])
+        .await;
+        match Vault::unlock(b"any-passphrase").await {
+            Err(Error::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("invalid revision 0"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            Err(err) => panic!("expected Corrupt for v2 revision 0, got Err({err:?})"),
+            Ok(_) => panic!("expected Corrupt for v2 revision 0, got Ok"),
+        }
+
+        clean_browser_vault().await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn vault_rollback_anchor_rejects_stale_revision_and_salt_swap() {
+        clean_browser_vault().await;
+
+        let state_v1 = AppState {
+            name: "Rev 1".to_string(),
+            ..AppState::default()
+        };
+        let vault = Vault::create(b"rollback-passphrase", &state_v1)
+            .await
+            .expect("Vault::create");
+        let rev1_header_bytes = raw_idb_get(HEADER).await.expect("rev1 header in IDB");
+        let rev1_state_bytes = raw_idb_get(STATE).await.expect("rev1 state in IDB");
+
+        let state_v2 = AppState {
+            name: "Rev 2".to_string(),
+            ..state_v1
+        };
+        vault
+            .save(&state_v2, &DeferredInitialsRecord::default(), [], [])
+            .await
+            .expect("advance vault to revision 2");
+        let rev2_header = vault.header.borrow().clone();
+        assert_eq!(rev2_header.revision, 2);
+        drop(vault);
+
+        let anchor = RollbackAnchor::parse(
+            &raw_local_storage_anchor().expect("rollback anchor present after save"),
+        )
+        .expect("valid anchor");
+        assert_eq!(anchor.max_revision, 2);
+
+        // 1. Offline IDB rollback to the authentic rev-1 snapshot must fail against anchor rev 2.
+        raw_idb_put(&[(HEADER, &rev1_header_bytes), (STATE, &rev1_state_bytes)]).await;
+        match Vault::unlock(b"rollback-passphrase").await {
+            Err(Error::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("vault rollback detected"),
+                    "unexpected rollback error: {msg}"
+                );
+            }
+            Err(err) => panic!("expected Corrupt on stale revision rollback, got Err({err:?})"),
+            Ok(_) => panic!("expected Corrupt on stale revision rollback, got Ok"),
+        }
+
+        // 2. Same-version salt swap with a higher revision must also fail against the anchor.
+        let mut swapped_header = rev2_header;
+        swapped_header.salt[0] ^= 0xFF;
+        swapped_header.revision = 10;
+        raw_idb_put(&[(HEADER, &swapped_header.encode_to_vec())]).await;
+        match Vault::unlock(b"rollback-passphrase").await {
+            Err(Error::Corrupt(msg)) => {
+                assert!(
+                    msg.contains("salt does not match anchor"),
+                    "unexpected salt-swap error: {msg}"
+                );
+            }
+            Err(err) => panic!("expected Corrupt on salt swap, got Err({err:?})"),
+            Ok(_) => panic!("expected Corrupt on salt swap, got Ok"),
+        }
+
+        clean_browser_vault().await;
+    }
+
+    #[wasm_bindgen_test]
+    async fn vault_destroy_clears_idb_and_rollback_anchor_for_fresh_create() {
+        clean_browser_vault().await;
+
+        let peer: PublicKey = [0x99u8; 32];
+        let initial = AppState {
+            name: "Old Vault".to_string(),
+            ..AppState::default()
+        };
+        let vault = Vault::create(b"old-passphrase", &initial)
+            .await
+            .expect("create initial vault");
+        let entry = HistoryEntry {
+            outgoing: true,
+            at: 100,
+            content: Some(Content {
+                clock: 1,
+                kind: Some(Kind::Text("to be wiped".to_string())),
+                ..Content::default()
+            }),
+            delivery: Delivery::Sent.into(),
+            place: 1,
+            ..HistoryEntry::default()
+        };
+        vault
+            .save(
+                &initial,
+                &DeferredInitialsRecord::default(),
+                &[(peer, 0u64, entry)],
+                [],
+            )
+            .await
+            .expect("save entry before destroy");
+        let old_anchor =
+            RollbackAnchor::parse(&raw_local_storage_anchor().expect("old anchor present"))
+                .expect("parse old anchor");
+        assert_eq!(old_anchor.max_revision, 2);
+        drop(vault);
+
+        // Destroy must wipe both IndexedDB records and localStorage ROLLBACK_ANCHOR_KEY.
+        Vault::destroy().await.expect("Vault::destroy");
+        assert!(!Vault::exists().await.expect("Vault::exists after destroy"));
+        assert!(raw_idb_keys().await.is_empty());
+        assert!(raw_local_storage_anchor().is_none());
+
+        // A fresh Vault::create at revision 1 with a new random salt succeeds cleanly.
+        let fresh_state = AppState {
+            name: "Fresh Vault".to_string(),
+            ..AppState::default()
+        };
+        let fresh_vault = Vault::create(b"fresh-passphrase", &fresh_state)
+            .await
+            .expect("fresh Vault::create after destroy");
+        drop(fresh_vault);
+
+        let (reopened, restored_state, _) = Vault::unlock(b"fresh-passphrase")
+            .await
+            .expect("unlock fresh vault after destroy");
+        assert_eq!(restored_state.name, "Fresh Vault");
+        let new_anchor = RollbackAnchor::parse(
+            &raw_local_storage_anchor().expect("new anchor present after recreate"),
+        )
+        .expect("parse new anchor");
+        assert_eq!(new_anchor.max_revision, 1);
+        assert_ne!(new_anchor.salt_hash, old_anchor.salt_hash);
+        assert!(
+            reopened
+                .entry(&peer, 0)
+                .await
+                .expect("old history entry lookup")
+                .is_none()
+        );
+
+        drop(reopened);
+        clean_browser_vault().await;
+    }
+}

@@ -32,6 +32,37 @@ const TIMEOUT: i32 = 60_000;
 /// Call ID reserved for the worker's initial `READY` handshake.
 const READY_ID: u32 = 0;
 
+#[cfg(all(test, target_arch = "wasm32"))]
+thread_local! {
+    static TEST_TIMEOUT_MS: Cell<Option<i32>> = const { Cell::new(None) };
+    static TEST_SCRIPTS: RefCell<HashMap<Worker, std::collections::VecDeque<String>>> =
+        RefCell::new(HashMap::new());
+}
+
+fn timeout_ms() -> i32 {
+    #[cfg(all(test, target_arch = "wasm32"))]
+    if let Some(ms) = TEST_TIMEOUT_MS.with(Cell::get) {
+        return ms;
+    }
+    TIMEOUT
+}
+
+fn worker_script(kind: Worker) -> String {
+    #[cfg(all(test, target_arch = "wasm32"))]
+    if let Some(url) = TEST_SCRIPTS.with(|scripts| {
+        let mut scripts = scripts.borrow_mut();
+        let queue = scripts.get_mut(&kind)?;
+        if queue.len() > 1 {
+            queue.pop_front()
+        } else {
+            queue.front().cloned()
+        }
+    }) {
+        return url;
+    }
+    kind.script().to_string()
+}
+
 /// Advance a non-zero call ID, skipping [`READY_ID`] (`0`) on 32-bit wraparound.
 fn next_call_id(current: u32) -> u32 {
     let next = current.wrapping_add(1);
@@ -65,7 +96,7 @@ impl TimeoutGuard {
         let timer = window
             .set_timeout_with_callback_and_timeout_and_arguments_0(
                 closure.as_ref().unchecked_ref(),
-                TIMEOUT,
+                timeout_ms(),
             )
             .ok();
         Self {
@@ -177,7 +208,7 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
     {
         return Ok(running);
     }
-    let worker = web_sys::Worker::new(kind.script()).map_err(js_error)?;
+    let worker = web_sys::Worker::new(&worker_script(kind)).map_err(js_error)?;
     let calls = Rc::new(Calls::default());
     let ready = calls.add_ready();
     let on_message = {
@@ -446,5 +477,338 @@ mod tests {
 
         assert_eq!(next_start_id(0), 1);
         assert_eq!(next_start_id(u32::MAX), 1);
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use std::collections::VecDeque;
+
+    use futures_util::future::{join, join3};
+    use js_sys::Array;
+    use wasm_bindgen_test::*;
+    use web_sys::{Blob, BlobPropertyBag, Url};
+
+    use super::*;
+
+    fn make_blob_script(source: &str) -> String {
+        let parts = Array::of1(&JsValue::from_str(source));
+        let options = BlobPropertyBag::new();
+        options.set_type("application/javascript");
+        let blob = Blob::new_with_str_sequence_and_options(&parts, &options)
+            .expect("create mock worker JS Blob");
+        Url::create_object_url_with_blob(&blob).expect("create Blob URL for mock worker")
+    }
+
+    fn stop_kind(kind: Worker) {
+        if let Some(current) = RUNNING.with(|running| running.borrow().get(&kind).cloned()) {
+            stop(kind, &current.calls, "test cleanup");
+        }
+    }
+
+    fn current_start_id(kind: Worker) -> Option<u32> {
+        RUNNING.with(|running| running.borrow().get(&kind).map(|w| w.start))
+    }
+
+    struct MockWorkerHarness {
+        kind: Worker,
+        urls: Vec<String>,
+    }
+
+    impl MockWorkerHarness {
+        fn new(kind: Worker, scripts: &[&str], timeout: Option<i32>) -> Self {
+            stop_kind(kind);
+            let urls: Vec<String> = scripts.iter().map(|src| make_blob_script(src)).collect();
+            TEST_SCRIPTS.with(|map| {
+                map.borrow_mut()
+                    .insert(kind, VecDeque::from_iter(urls.iter().cloned()));
+            });
+            TEST_TIMEOUT_MS.with(|slot| slot.set(timeout));
+            Self { kind, urls }
+        }
+    }
+
+    impl Drop for MockWorkerHarness {
+        fn drop(&mut self) {
+            TEST_TIMEOUT_MS.with(|slot| slot.set(None));
+            TEST_SCRIPTS.with(|map| {
+                map.borrow_mut().remove(&self.kind);
+            });
+            stop_kind(self.kind);
+            for url in &self.urls {
+                let _ = Url::revoke_object_url(url);
+            }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn workers_ready_handshake_and_fifo_queue_ordering() {
+        // Delays READY (after posting a bogus id=0 reply that must be ignored), enforces
+        // single-flight non-overlap (proving client-side FIFO queue serialization), and sleeps
+        // 180ms each for the first two requests so total queued time (~440ms) exceeds the 400ms
+        // per-call timeout while each head-of-line call stays well under 400ms.
+        const SCRIPT: &str = r#"
+            let ready = false;
+            let inFlight = false;
+            let seq = 0;
+
+            self.onmessage = (event) => {
+                const [id, method, text] = event.data;
+                if (!ready) {
+                    self.postMessage([id, false, "received request before READY"]);
+                    return;
+                }
+                if (method !== "find") {
+                    self.postMessage([id, false, "unexpected method: " + method]);
+                    return;
+                }
+                if (inFlight) {
+                    self.postMessage([id, false, "concurrent request overlap detected"]);
+                    return;
+                }
+                inFlight = true;
+                seq += 1;
+                const mySeq = seq;
+                const delay = text === "third" ? 20 : 180;
+                setTimeout(() => {
+                    inFlight = false;
+                    const offsets = new Uint32Array([mySeq, id]);
+                    self.postMessage([id, true, [offsets, false]], [offsets.buffer]);
+                }, delay);
+            };
+
+            // Bogus id=0 reply before READY must be ignored by `workers.rs` (`id != READY_ID`).
+            self.postMessage([0, true, "spurious-zero-id"]);
+            setTimeout(() => {
+                ready = true;
+                self.postMessage("ready");
+            }, 60);
+        "#;
+
+        let _harness = MockWorkerHarness::new(Worker::Search, &[SCRIPT], Some(400));
+        let (r1, r2, r3) = join3(
+            find("first", "q", false, false),
+            find("second", "q", false, false),
+            find("third", "q", false, false),
+        )
+        .await;
+
+        assert_eq!(r1, Ok((vec![(1, 1)], false)));
+        assert_eq!(r2, Ok((vec![(2, 2)], false)));
+        assert_eq!(r3, Ok((vec![(3, 3)], false)));
+        assert!(current_start_id(Worker::Search).is_some());
+    }
+
+    #[wasm_bindgen_test]
+    async fn workers_timeout_guard_terminates_and_restarts_cleanly() {
+        // Subcase 1: worker never emits READY -> start timeout terminates & next call recovers.
+        const SILENT_WORKER: &str = r#"
+            self.onmessage = () => {};
+        "#;
+        const READY_OK_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id] = event.data;
+                const offsets = new Uint32Array([10, 20]);
+                self.postMessage([id, true, [offsets, false]], [offsets.buffer]);
+            };
+            self.postMessage("ready");
+        "#;
+        {
+            let _harness = MockWorkerHarness::new(
+                Worker::Search,
+                &[SILENT_WORKER, READY_OK_WORKER],
+                Some(150),
+            );
+            let err = find("boot", "q", false, false)
+                .await
+                .expect_err("silent worker must hit start timeout");
+            assert_eq!(err, "the preview took too long to start");
+            assert!(current_start_id(Worker::Search).is_none());
+
+            TEST_TIMEOUT_MS.with(|slot| slot.set(Some(2_000)));
+            let recovered = find("after-start-timeout", "q", false, false)
+                .await
+                .expect("fresh worker must succeed after start timeout");
+            assert_eq!(recovered, (vec![(10, 20)], false));
+            assert!(current_start_id(Worker::Search).is_some());
+        }
+
+        // Subcase 2: worker answers one call, then stalls on "stall" -> TimeoutGuard terminates
+        // it, fails both head-of-line and queued callers, and the next call starts a fresh worker.
+        const STALL_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id, _method, text] = event.data;
+                if (text === "stall") {
+                    return;
+                }
+                const offsets = new Uint32Array([1, 2]);
+                self.postMessage([id, true, [offsets, false]], [offsets.buffer]);
+            };
+            self.postMessage("ready");
+        "#;
+        const RECOVERED_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id] = event.data;
+                const offsets = new Uint32Array([7, 14]);
+                self.postMessage([id, true, [offsets, true]], [offsets.buffer]);
+            };
+            self.postMessage("ready");
+        "#;
+        {
+            let _harness = MockWorkerHarness::new(
+                Worker::Search,
+                &[STALL_WORKER, RECOVERED_WORKER],
+                Some(2_000),
+            );
+            assert_eq!(
+                find("ok", "q", false, false).await,
+                Ok((vec![(1, 2)], false))
+            );
+            let start_1 = current_start_id(Worker::Search).expect("worker 1 running");
+
+            TEST_TIMEOUT_MS.with(|slot| slot.set(Some(150)));
+            let (stalled, queued) = join(
+                find("stall", "q", false, false),
+                find("queued-behind-stall", "q", false, false),
+            )
+            .await;
+            assert_eq!(stalled, Err("the preview took too long".to_string()));
+            assert_eq!(queued, Err("the preview took too long".to_string()));
+            assert!(current_start_id(Worker::Search).is_none());
+
+            TEST_TIMEOUT_MS.with(|slot| slot.set(Some(2_000)));
+            let recovered = find("recovered", "q", false, false)
+                .await
+                .expect("fresh worker must succeed after call timeout");
+            assert_eq!(recovered, (vec![(7, 14)], true));
+            let start_2 = current_start_id(Worker::Search).expect("worker 2 running");
+            assert_ne!(start_2, start_1);
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn workers_on_error_crash_restarts_cleanly() {
+        const CRASHING_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id, _method, text] = event.data;
+                if (text === "crash") {
+                    throw new Error("simulated preview worker crash");
+                }
+                const offsets = new Uint32Array([0, 2]);
+                self.postMessage([id, true, [offsets, false]], [offsets.buffer]);
+            };
+            self.postMessage("ready");
+        "#;
+        const HEALTHY_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id] = event.data;
+                const offsets = new Uint32Array([3, 8]);
+                self.postMessage([id, true, [offsets, false]], [offsets.buffer]);
+            };
+            self.postMessage("ready");
+        "#;
+
+        let _harness = MockWorkerHarness::new(
+            Worker::Search,
+            &[CRASHING_WORKER, HEALTHY_WORKER],
+            Some(2_000),
+        );
+        assert_eq!(
+            find("ok", "q", false, false).await,
+            Ok((vec![(0, 2)], false))
+        );
+        let start_1 = current_start_id(Worker::Search).expect("worker 1 started");
+
+        let crash_err = find("crash", "q", false, false)
+            .await
+            .expect_err("uncaught worker exception must reject via on_error");
+        assert_eq!(crash_err, "the preview failed");
+
+        // Next call immediately restarts into a fresh worker even before deferred stop settles.
+        let recovered = find("after-crash", "q", false, false)
+            .await
+            .expect("call after crash must spawn a healthy worker");
+        assert_eq!(recovered, (vec![(3, 8)], false));
+        let start_2 = current_start_id(Worker::Search).expect("worker 2 started");
+        assert_ne!(start_2, start_1);
+    }
+
+    #[wasm_bindgen_test]
+    async fn workers_pdf_generation_id_staleness_after_restart() {
+        const PDF_WORKER_1: &str = r#"
+            self.onmessage = (event) => {
+                const [id, method, arg] = event.data;
+                if (method === "open") {
+                    if (arg.length > 0 && arg[0] === 0xff) {
+                        throw new Error("simulated pdf worker crash");
+                    }
+                    const sizes = new Float64Array([612, 792]);
+                    self.postMessage([id, true, [42, sizes]], [sizes.buffer]);
+                } else if (method === "render") {
+                    const pixels = new Uint8ClampedArray(2 * 2 * 4);
+                    pixels.fill(128);
+                    self.postMessage([id, true, [2, 2, pixels]], [pixels.buffer]);
+                } else if (method === "close") {
+                    self.postMessage([id, true, undefined]);
+                } else {
+                    self.postMessage([id, false, "unknown method"]);
+                }
+            };
+            self.postMessage("ready");
+        "#;
+        const PDF_WORKER_2: &str = r#"
+            self.onmessage = (event) => {
+                const [id, method] = event.data;
+                if (method === "open") {
+                    const sizes = new Float64Array([300, 400]);
+                    self.postMessage([id, true, [42, sizes]], [sizes.buffer]);
+                } else if (method === "render") {
+                    const pixels = new Uint8ClampedArray([10, 20, 30, 255]);
+                    self.postMessage([id, true, [1, 1, pixels]], [pixels.buffer]);
+                } else if (method === "close") {
+                    self.postMessage([id, true, undefined]);
+                } else {
+                    self.postMessage([id, false, "unknown method"]);
+                }
+            };
+            self.postMessage("ready");
+        "#;
+
+        let _harness =
+            MockWorkerHarness::new(Worker::Pdf, &[PDF_WORKER_1, PDF_WORKER_2], Some(2_000));
+
+        let (pdf1, sizes1) = open_pdf(b"%PDF-1.7").await.expect("open pdf1");
+        assert_eq!(sizes1, vec![(612.0, 792.0)]);
+        let img1 = render_pdf(pdf1, 0, 2).await.expect("render pdf1 page 0");
+        assert_eq!((img1.width(), img1.height()), (2, 2));
+
+        // Crash worker 1, then open a new PDF which spawns worker 2 with a new generation ID.
+        let crash_err = open_pdf(&[0xff])
+            .await
+            .expect_err("sentinel bytes must crash pdf worker 1");
+        assert_eq!(crash_err, "the preview failed");
+
+        let (pdf2, sizes2) = open_pdf(b"%PDF-2.0")
+            .await
+            .expect("open pdf2 on restarted worker");
+        assert_eq!(sizes2, vec![(300.0, 400.0)]);
+        assert_ne!(pdf2.start, pdf1.start);
+
+        // Stale handle from generation 1 must be rejected without reaching worker 2.
+        let stale_err = render_pdf(pdf1, 0, 2)
+            .await
+            .expect_err("stale pdf handle must be rejected after restart");
+        assert_eq!(stale_err, "the preview restarted: open the file again");
+
+        // Fresh handle on generation 2 continues rendering normally.
+        let img2 = render_pdf(pdf2, 0, 1).await.expect("render pdf2 page 0");
+        assert_eq!((img2.width(), img2.height()), (1, 1));
+
+        // Stopping the worker also invalidates pdf2 with the same staleness error.
+        stop_kind(Worker::Pdf);
+        let stopped_err = render_pdf(pdf2, 0, 1)
+            .await
+            .expect_err("stopped pdf worker must reject existing handle");
+        assert_eq!(stopped_err, "the preview restarted: open the file again");
     }
 }
