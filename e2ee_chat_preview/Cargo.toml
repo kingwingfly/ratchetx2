@@ -127,6 +127,9 @@ serde_json = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 web-sys = { workspace = true, features = ["console", "DedicatedWorkerGlobalScope", "MessageEvent"], optional = true }
 
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+
 # The workers, which the web client's trunk build compiles to WebAssembly.
 [[bin]]
 name = "preview_pdf"

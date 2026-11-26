@@ -11,3 +11,6 @@ node_modules
 .dev.vars
 /e2ee_chat_worker/build
 /e2ee_chat_web/dist
+/e2ee_chat_web/e2e/playwright-report
+/e2ee_chat_web/e2e/test-results
+/e2ee_chat_web/e2e/blob-report
