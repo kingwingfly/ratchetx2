@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use e2ee_chat_preview::{
@@ -8,13 +8,14 @@ use e2ee_chat_preview::{
 use leptos::{ev, html, prelude::*, task::spawn_local};
 use session::PublicKey;
 use unicode_general_category::{GeneralCategory, get_general_category};
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::JsFuture;
+use web_sys::ResizeObserver;
 
 use crate::{
     icon::{Icon, icon},
     preview::{self, DiffLine, Kind},
-    search::Search,
+    search::{Search, VirtualLines, VirtualTextIndex},
     state::{Attachment, RemoteFile, Streamed},
     util::{js_error, percent_decode, sanitize_filename, size, size_u64},
     workers,
@@ -56,6 +57,8 @@ pub(super) fn Viewer() -> impl IntoView {
     let waiting = Memo::new(move |_| ui.opening.with(Option::is_some));
     // What it shows, and whether that is text, which can be searched.
     let shown_content = NodeRef::<html::Div>::new();
+    // Active virtualized search provider (set by large `DiffView`, `None` for DOM-walked views).
+    let virtual_lines = RwSignal::new_local(None::<VirtualLines>);
     let slides_full = RwSignal::new(false);
     let preview_kind = Memo::new(move |_| {
         ui.viewer.with(|attachment| {
@@ -177,7 +180,7 @@ pub(super) fn Viewer() -> impl IntoView {
             Kind::Table(table) => table_view(table),
             Kind::Archive(listing) => archive_view(listing),
             Kind::Cards(cards) => cards_view(cards),
-            Kind::Diff(lines) => diff_view(lines),
+            Kind::Diff(diff) => view! { <DiffView diff virtual_lines /> }.into_any(),
             Kind::None => no_preview(),
         })
     };
@@ -236,7 +239,7 @@ pub(super) fn Viewer() -> impl IntoView {
                 <span>{title}</span>
                 <div>
                     <Show when=move || searchable.get()>
-                        <Search content=shown_content />
+                        <Search content=shown_content virtual_lines />
                     </Show>
                     <Show when=move || {
                         ui.viewer.with(Option::is_some) || ui.streaming.with(Option::is_some)
@@ -1153,27 +1156,300 @@ fn cards_view(cards: preview::Cards) -> AnyView {
     .into_any()
 }
 
-fn diff_view(diff: preview::Diff) -> AnyView {
+/// Diffs with more than this many lines switch from flat `<pre>` rendering to a fixed-line-height
+/// virtualized viewport so up to `DIFF_LINES_MAX` (20,000) lines mount without freezing the UI.
+const VIRTUAL_THRESHOLD: usize = 500;
+/// Extra rows mounted above and below the visible band in a virtualized [`DiffView`].
+const OVERSCAN: usize = 40;
+/// Fallback row height in CSS pixels matching `--diff-line-height` until the DOM probe measures.
+const DEFAULT_DIFF_LINE_HEIGHT: f64 = 22.0;
+
+fn diff_line_class(kind: DiffLine) -> &'static str {
+    match kind {
+        DiffLine::File => "diff-file",
+        DiffLine::Hunk => "diff-hunk",
+        DiffLine::Added => "diff-added",
+        DiffLine::Removed => "diff-removed",
+        DiffLine::Context => "diff-context",
+    }
+}
+
+/// Compute the half-open slice `start..end` of diff rows to mount for a list of `total_lines`
+/// fixed-height rows, clamped to `0..total_lines` with `overscan` rows on either side.
+fn virtual_window(
+    total_lines: usize,
+    scroll_top: f64,
+    viewport_height: f64,
+    line_height: f64,
+    overscan: usize,
+) -> Range<usize> {
+    if total_lines == 0 {
+        return 0..0;
+    }
+    let lh = if line_height.is_finite() && line_height > 0.0 {
+        line_height
+    } else {
+        DEFAULT_DIFF_LINE_HEIGHT
+    };
+    let scroll = if scroll_top.is_finite() && scroll_top > 0.0 {
+        scroll_top
+    } else {
+        0.0
+    };
+    let height = if viewport_height.is_finite() && viewport_height > 0.0 {
+        viewport_height
+    } else {
+        0.0
+    };
+    let visible_start = ((scroll / lh).floor() as usize).min(total_lines);
+    let visible_end = if height > 0.0 {
+        (((scroll + height) / lh).ceil() as usize).min(total_lines)
+    } else {
+        visible_start
+    };
+    let start = visible_start.saturating_sub(overscan).min(total_lines);
+    let end = visible_end.saturating_add(overscan).min(total_lines);
+    start..end
+}
+
+/// Compute the viewport `scrollTop` that vertically centers `line_idx` inside a fixed-height
+/// virtualized viewport whose line `0` starts at `top_offset` CSS pixels from the top of the
+/// scrollable area.
+fn scroll_top_for_line(
+    line_idx: usize,
+    line_height: f64,
+    viewport_height: f64,
+    top_offset: f64,
+) -> f64 {
+    let lh = if line_height.is_finite() && line_height > 0.0 {
+        line_height
+    } else {
+        DEFAULT_DIFF_LINE_HEIGHT
+    };
+    let vh = if viewport_height.is_finite() && viewport_height > 0.0 {
+        viewport_height
+    } else {
+        0.0
+    };
+    let offset = if top_offset.is_finite() && top_offset > 0.0 {
+        top_offset
+    } else {
+        0.0
+    };
+    let center = offset + (line_idx as f64) * lh + lh * 0.5;
+    (center - vh * 0.5).max(0.0)
+}
+
+/// RAII wrapper keeping a `ResizeObserver` and its JS callback alive until dropped.
+struct DiffResizeGuard {
+    observer: ResizeObserver,
+    _callback: Closure<dyn FnMut(js_sys::Array)>,
+}
+
+impl Drop for DiffResizeGuard {
+    fn drop(&mut self) {
+        self.observer.disconnect();
+    }
+}
+
+fn measure_diff_line_height(probe_ref: NodeRef<html::Span>, fallback: f64) -> f64 {
+    probe_ref
+        .try_get_untracked()
+        .flatten()
+        .map(|el| el.get_bounding_client_rect().height())
+        .filter(|h| h.is_finite() && *h > 1.0)
+        .unwrap_or(fallback)
+}
+
+fn measure_diff_top_offset(viewport: &web_sys::Element, spacer_ref: NodeRef<html::Div>) -> f64 {
+    let Some(spacer) = spacer_ref.try_get_untracked().flatten() else {
+        return 0.0;
+    };
+    let offset = spacer.get_bounding_client_rect().top()
+        - viewport.get_bounding_client_rect().top()
+        + f64::from(viewport.scroll_top());
+    if offset.is_finite() && offset >= 0.0 {
+        offset
+    } else {
+        0.0
+    }
+}
+
+#[component]
+fn DiffView(
+    diff: preview::Diff,
+    virtual_lines: RwSignal<Option<VirtualLines>, LocalStorage>,
+) -> impl IntoView {
     let notice = diff.notice();
+    if diff.lines.len() <= VIRTUAL_THRESHOLD {
+        return view! {
+            <div class="diff-preview">
+                {notice.map(|notice| view! { <p class="preview-note">{notice}</p> })}
+                <pre class="code diff">
+                    {diff
+                        .lines
+                        .into_iter()
+                        .map(|(kind, line)| {
+                            view! { <span class=diff_line_class(kind)>{line}</span> }
+                        })
+                        .collect_view()}
+                </pre>
+            </div>
+        }
+        .into_any();
+    }
+
+    let lines = Arc::new(diff.lines);
+    let total_lines = lines.len();
+    let viewport_ref = NodeRef::<html::Div>::new();
+    let spacer_ref = NodeRef::<html::Div>::new();
+    let window_ref = NodeRef::<html::Div>::new();
+    let probe_ref = NodeRef::<html::Span>::new();
+    let line_height = RwSignal::new(DEFAULT_DIFF_LINE_HEIGHT);
+    let initial_window =
+        virtual_window(total_lines, 0.0, 800.0, DEFAULT_DIFF_LINE_HEIGHT, OVERSCAN);
+    let window = RwSignal::new(initial_window);
+    let resize_guard = StoredValue::new_local(None::<DiffResizeGuard>);
+    let here = StoredValue::new(());
+
+    let sync_viewport = move || {
+        let Some(viewport) = viewport_ref.try_get_untracked().flatten() else {
+            return;
+        };
+        let viewport_el: &web_sys::Element = viewport.as_ref();
+        let lh = measure_diff_line_height(probe_ref, line_height.get_untracked());
+        if (line_height.get_untracked() - lh).abs() > 0.01 {
+            line_height.set(lh);
+        }
+        let vh = f64::from(viewport_el.client_height());
+        if vh <= 0.0 {
+            return;
+        }
+        let top_offset = measure_diff_top_offset(viewport_el, spacer_ref);
+        let content_scroll = (f64::from(viewport_el.scroll_top()) - top_offset).max(0.0);
+        let next = virtual_window(total_lines, content_scroll, vh, lh, OVERSCAN);
+        if window.with_untracked(|cur| *cur != next) {
+            window.set(next);
+        }
+    };
+
+    let scroll_to_line = move |target_line: usize| {
+        let Some(viewport) = viewport_ref.try_get_untracked().flatten() else {
+            return;
+        };
+        let viewport_el: &web_sys::Element = viewport.as_ref();
+        let lh = measure_diff_line_height(probe_ref, line_height.get_untracked());
+        if (line_height.get_untracked() - lh).abs() > 0.01 {
+            line_height.set(lh);
+        }
+        let top_offset = measure_diff_top_offset(viewport_el, spacer_ref);
+        let vh = f64::from(viewport_el.client_height());
+        let clamped_line = target_line.min(total_lines.saturating_sub(1));
+        let target_scroll = scroll_top_for_line(clamped_line, lh, vh, top_offset);
+        viewport_el.set_scroll_top(target_scroll.round() as i32);
+        let actual_scroll = f64::from(viewport_el.scroll_top());
+        let mut next = virtual_window(
+            total_lines,
+            (actual_scroll - top_offset).max(0.0),
+            vh,
+            lh,
+            OVERSCAN,
+        );
+        if total_lines > 0 && !next.contains(&clamped_line) {
+            next = virtual_window(
+                total_lines,
+                (target_scroll - top_offset).max(0.0),
+                vh,
+                lh,
+                OVERSCAN,
+            );
+        }
+        if window.with_untracked(|cur| *cur != next) {
+            window.set(next);
+        }
+    };
+
+    let search_lines = Arc::clone(&lines);
+    let provider = VirtualLines::new(
+        move || VirtualTextIndex::from_lines(search_lines.iter().map(|(_, line)| line.as_str())),
+        viewport_ref,
+        window_ref,
+        window,
+        scroll_to_line,
+    );
+    let provider_id = provider.id();
+    virtual_lines.set(Some(provider));
+
+    Effect::new(move || {
+        resize_guard.set_value(None);
+        let Some(viewport) = viewport_ref.get() else {
+            return;
+        };
+        let on_resize = Closure::<dyn FnMut(js_sys::Array)>::new(move |_entries: js_sys::Array| {
+            sync_viewport();
+        });
+        if let Ok(observer) = ResizeObserver::new(on_resize.as_ref().unchecked_ref()) {
+            observer.observe(&viewport);
+            resize_guard.set_value(Some(DiffResizeGuard {
+                observer,
+                _callback: on_resize,
+            }));
+        }
+        sync_viewport();
+        if viewport.client_height() <= 0 {
+            request_animation_frame(move || {
+                if here.try_get_value().is_some() {
+                    sync_viewport();
+                }
+            });
+        }
+    });
+
+    let window_resizes = window_event_listener(ev::resize, move |_| sync_viewport());
+
+    on_cleanup(move || {
+        window_resizes.remove();
+        resize_guard.try_set_value(None);
+        let _ = virtual_lines.try_update(|slot| {
+            if slot.as_ref().is_some_and(|v| v.id() == provider_id) {
+                *slot = None;
+            }
+        });
+    });
+
+    let total_height = move || format!("{}px", total_lines as f64 * line_height.get());
+    let offset_y = move || {
+        format!(
+            "translateY({}px)",
+            window.get().start as f64 * line_height.get()
+        )
+    };
+    let render_lines = Arc::clone(&lines);
+
     view! {
-        <div class="diff-preview">
+        <div class="diff-preview virtual">
             {notice.map(|notice| view! { <p class="preview-note">{notice}</p> })}
-            <pre class="code diff">
-                {diff
-                    .lines
-                    .into_iter()
-                    .map(|(kind, line)| {
-                        let class = match kind {
-                            DiffLine::File => "diff-file",
-                            DiffLine::Hunk => "diff-hunk",
-                            DiffLine::Added => "diff-added",
-                            DiffLine::Removed => "diff-removed",
-                            DiffLine::Context => "diff-context",
-                        };
-                        view! { <span class=class>{line}</span> }
-                    })
-                    .collect_view()}
-            </pre>
+            <div class="diff-viewport" node_ref=viewport_ref on:scroll=move |_| sync_viewport()>
+                <pre class="code diff diff-virtual">
+                    <span class="diff-probe" aria-hidden="true" node_ref=probe_ref></span>
+                    <div class="diff-spacer" node_ref=spacer_ref style:height=total_height>
+                        <div class="diff-window" node_ref=window_ref style:transform=offset_y>
+                            <For
+                                each=move || window.get()
+                                key=|&idx| idx
+                                children=move |idx| {
+                                    let (kind, line) = &render_lines[idx];
+                                    view! {
+                                        <span class=diff_line_class(*kind) data-line=idx.to_string()>
+                                            {line.clone()}
+                                        </span>
+                                    }
+                                }
+                            />
+                        </div>
+                    </div>
+                </pre>
+            </div>
         </div>
     }
     .into_any()
@@ -1188,4 +1464,95 @@ fn download(attachment: &Attachment, download_anchor: NodeRef<html::A>) {
         &attachment.name,
         download_anchor,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DEFAULT_DIFF_LINE_HEIGHT, OVERSCAN, VIRTUAL_THRESHOLD, scroll_top_for_line, virtual_window,
+    };
+
+    #[test]
+    fn virtual_window_handles_empty_and_small_inputs() {
+        assert_eq!(virtual_window(0, 0.0, 600.0, 22.0, OVERSCAN), 0..0);
+        assert_eq!(virtual_window(0, 500.0, 600.0, 22.0, OVERSCAN), 0..0);
+        assert_eq!(virtual_window(1, 0.0, 600.0, 22.0, OVERSCAN), 0..1);
+        assert_eq!(virtual_window(25, 0.0, 600.0, 22.0, OVERSCAN), 0..25);
+    }
+
+    #[test]
+    fn virtual_window_clamps_at_start_and_end_with_overscan_40() {
+        assert_eq!(OVERSCAN, 40);
+        assert_eq!(VIRTUAL_THRESHOLD, 500);
+
+        // Top of a 20,000-line diff: 20 visible rows (440 / 22) + 40 overscan below, clamped at 0.
+        assert_eq!(virtual_window(20_000, 0.0, 440.0, 22.0, OVERSCAN), 0..60);
+
+        // Near top (line 20 visible): 40 overscan above clamps to 0.
+        assert_eq!(virtual_window(20_000, 440.0, 440.0, 22.0, OVERSCAN), 0..80);
+
+        // Middle (line 15,000 visible): 20 visible + 40 above + 40 below.
+        let scroll_15k = 15_000.0 * 22.0;
+        assert_eq!(
+            virtual_window(20_000, scroll_15k, 440.0, 22.0, OVERSCAN),
+            14_960..15_060
+        );
+
+        // Bottom (last 20 lines visible): 40 overscan below clamps to 20,000.
+        let scroll_end = 19_980.0 * 22.0;
+        assert_eq!(
+            virtual_window(20_000, scroll_end, 440.0, 22.0, OVERSCAN),
+            19_940..20_000
+        );
+
+        // Exact partial row boundary: 440.1px exposes 21 rows (0..21) + 40 overscan = 0..61.
+        assert_eq!(virtual_window(20_000, 0.0, 440.1, 22.0, OVERSCAN), 0..61);
+    }
+
+    #[test]
+    fn virtual_window_clamps_negative_overscroll_and_invalid_dimensions() {
+        // Negative rubber-band scrollTop clamps to 0.
+        assert_eq!(virtual_window(1_000, -120.0, 440.0, 22.0, OVERSCAN), 0..60);
+
+        // Scroll past document end still returns a valid clamped range.
+        assert_eq!(
+            virtual_window(1_000, 1_000_000.0, 440.0, 22.0, OVERSCAN),
+            960..1_000
+        );
+
+        // Zero viewport height (pre-layout) mounts overscan around the scroll anchor.
+        assert_eq!(virtual_window(1_000, 0.0, 0.0, 22.0, OVERSCAN), 0..40);
+        assert_eq!(virtual_window(1_000, 0.0, 0.0, 22.0, 0), 0..0);
+
+        // Non-finite or zero line height falls back cleanly to DEFAULT_DIFF_LINE_HEIGHT.
+        let expected = virtual_window(1_000, 0.0, 440.0, DEFAULT_DIFF_LINE_HEIGHT, OVERSCAN);
+        assert_eq!(virtual_window(1_000, 0.0, 440.0, 0.0, OVERSCAN), expected);
+        assert_eq!(virtual_window(1_000, 0.0, 440.0, -5.0, OVERSCAN), expected);
+        assert_eq!(
+            virtual_window(1_000, 0.0, 440.0, f64::NAN, OVERSCAN),
+            expected
+        );
+        assert_eq!(
+            virtual_window(1_000, f64::NAN, f64::INFINITY, f64::INFINITY, OVERSCAN),
+            0..40
+        );
+    }
+
+    #[test]
+    fn scroll_top_for_line_centers_target_and_clamps_top() {
+        // Line 0 near top clamps to 0 rather than going negative.
+        assert_eq!(scroll_top_for_line(0, 22.0, 600.0, 24.0), 0.0);
+
+        // Line 15,000 centered in a 600px viewport with 24px top padding.
+        let target = scroll_top_for_line(15_000, 22.0, 600.0, 24.0);
+        assert_eq!(target, 24.0 + 15_000.0 * 22.0 + 11.0 - 300.0);
+
+        // Invalid dimensions fall back safely without NaN.
+        let fallback = scroll_top_for_line(100, 0.0, -10.0, f64::NAN);
+        assert!(fallback.is_finite());
+        assert_eq!(
+            fallback,
+            100.0 * DEFAULT_DIFF_LINE_HEIGHT + DEFAULT_DIFF_LINE_HEIGHT * 0.5
+        );
+    }
 }

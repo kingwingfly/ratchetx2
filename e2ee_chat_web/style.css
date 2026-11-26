@@ -36,7 +36,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
    in green. Safari, which has no scrollbar-color, takes its own pseudo-elements instead. */
 :root { scrollbar-color: var(--line-strong) transparent; }
 * { scrollbar-width: thin; }
-:where(.chats, .messages, .welcome, .activity, .share-list, .viewer-content, .markdown pre, .slides .enhanced, .composer textarea):hover { scrollbar-color: var(--accent-line) transparent; }
+:where(.chats, .messages, .welcome, .activity, .share-list, .viewer-content, .diff-viewport, .markdown pre, .slides .enhanced, .composer textarea):hover { scrollbar-color: var(--accent-line) transparent; }
 @supports not (scrollbar-color: auto) {
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track, ::-webkit-scrollbar-corner { background: transparent; }
@@ -536,6 +536,16 @@ pre.code { margin: 0; padding: 24px; font-family: var(--mono); font-size: 13px; 
 .diff-hunk { color: #82aaff; }
 .diff-added { color: #c3e88d; background: #1c2e1a; }
 .diff-removed { color: #f07178; background: #2e1a1c; }
+/* Large diffs (> 500 lines): fixed-line-height scrollable viewport with horizontal scroll and
+   no line wrapping so virtual window geometry stays exact across up to 20,000 lines. */
+.diff-preview.virtual { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.diff-preview.virtual .preview-note { flex: none; margin: 0; padding: 12px 24px; border-bottom: 1px solid var(--line); }
+.diff-viewport { flex: 1; min-height: 0; overflow: auto; overflow-anchor: none; }
+pre.code.diff-virtual { --diff-line-height: 22px; position: relative; padding: 24px 0; white-space: pre; overflow-wrap: normal; line-height: var(--diff-line-height); }
+.diff-spacer { position: relative; min-width: 100%; }
+.diff-window { position: absolute; top: 0; left: 0; min-width: 100%; width: max-content; will-change: transform; }
+.diff-virtual .diff-window span { display: block; height: var(--diff-line-height); min-height: var(--diff-line-height); line-height: var(--diff-line-height); padding-inline: 24px; }
+.diff-virtual .diff-probe { position: absolute; top: 0; left: 0; width: 0; height: var(--diff-line-height); min-height: 0; line-height: var(--diff-line-height); visibility: hidden; pointer-events: none; user-select: none; }
 
 /* Notices and dropping files. */
 .toast { position: fixed; right: 20px; bottom: 20px; z-index: 100; max-width: min(520px, calc(100vw - 40px)); padding: 12px 16px; border: 1px solid var(--accent-line); border-radius: 10px; background: var(--raised-strong); box-shadow: 0 10px 40px #0008; font-size: 13px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; opacity: 0; transform: translateY(6px); pointer-events: none; transition: opacity .15s, transform .15s; }
