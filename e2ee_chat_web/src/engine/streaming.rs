@@ -1,17 +1,14 @@
 //! Range requests and decrypted chunk caching for streaming media.
 
 use super::attachments::{FetchError, Fetching, Waiter, read_chunk};
-use super::{CHUNKS_DECRYPTED_KEPT, ChunkOf, DecryptedChunk, Engine, VaultStore};
+use super::{ChunkOf, DecryptedChunk, Engine, VaultStore};
 use crate::content::AttachmentPointer;
-use crate::glue::{MediaError, MediaRange, MediaRequest};
+use crate::glue::{self, MediaError, MediaRange, MediaRequest};
 use crate::state::Link;
 use crate::util::hex;
-use crate::{glue, preview};
-use futures_channel::oneshot;
 use leptos::prelude::*;
 use session::PublicKey;
 use session::attachment::CHUNK_SIZE;
-use std::collections::hash_map;
 use std::rc::Rc;
 use zeroize::Zeroizing;
 
@@ -55,14 +52,14 @@ impl<V: VaultStore> Engine<V> {
             mime: stream_mime(&pointer.mime),
             clock,
         };
-        self.streams.borrow_mut().insert(token.clone(), stream);
+        self.media.insert_stream(token.clone(), stream);
         Some(format!("/media/{token}"))
     }
 
     /// End the stream at `url`, as its player went.
     pub fn end_stream(&self, url: &str) {
         if let Some(token) = url.strip_prefix("/media/") {
-            self.streams.borrow_mut().remove(token);
+            self.media.remove_stream(token);
         }
     }
 
@@ -109,19 +106,15 @@ impl<V: VaultStore> Engine<V> {
             return Err(MediaError::Status(GONE));
         }
         let size = self
-            .streams
-            .borrow()
-            .get(token)
-            .map(|stream| stream.fetching.size)
+            .media
+            .stream_size(token)
             .ok_or(MediaError::Status(GONE))?;
         let (start, end) = match *range {
             MediaRange::Whole => {
                 if size == 0 {
                     let mime = self
-                        .streams
-                        .borrow()
-                        .get(token)
-                        .map(|stream| stream.mime.clone())
+                        .media
+                        .stream_mime(token)
                         .ok_or(MediaError::Status(GONE))?;
                     return Ok((0, 0, mime, Vec::new()));
                 }
@@ -163,10 +156,8 @@ impl<V: VaultStore> Engine<V> {
             .ok_or(MediaError::OutOfRange { size })?
             .to_vec();
         let mime = self
-            .streams
-            .borrow()
-            .get(token)
-            .map(|stream| stream.mime.clone())
+            .media
+            .stream_mime(token)
             .ok_or(MediaError::Status(GONE))?;
         Ok((size, start, mime, bytes))
     }
@@ -185,31 +176,18 @@ impl<V: VaultStore> Engine<V> {
             if aborted() {
                 return Ok(None);
             }
-            let Some((fetching, clock)) = self
-                .streams
-                .borrow()
-                .get(token)
-                .map(|stream| (stream.fetching.clone(), stream.clock))
-            else {
+            let Some((fetching, clock)) = self.media.stream_fetching_and_clock(token) else {
                 return Ok(None);
             };
             let chunk_of = (fetching.peer, fetching.id, fetching.key_hash, index);
             if let Some(chunk) = self.decrypted_chunk(&chunk_of) {
                 if index == 0 {
-                    self.sniff_stream_mime(token, &fetching, &chunk);
+                    self.media.sniff_stream_mime(token, &fetching, &chunk);
                 }
                 return Ok(Some(chunk));
             }
-            let waiting = match self.loading.borrow_mut().entry(chunk_of) {
-                hash_map::Entry::Occupied(mut waiters) => {
-                    let (done, waiting) = oneshot::channel();
-                    waiters.get_mut().push(done);
-                    waiting
-                }
-                hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(vec![]);
-                    break (fetching, clock);
-                }
+            let Some(waiting) = self.media.begin_or_wait_loading(chunk_of) else {
+                break (fetching, clock);
             };
             // Then among those decrypted, unless fetching it failed, or stopped as its stream
             // ended: then fetched here.
@@ -218,7 +196,7 @@ impl<V: VaultStore> Engine<V> {
         let chunk_of = (fetching.peer, fetching.id, fetching.key_hash, index);
         // Ensure cancelled or panicking range requests always remove `chunk_of` and wake waiters.
         let loading_guard = scopeguard::guard(chunk_of, |key| {
-            self.loading.borrow_mut().remove(&key);
+            self.media.finish_loading(&key);
         });
         let loaded = self
             .load_stream_chunk(token, index, &fetching, aborted)
@@ -242,25 +220,9 @@ impl<V: VaultStore> Engine<V> {
         Ok(Some(chunk))
     }
 
-    /// Update the stream's served MIME type from chunk 0's magic bytes (only video or audio, as
-    /// streams are served from the page's origin).
-    fn sniff_stream_mime(&self, token: &str, fetching: &Fetching, chunk: &[u8]) {
-        if let Some(stream) = self.streams.borrow_mut().get_mut(token)
-            && let Some(mime) = preview::media_mime(&fetching.name, &stream.mime, chunk)
-                .filter(|mime| mime.starts_with("video/") || mime.starts_with("audio/"))
-        {
-            stream.mime = mime.to_string();
-        }
-    }
-
     /// The chunk `chunk_of`, if the streams decrypted it lately, which keeps it longer.
     pub(super) fn decrypted_chunk(&self, chunk_of: &ChunkOf) -> Option<DecryptedChunk> {
-        let mut decrypted = self.decrypted.borrow_mut();
-        let at = decrypted.iter().position(|(of, _)| of == chunk_of)?;
-        let kept = decrypted.remove(at)?;
-        let chunk = kept.1.clone();
-        decrypted.push_back(kept);
-        Some(chunk)
+        self.media.get_decrypted(chunk_of)
     }
 
     /// Chunk `index` of the stream `token`, which fetches `fetching`, as
@@ -274,14 +236,12 @@ impl<V: VaultStore> Engine<V> {
         aborted: &dyn Fn() -> bool,
     ) -> Result<Option<(DecryptedChunk, bool)>, String> {
         let file = self
-            .files
-            .borrow()
-            .get(&(fetching.peer, fetching.id, fetching.key_hash))
-            .cloned();
+            .uploads
+            .get_file(&(fetching.peer, fetching.id, fetching.key_hash));
         let (plaintext, fetched) = match file {
             Some(file) => (read_chunk(&file, index, fetching.size).await?, false),
             None => {
-                let plays = || !aborted() && self.streams.borrow().contains_key(token);
+                let plays = || !aborted() && self.media.contains_stream(token);
                 match self.chunk(fetching, index, Waiter::Chat(&plays)).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => return Ok(None),
@@ -299,18 +259,13 @@ impl<V: VaultStore> Engine<V> {
             return Ok(None);
         }
         let chunk = Rc::new(Zeroizing::new(plaintext));
-        let mut decrypted = self.decrypted.borrow_mut();
-        decrypted.push_back((
+        self.media.cache_decrypted(
             (fetching.peer, fetching.id, fetching.key_hash, index),
             chunk.clone(),
-        ));
-        if decrypted.len() > CHUNKS_DECRYPTED_KEPT {
-            decrypted.pop_front();
-        }
-        drop(decrypted);
+        );
         // Served from the page's origin: only ever as video or audio.
         if index == 0 {
-            self.sniff_stream_mime(token, fetching, &chunk);
+            self.media.sniff_stream_mime(token, fetching, &chunk);
         }
         Ok(Some((chunk, fetched)))
     }

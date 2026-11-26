@@ -1282,8 +1282,7 @@ impl<V: VaultStore> Engine<V> {
         match outcome {
             Ok(outcome @ (PublishV2Outcome::V2Pq | PublishV2Outcome::V2ClassicalOff)) => {
                 inner.client.commit_publish_v2(prepared);
-                self.publish_waits_sign_in.set(false);
-                self.publish_waits_settings.set(false);
+                self.startup.on_publish_succeeded();
                 inner.state.used_pq_one_time_prekeys = 0;
                 inner.last_server_classical_opks = Some(ONE_TIME_PREKEYS as u32);
                 let log_msg = match outcome {
@@ -1345,7 +1344,7 @@ impl<V: VaultStore> Engine<V> {
     ) -> Result<(), PublishError> {
         let live = !self.shutting_down.get() && !crate::glue::lock_released();
         if error.needs_sign_in() {
-            self.publish_waits_sign_in.set(true);
+            self.startup.set_publish_waits_sign_in(true);
         }
         if error.rejects_settings() {
             if error.kind == Some(ErrorKind::PqRequired) {
@@ -1383,7 +1382,7 @@ impl<V: VaultStore> Engine<V> {
                     }
                     Err(e) => {
                         inner.state.needs_publish = false;
-                        self.publish_waits_settings.set(true);
+                        self.startup.set_publish_waits_settings(true);
                         error.message.push_str(&format!(
                             ". Could not restore previous settings: {}. Adjust post-quantum settings in Settings to retry.",
                             describe(&e)
@@ -1392,7 +1391,7 @@ impl<V: VaultStore> Engine<V> {
                 }
             } else {
                 inner.state.needs_publish = false;
-                self.publish_waits_settings.set(true);
+                self.startup.set_publish_waits_settings(true);
                 let guidance = "The server refused the current post-quantum settings; automatic prekey publishing is paused. Open Settings to adjust post-quantum settings and retry.";
                 if live {
                     self.ui.log(format!("{guidance} ({})", error.message));
@@ -1444,7 +1443,7 @@ impl<V: VaultStore> Engine<V> {
                 inner.client.rollback_refill_v2_on_refusal(prepared);
                 let outcome = match e.kind() {
                     ErrorKind::SignInRequired => {
-                        self.publish_waits_sign_in.set(true);
+                        self.startup.set_publish_waits_sign_in(true);
                         Ok(RefillV2Outcome::Handled)
                     }
                     ErrorKind::LimitExceeded => {
@@ -1550,13 +1549,11 @@ impl<V: VaultStore> Engine<V> {
             || now().saturating_sub(inner.state.published_at) > REPUBLISH_AGE;
 
         if full_due {
-            if (self.publish_waits_sign_in.get() || self.publish_waits_settings.get())
-                && !now_anyway
-            {
+            if self.startup.is_publish_paused() && !now_anyway {
                 return Ok(());
             }
             if now_anyway {
-                self.publish_waits_settings.set(false);
+                self.startup.set_publish_waits_settings(false);
             }
             return self
                 .publish_full(inner, now_anyway)
@@ -1565,7 +1562,7 @@ impl<V: VaultStore> Engine<V> {
         }
 
         // M-5: Non-rotating OPK/PQOPK refill (does NOT rotate SPK!).
-        if self.publish_waits_sign_in.get() || self.publish_waits_settings.get() {
+        if self.startup.is_publish_paused() {
             return Ok(());
         }
         let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;
@@ -1841,15 +1838,9 @@ impl<V: VaultStore> Engine<V> {
             }
         }
 
-        self.in_flight_start_chat.set(Some((submission_id, false)));
+        self.startup.set_in_flight_start_chat(submission_id, false);
         let _in_flight = scopeguard::guard((), |()| {
-            if self
-                .in_flight_start_chat
-                .get()
-                .is_some_and(|(id, _)| id == submission_id)
-            {
-                self.in_flight_start_chat.set(None);
-            }
+            self.startup.clear_in_flight_start_chat(submission_id);
         });
 
         let mut peer_state = PeerPqState::default();
@@ -2061,9 +2052,7 @@ impl<V: VaultStore> Engine<V> {
             // Recheck cancellation after IndexedDB persistence: roll back the never-announced
             // contact locally so it neither lingers nor transmits a carried greeting on deletion.
             if self.is_submission_cancelled(submission_id) {
-                self.sign_in_flow
-                    .borrow_mut()
-                    .end_new_chat_submit(submission_id);
+                self.startup.end_new_chat_submit(submission_id);
                 self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, false)
                     .await;
                 return Err(StartChatError::Cancelled);
@@ -2096,9 +2085,7 @@ impl<V: VaultStore> Engine<V> {
                 return Err(StartChatError::Cancelled);
             }
             if self.is_submission_cancelled(submission_id) {
-                self.sign_in_flow
-                    .borrow_mut()
-                    .end_new_chat_submit(submission_id);
+                self.startup.end_new_chat_submit(submission_id);
                 self.rollback_cancelled_start_chat(
                     inner,
                     &peer,
@@ -2113,8 +2100,7 @@ impl<V: VaultStore> Engine<V> {
             // yet, so `RegisterWriteToken` succeeds on our DO.
             if ready_to_send
                 && (inner.state.published_at == 0 || inner.client.manifest_seq() == 0)
-                && !self.publish_waits_sign_in.get()
-                && !self.publish_waits_settings.get()
+                && !self.startup.is_publish_paused()
             {
                 let _ = self.publish_full(inner, false).await;
                 if !self.is_live(vgen) {
@@ -2125,11 +2111,9 @@ impl<V: VaultStore> Engine<V> {
             // The chat is now durably persisted; mark `in_flight_start_chat` as greeting-only so a
             // 403 transport hook clears auto-start ownership immediately instead of handing a stale
             // reservation to `SignInDialog`.
-            self.in_flight_start_chat.set(Some((submission_id, true)));
+            self.startup.set_in_flight_start_chat(submission_id, true);
             if !ready_to_send {
-                self.sign_in_flow
-                    .borrow_mut()
-                    .end_new_chat_submit(submission_id);
+                self.startup.end_new_chat_submit(submission_id);
                 self.ui.contacts.set(inner.views());
             }
             (
@@ -2154,9 +2138,7 @@ impl<V: VaultStore> Engine<V> {
         // If cancelled while `RegisterWriteToken` was in flight (before `SendInitialV2` left),
         // roll back the never-announced contact cleanly if it still matches our created session.
         if self.is_submission_cancelled(submission_id) {
-            self.sign_in_flow
-                .borrow_mut()
-                .end_new_chat_submit(submission_id);
+            self.startup.end_new_chat_submit(submission_id);
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
@@ -2207,9 +2189,7 @@ impl<V: VaultStore> Engine<V> {
         match send_res {
             Err(e) => {
                 if !contact_exists {
-                    self.sign_in_flow
-                        .borrow_mut()
-                        .end_new_chat_submit(submission_id);
+                    self.startup.end_new_chat_submit(submission_id);
                     return Err(StartChatError::Cancelled);
                 }
                 // Clear auto-start ownership BEFORE any await (`save_state`) so `SignInDialog`
@@ -2219,14 +2199,11 @@ impl<V: VaultStore> Engine<V> {
                     && !self.is_submission_cancelled(submission_id)
                 {
                     let dialog = self
-                        .sign_in_flow
-                        .borrow_mut()
+                        .startup
                         .on_chat_created_greeting_needs_sign_in(submission_id);
                     self.show_dialog_if_changed(dialog);
                 } else {
-                    self.sign_in_flow
-                        .borrow_mut()
-                        .end_new_chat_submit(submission_id);
+                    self.startup.end_new_chat_submit(submission_id);
                 }
                 if e.is_server_refusal() && matches_session {
                     if self.is_submission_cancelled(submission_id)
@@ -2274,9 +2251,7 @@ impl<V: VaultStore> Engine<V> {
                 ));
             }
             Ok(()) => {
-                self.sign_in_flow
-                    .borrow_mut()
-                    .end_new_chat_submit(submission_id);
+                self.startup.end_new_chat_submit(submission_id);
                 if !contact_exists {
                     return Err(StartChatError::Cancelled);
                 }

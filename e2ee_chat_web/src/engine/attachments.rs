@@ -306,7 +306,7 @@ pub(super) enum Waiter<'a> {
 impl<V: VaultStore> Engine<V> {
     /// Whether upload `id` was cancelled (or its chat deleted) on this page.
     pub(super) fn is_cancelled(&self, id: &[u8; 16]) -> bool {
-        self.cancelled.borrow().contains(id)
+        self.uploads.is_cancelled(id)
     }
 
     /// Send `peer` an attachment of `file`, then upload it: the peer can download it meanwhile,
@@ -395,7 +395,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.files.borrow_mut().insert(
+        self.uploads.insert_file(
             (peer, *upload.id(), attachment_key_hash(upload.key())),
             file.clone(),
         );
@@ -403,7 +403,7 @@ impl<V: VaultStore> Engine<V> {
             Ok(Some(pending)) => pending,
             Ok(None) => return Ok(()),
             Err(AnnounceError::NotSent(e)) => {
-                self.cancelled.borrow_mut().insert(*upload.id());
+                self.uploads.mark_cancelled(*upload.id());
                 self.remove_attachment_caches(&peer, upload.id());
                 {
                     let guard = self.lock_inner().await;
@@ -425,7 +425,7 @@ impl<V: VaultStore> Engine<V> {
                 if keep {
                     self.show_upload(&peer, &pending, UploadState::Paused(error.clone()));
                 } else {
-                    self.cancelled.borrow_mut().insert(*upload.id());
+                    self.uploads.mark_cancelled(*upload.id());
                     self.remove_attachment_caches(&peer, upload.id());
                     let _ = upload.cancel(&Fetch::client(&server)).await;
                 }
@@ -436,7 +436,7 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         // A new upload, which nothing else runs.
-        self.running.borrow_mut().insert(*upload.id());
+        self.uploads.start_running(*upload.id());
         self.show_upload(&peer, &pending, UploadState::Running);
         let engine = self.clone();
         #[cfg(target_arch = "wasm32")]
@@ -522,9 +522,8 @@ impl<V: VaultStore> Engine<V> {
         self.show_new(inner, &peer, vec![view]);
         self.ui.contacts.set(inner.views());
         drop(guard);
-        self.files
-            .borrow_mut()
-            .insert((peer, id, attachment_key_hash(&[])), file);
+        self.uploads
+            .insert_file((peer, id, attachment_key_hash(&[])), file);
         self.show_upload(
             &peer,
             &waiting,
@@ -562,11 +561,11 @@ impl<V: VaultStore> Engine<V> {
             let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
                 continue;
             };
-            if self.is_cancelled(&id) || self.running.borrow().contains(&id) {
+            if self.is_cancelled(&id) || self.uploads.is_running(&id) {
                 continue;
             }
             let key = (peer, id, attachment_key_hash(&pending.key));
-            let Some(file) = self.files.borrow().get(&key).cloned() else {
+            let Some(file) = self.uploads.get_file(&key) else {
                 // Re-check under the lock so an upload already promoted by a concurrent
                 // `resume_upload` or dropped by `SealOutcome::Failed` is never resurrected.
                 let still_waiting = {
@@ -577,7 +576,7 @@ impl<V: VaultStore> Engine<V> {
                     let Some(inner) = guard.as_ref() else {
                         return;
                     };
-                    if self.is_cancelled(&id) || self.running.borrow().contains(&id) {
+                    if self.is_cancelled(&id) || self.uploads.is_running(&id) {
                         false
                     } else {
                         inner
@@ -607,11 +606,11 @@ impl<V: VaultStore> Engine<V> {
                 }
                 continue;
             };
-            if !self.running.borrow_mut().insert(id) {
+            if !self.uploads.start_running(id) {
                 continue;
             }
             let running_guard = scopeguard::guard(id, |id| {
-                self.running.borrow_mut().remove(&id);
+                self.uploads.stop_running(&id);
             });
             let result = self.start_waiting(peer, id, file).await;
             drop(running_guard);
@@ -694,9 +693,8 @@ impl<V: VaultStore> Engine<V> {
                 if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                     return Ok(());
                 }
-                self.files
-                    .borrow_mut()
-                    .insert((peer, waiting, attachment_key_hash(&kept.key)), file);
+                self.uploads
+                    .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
                 self.show_upload(&peer, &kept, UploadState::Paused(WAITS_SIGN_IN.to_string()));
                 self.ask_sign_in();
                 return Ok(());
@@ -783,7 +781,7 @@ impl<V: VaultStore> Engine<V> {
         // and its message reverts to an un-uploaded failed attachment without publishing the
         // cancelled pointer ID to the UI.
         if self.is_cancelled(&waiting) {
-            self.cancelled.borrow_mut().insert(*upload.id());
+            self.uploads.mark_cancelled(*upload.id());
             self.remove_attachment_caches(&peer, &waiting);
             self.remove_attachment_caches(&peer, upload.id());
             let _ = inner.vault.forget_upload(&peer, upload.id()).await;
@@ -835,18 +833,18 @@ impl<V: VaultStore> Engine<V> {
         drop(guard);
         // Under the server's ID and key hash from now on.
         self.remove_attachment_caches(&peer, &waiting);
-        self.files.borrow_mut().insert(
+        self.uploads.insert_file(
             (peer, *upload.id(), attachment_key_hash(upload.key())),
             file.clone(),
         );
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != waiting));
-        self.running.borrow_mut().remove(&waiting);
+        self.uploads.stop_running(&waiting);
         let new_id = *upload.id();
-        self.running.borrow_mut().insert(new_id);
+        self.uploads.start_running(new_id);
         let new_running_guard = scopeguard::guard(new_id, |id| {
-            self.running.borrow_mut().remove(&id);
+            self.uploads.stop_running(&id);
         });
         self.show_upload(&peer, &pending, UploadState::Running);
         self.release(&peer, kept.history_index);
@@ -1060,21 +1058,14 @@ impl<V: VaultStore> Engine<V> {
 
     /// Purge in-memory file and decrypted chunk caches for `(peer, id)`.
     pub(super) fn remove_attachment_caches(&self, peer: &PublicKey, id: &[u8; 16]) {
-        self.files
-            .borrow_mut()
-            .retain(|(p, i, _), _| !(p == peer && i == id));
-        self.decrypted
-            .borrow_mut()
-            .retain(|((p, i, _, _), _)| !(p == peer && i == id));
+        self.uploads.remove_attachment_files(peer, id);
+        self.media.remove_attachment_chunks(peer, id);
     }
 
     /// Whether the file of the upload `id` for `peer` is still here, so that it can go on without
     /// the file chosen again.
     pub fn has_file(&self, peer: &PublicKey, id: &[u8; 16]) -> bool {
-        self.files
-            .borrow()
-            .keys()
-            .any(|(p, i, _)| p == peer && i == id)
+        self.uploads.has_file(peer, id)
     }
 
     /// Go on with the upload `id`, in the chat with `peer`: with `file`, chosen again, or else
@@ -1096,14 +1087,14 @@ impl<V: VaultStore> Engine<V> {
         id: [u8; 16],
         file: Option<ChunkSource>,
     ) -> Result<(), String> {
-        // Guard the upload ID in `self.running` up front so double-clicking Resume on either a
+        // Guard the upload ID in `self.uploads` up front so double-clicking Resume on either a
         // sign-in-held (`!started()`) upload or a started upload cannot race `start_waiting` and
         // surface a spurious `"that upload is gone"` error.
-        if self.is_cancelled(&id) || !self.running.borrow_mut().insert(id) {
+        if self.is_cancelled(&id) || !self.uploads.start_running(id) {
             return Ok(());
         }
         let running_guard = scopeguard::guard(id, |id| {
-            self.running.borrow_mut().remove(&id);
+            self.uploads.stop_running(&id);
         });
         // Look up the pending upload once under the lock, exiting quietly if it was cancelled or
         // forgotten concurrently (e.g. by `cancel_upload`, `SealOutcome::Failed`, or `delete`).
@@ -1136,13 +1127,13 @@ impl<V: VaultStore> Engine<V> {
         if !pending.started() {
             let key = (peer, id, attachment_key_hash(&[]));
             let file = file
-                .or_else(|| self.files.borrow().get(&key).cloned())
+                .or_else(|| self.uploads.get_file(&key))
                 .ok_or("choose the file again")?;
             return self.start_waiting(peer, id, file).await;
         }
         let cache_key = (peer, id, attachment_key_hash(&pending.key));
         let file = file
-            .or_else(|| self.files.borrow().get(&cache_key).cloned())
+            .or_else(|| self.uploads.get_file(&cache_key))
             .ok_or("choose the file again")?;
         let resume = match self.check(&peer, &pending, &file).await {
             Ok(resume) => resume,
@@ -1157,7 +1148,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) || self.is_cancelled(&id) {
             return Ok(());
         }
-        self.files.borrow_mut().insert(cache_key, file.clone());
+        self.uploads.insert_file(cache_key, file.clone());
         let before_announce = pending.clone();
         let pending = match self.announce(&peer, pending).await {
             Ok(Some(pending)) => pending,
@@ -1180,7 +1171,7 @@ impl<V: VaultStore> Engine<V> {
     pub async fn cancel_upload(&self, peer: PublicKey, id: [u8; 16]) -> Result<(), String> {
         let vgen = self.vault_gen();
         // For good, running or not: what is on its way stops, and keeps nothing of it again.
-        self.cancelled.borrow_mut().insert(id);
+        self.uploads.mark_cancelled(id);
         self.remove_attachment_caches(&peer, &id);
         self.ui
             .uploads
@@ -1350,7 +1341,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.waits_sign_in.borrow_mut().remove(&peer);
+        self.queue.clear_peer_sign_in_wait(&peer);
         if let Err(e) = self.flush(&peer).await
             && self.is_live(vgen)
         {
@@ -1413,7 +1404,7 @@ impl<V: VaultStore> Engine<V> {
             if matched_index.is_none() && !by_id.contains_key(&id) {
                 continue;
             }
-            self.cancelled.borrow_mut().insert(id);
+            self.uploads.mark_cancelled(id);
             self.remove_attachment_caches(peer, &id);
             self.ui
                 .uploads
@@ -1440,7 +1431,7 @@ impl<V: VaultStore> Engine<V> {
             if handled_ids.contains(&id) {
                 continue;
             }
-            self.cancelled.borrow_mut().insert(id);
+            self.uploads.mark_cancelled(id);
             self.remove_attachment_caches(peer, &id);
             self.ui
                 .uploads
@@ -1575,7 +1566,7 @@ impl<V: VaultStore> Engine<V> {
             .try_into()
             .map_err(|_| format!("the upload of {} is corrupt", pending.name))?;
         let running_guard = scopeguard::guard(id, |id| {
-            self.running.borrow_mut().remove(&id);
+            self.uploads.stop_running(&id);
         });
         let uploaded = match upload_of_with_digests(&pending, resume.digests) {
             Ok(upload) => {
@@ -1672,10 +1663,10 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        if !kept && !self.running.borrow().contains(&id) {
+        if !kept && !self.uploads.is_running(&id) {
             return Ok(());
         }
-        self.cancelled.borrow_mut().insert(id);
+        self.uploads.mark_cancelled(id);
         self.remove_attachment_caches(peer, &id);
         self.ui
             .uploads
@@ -2156,7 +2147,7 @@ impl<V: VaultStore> Engine<V> {
         // The sender's own, while on the page that chose it: keyed by `(peer, id, key_hash)` so
         // another peer or mismatched key can never read a cached plaintext file (M-13).
         let key_hash = attachment_key_hash(&pointer.key);
-        let file = self.files.borrow().get(&(peer, *id, key_hash)).cloned();
+        let file = self.uploads.get_file(&(peer, *id, key_hash));
         if let Some(file) = file {
             let data = file.read_all().await.map_err(FetchError::Other)?;
             let attachment = Attachment {

@@ -467,7 +467,7 @@ impl<V: VaultStore> Engine<V> {
                     if !self.is_live(vgen) {
                         return;
                     }
-                    if self.wake.replace(false) {
+                    if self.queue.take_wake() {
                         delay = POLL_FAST;
                         break;
                     }
@@ -641,7 +641,7 @@ impl<V: VaultStore> Engine<V> {
     /// Sync soon.
     pub fn wake(&self) {
         if !self.shutting_down.get() && !crate::glue::lock_released() {
-            self.wake.set(true);
+            self.queue.request_wake();
         }
     }
 
@@ -650,7 +650,7 @@ impl<V: VaultStore> Engine<V> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return;
         }
-        self.clear_all_approval_backoffs();
+        self.queue.clear_all_approval_backoffs();
         self.ui.syncing.set(true);
         self.wake();
     }
@@ -673,7 +673,7 @@ impl<V: VaultStore> Engine<V> {
             _ if !self.is_live(vgen) => return,
             Ok(info) if info.pq_enabled => {
                 if !inner.client.clock().is_drift_exceeded() {
-                    self.clock_skew_warned.set(false);
+                    self.startup.clear_clock_skew_warned();
                 }
                 let suites = info
                     .supported_suites

@@ -38,7 +38,7 @@ impl<V: VaultStore> Engine<V> {
             let inner = guard.as_ref().ok_or("locked")?;
             if *inner.client.pq_config() == config
                 && !inner.state.needs_publish
-                && !self.publish_waits_settings.get()
+                && !self.startup.publish_waits_settings()
             {
                 return Ok(PqSaveOutcome::Unchanged);
             }
@@ -58,7 +58,7 @@ impl<V: VaultStore> Engine<V> {
         let inner = guard.as_mut().ok_or("locked")?;
         if *inner.client.pq_config() == config
             && !inner.state.needs_publish
-            && !self.publish_waits_settings.get()
+            && !self.startup.publish_waits_settings()
         {
             return Ok(PqSaveOutcome::Unchanged);
         }
@@ -67,7 +67,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.publish_waits_settings.set(false);
+        self.startup.set_publish_waits_settings(false);
         self.ui.me.set(Some(inner.me()));
         self.ui.contacts.set(inner.views());
 
@@ -613,7 +613,7 @@ impl<V: VaultStore> Engine<V> {
     /// Clear transient security/approval alerts for `peer` and retry PQ session setup / flushing.
     pub async fn retry_pq(&self, peer: PublicKey) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let waits_sign_in = self.waits_sign_in.borrow().contains(&peer);
+        let waits_sign_in = self.queue.waits_for_sign_in(&peer);
         let use_flush = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {

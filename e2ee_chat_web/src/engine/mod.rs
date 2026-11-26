@@ -8,6 +8,7 @@ mod attachments;
 mod contact;
 mod handshake;
 mod outbox;
+mod runtime;
 mod settings;
 mod streaming;
 mod sync;
@@ -19,12 +20,12 @@ use crate::glue::LockStatus;
 use crate::kdf_worker::KdfCancelToken;
 use crate::notify::CloseHandle;
 use crate::state::{
-    Body, ContactView, Delivery, Dialog, IsolatedContactView, Link, Me, MessageRow, MessageView,
-    PendingNewChat, Phase, ServerPqStatus, SignIn, SignInFlow, SignInSuccessAction, Ui,
-    UnavailableReason, UploadState, order, order_rows,
+    ContactView, Dialog, IsolatedContactView, Link, Me, MessageView, PendingNewChat, Phase,
+    ServerPqStatus, SignIn, SignInSuccessAction, Ui, UnavailableReason, UploadState, order,
+    order_rows,
 };
 use crate::transport::{Connect, Fetch};
-use crate::util::{describe, key_to_url, monotonic_now_ms, short, size_u64, sleep};
+use crate::util::{describe, key_to_url, short, size_u64, sleep};
 use crate::vault::{
     AppState, CarriedDeferredTimestamp, ContactState, DeferredEnvelope, DeferredInitial,
     DeferredRecord, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry,
@@ -36,12 +37,16 @@ use contact::{
     Contact, DisplayedEntry, FarewellMode, isolated_contact_views, restore_contacts,
     stored_contacts,
 };
-use futures_channel::oneshot;
 use futures_util::future::{Either, select};
 use futures_util::lock::Mutex;
 use handshake::encrypt_session_farewells;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+#[cfg(test)]
+use runtime::OpenTracker;
+use runtime::{
+    DisplayedHistory, MediaStreams, OpenChatState, SendQueue, StartupFlow, UploadRegistry,
+};
 use session::attachment::{CHUNK_SIZE, Upload};
 use session::protocol::attachment::DEFAULT_MAX_CHUNKS;
 use session::{
@@ -50,9 +55,8 @@ use session::{
 };
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use streaming::Stream;
 use zeroize::Zeroizing;
 
 /// Why an attachment's upload has not started.
@@ -173,190 +177,26 @@ pub struct Engine<V = Vault> {
     /// Synchronous close handle for the active notification WebSocket, invoked directly on
     /// `pagehide` without awaiting `self.inner`.
     ws_close: RefCell<Option<CloseHandle>>,
-    /// Single-unlock / single-create re-entrancy guard preventing overlapping unlocks or
-    /// duplicate sync/notification/service-worker loops.
-    unlocking: Cell<bool>,
-    /// Sync now, e.g. after sending, as a reply may follow.
-    wake: Cell<bool>,
-    /// The files of the uploads started or resumed on this page, keyed by `(peer, id, key_hash)`,
-    /// which can go on without the files chosen again.
-    files: RefCell<HashMap<AttachmentKey, ChunkSource>>,
-    /// The uploads going on, or being resumed.
-    running: RefCell<HashSet<[u8; 16]>>,
-    /// The uploads cancelled, or whose chat was deleted, on this page: those going on stop before
-    /// their next chunk, and none is kept in the vault again.
-    cancelled: RefCell<HashSet<[u8; 16]>>,
-    /// What was sent and has yet to go, in the order it was sent, and whether a task is sending
-    /// it.
-    sending: RefCell<VecDeque<Sending>>,
-    draining: Cell<bool>,
     /// Monotonic timestamp (ms) since the page has been hidden or out of focus, if it is.
     away_since: Cell<Option<u64>>,
-    /// The attachments playing as they are fetched, by the tokens of their URLs.
-    streams: RefCell<HashMap<String, Stream>>,
-    /// The chunks the streams decrypted last, keyed by `(peer, id, key_hash, index)`, oldest
-    /// first, shared only across streams with matching peer, attachment ID, and key; zeroized on
-    /// eviction/drop.
-    decrypted: RefCell<VecDeque<(ChunkOf, DecryptedChunk)>>,
-    /// The chunks the streams are fetching, keyed by `(peer, id, key_hash, index)`, with what
-    /// waits for each, woken once it is done.
-    loading: RefCell<HashMap<ChunkOf, Vec<oneshot::Sender<()>>>>,
-    /// The chats whose next message waits for this browser to sign in to the server, which
-    /// keeps a message that large only for those who do. It goes once it signs in; until then,
-    /// the chat's messages stay in its outbox, in order. An attachment waits so too, by its
-    /// message's [`awaits_upload`](crate::vault::Outgoing::awaits_upload).
-    waits_sign_in: RefCell<HashSet<PublicKey>>,
-    /// Whether this page can sign in to the unlocked vault's server (same origin).
-    can_sign_in_here: Cell<bool>,
-    /// Coordinates sign-in dialogs with invitation / `NewChat` drafts so signing in or dismissing
-    /// never discards a parsed invitation or user edits.
-    sign_in_flow: RefCell<SignInFlow>,
-    /// Actionable feedback (e.g. classical fallback prompt or error) to display when `NewChat`
-    /// reopens after an automatic post-sign-in `start_chat` attempt needs user attention.
-    new_chat_feedback: RefCell<Option<StartChatError>>,
-    /// Whether publishing the prekeys was refused for the sign-in: it waits for one, rather than
-    /// tries every round.
-    publish_waits_sign_in: Cell<bool>,
-    /// Whether publishing prekeys was definitively refused for the current settings with no
-    /// rollback snapshot: background publishing pauses until the user adjusts settings or retries.
-    publish_waits_settings: Cell<bool>,
-    /// Monotonic generation and target peer (`None` for chat list) for [`Engine::open`],
-    /// [`Engine::close_chat`], and open-chat deletion so an older in-flight `open` never
-    /// overwrites a newer navigation while deleting peer A never cancels a queued open of peer B.
-    open_tracker: Cell<OpenTracker>,
-    /// Submission ID of a `start_chat` call currently awaiting network RPCs under `inner`, together
-    /// with whether the chat has already been persisted (`greeting_only == true`), used to suppress
-    /// late transport 403 sign-in prompts for discarded submissions and prevent greeting-only 403s
-    /// from re-attaching an auto-start draft.
-    in_flight_start_chat: Cell<Option<(u64, bool)>>,
-    /// Startup submission IDs with active async tasks, reference-counted so overlapping `NewChat`
-    /// and `SignInDialog` tasks sharing an ID keep cancellation live until the last task finishes.
-    live_submissions: RefCell<HashMap<u64, usize>>,
-    /// Live startup submission IDs cancelled by browser Back or native dialog dismissal.
-    cancelled_submissions: RefCell<HashSet<u64>>,
-    /// Exact set of history entries currently rendered on screen for the open chat, so
-    /// visibility-return (`mark_read`), `saved_late` recovery, paging earlier history, and lifting
-    /// quarantine only acknowledge messages that were actually displayed.
-    displayed_history: RefCell<Option<DisplayedHistory>>,
-    /// Per-row reactive signals for the currently displayed chat, enabling O(1) delivery and
-    /// remote-attachment updates without scanning `ui.messages` per row and disposing cleanly on
-    /// chat switches.
-    displayed_rows: RefCell<DisplayedRows>,
-    /// Monotonic counter tagging `Ui::deleted_peer` notifications.
-    deleted_peer_seq: Cell<u64>,
-    /// Whether a clock-skew warning has already been surfaced during the current drift episode.
-    clock_skew_warned: Cell<bool>,
-    /// Per-peer exponential backoff after `WriteTokenRejected` while awaiting peer approval:
-    /// maps `peer -> (next_try_monotonic_ms, current_delay_ms)`.
-    approval_backoff: RefCell<HashMap<PublicKey, (u64, u64)>>,
-    /// Per-peer serialization mutexes for outbox flushes (`ClaimBundle`, `RegisterWriteToken`,
-    /// `SendInitialV2`, `PushV2`, `push_events`), stored as `Weak` handles so an in-flight flush's
-    /// mutex remains uniquely shared across concurrent delete+recreate cycles and is pruned cleanly
-    /// once the last holder drops.
-    peer_flush_locks: RefCell<HashMap<PublicKey, std::rc::Weak<Mutex<()>>>>,
+    /// Active attachment uploads, local file sources, and cancellation state.
+    uploads: UploadRegistry,
+    /// Active service-worker media streams, decrypted chunk LRU cache, and inflight chunk waiters.
+    media: MediaStreams,
+    /// Outbox FIFO queue, sync wake flag, sign-in holds, approval backoff, and per-peer flush locks.
+    queue: SendQueue,
+    /// Vault unlock guard, sign-in / `NewChat` submission flow, publish-wait flags, and clock skew.
+    startup: StartupFlow,
+    /// Open-chat navigation tracker, displayed history window, per-row signals, and delete counter.
+    open_chat: OpenChatState,
 }
 
-/// Per-row reactive signal handles owned by the currently rendered chat.
-#[derive(Debug, Clone, Copy)]
-struct RowSignals {
-    place: u64,
-    delivery: Option<RwSignal<Delivery>>,
-    remote_body: Option<RwSignal<Body>>,
-}
-
-impl RowSignals {
-    fn from_row(row: &MessageRow) -> Self {
-        Self {
-            place: row.place,
-            delivery: row.delivery_signal,
-            remote_body: row.remote_body_signal,
-        }
-    }
-
-    fn dispose(self) {
-        if let Some(signal) = self.delivery {
-            signal.dispose();
-        }
-        if let Some(signal) = self.remote_body {
-            signal.dispose();
-        }
-    }
-}
-
-/// Index map of rendered message rows for the active chat.
-#[derive(Default)]
-struct DisplayedRows {
-    peer: Option<PublicKey>,
-    rows: HashMap<u64, RowSignals>,
-}
-
-/// Tracks what is currently displayed in `ui.messages` for an open chat so read acknowledgments
-/// are idempotent by history index and older history pages remain reachable.
-#[derive(Debug, Clone)]
-struct DisplayedHistory {
-    peer: PublicKey,
-    /// Whether the latest history window load (`load_history` / `show_history`) succeeded.
-    history_loaded: bool,
-    /// Oldest history index boundary loaded so far (`0` means the start of history is reached).
-    loaded_start: u64,
-    /// Displayed entries whose unread/receipt state has not yet been acknowledged on screen.
-    pending_entries: Vec<DisplayedEntry>,
-}
-
-/// Loaded history page returned by [`Engine::load_history_before`] together with its read-tracking
+/// Loaded history page returned by [`Engine::load_history_window`] together with its read-tracking
 /// entries.
 struct LoadedHistoryPage {
     messages: Vec<MessageView>,
     loaded_start: u64,
     entries: Vec<DisplayedEntry>,
-}
-
-/// Tracks the latest requested chat open/close generation and target peer.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct OpenTracker {
-    generation: u64,
-    target: Option<PublicKey>,
-    /// If the previous target generation was invalidated by deleting that peer (rather than by a
-    /// newer navigation), record that generation so its queued `Engine::open` returns
-    /// [`OpenOutcome::Ignored`] and reconciles browser history instead of leaving the list on a
-    /// deleted chat entry.
-    deleted_generation: Option<u64>,
-}
-
-impl OpenTracker {
-    pub(super) fn begin_open(&mut self, peer: PublicKey) -> u64 {
-        self.generation = self.generation.wrapping_add(1);
-        self.target = Some(peer);
-        self.deleted_generation = None;
-        self.generation
-    }
-
-    pub(super) fn close(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        self.target = None;
-        self.deleted_generation = None;
-    }
-
-    pub(super) fn is_current(&self, generation: u64) -> bool {
-        self.generation == generation
-    }
-
-    pub(super) fn was_deleted(&self, generation: u64) -> bool {
-        self.deleted_generation == Some(generation)
-    }
-
-    pub(super) fn is_settled_on(&self, displayed: Option<PublicKey>, peer: PublicKey) -> bool {
-        displayed == Some(peer) && self.target == Some(peer)
-    }
-
-    pub(super) fn invalidate_peer(&mut self, peer: PublicKey) {
-        if self.target == Some(peer) {
-            let invalidated = self.generation;
-            self.generation = self.generation.wrapping_add(1);
-            self.target = None;
-            self.deleted_generation = Some(invalidated);
-        }
-    }
 }
 
 /// Whether the browser tab is currently visible (always `true` in native tests).
@@ -550,8 +390,8 @@ impl<V: VaultStore> Engine<V> {
         let engine = Self::empty(ui);
         engine.bump_vault_generation();
         engine
-            .can_sign_in_here
-            .set(same_server(&inner.server, &origin()));
+            .startup
+            .set_can_sign_in_here(same_server(&inner.server, &origin()));
         engine.ui.me.set(Some(inner.me()));
         engine.ui.contacts.set(inner.views());
         engine.ui.isolated_contacts.set(inner.isolated_views());
@@ -569,33 +409,12 @@ impl<V: VaultStore> Engine<V> {
             vault_generation: Cell::new(0),
             shutting_down: Cell::new(false),
             ws_close: RefCell::new(None),
-            unlocking: Cell::new(false),
-            wake: Cell::new(false),
-            files: RefCell::default(),
-            running: RefCell::default(),
-            cancelled: RefCell::default(),
-            sending: RefCell::default(),
-            draining: Cell::new(false),
             away_since: Cell::new(None),
-            streams: RefCell::default(),
-            decrypted: RefCell::default(),
-            loading: RefCell::default(),
-            waits_sign_in: RefCell::default(),
-            can_sign_in_here: Cell::new(false),
-            sign_in_flow: RefCell::default(),
-            new_chat_feedback: RefCell::default(),
-            publish_waits_sign_in: Cell::default(),
-            publish_waits_settings: Cell::default(),
-            open_tracker: Cell::new(OpenTracker::default()),
-            in_flight_start_chat: Cell::new(None),
-            live_submissions: RefCell::default(),
-            cancelled_submissions: RefCell::default(),
-            displayed_history: RefCell::default(),
-            displayed_rows: RefCell::default(),
-            deleted_peer_seq: Cell::new(0),
-            clock_skew_warned: Cell::new(false),
-            approval_backoff: RefCell::default(),
-            peer_flush_locks: RefCell::default(),
+            uploads: UploadRegistry::default(),
+            media: MediaStreams::default(),
+            queue: SendQueue::default(),
+            startup: StartupFlow::default(),
+            open_chat: OpenChatState::default(),
         });
         // Register synchronous `pagehide` teardown BEFORE releasing the exclusive Web Lock.
         let weak = Rc::downgrade(&engine);
@@ -684,29 +503,15 @@ impl<V: VaultStore> Engine<V> {
         // 6. Synchronously terminate all live preview workers and reject pending calls.
         crate::workers::terminate_all();
 
-        // 7. Clear transient engine caches and invalidate in-flight navigation/submissions.
-        self.unlocking.set(false);
-        self.wake.set(false);
-        self.files.borrow_mut().clear();
-        self.running.borrow_mut().clear();
-        self.cancelled.borrow_mut().clear();
-        self.sending.borrow_mut().clear();
-        self.streams.borrow_mut().clear();
-        self.decrypted.borrow_mut().clear();
-        self.loading.borrow_mut().clear();
-        self.waits_sign_in.borrow_mut().clear();
-        self.approval_backoff.borrow_mut().clear();
-        self.peer_flush_locks.borrow_mut().clear();
-        *self.new_chat_feedback.borrow_mut() = None;
-        self.cancel_active_startup_submission();
-        *self.displayed_history.borrow_mut() = None;
-        let mut tracker = self.open_tracker.get();
-        tracker.close();
-        self.open_tracker.set(tracker);
+        // 7. Clear transient engine sub-struct caches and invalidate in-flight navigation/submissions.
+        self.uploads.clear_on_teardown();
+        self.media.clear_on_teardown();
+        self.queue.clear_on_teardown();
+        self.startup.clear_on_teardown();
 
         // 8. Synchronously clear displayed messages, scrub ALL sensitive `Ui` signals, and reset
         //    `document.title` to generic `"E2EE Chat"` (no unread counts or peer names).
-        self.clear_displayed_messages();
+        self.open_chat.clear_on_teardown(&self.ui);
         let _ = self.ui.me.try_set(None);
         let _ = self.ui.contacts.try_set(vec![]);
         let _ = self.ui.isolated_contacts.try_set(vec![]);
@@ -741,54 +546,8 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    /// Return the per-peer serialization mutex for `peer`'s outbox flush, upgrading any live
-    /// `Weak` entry so concurrent delete+recreate cycles strictly serialize behind an in-flight
-    /// flush. Always acquired BEFORE `self.lock_inner()` (never while holding `self.inner`).
-    pub(super) fn peer_flush_lock(&self, peer: &PublicKey) -> Rc<Mutex<()>> {
-        let mut map = self.peer_flush_locks.borrow_mut();
-        if let Some(existing) = map.get(peer).and_then(std::rc::Weak::upgrade) {
-            return existing;
-        }
-        let lock = Rc::new(Mutex::new(()));
-        map.insert(*peer, Rc::downgrade(&lock));
-        lock
-    }
-
-    /// Remove `peer`'s entry from `peer_flush_locks` only once no active or queued flush holds an
-    /// `Rc` to that mutex (`strong_count() == 0`).
-    pub(super) fn prune_peer_flush_lock(&self, peer: &PublicKey) {
-        let mut map = self.peer_flush_locks.borrow_mut();
-        if map.get(peer).is_some_and(|weak| weak.strong_count() == 0) {
-            map.remove(peer);
-        }
-    }
-
     pub(super) fn clear_approval_backoff(&self, peer: &PublicKey) {
-        self.approval_backoff.borrow_mut().remove(peer);
-    }
-
-    pub(super) fn clear_all_approval_backoffs(&self) {
-        self.approval_backoff.borrow_mut().clear();
-    }
-
-    pub(super) fn is_approval_backed_off(&self, peer: &PublicKey) -> bool {
-        self.approval_backoff
-            .borrow()
-            .get(peer)
-            .is_some_and(|&(next_try, _)| monotonic_now_ms() < next_try)
-    }
-
-    /// Record or advance per-peer approval backoff (`15s -> 30s -> 60s -> 5m`).
-    pub(super) fn record_approval_backoff(&self, peer: &PublicKey) -> u64 {
-        let mut map = self.approval_backoff.borrow_mut();
-        let delay = match map.get(peer).map(|&(_, prev)| prev) {
-            None => 15_000,
-            Some(15_000) => 30_000,
-            Some(30_000) => 60_000,
-            Some(_) => 300_000,
-        };
-        map.insert(*peer, (monotonic_now_ms().saturating_add(delay), delay));
-        delay
+        self.queue.clear_approval_backoff(peer);
     }
 
     /// Log and notify the user once per drift episode when the device clock disagrees with the
@@ -797,7 +556,7 @@ impl<V: VaultStore> Engine<V> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return;
         }
-        if !self.clock_skew_warned.replace(true) {
+        if self.startup.mark_clock_skew_warned() {
             let hours = offset_ms.unsigned_abs() / (60 * 60 * 1000);
             self.ui.log(format!(
                 "device clock drift exceeds trusted limit ({hours}h): {CLOCK_SKEW_MESSAGE}"
@@ -835,8 +594,7 @@ impl<V: VaultStore> Engine<V> {
     /// would not keep that order, as a file waits to be read, an attachment for its upload to
     /// start, and each waits for the lock, all of which let what was sent later go first.
     pub fn queue(self: &Rc<Self>, what: Sending) {
-        self.sending.borrow_mut().push_back(what);
-        if !self.draining.replace(true) {
+        if self.queue.enqueue(what) {
             let engine = self.clone();
             spawn_local(async move { engine.drain().await });
         }
@@ -845,12 +603,12 @@ impl<V: VaultStore> Engine<V> {
     /// Send what was sent, a message at a time, until none is left.
     async fn drain(self: Rc<Self>) {
         let vgen = self.vault_gen();
-        let _guard = scopeguard::guard((), |()| self.draining.set(false));
+        let _guard = scopeguard::guard((), |()| self.queue.finish_draining());
         loop {
             if !self.is_live(vgen) {
                 break;
             }
-            let Some(next) = self.sending.borrow_mut().pop_front() else {
+            let Some(next) = self.queue.pop_front() else {
                 break;
             };
             let sent = match next {
@@ -904,9 +662,8 @@ impl<V: VaultStore> Engine<V> {
     /// server sign-in (either via [`sign_in`](Self::sign_in) or an external sign-in discovered by
     /// [`signed_in`](Self::signed_in)).
     fn resume_after_sign_in(&self) {
-        self.waits_sign_in.borrow_mut().clear();
-        self.sign_in_flow.borrow_mut().reset_declined();
-        self.publish_waits_sign_in.set(false);
+        self.queue.clear_all_sign_in_waits();
+        self.startup.on_resume_after_sign_in();
         self.wake();
     }
 
@@ -1005,13 +762,10 @@ impl<V: VaultStore> Engine<V> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return;
         }
-        let next = self.ui.dialog.with_untracked(|current| {
-            self.sign_in_flow.borrow_mut().on_ask_sign_in(
-                current.as_ref(),
-                self.can_sign_in_here.get(),
-                false,
-            )
-        });
+        let next = self
+            .ui
+            .dialog
+            .with_untracked(|current| self.startup.on_ask_sign_in(current.as_ref()));
         if let Some(dialog) = next {
             self.show_dialog_if_changed(dialog);
         }
@@ -1023,45 +777,19 @@ impl<V: VaultStore> Engine<V> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return;
         }
-        if let Some((id, greeting_only)) = self.in_flight_start_chat.get() {
-            if self.is_submission_cancelled(id) {
-                return;
-            }
-            if greeting_only {
-                if self.can_sign_in_here.get() {
-                    let dialog = self
-                        .sign_in_flow
-                        .borrow_mut()
-                        .on_chat_created_greeting_needs_sign_in(id);
-                    self.show_dialog_if_changed(dialog);
-                }
-                return;
-            }
-        }
-        let next = self.ui.dialog.with_untracked(|current| {
-            self.sign_in_flow.borrow_mut().on_ask_sign_in(
-                current.as_ref(),
-                self.can_sign_in_here.get(),
-                true,
-            )
-        });
+        let next = self
+            .ui
+            .dialog
+            .with_untracked(|current| self.startup.on_refused_for_sign_in(current.as_ref()));
         if let Some(dialog) = next {
             self.show_dialog_if_changed(dialog);
-        }
-    }
-
-    fn mark_submission_cancelled(&self, submission_id: u64) {
-        if self.live_submissions.borrow().contains_key(&submission_id) {
-            self.cancelled_submissions
-                .borrow_mut()
-                .insert(submission_id);
         }
     }
 
     /// Suppress subsequent background sign-in prompts without restoring any cancelled draft
     /// (called when browser Back or an OS close dismisses `Dialog::SignIn`).
     pub fn decline_sign_in_prompts(&self) {
-        self.sign_in_flow.borrow_mut().decline_background_prompts();
+        self.startup.decline_background_prompts();
     }
 
     /// The user dismissed `SignInDialog` ("Not now" or Escape): suppress background sign-in
@@ -1069,11 +797,7 @@ impl<V: VaultStore> Engine<V> {
     /// invitation draft, and return `true` if a dialog was restored (so a native `<dialog>` cancel
     /// event keeps the modal open).
     pub fn dismiss_sign_in(&self) -> bool {
-        let (cancelled_id, restored) = self.sign_in_flow.borrow_mut().on_dismiss_sign_in();
-        if let Some(id) = cancelled_id {
-            self.mark_submission_cancelled(id);
-        }
-        match restored {
+        match self.startup.dismiss_sign_in() {
             Some(restored) => {
                 self.ui.dialog.set(Some(restored));
                 true
@@ -1094,9 +818,7 @@ impl<V: VaultStore> Engine<V> {
         server: Option<String>,
         pq_pinned: bool,
     ) {
-        self.sign_in_flow
-            .borrow_mut()
-            .on_new_chat_mounted(key, name, server, pq_pinned);
+        self.startup.new_chat_mounted(key, name, server, pq_pinned);
     }
 
     /// Update the live `NewChat` draft as the user edits key or name.
@@ -1107,79 +829,46 @@ impl<V: VaultStore> Engine<V> {
         server: Option<String>,
         pq_pinned: bool,
     ) {
-        self.sign_in_flow
-            .borrow_mut()
-            .on_new_chat_edited(key, name, server, pq_pinned);
+        self.startup.new_chat_edited(key, name, server, pq_pinned);
     }
 
     /// Clear the live `NewChat` draft tracker when `NewChat` unmounts.
     pub fn new_chat_unmounted(&self) {
-        self.sign_in_flow.borrow_mut().on_new_chat_unmounted();
+        self.startup.new_chat_unmounted();
     }
 
     /// Mark that `NewChat` has an in-flight `start_chat` submission, returning its unique ID.
     pub fn begin_new_chat_submit(&self, draft: PendingNewChat) -> u64 {
-        let id = self.sign_in_flow.borrow_mut().begin_new_chat_submit(draft);
-        *self.live_submissions.borrow_mut().entry(id).or_insert(0) += 1;
-        id
+        self.startup.begin_new_chat_submit(draft)
     }
 
     /// Register a live `SignInDialog` auto-start task for `submission_id` so dismissal cancels it
     /// without retaining tombstones for idle dialogs.
     pub fn begin_sign_in_auto_start(&self, submission_id: u64) {
-        *self
-            .live_submissions
-            .borrow_mut()
-            .entry(submission_id)
-            .or_insert(0) += 1;
+        self.startup.begin_sign_in_auto_start(submission_id);
     }
 
     /// Decrement the active task count for `submission_id` once its async task finishes, clearing
     /// its cancellation tombstone only once all overlapping tasks sharing `submission_id` end.
     pub fn finish_submission(&self, submission_id: u64) {
-        let mut live = self.live_submissions.borrow_mut();
-        if let Some(count) = live.get_mut(&submission_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                live.remove(&submission_id);
-                self.cancelled_submissions
-                    .borrow_mut()
-                    .remove(&submission_id);
-            }
-        } else {
-            self.cancelled_submissions
-                .borrow_mut()
-                .remove(&submission_id);
-        }
-        self.sign_in_flow
-            .borrow_mut()
-            .end_new_chat_submit(submission_id);
+        self.startup.finish_submission(submission_id);
     }
 
     /// Mark a specific startup submission cancelled (e.g. on dialog unmount) so late network
     /// responses cannot reopen Sign In, send a greeting, or clobber a newer draft.
     pub fn cancel_startup_submission(&self, submission_id: u64) {
-        self.mark_submission_cancelled(submission_id);
-        self.sign_in_flow
-            .borrow_mut()
-            .cancel_submission(submission_id);
+        self.startup.cancel_submission(submission_id);
     }
 
     /// Cancel whichever in-flight `NewChat` or auto-start `SignIn` submission is currently active
     /// (called synchronously on browser Back or native dialog cancel/close).
     pub fn cancel_active_startup_submission(&self) {
-        let cancelled = self.sign_in_flow.borrow_mut().cancel_active_submissions();
-        for id in cancelled {
-            self.mark_submission_cancelled(id);
-        }
-        if let Some((id, _)) = self.in_flight_start_chat.get() {
-            self.mark_submission_cancelled(id);
-        }
+        self.startup.cancel_active_submissions();
     }
 
     /// Whether `submission_id` was cancelled by user Back or native dialog dismissal.
     pub fn is_submission_cancelled(&self, submission_id: u64) -> bool {
-        self.cancelled_submissions.borrow().contains(&submission_id)
+        self.startup.is_submission_cancelled(submission_id)
     }
 
     /// Clear any preserved `pending_new_chat` draft belonging to `submission_id` once `NewChat`
@@ -1187,30 +876,27 @@ impl<V: VaultStore> Engine<V> {
     /// draft before `start_chat` acquired the engine mutex), without marking `submission_id`
     /// cancelled or closing `SignInDialog`.
     pub fn clear_pending_new_chat(&self, submission_id: u64) {
-        self.sign_in_flow
-            .borrow_mut()
-            .cancel_submission(submission_id);
+        self.startup.clear_pending_new_chat(submission_id);
     }
 
     /// Preserve a submitted `NewChat` draft (with `auto_start: true`) and immediately present
     /// `SignInDialog` cleanly when `start_chat` hits `SignInRequired`.
     pub fn require_sign_in_for_new_chat(&self, submission_id: u64, draft: PendingNewChat) {
         let dialog = self
-            .sign_in_flow
-            .borrow_mut()
-            .on_start_chat_sign_in_required(submission_id, draft);
+            .startup
+            .require_sign_in_for_new_chat(submission_id, draft);
         self.show_dialog_if_changed(dialog);
     }
 
     /// Hint for `SignInDialog` when a `NewChat` / invitation draft is waiting:
     /// `Some((auto_start, has_key))`.
     pub fn pending_new_chat_hint(&self) -> Option<(bool, bool)> {
-        self.sign_in_flow.borrow().pending_new_chat_hint()
+        self.startup.pending_new_chat_hint()
     }
 
     /// Submission ID of a pending `auto_start: true` chat waiting behind `SignInDialog`, if any.
     pub fn pending_auto_start_id(&self) -> Option<u64> {
-        self.sign_in_flow.borrow().pending_auto_start_id()
+        self.startup.pending_auto_start_id()
     }
 
     /// Close the dialog only if `NewChat` is still the active dialog (avoiding clobbering
@@ -1238,34 +924,24 @@ impl<V: VaultStore> Engine<V> {
 
     /// Determine what `SignInDialog` should do right after `Engine::sign_in` succeeds.
     pub fn complete_sign_in_flow(&self) -> SignInSuccessAction {
-        self.sign_in_flow.borrow_mut().on_sign_in_succeeded()
+        self.startup.complete_sign_in_flow()
     }
 
     /// Complete an automatic post-sign-in `start_chat` attempt scoped strictly to `submission_id`,
     /// closing `SignInDialog` on success or reopening `NewChat` prefilled with `err` when user
     /// attention is required.
     pub fn finish_auto_start_chat(&self, submission_id: u64, err: Option<StartChatError>) {
-        let (succeeded, still_needs_sign_in) = match &err {
-            None => (true, false),
-            Some(StartChatError::SignInRequired) => (false, true),
-            Some(_) => (false, false),
-        };
-        let (close_sign_in, reopened) = self.sign_in_flow.borrow_mut().on_auto_start_finished(
-            submission_id,
-            succeeded,
-            still_needs_sign_in,
-        );
+        let (close_sign_in, reopened) = self.startup.finish_auto_start_chat(submission_id, err);
         if close_sign_in {
             self.close_dialog_if_sign_in();
         } else if let Some(dialog) = reopened {
-            *self.new_chat_feedback.borrow_mut() = err;
             self.ui.dialog.set(Some(dialog));
         }
     }
 
     /// Take any deferred feedback queued for a newly mounted `NewChat` dialog.
     pub fn take_new_chat_feedback(&self) -> Option<StartChatError> {
-        self.new_chat_feedback.borrow_mut().take()
+        self.startup.take_new_chat_feedback()
     }
 
     /// The server's address.
@@ -1355,12 +1031,11 @@ impl Engine<Vault> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return Err(VaultOpenError::Cancelled);
         }
-        if self.unlocking.replace(true) {
+        let Some(_unlock_guard) = self.startup.try_begin_unlock() else {
             return Err(VaultOpenError::Failed(
                 "The vault is already being opened.".to_string(),
             ));
-        }
-        let _unlock_guard = scopeguard::guard((), |()| self.unlocking.set(false));
+        };
         let vgen = self.bump_vault_generation();
         if self.lock_inner().await.is_some() {
             return Err(VaultOpenError::Failed(
@@ -1448,12 +1123,11 @@ impl Engine<Vault> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return Err(VaultOpenError::Cancelled);
         }
-        if self.unlocking.replace(true) {
+        let Some(_unlock_guard) = self.startup.try_begin_unlock() else {
             return Err(VaultOpenError::Failed(
                 "The vault is already being opened.".to_string(),
             ));
-        }
-        let _unlock_guard = scopeguard::guard((), |()| self.unlocking.set(false));
+        };
         let vgen = self.bump_vault_generation();
         if self.lock_inner().await.is_some() {
             return Err(VaultOpenError::Failed(
@@ -1555,7 +1229,7 @@ impl Engine<Vault> {
             return;
         }
         let can_sign_in_here = same_server(&inner.server, &origin());
-        self.can_sign_in_here.set(can_sign_in_here);
+        self.startup.set_can_sign_in_here(can_sign_in_here);
         self.ui.me.set(Some(inner.me()));
         self.ui.contacts.set(inner.views());
         self.ui.isolated_contacts.set(inner.isolated_views());
@@ -1648,11 +1322,9 @@ impl Engine<Vault> {
             if !self.is_live(vgen) {
                 return;
             }
-            let initial = self.sign_in_flow.borrow_mut().on_unlock_with_invitation(
-                dialog,
-                can_sign_in_here,
-                signed_in,
-            );
+            let initial =
+                self.startup
+                    .on_unlock_with_invitation(dialog, can_sign_in_here, signed_in);
             self.ui.dialog.set(Some(initial));
         }
         if !self.is_live(vgen) {
@@ -1712,32 +1384,15 @@ impl<V: VaultStore> Engine<V> {
     /// Whether `peer` is currently displayed on screen with its history loaded and no conflicting
     /// queued navigation.
     pub fn is_settled_on(&self, peer: PublicKey) -> bool {
-        self.open_tracker
-            .get()
+        self.open_chat
             .is_settled_on(self.ui.open.get_untracked(), peer)
-            && self.is_history_loaded_for(peer)
     }
 
     /// Invalidate any queued [`Engine::open`] synchronously (e.g. when the user clicks in-app
     /// Close while browser `history.back()` is settling) without clearing `ui.open` prematurely,
     /// so an in-flight history load cannot open and mark a chat read after the user chose to leave.
     pub fn cancel_pending_open(&self) {
-        let mut tracker = self.open_tracker.get();
-        tracker.close();
-        self.open_tracker.set(tracker);
-    }
-
-    /// Clear `ui.messages` and dispose every per-row reactive signal owned by the previous chat.
-    fn clear_displayed_messages(&self) {
-        let _ = self.ui.messages.try_set(vec![]);
-        let old = {
-            let mut displayed = self.displayed_rows.borrow_mut();
-            displayed.peer = None;
-            std::mem::take(&mut displayed.rows)
-        };
-        for signals in old.into_values() {
-            signals.dispose();
-        }
+        self.open_chat.cancel_pending_open();
     }
 
     /// Replace the displayed message list for `peer`, reusing existing per-row reactive signals
@@ -1747,98 +1402,25 @@ impl<V: VaultStore> Engine<V> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return;
         }
-        let mut displayed = self.displayed_rows.borrow_mut();
-        let same_peer = displayed.peer == Some(peer);
-        let mut old_rows = std::mem::take(&mut displayed.rows);
-        let mut next_rows = HashMap::with_capacity(views.len());
-        let mut rows = Vec::with_capacity(views.len());
-        for view in views {
-            if same_peer && let Some(existing) = old_rows.remove(&view.index) {
-                if let Some(sig) = existing.delivery
-                    && sig.get_untracked() != view.delivery
-                {
-                    sig.set(view.delivery);
-                }
-                if let Some(sig) = existing.remote_body
-                    && sig.with_untracked(|current| *current != view.body)
-                {
-                    sig.set(view.body.clone());
-                }
-                let row = MessageRow {
-                    index: view.index,
-                    place: view.place,
-                    outgoing: view.outgoing,
-                    at: view.at,
-                    body: view.body,
-                    delivery: view.delivery,
-                    delivery_signal: existing.delivery,
-                    remote_body_signal: existing.remote_body,
-                };
-                next_rows.insert(
-                    row.index,
-                    RowSignals {
-                        place: row.place,
-                        delivery: existing.delivery,
-                        remote_body: existing.remote_body,
-                    },
-                );
-                rows.push(row);
-            } else {
-                let row = MessageRow::from_view(view);
-                next_rows.insert(row.index, RowSignals::from_row(&row));
-                rows.push(row);
-            }
-        }
-        displayed.peer = Some(peer);
-        displayed.rows = next_rows;
-        drop(displayed);
-
-        self.ui.messages.set(rows);
-        if open_peer {
-            self.ui.open.set(Some(peer));
-        }
-        for signals in old_rows.into_values() {
-            signals.dispose();
-        }
+        self.open_chat
+            .set_displayed_messages(&self.ui, peer, views, open_peer);
     }
 
     /// Return to the chat list immediately without waiting for `inner` (which a stalled network
     /// sync or flush may hold), invalidating any in-flight [`Engine::open`] so it cannot reopen
     /// the closed chat or write stale history messages.
     pub fn close_chat(&self) {
-        let mut tracker = self.open_tracker.get();
-        tracker.close();
-        self.open_tracker.set(tracker);
-        *self.displayed_history.borrow_mut() = None;
-        self.ui.has_older_messages.set(false);
-        self.ui.open.set(None);
-        self.clear_displayed_messages();
+        self.open_chat.close(&self.ui);
     }
 
     fn is_history_loaded_for(&self, peer: PublicKey) -> bool {
-        self.displayed_history
-            .borrow()
-            .as_ref()
-            .is_some_and(|d| d.peer == peer && d.history_loaded)
+        self.open_chat.is_history_loaded_for(peer)
     }
 
     /// Record entries just appended to `ui.messages` for `peer` so later visibility return
     /// (`mark_read`) or quarantine clearance reconciles them idempotently by history index.
     fn record_displayed_entries(&self, peer: &PublicKey, entries: &[DisplayedEntry]) {
-        if entries.is_empty() {
-            return;
-        }
-        let mut slot = self.displayed_history.borrow_mut();
-        let displayed = match slot.as_mut().filter(|d| d.peer == *peer) {
-            Some(d) => d,
-            None => slot.insert(DisplayedHistory {
-                peer: *peer,
-                history_loaded: false,
-                loaded_start: 0,
-                pending_entries: Vec::new(),
-            }),
-        };
-        displayed.pending_entries.extend_from_slice(entries);
+        self.open_chat.record_displayed_entries(peer, entries);
     }
 
     /// Acknowledge newly appended displayed entries immediately when visible and unquarantined, or
@@ -1887,11 +1469,9 @@ impl<V: VaultStore> Engine<V> {
         if contact.state.quarantined {
             return false;
         }
-        let mut slot = self.displayed_history.borrow_mut();
-        let Some(displayed) = slot.as_mut().filter(|d| d.peer == *peer) else {
+        let Some(entries) = self.open_chat.take_pending_entries(peer) else {
             return false;
         };
-        let entries = std::mem::take(&mut displayed.pending_entries);
         contact.acknowledge_entries(&entries)
     }
 
@@ -1905,14 +1485,12 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return OpenOutcome::Ignored;
         }
-        let mut tracker = self.open_tracker.get();
-        let generation = tracker.begin_open(peer);
-        self.open_tracker.set(tracker);
+        let generation = self.open_chat.begin_open(peer);
         let mut guard = self.lock_inner().await;
         if !self.is_live(vgen) {
             return OpenOutcome::Ignored;
         }
-        let current = self.open_tracker.get();
+        let current = self.open_chat.tracker();
         if current.was_deleted(generation) {
             return OpenOutcome::Ignored;
         }
@@ -1940,7 +1518,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return OpenOutcome::Ignored;
         }
-        let current = self.open_tracker.get();
+        let current = self.open_chat.tracker();
         if current.was_deleted(generation) {
             return OpenOutcome::Ignored;
         }
@@ -1953,7 +1531,7 @@ impl<V: VaultStore> Engine<V> {
         let (messages, has_older) = match loaded {
             Some(page) => {
                 let has_older = page.loaded_start > 0;
-                *self.displayed_history.borrow_mut() = Some(DisplayedHistory {
+                self.open_chat.set_displayed_history(DisplayedHistory {
                     peer,
                     history_loaded: true,
                     loaded_start: page.loaded_start,
@@ -1962,7 +1540,7 @@ impl<V: VaultStore> Engine<V> {
                 (page.messages, has_older)
             }
             None => {
-                *self.displayed_history.borrow_mut() = Some(DisplayedHistory {
+                self.open_chat.set_displayed_history(DisplayedHistory {
                     peer,
                     history_loaded: false,
                     loaded_start: 0,
@@ -1997,7 +1575,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return OpenOutcome::Ignored;
         }
-        let current = self.open_tracker.get();
+        let current = self.open_chat.tracker();
         if current.was_deleted(generation) {
             OpenOutcome::Ignored
         } else if !current.is_current(generation) {
@@ -2076,12 +1654,7 @@ impl<V: VaultStore> Engine<V> {
         else {
             return false;
         };
-        let existing_start = self
-            .displayed_history
-            .borrow()
-            .as_ref()
-            .filter(|d| d.peer == *peer && d.history_loaded)
-            .map(|d| d.loaded_start);
+        let existing_start = self.open_chat.loaded_start_for(*peer);
         let limit = match existing_start {
             Some(start) => history_len.saturating_sub(start).max(HISTORY_SHOWN),
             None => HISTORY_SHOWN,
@@ -2095,7 +1668,7 @@ impl<V: VaultStore> Engine<V> {
                 if self.is_live(vgen) && self.ui.open.get_untracked() == Some(*peer) =>
             {
                 let has_older = page.loaded_start > 0;
-                *self.displayed_history.borrow_mut() = Some(DisplayedHistory {
+                self.open_chat.set_displayed_history(DisplayedHistory {
                     peer: *peer,
                     history_loaded: true,
                     loaded_start: page.loaded_start,
@@ -2125,13 +1698,8 @@ impl<V: VaultStore> Engine<V> {
         let Some(inner) = guard.as_mut() else {
             return Err("locked".into());
         };
-        let before = match self
-            .displayed_history
-            .borrow()
-            .as_ref()
-            .filter(|d| d.peer == peer && d.history_loaded)
-        {
-            Some(d) if d.loaded_start > 0 => d.loaded_start,
+        let before = match self.open_chat.loaded_start_for(peer) {
+            Some(start) if start > 0 => start,
             _ => {
                 self.ui.has_older_messages.set(false);
                 return Ok(false);
@@ -2148,38 +1716,12 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) || self.ui.open.get_untracked() != Some(peer) {
             return Ok(false);
         }
-        let still_at_boundary = self
-            .displayed_history
-            .borrow()
-            .as_ref()
-            .is_some_and(|d| d.peer == peer && d.history_loaded && d.loaded_start == before);
-        if !still_at_boundary {
+        if self.open_chat.loaded_start_for(peer) != Some(before) {
             return Ok(false);
         }
         let has_older = page.loaded_start > 0;
         let me = inner.client.identity_key();
-        let added_rows: Vec<MessageRow> = {
-            let mut displayed = self.displayed_rows.borrow_mut();
-            if displayed.peer != Some(peer) {
-                displayed.peer = Some(peer);
-                let old = std::mem::take(&mut displayed.rows);
-                for signals in old.into_values() {
-                    signals.dispose();
-                }
-            }
-            page.messages
-                .into_iter()
-                .filter_map(|view| {
-                    if displayed.rows.contains_key(&view.index) {
-                        None
-                    } else {
-                        let row = MessageRow::from_view(view);
-                        displayed.rows.insert(row.index, RowSignals::from_row(&row));
-                        Some(row)
-                    }
-                })
-                .collect()
-        };
+        let added_rows = self.open_chat.register_earlier_rows(peer, page.messages);
         let prepended = !added_rows.is_empty();
         if prepended {
             self.ui.messages.update(|messages| {
@@ -2187,15 +1729,8 @@ impl<V: VaultStore> Engine<V> {
                 order_rows(messages, &me, &peer);
             });
         }
-        if let Some(displayed) = self
-            .displayed_history
-            .borrow_mut()
-            .as_mut()
-            .filter(|d| d.peer == peer)
-        {
-            displayed.loaded_start = page.loaded_start;
-            displayed.pending_entries.extend(page.entries);
-        }
+        self.open_chat
+            .extend_earlier_history(peer, page.loaded_start, page.entries);
         self.ui.has_older_messages.set(has_older);
         let read = self.acknowledge_displayed_window(inner, &peer);
         if read && let Err(e) = inner.save_state().await {
@@ -2389,9 +1924,7 @@ impl<V: VaultStore> Engine<V> {
 
     /// Purge in-flight queued sends and viewer attachment opening state for a deleted `peer`.
     pub(super) fn purge_peer_transient_state(&self, peer: &PublicKey) {
-        self.sending
-            .borrow_mut()
-            .retain(|item| item.peer() != *peer);
+        self.queue.purge_peer_sending(peer);
         if self
             .ui
             .opening
@@ -2432,7 +1965,7 @@ impl<V: VaultStore> Engine<V> {
                 .map(|upload| upload.id.to_vec())
                 .collect()
         });
-        let running: HashSet<[u8; 16]> = self.running.borrow().clone();
+        let running = self.uploads.snapshot_running();
         let vault_uploads = inner
             .vault
             .uploads(Some(&peer))
@@ -2524,8 +2057,8 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.clear_approval_backoff(&peer);
-        self.prune_peer_flush_lock(&peer);
+        self.queue.clear_approval_backoff(&peer);
+        self.queue.prune_peer_flush_lock(&peer);
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
         // chat, which `may_keep` now tells them is gone.
         upload_ids.extend(self.ui.uploads.with_untracked(|uploads| {
@@ -2536,17 +2069,12 @@ impl<V: VaultStore> Engine<V> {
                 .collect::<Vec<_>>()
         }));
         for id in upload_ids {
-            self.cancelled.borrow_mut().insert(id);
+            self.uploads.mark_cancelled(id);
             self.remove_attachment_caches(&peer, &id);
         }
         self.purge_peer_transient_state(&peer);
-        self.files.borrow_mut().retain(|(p, _, _), _| *p != peer);
-        self.decrypted
-            .borrow_mut()
-            .retain(|((p, _, _, _), _)| *p != peer);
-        self.streams
-            .borrow_mut()
-            .retain(|_, stream| stream.fetching.peer != peer);
+        self.uploads.remove_peer_files(&peer);
+        self.media.remove_peer(&peer);
         if self
             .ui
             .streaming
@@ -2561,29 +2089,11 @@ impl<V: VaultStore> Engine<V> {
         self.ui.gone.update(|gone| gone.retain(|(p, _)| *p != peer));
         // Nor does what waited for a sign-in, which would otherwise hold up a chat started
         // again with the peer, or go to it.
-        self.waits_sign_in.borrow_mut().remove(&peer);
+        self.queue.clear_peer_sign_in_wait(&peer);
         self.wake();
         // Only invalidate a queued open targeting the deleted peer; preserve queued navigation to
         // a different peer started while the vault deletion was committing.
-        let mut tracker = self.open_tracker.get();
-        tracker.invalidate_peer(peer);
-        self.open_tracker.set(tracker);
-        if self
-            .displayed_history
-            .borrow()
-            .as_ref()
-            .is_some_and(|d| d.peer == peer)
-        {
-            *self.displayed_history.borrow_mut() = None;
-        }
-        if self.ui.open.get_untracked() == Some(peer) {
-            self.ui.has_older_messages.set(false);
-            self.ui.open.set(None);
-            self.clear_displayed_messages();
-        }
-        let seq = self.deleted_peer_seq.get().wrapping_add(1).max(1);
-        self.deleted_peer_seq.set(seq);
-        self.ui.deleted_peer.set(Some((seq, peer)));
+        self.open_chat.on_peer_deleted(peer, &self.ui);
         self.ui.contacts.set(inner.views());
         self.ui.isolated_contacts.set(inner.isolated_views());
         if was_isolated {
@@ -3356,38 +2866,7 @@ impl<V: VaultStore> Engine<V> {
             return;
         }
         let me = inner.client.identity_key();
-        let added_rows: Vec<MessageRow> = {
-            let mut displayed = self.displayed_rows.borrow_mut();
-            if displayed.peer != Some(*peer) {
-                displayed.peer = Some(*peer);
-                let old = std::mem::take(&mut displayed.rows);
-                for signals in old.into_values() {
-                    signals.dispose();
-                }
-            }
-            views
-                .into_iter()
-                .filter_map(|view| {
-                    if let Some(existing) = displayed.rows.get_mut(&view.index) {
-                        if let Some(sig) = existing.delivery
-                            && sig.get_untracked() != view.delivery
-                        {
-                            sig.set(view.delivery);
-                        }
-                        if let Some(sig) = existing.remote_body
-                            && sig.with_untracked(|current| *current != view.body)
-                        {
-                            sig.set(view.body);
-                        }
-                        None
-                    } else {
-                        let row = MessageRow::from_view(view);
-                        displayed.rows.insert(row.index, RowSignals::from_row(&row));
-                        Some(row)
-                    }
-                })
-                .collect()
-        };
+        let added_rows = self.open_chat.upsert_new_rows(*peer, views);
         if !added_rows.is_empty() {
             self.ui.messages.update(|messages| {
                 messages.extend(added_rows);
@@ -3414,38 +2893,7 @@ impl<V: VaultStore> Engine<V> {
         }
         let me = inner.client.identity_key();
         let contact = inner.contacts.iter().find(|contact| contact.peer == *peer);
-        let mut place_updates: Vec<(u64, u64)> = Vec::new();
-        {
-            let mut displayed = self.displayed_rows.borrow_mut();
-            if displayed.peer != Some(*peer) {
-                return;
-            }
-            for (index, entry) in entries {
-                let Some(signals) = displayed.rows.get_mut(index) else {
-                    continue;
-                };
-                if entry.outgoing
-                    && let Some(sig) = signals.delivery
-                {
-                    let next_delivery = entry.delivery();
-                    if sig.get_untracked() != next_delivery {
-                        sig.set(next_delivery);
-                    }
-                }
-                if let Some(sig) = signals.remote_body
-                    && let Some(contact) = contact
-                {
-                    let updated = contact.message(*index, entry.clone()).body;
-                    if sig.with_untracked(|current| *current != updated) {
-                        sig.set(updated);
-                    }
-                }
-                if signals.place != entry.place {
-                    signals.place = entry.place;
-                    place_updates.push((*index, entry.place));
-                }
-            }
-        }
+        let place_updates = self.open_chat.apply_row_changes(peer, contact, entries);
         if !place_updates.is_empty() {
             self.ui.messages.update(|messages| {
                 for (index, place) in place_updates {

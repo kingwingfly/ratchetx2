@@ -81,18 +81,14 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        // Declare the RAII prune guard BEFORE `peer_lock` so Rust drops `_peer_guard`, then
-        // `peer_lock` (decrementing its strong count), and finally removes the `Weak` entry iff
-        // `strong_count() == 0`.
-        let _prune_peer_lock = scopeguard::guard(*peer, |peer| {
-            self.prune_peer_flush_lock(&peer);
-        });
-        let peer_lock = self.peer_flush_lock(peer);
+        // RAII `PeerFlushLock` guarantees `_peer_guard` drops first, then the `Rc<Mutex<()>>`, and
+        // finally removes the `Weak` entry iff `strong_count() == 0`.
+        let peer_lock = self.queue.peer_flush_lock(peer);
         let _peer_guard = peer_lock.lock().await;
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        if self.waits_sign_in.borrow().contains(peer) || self.is_approval_backed_off(peer) {
+        if self.queue.waits_for_sign_in(peer) || self.queue.is_approval_backed_off(peer) {
             return Ok(false);
         }
         // With messages waiting and no session to send on, the peer may have started one, e.g.
@@ -127,7 +123,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            if self.waits_sign_in.borrow().contains(peer) || self.is_approval_backed_off(peer) {
+            if self.queue.waits_for_sign_in(peer) || self.queue.is_approval_backed_off(peer) {
                 break;
             }
 
@@ -694,7 +690,7 @@ impl<V: VaultStore> Engine<V> {
                             if let Some(inner) = guard.as_mut()
                                 && inner.contact(peer).is_some()
                             {
-                                let delay_ms = self.record_approval_backoff(peer);
+                                let delay_ms = self.queue.record_approval_backoff(peer);
                                 let label = inner
                                     .contact(peer)
                                     .map_or_else(|| short(peer), |c| c.view().label());
@@ -708,7 +704,7 @@ impl<V: VaultStore> Engine<V> {
                         // Large enough to cost the server storage, which it keeps only for those
                         // signed in to it: it waits, with those after it, until this browser is.
                         Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
-                            self.waits_sign_in.borrow_mut().insert(*peer);
+                            self.queue.mark_waits_sign_in(*peer);
                             self.hold(peer, outgoing.history_index);
                             self.ask_sign_in();
                             break;
@@ -779,8 +775,8 @@ impl<V: VaultStore> Engine<V> {
         if result.is_ok()
             && signs_in_here
             && self.is_live(vgen)
-            && !self.waits_sign_in.borrow().contains(peer)
-            && !self.is_approval_backed_off(peer)
+            && !self.queue.waits_for_sign_in(peer)
+            && !self.queue.is_approval_backed_off(peer)
         {
             match self.push_events(vgen, peer).await {
                 Ok(told) => changed |= told,
@@ -1405,14 +1401,14 @@ impl<V: VaultStore> Engine<V> {
                     }
                     let _ = inner.save_state().await;
                 } else {
-                    self.record_approval_backoff(peer);
+                    self.queue.record_approval_backoff(peer);
                 }
                 return Ok(false);
             }
             // The chat waits for the sign-in, as a message refused for it does, rather than
             // tries every round, and goes once signed in.
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
-                self.waits_sign_in.borrow_mut().insert(*peer);
+                self.queue.mark_waits_sign_in(*peer);
                 return Ok(false);
             }
             Err(e) => {

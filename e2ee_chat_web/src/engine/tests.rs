@@ -1860,7 +1860,7 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         assert!(err.rejects_settings());
         assert!(err.message.contains("Settings"));
         assert!(!inner.state.needs_publish);
-        assert!(engine.publish_waits_settings.get());
+        assert!(engine.startup.publish_waits_settings());
         assert!(
             engine
                 .ui
@@ -1896,7 +1896,7 @@ fn refused_publish_without_rollback_clears_needs_publish_and_pauses_retries() {
         assert!(err.message.contains("Settings") && err.message.contains("will retry"));
         assert!(!reloaded.state.needs_publish);
         assert!(reloaded.unsaved_state);
-        assert!(engine2.publish_waits_settings.get());
+        assert!(engine2.startup.publish_waits_settings());
         assert_eq!(reloaded.server_pq, ServerPqStatus::Disabled);
         assert_eq!(
             engine2.ui.me.get_untracked().unwrap().server_pq,
@@ -2881,12 +2881,10 @@ fn unannounced_greeting_suppresses_farewell_and_displayed_window_reconciles_accu
 
     // `cancel_pending_open` synchronously invalidates a queued open without clearing `ui.open`.
     let engine_close = Engine::new(Ui::new());
-    let mut t = engine_close.open_tracker.get();
-    let open_gen = t.begin_open(peer);
-    engine_close.open_tracker.set(t);
-    assert!(engine_close.open_tracker.get().is_current(open_gen));
+    let open_gen = engine_close.open_chat.begin_open(peer);
+    assert!(engine_close.open_chat.tracker().is_current(open_gen));
     engine_close.cancel_pending_open();
-    assert!(!engine_close.open_tracker.get().is_current(open_gen));
+    assert!(!engine_close.open_chat.tracker().is_current(open_gen));
 }
 
 #[test]
@@ -2991,7 +2989,7 @@ fn fallback_farewells_greeting_only_403_and_per_row_signals() {
     // 2. Greeting-only 403 hook clears auto-start ownership immediately so `SignInDialog` cannot
     // steal the history reservation during an async refusal save.
     let engine = Engine::new(Ui::new());
-    engine.can_sign_in_here.set(true);
+    engine.startup.set_can_sign_in_here(true);
     let draft = PendingNewChat {
         key: "peer-key".into(),
         name: "Bob".into(),
@@ -3001,24 +2999,24 @@ fn fallback_farewells_greeting_only_403_and_per_row_signals() {
         auto_start: true,
     };
     let submit_id = engine.begin_new_chat_submit(draft);
-    engine.in_flight_start_chat.set(Some((submit_id, true)));
+    engine.startup.set_in_flight_start_chat(submit_id, true);
     engine.refused_for_sign_in();
     assert_eq!(engine.pending_auto_start_id(), None);
     assert_eq!(engine.ui().dialog.get_untracked(), Some(Dialog::SignIn));
 
     // 3. `is_settled_on` requires history to actually be loaded for `peer`, and per-row reactive
     // signals update delivery ticks in O(1) without replacing row signals on same-peer refresh.
-    let mut tracker = engine.open_tracker.get();
-    let _ = tracker.begin_open(bob_peer);
-    engine.open_tracker.set(tracker);
+    let _ = engine.open_chat.begin_open(bob_peer);
     engine.ui().open.set(Some(bob_peer));
     assert!(!engine.is_settled_on(bob_peer));
-    *engine.displayed_history.borrow_mut() = Some(super::DisplayedHistory {
-        peer: bob_peer,
-        history_loaded: true,
-        loaded_start: 0,
-        pending_entries: Vec::new(),
-    });
+    engine
+        .open_chat
+        .set_displayed_history(super::DisplayedHistory {
+            peer: bob_peer,
+            history_loaded: true,
+            loaded_start: 0,
+            pending_entries: Vec::new(),
+        });
     assert!(engine.is_settled_on(bob_peer));
 
     let msg0 = MessageView {
@@ -3064,7 +3062,7 @@ fn fallback_farewells_greeting_only_403_and_per_row_signals() {
     assert_eq!(sig0, sig0_after);
     assert_eq!(sig0_after.get_untracked(), Delivery::Downloaded);
 
-    engine.clear_displayed_messages();
+    engine.open_chat.clear_displayed_messages(&engine.ui());
     assert!(engine.ui().messages.with_untracked(Vec::is_empty));
 
     // 4. `show_dialog_if_changed` does not re-notify `ui.dialog` when `Dialog::SignIn` is already
@@ -3090,7 +3088,7 @@ fn fallback_farewells_greeting_only_403_and_per_row_signals() {
         allow_classical: false,
         auto_start: true,
     });
-    engine.in_flight_start_chat.set(Some((submit_id_2, true)));
+    engine.startup.set_in_flight_start_chat(submit_id_2, true);
     engine.refused_for_sign_in();
     observer.get();
     assert_eq!(engine.pending_auto_start_id(), None);
@@ -3664,18 +3662,16 @@ fn is_cancelled_and_delete_purge_sending_and_opening_state() {
     let id_b = [0xBBu8; 16];
 
     assert!(!engine.is_cancelled(&id_a));
-    engine.cancelled.borrow_mut().insert(id_a);
+    engine.uploads.mark_cancelled(id_a);
     assert!(engine.is_cancelled(&id_a));
     assert!(!engine.is_cancelled(&id_b));
 
     engine
-        .sending
-        .borrow_mut()
-        .push_back(Sending::Content(peer_a, Kind::Text("stale".into())));
+        .queue
+        .push_sending(Sending::Content(peer_a, Kind::Text("stale".into())));
     engine
-        .sending
-        .borrow_mut()
-        .push_back(Sending::Content(peer_b, Kind::Text("keep".into())));
+        .queue
+        .push_sending(Sending::Content(peer_b, Kind::Text("keep".into())));
     ui.opening.set(Some(Opening {
         token: 7,
         peer: peer_a,
@@ -3687,8 +3683,7 @@ fn is_cancelled_and_delete_purge_sending_and_opening_state() {
     }));
 
     engine.purge_peer_transient_state(&peer_a);
-    assert_eq!(engine.sending.borrow().len(), 1);
-    assert_eq!(engine.sending.borrow()[0].peer(), peer_b);
+    assert_eq!(engine.queue.sending_peers(), vec![peer_b]);
     assert!(ui.opening.get_untracked().is_none());
 
     // Purging `peer_a` when `ui.opening` belongs to `peer_b` leaves `peer_b`'s opening intact.
@@ -4435,7 +4430,7 @@ fn streaming_media_range_and_stream_chunk_decrypt_cache_and_fault_injection() {
 
         // 3. After evicting the plaintext LRU cache, chunk 0 still serves from MemoryVault without
         //    re-fetching from the server.
-        engine.decrypted.borrow_mut().clear();
+        engine.media.clear_decrypted_cache();
         let (_, start3, _, slice2) = engine
             .media_range(
                 token,
@@ -4479,7 +4474,7 @@ fn streaming_media_range_and_stream_chunk_decrypt_cache_and_fault_injection() {
         assert_eq!(suffix_start, total_size - 32);
         assert_eq!(suffix_bytes, &chunk1_plain[32..64]);
         assert_eq!(get_counts.borrow().get(&1).copied(), Some(2));
-        let fetching = engine.streams.borrow().get(token).unwrap().fetching.clone();
+        let fetching = engine.media.stream_fetching(token).unwrap();
         assert!(engine.all_kept(&fetching).await);
         assert_eq!(
             push_count.get(),
@@ -4518,7 +4513,7 @@ fn streaming_media_range_and_stream_chunk_decrypt_cache_and_fault_injection() {
         let local_id = [0x99u8; 16];
         let local_key = [0x55u8; session::attachment::KEY_LENGTH];
         let local_bytes = b"OggS-local-stream-bytes".to_vec();
-        engine.files.borrow_mut().insert(
+        engine.uploads.insert_file(
             (peer, local_id, super::attachment_key_hash(&local_key)),
             ChunkSource::from_bytes("local.ogg", "audio/ogg", local_bytes.clone()),
         );
@@ -4681,7 +4676,7 @@ fn outbox_flush_retries_idempotently_handles_partial_failure_and_fail_waiting() 
             Ok((err.status, err.body))
         });
         assert_eq!(engine.flush(&peer).await, Ok(false));
-        assert!(engine.waits_sign_in.borrow().contains(&peer));
+        assert!(engine.queue.waits_for_sign_in(&peer));
         assert!(engine.ui().held.get_untracked().contains(&(peer, held_idx)));
         assert_eq!(engine.ui().dialog.get_untracked(), Some(Dialog::SignIn));
 
@@ -5166,30 +5161,28 @@ fn engine_delete_cleans_up_peer_and_rolls_back_on_forget_fault() {
 
         // Seed transient engine & UI state for both peers.
         engine.open(Some(alice_peer)).await;
-        engine.files.borrow_mut().insert(
+        engine.uploads.insert_file(
             (alice_peer, alice_upload_id, alice_key_hash),
             ChunkSource::from_bytes("a.bin", "application/octet-stream", vec![1, 2, 3]),
         );
-        engine.files.borrow_mut().insert(
+        engine.uploads.insert_file(
             (bob_peer, bob_upload_id, bob_key_hash),
             ChunkSource::from_bytes("b.bin", "application/octet-stream", vec![4, 5, 6]),
         );
-        engine.decrypted.borrow_mut().push_back((
+        engine.media.cache_decrypted(
             (alice_peer, alice_upload_id, alice_key_hash, 0),
             Rc::new(zeroize::Zeroizing::new(vec![1])),
-        ));
-        engine.decrypted.borrow_mut().push_back((
+        );
+        engine.media.cache_decrypted(
             (bob_peer, bob_upload_id, bob_key_hash, 0),
             Rc::new(zeroize::Zeroizing::new(vec![2])),
-        ));
+        );
         engine
-            .sending
-            .borrow_mut()
-            .push_back(Sending::Content(alice_peer, Kind::Text("drop".into())));
+            .queue
+            .push_sending(Sending::Content(alice_peer, Kind::Text("drop".into())));
         engine
-            .sending
-            .borrow_mut()
-            .push_back(Sending::Content(bob_peer, Kind::Text("stay".into())));
+            .queue
+            .push_sending(Sending::Content(bob_peer, Kind::Text("stay".into())));
         engine.ui().held.update(|h| {
             h.insert((alice_peer, 0));
             h.insert((bob_peer, 0));
@@ -5282,26 +5275,10 @@ fn engine_delete_cleans_up_peer_and_rolls_back_on_forget_fault() {
             &[alice_upload_id.to_vec()]
         );
         assert!(engine.is_cancelled(&alice_upload_id));
-        assert_eq!(engine.files.borrow().len(), 1);
-        assert!(engine.files.borrow().keys().all(|(p, _, _)| *p == bob_peer));
-        assert_eq!(engine.decrypted.borrow().len(), 1);
-        assert!(
-            engine
-                .decrypted
-                .borrow()
-                .iter()
-                .all(|((p, _, _, _), _)| *p == bob_peer)
-        );
-        assert_eq!(engine.streams.borrow().len(), 1);
-        assert!(
-            engine
-                .streams
-                .borrow()
-                .values()
-                .all(|s| s.fetching.peer == bob_peer)
-        );
-        assert_eq!(engine.sending.borrow().len(), 1);
-        assert_eq!(engine.sending.borrow()[0].peer(), bob_peer);
+        assert_eq!(engine.uploads.file_peers(), vec![bob_peer]);
+        assert_eq!(engine.media.decrypted_peers(), vec![bob_peer]);
+        assert_eq!(engine.media.stream_peers(), vec![bob_peer]);
+        assert_eq!(engine.queue.sending_peers(), vec![bob_peer]);
         assert_eq!(engine.ui().held.get_untracked().len(), 1);
         assert!(engine.ui().held.get_untracked().contains(&(bob_peer, 0)));
         assert_eq!(engine.ui().gone.get_untracked().len(), 1);
@@ -5866,7 +5843,7 @@ fn human_approved_grants_backoff_revokes_and_farewell_write_token_rejected() {
             assert_eq!(alice_engine.flush(&bob_peer).await, Ok(false));
             assert_eq!(push_calls.get(), 1);
             assert_eq!(send_initial_calls.get(), 1);
-            assert!(alice_engine.is_approval_backed_off(&bob_peer));
+            assert!(alice_engine.queue.is_approval_backed_off(&bob_peer));
 
             // 2nd immediate flush: skipped silently while backed off.
             assert_eq!(alice_engine.flush(&bob_peer).await, Ok(false));
@@ -8294,12 +8271,9 @@ fn push_v2_releases_inner_lock_allows_peer_b_and_ui_and_handles_concurrent_delet
     // Delete peer_a concurrently while PushV2(peer_a) is suspended! The live `Weak` lock entry
     // remains tracked until the in-flight flush exits, then prunes automatically.
     pool.run_until(engine.delete(peer_a)).unwrap();
-    assert!(
-        engine
-            .peer_flush_locks
-            .borrow()
-            .get(&peer_a)
-            .is_some_and(|weak| weak.strong_count() == 1),
+    assert_eq!(
+        engine.queue.peer_flush_lock_strong_count(&peer_a),
+        Some(1),
         "live per-peer flush lock must stay registered until in-flight flush exits"
     );
 
@@ -8309,7 +8283,7 @@ fn push_v2_releases_inner_lock_allows_peer_b_and_ui_and_handles_concurrent_delet
     pool.run_until_stalled();
     assert_eq!(*flush_del_done.borrow(), Some(Ok(false)));
     assert!(
-        !engine.peer_flush_locks.borrow().contains_key(&peer_a),
+        !engine.queue.has_peer_flush_lock(&peer_a),
         "peer_flush_locks entry must be pruned once the last flush holder exits"
     );
     pool.run_until(async {
@@ -8470,7 +8444,7 @@ fn pagehide_during_suspended_claim_bundle_and_push_v2_blocks_all_writes_and_ui()
             engine.inner.try_lock().expect("uncontended").is_none(),
             "Inner must be dropped synchronously on pagehide while ClaimBundle is suspended"
         );
-        assert!(engine.peer_flush_locks.borrow().is_empty());
+        assert!(engine.queue.peer_flush_locks_is_empty());
 
         // Release ClaimBundle -> continuation MUST abort with zero IDB writes and zero UI repaints!
         claim_tx.send(()).unwrap();
@@ -8550,7 +8524,7 @@ fn pagehide_during_suspended_claim_bundle_and_push_v2_blocks_all_writes_and_ui()
             engine.inner.try_lock().expect("uncontended").is_none(),
             "Inner must be dropped synchronously on pagehide while PushV2 is suspended"
         );
-        assert!(engine.peer_flush_locks.borrow().is_empty());
+        assert!(engine.queue.peer_flush_locks_is_empty());
 
         // Release PushV2 -> flush MUST abort with zero IDB writes and zero UI repaints!
         push_tx.send(()).unwrap();
@@ -8641,12 +8615,9 @@ fn delete_recreate_during_suspended_push_v2_preserves_per_peer_serialization_and
     // 2. Delete peer_a concurrently, then immediately recreate peer_a with a brand-new session S2
     //    and queue a message on S2, then spawn flush #2 for peer_a while flush #1 is still paused!
     pool.run_until(engine.delete(peer_a)).unwrap();
-    assert!(
-        engine
-            .peer_flush_locks
-            .borrow()
-            .get(&peer_a)
-            .is_some_and(|weak| weak.strong_count() == 1),
+    assert_eq!(
+        engine.queue.peer_flush_lock_strong_count(&peer_a),
+        Some(1),
         "delete must not evict a live Weak flush lock"
     );
 
@@ -8716,13 +8687,7 @@ fn delete_recreate_during_suspended_push_v2_preserves_per_peer_serialization_and
         1,
         "flush #2 after delete+recreate must wait on the exact same per-peer mutex as flush #1"
     );
-    assert!(
-        engine
-            .peer_flush_locks
-            .borrow()
-            .get(&peer_a)
-            .is_some_and(|weak| weak.strong_count() == 2)
-    );
+    assert_eq!(engine.queue.peer_flush_lock_strong_count(&peer_a), Some(2));
     assert!(f2_done.borrow().is_none());
 
     // 3. Release flush #1 -> S2's message is pushed ONCE (zero duplicate PushV2), decrypts cleanly
@@ -8744,7 +8709,7 @@ fn delete_recreate_during_suspended_push_v2_preserves_per_peer_serialization_and
         Some(Kind::Text("recreated-session-msg".into()))
     );
     assert!(
-        !engine.peer_flush_locks.borrow().contains_key(&peer_a),
+        !engine.queue.has_peer_flush_lock(&peer_a),
         "peer_flush_locks entry must be pruned once both flushes exit"
     );
 }
