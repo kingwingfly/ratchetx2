@@ -177,7 +177,8 @@ impl<V: VaultStore> Inner<V> {
 }
 
 impl<V: VaultStore> Engine<V> {
-    /// Flush staged `RegisterWriteToken` grants for `peer`, checking for core v2 protocol errors.
+    /// Flush staged `RegisterWriteToken` grants for `peer` while holding `inner` (used by callers
+    /// that already hold `self.inner` across a local recovery step or settings flow).
     pub(super) async fn flush_pending_grants_for(
         &self,
         inner: &mut Inner<impl VaultStore>,
@@ -192,28 +193,132 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    /// Flush staged `RegisterWriteToken` grants across all contacts.
-    pub(super) async fn flush_pending_grants(&self) -> Result<(), String> {
+    /// Lock-free flush of staged `RegisterWriteToken` grants for `peer`: signs each request under
+    /// `self.inner`, drops `self.inner` across the network RPC, then re-acquires `self.inner`,
+    /// validates `is_live(vgen)`, and removes the confirmed grant.
+    pub(super) async fn flush_pending_grants_for_peer(
+        &self,
+        peer: &PublicKey,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let mut guard = self.lock_inner().await;
         if !self.is_live(vgen) {
             return Ok(());
         }
-        let Some(inner) = guard.as_mut() else {
-            return Ok(());
+        let mut first_err: Option<String> = None;
+        let mut attempted: Vec<([u8; 32], u64)> = Vec::new();
+        loop {
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let next = {
+                let guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                let Some(inner) = guard.as_ref() else {
+                    return Ok(());
+                };
+                let Some(contact) = inner.contacts.iter().find(|c| c.peer == *peer) else {
+                    break;
+                };
+                let Some(grant) = contact
+                    .session
+                    .pending_register_grants()
+                    .iter()
+                    .find(|g| !attempted.contains(&(g.token_hash, g.grant_version)))
+                    .copied()
+                else {
+                    break;
+                };
+                match inner.client.sign_register_write_token_v2(
+                    &inner.audience,
+                    peer,
+                    &grant.token_hash,
+                    grant.grant_version,
+                    grant.pin_active,
+                ) {
+                    Ok(request) => (inner.server.clone(), grant, request),
+                    Err(e) => {
+                        if e.kind() == ErrorKind::ClockSkew {
+                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                        }
+                        first_err = Some(describe(&e));
+                        break;
+                    }
+                }
+            };
+            let (server, grant, request) = next;
+            attempted.push((grant.token_hash, grant.grant_version));
+            let rpc_res: session::Result<()> = Fetch::client(&server)
+                .register_write_token(request)
+                .await
+                .map(|_| ())
+                .map_err(session::Error::from);
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let remove = match rpc_res {
+                Ok(()) => true,
+                // Stale/superseded grant version (`grant_version <= revoked_below_version`) or
+                // terminal protocol refusal: drop the stale grant so later grants proceed.
+                Err(e)
+                    if e.is_server_refusal()
+                        && matches!(e.kind(), ErrorKind::Protocol | ErrorKind::LimitExceeded) =>
+                {
+                    true
+                }
+                Err(e) => {
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                    first_err = Some(describe(&e));
+                    break;
+                }
+            };
+            if remove {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                if let Some(inner) = guard.as_mut()
+                    && let Some(contact) = inner.contact(peer)
+                    && contact
+                        .session
+                        .remove_pending_grant(&grant.token_hash, grant.grant_version)
+                {
+                    let _ = inner.save_state().await;
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Flush staged `RegisterWriteToken` grants across all contacts without holding `self.inner`
+    /// across network RPCs.
+    pub(super) async fn flush_pending_grants(&self) -> Result<(), String> {
+        let vgen = self.vault_gen();
+        let peers: Vec<PublicKey> = {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_ref() else {
+                return Ok(());
+            };
+            inner
+                .contacts
+                .iter()
+                .filter(|c| !c.session.pending_register_grants().is_empty())
+                .map(|c| c.peer)
+                .collect()
         };
-        let peers: Vec<PublicKey> = inner
-            .contacts
-            .iter()
-            .filter(|c| !c.session.pending_register_grants().is_empty())
-            .map(|c| c.peer)
-            .collect();
         let mut first_err: Option<String> = None;
         for peer in peers {
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            if let Err(e) = self.flush_pending_grants_for(inner, &peer).await {
+            if let Err(e) = self.flush_pending_grants_for_peer(&peer).await {
                 first_err.get_or_insert(e);
             }
         }
@@ -223,53 +328,79 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    /// Flush durably staged `RevokeWriteToken` entries from `AppState.pending_revokes`.
+    /// Flush durably staged `RevokeWriteToken` entries from `AppState.pending_revokes` without
+    /// holding `self.inner` across network RPCs.
     pub(super) async fn flush_pending_revokes(&self) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let mut guard = self.lock_inner().await;
-        if !self.is_live(vgen) {
-            return Ok(());
-        }
-        let Some(inner) = guard.as_mut() else {
-            return Ok(());
-        };
-        let mailbox = Fetch::client(&inner.server);
-        while let Some(revoke) = inner.state.pending_revokes.first().cloned() {
+        loop {
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            let Ok(slot_id) = <[u8; 32]>::try_from(revoke.peer_slot_id.as_slice()) else {
-                inner.state.pending_revokes.remove(0);
-                let _ = inner.save_state().await;
-                continue;
-            };
-            match inner
-                .client
-                .revoke_write_token_v2(
-                    &mailbox,
+            let next = {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                let Some(inner) = guard.as_mut() else {
+                    return Ok(());
+                };
+                let Some(revoke) = inner.state.pending_revokes.first().cloned() else {
+                    return Ok(());
+                };
+                let Ok(slot_id) = <[u8; 32]>::try_from(revoke.peer_slot_id.as_slice()) else {
+                    inner.state.pending_revokes.remove(0);
+                    let _ = inner.save_state().await;
+                    continue;
+                };
+                match inner.client.sign_revoke_write_token_v2(
                     &inner.audience,
                     &slot_id,
                     None,
                     revoke.min_grant_version,
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => {
-                    if self.is_live(vgen) {
-                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                ) {
+                    Ok(request) => (inner.server.clone(), revoke, request),
+                    Err(e) => {
+                        if e.kind() == ErrorKind::ClockSkew {
+                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                        }
+                        return Err(describe(&e));
                     }
-                    return Err(describe(&e));
                 }
-            }
+            };
+            let (server, revoke, request) = next;
+            let rpc_res: session::Result<_> = Fetch::client(&server)
+                .revoke_write_token(request)
+                .await
+                .map_err(session::Error::from);
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            inner.state.pending_revokes.remove(0);
-            inner.save_state().await.map_err(|e| describe(&e))?;
+            match rpc_res {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                    return Err(describe(&e));
+                }
+            }
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(());
+            };
+            // Remove only if the entry still targets the same slot with `min_grant_version`
+            // covered by this RPC (if a subsequent delete bumped `min_grant_version`, keep it
+            // so the next iteration sends the higher floor).
+            if let Some(pos) = inner.state.pending_revokes.iter().position(|r| {
+                r.peer_slot_id == revoke.peer_slot_id
+                    && r.min_grant_version <= revoke.min_grant_version
+            }) {
+                inner.state.pending_revokes.remove(pos);
+                inner.save_state().await.map_err(|e| describe(&e))?;
+            }
         }
-        Ok(())
     }
 
     /// Whether the user is here: the page shown and in focus, or hidden for less than
@@ -741,27 +872,34 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Push the messages telling peers that their chats were deleted here, see
-    /// [`delete`](Self::delete).
+    /// [`delete`](Self::delete), releasing `self.inner` across each `PushV2` network RPC.
     pub(super) async fn say_farewells(&self) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let mut guard = self.lock_inner().await;
-        if !self.is_live(vgen) {
-            return Ok(());
-        }
-        let Some(inner) = guard.as_mut() else {
-            return Ok(());
-        };
-        let signs_in_here = same_server(&inner.server, &origin());
-        while let Some(farewell) = inner.state.farewells.first().cloned() {
+        loop {
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            let Some(v2_req) = farewell_push_v2_request(&farewell) else {
-                inner.state.farewells.remove(0);
-                inner.save_state().await.map_err(|e| describe(&e))?;
-                continue;
+            let next = {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                let Some(inner) = guard.as_mut() else {
+                    return Ok(());
+                };
+                let Some(farewell) = inner.state.farewells.first().cloned() else {
+                    return Ok(());
+                };
+                let Some(v2_req) = farewell_push_v2_request(&farewell) else {
+                    inner.state.farewells.remove(0);
+                    inner.save_state().await.map_err(|e| describe(&e))?;
+                    continue;
+                };
+                let signs_in_here = same_server(&inner.server, &origin());
+                (inner.server.clone(), signs_in_here, farewell, v2_req)
             };
-            let pushed: session::Result<()> = Fetch::client(&inner.server)
+            let (server, signs_in_here, farewell, v2_req) = next;
+            let pushed: session::Result<()> = Fetch::client(&server)
                 .push_v2(v2_req)
                 .await
                 .map(|_| ())
@@ -794,10 +932,23 @@ impl<V: VaultStore> Engine<V> {
                     return Err(describe(&e));
                 }
             }
-            inner.state.farewells.remove(0);
-            inner.save_state().await.map_err(|e| describe(&e))?;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(());
+            };
+            if let Some(pos) = inner
+                .state
+                .farewells
+                .iter()
+                .position(|f| f.push_v2 == farewell.push_v2)
+            {
+                inner.state.farewells.remove(pos);
+                inner.save_state().await.map_err(|e| describe(&e))?;
+            }
         }
-        Ok(())
     }
 
     pub(super) async fn peers(&self) -> Vec<PublicKey> {

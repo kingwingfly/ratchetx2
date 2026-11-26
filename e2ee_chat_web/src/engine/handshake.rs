@@ -2,9 +2,10 @@
 
 use super::contact::{Contact, DisplayedEntry, FarewellMode, forget_told};
 use super::{
-    Engine, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS, ProtocolRpcScope,
-    REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS, SERVER_MAX_PQ_ONE_TIME_PREKEYS,
-    StartChatError, VaultStore, origin, records, same_server, should_require_update_for_rpc,
+    Engine, Inner, InnerGuard, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS,
+    ProtocolRpcScope, REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS,
+    SERVER_MAX_PQ_ONE_TIME_PREKEYS, StartChatError, VaultStore, origin, records, same_server,
+    should_require_update_for_rpc,
 };
 use crate::content::{Content, Deleted, Events, Kind, stamp};
 use crate::state::{Delivery, MessageView, ServerPqStatus};
@@ -18,7 +19,7 @@ use crate::vault::{
 };
 use leptos::prelude::*;
 use prost::Message as _;
-use session::protocol::handshake_v2::InitialMessageV2 as WireInitial;
+use session::protocol::handshake_v2::{InitialMessageV2 as WireInitial, LocalHandshakeV2};
 use session::{
     AcceptedInitial, ErrorKind, InitialMessageKind, InitialMessageV2, ListedInitialMessages,
     PeerPqState, PqSuite, PublicKey, PublishV2Outcome, Session,
@@ -694,18 +695,31 @@ impl<V: VaultStore> Engine<V> {
                 }
                 all_upgrades.extend(upgrades);
                 inbox_peers.extend(touched_peers);
-                for peer in grant_peers {
+                if !grant_peers.is_empty() {
+                    drop(guard);
+                    for peer in grant_peers {
+                        if !self.is_live(vgen) {
+                            return Ok((false, BTreeSet::new()));
+                        }
+                        let _ = self.flush_pending_grants_for_peer(&peer).await;
+                    }
                     if !self.is_live(vgen) {
                         return Ok((false, BTreeSet::new()));
                     }
-                    let _ = self.flush_pending_grants_for(inner, &peer).await;
+                    let mut ack_guard = self.lock_inner().await;
+                    if !self.is_live(vgen) {
+                        return Ok((false, BTreeSet::new()));
+                    }
+                    if let Some(inner) = ack_guard.as_mut() {
+                        self.ack_pending_inbox_v2(inner).await?;
+                    }
+                } else {
+                    self.ack_pending_inbox_v2(inner).await?;
+                    drop(guard);
                 }
-                if !self.is_live(vgen) {
-                    return Ok((false, BTreeSet::new()));
-                }
-                self.ack_pending_inbox_v2(inner).await?;
+            } else {
+                drop(guard);
             }
-            drop(guard);
             if !has_more {
                 break;
             }
@@ -1602,45 +1616,64 @@ impl<V: VaultStore> Engine<V> {
         Ok(())
     }
 
-    /// Start a chat with `key`, named `name`, greeting the peer; or open the chat if there is one.
-    ///
-    /// When `pin_pq` is `true` (e.g. from a `#chat=...&pq=1` invitation link), pins the peer as
-    /// post-quantum capable BEFORE the first `ClaimBundle` so server stripping hard-fails.
-    /// When `allow_classical` is `true`, records an explicit user-approved classical fallback.
-    /// Always persists the newly established session to IndexedDB BEFORE transmitting (H-2).
-    pub async fn start_chat(
+    /// Map a `session::Error` from `claim_peer_bundle_v2` or `finish_prepare_initiate_v2` into
+    /// [`StartChatError`], checking `is_live(vgen)` before touching UI signals or cancellation.
+    fn map_start_chat_session_error(
         &self,
+        vgen: u64,
         submission_id: u64,
-        key: &str,
+        signs_in_here: bool,
+        clock: &session::ServerClock,
+        error: session::Error,
+    ) -> StartChatError {
+        if !self.is_live(vgen) {
+            return StartChatError::Cancelled;
+        }
+        self.check_protocol_error(ProtocolRpcScope::CoreV2, &error);
+        if self.is_submission_cancelled(submission_id) {
+            return StartChatError::Cancelled;
+        }
+        match error.kind() {
+            ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
+            ErrorKind::SignInRequired => {
+                StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
+            }
+            ErrorKind::ClassicalApprovalRequired => StartChatError::ClassicalApprovalRequired,
+            ErrorKind::DowngradeDetected => StartChatError::DowngradeDetected,
+            ErrorKind::PeerManifestExpired => StartChatError::PeerManifestExpired,
+            ErrorKind::PqRequired => StartChatError::PqRequired,
+            ErrorKind::ClockSkew => {
+                self.warn_clock_skew(clock.offset_ms());
+                StartChatError::Other(super::CLOCK_SKEW_MESSAGE.to_string())
+            }
+            ErrorKind::NotFound => StartChatError::Other(
+                "nobody published keys for that key on this server".to_string(),
+            ),
+            _ => StartChatError::Other(describe(&error)),
+        }
+    }
+
+    /// Complete [`Engine::start_chat`] when `peer` already exists in `inner.contacts` (either on
+    /// entry or because an inbound initial arrived while `ClaimBundle` was suspended). Releases
+    /// `guard` across `RegisterWriteToken` and `flush`.
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_existing_contact_start_chat(
+        &self,
+        mut guard: InnerGuard<'_, V>,
+        vgen: u64,
+        submission_id: u64,
+        peer: PublicKey,
         name: String,
-        server: Option<&str>,
         pin_pq: bool,
         allow_classical: bool,
     ) -> Result<PublicKey, StartChatError> {
-        let vgen = self.vault_gen();
-        if !self.is_live(vgen) {
-            return Err(StartChatError::Cancelled);
-        }
-        let peer = key_from_text(key)
-            .ok_or_else(|| StartChatError::Other("that is not an identity key".into()))?;
-        let name = name.trim().to_string();
-        let mut guard = self.lock_inner().await;
-        if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
-            return Err(StartChatError::Cancelled);
-        }
-        let inner = guard
-            .as_mut()
-            .ok_or_else(|| StartChatError::Other("locked".into()))?;
-        // Validate any invitation relay URL BEFORE any contact lookup or mutation so a foreign
-        // invitation can never rename, accept, or mutate an existing local contact.
-        validate_start_chat_server(server, &inner.server)?;
-        inner.check_outgoing_peer(&peer)?;
-        if allow_classical
-            && super::settings::check_classical_approval(inner.client.pq_config()).is_err()
-        {
-            return Err(StartChatError::PqRequired);
-        }
-        if let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) {
+        let accepted_now = {
+            let inner = guard
+                .as_mut()
+                .ok_or_else(|| StartChatError::Other("locked".into()))?;
+            let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
+                return Err(StartChatError::Cancelled);
+            };
             let snapshot = inner.contacts[index].snapshot();
             let was_request = inner.contacts[index].state.request;
             let quarantined = inner.contacts[index].state.quarantined;
@@ -1722,27 +1755,102 @@ impl<V: VaultStore> Engine<V> {
                 self.ui.contacts.set(inner.views());
                 return Err(StartChatError::Cancelled);
             }
-            if accepted_now {
-                let _ = self.flush_pending_grants_for(inner, &peer).await;
-                if !self.is_live(vgen) {
-                    return Err(StartChatError::Cancelled);
-                }
-                let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
-            }
+            self.ui.contacts.set(inner.views());
+            accepted_now
+        };
+        drop(guard);
+        if accepted_now {
+            let _ = self.flush_pending_grants_for_peer(&peer).await;
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
-            self.ui.contacts.set(inner.views());
-            drop(guard);
-            if accepted_now {
-                let _ = self.flush(&peer).await;
+            {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Err(StartChatError::Cancelled);
+                }
+                if let Some(inner) = guard.as_mut() {
+                    let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+                    if !self.is_live(vgen) {
+                        return Err(StartChatError::Cancelled);
+                    }
+                    self.ui.contacts.set(inner.views());
+                }
+            }
+            let _ = self.flush(&peer).await;
+            if self.is_live(vgen) {
                 self.wake();
             }
-            return Ok(peer);
+        }
+        Ok(peer)
+    }
+
+    /// Start a chat with `key`, named `name`, greeting the peer; or open the chat if there is one.
+    ///
+    /// When `pin_pq` is `true` (e.g. from a `#chat=...&pq=1` invitation link), pins the peer as
+    /// post-quantum capable BEFORE the first `ClaimBundle` so server stripping hard-fails.
+    /// When `allow_classical` is `true`, records an explicit user-approved classical fallback.
+    /// Releases `Engine::inner` across `ClaimBundle`, `RegisterWriteToken`, and `SendInitialV2`
+    /// network RPCs while always persisting the newly established session to IndexedDB BEFORE
+    /// transmitting (H-2).
+    pub async fn start_chat(
+        &self,
+        submission_id: u64,
+        key: &str,
+        name: String,
+        server: Option<&str>,
+        pin_pq: bool,
+        allow_classical: bool,
+    ) -> Result<PublicKey, StartChatError> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Err(StartChatError::Cancelled);
+        }
+        let peer = key_from_text(key)
+            .ok_or_else(|| StartChatError::Other("that is not an identity key".into()))?;
+        let name = name.trim().to_string();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
+            return Err(StartChatError::Cancelled);
+        }
+        {
+            let inner = guard
+                .as_mut()
+                .ok_or_else(|| StartChatError::Other("locked".into()))?;
+            // Validate any invitation relay URL BEFORE any contact lookup or mutation so a foreign
+            // invitation can never rename, accept, or mutate an existing local contact.
+            validate_start_chat_server(server, &inner.server)?;
+            inner.check_outgoing_peer(&peer)?;
+            if allow_classical
+                && super::settings::check_classical_approval(inner.client.pq_config()).is_err()
+            {
+                return Err(StartChatError::PqRequired);
+            }
+            if inner.contacts.iter().any(|c| c.peer == peer) {
+                return self
+                    .finish_existing_contact_start_chat(
+                        guard,
+                        vgen,
+                        submission_id,
+                        peer,
+                        name,
+                        pin_pq,
+                        allow_classical,
+                    )
+                    .await;
+            }
         }
 
         self.in_flight_start_chat.set(Some((submission_id, false)));
-        let _in_flight = scopeguard::guard((), |()| self.in_flight_start_chat.set(None));
+        let _in_flight = scopeguard::guard((), |()| {
+            if self
+                .in_flight_start_chat
+                .get()
+                .is_some_and(|(id, _)| id == submission_id)
+            {
+                self.in_flight_start_chat.set(None);
+            }
+        });
 
         let mut peer_state = PeerPqState::default();
         if pin_pq {
@@ -1752,191 +1860,259 @@ impl<V: VaultStore> Engine<V> {
             peer_state.approve_classical_exception();
         }
 
-        let initial_session_seq = inner.next_new_chat_session_seq();
-        let hello = Kind::Hello(
-            inner
-                .client
-                .make_hello(inner.state.name.clone(), initial_session_seq),
-        );
-        // The chat's first message, at its first place.
-        let mut greeting = hello.to_bytes();
-        stamp(&mut greeting, 1);
-        let signs_in_here = same_server(&inner.server, &origin());
+        // Phase 1: Lock-free `ClaimBundle` (retrying cleanly if PQ settings change mid-flight).
+        const MAX_PQ_CONFIG_RETRIES: usize = 2;
+        let (mut guard, claimed, server_url, clock, signs_in_here) = {
+            let mut attempt = 0usize;
+            loop {
+                let (server_url, audience, pq_config, clock, signs_in_here) = {
+                    let inner = guard
+                        .as_ref()
+                        .ok_or_else(|| StartChatError::Other("locked".into()))?;
+                    let server_url = inner.server.clone();
+                    let audience = inner.audience.clone();
+                    let pq_config = inner.client.pq_config().clone();
+                    let clock = inner.client.clock().clone();
+                    let signs_in_here = same_server(&server_url, &origin());
+                    (server_url, audience, pq_config, clock, signs_in_here)
+                };
+                drop(guard);
 
-        let prepared = inner
-            .client
-            .prepare_initiate_v2(
-                &inner.audience,
-                &peer,
-                &peer_state,
-                &greeting,
-                Fetch::client(&inner.server),
-            )
-            .await
-            .map_err(|e| {
+                let claimed = session::claim_peer_bundle_v2(
+                    &Fetch::client(&server_url),
+                    &audience,
+                    &peer,
+                    &peer_state,
+                    &pq_config,
+                    &clock,
+                )
+                .await
+                .map_err(|e| {
+                    self.map_start_chat_session_error(vgen, submission_id, signs_in_here, &clock, e)
+                })?;
+
                 if !self.is_live(vgen) {
-                    return StartChatError::Cancelled;
+                    return Err(StartChatError::Cancelled);
                 }
-                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-                if self.is_submission_cancelled(submission_id) {
-                    return StartChatError::Cancelled;
+                guard = self.lock_inner().await;
+                // Check `is_live(vgen)` BEFORE `is_submission_cancelled` / any UI writes per PR 29.2.
+                if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
+                    return Err(StartChatError::Cancelled);
                 }
-                match e.kind() {
-                    ErrorKind::SignInRequired if signs_in_here => StartChatError::SignInRequired,
-                    ErrorKind::SignInRequired => {
-                        StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
+                {
+                    let inner = guard
+                        .as_mut()
+                        .ok_or_else(|| StartChatError::Other("locked".into()))?;
+                    inner.check_outgoing_peer(&peer)?;
+                    if inner.contacts.iter().any(|c| c.peer == peer) {
+                        // Peer arrived via an inbound initial while `ClaimBundle` was suspended:
+                        // discard the stale bundle cleanly without corrupting the inbound ratchet!
+                        drop(claimed);
+                        if allow_classical
+                            && super::settings::check_classical_approval(inner.client.pq_config())
+                                .is_err()
+                        {
+                            return Err(StartChatError::PqRequired);
+                        }
+                        return self
+                            .finish_existing_contact_start_chat(
+                                guard,
+                                vgen,
+                                submission_id,
+                                peer,
+                                name,
+                                pin_pq,
+                                allow_classical,
+                            )
+                            .await;
                     }
-                    ErrorKind::ClassicalApprovalRequired => {
-                        StartChatError::ClassicalApprovalRequired
+                    if *inner.client.pq_config() != pq_config {
+                        // User changed PQ settings mid-flight: discard the stale bundle, re-check
+                        // classical approval policy, and re-claim under the updated config.
+                        drop(claimed);
+                        if allow_classical
+                            && super::settings::check_classical_approval(inner.client.pq_config())
+                                .is_err()
+                        {
+                            return Err(StartChatError::PqRequired);
+                        }
+                        if attempt < MAX_PQ_CONFIG_RETRIES {
+                            attempt += 1;
+                            continue;
+                        }
+                        return Err(StartChatError::Other(
+                            "Post-quantum settings changed while starting this chat. Try again."
+                                .to_string(),
+                        ));
                     }
-                    ErrorKind::DowngradeDetected => StartChatError::DowngradeDetected,
-                    ErrorKind::PeerManifestExpired => StartChatError::PeerManifestExpired,
-                    ErrorKind::PqRequired => StartChatError::PqRequired,
-                    ErrorKind::ClockSkew => {
-                        self.warn_clock_skew(inner.client.clock().offset_ms());
-                        StartChatError::Other(super::CLOCK_SKEW_MESSAGE.to_string())
-                    }
-                    ErrorKind::NotFound => StartChatError::Other(
-                        "nobody published keys for that key on this server".to_string(),
-                    ),
-                    _ => StartChatError::Other(describe(&e)),
                 }
-            })?;
-        // If the user dismissed or backed out of NewChat/SignIn while prekeys were fetching,
-        // abort before persisting the new contact or transmitting a greeting.
-        if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
-            return Err(StartChatError::Cancelled);
-        }
-        let (mut session, outgoing_request) = (prepared.session, prepared.request);
-        // Stage write-token registration `H(t_{peer->me})` on Alice's DO before persisting so Bob
-        // can reply immediately upon accepting Alice's chat request.
-        if let Some(token_hash) = session.active_inbound_token_hash() {
-            let grant_version = inner
-                .client
-                .allocate_grant_version()
-                .map_err(|e| StartChatError::Other(describe(&e)))?;
-            session
-                .queue_pending_grant(session::PendingGrant {
-                    token_hash,
-                    grant_version,
-                    pin_active: true,
-                })
-                .map_err(|e| StartChatError::Other(describe(&e)))?;
-        }
-
-        // Retain any previously queued deletion farewells for `peer` on the recreated contact
-        // until the replacement greeting is confirmed delivered: `say_farewells` will not send
-        // them prematurely while the recreated chat is active, yet deleting the chat before the
-        // replacement greeting succeeds still restores them so the peer learns of the original
-        // deletion.
-        let saved_farewells = inner.state.farewells.clone();
-        let mut retained_farewells = Vec::new();
-        inner.state.farewells.retain(|farewell| {
-            if farewell.recipient().as_deref() == Some(peer.as_slice()) {
-                retained_farewells.push(farewell.clone());
-                false
-            } else {
-                true
+                break (guard, claimed, server_url, clock, signs_in_here);
             }
-        });
-        let entry = HistoryEntry {
-            outgoing: true,
-            at: now(),
-            content: Some(Content {
-                clock: 1,
-                kind: Some(hello),
-                events: None,
-            }),
-            delivery: Delivery::Sent.into(),
-            place: 1,
-            ..HistoryEntry::default()
         };
-        let last_message = Some(super::contact::preview_for_entry(&entry));
-        inner.contacts.push(Contact {
-            peer,
-            session,
-            deferred_carried: 0,
-            state: ContactState {
-                peer: peer.to_vec(),
-                name,
-                history_len: 1,
-                last_activity: now(),
-                last_message,
-                clock: 1,
-                greeting_delivery: GREETING_DELIVERY_UNSENT,
-                acked_ranges: vec![IndexRange { start: 0, end: 1 }],
-                fallback_farewells: retained_farewells,
-                ..ContactState::default()
-            },
-        });
-        let prev_next_session_seq = inner.state.next_session_seq;
-        inner.state.next_session_seq = initial_session_seq
-            .saturating_add(1)
-            .min(session::protocol::MAX_SAFE_INTEGER);
-        let record = (peer, 0, entry);
-        // H-2: Persist the newly created session BEFORE transmitting the initial message!
-        if let Err(e) = inner.save(std::slice::from_ref(&record)).await {
-            inner.contacts.pop();
-            inner.state.farewells = saved_farewells;
-            inner.state.next_session_seq = prev_next_session_seq;
+
+        // Phase 2: Synchronous handshake completion and H-2 durable persistence under `self.inner`.
+        let (created_session_id, outgoing_request, retained_farewells, ready_to_send) = {
+            let inner = guard
+                .as_mut()
+                .ok_or_else(|| StartChatError::Other("locked".into()))?;
+            let initial_session_seq = inner.next_new_chat_session_seq();
+            let hello = Kind::Hello(
+                inner
+                    .client
+                    .make_hello(inner.state.name.clone(), initial_session_seq),
+            );
+            // The chat's first message, at its first place.
+            let mut greeting = hello.to_bytes();
+            stamp(&mut greeting, 1);
+
+            let prepared = inner
+                .client
+                .finish_prepare_initiate_v2(
+                    claimed,
+                    &peer_state,
+                    &greeting,
+                    Fetch::client(&inner.server),
+                )
+                .map_err(|e| {
+                    self.map_start_chat_session_error(vgen, submission_id, signs_in_here, &clock, e)
+                })?;
+
+            let (mut session, outgoing_request) = (prepared.session, prepared.request);
+            let created_session_id = session.active_id().copied();
+            // Stage write-token registration `H(t_{peer->me})` on Alice's DO before persisting so
+            // Bob can reply immediately upon accepting Alice's chat request.
+            if let Some(token_hash) = session.active_inbound_token_hash() {
+                let grant_version = inner
+                    .client
+                    .allocate_grant_version()
+                    .map_err(|e| StartChatError::Other(describe(&e)))?;
+                session
+                    .queue_pending_grant(session::PendingGrant {
+                        token_hash,
+                        grant_version,
+                        pin_active: true,
+                    })
+                    .map_err(|e| StartChatError::Other(describe(&e)))?;
+            }
+
+            // Retain any previously queued deletion farewells for `peer` on the recreated contact
+            // until the replacement greeting is confirmed delivered: `say_farewells` will not send
+            // them prematurely while the recreated chat is active, yet deleting the chat before the
+            // replacement greeting succeeds still restores them so the peer learns of the original
+            // deletion.
+            let saved_farewells = inner.state.farewells.clone();
+            let mut retained_farewells = Vec::new();
+            inner.state.farewells.retain(|farewell| {
+                if farewell.recipient().as_deref() == Some(peer.as_slice()) {
+                    retained_farewells.push(farewell.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let entry = HistoryEntry {
+                outgoing: true,
+                at: now(),
+                content: Some(Content {
+                    clock: 1,
+                    kind: Some(hello),
+                    events: None,
+                }),
+                delivery: Delivery::Sent.into(),
+                place: 1,
+                ..HistoryEntry::default()
+            };
+            let last_message = Some(super::contact::preview_for_entry(&entry));
+            inner.contacts.push(Contact {
+                peer,
+                session,
+                deferred_carried: 0,
+                state: ContactState {
+                    peer: peer.to_vec(),
+                    name,
+                    history_len: 1,
+                    last_activity: now(),
+                    last_message,
+                    clock: 1,
+                    greeting_delivery: GREETING_DELIVERY_UNSENT,
+                    acked_ranges: vec![IndexRange { start: 0, end: 1 }],
+                    fallback_farewells: retained_farewells.clone(),
+                    ..ContactState::default()
+                },
+            });
+            let prev_next_session_seq = inner.state.next_session_seq;
+            inner.state.next_session_seq = initial_session_seq
+                .saturating_add(1)
+                .min(session::protocol::MAX_SAFE_INTEGER);
+            let record = (peer, 0, entry);
+            // H-2: Persist the newly created session BEFORE transmitting the initial message!
+            if let Err(e) = inner.save(std::slice::from_ref(&record)).await {
+                inner.contacts.pop();
+                inner.state.farewells = saved_farewells;
+                inner.state.next_session_seq = prev_next_session_seq;
+                if !self.is_live(vgen) {
+                    return Err(StartChatError::Cancelled);
+                }
+                return Err(StartChatError::Other(describe(&e)));
+            }
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
-            return Err(StartChatError::Other(describe(&e)));
-        }
-        if !self.is_live(vgen) {
-            return Err(StartChatError::Cancelled);
-        }
-        // Recheck cancellation after IndexedDB persistence: roll back the never-announced contact
-        // locally so it neither lingers nor transmits a carried greeting on deletion.
-        if self.is_submission_cancelled(submission_id) {
-            self.sign_in_flow
-                .borrow_mut()
-                .end_new_chat_submit(submission_id);
-            self.rollback_cancelled_start_chat(inner, &peer, saved_farewells, false)
-                .await;
-            return Err(StartChatError::Cancelled);
-        }
+            // Recheck cancellation after IndexedDB persistence: roll back the never-announced
+            // contact locally so it neither lingers nor transmits a carried greeting on deletion.
+            if self.is_submission_cancelled(submission_id) {
+                self.sign_in_flow
+                    .borrow_mut()
+                    .end_new_chat_submit(submission_id);
+                self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, false)
+                    .await;
+                return Err(StartChatError::Cancelled);
+            }
 
-        // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE transmitting so that a lost response or
-        // post-success save failure still notifies an established peer on deletion without
-        // carrying an unconfirmed greeting. Do NOT transmit unless this durable marker persists,
-        // and recheck cancellation immediately after the final await before issuing the RPC.
-        let mut ready_to_send = true;
-        if let Some(contact) = inner.contact(&peer) {
-            contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-        }
-        if let Err(e) = inner.save(&[]).await {
-            ready_to_send = false;
+            // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE transmitting so that a lost response or
+            // post-success save failure still notifies an established peer on deletion without
+            // carrying an unconfirmed greeting. Do NOT transmit unless this durable marker
+            // persists, and recheck cancellation immediately after the final await before issuing
+            // the RPC.
+            let mut ready_to_send = true;
             if let Some(contact) = inner.contact(&peer) {
-                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+            }
+            if let Err(e) = inner.save(&[]).await {
+                ready_to_send = false;
+                if let Some(contact) = inner.contact(&peer) {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                }
+                if !self.is_live(vgen) {
+                    return Err(StartChatError::Cancelled);
+                }
+                self.ui.log(format!(
+                    "saved chat with {}, but could not prepare its initial greeting yet (it will carry on the first message): {}",
+                    short(&peer),
+                    describe(&e)
+                ));
             }
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
-            self.ui.log(format!(
-                "saved chat with {}, but could not prepare its initial greeting yet (it will carry on the first message): {}",
-                short(&peer),
-                describe(&e)
-            ));
-        }
-        if !self.is_live(vgen) {
-            return Err(StartChatError::Cancelled);
-        }
-        if self.is_submission_cancelled(submission_id) {
-            self.sign_in_flow
-                .borrow_mut()
-                .end_new_chat_submit(submission_id);
-            self.rollback_cancelled_start_chat(inner, &peer, saved_farewells, ready_to_send)
+            if self.is_submission_cancelled(submission_id) {
+                self.sign_in_flow
+                    .borrow_mut()
+                    .end_new_chat_submit(submission_id);
+                self.rollback_cancelled_start_chat(
+                    inner,
+                    &peer,
+                    &retained_farewells,
+                    ready_to_send,
+                )
                 .await;
-            return Err(StartChatError::Cancelled);
-        }
+                return Err(StartChatError::Cancelled);
+            }
 
-        // Register Alice's inbound write token on Alice's DO BEFORE transmitting SendInitialV2 so
-        // Bob's immediate reply upon accepting is authorized. Ensure our own manifest is published
-        // first if this brand-new vault hasn't published yet.
-        if ready_to_send {
-            if (inner.state.published_at == 0 || inner.client.manifest_seq() == 0)
+            // Ensure our own manifest is published first if this brand-new vault hasn't published
+            // yet, so `RegisterWriteToken` succeeds on our DO.
+            if ready_to_send
+                && (inner.state.published_at == 0 || inner.client.manifest_seq() == 0)
                 && !self.publish_waits_sign_in.get()
                 && !self.publish_waits_settings.get()
             {
@@ -1945,91 +2121,193 @@ impl<V: VaultStore> Engine<V> {
                     return Err(StartChatError::Cancelled);
                 }
             }
-            let _ = self.flush_pending_grants_for(inner, &peer).await;
-            if !self.is_live(vgen) {
-                return Err(StartChatError::Cancelled);
-            }
-        }
-        // The chat is now durably persisted; mark `in_flight_start_chat` as greeting-only so a
-        // 403 transport hook clears auto-start ownership immediately instead of handing a stale
-        // reservation to `SignInDialog`.
-        self.in_flight_start_chat.set(Some((submission_id, true)));
-        if !ready_to_send {
-            self.sign_in_flow
-                .borrow_mut()
-                .end_new_chat_submit(submission_id);
-        } else if let Err(e) = inner
-            .client
-            .send_prepared_initiate_v2(&outgoing_request)
-            .await
-        {
-            if !self.is_live(vgen) {
-                return Err(StartChatError::Cancelled);
-            }
-            // Clear auto-start ownership BEFORE any await (`save_state`) so `SignInDialog`
-            // cannot claim this submission's history reservation while IndexedDB persists.
-            if e.kind() == ErrorKind::SignInRequired
-                && signs_in_here
-                && !self.is_submission_cancelled(submission_id)
-            {
-                let dialog = self
-                    .sign_in_flow
-                    .borrow_mut()
-                    .on_chat_created_greeting_needs_sign_in(submission_id);
-                self.show_dialog_if_changed(dialog);
-            } else {
+
+            // The chat is now durably persisted; mark `in_flight_start_chat` as greeting-only so a
+            // 403 transport hook clears auto-start ownership immediately instead of handing a stale
+            // reservation to `SignInDialog`.
+            self.in_flight_start_chat.set(Some((submission_id, true)));
+            if !ready_to_send {
                 self.sign_in_flow
                     .borrow_mut()
                     .end_new_chat_submit(submission_id);
+                self.ui.contacts.set(inner.views());
             }
-            if e.is_server_refusal() {
-                if let Some(contact) = inner.contact(&peer) {
-                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                }
-                let _ = inner.save_state().await;
-                if !self.is_live(vgen) {
-                    return Err(StartChatError::Cancelled);
-                }
-            }
-            let outgoing_is_pq = outgoing_request
-                .message
-                .as_ref()
-                .is_some_and(|m| m.version >= 2);
-            if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !outgoing_is_pq {
-                self.require_update(describe(&e));
-            }
-            self.ui.log(format!(
-                "saved chat with {}, but could not send its initial greeting yet (it will carry on the first message): {}",
-                short(&peer),
-                describe(&e)
-            ));
-        } else {
-            if !self.is_live(vgen) {
-                return Err(StartChatError::Cancelled);
-            }
+            (
+                created_session_id,
+                outgoing_request,
+                retained_farewells,
+                ready_to_send,
+            )
+        };
+        drop(guard);
+
+        if !ready_to_send {
+            self.wake();
+            return Ok(peer);
+        }
+
+        // Phase 3: Lock-free `RegisterWriteToken` and `SendInitialV2` network RPCs.
+        let _ = self.flush_pending_grants_for_peer(&peer).await;
+        if !self.is_live(vgen) {
+            return Err(StartChatError::Cancelled);
+        }
+        // If cancelled while `RegisterWriteToken` was in flight (before `SendInitialV2` left),
+        // roll back the never-announced contact cleanly if it still matches our created session.
+        if self.is_submission_cancelled(submission_id) {
             self.sign_in_flow
                 .borrow_mut()
                 .end_new_chat_submit(submission_id);
-            if let Some(contact) = inner.contact(&peer) {
-                contact.mark_greeting_confirmed();
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err(StartChatError::Cancelled);
             }
-            let _ = inner.save_state().await;
+            if let Some(inner) = guard.as_mut()
+                && inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer)
+                    .is_some_and(|c| {
+                        c.session.active_id() == created_session_id.as_ref()
+                            && c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
+                            && c.state.history_len == 1
+                    })
+            {
+                self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true)
+                    .await;
+            }
+            return Err(StartChatError::Cancelled);
+        }
+
+        let send_res: session::Result<()> = Fetch::client(&server_url)
+            .send_initial_v2(outgoing_request.clone())
+            .await
+            .map(|_| ())
+            .map_err(session::Error::from);
+        if !self.is_live(vgen) {
+            return Err(StartChatError::Cancelled);
+        }
+
+        // Phase 4: Re-acquire `self.inner`, validate `is_live(vgen)`, contact still exists, and
+        // `active_id` still matches `created_session_id` before persisting confirmation or
+        // rolling back on refusal/cancellation.
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err(StartChatError::Cancelled);
+        }
+        let Some(inner) = guard.as_mut() else {
+            return Err(StartChatError::Cancelled);
+        };
+        let contact_exists = inner.contacts.iter().any(|c| c.peer == peer);
+        let matches_session = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == peer)
+            .is_some_and(|c| c.session.active_id() == created_session_id.as_ref());
+
+        match send_res {
+            Err(e) => {
+                if !contact_exists {
+                    self.sign_in_flow
+                        .borrow_mut()
+                        .end_new_chat_submit(submission_id);
+                    return Err(StartChatError::Cancelled);
+                }
+                // Clear auto-start ownership BEFORE any await (`save_state`) so `SignInDialog`
+                // cannot claim this submission's history reservation while IndexedDB persists.
+                if e.kind() == ErrorKind::SignInRequired
+                    && signs_in_here
+                    && !self.is_submission_cancelled(submission_id)
+                {
+                    let dialog = self
+                        .sign_in_flow
+                        .borrow_mut()
+                        .on_chat_created_greeting_needs_sign_in(submission_id);
+                    self.show_dialog_if_changed(dialog);
+                } else {
+                    self.sign_in_flow
+                        .borrow_mut()
+                        .end_new_chat_submit(submission_id);
+                }
+                if e.is_server_refusal() && matches_session {
+                    if self.is_submission_cancelled(submission_id)
+                        && inner
+                            .contacts
+                            .iter()
+                            .find(|c| c.peer == peer)
+                            .is_some_and(|c| {
+                                c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
+                                    && c.state.history_len == 1
+                            })
+                    {
+                        self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true)
+                            .await;
+                        return Err(StartChatError::Cancelled);
+                    }
+                    // Only revert `UNCERTAIN -> UNSENT`; never downgrade a greeting already
+                    // confirmed concurrently on this session.
+                    let reverted = inner.contact(&peer).is_some_and(|contact| {
+                        if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                            contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if reverted {
+                        let _ = inner.save_state().await;
+                        if !self.is_live(vgen) {
+                            return Err(StartChatError::Cancelled);
+                        }
+                    }
+                }
+                let outgoing_is_pq = outgoing_request
+                    .message
+                    .as_ref()
+                    .is_some_and(|m| m.version >= 2);
+                if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !outgoing_is_pq {
+                    self.require_update(describe(&e));
+                }
+                self.ui.log(format!(
+                    "saved chat with {}, but could not send its initial greeting yet (it will carry on the first message): {}",
+                    short(&peer),
+                    describe(&e)
+                ));
+            }
+            Ok(()) => {
+                self.sign_in_flow
+                    .borrow_mut()
+                    .end_new_chat_submit(submission_id);
+                if !contact_exists {
+                    return Err(StartChatError::Cancelled);
+                }
+                if matches_session {
+                    if let Some(contact) = inner.contact(&peer) {
+                        contact.mark_greeting_confirmed();
+                    }
+                    let _ = inner.save_state().await;
+                    if !self.is_live(vgen) {
+                        return Err(StartChatError::Cancelled);
+                    }
+                }
+            }
         }
         if !self.is_live(vgen) {
             return Err(StartChatError::Cancelled);
         }
         self.ui.contacts.set(inner.views());
+        drop(guard);
         self.wake();
         Ok(peer)
     }
 
-    /// Roll back a newly saved but never-transmitted chat after cancellation, retrying once on a
-    /// transient storage failure and warning the user if the draft chat could not be removed.
+    /// Roll back a newly saved but never-transmitted chat after cancellation, restoring only
+    /// `retained_farewells` into live `AppState.farewells` so concurrent deletes/deliveries for
+    /// other peers are never clobbered.
     async fn rollback_cancelled_start_chat(
         &self,
         inner: &mut Inner<V>,
         peer: &PublicKey,
-        saved_farewells: Vec<Farewell>,
+        retained_farewells: &[Farewell],
         uncertain_persisted: bool,
     ) {
         if let Some(contact) = inner.contact(peer) {
@@ -2042,7 +2320,15 @@ impl<V: VaultStore> Engine<V> {
             }
             let mut state = inner.app_state();
             state.contacts.retain(|contact| contact.peer != *peer);
-            state.farewells = saved_farewells.clone();
+            for farewell in retained_farewells {
+                if !state
+                    .farewells
+                    .iter()
+                    .any(|existing| existing.push_v2 == farewell.push_v2)
+                {
+                    state.farewells.push(farewell.clone());
+                }
+            }
             let deferred = inner.deferred_record();
             match inner.forget_peer(peer, state, deferred).await {
                 Ok(()) => {

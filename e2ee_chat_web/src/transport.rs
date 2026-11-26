@@ -157,7 +157,11 @@ enum XhrOutcome {
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
-type MockPostHandler = Box<dyn FnMut(&str, &str, Vec<u8>) -> protocol::Result<(u16, Vec<u8>)>>;
+type MockPostFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = protocol::Result<(u16, Vec<u8>)>>>>;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+type MockPostHandler = Box<dyn FnMut(&str, &str, Vec<u8>) -> MockPostFuture>;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 thread_local! {
@@ -184,9 +188,34 @@ impl Drop for MockFetchGuard {
 /// Any previous responder is restored automatically when the returned guard is dropped.
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub fn mock_fetch(
-    handler: impl FnMut(&str, &str, Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> + 'static,
+    mut handler: impl FnMut(&str, &str, Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> + 'static,
 ) -> MockFetchGuard {
-    let previous = MOCK_POST.with(|slot| slot.borrow_mut().replace(Box::new(handler)));
+    let previous = MOCK_POST.with(|slot| {
+        slot.borrow_mut()
+            .replace(Box::new(move |server, path, body| {
+                let res = handler(server, path, body);
+                Box::pin(std::future::ready(res))
+            }))
+    });
+    MockFetchGuard { previous }
+}
+
+/// Install an async thread-local mock responder for `impl LocalPost for Fetch` in native tests,
+/// releasing the `MOCK_POST` borrow before awaiting the returned future so concurrent RPCs can
+/// progress while specific calls are deterministically suspended on a channel.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub fn mock_fetch_async<F>(
+    mut handler: impl FnMut(String, String, Vec<u8>) -> F + 'static,
+) -> MockFetchGuard
+where
+    F: std::future::Future<Output = protocol::Result<(u16, Vec<u8>)>> + 'static,
+{
+    let previous = MOCK_POST.with(|slot| {
+        slot.borrow_mut()
+            .replace(Box::new(move |server, path, body| {
+                Box::pin(handler(server.to_string(), path.to_string(), body))
+            }))
+    });
     MockFetchGuard { previous }
 }
 
@@ -198,16 +227,17 @@ impl LocalPost for Fetch {
                 let len = body.len() as u64;
                 progress(len, len);
             }
-            let (status, resp_body) = MOCK_POST.with(|slot| {
+            let fut = MOCK_POST.with(|slot| {
                 let mut handler = slot.borrow_mut();
                 match handler.as_mut() {
                     Some(respond) => respond(&self.server, path, body),
-                    None => Err(Error::new(
+                    None => Box::pin(std::future::ready(Err(Error::new(
                         ErrorKind::Connect,
                         format!("no mock responder installed for POST {}{path}", self.server),
-                    )),
+                    )))),
                 }
-            })?;
+            });
+            let (status, resp_body) = fut.await?;
             check_response_size(resp_body.len() as u64)?;
             if asks_sign_in(status, &resp_body)
                 && let Some(refused) = REFUSED.with_borrow(Clone::clone)

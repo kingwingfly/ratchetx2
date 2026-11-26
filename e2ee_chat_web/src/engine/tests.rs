@@ -440,6 +440,7 @@ struct MemoryVault {
     fail_promote_upload: Cell<bool>,
     fail_forget: Cell<bool>,
     saved_manifest_seqs: std::rc::Rc<RefCell<Vec<u64>>>,
+    save_count: std::rc::Rc<Cell<usize>>,
     on_save: RefCell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -516,6 +517,7 @@ impl VaultStore for MemoryVault {
         if self.fail_save.get() {
             return Err(crate::vault::Error::Storage("write failed".into()));
         }
+        self.save_count.set(self.save_count.get() + 1);
         if let Some(client) = state.client.as_ref() {
             self.saved_manifest_seqs
                 .borrow_mut()
@@ -696,6 +698,7 @@ impl VaultStore for MemoryVault {
         if self.fail_forget.get() || self.fail_save.get() {
             return Err(crate::vault::Error::Storage("forget failed".into()));
         }
+        self.save_count.set(self.save_count.get() + 1);
         self.entries.borrow_mut().retain(|(p, _), _| p != peer);
         self.files.borrow_mut().retain(|(p, _), _| p != peer);
         self.outbox.borrow_mut().retain(|(p, _), _| p != peer);
@@ -7399,6 +7402,1820 @@ fn start_chat_aborts_without_ui_repaint_when_teardown_fires_during_save() {
         assert!(
             engine.inner.try_lock().expect("uncontended").is_none(),
             "InnerGuard::drop must clear Inner on exit"
+        );
+    });
+}
+
+/// Suspend on an optional oneshot gate without holding the `RefCell` borrow across `.await`.
+#[cfg(not(target_arch = "wasm32"))]
+async fn await_gate(slot: &RefCell<Option<futures::channel::oneshot::Receiver<()>>>) {
+    let rx = slot.borrow_mut().take();
+    if let Some(rx) = rx {
+        let _ = rx.await;
+    }
+}
+
+/// Publish a v2 bundle on `client` and return a `ClaimBundleResponse` using prekey slot `idx`.
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_bundle_for_test(
+    client: &mut Client<Connect>,
+    audience: &str,
+    count: usize,
+) -> Vec<protocol::handshake_v2::ClaimBundleResponse> {
+    let published = client.prepare_publish_v2(audience, count, count).unwrap();
+    let p = &published.request;
+    let bundles = (0..count)
+        .map(|idx| protocol::handshake_v2::ClaimBundleResponse {
+            signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+            signed_prekey_signature: p.signed_prekey_signature.clone(),
+            one_time_prekey: p.one_time_prekeys.get(idx).cloned(),
+            pq_last_resort: p.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: p.pq_one_time_prekeys.get(idx).cloned(),
+            manifest: p.manifest.clone(),
+        })
+        .collect();
+    client.commit_publish_v2(published);
+    bundles
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn start_chat_claim_bundle_and_send_initial_release_inner_lock() {
+    use crate::state::PendingNewChat;
+    use crate::util::key_to_text;
+    use crate::vault::GREETING_DELIVERY_CONFIRMED;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::handshake_v2::{ClaimBundleRequest, SendInitialV2Response};
+    use protocol::mailbox_v2::{PushV2Response, RegisterWriteTokenResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    let (engine, peer_b, peer_a_client, bundle_a1, bundle_a2, alice_bundle) =
+        pool.run_until(async {
+            let (engine, peer_b, _bob) = established_engine_on_localhost().await;
+            // Mark Alice's own manifest published so `start_chat` goes straight to ClaimBundle ->
+            // RegisterWriteToken -> SendInitialV2.
+            let alice_bundle = {
+                let mut guard = engine.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let bundles = publish_bundle_for_test(&mut inner.client, "localhost", 2);
+                inner.state.published_at = crate::util::now();
+                inner.save_state().await.unwrap();
+                bundles.into_iter().next().unwrap()
+            };
+            let mut peer_a_client = Client::new(Fetch::client(LOCAL_SERVER));
+            let mut bundles = publish_bundle_for_test(&mut peer_a_client, "localhost", 2);
+            let bundle_a1 = bundles.remove(0);
+            let bundle_a2 = bundles.remove(0);
+            (
+                engine,
+                peer_b,
+                peer_a_client,
+                bundle_a1,
+                bundle_a2,
+                alice_bundle,
+            )
+        });
+    let peer_a = peer_a_client.identity_key();
+
+    // Part 1: Suspend ClaimBundle in start_chat(peer_a) -> verify open(peer_b) / send(peer_b) /
+    // flush(peer_b) complete immediately; also suspend SendInitialV2 and verify peer_b still
+    // completes immediately; then release and verify peer_a finishes cleanly.
+    let (claim_tx, claim_rx) = oneshot::channel::<()>();
+    let (send_init_tx, send_init_rx) = oneshot::channel::<()>();
+    let claim_rx = Rc::new(RefCell::new(Some(claim_rx)));
+    let send_init_rx = Rc::new(RefCell::new(Some(send_init_rx)));
+    let claim_started = Rc::new(Cell::new(false));
+    let send_init_started = Rc::new(Cell::new(false));
+    let reg_calls = Rc::new(Cell::new(0usize));
+    let peer_b_pushes = Rc::new(Cell::new(0usize));
+    let seq = Rc::new(Cell::new(0u64));
+
+    let claim_rx_ref = claim_rx.clone();
+    let send_init_rx_ref = send_init_rx.clone();
+    let claim_started_ref = claim_started.clone();
+    let send_init_started_ref = send_init_started.clone();
+    let reg_calls_ref = reg_calls.clone();
+    let peer_b_pushes_ref = peer_b_pushes.clone();
+    let seq_ref = seq.clone();
+    let bundle_a1_clone = bundle_a1.clone();
+
+    let _mock = crate::transport::mock_fetch_async(move |_server, path, body| {
+        let claim_rx_ref = claim_rx_ref.clone();
+        let send_init_rx_ref = send_init_rx_ref.clone();
+        let claim_started_ref = claim_started_ref.clone();
+        let send_init_started_ref = send_init_started_ref.clone();
+        let reg_calls_ref = reg_calls_ref.clone();
+        let peer_b_pushes_ref = peer_b_pushes_ref.clone();
+        let seq_ref = seq_ref.clone();
+        let bundle_a1_clone = bundle_a1_clone.clone();
+        async move {
+            if path.ends_with("/ClaimBundle") {
+                let req = ClaimBundleRequest::decode(body.as_slice()).unwrap();
+                assert_eq!(req.identity_key.as_ref(), peer_a.as_slice());
+                claim_started_ref.set(true);
+                await_gate(&claim_rx_ref).await;
+                Ok((200, bundle_a1_clone.encode_to_vec()))
+            } else if path.ends_with("/RegisterWriteToken") {
+                reg_calls_ref.set(reg_calls_ref.get() + 1);
+                Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+            } else if path.ends_with("/SendInitialV2") {
+                send_init_started_ref.set(true);
+                await_gate(&send_init_rx_ref).await;
+                Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+            } else if path.ends_with("/PushV2") {
+                let req = PushV2Request::decode(body.as_slice()).unwrap();
+                assert_eq!(req.recipient.as_ref(), peer_b.as_slice());
+                peer_b_pushes_ref.set(peer_b_pushes_ref.get() + 1);
+                let next = seq_ref.get() + 1;
+                seq_ref.set(next);
+                Ok((200, PushV2Response { sequence: next }.encode_to_vec()))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+
+    let key_a_text = key_to_text(&peer_a);
+    let sub_id = engine.begin_new_chat_submit(PendingNewChat {
+        key: key_a_text.clone(),
+        name: "Carol".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: false,
+    });
+    let start_done = Rc::new(RefCell::new(None::<Result<PublicKey, StartChatError>>));
+    let start_done_ref = start_done.clone();
+    let eng_clone = engine.clone();
+    spawner
+        .spawn_local(async move {
+            let res = eng_clone
+                .start_chat(sub_id, &key_a_text, "Carol".into(), None, false, false)
+                .await;
+            *start_done_ref.borrow_mut() = Some(res);
+        })
+        .unwrap();
+
+    // Advance until `start_chat` suspends inside `ClaimBundle`.
+    pool.run_until_stalled();
+    assert!(
+        claim_started.get(),
+        "start_chat must have issued ClaimBundle"
+    );
+    assert!(
+        start_done.borrow().is_none(),
+        "start_chat must remain suspended while ClaimBundle is gated"
+    );
+
+    // While ClaimBundle(peer_a) is suspended, open(peer_b), send(peer_b), and flush(peer_b) MUST
+    // complete immediately without blocking on Engine::inner!
+    let outcome = pool.run_until(engine.open(Some(peer_b)));
+    assert_eq!(outcome, OpenOutcome::Opened);
+    let idx1 = pool
+        .run_until(engine.send_returning_index(peer_b, Kind::Text("during-claim".into())))
+        .unwrap();
+    assert_eq!(peer_b_pushes.get(), 1);
+    assert!(
+        start_done.borrow().is_none(),
+        "start_chat must still be suspended"
+    );
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(
+            inner.vault.entries.borrow()[&(peer_b, idx1)].delivery(),
+            Delivery::Sent
+        );
+        assert!(
+            inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer_b)
+                .unwrap()
+                .state
+                .outbox
+                .is_empty()
+        );
+    });
+
+    // Release ClaimBundle -> start_chat persists, flushes RegisterWriteToken, and suspends in SendInitialV2.
+    claim_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(reg_calls.get(), 1);
+    assert!(
+        send_init_started.get(),
+        "start_chat must have issued SendInitialV2 after RegisterWriteToken"
+    );
+    assert!(start_done.borrow().is_none());
+
+    // While SendInitialV2(peer_a) is suspended, send(peer_b) + flush(peer_b) still runs unblocked!
+    let idx2 = pool
+        .run_until(engine.send_returning_index(peer_b, Kind::Text("during-send-initial".into())))
+        .unwrap();
+    assert_eq!(peer_b_pushes.get(), 2);
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(
+            inner.vault.entries.borrow()[&(peer_b, idx2)].delivery(),
+            Delivery::Sent
+        );
+    });
+
+    // Release SendInitialV2 -> start_chat finishes cleanly and confirms greeting delivery.
+    send_init_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*start_done.borrow(), Some(Ok(peer_a)));
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        let contact_a = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == peer_a)
+            .expect("peer_a persisted");
+        assert_eq!(
+            contact_a.state.greeting_delivery,
+            GREETING_DELIVERY_CONFIRMED
+        );
+        assert!(contact_a.session.pending_register_grants().is_empty());
+    });
+    drop(_mock);
+
+    // Part 2: Inbound initial arrives from a new peer (peer_c) while start_chat(peer_c)'s
+    // ClaimBundle is suspended -> stale bundle is discarded without corrupting peer_c's ratchet!
+    let mut peer_c_client = Client::new(ConnectClient::new(BundleResponse(
+        "/ClaimBundle",
+        alice_bundle,
+    )));
+    let peer_c = peer_c_client.identity_key();
+    let alice_id = pool.run_until(async {
+        engine
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .client
+            .identity_key()
+    });
+    let prep_c = pool.run_until(async {
+        peer_c_client
+            .prepare_initiate_v2(
+                "localhost",
+                &alice_id,
+                &Default::default(),
+                &Kind::Hello(peer_c_client.make_hello("Dave", 1)).to_bytes(),
+                Fetch::client(LOCAL_SERVER),
+            )
+            .await
+            .unwrap()
+    });
+    let inbound_c = Incoming::try_from(prep_c.request.message.as_ref().unwrap()).unwrap();
+    let mut dave_sender_session = prep_c.session;
+    let dave_expected_id = *dave_sender_session.active_id().unwrap();
+
+    // Publish a real bundle for peer_c so `claim_peer_bundle_v2` returns `Ok(ClaimedPeerBundle)`.
+    let bundle_c = {
+        let mut peer_c_pub = Client::restore(
+            Fetch::client(LOCAL_SERVER),
+            ClientState::try_from(&proto::ClientState::from(peer_c_client.state())).unwrap(),
+        );
+        publish_bundle_for_test(&mut peer_c_pub, "localhost", 1)
+            .into_iter()
+            .next()
+            .unwrap()
+    };
+    let (claim_c_tx, claim_c_rx) = oneshot::channel::<()>();
+    let claim_c_rx = Rc::new(RefCell::new(Some(claim_c_rx)));
+    let claim_c_started = Rc::new(Cell::new(false));
+    let send_init_c_calls = Rc::new(Cell::new(0usize));
+    let claim_c_rx_ref = claim_c_rx.clone();
+    let claim_c_started_ref = claim_c_started.clone();
+    let send_init_c_calls_ref = send_init_c_calls.clone();
+    let _mock_c = crate::transport::mock_fetch_async(move |_server, path, _body| {
+        let claim_c_rx_ref = claim_c_rx_ref.clone();
+        let claim_c_started_ref = claim_c_started_ref.clone();
+        let send_init_c_calls_ref = send_init_c_calls_ref.clone();
+        let bundle_c = bundle_c.clone();
+        async move {
+            if path.ends_with("/ClaimBundle") {
+                claim_c_started_ref.set(true);
+                await_gate(&claim_c_rx_ref).await;
+                Ok((200, bundle_c.encode_to_vec()))
+            } else if path.ends_with("/RegisterWriteToken") {
+                Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+            } else if path.ends_with("/PushV2") {
+                Ok((200, PushV2Response { sequence: 99 }.encode_to_vec()))
+            } else if path.ends_with("/SendInitialV2") {
+                send_init_c_calls_ref.set(send_init_c_calls_ref.get() + 1);
+                Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+    let _ = bundle_a2;
+
+    let key_c_text = key_to_text(&peer_c);
+    let sub_c = engine.begin_new_chat_submit(PendingNewChat {
+        key: key_c_text.clone(),
+        name: "Dave".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: false,
+    });
+    let start_c_done = Rc::new(RefCell::new(None::<Result<PublicKey, StartChatError>>));
+    let start_c_done_ref = start_c_done.clone();
+    let eng_c = engine.clone();
+    spawner
+        .spawn_local(async move {
+            let res = eng_c
+                .start_chat(sub_c, &key_c_text, "Dave".into(), None, false, false)
+                .await;
+            *start_c_done_ref.borrow_mut() = Some(res);
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert!(claim_c_started.get());
+    assert!(start_c_done.borrow().is_none());
+
+    // Inject Dave's inbound initial while start_chat(Dave)'s ClaimBundle is suspended!
+    pool.run_until(async {
+        let mut guard = engine.lock_inner().await;
+        let inner = guard.as_mut().unwrap();
+        let mut batch = InitialBatch::default();
+        engine.process_initial(inner, &peer_c, &inbound_c, &mut batch);
+        engine.save_initial_batch(inner, batch).await.unwrap();
+    });
+
+    // Release ClaimBundle -> start_chat sees peer_c already exists, discards stale bundle, accepts
+    // the inbound request cleanly without calling SendInitialV2 or corrupting Dave's ratchet!
+    claim_c_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*start_c_done.borrow(), Some(Ok(peer_c)));
+    assert_eq!(
+        send_init_c_calls.get(),
+        0,
+        "stale ClaimBundle must be discarded without transmitting SendInitialV2"
+    );
+    pool.run_until(async {
+        let mut guard = engine.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
+        let contact_c = inner.contact(&peer_c).expect("Dave exists");
+        assert_eq!(contact_c.session.active_id(), Some(&dave_expected_id));
+        assert!(!contact_c.state.request);
+        // Verify the inbound ratchet is completely uncorrupted: Dave encrypts, Alice decrypts.
+        let sealed = dave_sender_session
+            .encrypt(&Kind::Text("ratchet-intact".into()).to_bytes())
+            .unwrap();
+        let decrypted = contact_c.session.decrypt_envelope(&sealed.message).unwrap();
+        assert_eq!(
+            Content::from_bytes(&decrypted.content).kind,
+            Some(Kind::Text("ratchet-intact".into()))
+        );
+    });
+    drop(_mock_c);
+
+    // Part 3: User changes `pq_config` while `ClaimBundle` is suspended in `start_chat` ->
+    // stale bundle is discarded cleanly and `start_chat` re-claims under the updated `pq_config`!
+    let mut peer_d_client = Client::new(Fetch::client(LOCAL_SERVER));
+    let peer_d = peer_d_client.identity_key();
+    let mut bundles_d = publish_bundle_for_test(&mut peer_d_client, "localhost", 2);
+    let bundle_d1 = bundles_d.remove(0);
+    let bundle_d2 = bundles_d.remove(0);
+    let (claim_d1_tx, claim_d1_rx) = oneshot::channel::<()>();
+    let claim_d1_rx = Rc::new(RefCell::new(Some(claim_d1_rx)));
+    let claim_d_calls = Rc::new(Cell::new(0usize));
+    let seen_pref_suites: Rc<RefCell<Vec<Vec<u32>>>> = Rc::default();
+    let claim_d1_rx_ref = claim_d1_rx.clone();
+    let claim_d_calls_ref = claim_d_calls.clone();
+    let seen_pref_ref = seen_pref_suites.clone();
+    let _mock_d = crate::transport::mock_fetch_async(move |_server, path, body| {
+        let claim_d1_rx_ref = claim_d1_rx_ref.clone();
+        let claim_d_calls_ref = claim_d_calls_ref.clone();
+        let seen_pref_ref = seen_pref_ref.clone();
+        let bundle_d1 = bundle_d1.clone();
+        let bundle_d2 = bundle_d2.clone();
+        async move {
+            if path.ends_with("/ClaimBundle") {
+                let req = ClaimBundleRequest::decode(body.as_slice()).unwrap();
+                seen_pref_ref.borrow_mut().push(req.preferred_suites);
+                let call = claim_d_calls_ref.get() + 1;
+                claim_d_calls_ref.set(call);
+                if call == 1 {
+                    await_gate(&claim_d1_rx_ref).await;
+                    Ok((200, bundle_d1.encode_to_vec()))
+                } else {
+                    Ok((200, bundle_d2.encode_to_vec()))
+                }
+            } else if path.ends_with("/RegisterWriteToken") {
+                Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+            } else if path.ends_with("/SendInitialV2") {
+                Ok((200, SendInitialV2Response { id: 2 }.encode_to_vec()))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+
+    let key_d_text = key_to_text(&peer_d);
+    let sub_d = engine.begin_new_chat_submit(PendingNewChat {
+        key: key_d_text.clone(),
+        name: "Eve".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: false,
+    });
+    let start_d_done = Rc::new(RefCell::new(None::<Result<PublicKey, StartChatError>>));
+    let start_d_done_ref = start_d_done.clone();
+    let eng_d = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *start_d_done_ref.borrow_mut() = Some(
+                eng_d
+                    .start_chat(sub_d, &key_d_text, "Eve".into(), None, false, false)
+                    .await,
+            );
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert_eq!(claim_d_calls.get(), 1);
+    assert!(start_d_done.borrow().is_none());
+
+    // Change local `pq_config` (toggle `pq_ratchet_enabled`) while `ClaimBundle` #1 is suspended.
+    pool.run_until(async {
+        let mut guard = engine.lock_inner().await;
+        let inner = guard.as_mut().unwrap();
+        let mut cfg = inner.client.pq_config().clone();
+        cfg.pq_ratchet_enabled = !cfg.pq_ratchet_enabled;
+        inner.client.set_pq_config(cfg).unwrap();
+    });
+
+    // Release ClaimBundle #1 -> `start_chat` detects `pq_config` mismatch, discards stale bundle,
+    // re-claims under the updated `pq_config`, and succeeds!
+    claim_d1_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*start_d_done.borrow(), Some(Ok(peer_d)));
+    assert_eq!(
+        claim_d_calls.get(),
+        2,
+        "start_chat must re-claim when pq_config changes mid-flight"
+    );
+    let _ = seen_pref_suites;
+    let _ = peer_a_client;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn outbox_rekey_claim_bundle_discards_stale_bundle_when_inbound_session_arrives() {
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::handshake_v2::{ListInitialMessagesResponse, SendInitialV2Response};
+    use protocol::mailbox_v2::{PushV2Response, RegisterWriteTokenResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    let (engine, peer_a, alice_id, alice_bundle, bob_bundle, bob_client) = pool.run_until(async {
+        let (engine, peer_a, mut bob) = established_engine_on_localhost().await;
+        let bob_bundle = publish_bundle_for_test(&mut bob, "localhost", 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let (alice_id, alice_bundle) = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let alice_bundle = publish_bundle_for_test(&mut inner.client, "localhost", 1)
+                .into_iter()
+                .next()
+                .unwrap();
+            let alice_id = inner.client.identity_key();
+            // Retire peer_a's session so `flush(&peer_a)` must rekey via `ClaimBundle`, and
+            // enqueue an unsealed message waiting for the new session.
+            inner.contact(&peer_a).unwrap().session.retire();
+            inner
+                .add(&peer_a, Kind::Text("sent-on-inbound-ratchet".into()), false)
+                .await
+                .unwrap();
+            (alice_id, alice_bundle)
+        };
+        (engine, peer_a, alice_id, alice_bundle, bob_bundle, bob)
+    });
+
+    // Prepare Bob's real inbound replacement session against Alice's published bundle.
+    let mut bob_initiator = Client::restore(
+        ConnectClient::new(BundleResponse("/ClaimBundle", alice_bundle)),
+        ClientState::try_from(&proto::ClientState::from(bob_client.state())).unwrap(),
+    );
+    let bob_prep = pool.run_until(async {
+        bob_initiator
+            .prepare_initiate_v2(
+                "localhost",
+                &alice_id,
+                &Default::default(),
+                &Kind::Hello(bob_initiator.make_hello("Bob", 10)).to_bytes(),
+                Fetch::client(LOCAL_SERVER),
+            )
+            .await
+            .unwrap()
+    });
+    let inbound_initial = Incoming::try_from(bob_prep.request.message.as_ref().unwrap()).unwrap();
+    let mut bob_new_session = bob_prep.session;
+    let expected_inbound_id = *bob_new_session.active_id().unwrap();
+
+    let (claim_tx, claim_rx) = oneshot::channel::<()>();
+    let claim_rx = Rc::new(RefCell::new(Some(claim_rx)));
+    let claim_started = Rc::new(Cell::new(false));
+    let send_init_calls = Rc::new(Cell::new(0usize));
+    let pushed_reqs: Rc<RefCell<Vec<PushV2Request>>> = Rc::default();
+
+    let claim_rx_ref = claim_rx.clone();
+    let claim_started_ref = claim_started.clone();
+    let send_init_calls_ref = send_init_calls.clone();
+    let pushed_reqs_ref = pushed_reqs.clone();
+
+    let _mock = crate::transport::mock_fetch_async(move |_server, path, body| {
+        let claim_rx_ref = claim_rx_ref.clone();
+        let claim_started_ref = claim_started_ref.clone();
+        let send_init_calls_ref = send_init_calls_ref.clone();
+        let pushed_reqs_ref = pushed_reqs_ref.clone();
+        let bob_bundle = bob_bundle.clone();
+        async move {
+            if path.ends_with("/ListInitialMessages") {
+                Ok((
+                    200,
+                    ListInitialMessagesResponse {
+                        messages: vec![],
+                        has_more: false,
+                    }
+                    .encode_to_vec(),
+                ))
+            } else if path.ends_with("/ClaimBundle") {
+                claim_started_ref.set(true);
+                await_gate(&claim_rx_ref).await;
+                Ok((200, bob_bundle.encode_to_vec()))
+            } else if path.ends_with("/SendInitialV2") {
+                send_init_calls_ref.set(send_init_calls_ref.get() + 1);
+                Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+            } else if path.ends_with("/RegisterWriteToken") {
+                Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+            } else if path.ends_with("/PushV2") {
+                let req = PushV2Request::decode(body.as_slice()).unwrap();
+                pushed_reqs_ref.borrow_mut().push(req);
+                Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+
+    let flush_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let flush_done_ref = flush_done.clone();
+    let eng_clone = engine.clone();
+    spawner
+        .spawn_local(async move {
+            let res = eng_clone.flush(&peer_a).await;
+            *flush_done_ref.borrow_mut() = Some(res);
+        })
+        .unwrap();
+
+    // Advance until outbox rekey suspends inside ClaimBundle.
+    pool.run_until_stalled();
+    assert!(
+        claim_started.get(),
+        "outbox rekey must have issued ClaimBundle"
+    );
+    assert!(flush_done.borrow().is_none());
+
+    // Inject Bob's inbound replacement session while Alice's ClaimBundle is suspended!
+    // Acquiring `engine.lock_inner()` succeeds immediately because ClaimBundle dropped the lock.
+    pool.run_until(async {
+        let mut guard = engine.lock_inner().await;
+        let inner = guard.as_mut().unwrap();
+        let mut batch = InitialBatch::default();
+        engine.process_initial(inner, &peer_a, &inbound_initial, &mut batch);
+        engine.save_initial_batch(inner, batch).await.unwrap();
+        assert_eq!(
+            inner.contact(&peer_a).unwrap().session.active_id(),
+            Some(&expected_inbound_id)
+        );
+    });
+
+    // Release ClaimBundle -> Alice MUST discard the stale bundle, NEVER transmit SendInitialV2,
+    // keep Bob's inbound session as active, and encrypt/push the queued message on Bob's ratchet!
+    claim_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*flush_done.borrow(), Some(Ok(true)));
+    assert_eq!(
+        send_init_calls.get(),
+        0,
+        "stale ClaimBundle must not produce an outgoing SendInitialV2"
+    );
+    assert_eq!(pushed_reqs.borrow().len(), 1);
+    let pushed_msg = pushed_reqs.borrow()[0]
+        .message
+        .as_ref()
+        .expect("encrypted message")
+        .clone();
+    let decrypted = bob_new_session.decrypt_envelope(&pushed_msg).unwrap();
+    assert_eq!(
+        Content::from_bytes(&decrypted.content).kind,
+        Some(Kind::Text("sent-on-inbound-ratchet".into()))
+    );
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        let contact = inner.contacts.iter().find(|c| c.peer == peer_a).unwrap();
+        assert_eq!(contact.session.active_id(), Some(&expected_inbound_id));
+        assert!(contact.state.outbox.is_empty());
+    });
+    let _ = bob_client;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn push_v2_releases_inner_lock_allows_peer_b_and_ui_and_handles_concurrent_delete() {
+    use crate::vault::GREETING_DELIVERY_CONFIRMED;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::mailbox_v2::{PushV2Response, RevokeWriteTokenResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    // Build an engine with TWO established contacts: peer_a and peer_b.
+    let (engine, peer_a, peer_b) = pool.run_until(async {
+        let (engine, peer_a, _bob_a) = established_engine_on_localhost().await;
+        let mut bob_b = Client::new(Fetch::client(LOCAL_SERVER));
+        let peer_b = bob_b.identity_key();
+        let bundle_b = publish_bundle_for_test(&mut bob_b, "localhost", 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let mut guard = engine.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
+        let mut alice_tmp = Client::restore(
+            ConnectClient::new(BundleResponse("/ClaimBundle", bundle_b)),
+            ClientState::try_from(&proto::ClientState::from(inner.client.state())).unwrap(),
+        );
+        let prep_b = alice_tmp
+            .prepare_initiate_v2(
+                "localhost",
+                &peer_b,
+                &Default::default(),
+                &Kind::Text("init-b".into()).to_bytes(),
+                Fetch::client(LOCAL_SERVER),
+            )
+            .await
+            .unwrap();
+        let mut contact_b = super::contact::Contact {
+            peer: peer_b,
+            session: prep_b.session,
+            deferred_carried: 0,
+            state: ContactState {
+                peer: peer_b.to_vec(),
+                name: "Peer B".into(),
+                greeting_delivery: GREETING_DELIVERY_CONFIRMED,
+                ..ContactState::default()
+            },
+        };
+        // Seed one unread incoming message on peer_b so `mark_read(peer_b)` exercises a real
+        // read-receipt + `push_events` while peer_a's `PushV2` is suspended!
+        let (unread_idx, unread_entry) = contact_b
+            .add_received(
+                Content {
+                    clock: 5,
+                    kind: Some(Kind::Text("unread-from-b".into())),
+                    events: None,
+                },
+                false,
+            )
+            .unwrap();
+        inner.contacts.push(contact_b);
+        inner
+            .save(&[(peer_b, unread_idx, unread_entry)])
+            .await
+            .unwrap();
+        // Queue an outgoing message for peer_a.
+        inner
+            .add(&peer_a, Kind::Text("msg-a1".into()), false)
+            .await
+            .unwrap();
+        drop(guard);
+        (engine, peer_a, peer_b)
+    });
+
+    // Part A: Suspend PushV2 for peer_a -> verify peer_flush_locks serializes a 2nd flush(peer_a),
+    // while open/mark_read/send/flush for peer_b all complete immediately!
+    let (push_a1_tx, push_a1_rx) = oneshot::channel::<()>();
+    let push_a1_rx = Rc::new(RefCell::new(Some(push_a1_rx)));
+    let push_a_calls = Rc::new(Cell::new(0usize));
+    let push_b_calls = Rc::new(Cell::new(0usize));
+    let seq = Rc::new(Cell::new(0u64));
+
+    let push_a1_rx_ref = push_a1_rx.clone();
+    let push_a_calls_ref = push_a_calls.clone();
+    let push_b_calls_ref = push_b_calls.clone();
+    let seq_ref = seq.clone();
+
+    let _mock = crate::transport::mock_fetch_async(move |_server, path, body| {
+        let push_a1_rx_ref = push_a1_rx_ref.clone();
+        let push_a_calls_ref = push_a_calls_ref.clone();
+        let push_b_calls_ref = push_b_calls_ref.clone();
+        let seq_ref = seq_ref.clone();
+        async move {
+            assert!(path.ends_with("/PushV2"), "unexpected path: {path}");
+            let req = PushV2Request::decode(body.as_slice()).unwrap();
+            if req.recipient.as_ref() == peer_a.as_slice() {
+                push_a_calls_ref.set(push_a_calls_ref.get() + 1);
+                await_gate(&push_a1_rx_ref).await;
+            } else if req.recipient.as_ref() == peer_b.as_slice() {
+                push_b_calls_ref.set(push_b_calls_ref.get() + 1);
+            } else {
+                panic!("unexpected recipient");
+            }
+            let next = seq_ref.get() + 1;
+            seq_ref.set(next);
+            Ok((200, PushV2Response { sequence: next }.encode_to_vec()))
+        }
+    });
+
+    let flush_a1_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let flush_a2_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let f1_ref = flush_a1_done.clone();
+    let f2_ref = flush_a2_done.clone();
+    let e1 = engine.clone();
+    let e2 = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *f1_ref.borrow_mut() = Some(e1.flush(&peer_a).await);
+        })
+        .unwrap();
+    spawner
+        .spawn_local(async move {
+            *f2_ref.borrow_mut() = Some(e2.flush(&peer_a).await);
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert_eq!(
+        push_a_calls.get(),
+        1,
+        "peer_flush_locks must serialize concurrent flushes for peer_a so PushV2 is issued once"
+    );
+    assert!(flush_a1_done.borrow().is_none());
+    assert!(flush_a2_done.borrow().is_none());
+
+    // While peer_a's PushV2 is paused, open(peer_b) (which marks unread read & pushes read receipt),
+    // mark_read(peer_b), and send(peer_b) + flush(peer_b) all run unblocked!
+    assert_eq!(
+        pool.run_until(engine.open(Some(peer_b))),
+        OpenOutcome::Opened
+    );
+    // Opening peer_b already acknowledged its unread message and flushed its read receipt via push_events!
+    assert_eq!(push_b_calls.get(), 1);
+    pool.run_until(engine.mark_read(peer_b));
+    let idx_b = pool
+        .run_until(engine.send_returning_index(peer_b, Kind::Text("msg-b1".into())))
+        .unwrap();
+    assert_eq!(push_b_calls.get(), 2);
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(
+            inner.vault.entries.borrow()[&(peer_b, idx_b)].delivery(),
+            Delivery::Sent
+        );
+        let contact_b = inner.contacts.iter().find(|c| c.peer == peer_b).unwrap();
+        assert_eq!(contact_b.state.unread, 0);
+        assert!(contact_b.state.outbox.is_empty());
+        assert!(contact_b.state.sealed_events.is_none());
+    });
+
+    // Release peer_a's PushV2 -> first flush commits msg-a1, second flush runs next and finds empty outbox.
+    push_a1_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*flush_a1_done.borrow(), Some(Ok(true)));
+    assert_eq!(*flush_a2_done.borrow(), Some(Ok(false)));
+    assert_eq!(push_a_calls.get(), 1);
+    drop(_mock);
+
+    // Part B: Concurrent `delete(peer_a)` while `PushV2` for peer_a is suspended ->
+    // `flush(&peer_a)` exits cleanly without recreating or corrupting state, and lock-free
+    // `flush_pending_revokes` + `say_farewells` also release `self.inner` across RPCs!
+    pool.run_until(async {
+        let mut guard = engine.inner.lock().await;
+        guard
+            .as_mut()
+            .unwrap()
+            .add(
+                &peer_a,
+                Kind::Text("msg-a2-deleted-midflight".into()),
+                false,
+            )
+            .await
+            .unwrap();
+    });
+    let (push_a2_tx, push_a2_rx) = oneshot::channel::<()>();
+    let (revoke_tx, revoke_rx) = oneshot::channel::<()>();
+    let (farewell_tx, farewell_rx) = oneshot::channel::<()>();
+    let push_a2_rx = Rc::new(RefCell::new(Some(push_a2_rx)));
+    let revoke_rx = Rc::new(RefCell::new(Some(revoke_rx)));
+    let farewell_rx = Rc::new(RefCell::new(Some(farewell_rx)));
+    let push_a2_started = Rc::new(Cell::new(false));
+    let revoke_started = Rc::new(Cell::new(false));
+    let farewell_started = Rc::new(Cell::new(false));
+
+    let push_a2_rx_ref = push_a2_rx.clone();
+    let revoke_rx_ref = revoke_rx.clone();
+    let farewell_rx_ref = farewell_rx.clone();
+    let push_a2_started_ref = push_a2_started.clone();
+    let revoke_started_ref = revoke_started.clone();
+    let farewell_started_ref = farewell_started.clone();
+
+    let _mock2 = crate::transport::mock_fetch_async(move |_server, path, _body| {
+        let push_a2_rx_ref = push_a2_rx_ref.clone();
+        let revoke_rx_ref = revoke_rx_ref.clone();
+        let farewell_rx_ref = farewell_rx_ref.clone();
+        let push_a2_started_ref = push_a2_started_ref.clone();
+        let revoke_started_ref = revoke_started_ref.clone();
+        let farewell_started_ref = farewell_started_ref.clone();
+        async move {
+            if path.ends_with("/PushV2") {
+                let push_rx = push_a2_rx_ref.borrow_mut().take();
+                if let Some(rx) = push_rx {
+                    push_a2_started_ref.set(true);
+                    let _ = rx.await;
+                } else {
+                    let fw_rx = farewell_rx_ref.borrow_mut().take();
+                    if let Some(rx) = fw_rx {
+                        farewell_started_ref.set(true);
+                        let _ = rx.await;
+                    }
+                }
+                Ok((200, PushV2Response { sequence: 50 }.encode_to_vec()))
+            } else if path.ends_with("/RevokeWriteToken") {
+                revoke_started_ref.set(true);
+                await_gate(&revoke_rx_ref).await;
+                Ok((200, RevokeWriteTokenResponse { revoked: 1 }.encode_to_vec()))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+
+    let flush_del_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let flush_del_ref = flush_del_done.clone();
+    let eng_del = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *flush_del_ref.borrow_mut() = Some(eng_del.flush(&peer_a).await);
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert!(push_a2_started.get());
+    assert!(flush_del_done.borrow().is_none());
+
+    // Delete peer_a concurrently while PushV2(peer_a) is suspended! The live `Weak` lock entry
+    // remains tracked until the in-flight flush exits, then prunes automatically.
+    pool.run_until(engine.delete(peer_a)).unwrap();
+    assert!(
+        engine
+            .peer_flush_locks
+            .borrow()
+            .get(&peer_a)
+            .is_some_and(|weak| weak.strong_count() == 1),
+        "live per-peer flush lock must stay registered until in-flight flush exits"
+    );
+
+    // Release PushV2(peer_a) -> flush exits cleanly without recreating peer_a or corrupting vault,
+    // and prunes the peer_flush_locks entry once strong_count drops to 0.
+    push_a2_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*flush_del_done.borrow(), Some(Ok(false)));
+    assert!(
+        !engine.peer_flush_locks.borrow().contains_key(&peer_a),
+        "peer_flush_locks entry must be pruned once the last flush holder exits"
+    );
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert!(inner.contacts.iter().all(|c| c.peer != peer_a));
+        assert!(inner.contacts.iter().any(|c| c.peer == peer_b));
+        assert!(
+            inner
+                .vault
+                .outbox
+                .borrow()
+                .keys()
+                .all(|(p, _)| *p != peer_a)
+        );
+        assert_eq!(inner.state.pending_revokes.len(), 1);
+        assert_eq!(inner.state.farewells.len(), 1);
+    });
+
+    // Verify `flush_pending_revokes` and `say_farewells` ALSO release `self.inner` across RPCs!
+    let revoke_done = Rc::new(RefCell::new(None::<Result<(), String>>));
+    let revoke_done_ref = revoke_done.clone();
+    let eng_rev = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *revoke_done_ref.borrow_mut() = Some(eng_rev.flush_pending_revokes().await);
+        })
+        .unwrap();
+    pool.run_until_stalled();
+    assert!(revoke_started.get());
+    assert!(revoke_done.borrow().is_none());
+    // UI `open(peer_b)` completes immediately while RevokeWriteToken is suspended!
+    assert_eq!(
+        pool.run_until(engine.open(Some(peer_b))),
+        OpenOutcome::Opened
+    );
+    revoke_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*revoke_done.borrow(), Some(Ok(())));
+
+    let farewell_done = Rc::new(RefCell::new(None::<Result<(), String>>));
+    let farewell_done_ref = farewell_done.clone();
+    let eng_fw = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *farewell_done_ref.borrow_mut() = Some(eng_fw.say_farewells().await);
+        })
+        .unwrap();
+    pool.run_until_stalled();
+    assert!(farewell_started.get());
+    assert!(farewell_done.borrow().is_none());
+    // UI `open(peer_b)` completes immediately while farewell PushV2 is suspended!
+    assert_eq!(
+        pool.run_until(engine.open(Some(peer_b))),
+        OpenOutcome::Opened
+    );
+    farewell_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*farewell_done.borrow(), Some(Ok(())));
+
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert!(inner.state.pending_revokes.is_empty());
+        assert!(inner.state.farewells.is_empty());
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn pagehide_during_suspended_claim_bundle_and_push_v2_blocks_all_writes_and_ui() {
+    use crate::state::{PendingNewChat, Phase};
+    use crate::util::key_to_text;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::mailbox_v2::PushV2Response;
+    use std::rc::Rc;
+
+    // Subcase A: Trigger `glue::teardown_and_release_lock()` while `ClaimBundle` is suspended.
+    {
+        let prev_released = crate::glue::set_lock_released_for_test(false);
+        let _restore_lock = scopeguard::guard(prev_released, |prev| {
+            crate::glue::set_lock_released_for_test(prev);
+        });
+
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+        let (engine, ui, save_count, peer_a, bundle_a) = pool.run_until(async {
+            let (engine, _peer_b, _bob) = established_engine_on_localhost().await;
+            let save_count = {
+                let mut guard = engine.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let _ = publish_bundle_for_test(&mut inner.client, "localhost", 1);
+                inner.state.published_at = crate::util::now();
+                inner.save_state().await.unwrap();
+                inner.vault.save_count.clone()
+            };
+            let mut peer_a_client = Client::new(Fetch::client(LOCAL_SERVER));
+            let peer_a = peer_a_client.identity_key();
+            let bundle_a = publish_bundle_for_test(&mut peer_a_client, "localhost", 1)
+                .into_iter()
+                .next()
+                .unwrap();
+            let ui = engine.ui();
+            (engine, ui, save_count, peer_a, bundle_a)
+        });
+
+        let (claim_tx, claim_rx) = oneshot::channel::<()>();
+        let claim_rx = Rc::new(RefCell::new(Some(claim_rx)));
+        let claim_started = Rc::new(Cell::new(false));
+        let claim_rx_ref = claim_rx.clone();
+        let claim_started_ref = claim_started.clone();
+        let _mock = crate::transport::mock_fetch_async(move |_server, path, _body| {
+            let claim_rx_ref = claim_rx_ref.clone();
+            let claim_started_ref = claim_started_ref.clone();
+            let bundle_a = bundle_a.clone();
+            async move {
+                assert!(path.ends_with("/ClaimBundle"), "unexpected path: {path}");
+                claim_started_ref.set(true);
+                await_gate(&claim_rx_ref).await;
+                Ok((200, bundle_a.encode_to_vec()))
+            }
+        });
+
+        let key_a_text = key_to_text(&peer_a);
+        let sub_id = engine.begin_new_chat_submit(PendingNewChat {
+            key: key_a_text.clone(),
+            name: "Carol".into(),
+            server: None,
+            pq_pinned: false,
+            allow_classical: false,
+            auto_start: false,
+        });
+        let start_done = Rc::new(RefCell::new(None::<Result<PublicKey, StartChatError>>));
+        let start_done_ref = start_done.clone();
+        let eng_clone = engine.clone();
+        spawner
+            .spawn_local(async move {
+                *start_done_ref.borrow_mut() = Some(
+                    eng_clone
+                        .start_chat(sub_id, &key_a_text, "Carol".into(), None, false, false)
+                        .await,
+                );
+            })
+            .unwrap();
+
+        pool.run_until_stalled();
+        assert!(claim_started.get());
+        assert!(start_done.borrow().is_none());
+
+        // Fire synchronous `pagehide` teardown while `ClaimBundle` is suspended!
+        crate::glue::teardown_and_release_lock();
+        let saves_at_teardown = save_count.get();
+
+        // Because `Engine::inner` was released across `ClaimBundle`, `Inner` dropped IMMEDIATELY!
+        assert!(
+            engine.inner.try_lock().expect("uncontended").is_none(),
+            "Inner must be dropped synchronously on pagehide while ClaimBundle is suspended"
+        );
+        assert!(engine.peer_flush_locks.borrow().is_empty());
+
+        // Release ClaimBundle -> continuation MUST abort with zero IDB writes and zero UI repaints!
+        claim_tx.send(()).unwrap();
+        pool.run_until_stalled();
+        assert_eq!(*start_done.borrow(), Some(Err(StartChatError::Cancelled)));
+        assert_eq!(
+            save_count.get(),
+            saves_at_teardown,
+            "zero post-pagehide IDB writes permitted after ClaimBundle resumes"
+        );
+        assert_eq!(ui.phase.get_untracked(), Phase::Locked);
+        assert!(ui.contacts.get_untracked().is_empty());
+        assert!(ui.log.get_untracked().is_empty());
+        assert!(ui.notice.get_untracked().is_none());
+        assert!(engine.inner.try_lock().expect("uncontended").is_none());
+    }
+
+    // Subcase B: Trigger `glue::teardown_and_release_lock()` while `PushV2` is suspended.
+    {
+        let prev_released = crate::glue::set_lock_released_for_test(false);
+        let _restore_lock = scopeguard::guard(prev_released, |prev| {
+            crate::glue::set_lock_released_for_test(prev);
+        });
+
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+        let (engine, ui, save_count, peer_a) = pool.run_until(async {
+            let (engine, peer_a, _bob) = established_engine_on_localhost().await;
+            let save_count = {
+                let mut guard = engine.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                inner
+                    .add(&peer_a, Kind::Text("in-flight-at-pagehide".into()), false)
+                    .await
+                    .unwrap();
+                inner.vault.save_count.clone()
+            };
+            let ui = engine.ui();
+            (engine, ui, save_count, peer_a)
+        });
+
+        let (push_tx, push_rx) = oneshot::channel::<()>();
+        let push_rx = Rc::new(RefCell::new(Some(push_rx)));
+        let push_started = Rc::new(Cell::new(false));
+        let push_rx_ref = push_rx.clone();
+        let push_started_ref = push_started.clone();
+        let _mock = crate::transport::mock_fetch_async(move |_server, path, _body| {
+            let push_rx_ref = push_rx_ref.clone();
+            let push_started_ref = push_started_ref.clone();
+            async move {
+                assert!(path.ends_with("/PushV2"), "unexpected path: {path}");
+                push_started_ref.set(true);
+                await_gate(&push_rx_ref).await;
+                Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+            }
+        });
+
+        let flush_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+        let flush_done_ref = flush_done.clone();
+        let eng_clone = engine.clone();
+        spawner
+            .spawn_local(async move {
+                *flush_done_ref.borrow_mut() = Some(eng_clone.flush(&peer_a).await);
+            })
+            .unwrap();
+
+        pool.run_until_stalled();
+        assert!(push_started.get());
+        assert!(flush_done.borrow().is_none());
+
+        // Fire synchronous `pagehide` teardown while `PushV2` is suspended!
+        crate::glue::teardown_and_release_lock();
+        let saves_at_teardown = save_count.get();
+
+        // Because `Engine::inner` was released across `PushV2`, `Inner` dropped IMMEDIATELY!
+        assert!(
+            engine.inner.try_lock().expect("uncontended").is_none(),
+            "Inner must be dropped synchronously on pagehide while PushV2 is suspended"
+        );
+        assert!(engine.peer_flush_locks.borrow().is_empty());
+
+        // Release PushV2 -> flush MUST abort with zero IDB writes and zero UI repaints!
+        push_tx.send(()).unwrap();
+        pool.run_until_stalled();
+        assert_eq!(*flush_done.borrow(), Some(Ok(false)));
+        assert_eq!(
+            save_count.get(),
+            saves_at_teardown,
+            "zero post-pagehide IDB writes permitted after PushV2 resumes"
+        );
+        assert_eq!(ui.phase.get_untracked(), Phase::Locked);
+        assert!(ui.contacts.get_untracked().is_empty());
+        assert!(ui.messages.get_untracked().is_empty());
+        assert!(ui.log.get_untracked().is_empty());
+        assert!(ui.notice.get_untracked().is_none());
+        assert!(engine.inner.try_lock().expect("uncontended").is_none());
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn delete_recreate_during_suspended_push_v2_preserves_per_peer_serialization_and_prunes() {
+    use crate::vault::GREETING_DELIVERY_CONFIRMED;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::mailbox_v2::PushV2Response;
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    let (engine, peer_a, mut bob_client) = pool.run_until(async {
+        let (engine, peer_a, bob) = established_engine_on_localhost().await;
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner
+                .add(&peer_a, Kind::Text("old-session-msg".into()), false)
+                .await
+                .unwrap();
+        }
+        (engine, peer_a, bob)
+    });
+    let bundle_a_new = publish_bundle_for_test(&mut bob_client, "localhost", 1)
+        .into_iter()
+        .next()
+        .unwrap();
+
+    let (push1_tx, push1_rx) = oneshot::channel::<()>();
+    let push1_rx = Rc::new(RefCell::new(Some(push1_rx)));
+    let push_reqs: Rc<RefCell<Vec<PushV2Request>>> = Rc::default();
+    let seq = Rc::new(Cell::new(0u64));
+    let push1_rx_ref = push1_rx.clone();
+    let push_reqs_ref = push_reqs.clone();
+    let seq_ref = seq.clone();
+
+    let _mock = crate::transport::mock_fetch_async(move |_server, path, body| {
+        let push1_rx_ref = push1_rx_ref.clone();
+        let push_reqs_ref = push_reqs_ref.clone();
+        let seq_ref = seq_ref.clone();
+        async move {
+            assert!(path.ends_with("/PushV2"), "unexpected path: {path}");
+            let req = PushV2Request::decode(body.as_slice()).unwrap();
+            push_reqs_ref.borrow_mut().push(req);
+            if push_reqs_ref.borrow().len() == 1 {
+                await_gate(&push1_rx_ref).await;
+            }
+            let next = seq_ref.get() + 1;
+            seq_ref.set(next);
+            Ok((200, PushV2Response { sequence: next }.encode_to_vec()))
+        }
+    });
+
+    // 1. Start flush #1 for peer_a and pause inside PushV2 for the old session.
+    let f1_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let f1_ref = f1_done.clone();
+    let e1 = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *f1_ref.borrow_mut() = Some(e1.flush(&peer_a).await);
+        })
+        .unwrap();
+    pool.run_until_stalled();
+    assert_eq!(push_reqs.borrow().len(), 1);
+    assert!(f1_done.borrow().is_none());
+
+    // 2. Delete peer_a concurrently, then immediately recreate peer_a with a brand-new session S2
+    //    and queue a message on S2, then spawn flush #2 for peer_a while flush #1 is still paused!
+    pool.run_until(engine.delete(peer_a)).unwrap();
+    assert!(
+        engine
+            .peer_flush_locks
+            .borrow()
+            .get(&peer_a)
+            .is_some_and(|weak| weak.strong_count() == 1),
+        "delete must not evict a live Weak flush lock"
+    );
+
+    let mut bob_s2_session = pool.run_until(async {
+        let mut guard = engine.lock_inner().await;
+        let inner = guard.as_mut().unwrap();
+        let mut alice_tmp = Client::restore(
+            ConnectClient::new(BundleResponse("/ClaimBundle", bundle_a_new)),
+            ClientState::try_from(&proto::ClientState::from(inner.client.state())).unwrap(),
+        );
+        let prep = alice_tmp
+            .prepare_initiate_v2(
+                "localhost",
+                &peer_a,
+                &Default::default(),
+                &Kind::Hello(alice_tmp.make_hello("Alice", 99)).to_bytes(),
+                Fetch::client(LOCAL_SERVER),
+            )
+            .await
+            .unwrap();
+        let inc = Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap();
+        let AcceptedInitial::Accepted {
+            session: bob_session,
+            ..
+        } = bob_client
+            .accept_initial_v2(
+                &inner.client.identity_key(),
+                &Default::default(),
+                &inc,
+                Fetch::client(LOCAL_SERVER),
+            )
+            .unwrap()
+        else {
+            panic!("expected accepted initial on S2");
+        };
+        inner.contacts.push(super::contact::Contact {
+            peer: peer_a,
+            session: prep.session,
+            deferred_carried: 0,
+            state: ContactState {
+                peer: peer_a.to_vec(),
+                name: "Peer A Recreated".into(),
+                greeting_delivery: GREETING_DELIVERY_CONFIRMED,
+                ..ContactState::default()
+            },
+        });
+        inner
+            .add(&peer_a, Kind::Text("recreated-session-msg".into()), false)
+            .await
+            .unwrap();
+        bob_session
+    });
+
+    let f2_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let f2_ref = f2_done.clone();
+    let e2 = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *f2_ref.borrow_mut() = Some(e2.flush(&peer_a).await);
+        })
+        .unwrap();
+
+    // Flush #2 MUST serialize behind flush #1's shared Weak-upgraded mutex (NO concurrent PushV2!).
+    pool.run_until_stalled();
+    assert_eq!(
+        push_reqs.borrow().len(),
+        1,
+        "flush #2 after delete+recreate must wait on the exact same per-peer mutex as flush #1"
+    );
+    assert!(
+        engine
+            .peer_flush_locks
+            .borrow()
+            .get(&peer_a)
+            .is_some_and(|weak| weak.strong_count() == 2)
+    );
+    assert!(f2_done.borrow().is_none());
+
+    // 3. Release flush #1 -> S2's message is pushed ONCE (zero duplicate PushV2), decrypts cleanly
+    //    on S2, both flushes complete, and `peer_flush_locks` is pruned to empty!
+    push1_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert!(f1_done.borrow().is_some());
+    assert!(f2_done.borrow().is_some());
+    assert_eq!(
+        push_reqs.borrow().len(),
+        2,
+        "recreated session message must be pushed exactly once (1 old + 1 new)"
+    );
+    let decrypted = bob_s2_session
+        .decrypt_envelope(push_reqs.borrow()[1].message.as_ref().unwrap())
+        .unwrap();
+    assert_eq!(
+        Content::from_bytes(&decrypted.content).kind,
+        Some(Kind::Text("recreated-session-msg".into()))
+    );
+    assert!(
+        !engine.peer_flush_locks.borrow().contains_key(&peer_a),
+        "peer_flush_locks entry must be pruned once both flushes exit"
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn cancelled_start_chat_during_suspended_rpc_preserves_concurrent_farewells() {
+    use crate::state::PendingNewChat;
+    use crate::util::key_to_text;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::handshake_v2::SendInitialV2Response;
+    use protocol::mailbox_v2::{PushV2Response, RegisterWriteTokenResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    let (engine, peer_a, peer_b, bundle_a1, bundle_a2, fw_a, fw_c) = pool.run_until(async {
+        let (engine, peer_b, _bob) = established_engine_on_localhost().await;
+        let mut peer_a_client = Client::new(Fetch::client(LOCAL_SERVER));
+        let peer_a = peer_a_client.identity_key();
+        let mut bundles_a = publish_bundle_for_test(&mut peer_a_client, "localhost", 2);
+        let bundle_a1 = bundles_a.remove(0);
+        let bundle_a2 = bundles_a.remove(0);
+
+        let peer_c = [0xCCu8; 32];
+        let fw_a = Farewell {
+            push_v2: PushV2Request {
+                recipient: Bytes::copy_from_slice(&peer_a),
+                message: Some(party::EncryptedMessage {
+                    header: Bytes::from_static(b"hdr-a"),
+                    content: Bytes::from_static(b"ct-a"),
+                }),
+                write_token: Bytes::from_static(&[0x11u8; 32]),
+                client_message_id: Bytes::from_static(&[0xAAu8; 16]),
+                initial_message: None,
+            }
+            .encode_to_vec(),
+        };
+        let fw_c = Farewell {
+            push_v2: PushV2Request {
+                recipient: Bytes::copy_from_slice(&peer_c),
+                message: Some(party::EncryptedMessage {
+                    header: Bytes::from_static(b"hdr-c"),
+                    content: Bytes::from_static(b"ct-c"),
+                }),
+                write_token: Bytes::from_static(&[0x22u8; 32]),
+                client_message_id: Bytes::from_static(&[0xCCu8; 16]),
+                initial_message: None,
+            }
+            .encode_to_vec(),
+        };
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let _ = publish_bundle_for_test(&mut inner.client, "localhost", 1);
+            inner.state.published_at = crate::util::now();
+            inner.state.farewells.push(fw_a.clone());
+            inner.state.farewells.push(fw_c.clone());
+            inner.save_state().await.unwrap();
+        }
+        (engine, peer_a, peer_b, bundle_a1, bundle_a2, fw_a, fw_c)
+    });
+
+    // Subcase 1: Cancel `start_chat(peer_a)` while `RegisterWriteToken` is suspended, after
+    // concurrently delivering `fw_c` via `say_farewells()` AND deleting `peer_b` (appending `fw_b`).
+    let (reg_tx, reg_rx) = oneshot::channel::<()>();
+    let reg_rx = Rc::new(RefCell::new(Some(reg_rx)));
+    let reg_started = Rc::new(Cell::new(false));
+    let reg_rx_ref = reg_rx.clone();
+    let reg_started_ref = reg_started.clone();
+    let bundle_a1_clone = bundle_a1.clone();
+
+    let _mock1 = crate::transport::mock_fetch_async(move |_server, path, _body| {
+        let reg_rx_ref = reg_rx_ref.clone();
+        let reg_started_ref = reg_started_ref.clone();
+        let bundle_a1_clone = bundle_a1_clone.clone();
+        async move {
+            if path.ends_with("/ClaimBundle") {
+                Ok((200, bundle_a1_clone.encode_to_vec()))
+            } else if path.ends_with("/RegisterWriteToken") {
+                reg_started_ref.set(true);
+                await_gate(&reg_rx_ref).await;
+                Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+            } else if path.ends_with("/PushV2") {
+                Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+            } else if path.ends_with("/SendInitialV2") {
+                Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+
+    let key_a_text = key_to_text(&peer_a);
+    let sub1 = engine.begin_new_chat_submit(PendingNewChat {
+        key: key_a_text.clone(),
+        name: "Peer A".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: false,
+    });
+    let start1_done = Rc::new(RefCell::new(None::<Result<PublicKey, StartChatError>>));
+    let start1_ref = start1_done.clone();
+    let e1 = engine.clone();
+    let k1 = key_a_text.clone();
+    spawner
+        .spawn_local(async move {
+            *start1_ref.borrow_mut() = Some(
+                e1.start_chat(sub1, &k1, "Peer A".into(), None, false, false)
+                    .await,
+            );
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert!(reg_started.get());
+    assert!(start1_done.borrow().is_none());
+
+    // Concurrently deliver `fw_c` via `say_farewells()`, delete `peer_b` (appending `fw_b`), and
+    // cancel `start_chat(peer_a)` while `RegisterWriteToken` is still suspended!
+    pool.run_until(engine.say_farewells()).unwrap();
+    pool.run_until(engine.delete(peer_b)).unwrap();
+    let fw_b_bytes = pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(inner.state.farewells.len(), 1);
+        assert_eq!(
+            inner.state.farewells[0].recipient().as_deref(),
+            Some(peer_b.as_slice())
+        );
+        inner.state.farewells[0].push_v2.clone()
+    });
+    engine.cancel_startup_submission(sub1);
+
+    reg_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*start1_done.borrow(), Some(Err(StartChatError::Cancelled)));
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert!(inner.contacts.iter().all(|c| c.peer != peer_a));
+        let fws: Vec<&[u8]> = inner
+            .state
+            .farewells
+            .iter()
+            .map(|f| f.push_v2.as_slice())
+            .collect();
+        assert!(
+            fws.contains(&fw_b_bytes.as_slice()),
+            "concurrently added peer_b farewell must not be clobbered by start_chat rollback"
+        );
+        assert!(
+            fws.contains(&fw_a.push_v2.as_slice()),
+            "peer_a retained farewell must be restored on start_chat rollback"
+        );
+        assert!(
+            !fws.contains(&fw_c.push_v2.as_slice()),
+            "concurrently delivered peer_c farewell must not be resurrected by rollback"
+        );
+    });
+    drop(_mock1);
+
+    // Subcase 2: Cancel `start_chat(peer_a)` while `SendInitialV2` is suspended and returns a
+    // definitive server refusal, after concurrently appending a farewell `fw_d`.
+    let peer_d = [0xDDu8; 32];
+    let fw_d = Farewell {
+        push_v2: PushV2Request {
+            recipient: Bytes::copy_from_slice(&peer_d),
+            message: Some(party::EncryptedMessage {
+                header: Bytes::from_static(b"hdr-d"),
+                content: Bytes::from_static(b"ct-d"),
+            }),
+            write_token: Bytes::from_static(&[0x33u8; 32]),
+            client_message_id: Bytes::from_static(&[0xDDu8; 16]),
+            initial_message: None,
+        }
+        .encode_to_vec(),
+    };
+    let (send_tx, send_rx) = oneshot::channel::<()>();
+    let send_rx = Rc::new(RefCell::new(Some(send_rx)));
+    let send_started = Rc::new(Cell::new(false));
+    let send_rx_ref = send_rx.clone();
+    let send_started_ref = send_started.clone();
+
+    let _mock2 = crate::transport::mock_fetch_async(move |_server, path, _body| {
+        let send_rx_ref = send_rx_ref.clone();
+        let send_started_ref = send_started_ref.clone();
+        let bundle_a2 = bundle_a2.clone();
+        async move {
+            if path.ends_with("/ClaimBundle") {
+                Ok((200, bundle_a2.encode_to_vec()))
+            } else if path.ends_with("/RegisterWriteToken") {
+                Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+            } else if path.ends_with("/SendInitialV2") {
+                send_started_ref.set(true);
+                await_gate(&send_rx_ref).await;
+                let err =
+                    protocol::connect::error(protocol::ErrorKind::LimitExceeded, "inbox full");
+                Ok((err.status, err.body))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+
+    let sub2 = engine.begin_new_chat_submit(PendingNewChat {
+        key: key_a_text.clone(),
+        name: "Peer A".into(),
+        server: None,
+        pq_pinned: false,
+        allow_classical: false,
+        auto_start: false,
+    });
+    let start2_done = Rc::new(RefCell::new(None::<Result<PublicKey, StartChatError>>));
+    let start2_ref = start2_done.clone();
+    let e2 = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *start2_ref.borrow_mut() = Some(
+                e2.start_chat(sub2, &key_a_text, "Peer A".into(), None, false, false)
+                    .await,
+            );
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert!(send_started.get());
+    assert!(start2_done.borrow().is_none());
+
+    pool.run_until(async {
+        let mut guard = engine.lock_inner().await;
+        let inner = guard.as_mut().unwrap();
+        inner.state.farewells.push(fw_d.clone());
+        inner.save_state().await.unwrap();
+    });
+    engine.cancel_startup_submission(sub2);
+
+    send_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*start2_done.borrow(), Some(Err(StartChatError::Cancelled)));
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert!(inner.contacts.iter().all(|c| c.peer != peer_a));
+        let fws: Vec<&[u8]> = inner
+            .state
+            .farewells
+            .iter()
+            .map(|f| f.push_v2.as_slice())
+            .collect();
+        assert!(fws.contains(&fw_b_bytes.as_slice()));
+        assert!(fws.contains(&fw_d.push_v2.as_slice()));
+        assert!(fws.contains(&fw_a.push_v2.as_slice()));
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn greeting_delivery_never_downgrades_from_confirmed_and_stays_uncertain_on_write_token_retry() {
+    use crate::vault::{
+        GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
+    };
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    // Part 1: While `PushV2` (promoted UNSENT -> UNCERTAIN) is suspended, concurrent confirmation
+    // sets `GREETING_DELIVERY_CONFIRMED`; a late server refusal (`LimitExceeded`) MUST NOT
+    // downgrade `greeting_delivery` back to `UNSENT`!
+    let (engine, peer) = pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contact(&peer).unwrap().state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+            inner
+                .add(&peer, Kind::Text("refused-after-confirm".into()), false)
+                .await
+                .unwrap();
+        }
+        (engine, peer)
+    });
+
+    let (push_tx, push_rx) = oneshot::channel::<()>();
+    let push_rx = Rc::new(RefCell::new(Some(push_rx)));
+    let push_started = Rc::new(Cell::new(false));
+    let push_rx_ref = push_rx.clone();
+    let push_started_ref = push_started.clone();
+
+    let _mock1 = crate::transport::mock_fetch_async(move |_server, path, _body| {
+        let push_rx_ref = push_rx_ref.clone();
+        let push_started_ref = push_started_ref.clone();
+        async move {
+            assert!(path.ends_with("/PushV2"), "unexpected path: {path}");
+            push_started_ref.set(true);
+            await_gate(&push_rx_ref).await;
+            let err = protocol::connect::error(protocol::ErrorKind::LimitExceeded, "too big");
+            Ok((err.status, err.body))
+        }
+    });
+
+    let flush_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let flush_ref = flush_done.clone();
+    let e1 = engine.clone();
+    spawner
+        .spawn_local(async move {
+            *flush_ref.borrow_mut() = Some(e1.flush(&peer).await);
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert!(push_started.get());
+    assert!(flush_done.borrow().is_none());
+
+    // Confirm greeting concurrently while `PushV2` is suspended!
+    pool.run_until(async {
+        let mut guard = engine.lock_inner().await;
+        let inner = guard.as_mut().unwrap();
+        assert_eq!(
+            inner.contact(&peer).unwrap().state.greeting_delivery,
+            GREETING_DELIVERY_UNCERTAIN
+        );
+        inner.contact(&peer).unwrap().mark_greeting_confirmed();
+        inner.save_state().await.unwrap();
+    });
+
+    push_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*flush_done.borrow(), Some(Ok(true)));
+    pool.run_until(async {
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(
+            inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .unwrap()
+                .state
+                .greeting_delivery,
+            GREETING_DELIVERY_CONFIRMED,
+            "late server refusal must never downgrade GREETING_DELIVERY_CONFIRMED back to UNSENT"
+        );
+    });
+    drop(_mock1);
+
+    // Part 2: `WriteTokenRejected` -> `SendInitialV2` retry keeps `GREETING_DELIVERY_UNCERTAIN`
+    // durably persisted BEFORE transmitting and across transient network drop, and reverts to
+    // `UNSENT` ONLY on definitive server refusal while still `UNCERTAIN`.
+    let (engine2, peer2) = pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contact(&peer).unwrap().state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+            inner
+                .add(&peer, Kind::Text("needs-approval-retry".into()), false)
+                .await
+                .unwrap();
+        }
+        (engine, peer)
+    });
+
+    // Subcase 2a: PushV2 -> WriteTokenRejected, SendInitialV2 retry is suspended -> verify vault
+    // has `GREETING_DELIVERY_UNCERTAIN` BEFORE/DURING SendInitialV2, and stays `UNCERTAIN` when
+    // SendInitialV2 drops transiently (`Connect` error)!
+    let (retry_tx, retry_rx) = oneshot::channel::<()>();
+    let retry_rx = Rc::new(RefCell::new(Some(retry_rx)));
+    let retry_started = Rc::new(Cell::new(false));
+    let retry_rx_ref = retry_rx.clone();
+    let retry_started_ref = retry_started.clone();
+    let _mock2a = crate::transport::mock_fetch_async(move |_server, path, _body| {
+        let retry_rx_ref = retry_rx_ref.clone();
+        let retry_started_ref = retry_started_ref.clone();
+        async move {
+            if path.ends_with("/PushV2") {
+                let err = protocol::connect::error(
+                    protocol::ErrorKind::WriteTokenRejected,
+                    "not accepted yet",
+                );
+                Ok((err.status, err.body))
+            } else if path.ends_with("/SendInitialV2") {
+                retry_started_ref.set(true);
+                await_gate(&retry_rx_ref).await;
+                Err(protocol::Error::new(
+                    protocol::ErrorKind::Connect,
+                    "response lost after server accepted",
+                ))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        }
+    });
+
+    let f2a_done = Rc::new(RefCell::new(None::<Result<bool, String>>));
+    let f2a_ref = f2a_done.clone();
+    let e2a = engine2.clone();
+    spawner
+        .spawn_local(async move {
+            *f2a_ref.borrow_mut() = Some(e2a.flush(&peer2).await);
+        })
+        .unwrap();
+
+    pool.run_until_stalled();
+    assert!(retry_started.get());
+    assert!(f2a_done.borrow().is_none());
+    // While `SendInitialV2` retry is in flight, persisted vault state MUST be `UNCERTAIN` (not `UNSENT`)!
+    pool.run_until(async {
+        let guard = engine2.lock_inner().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(
+            inner.vault.state.borrow().contacts[0].greeting_delivery,
+            GREETING_DELIVERY_UNCERTAIN,
+            "WriteTokenRejected SendInitialV2 retry must transmit with persisted UNCERTAIN"
+        );
+    });
+
+    // Transient network drop on `SendInitialV2` MUST keep `GREETING_DELIVERY_UNCERTAIN`!
+    retry_tx.send(()).unwrap();
+    pool.run_until_stalled();
+    assert_eq!(*f2a_done.borrow(), Some(Ok(false)));
+    pool.run_until(async {
+        let guard = engine2.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(
+            inner.vault.state.borrow().contacts[0].greeting_delivery,
+            GREETING_DELIVERY_UNCERTAIN,
+            "transient SendInitialV2 retry error must preserve GREETING_DELIVERY_UNCERTAIN"
+        );
+    });
+    drop(_mock2a);
+
+    // Subcase 2b: Clear backoff, reset to `UNSENT`, and have `SendInitialV2` retry return a
+    // definitive server refusal -> reverts cleanly `UNCERTAIN -> UNSENT`.
+    engine2.clear_approval_backoff(&peer2);
+    pool.run_until(async {
+        let mut guard = engine2.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
+        inner.contact(&peer2).unwrap().state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+        inner.save_state().await.unwrap();
+    });
+    let _mock2b = crate::transport::mock_fetch(|_server, path, _body| {
+        if path.ends_with("/PushV2") {
+            let err = protocol::connect::error(
+                protocol::ErrorKind::WriteTokenRejected,
+                "not accepted yet",
+            );
+            Ok((err.status, err.body))
+        } else if path.ends_with("/SendInitialV2") {
+            let err = protocol::connect::error(protocol::ErrorKind::LimitExceeded, "inbox full");
+            Ok((err.status, err.body))
+        } else {
+            panic!("unexpected path: {path}");
+        }
+    });
+    assert_eq!(pool.run_until(engine2.flush(&peer2)), Ok(false));
+    pool.run_until(async {
+        let guard = engine2.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert_eq!(
+            inner.vault.state.borrow().contacts[0].greeting_delivery,
+            GREETING_DELIVERY_UNSENT,
+            "definitive server refusal on promoted SendInitialV2 retry should revert to UNSENT"
         );
     });
 }

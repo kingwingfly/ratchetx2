@@ -249,6 +249,11 @@ pub struct Engine<V = Vault> {
     /// Per-peer exponential backoff after `WriteTokenRejected` while awaiting peer approval:
     /// maps `peer -> (next_try_monotonic_ms, current_delay_ms)`.
     approval_backoff: RefCell<HashMap<PublicKey, (u64, u64)>>,
+    /// Per-peer serialization mutexes for outbox flushes (`ClaimBundle`, `RegisterWriteToken`,
+    /// `SendInitialV2`, `PushV2`, `push_events`), stored as `Weak` handles so an in-flight flush's
+    /// mutex remains uniquely shared across concurrent delete+recreate cycles and is pruned cleanly
+    /// once the last holder drops.
+    peer_flush_locks: RefCell<HashMap<PublicKey, std::rc::Weak<Mutex<()>>>>,
 }
 
 /// Per-row reactive signal handles owned by the currently rendered chat.
@@ -590,6 +595,7 @@ impl<V: VaultStore> Engine<V> {
             deleted_peer_seq: Cell::new(0),
             clock_skew_warned: Cell::new(false),
             approval_backoff: RefCell::default(),
+            peer_flush_locks: RefCell::default(),
         });
         // Register synchronous `pagehide` teardown BEFORE releasing the exclusive Web Lock.
         let weak = Rc::downgrade(&engine);
@@ -690,6 +696,7 @@ impl<V: VaultStore> Engine<V> {
         self.loading.borrow_mut().clear();
         self.waits_sign_in.borrow_mut().clear();
         self.approval_backoff.borrow_mut().clear();
+        self.peer_flush_locks.borrow_mut().clear();
         *self.new_chat_feedback.borrow_mut() = None;
         self.cancel_active_startup_submission();
         *self.displayed_history.borrow_mut() = None;
@@ -731,6 +738,28 @@ impl<V: VaultStore> Engine<V> {
         //    and `ensure_vault_lock_owned()` prevent any post-`pagehide` IDB or `Ui` writes.
         if let Some(mut guard) = self.inner.try_lock() {
             let _ = guard.take();
+        }
+    }
+
+    /// Return the per-peer serialization mutex for `peer`'s outbox flush, upgrading any live
+    /// `Weak` entry so concurrent delete+recreate cycles strictly serialize behind an in-flight
+    /// flush. Always acquired BEFORE `self.lock_inner()` (never while holding `self.inner`).
+    pub(super) fn peer_flush_lock(&self, peer: &PublicKey) -> Rc<Mutex<()>> {
+        let mut map = self.peer_flush_locks.borrow_mut();
+        if let Some(existing) = map.get(peer).and_then(std::rc::Weak::upgrade) {
+            return existing;
+        }
+        let lock = Rc::new(Mutex::new(()));
+        map.insert(*peer, Rc::downgrade(&lock));
+        lock
+    }
+
+    /// Remove `peer`'s entry from `peer_flush_locks` only once no active or queued flush holds an
+    /// `Rc` to that mutex (`strong_count() == 0`).
+    pub(super) fn prune_peer_flush_lock(&self, peer: &PublicKey) {
+        let mut map = self.peer_flush_locks.borrow_mut();
+        if map.get(peer).is_some_and(|weak| weak.strong_count() == 0) {
+            map.remove(peer);
         }
     }
 
@@ -2294,17 +2323,26 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            // Register write token BEFORE pushing `Events { accepted: true }` so the peer's
-            // follow-up messages are immediately accepted on our DO.
-            let _ = self.flush_pending_grants_for(inner, &peer).await;
-            if !self.is_live(vgen) {
-                return Err("locked".into());
-            }
-            let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
-            if !self.is_live(vgen) {
-                return Err("locked".into());
-            }
             self.ui.contacts.set(inner.views());
+        }
+        // Register write token outside `self.inner` BEFORE pushing `Events { accepted: true }` so
+        // the peer's follow-up messages are immediately accepted on our DO without stalling UI.
+        let _ = self.flush_pending_grants_for_peer(&peer).await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
+        {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            if let Some(inner) = guard.as_mut() {
+                let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+                if !self.is_live(vgen) {
+                    return Err("locked".into());
+                }
+                self.ui.contacts.set(inner.views());
+            }
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -2487,6 +2525,7 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         self.clear_approval_backoff(&peer);
+        self.prune_peer_flush_lock(&peer);
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
         // chat, which `may_keep` now tells them is gone.
         upload_ids.extend(self.ui.uploads.with_untracked(|uploads| {

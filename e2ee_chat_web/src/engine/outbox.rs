@@ -1,31 +1,94 @@
 //! Durable outgoing messages, delivery updates and session replacement recovery.
 
 use super::attachments::ServerDeleteJob;
-use super::contact::{forget_told, keep_last};
+use super::contact::{Contact, forget_told, keep_last};
 use super::{
     Engine, Inner, NOT_SIGNED_IN_HERE, ProtocolRpcScope, VaultStore, origin, records, same_server,
     should_require_update_for_rpc,
 };
 use crate::content::{Content, Events, Kind, stamp};
 use crate::state::{Delivery, MessageView, Step, Ui};
+use crate::transport::Fetch;
 use crate::util::{describe, now, short};
 use crate::vault::{
     Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
-    GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, Outgoing,
-    OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
-    SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
+    GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
+    HistoryEntry, Outgoing, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
+    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
 };
 use bytes::Bytes;
 use leptos::prelude::*;
-use session::protocol::handshake_v2::SendInitialV2Request;
+use session::protocol::handshake_v2::{LocalHandshakeV2, SendInitialV2Request};
+use session::protocol::mailbox_v2::{LocalMailboxV2, PushV2Request};
 use session::{ErrorKind, PublicKey};
 use std::collections::{BTreeMap, BTreeSet, btree_map};
+
+/// Wire payload and metadata prepared under `self.inner` before releasing the mutex for `PushV2`.
+struct PreparedPush {
+    outgoing: Outgoing,
+    session_id: Vec<u8>,
+    push_req: PushV2Request,
+    server: String,
+    retry_initial: Option<SendInitialV2Request>,
+    promoted_from_unsent: bool,
+}
+
+/// Next action prepared under `self.inner` during [`Engine::flush`] before dropping the lock.
+enum NextPush {
+    Done,
+    NeedsNewSession,
+    Push(Box<PreparedPush>),
+}
+
+/// Outcome of committing one completed outbox item under `self.inner`.
+enum CommitOutcome {
+    Committed,
+    Aborted,
+}
+
+/// Outcome of establishing a replacement session via lock-free `ClaimBundle` +
+/// `RegisterWriteToken` + `SendInitialV2`.
+enum RekeyOutcome {
+    /// Active session is now ready (either newly created or an inbound session arrived).
+    Ready,
+    /// Paused pending explicit user security decision (alert/approval already persisted).
+    Paused,
+    /// Permanently failed (`NotFound` / `InvalidKeys`): waiting outbox items marked failed.
+    Failed,
+    /// Contact was deleted or isolated concurrently while rekeying.
+    ContactGone,
+    /// Server rejected v2 protocol (`Unimplemented`); prompt user to refresh.
+    UpdateRequired(String),
+    /// `pagehide` / vault teardown fired while rekeying.
+    Aborted,
+}
+
+/// Result of sealing one unsealed outbox item on an already-active session under `self.inner`.
+enum LocalSealOutcome {
+    Ready,
+    CorruptDropped(u64, Vec<(u64, HistoryEntry)>),
+}
 
 impl<V: VaultStore> Engine<V> {
     /// Push the messages waiting for `peer`, in order, each encrypted as its turn comes, then
     /// the events to tell the peer. Returns whether any went.
+    ///
+    /// Serialized per peer via `peer_flush_locks` while releasing `Engine::inner` across every
+    /// network RPC (`ClaimBundle`, `RegisterWriteToken`, `SendInitialV2`, `PushV2`, `push_events`)
+    /// so UI operations and independent peers' flushes never stall behind slow RTTs.
     pub(super) async fn flush(&self, peer: &PublicKey) -> Result<bool, String> {
         let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
+        // Declare the RAII prune guard BEFORE `peer_lock` so Rust drops `_peer_guard`, then
+        // `peer_lock` (decrementing its strong count), and finally removes the `Weak` entry iff
+        // `strong_count() == 0`.
+        let _prune_peer_lock = scopeguard::guard(*peer, |peer| {
+            self.prune_peer_flush_lock(&peer);
+        });
+        let peer_lock = self.peer_flush_lock(peer);
+        let _peer_guard = peer_lock.lock().await;
         if !self.is_live(vgen) {
             return Ok(false);
         }
@@ -54,166 +117,330 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        let mut guard = self.lock_inner().await;
-        if !self.is_live(vgen) {
-            return Ok(false);
-        }
-        let Some(inner) = guard.as_mut() else {
-            return Ok(false);
-        };
-        // Flush any unsaved requeued outbox records before `seal_next` reads from IndexedDB,
-        // ensuring we never encrypt stale empty-content records after an earlier save failure.
-        if inner.unsaved_state || inner.unsaved_outbox.iter().any(|(p, _, _)| p == peer) {
-            inner.save(&[]).await.map_err(|e| describe(&e))?;
-        }
-        if !self.is_live(vgen) {
-            return Ok(false);
-        }
-        // Never send or send receipts on a brand-new quarantined classical contact.
-        if inner
-            .contacts
-            .iter()
-            .any(|c| c.peer == *peer && c.is_new_quarantined())
-        {
-            return Ok(false);
-        }
-        if let Some(outcome) = inner.requeue_before_push(peer).await? {
-            if !self.is_live(vgen) {
-                return Ok(false);
-            }
-            outcome.log_missing(&self.ui, peer);
-            self.show_changes(inner, peer, &outcome.history);
-        }
+
         let mut changed = false;
-        let mut result = Ok(());
+        let mut result: Result<(), String> = Ok(());
         let mut server_deletes: Vec<ServerDeleteJob> = vec![];
-        // Completed outbox items (with their original `Outgoing` so M-18 can keep any item whose
-        // history entry failed to read from IndexedDB instead of deleting its outbox record).
-        // Items stay in `contact.state.outbox` until the atomic `save_with` below commits (or
-        // rolls back cleanly on failure), indexed via `pushed_count`.
-        let mut completed: Vec<(Outgoing, Step, u64)> = vec![];
-        let mut pushed_count = 0usize;
-        // Whether this page can sign in to the server, which only its own page can: otherwise a
-        // message that takes it never goes, and must not hold up those after it.
-        let signs_in_here = same_server(&inner.server, &origin());
-        while let Some(contact) = inner.contact(peer)
-            && let Some(outgoing) = contact.state.outbox.get(pushed_count).cloned()
-        {
+        let mut signs_in_here = false;
+
+        loop {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            // An attachment whose upload has not started: it, and what was sent after it, wait
-            // for it to start.
-            if outgoing.awaits_upload {
+            if self.waits_sign_in.borrow().contains(peer) || self.is_approval_backed_off(peer) {
                 break;
             }
-            if !outgoing.sealed {
-                // Pause sealing if waiting on explicit user action (quarantine / classical approval / alert).
-                if contact.session.needs_new_session()
-                    && (contact.state.quarantined
-                        || contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
-                        || contact.state.security_alert != SECURITY_ALERT_NONE)
-                {
-                    break;
+
+            // Phase 1 under `self.inner`: recover unsaved state / requeue / seal locally and
+            // extract the exact `PushV2Request` to transmit outside the mutex.
+            let next_push = {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(false);
                 }
-                let needed_new_session = contact.session.needs_new_session();
-                // Encrypted now that it goes, so that its place is after what came so far; the
-                // ones after it wait their turn.
-                match inner.seal_next(peer).await {
-                    _ if !self.is_live(vgen) => return Ok(false),
-                    Ok(SealOutcome::Ready) => {
-                        if needed_new_session
-                            && inner
-                                .contact(peer)
-                                .is_some_and(|c| !c.session.needs_new_session())
-                        {
-                            self.ui.contacts.set(inner.views());
-                        }
-                    }
-                    Ok(SealOutcome::Paused) => {
-                        self.ui.contacts.set(inner.views());
+                let Some(inner) = guard.as_mut() else {
+                    return Ok(false);
+                };
+                signs_in_here = same_server(&inner.server, &origin());
+                // Flush any unsaved requeued outbox records before sealing reads from IndexedDB,
+                // ensuring we never encrypt stale empty-content records after a prior save failure.
+                if inner.unsaved_state || inner.unsaved_outbox.iter().any(|(p, _, _)| p == peer) {
+                    if let Err(e) = inner.save(&[]).await {
+                        result = Err(describe(&e));
                         break;
                     }
-                    Ok(SealOutcome::Failed(reason, failed_indices)) => {
-                        for idx in &failed_indices {
-                            self.release(peer, *idx);
-                        }
-                        server_deletes.extend(
-                            self.prepare_cancel_uploads_for_failed(inner, peer, &failed_indices)
-                                .await,
-                        );
+                    if !self.is_live(vgen) {
+                        return Ok(false);
+                    }
+                }
+                // Never send or send receipts on a brand-new quarantined classical contact.
+                if inner
+                    .contacts
+                    .iter()
+                    .any(|c| c.peer == *peer && c.is_new_quarantined())
+                {
+                    return Ok(false);
+                }
+                match inner.requeue_before_push(peer).await {
+                    Ok(Some(outcome)) => {
                         if !self.is_live(vgen) {
                             return Ok(false);
                         }
-                        self.ui
-                            .notify(format!("messages could not be sent: {reason}"));
-                        if self.ui.open.get_untracked() == Some(*peer) {
-                            self.show_history(inner, peer).await;
-                        }
-                        changed = true;
+                        outcome.log_missing(&self.ui, peer);
+                        self.show_changes(inner, peer, &outcome.history);
                     }
-                    Ok(SealOutcome::CorruptDropped(dropped_index, history)) => {
-                        self.release(peer, dropped_index);
-                        server_deletes.extend(
-                            self.prepare_cancel_uploads_for_failed(inner, peer, &[dropped_index])
-                                .await,
-                        );
-                        if !self.is_live(vgen) {
-                            return Ok(false);
-                        }
-                        self.ui.log(format!(
-                            "Dropped corrupt pending message #{dropped_index} for {}: outbox record could not be recovered",
-                            short(peer)
-                        ));
-                        self.show_changes(inner, peer, &history);
-                        changed = true;
-                    }
-                    Ok(SealOutcome::UpdateRequired(reason)) => {
-                        self.require_update(reason.clone());
-                        result = Err(reason);
-                        break;
-                    }
+                    Ok(None) => {}
                     Err(e) => {
                         result = Err(e);
                         break;
                     }
                 }
-                continue;
+
+                // Loop locally while sealing/recovering without network RPCs.
+                let mut step = NextPush::Done;
+                while let Some(contact) = inner.contact(peer)
+                    && let Some(outgoing) = contact.state.outbox.first().cloned()
+                {
+                    if !self.is_live(vgen) {
+                        return Ok(false);
+                    }
+                    // An attachment whose upload has not started: it, and what was sent after it,
+                    // wait for it to start.
+                    if outgoing.awaits_upload {
+                        step = NextPush::Done;
+                        break;
+                    }
+                    if !outgoing.sealed {
+                        if contact.session.needs_new_session() {
+                            // Pause sealing if waiting on explicit user action (quarantine /
+                            // classical approval / security alert).
+                            if contact.state.quarantined
+                                || contact.state.classical_approval_needed
+                                    != CLASSICAL_APPROVAL_NONE
+                                || contact.state.security_alert != SECURITY_ALERT_NONE
+                            {
+                                step = NextPush::Done;
+                                break;
+                            }
+                            step = NextPush::NeedsNewSession;
+                            break;
+                        }
+                        match inner.seal_head_on_active_session(peer).await {
+                            _ if !self.is_live(vgen) => return Ok(false),
+                            Ok(LocalSealOutcome::Ready) => continue,
+                            Ok(LocalSealOutcome::CorruptDropped(dropped_index, history)) => {
+                                self.release(peer, dropped_index);
+                                server_deletes.extend(
+                                    self.prepare_cancel_uploads_for_failed(
+                                        inner,
+                                        peer,
+                                        &[dropped_index],
+                                    )
+                                    .await,
+                                );
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
+                                self.ui.log(format!(
+                                    "Dropped corrupt pending message #{dropped_index} for {}: outbox record could not be recovered",
+                                    short(peer)
+                                ));
+                                self.show_changes(inner, peer, &history);
+                                changed = true;
+                                continue;
+                            }
+                            Err(e) => {
+                                result = Err(e);
+                                step = NextPush::Done;
+                                break;
+                            }
+                        }
+                    }
+
+                    let record = match inner.vault.outgoing(peer, outgoing.history_index).await {
+                        _ if !self.is_live(vgen) => return Ok(false),
+                        Ok(record) => record,
+                        Err(crate::vault::Error::Corrupt(reason)) => {
+                            match inner
+                                .recover_corrupt_outbox(peer, outgoing.history_index)
+                                .await
+                            {
+                                _ if !self.is_live(vgen) => return Ok(false),
+                                Ok(CorruptOutboxRecovery::Rebuilt(_)) => {
+                                    self.ui.log(format!(
+                                        "Rebuilt corrupt outbox record #{} for {} ({reason})",
+                                        outgoing.history_index,
+                                        short(peer)
+                                    ));
+                                    changed = true;
+                                    continue;
+                                }
+                                Ok(CorruptOutboxRecovery::Dropped { history }) => {
+                                    self.release(peer, outgoing.history_index);
+                                    server_deletes.extend(
+                                        self.prepare_cancel_uploads_for_failed(
+                                            inner,
+                                            peer,
+                                            &[outgoing.history_index],
+                                        )
+                                        .await,
+                                    );
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                    self.ui.log(format!(
+                                        "Dropped corrupt outbox record #{} for {} ({reason})",
+                                        outgoing.history_index,
+                                        short(peer)
+                                    ));
+                                    self.show_changes(inner, peer, &history);
+                                    changed = true;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    result = Err(e);
+                                    step = NextPush::Done;
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            result = Err(describe(&e));
+                            step = NextPush::Done;
+                            break;
+                        }
+                    };
+
+                    // If this sealed record belongs to an older session than `active_id`, requeue
+                    // sealed outbox items on the current active session before transmitting.
+                    let stale_session = !record.session_id.is_empty()
+                        && inner.contact(peer).is_some_and(|c| {
+                            c.session
+                                .active_id()
+                                .is_some_and(|id| id.as_slice() != record.session_id.as_slice())
+                        });
+                    if stale_session {
+                        if let Some(contact) = inner.contact(peer) {
+                            contact.state.needs_requeue_sealed = true;
+                        }
+                        match inner.requeue_before_push(peer).await {
+                            Ok(Some(outcome)) => {
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
+                                outcome.log_missing(&self.ui, peer);
+                                self.show_changes(inner, peer, &outcome.history);
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                result = Err(e);
+                                step = NextPush::Done;
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+
+                    let Some(sealed_msg) = record.to_sealed() else {
+                        match inner
+                            .recover_corrupt_outbox(peer, outgoing.history_index)
+                            .await
+                        {
+                            _ if !self.is_live(vgen) => return Ok(false),
+                            Ok(CorruptOutboxRecovery::Rebuilt(_)) => {
+                                self.ui.log(format!(
+                                    "Rebuilt incomplete sealed outbox record #{} for {}",
+                                    outgoing.history_index,
+                                    short(peer)
+                                ));
+                                changed = true;
+                                continue;
+                            }
+                            Ok(CorruptOutboxRecovery::Dropped { history }) => {
+                                self.release(peer, outgoing.history_index);
+                                server_deletes.extend(
+                                    self.prepare_cancel_uploads_for_failed(
+                                        inner,
+                                        peer,
+                                        &[outgoing.history_index],
+                                    )
+                                    .await,
+                                );
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
+                                self.show_changes(inner, peer, &history);
+                                changed = true;
+                                continue;
+                            }
+                            Err(e) => {
+                                result = Err(e);
+                                step = NextPush::Done;
+                                break;
+                            }
+                        }
+                    };
+
+                    // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE dropping `guard` and
+                    // transmitting a message that can carry a previously unsent initial greeting.
+                    let promoted_from_unsent = inner.contacts.iter().any(|c| {
+                        c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT
+                    });
+                    if promoted_from_unsent {
+                        if let Err(e) = inner
+                            .with_contact_tx(peer, async |inner| {
+                                if let Some(contact) = inner.contact(peer) {
+                                    contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                                }
+                                inner.save(&[]).await.map_err(|e| describe(&e))
+                            })
+                            .await
+                        {
+                            result = Err(e);
+                            step = NextPush::Done;
+                            break;
+                        }
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
+                    }
+
+                    let session_id = if !record.session_id.is_empty() {
+                        record.session_id.clone()
+                    } else {
+                        inner
+                            .contact(peer)
+                            .and_then(|c| c.session.active_id().map(|id| id.to_vec()))
+                            .unwrap_or_default()
+                    };
+                    let push_req = sealed_msg.push_v2_request(peer);
+                    let retry_initial = (!record.carried_initial.is_empty())
+                        .then(|| {
+                            session::protocol::mailbox_v2::decode_carried_initial(
+                                &record.carried_initial,
+                            )
+                            .map(|wire_initial| SendInitialV2Request {
+                                recipient: Bytes::copy_from_slice(peer),
+                                message: Some(wire_initial),
+                            })
+                        })
+                        .flatten();
+                    step = NextPush::Push(Box::new(PreparedPush {
+                        outgoing,
+                        session_id,
+                        push_req,
+                        server: inner.server.clone(),
+                        retry_initial,
+                        promoted_from_unsent,
+                    }));
+                    break;
+                }
+                step
+            };
+
+            if result.is_err() {
+                break;
             }
-            let record = match inner.vault.outgoing(peer, outgoing.history_index).await {
-                Ok(record) => record,
-                Err(crate::vault::Error::Corrupt(reason)) => {
-                    match inner
-                        .recover_corrupt_outbox(peer, outgoing.history_index)
+
+            // Phase 2 outside `self.inner`: run lock-free rekey or `PushV2`.
+            match next_push {
+                NextPush::Done => break,
+                NextPush::NeedsNewSession => {
+                    match self
+                        .ensure_session_for_outbox(vgen, peer, &mut server_deletes)
                         .await
                     {
-                        Ok(CorruptOutboxRecovery::Rebuilt(_)) => {
-                            self.ui.log(format!(
-                                "Rebuilt corrupt outbox record #{} for {} ({reason})",
-                                outgoing.history_index,
-                                short(peer)
-                            ));
+                        Ok(RekeyOutcome::Aborted) => return Ok(false),
+                        Ok(RekeyOutcome::Ready) => continue,
+                        Ok(RekeyOutcome::Paused | RekeyOutcome::ContactGone) => break,
+                        Ok(RekeyOutcome::Failed) => {
                             changed = true;
                             continue;
                         }
-                        Ok(CorruptOutboxRecovery::Dropped { history }) => {
-                            self.release(peer, outgoing.history_index);
-                            server_deletes.extend(
-                                self.prepare_cancel_uploads_for_failed(
-                                    inner,
-                                    peer,
-                                    &[outgoing.history_index],
-                                )
-                                .await,
-                            );
-                            self.ui.log(format!(
-                                "Dropped corrupt outbox record #{} for {} ({reason})",
-                                outgoing.history_index,
-                                short(peer)
-                            ));
-                            self.show_changes(inner, peer, &history);
-                            changed = true;
-                            continue;
+                        Ok(RekeyOutcome::UpdateRequired(reason)) => {
+                            self.require_update(reason.clone());
+                            result = Err(reason);
+                            break;
                         }
                         Err(e) => {
                             result = Err(e);
@@ -221,358 +448,952 @@ impl<V: VaultStore> Engine<V> {
                         }
                     }
                 }
-                Err(e) => {
-                    result = Err(describe(&e));
-                    break;
-                }
-            };
-            // If this sealed record belongs to an older session than `active_id`, requeue sealed
-            // outbox items on the current active session before transmitting.
-            let stale_session = !record.session_id.is_empty()
-                && inner.contact(peer).is_some_and(|c| {
-                    c.session
-                        .active_id()
-                        .is_some_and(|id| id.as_slice() != record.session_id.as_slice())
-                });
-            if stale_session {
-                if let Some(contact) = inner.contact(peer) {
-                    contact.state.needs_requeue_sealed = true;
-                }
-                if let Some(outcome) = inner.requeue_before_push(peer).await? {
-                    outcome.log_missing(&self.ui, peer);
-                    self.show_changes(inner, peer, &outcome.history);
-                }
-                continue;
-            }
-            let Some(sealed_msg) = record.to_sealed() else {
-                match inner
-                    .recover_corrupt_outbox(peer, outgoing.history_index)
-                    .await
-                {
-                    Ok(CorruptOutboxRecovery::Rebuilt(_)) => {
-                        self.ui.log(format!(
-                            "Rebuilt incomplete sealed outbox record #{} for {}",
-                            outgoing.history_index,
-                            short(peer)
-                        ));
-                        changed = true;
-                        continue;
-                    }
-                    Ok(CorruptOutboxRecovery::Dropped { history }) => {
-                        self.release(peer, outgoing.history_index);
-                        server_deletes.extend(
-                            self.prepare_cancel_uploads_for_failed(
-                                inner,
-                                peer,
-                                &[outgoing.history_index],
-                            )
-                            .await,
-                        );
-                        self.show_changes(inner, peer, &history);
-                        changed = true;
-                        continue;
-                    }
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                }
-            };
-            // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE transmitting a message that can carry a
-            // previously unsent initial greeting so a lost response still notifies an established
-            // peer on deletion without carrying the unconfirmed greeting.
-            let push_res = match inner
-                .transmit_with_greeting_delivery(peer, false, false, async |inner| {
-                    let Some(contact) = inner.contact(peer) else {
-                        return Err(session::Error::from(ErrorKind::NotFound));
-                    };
-                    contact.session.push_v2(&sealed_msg).await.map(|_| ())
-                })
-                .await
-            {
-                _ if !self.is_live(vgen) => return Ok(false),
-                Ok(res) => res,
-                Err(e) => {
-                    result = Err(e);
-                    break;
-                }
-            };
-            if inner.contact(peer).is_none() {
-                break;
-            }
-            let step = match push_res {
-                Ok(()) => {
-                    self.clear_approval_backoff(peer);
-                    self.release(peer, outgoing.history_index);
-                    (Step::Pushed, outgoing.clock)
-                }
-                Err(e) if e.kind() == ErrorKind::WriteTokenRejected => {
-                    let known = inner
-                        .contact(peer)
-                        .is_some_and(|c| c.session.is_known_by_peer());
-                    if known {
-                        // Peer previously accepted us and has since revoked/deleted the chat:
-                        // retire active session and requeue so the next sync starts fresh.
-                        if let Some(contact) = inner.contact(peer) {
-                            contact.state.needs_requeue_sealed = true;
-                            contact.session.retire();
-                        }
-                        let _ = inner.save_state().await;
-                        if self.is_live(vgen) {
-                            self.ui.contacts.set(inner.views());
-                        }
-                        break;
-                    }
-                    // Peer has not yet accepted our chat request: retry idempotent `SendInitialV2`
-                    // at most once if greeting delivery wasn't confirmed, then back off without
-                    // dropping the outbox or setting an offline error.
-                    let greeting_unconfirmed = inner
-                        .contact(peer)
-                        .is_some_and(|c| c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED);
-                    if greeting_unconfirmed
-                        && !record.carried_initial.is_empty()
-                        && let Some(wire_initial) =
-                            session::protocol::mailbox_v2::decode_carried_initial(
-                                &record.carried_initial,
-                            )
-                    {
-                        let retry_req = SendInitialV2Request {
-                            recipient: Bytes::copy_from_slice(peer),
-                            message: Some(wire_initial),
-                        };
-                        if inner
-                            .client
-                            .send_prepared_initiate_v2(&retry_req)
-                            .await
-                            .is_ok()
-                        {
-                            if let Some(contact) = inner.contact(peer) {
-                                contact.mark_greeting_confirmed();
-                            }
-                            let _ = inner.save_state().await;
-                        }
-                    }
+                NextPush::Push(prepared) => {
+                    let PreparedPush {
+                        outgoing,
+                        session_id,
+                        push_req,
+                        server,
+                        retry_initial,
+                        promoted_from_unsent,
+                    } = *prepared;
+                    let push_res: session::Result<()> = Fetch::client(&server)
+                        .push_v2(push_req)
+                        .await
+                        .map(|_| ())
+                        .map_err(session::Error::from);
                     if !self.is_live(vgen) {
                         return Ok(false);
                     }
-                    let delay_ms = self.record_approval_backoff(peer);
-                    let label = inner
-                        .contact(peer)
-                        .map_or_else(|| short(peer), |c| c.view().label());
-                    self.ui.log(format!(
-                        "Waiting for {label} to accept your chat request (retrying in {}s)…",
-                        delay_ms / 1000
-                    ));
-                    break;
-                }
-                // Large enough to cost the server storage, which it keeps only for those signed
-                // in to it: it waits, with those after it, until this browser is.
-                Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
-                    self.waits_sign_in.borrow_mut().insert(*peer);
-                    self.hold(peer, outgoing.history_index);
-                    self.ask_sign_in();
-                    break;
-                }
-                // The same, but this page cannot sign in to the server: it never will go.
-                Err(e) if e.kind() == ErrorKind::SignInRequired => {
-                    self.release(peer, outgoing.history_index);
-                    self.ui
-                        .notify(format!("a message could not be sent: {NOT_SIGNED_IN_HERE}"));
-                    (Step::Refused, 0)
-                }
-                // Too large for the server: it never will go.
-                Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::LimitExceeded => {
-                    self.release(peer, outgoing.history_index);
-                    self.ui
-                        .notify(format!("a message could not be sent: {}", describe(&e)));
-                    (Step::Refused, 0)
-                }
-                Err(e) => {
-                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-                    result = Err(describe(&e));
-                    break;
-                }
-            };
-            completed.push((outgoing, step.0, step.1));
-            pushed_count += 1;
-            changed = true;
-        }
-        if !completed.is_empty() {
-            let pushed_any = completed.iter().any(|(_, step, _)| *step == Step::Pushed);
-            let mut entries = vec![];
-            let mut gone = vec![];
-            let mut keep_in_outbox = vec![];
-            let mut new_awaiting = vec![];
-            for (outgoing, step, clock) in completed {
-                let index = outgoing.history_index;
-                match inner.vault.entry(peer, index).await {
-                    Ok(Some(mut entry)) => {
-                        entry.set_delivery(entry.delivery().after(step));
-                        // Pushed, it has its place, and waits for the peer to read it.
-                        if step == Step::Pushed {
-                            entry.place = clock;
-                            let content = entry.content.get_or_insert_default();
-                            content.clock = clock;
-                            let attachment = matches!(content.kind, Some(Kind::Attachment(_)));
-                            new_awaiting.push(Awaiting {
-                                place: clock,
-                                history_index: index,
-                                read: false,
-                                attachment,
+
+                    // Phase 3: Re-acquire `self.inner`, validate live generation, contact
+                    // existence, matching active session, `!needs_requeue_sealed`, and head index.
+                    let mut guard = self.lock_inner().await;
+                    if !self.is_live(vgen) {
+                        return Ok(false);
+                    }
+                    let Some(inner) = guard.as_mut() else {
+                        return Ok(false);
+                    };
+                    if inner.contact(peer).is_none() {
+                        break;
+                    }
+                    let session_matches = inner
+                        .contacts
+                        .iter()
+                        .find(|c| c.peer == *peer)
+                        .is_some_and(|c| {
+                            !c.session.needs_new_session()
+                                && !c.state.needs_requeue_sealed
+                                && (session_id.is_empty()
+                                    || c.session
+                                        .active_id()
+                                        .is_some_and(|id| id.as_slice() == session_id.as_slice()))
+                        });
+                    let will_retry_initial = session_matches
+                        && matches!(&push_res, Err(e) if e.kind() == ErrorKind::WriteTokenRejected)
+                        && retry_initial.is_some()
+                        && inner
+                            .contacts
+                            .iter()
+                            .find(|c| c.peer == *peer)
+                            .is_some_and(|c| {
+                                !c.session.is_known_by_peer()
+                                    && c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
                             });
+                    // Only revert `UNCERTAIN -> UNSENT` when NOT about to transmit a `SendInitialV2`
+                    // retry, and NEVER downgrade a greeting already confirmed concurrently.
+                    if let Err(ref e) = push_res
+                        && e.is_server_refusal()
+                        && promoted_from_unsent
+                        && session_matches
+                        && !will_retry_initial
+                    {
+                        let reverted = inner.contact(peer).is_some_and(|contact| {
+                            if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                                contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if reverted {
+                            let _ = inner.save_state().await;
+                            if !self.is_live(vgen) {
+                                return Ok(false);
+                            }
                         }
-                        entries.push((index, entry));
-                        gone.push((*peer, index, None));
                     }
-                    Ok(None) => {
-                        gone.push((*peer, index, None));
+                    if !session_matches {
+                        // Active session changed or requeue became pending while `PushV2` was
+                        // suspended: loop to requeue and re-seal cleanly on the active session.
+                        continue;
                     }
-                    // M-18: Do NOT delete outbox entries when reading the history entry fails!
-                    Err(e) => {
-                        result = Err(describe(&e));
-                        keep_in_outbox.push(outgoing);
+                    let head_matches = inner.contact(peer).is_some_and(|c| {
+                        c.state.outbox.first().is_some_and(|head| {
+                            head.history_index == outgoing.history_index
+                                && head.sealed
+                                && head.clock == outgoing.clock
+                        })
+                    });
+                    if !head_matches {
+                        // Head item was already settled (e.g. via peer receipt), requeued, or
+                        // cancelled while `PushV2` was suspended: continue with the new head.
+                        continue;
                     }
-                }
-            }
-            if !gone.is_empty() {
-                // Take a snapshot after any committed `seal_next` advances and BEFORE mutating
-                // `outbox`/`awaiting` so a `save_with` failure rolls back cleanly without
-                // stranding history entries as `Pending`.
-                let snapshot = inner.contact(peer).map(|c| c.snapshot());
-                if let Some(contact) = inner.contact(peer) {
-                    let drain_end = pushed_count.min(contact.state.outbox.len());
-                    contact.state.outbox.splice(0..drain_end, keep_in_outbox);
-                    if pushed_any {
-                        contact.mark_greeting_confirmed();
+
+                    match push_res {
+                        Ok(()) => {
+                            self.clear_approval_backoff(peer);
+                            self.release(peer, outgoing.history_index);
+                            match self
+                                .commit_outbox_item(
+                                    vgen,
+                                    inner,
+                                    peer,
+                                    &outgoing,
+                                    Step::Pushed,
+                                    outgoing.clock,
+                                    &mut server_deletes,
+                                )
+                                .await
+                            {
+                                Ok(CommitOutcome::Committed) => {
+                                    changed = true;
+                                }
+                                Ok(CommitOutcome::Aborted) => return Ok(false),
+                                Err(e) => {
+                                    // M-18: Outbox entry stayed intact when reading/saving failed.
+                                    result = Err(e);
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::WriteTokenRejected => {
+                            let known = inner
+                                .contact(peer)
+                                .is_some_and(|c| c.session.is_known_by_peer());
+                            if known {
+                                // Peer previously accepted us and has since revoked/deleted the
+                                // chat: retire active session and requeue so the next sync starts
+                                // fresh.
+                                if let Some(contact) = inner.contact(peer) {
+                                    contact.state.needs_requeue_sealed = true;
+                                    contact.session.retire();
+                                }
+                                let _ = inner.save_state().await;
+                                if self.is_live(vgen) {
+                                    self.ui.contacts.set(inner.views());
+                                }
+                                break;
+                            }
+                            // Peer has not yet accepted our chat request: retry idempotent
+                            // `SendInitialV2` at most once (outside `self.inner`!) if greeting
+                            // delivery wasn't confirmed, persisting `GREETING_DELIVERY_UNCERTAIN`
+                            // BEFORE transmitting so a lost response still notifies on delete.
+                            let greeting_unconfirmed = inner.contact(peer).is_some_and(|c| {
+                                c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
+                            });
+                            if greeting_unconfirmed && let Some(retry_req) = retry_initial {
+                                let mut retry_promoted = promoted_from_unsent;
+                                let mut ready_for_retry = true;
+                                if inner.contacts.iter().any(|c| {
+                                    c.peer == *peer
+                                        && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT
+                                }) {
+                                    if inner
+                                        .with_contact_tx(peer, async |inner| {
+                                            if let Some(contact) = inner.contact(peer) {
+                                                contact.state.greeting_delivery =
+                                                    GREETING_DELIVERY_UNCERTAIN;
+                                            }
+                                            inner.save(&[]).await.map_err(|e| describe(&e))
+                                        })
+                                        .await
+                                        .is_ok()
+                                    {
+                                        retry_promoted = true;
+                                    } else {
+                                        ready_for_retry = false;
+                                    }
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                }
+                                if ready_for_retry {
+                                    drop(guard);
+                                    let retry_res: session::Result<()> = Fetch::client(&server)
+                                        .send_initial_v2(retry_req)
+                                        .await
+                                        .map(|_| ())
+                                        .map_err(session::Error::from);
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                    guard = self.lock_inner().await;
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                    let Some(inner) = guard.as_mut() else {
+                                        return Ok(false);
+                                    };
+                                    if inner.contact(peer).is_none() {
+                                        break;
+                                    }
+                                    let still_matches = inner
+                                        .contacts
+                                        .iter()
+                                        .find(|c| c.peer == *peer)
+                                        .is_some_and(|c| {
+                                            !c.session.needs_new_session()
+                                                && (session_id.is_empty()
+                                                    || c.session.active_id().is_some_and(|id| {
+                                                        id.as_slice() == session_id.as_slice()
+                                                    }))
+                                        });
+                                    match retry_res {
+                                        Ok(()) if still_matches => {
+                                            if let Some(contact) = inner.contact(peer) {
+                                                contact.mark_greeting_confirmed();
+                                            }
+                                            let _ = inner.save_state().await;
+                                            if !self.is_live(vgen) {
+                                                return Ok(false);
+                                            }
+                                        }
+                                        Err(retry_err)
+                                            if retry_err.is_server_refusal()
+                                                && retry_promoted
+                                                && still_matches =>
+                                        {
+                                            // Only revert `UNCERTAIN -> UNSENT`; never downgrade
+                                            // a greeting already confirmed concurrently.
+                                            let reverted =
+                                                inner.contact(peer).is_some_and(|contact| {
+                                                    if contact.state.greeting_delivery
+                                                        == GREETING_DELIVERY_UNCERTAIN
+                                                    {
+                                                        contact.state.greeting_delivery =
+                                                            GREETING_DELIVERY_UNSENT;
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                });
+                                            if reverted {
+                                                let _ = inner.save_state().await;
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            if let Some(inner) = guard.as_mut()
+                                && inner.contact(peer).is_some()
+                            {
+                                let delay_ms = self.record_approval_backoff(peer);
+                                let label = inner
+                                    .contact(peer)
+                                    .map_or_else(|| short(peer), |c| c.view().label());
+                                self.ui.log(format!(
+                                    "Waiting for {label} to accept your chat request (retrying in {}s)…",
+                                    delay_ms / 1000
+                                ));
+                            }
+                            break;
+                        }
+                        // Large enough to cost the server storage, which it keeps only for those
+                        // signed in to it: it waits, with those after it, until this browser is.
+                        Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
+                            self.waits_sign_in.borrow_mut().insert(*peer);
+                            self.hold(peer, outgoing.history_index);
+                            self.ask_sign_in();
+                            break;
+                        }
+                        // The same, but this page cannot sign in to the server: it never will go.
+                        Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                            self.release(peer, outgoing.history_index);
+                            self.ui.notify(format!(
+                                "a message could not be sent: {NOT_SIGNED_IN_HERE}"
+                            ));
+                            match self
+                                .commit_outbox_item(
+                                    vgen,
+                                    inner,
+                                    peer,
+                                    &outgoing,
+                                    Step::Refused,
+                                    0,
+                                    &mut server_deletes,
+                                )
+                                .await
+                            {
+                                Ok(CommitOutcome::Committed) => changed = true,
+                                Ok(CommitOutcome::Aborted) => return Ok(false),
+                                Err(err) => {
+                                    result = Err(err);
+                                    break;
+                                }
+                            }
+                        }
+                        // Too large for the server: it never will go.
+                        Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::LimitExceeded => {
+                            self.release(peer, outgoing.history_index);
+                            self.ui
+                                .notify(format!("a message could not be sent: {}", describe(&e)));
+                            match self
+                                .commit_outbox_item(
+                                    vgen,
+                                    inner,
+                                    peer,
+                                    &outgoing,
+                                    Step::Refused,
+                                    0,
+                                    &mut server_deletes,
+                                )
+                                .await
+                            {
+                                Ok(CommitOutcome::Committed) => changed = true,
+                                Ok(CommitOutcome::Aborted) => return Ok(false),
+                                Err(err) => {
+                                    result = Err(err);
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                            result = Err(describe(&e));
+                            break;
+                        }
                     }
-                    if !new_awaiting.is_empty() {
-                        contact.state.awaiting.extend(new_awaiting);
-                        keep_last(&mut contact.state.awaiting);
-                    }
-                }
-                if let Err(e) = inner.save_with(&records(peer, &entries), &gone).await {
-                    if let Some(snapshot) = snapshot {
-                        inner.roll_back(peer, snapshot)?;
-                    }
-                    return Err(describe(&e));
-                }
-                if !self.is_live(vgen) {
-                    return Ok(false);
-                }
-                self.show_changes(inner, peer, &entries);
-                let refused_indices: Vec<u64> = entries
-                    .iter()
-                    .filter(|(_, entry)| entry.delivery() == Delivery::Failed)
-                    .map(|(index, _)| *index)
-                    .collect();
-                if !refused_indices.is_empty() {
-                    server_deletes.extend(
-                        self.prepare_cancel_uploads_for_failed(inner, peer, &refused_indices)
-                            .await,
-                    );
                 }
             }
         }
+
         // Not from a page that cannot sign in to the server, which takes no push from it: each
         // try would use up a key of the ratchet.
-        if result.is_ok() && signs_in_here && self.is_live(vgen) {
-            match self.push_events(inner, peer).await {
+        if result.is_ok()
+            && signs_in_here
+            && self.is_live(vgen)
+            && !self.waits_sign_in.borrow().contains(peer)
+            && !self.is_approval_backed_off(peer)
+        {
+            match self.push_events(vgen, peer).await {
                 Ok(told) => changed |= told,
                 Err(e) => result = Err(e),
             }
         }
-        drop(guard);
         if !server_deletes.is_empty() && self.is_live(vgen) {
             self.finish_server_deletes(peer, server_deletes).await;
         }
         result.map(|()| changed)
     }
 
+    /// Commit one pushed or permanently refused outbox head entry immediately to the vault,
+    /// preserving M-18 outbox retention if reading the history entry fails.
+    #[allow(clippy::too_many_arguments)]
+    async fn commit_outbox_item(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<V>,
+        peer: &PublicKey,
+        outgoing: &Outgoing,
+        step: Step,
+        clock: u64,
+        server_deletes: &mut Vec<ServerDeleteJob>,
+    ) -> Result<CommitOutcome, String> {
+        let index = outgoing.history_index;
+        let entry_opt = match inner.vault.entry(peer, index).await {
+            _ if !self.is_live(vgen) => return Ok(CommitOutcome::Aborted),
+            // M-18: Do NOT delete the outbox entry when reading its history entry fails!
+            Err(e) => return Err(describe(&e)),
+            Ok(entry) => entry,
+        };
+        let mut entries = vec![];
+        let mut new_awaiting = None;
+        if let Some(mut entry) = entry_opt {
+            entry.set_delivery(entry.delivery().after(step));
+            // Pushed, it has its place, and waits for the peer to read it.
+            if step == Step::Pushed {
+                entry.place = clock;
+                let content = entry.content.get_or_insert_default();
+                content.clock = clock;
+                let attachment = matches!(content.kind, Some(Kind::Attachment(_)));
+                new_awaiting = Some(Awaiting {
+                    place: clock,
+                    history_index: index,
+                    read: false,
+                    attachment,
+                });
+            }
+            entries.push((index, entry));
+        }
+        let snapshot = inner.contact(peer).map(|c| c.snapshot());
+        if let Some(contact) = inner.contact(peer) {
+            if let Some(pos) = contact
+                .state
+                .outbox
+                .iter()
+                .position(|o| o.history_index == index)
+            {
+                contact.state.outbox.remove(pos);
+            }
+            if step == Step::Pushed {
+                contact.mark_greeting_confirmed();
+            }
+            if let Some(awaiting) = new_awaiting {
+                contact.state.awaiting.push(awaiting);
+                keep_last(&mut contact.state.awaiting);
+            }
+        }
+        if let Err(e) = inner
+            .save_with(&records(peer, &entries), &[(*peer, index, None)])
+            .await
+        {
+            if let Some(snapshot) = snapshot {
+                inner.roll_back(peer, snapshot)?;
+            }
+            if !self.is_live(vgen) {
+                return Ok(CommitOutcome::Aborted);
+            }
+            return Err(describe(&e));
+        }
+        if !self.is_live(vgen) {
+            return Ok(CommitOutcome::Aborted);
+        }
+        self.show_changes(inner, peer, &entries);
+        let refused_indices: Vec<u64> = entries
+            .iter()
+            .filter(|(_, entry)| entry.delivery() == Delivery::Failed)
+            .map(|(idx, _)| *idx)
+            .collect();
+        if !refused_indices.is_empty() {
+            server_deletes.extend(
+                self.prepare_cancel_uploads_for_failed(inner, peer, &refused_indices)
+                    .await,
+            );
+            if !self.is_live(vgen) {
+                return Ok(CommitOutcome::Aborted);
+            }
+        }
+        Ok(CommitOutcome::Committed)
+    }
+
+    /// Map a `session::Error` from `claim_peer_bundle_v2` or `finish_prepare_start_again_v2`
+    /// during outbox rekey into [`RekeyOutcome`] while holding `inner` (after rolling back any
+    /// in-memory mutations).
+    async fn handle_rekey_session_error(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<V>,
+        peer: &PublicKey,
+        clock: &session::ServerClock,
+        error: session::Error,
+        server_deletes: &mut Vec<ServerDeleteJob>,
+    ) -> Result<RekeyOutcome, String> {
+        let kind = error.kind();
+        if matches!(kind, ErrorKind::NotFound | ErrorKind::InvalidKeys) {
+            let (reason, failed_indices) = inner.fail_waiting(peer, describe(&error)).await?;
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+            for idx in &failed_indices {
+                self.release(peer, *idx);
+            }
+            server_deletes.extend(
+                self.prepare_cancel_uploads_for_failed(inner, peer, &failed_indices)
+                    .await,
+            );
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+            self.ui
+                .notify(format!("messages could not be sent: {reason}"));
+            if self.ui.open.get_untracked() == Some(*peer) {
+                self.show_history(inner, peer).await;
+            }
+            return Ok(RekeyOutcome::Failed);
+        }
+        if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &error) {
+            return Ok(RekeyOutcome::UpdateRequired(describe(&error)));
+        }
+        let paused = match kind {
+            ErrorKind::ClassicalApprovalRequired => {
+                if let Some(contact) = inner.contact(peer) {
+                    if matches!(
+                        contact.state.security_alert,
+                        SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
+                    ) {
+                        contact.state.security_alert = SECURITY_ALERT_NONE;
+                    }
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_SIGNED_OFF;
+                }
+                true
+            }
+            ErrorKind::DowngradeDetected => {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.session.peer_pq_state_mut().downgrade_detected = true;
+                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                }
+                true
+            }
+            ErrorKind::PeerManifestExpired => {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
+                }
+                true
+            }
+            ErrorKind::PqRequired => {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                }
+                true
+            }
+            _ => false,
+        };
+        if paused {
+            inner.save_state().await.map_err(|e| describe(&e))?;
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+            self.ui.contacts.set(inner.views());
+            return Ok(RekeyOutcome::Paused);
+        }
+        if kind == ErrorKind::ClockSkew {
+            self.warn_clock_skew(clock.offset_ms());
+            return Err(super::CLOCK_SKEW_MESSAGE.to_string());
+        }
+        Err(describe(&error))
+    }
+
+    /// Establish a replacement session for `peer` under `peer_flush_locks`, releasing
+    /// `Engine::inner` across `ClaimBundle`, `RegisterWriteToken`, and `SendInitialV2`.
+    ///
+    /// If an inbound session arrives from `peer` while `ClaimBundle` is suspended, the stale
+    /// claimed bundle is discarded cleanly without corrupting the inbound ratchet!
+    async fn ensure_session_for_outbox(
+        &self,
+        vgen: u64,
+        peer: &PublicKey,
+        server_deletes: &mut Vec<ServerDeleteJob>,
+    ) -> Result<RekeyOutcome, String> {
+        const MAX_CONFIG_RETRIES: usize = 2;
+        let mut attempt = 0usize;
+
+        let (server, new_session_id, outgoing_req) = loop {
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+            // Snapshot immutable inputs under `self.inner`, then drop `guard` before `ClaimBundle`.
+            let (server, audience, pq_config, clock, peer_pq) = {
+                let guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(RekeyOutcome::Aborted);
+                }
+                let Some(inner) = guard.as_ref() else {
+                    return Ok(RekeyOutcome::Aborted);
+                };
+                if inner.is_isolated_peer(peer) {
+                    return Ok(RekeyOutcome::ContactGone);
+                }
+                let Some(contact) = inner.contacts.iter().find(|c| c.peer == *peer) else {
+                    return Ok(RekeyOutcome::ContactGone);
+                };
+                if !contact.session.needs_new_session() {
+                    return Ok(RekeyOutcome::Ready);
+                }
+                if contact.state.quarantined
+                    || contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
+                    || contact.state.security_alert != SECURITY_ALERT_NONE
+                {
+                    return Ok(RekeyOutcome::Paused);
+                }
+                (
+                    inner.server.clone(),
+                    inner.audience.clone(),
+                    inner.client.pq_config().clone(),
+                    inner.client.clock().clone(),
+                    contact.session.peer_pq_state().clone(),
+                )
+            };
+
+            let claim_res = session::claim_peer_bundle_v2(
+                &Fetch::client(&server),
+                &audience,
+                peer,
+                &peer_pq,
+                &pq_config,
+                &clock,
+            )
+            .await;
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(RekeyOutcome::Aborted);
+            };
+            if inner.is_isolated_peer(peer) {
+                return Ok(RekeyOutcome::ContactGone);
+            }
+            let Some(index) = inner.contacts.iter().position(|c| c.peer == *peer) else {
+                return Ok(RekeyOutcome::ContactGone);
+            };
+            if !inner.contacts[index].session.needs_new_session() {
+                // An inbound session arrived while `ClaimBundle` was suspended: discard the stale
+                // bundle (or claim error) cleanly without corrupting the inbound ratchet!
+                drop(claim_res);
+                return Ok(RekeyOutcome::Ready);
+            }
+            if inner.contacts[index].state.quarantined
+                || inner.contacts[index].state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
+                || inner.contacts[index].state.security_alert != SECURITY_ALERT_NONE
+            {
+                drop(claim_res);
+                return Ok(RekeyOutcome::Paused);
+            }
+            if *inner.client.pq_config() != pq_config
+                || *inner.contacts[index].session.peer_pq_state() != peer_pq
+            {
+                drop(claim_res);
+                if attempt < MAX_CONFIG_RETRIES {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(
+                    "Post-quantum settings changed while establishing a new session; retrying later."
+                        .to_string(),
+                );
+            }
+
+            let claimed = match claim_res {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    return self
+                        .handle_rekey_session_error(vgen, inner, peer, &clock, e, server_deletes)
+                        .await;
+                }
+            };
+
+            // Synchronous Phase 2: complete handshake, stage grant, persist BEFORE transmitting!
+            let snapshot = inner.contacts[index].snapshot();
+            let prev_next_session_seq = inner.state.next_session_seq;
+            let session_seq = inner.next_new_chat_session_seq();
+            inner.state.next_session_seq = session_seq
+                .saturating_add(1)
+                .min(session::protocol::MAX_SAFE_INTEGER);
+            let greeting = Kind::Hello(
+                inner
+                    .client
+                    .make_hello(inner.state.name.clone(), session_seq),
+            );
+            inner.contacts[index].state.clock = inner.contacts[index].state.clock.saturating_add(1);
+            let mut hello = greeting.to_bytes();
+            stamp(&mut hello, inner.contacts[index].state.clock);
+
+            let prepared = {
+                let client = &inner.client;
+                let contact = &mut inner.contacts[index];
+                client.finish_prepare_start_again_v2(claimed, &mut contact.session, &hello)
+            };
+            let outgoing_req = match prepared {
+                Ok(req) => req,
+                Err(e) => {
+                    inner.state.next_session_seq = prev_next_session_seq;
+                    inner.roll_back(peer, snapshot)?;
+                    return self
+                        .handle_rekey_session_error(vgen, inner, peer, &clock, e, server_deletes)
+                        .await;
+                }
+            };
+
+            let (new_session_id, token_hash) = inner
+                .contact(peer)
+                .map(|contact| {
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                    contact.state.security_alert = SECURITY_ALERT_NONE;
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                    (
+                        contact.session.active_id().copied(),
+                        contact.session.active_inbound_token_hash(),
+                    )
+                })
+                .unwrap_or((None, None));
+            if let Some(token_hash) = token_hash
+                && let Err(e) = inner.stage_write_token_grant(peer, token_hash, true)
+            {
+                inner.state.next_session_seq = prev_next_session_seq;
+                inner.roll_back(peer, snapshot)?;
+                return Err(e);
+            }
+            // H-2: Persist new session, grant, and uncertain delivery marker BEFORE transmitting!
+            if let Err(e) = inner.save(&[]).await {
+                inner.state.next_session_seq = prev_next_session_seq;
+                inner.roll_back(peer, snapshot)?;
+                if !self.is_live(vgen) {
+                    return Ok(RekeyOutcome::Aborted);
+                }
+                return Err(describe(&e));
+            }
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+            self.ui.contacts.set(inner.views());
+            break (server, new_session_id, outgoing_req);
+        };
+
+        // Phase 3 outside `self.inner`: register our new inbound write token BEFORE sending the
+        // re-initiation `SendInitialV2`.
+        let _ = self.flush_pending_grants_for_peer(peer).await;
+        if !self.is_live(vgen) {
+            return Ok(RekeyOutcome::Aborted);
+        }
+
+        let send_res: session::Result<()> = Fetch::client(&server)
+            .send_initial_v2(outgoing_req)
+            .await
+            .map(|_| ())
+            .map_err(session::Error::from);
+        if !self.is_live(vgen) {
+            return Ok(RekeyOutcome::Aborted);
+        }
+
+        // Phase 4: Re-acquire `self.inner`, validate `is_live(vgen)`, contact existence, and
+        // matching `active_id` before updating `greeting_delivery`.
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(RekeyOutcome::Aborted);
+        }
+        let Some(inner) = guard.as_mut() else {
+            return Ok(RekeyOutcome::Aborted);
+        };
+        if inner.contact(peer).is_none() {
+            return Ok(RekeyOutcome::ContactGone);
+        }
+        let matches_session = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == *peer)
+            .is_some_and(|c| c.session.active_id() == new_session_id.as_ref());
+        match send_res {
+            Ok(()) => {
+                if matches_session
+                    && inner
+                        .contact(peer)
+                        .is_some_and(Contact::mark_greeting_confirmed)
+                {
+                    let _ = inner.save_state().await;
+                    if !self.is_live(vgen) {
+                        return Ok(RekeyOutcome::Aborted);
+                    }
+                }
+            }
+            Err(e) => {
+                if e.is_server_refusal() && matches_session {
+                    // Only revert `UNCERTAIN -> UNSENT`; never downgrade a greeting already
+                    // confirmed concurrently on this session.
+                    let reverted = inner.contact(peer).is_some_and(|contact| {
+                        if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                            contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if reverted {
+                        let _ = inner.save_state().await;
+                        if !self.is_live(vgen) {
+                            return Ok(RekeyOutcome::Aborted);
+                        }
+                    }
+                }
+                if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) {
+                    return Ok(RekeyOutcome::UpdateRequired(describe(&e)));
+                }
+            }
+        }
+        Ok(RekeyOutcome::Ready)
+    }
+
     /// Tell `peer` what this client did with its messages, all in one message, once what waits
     /// for it went: on the session, never starting one for it, and never in a request or
     /// quarantined chat, whose sender learns nothing until it is accepted/approved. Encrypted and
-    /// saved once, then pushed as it is until it goes, so that no key of the ratchet is used twice.
-    /// Once pushed, clearing `sealed_events` is persisted immediately to the vault.
-    async fn push_events(&self, inner: &mut Inner<V>, peer: &PublicKey) -> Result<bool, String> {
-        let vgen = self.vault_gen();
+    /// saved once under `self.inner`, then pushed outside `self.inner` so slow RTTs never stall
+    /// UI or other peers. Once pushed, clearing `sealed_events` is persisted immediately to the
+    /// vault after validating `is_live(vgen)`, contact existence, and matching `session_id`.
+    async fn push_events(&self, vgen: u64, peer: &PublicKey) -> Result<bool, String> {
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        let Some(contact) = inner.contact(peer) else {
-            return Ok(false);
-        };
-        if contact.state.request
-            || contact.state.quarantined
-            || !contact.state.outbox.is_empty()
-            || contact.session.needs_new_session()
-        {
-            return Ok(false);
-        }
-        let active = contact.session.active_id().map(|id| id.to_vec());
-        // One encrypted on a session that is no longer the active one, which the peer may never
-        // have had: what it tells, still in the events, is encrypted again on the active one.
-        if contact
-            .state
-            .sealed_events
-            .as_ref()
-            .is_some_and(|sealed| Some(&sealed.session) != active.as_ref())
-        {
-            contact.state.sealed_events = None;
-        }
-        let sealed = match contact.state.sealed_events.clone() {
-            Some(sealed) => sealed,
-            None => {
-                let Some(events) = contact
-                    .state
-                    .events
-                    .clone()
-                    .filter(|events| !events.is_empty())
-                else {
-                    return Ok(false);
-                };
-                inner
-                    .with_contact_tx(peer, async |inner| {
-                        let contact = inner
-                            .contact(peer)
-                            .ok_or_else(|| "no such chat".to_string())?;
-                        let message = contact
-                            .session
-                            .encrypt(&events.to_bytes())
-                            .map_err(|e| describe(&e))?;
-                        let session_id = active.clone().unwrap_or_default();
-                        let sealed = SealedEvents {
-                            record: Some(OutgoingRecord::sealed(message, &session_id)),
-                            session: session_id,
-                            events: Some(events),
-                        };
-                        contact.state.sealed_events = Some(sealed.clone());
-                        inner.save(&[]).await.map_err(|e| describe(&e))?;
-                        Ok::<_, String>(sealed)
-                    })
-                    .await?
+        // Phase 1 under `self.inner`: seal & persist `SealedEvents` and extract wire `PushV2Request`.
+        let prepared = {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(false);
             }
-        };
-        let Some(message) = sealed.record.as_ref().and_then(OutgoingRecord::to_sealed) else {
-            if let Some(contact) = inner.contact(peer) {
+            let Some(inner) = guard.as_mut() else {
+                return Ok(false);
+            };
+            let Some(contact) = inner.contact(peer) else {
+                return Ok(false);
+            };
+            if contact.state.request
+                || contact.state.quarantined
+                || !contact.state.outbox.is_empty()
+                || contact.session.needs_new_session()
+            {
+                return Ok(false);
+            }
+            let active = contact.session.active_id().map(|id| id.to_vec());
+            // One encrypted on a session that is no longer the active one, which the peer may
+            // never have had: what it tells, still in the events, is encrypted again on the active
+            // one.
+            if contact
+                .state
+                .sealed_events
+                .as_ref()
+                .is_some_and(|sealed| Some(&sealed.session) != active.as_ref())
+            {
                 contact.state.sealed_events = None;
             }
-            let _ = inner.save_state().await;
-            return Ok(false);
+            let sealed = match contact.state.sealed_events.clone() {
+                Some(sealed) => sealed,
+                None => {
+                    let Some(events) = contact
+                        .state
+                        .events
+                        .clone()
+                        .filter(|events| !events.is_empty())
+                    else {
+                        return Ok(false);
+                    };
+                    inner
+                        .with_contact_tx(peer, async |inner| {
+                            let contact = inner
+                                .contact(peer)
+                                .ok_or_else(|| "no such chat".to_string())?;
+                            let message = contact
+                                .session
+                                .encrypt(&events.to_bytes())
+                                .map_err(|e| describe(&e))?;
+                            let session_id = active.clone().unwrap_or_default();
+                            let sealed = SealedEvents {
+                                record: Some(OutgoingRecord::sealed(message, &session_id)),
+                                session: session_id,
+                                events: Some(events),
+                            };
+                            contact.state.sealed_events = Some(sealed.clone());
+                            inner.save(&[]).await.map_err(|e| describe(&e))?;
+                            Ok::<_, String>(sealed)
+                        })
+                        .await?
+                }
+            };
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
+            let Some(message) = sealed.record.as_ref().and_then(OutgoingRecord::to_sealed) else {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.sealed_events = None;
+                }
+                let _ = inner.save_state().await;
+                return Ok(false);
+            };
+            let promoted_from_unsent = inner
+                .contacts
+                .iter()
+                .any(|c| c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT);
+            if promoted_from_unsent {
+                inner
+                    .with_contact_tx(peer, async |inner| {
+                        if let Some(contact) = inner.contact(peer) {
+                            contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                        }
+                        inner.save(&[]).await.map_err(|e| describe(&e))
+                    })
+                    .await?;
+                if !self.is_live(vgen) {
+                    return Ok(false);
+                }
+            }
+            let push_req = message.push_v2_request(peer);
+            (inner.server.clone(), sealed, push_req, promoted_from_unsent)
         };
-        let push_res = inner
-            .transmit_with_greeting_delivery(peer, false, false, async |inner| {
-                let contact = inner.contact(peer).ok_or(ErrorKind::NotFound)?;
-                contact.session.push_v2(&message).await
-            })
-            .await?;
+        let (server, sealed, push_req, promoted_from_unsent) = prepared;
+
+        // Phase 2 outside `self.inner`: await `PushV2` RPC.
+        let push_res: session::Result<_> = Fetch::client(&server)
+            .push_v2(push_req)
+            .await
+            .map_err(session::Error::from);
         if !self.is_live(vgen) {
             return Ok(false);
+        }
+
+        // Phase 3: Re-acquire `self.inner` and validate live generation, contact existence, and
+        // matching `sealed_events.session` before mutating or persisting.
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
+        let Some(inner) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if inner.contact(peer).is_none() {
+            return Ok(false);
+        }
+        let matches_sealed = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == *peer)
+            .is_some_and(|c| {
+                c.state
+                    .sealed_events
+                    .as_ref()
+                    .is_some_and(|s| s.session == sealed.session)
+                    && (sealed.session.is_empty()
+                        || c.session
+                            .active_id()
+                            .is_some_and(|id| id.as_slice() == sealed.session.as_slice()))
+            });
+        if let Err(ref e) = push_res
+            && e.is_server_refusal()
+            && promoted_from_unsent
+            && matches_sealed
+        {
+            // Only revert `UNCERTAIN -> UNSENT`; never downgrade a greeting already confirmed
+            // concurrently on this session.
+            let reverted = inner.contact(peer).is_some_and(|contact| {
+                if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                    true
+                } else {
+                    false
+                }
+            });
+            if reverted {
+                let _ = inner.save_state().await;
+                if !self.is_live(vgen) {
+                    return Ok(false);
+                }
+            }
         }
         match push_res {
             Ok(_) => {
                 self.clear_approval_backoff(peer);
             }
             Err(e) if e.kind() == ErrorKind::WriteTokenRejected => {
+                if !matches_sealed {
+                    return Ok(false);
+                }
                 let known = inner
                     .contact(peer)
                     .is_some_and(|c| c.session.is_known_by_peer());
@@ -598,6 +1419,9 @@ impl<V: VaultStore> Engine<V> {
                 self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 return Err(describe(&e));
             }
+        }
+        if !matches_sealed {
+            return Ok(false);
         }
         // Those told since it was encrypted stay, to go in the next. Persist immediately after
         // clearing `sealed_events` so reload never re-pushes already-sent events.
@@ -654,20 +1478,6 @@ impl<V: VaultStore> Engine<V> {
         self.show_changes(inner, peer, &changed);
         Ok(())
     }
-}
-
-/// Result of [`Inner::seal_next`].
-enum SealOutcome {
-    /// Ready to push (or nothing unsealed left).
-    Ready,
-    /// Paused pending explicit user security decision (classical approval / downgrade / expired manifest).
-    Paused,
-    /// Permanently failed to start a session (e.g. peer has no keys); outbox entries marked failed.
-    Failed(String, Vec<u64>),
-    /// Unrecoverable corrupt outbox record was dropped and its history entry marked failed.
-    CorruptDropped(u64, Vec<(u64, HistoryEntry)>),
-    /// Server rejected the v2 protocol (`ErrorKind::Unimplemented`); prompt the user to refresh.
-    UpdateRequired(String),
 }
 
 /// Result of [`Inner::recover_corrupt_outbox`].
@@ -741,129 +1551,12 @@ impl<V: VaultStore> Inner<V> {
         .await
     }
 
-    /// Encrypt the next message waiting to `peer`, now that it goes, at the next place in the
-    /// chat, after what came so far: on the session, or on a new one if there is none to send
-    /// on, as the two kept missing each other or the peer deleted the chat. Persists the new
-    /// session BEFORE transmitting its initial message (H-2).
-    async fn seal_next(&mut self, peer: &PublicKey) -> Result<SealOutcome, String> {
-        let Some(index) = self.contacts.iter().position(|c| c.peer == *peer) else {
-            return Err("no such chat".into());
-        };
-        if self.contacts[index].session.needs_new_session() {
-            let snapshot = self.contacts[index].snapshot();
-            let prev_next_session_seq = self.state.next_session_seq;
-            let session_seq = self.next_new_chat_session_seq();
-            self.state.next_session_seq = session_seq
-                .saturating_add(1)
-                .min(session::protocol::MAX_SAFE_INTEGER);
-            let greeting =
-                Kind::Hello(self.client.make_hello(self.state.name.clone(), session_seq));
-            self.contacts[index].state.clock = self.contacts[index].state.clock.saturating_add(1);
-            let mut hello = greeting.to_bytes();
-            stamp(&mut hello, self.contacts[index].state.clock);
-
-            let prepared = {
-                let audience = &self.audience;
-                let client = &mut self.client;
-                let contact = &mut self.contacts[index];
-                client
-                    .prepare_start_again_v2(audience, &mut contact.session, &hello)
-                    .await
-            };
-            match prepared {
-                Ok(outgoing) => {
-                    let token_hash = self.contact(peer).and_then(|contact| {
-                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                        contact.state.security_alert = SECURITY_ALERT_NONE;
-                        contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-                        contact.session.active_inbound_token_hash()
-                    });
-                    if let Some(token_hash) = token_hash
-                        && let Err(e) = self.stage_write_token_grant(peer, token_hash, true)
-                    {
-                        self.state.next_session_seq = prev_next_session_seq;
-                        self.roll_back(peer, snapshot)?;
-                        return Err(e);
-                    }
-                    // H-2: Persist new session, grant, and uncertain delivery marker BEFORE transmitting!
-                    if let Err(e) = self.save(&[]).await {
-                        self.state.next_session_seq = prev_next_session_seq;
-                        self.roll_back(peer, snapshot)?;
-                        return Err(describe(&e));
-                    }
-                    // Register our new inbound write token BEFORE sending the re-initiation.
-                    let _ = self.flush_pending_grants_for(peer).await;
-                    if let Ok(Err(e)) = self
-                        .transmit_with_greeting_delivery(peer, true, true, async |inner| {
-                            inner.client.send_prepared_initiate_v2(&outgoing).await
-                        })
-                        .await
-                        && should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e)
-                    {
-                        return Ok(SealOutcome::UpdateRequired(describe(&e)));
-                    }
-                }
-                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::InvalidKeys) => {
-                    self.state.next_session_seq = prev_next_session_seq;
-                    self.roll_back(peer, snapshot)?;
-                    return self
-                        .fail_waiting(peer, describe(&e))
-                        .await
-                        .map(|(reason, failed)| SealOutcome::Failed(reason, failed));
-                }
-                Err(e) => {
-                    let kind = e.kind();
-                    self.state.next_session_seq = prev_next_session_seq;
-                    self.roll_back(peer, snapshot)?;
-                    if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) {
-                        return Ok(SealOutcome::UpdateRequired(describe(&e)));
-                    }
-                    let paused = match kind {
-                        ErrorKind::ClassicalApprovalRequired => {
-                            if let Some(contact) = self.contact(peer) {
-                                if matches!(
-                                    contact.state.security_alert,
-                                    SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
-                                ) {
-                                    contact.state.security_alert = SECURITY_ALERT_NONE;
-                                }
-                                contact.state.classical_approval_needed =
-                                    CLASSICAL_APPROVAL_SIGNED_OFF;
-                            }
-                            true
-                        }
-                        ErrorKind::DowngradeDetected => {
-                            if let Some(contact) = self.contact(peer) {
-                                contact.session.peer_pq_state_mut().downgrade_detected = true;
-                                contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                            }
-                            true
-                        }
-                        ErrorKind::PeerManifestExpired => {
-                            if let Some(contact) = self.contact(peer) {
-                                contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
-                            }
-                            true
-                        }
-                        ErrorKind::PqRequired => {
-                            if let Some(contact) = self.contact(peer) {
-                                contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
-                            }
-                            true
-                        }
-                        _ => false,
-                    };
-                    if paused {
-                        self.save_state().await.map_err(|e| describe(&e))?;
-                        return Ok(SealOutcome::Paused);
-                    }
-                    if kind == ErrorKind::ClockSkew {
-                        return Err(super::CLOCK_SKEW_MESSAGE.to_string());
-                    }
-                    return Err(describe(&e));
-                }
-            }
-        }
+    /// Encrypt the next unsealed outbox item for `peer` on its already-active session and persist
+    /// the sealed [`OutgoingRecord`] to IndexedDB (pure local crypto + storage, zero network RPCs).
+    async fn seal_head_on_active_session(
+        &mut self,
+        peer: &PublicKey,
+    ) -> Result<LocalSealOutcome, String> {
         let contact = self.contact(peer).ok_or("no such chat")?;
         let Some(next) = contact
             .state
@@ -871,7 +1564,7 @@ impl<V: VaultStore> Inner<V> {
             .iter()
             .position(|outgoing| !outgoing.sealed)
         else {
-            return Ok(SealOutcome::Ready);
+            return Ok(LocalSealOutcome::Ready);
         };
         let index = contact.state.outbox[next].history_index;
         let mut content = match self.vault.outgoing(peer, index).await {
@@ -880,7 +1573,7 @@ impl<V: VaultStore> Inner<V> {
                 match self.recover_corrupt_outbox(peer, index).await? {
                     CorruptOutboxRecovery::Rebuilt(bytes) => bytes,
                     CorruptOutboxRecovery::Dropped { history } => {
-                        return Ok(SealOutcome::CorruptDropped(index, history));
+                        return Ok(LocalSealOutcome::CorruptDropped(index, history));
                     }
                 }
             }
@@ -919,7 +1612,7 @@ impl<V: VaultStore> Inner<V> {
                 .map_err(|e| describe(&e))
         })
         .await?;
-        Ok(SealOutcome::Ready)
+        Ok(LocalSealOutcome::Ready)
     }
 
     /// Recover from a missing or corrupt `outbox/<peer>/<index>` record instead of permanently
