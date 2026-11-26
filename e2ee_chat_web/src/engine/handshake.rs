@@ -2,10 +2,9 @@
 
 use super::contact::{Contact, DisplayedEntry, FarewellMode, forget_told};
 use super::{
-    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS,
-    ProtocolRpcScope, REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS,
-    SERVER_MAX_PQ_ONE_TIME_PREKEYS, StartChatError, origin, records, same_server,
-    should_require_update_for_rpc,
+    Engine, Inner, NOT_SIGNED_IN_HERE, ONE_TIME_PREKEYS, PQ_ONE_TIME_PREKEYS, ProtocolRpcScope,
+    REFILL_USED, REPUBLISH_AGE, SERVER_MAX_ONE_TIME_PREKEYS, SERVER_MAX_PQ_ONE_TIME_PREKEYS,
+    StartChatError, VaultStore, origin, records, same_server, should_require_update_for_rpc,
 };
 use crate::content::{Content, Deleted, Events, Kind, stamp};
 use crate::state::{Delivery, MessageView, ServerPqStatus};
@@ -15,7 +14,7 @@ use crate::vault::{
     CLASSICAL_APPROVAL_NONE, CarriedDeferredTimestamp, ContactState, DeferredInitial, Farewell,
     GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
     HistoryEntry, IndexRange, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE,
-    SealedEvents, history_key,
+    SealedEvents,
 };
 use leptos::prelude::*;
 use prost::Message as _;
@@ -354,7 +353,7 @@ struct OpenedInitial {
 #[derive(Default)]
 pub(super) struct InitialBatch {
     dirty: bool,
-    records: Vec<(PublicKey, (String, HistoryEntry))>,
+    records: Vec<(PublicKey, u64, HistoryEntry)>,
     /// Newly added entries for the open chat: `(peer, view, displayed_entry)`.
     views: Vec<(PublicKey, MessageView, DisplayedEntry)>,
     requeue: BTreeSet<PublicKey>,
@@ -383,7 +382,7 @@ pub(super) fn prune_invalid_inbox_acks(pending: &mut Vec<u64>) -> usize {
     before - pending.len()
 }
 
-impl<V: HistoryStore> Inner<V> {
+impl<V: VaultStore> Inner<V> {
     /// Reserve a local copy deduplicated by payload (ignoring relay-assigned inbox ID) and
     /// include its ack ID in the same vault transaction.
     pub(super) fn defer_inbox_initial(&mut self, message: &Incoming) -> bool {
@@ -518,15 +517,12 @@ impl<V: HistoryStore> Inner<V> {
     /// the next full state save, including a batch consisting only of alerts or inbox IDs.
     pub(super) async fn save_inbox_changes(
         &mut self,
-        history: Vec<(PublicKey, (String, HistoryEntry))>,
-        outbox: Vec<(PublicKey, (String, Option<OutgoingRecord>))>,
+        history: Vec<(PublicKey, u64, HistoryEntry)>,
+        outbox: Vec<(PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> Result<(), String> {
-        let (peers, records): (Vec<_>, Vec<_>) = history.into_iter().unzip();
-        let (outbox_peers, outgoing): (Vec<_>, Vec<_>) = outbox.into_iter().unzip();
-        if let Err(e) = self.save_with(&records, &outgoing).await {
-            self.unsaved.extend(peers.into_iter().zip(records));
-            self.unsaved_outbox
-                .extend(outbox_peers.into_iter().zip(outgoing));
+        if let Err(e) = self.save_with(&history, &outbox).await {
+            self.unsaved.extend(history);
+            self.unsaved_outbox.extend(outbox);
             self.unsaved_state = true;
             return Err(describe(&e));
         }
@@ -604,8 +600,8 @@ enum RefillV2Outcome {
     PqDisabled,
 }
 
-impl Engine {
-    async fn ack_pending_inbox_v2(&self, inner: &mut Inner) -> Result<(), String> {
+impl<V: VaultStore> Engine<V> {
+    async fn ack_pending_inbox_v2(&self, inner: &mut Inner<V>) -> Result<(), String> {
         inner
             .ack_persisted_inbox(async |client, audience, ids| {
                 client
@@ -622,7 +618,7 @@ impl Engine {
 
     pub(super) fn process_inbox_messages(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
         inbox: ListedInitialMessages,
         batch: &mut InitialBatch,
     ) {
@@ -700,7 +696,7 @@ impl Engine {
     /// upgrade after releasing the lock, or `None` if the queue made no progress.
     pub(super) async fn replay_deferred_initials(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
     ) -> Result<Option<BTreeSet<PublicKey>>, String> {
         let mut batch = InitialBatch::default();
         let (pruned, modified) = sanitize_deferred_initials(&mut inner.deferred_initials, now());
@@ -762,7 +758,7 @@ impl Engine {
     /// Join the peer's pending carried initials. Each removal commits with its prekeys, session and history.
     pub(super) async fn join_carried(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
         peer: &PublicKey,
     ) -> Result<JoinCarriedOutcome, String> {
         inner.check_isolation(peer)?;
@@ -826,7 +822,7 @@ impl Engine {
 
     pub(super) fn process_initial(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
         peer: &PublicKey,
         message: &Incoming,
         batch: &mut InitialBatch,
@@ -1055,15 +1051,13 @@ impl Engine {
                 },
             ));
         }
-        batch
-            .records
-            .push((*peer, (history_key(peer, index), entry)));
+        batch.records.push((*peer, index, entry));
         InitialOutcome::Ack
     }
 
     pub(super) async fn save_initial_batch(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
         mut batch: InitialBatch,
     ) -> Result<BTreeSet<PublicKey>, String> {
         let mut outgoing = vec![];
@@ -1072,12 +1066,8 @@ impl Engine {
             match inner.requeue_sealed(&peer).await {
                 Ok(outcome) => {
                     outcome.log_missing(&self.ui, &peer);
-                    outgoing.extend(outcome.outbox.into_iter().map(|o| (peer, o)));
-                    batch.records.extend(
-                        records(&peer, &outcome.history)
-                            .into_iter()
-                            .map(|r| (peer, r)),
-                    );
+                    outgoing.extend(outcome.outbox);
+                    batch.records.extend(records(&peer, &outcome.history));
                     changed.push((peer, outcome.history));
                 }
                 // replace_session set the durable gate. flush retries before pushing any ciphertext.
@@ -1126,7 +1116,7 @@ impl Engine {
     /// server refusals from transient network/sign-in failures.
     pub(super) async fn publish_full(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         now_anyway: bool,
     ) -> Result<(), PublishError> {
         let (preserve_spks, preserve_digests) = preserved_deferred_prekeys(inner, now());
@@ -1194,7 +1184,7 @@ impl Engine {
 
     pub(super) async fn finish_publish_rollback(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
         mut error: PublishError,
         now_anyway: bool,
     ) -> Result<(), PublishError> {
@@ -1273,7 +1263,7 @@ impl Engine {
     /// returns `Ok(RefillV2Outcome::PqDisabled)` so the caller can retry with classical OPKs only.
     async fn try_refill_v2(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         classical_count: usize,
         pq_count: usize,
     ) -> Result<RefillV2Outcome, String> {
@@ -1658,7 +1648,7 @@ impl Engine {
         inner.state.next_session_seq = initial_session_seq
             .saturating_add(1)
             .min(session::protocol::MAX_SAFE_INTEGER);
-        let record = (history_key(&peer, 0), entry);
+        let record = (peer, 0, entry);
         // H-2: Persist the newly created session BEFORE transmitting the initial message!
         if let Err(e) = inner.save(std::slice::from_ref(&record)).await {
             inner.contacts.pop();
@@ -1770,7 +1760,7 @@ impl Engine {
     /// transient storage failure and warning the user if the draft chat could not be removed.
     async fn rollback_cancelled_start_chat(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         peer: &PublicKey,
         saved_farewells: Vec<Farewell>,
         uncertain_persisted: bool,

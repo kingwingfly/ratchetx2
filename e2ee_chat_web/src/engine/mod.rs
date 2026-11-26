@@ -26,10 +26,10 @@ use crate::util::{describe, js_error, key_to_url, short, size_u64, sleep};
 use crate::vault::{
     AppState, CarriedDeferredTimestamp, ContactState, DeferredInitial, DeferredInitialsRecord,
     GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, OutgoingRecord,
-    PendingUpload, Vault, history_key,
+    PendingUpload, Vault,
 };
 use crate::{content, glue, transport};
-use attachments::upload_of;
+use attachments::{ChunkSource, upload_of};
 use contact::{
     Contact, DisplayedEntry, FarewellMode, isolated_contact_views, restore_contacts,
     stored_contacts,
@@ -146,9 +146,9 @@ const CHUNKS_DECRYPTED_KEPT: usize = 4;
 /// writes whole.
 const EVENTS_KEPT: usize = 1_000;
 
-pub struct Engine {
+pub struct Engine<V = Vault> {
     ui: Ui,
-    inner: Mutex<Option<Inner>>,
+    inner: Mutex<Option<Inner<V>>>,
     /// Single-unlock / single-create re-entrancy guard preventing overlapping unlocks or
     /// duplicate sync/notification/service-worker loops.
     unlocking: Cell<bool>,
@@ -156,7 +156,7 @@ pub struct Engine {
     wake: Cell<bool>,
     /// The files of the uploads started or resumed on this page, keyed by `(peer, id, key_hash)`,
     /// which can go on without the files chosen again.
-    files: RefCell<HashMap<AttachmentKey, web_sys::File>>,
+    files: RefCell<HashMap<AttachmentKey, ChunkSource>>,
     /// The uploads going on, or being resumed.
     running: RefCell<HashSet<[u8; 16]>>,
     /// The uploads cancelled, or whose chat was deleted, on this page: those going on stop before
@@ -434,12 +434,12 @@ struct Inner<V = Vault> {
     /// History records that a save failed to write after what they record could not be undone:
     /// initial messages, which the server deleted once taken, and the greeting of a chat started.
     /// Each save writes them too, until one succeeds, so that the history has no gap.
-    unsaved: Vec<(PublicKey, (String, HistoryEntry))>,
+    unsaved: Vec<(PublicKey, u64, HistoryEntry)>,
     /// Requeued outbox records that a save failed to write after an accepted replacement session
     /// reset `outbox[*].sealed = false` in memory. Each save writes them before any caller
     /// `outgoing` updates until one succeeds so `seal_next` never reads stale empty-content
     /// sealed outbox records from IndexedDB.
-    unsaved_outbox: Vec<(PublicKey, (String, Option<OutgoingRecord>))>,
+    unsaved_outbox: Vec<(PublicKey, u64, Option<OutgoingRecord>)>,
     /// The chats whose records left unsaved a save wrote, which then show them.
     saved_late: Vec<PublicKey>,
 }
@@ -471,8 +471,31 @@ pub(super) fn should_require_update_for_rpc(
         && error.kind() == ErrorKind::Unimplemented
 }
 
-impl Engine {
+impl Engine<Vault> {
     pub fn new(ui: Ui) -> Rc<Self> {
+        Self::empty(ui)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl<V: VaultStore> Engine<V> {
+    /// Construct an already-unlocked engine backed by `inner` for deterministic native async tests.
+    fn with_inner(ui: Ui, inner: Inner<V>) -> Rc<Self> {
+        let engine = Self::empty(ui);
+        engine
+            .can_sign_in_here
+            .set(same_server(&inner.server, &origin()));
+        engine.ui.me.set(Some(inner.me()));
+        engine.ui.contacts.set(inner.views());
+        engine.ui.isolated_contacts.set(inner.isolated_views());
+        engine.ui.phase.set(Phase::Unlocked);
+        *engine.inner.try_lock().expect("fresh engine mutex") = Some(inner);
+        engine
+    }
+}
+
+impl<V: VaultStore> Engine<V> {
+    fn empty(ui: Ui) -> Rc<Self> {
         let engine = Rc::new(Self {
             ui,
             inner: Mutex::new(None),
@@ -584,7 +607,7 @@ impl Engine {
         }
         // An upload shows how far it got above the composer.
         if bytes > INLINE_FILE_MAX as u64 {
-            return self.send_attachment(peer, file).await;
+            return self.send_attachment(peer, ChunkSource::File(file)).await;
         }
         let buffer = JsFuture::from(file.array_buffer())
             .await
@@ -954,7 +977,9 @@ impl Engine {
         let guard = self.inner.lock().await;
         Ok(guard.as_ref().ok_or("locked")?.server.clone())
     }
+}
 
+impl Engine<Vault> {
     /// Find out whether to create or unlock the vault.
     pub async fn start(&self) {
         glue::register_media_worker();
@@ -1282,7 +1307,9 @@ impl Engine {
             spawn_local(async move { engine.serve_media(request).await });
         });
     }
+}
 
+impl<V: VaultStore> Engine<V> {
     /// Save `content` for `peer`, then push it, encrypted as its turn comes. What the user sends
     /// goes through [`Engine::queue`], to go in order.
     async fn send(&self, peer: PublicKey, content: Kind) -> Result<(), String> {
@@ -1440,7 +1467,7 @@ impl Engine {
     /// retain them in `displayed_history` so `mark_read` / quarantine clearance reconciles them.
     async fn acknowledge_appended_displayed(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
         peer: &PublicKey,
         entries: &[DisplayedEntry],
     ) {
@@ -1470,7 +1497,7 @@ impl Engine {
     /// `true` if unread count, `acked_ranges`, or pending read receipts changed.
     fn acknowledge_displayed_window(
         &self,
-        inner: &mut Inner<impl HistoryStore>,
+        inner: &mut Inner<impl VaultStore>,
         peer: &PublicKey,
     ) -> bool {
         if self.ui.open.get_untracked() != Some(*peer) || !is_page_visible() {
@@ -1581,7 +1608,7 @@ impl Engine {
     /// without touching `ui.messages`.
     async fn load_history_window(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         peer: &PublicKey,
         before: u64,
         limit: u64,
@@ -1620,7 +1647,7 @@ impl Engine {
 
     /// Load the last [`HISTORY_SHOWN`] entries of the history of the chat with `peer`, ordered for
     /// display, without touching `ui.messages`.
-    async fn load_history(&self, inner: &mut Inner, peer: &PublicKey) -> LoadedHistory {
+    async fn load_history(&self, inner: &mut Inner<V>, peer: &PublicKey) -> LoadedHistory {
         let Some(history_len) = inner
             .contacts
             .iter()
@@ -1637,7 +1664,7 @@ impl Engine {
     /// completes, preserving any earlier pages the user already loaded (`loaded_start`) instead of
     /// collapsing back to the tail [`HISTORY_SHOWN`] window. Returns `true` only when history
     /// loaded successfully and was applied to the still-open chat.
-    async fn show_history(&self, inner: &mut Inner, peer: &PublicKey) -> bool {
+    async fn show_history(&self, inner: &mut Inner<V>, peer: &PublicKey) -> bool {
         let Some(history_len) = inner
             .contacts
             .iter()
@@ -1783,7 +1810,7 @@ impl Engine {
     /// Returns `true` if unread/receipt state changed.
     async fn reconcile_open_chat_read(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         peer: &PublicKey,
         force_reload: bool,
     ) -> bool {
@@ -1796,7 +1823,7 @@ impl Engine {
         let needs_reload = force_reload
             || !self.is_history_loaded_for(*peer)
             || inner.saved_late.contains(peer)
-            || inner.unsaved.iter().any(|(p, _)| p == peer);
+            || inner.unsaved.iter().any(|(p, _, _)| p == peer);
         if needs_reload {
             if self.show_history(inner, peer).await {
                 inner.saved_late.retain(|saved| saved != peer);
@@ -2074,8 +2101,11 @@ impl Engine {
         }
         // What the server has of the uploads that never can finish now goes, so that the peer
         // does not wait for the rest; with their upload tokens, which name nobody.
+        let server = inner.server.clone();
+        drop(guard);
         if !unfinished.is_empty() {
-            let (ui, attachments) = (self.ui, Fetch::client(&inner.server));
+            let (ui, attachments) = (self.ui, Fetch::client(&server));
+            #[cfg(target_arch = "wasm32")]
             spawn_local(async move {
                 for (name, upload) in unfinished {
                     if let Err(e) = upload.cancel(&attachments).await {
@@ -2086,6 +2116,15 @@ impl Engine {
                     }
                 }
             });
+            #[cfg(not(target_arch = "wasm32"))]
+            for (name, upload) in unfinished {
+                if let Err(e) = upload.cancel(&attachments).await {
+                    ui.log(format!(
+                        "the server keeps what it has of {name} until it expires: {}",
+                        describe(&e)
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -2122,8 +2161,10 @@ impl Engine {
     }
 }
 
-/// The vault operations needed to stage incoming changes and rebuild outgoing messages.
-trait HistoryStore {
+/// All vault persistence operations used by [`Engine`] and [`Inner`], using typed
+/// `(PublicKey, u64, ...)` record keys so underlying storage schemes (v2 string keys, v3 opaque
+/// HMAC keys, or native `MemoryVault`) require zero engine signature changes.
+pub(crate) trait VaultStore: 'static {
     async fn entry(
         &self,
         peer: &PublicKey,
@@ -2139,12 +2180,68 @@ trait HistoryStore {
         &self,
         state: &AppState,
         deferred: &DeferredInitialsRecord,
-        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
-        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
+    ) -> crate::vault::Result<()>;
+    async fn history(
+        &self,
+        peer: &PublicKey,
+        history_len: u64,
+        limit: u64,
+    ) -> crate::vault::Result<Vec<(u64, HistoryEntry)>>;
+    async fn file(&self, peer: &PublicKey, index: u64) -> crate::vault::Result<Vec<u8>>;
+    async fn outgoing(&self, peer: &PublicKey, index: u64) -> crate::vault::Result<OutgoingRecord>;
+    async fn put_chunk(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+        index: u32,
+        chunk: &[u8],
+    ) -> crate::vault::Result<()>;
+    async fn chunk(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+        index: u32,
+    ) -> crate::vault::Result<Option<Vec<u8>>>;
+    async fn chunks_kept(&self, peer: &PublicKey, id: &[u8]) -> crate::vault::Result<u32>;
+    async fn save_upload(
+        &self,
+        peer: &PublicKey,
+        upload: &PendingUpload,
+    ) -> crate::vault::Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_upload<'a>(
+        &self,
+        state: &AppState,
+        deferred: &DeferredInitialsRecord,
+        peer: &PublicKey,
+        old_id: &[u8],
+        new_upload: &PendingUpload,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
+    ) -> crate::vault::Result<()>;
+    async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> crate::vault::Result<()>;
+    async fn upload(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+    ) -> crate::vault::Result<Option<PendingUpload>>;
+    async fn uploads(
+        &self,
+        peer: Option<&PublicKey>,
+    ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>>;
+    async fn forget<'a>(
+        &self,
+        state: &AppState,
+        deferred: &DeferredInitialsRecord,
+        peer: &PublicKey,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()>;
 }
 
-impl HistoryStore for Vault {
+impl VaultStore for Vault {
     async fn entry(
         &self,
         peer: &PublicKey,
@@ -2164,27 +2261,108 @@ impl HistoryStore for Vault {
         &self,
         state: &AppState,
         deferred: &DeferredInitialsRecord,
-        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
-        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()> {
         Vault::save(self, state, deferred, entries, outgoing).await
     }
+    async fn history(
+        &self,
+        peer: &PublicKey,
+        history_len: u64,
+        limit: u64,
+    ) -> crate::vault::Result<Vec<(u64, HistoryEntry)>> {
+        Vault::history(self, peer, history_len, limit).await
+    }
+    async fn file(&self, peer: &PublicKey, index: u64) -> crate::vault::Result<Vec<u8>> {
+        Vault::file(self, peer, index).await
+    }
+    async fn outgoing(&self, peer: &PublicKey, index: u64) -> crate::vault::Result<OutgoingRecord> {
+        Vault::outgoing(self, peer, index).await
+    }
+    async fn put_chunk(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+        index: u32,
+        chunk: &[u8],
+    ) -> crate::vault::Result<()> {
+        Vault::put_chunk(self, peer, id, index, chunk).await
+    }
+    async fn chunk(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+        index: u32,
+    ) -> crate::vault::Result<Option<Vec<u8>>> {
+        Vault::chunk(self, peer, id, index).await
+    }
+    async fn chunks_kept(&self, peer: &PublicKey, id: &[u8]) -> crate::vault::Result<u32> {
+        Vault::chunks_kept(self, peer, id).await
+    }
+    async fn save_upload(
+        &self,
+        peer: &PublicKey,
+        upload: &PendingUpload,
+    ) -> crate::vault::Result<()> {
+        Vault::save_upload(self, peer, upload).await
+    }
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_upload<'a>(
+        &self,
+        state: &AppState,
+        deferred: &DeferredInitialsRecord,
+        peer: &PublicKey,
+        old_id: &[u8],
+        new_upload: &PendingUpload,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
+    ) -> crate::vault::Result<()> {
+        Vault::promote_upload(
+            self, state, deferred, peer, old_id, new_upload, entries, outgoing,
+        )
+        .await
+    }
+    async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> crate::vault::Result<()> {
+        Vault::forget_upload(self, peer, id).await
+    }
+    async fn upload(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+    ) -> crate::vault::Result<Option<PendingUpload>> {
+        Vault::upload(self, peer, id).await
+    }
+    async fn uploads(
+        &self,
+        peer: Option<&PublicKey>,
+    ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>> {
+        Vault::uploads(self, peer).await
+    }
+    async fn forget<'a>(
+        &self,
+        state: &AppState,
+        deferred: &DeferredInitialsRecord,
+        peer: &PublicKey,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
+    ) -> crate::vault::Result<()> {
+        Vault::forget(self, state, deferred, peer, entries, outgoing).await
+    }
 }
 
-impl Inner {
+impl<V: VaultStore> Inner<V> {
     /// Atomically promote a waiting sign-in upload (`old_id`) into a server-started `new_upload`
     /// together with the updated state, deferred record, history entries, and outbox records in
-    /// one IndexedDB transaction.
+    /// one vault transaction.
     pub(super) async fn promote_upload_with(
         &mut self,
         peer: &PublicKey,
         old_id: &[u8],
         new_upload: &PendingUpload,
-        entries: &[(String, HistoryEntry)],
-        outgoing: &[(String, Option<OutgoingRecord>)],
+        entries: &[(PublicKey, u64, HistoryEntry)],
+        outgoing: &[(PublicKey, u64, Option<OutgoingRecord>)],
     ) -> crate::vault::Result<()> {
-        let unsaved = self.unsaved.iter().map(|(_, record)| record);
-        let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
         let state = self.app_state();
         let deferred = self.deferred_record();
         if !crate::glue::owns_lock() {
@@ -2199,18 +2377,18 @@ impl Inner {
                 peer,
                 old_id,
                 new_upload,
-                unsaved.chain(entries),
-                unsaved_outbox.chain(outgoing),
+                self.unsaved.iter().chain(entries),
+                self.unsaved_outbox.iter().chain(outgoing),
             )
             .await?;
         self.finish_state_save(state.pending_inbox_acks);
         self.saved_late
-            .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
+            .extend(self.unsaved.drain(..).map(|(peer, _, _)| peer));
         self.unsaved_outbox.clear();
         Ok(())
     }
 
-    /// Persist deletion of `peer` (and any pending records of other chats) via `Vault::forget`
+    /// Persist deletion of `peer` (and any pending records of other chats) via `VaultStore::forget`
     /// and update all in-memory peer/state tracking atomically on success.
     pub(super) async fn forget_peer(
         &mut self,
@@ -2221,13 +2399,11 @@ impl Inner {
         let unsaved = self
             .unsaved
             .iter()
-            .filter(|(unsaved, _)| unsaved != peer)
-            .map(|(_, record)| record);
+            .filter(|(unsaved, _, _)| unsaved != peer);
         let unsaved_outbox = self
             .unsaved_outbox
             .iter()
-            .filter(|(unsaved, _)| unsaved != peer)
-            .map(|(_, record)| record);
+            .filter(|(unsaved, _, _)| unsaved != peer);
         self.vault
             .forget(&state, &deferred, peer, unsaved, unsaved_outbox)
             .await?;
@@ -2242,7 +2418,7 @@ impl Inner {
         self.saved_late.extend(
             self.unsaved
                 .drain(..)
-                .map(|(unsaved, _)| unsaved)
+                .map(|(unsaved, _, _)| unsaved)
                 .filter(|unsaved| unsaved != peer),
         );
         self.unsaved_outbox.clear();
@@ -2282,9 +2458,7 @@ impl Inner {
         }
         Ok(None)
     }
-}
 
-impl<V: HistoryStore> Inner<V> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         vault: V,
@@ -2421,7 +2595,10 @@ impl<V: HistoryStore> Inner<V> {
     }
 
     /// Save the state, and `entries` with it, and the records left [unsaved](Self::unsaved).
-    async fn save(&mut self, entries: &[(String, HistoryEntry)]) -> crate::vault::Result<()> {
+    async fn save(
+        &mut self,
+        entries: &[(PublicKey, u64, HistoryEntry)],
+    ) -> crate::vault::Result<()> {
         self.save_with(entries, &[]).await
     }
 
@@ -2429,11 +2606,9 @@ impl<V: HistoryStore> Inner<V> {
     /// pushed, or none for one that went.
     async fn save_with(
         &mut self,
-        entries: &[(String, HistoryEntry)],
-        outgoing: &[(String, Option<OutgoingRecord>)],
+        entries: &[(PublicKey, u64, HistoryEntry)],
+        outgoing: &[(PublicKey, u64, Option<OutgoingRecord>)],
     ) -> crate::vault::Result<()> {
-        let unsaved = self.unsaved.iter().map(|(_, record)| record);
-        let unsaved_outbox = self.unsaved_outbox.iter().map(|(_, record)| record);
         let state = self.app_state();
         let deferred = self.deferred_record();
         if !crate::glue::owns_lock() {
@@ -2445,13 +2620,13 @@ impl<V: HistoryStore> Inner<V> {
             .save(
                 &state,
                 &deferred,
-                unsaved.chain(entries),
-                unsaved_outbox.chain(outgoing),
+                self.unsaved.iter().chain(entries),
+                self.unsaved_outbox.iter().chain(outgoing),
             )
             .await?;
         self.finish_state_save(state.pending_inbox_acks);
         self.saved_late
-            .extend(self.unsaved.drain(..).map(|(peer, _)| peer));
+            .extend(self.unsaved.drain(..).map(|(peer, _, _)| peer));
         self.unsaved_outbox.clear();
         Ok(())
     }
@@ -2624,14 +2799,9 @@ impl<V: HistoryStore> Inner<V> {
     }
 }
 
-impl Engine {
+impl<V: VaultStore> Engine<V> {
     /// Show `views`, new in the chat with `peer`, if it is on screen, in its order.
-    fn show_new(
-        &self,
-        inner: &Inner<impl HistoryStore>,
-        peer: &PublicKey,
-        views: Vec<MessageView>,
-    ) {
+    fn show_new(&self, inner: &Inner<impl VaultStore>, peer: &PublicKey, views: Vec<MessageView>) {
         if self.ui.open.get_untracked() != Some(*peer) || views.is_empty() {
             return;
         }
@@ -2681,7 +2851,7 @@ impl Engine {
     /// their real upload pointer once signed in), in the chat's order.
     fn show_changes(
         &self,
-        inner: &Inner<impl HistoryStore>,
+        inner: &Inner<impl VaultStore>,
         peer: &PublicKey,
         entries: &[(u64, HistoryEntry)],
     ) {
@@ -2752,17 +2922,27 @@ pub(super) fn normalize_update_reason(raw: &str) -> String {
     }
 }
 
-/// The records of `entries` of the chat with `peer`.
-fn records(peer: &PublicKey, entries: &[(u64, HistoryEntry)]) -> Vec<(String, HistoryEntry)> {
+/// The typed records of `entries` of the chat with `peer`.
+fn records(
+    peer: &PublicKey,
+    entries: &[(u64, HistoryEntry)],
+) -> Vec<(PublicKey, u64, HistoryEntry)> {
     entries
         .iter()
-        .map(|(index, entry)| (history_key(peer, *index), entry.clone()))
+        .map(|(index, entry)| (*peer, *index, entry.clone()))
         .collect()
 }
 
 /// The page's origin, e.g. `https://chat.example.com`.
+#[cfg(target_arch = "wasm32")]
 pub fn origin() -> String {
     window().location().origin().unwrap_or_default()
+}
+
+/// The page's origin in native tests.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn origin() -> String {
+    "http://localhost".to_string()
 }
 
 /// The address of `server`, as saved: the page's origin if empty.

@@ -1,3 +1,5 @@
+#[cfg(not(target_arch = "wasm32"))]
+use super::attachments::ChunkSource;
 use super::attachments::{ResumeVerifier, expected_chunk_len, upload_of_with_digests};
 use super::contact::{
     accept_contact_request_state, contact_state_is_new_quarantined, insert_acked_range, place_of,
@@ -18,11 +20,13 @@ use super::settings::{
 use super::streaming::stream_mime;
 use super::sync::{farewell_push_v2_request, resolve_stalled_peer};
 use super::{
-    EVENTS_KEPT, Engine, HistoryStore, Inner, NAME_MAX, ONE_TIME_PREKEYS, OpenTracker,
-    PqSaveOutcome, ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, Sending,
-    StartChatError, build_invitation_link, checked_name, normalize_update_reason,
+    EVENTS_KEPT, Engine, Inner, NAME_MAX, ONE_TIME_PREKEYS, OpenTracker, PqSaveOutcome,
+    ProtocolRpcScope, REFILL_USED, SERVER_MAX_ONE_TIME_PREKEYS, Sending, StartChatError,
+    VaultStore, build_invitation_link, checked_name, normalize_update_reason,
     parse_invitation_hash, same_server, sanitize_shared_name, should_require_update_for_rpc,
 };
+#[cfg(not(target_arch = "wasm32"))]
+use super::{HISTORY_SHOWN, OpenOutcome};
 use crate::content::{Contact as WireContact, Content, Events, Kind};
 use crate::state::{Body, Delivery, Dialog, Me, Opening, ServerPqStatus, SharedContact, Step, Ui};
 use crate::transport::{Connect, Fetch};
@@ -30,7 +34,7 @@ use crate::util::{hex, key_from_text, key_to_url, short, validate_relay_url};
 use crate::vault::{
     AppState, Awaiting, CarriedDeferredTimestamp, ContactState, DeferredInitial,
     DeferredInitialsRecord, Farewell, HistoryEntry, Outgoing, OutgoingRecord, PendingUpload,
-    UPLOAD_STATE_STARTED, history_key, outbox_key,
+    UPLOAD_STATE_STARTED,
 };
 use bytes::Bytes;
 use leptos::prelude::GetUntracked;
@@ -431,18 +435,58 @@ fn upgrade_to_pq_unlocks_inbound_request_and_records_hello_when_history_empty() 
 
 const TEST_SERVER: &str = "https://chat.example";
 
-/// Only these three vault operations participate in an inbox or outbox transaction.
+type MemoryChunkKey = (PublicKey, Vec<u8>, u32);
+
+/// In-memory [`VaultStore`] indexed directly by typed keys with deterministic fault injection.
 #[derive(Default)]
-struct MemoryHistory {
+struct MemoryVault {
     state: RefCell<AppState>,
     deferred: RefCell<DeferredInitialsRecord>,
-    entries: RefCell<HashMap<String, HistoryEntry>>,
-    outbox: RefCell<HashMap<String, OutgoingRecord>>,
+    entries: RefCell<HashMap<(PublicKey, u64), HistoryEntry>>,
+    files: RefCell<HashMap<(PublicKey, u64), Vec<u8>>>,
+    outbox: RefCell<HashMap<(PublicKey, u64), OutgoingRecord>>,
+    chunks: RefCell<HashMap<MemoryChunkKey, Vec<u8>>>,
+    uploads: RefCell<HashMap<(PublicKey, Vec<u8>), PendingUpload>>,
     fail_read_at: Cell<Option<u64>>,
+    fail_history: Cell<bool>,
     fail_save: Cell<bool>,
+    fail_put_chunk: Cell<bool>,
+    fail_promote_upload: Cell<bool>,
+    fail_forget: Cell<bool>,
 }
 
-impl HistoryStore for MemoryHistory {
+impl MemoryVault {
+    fn apply_entries<'a>(
+        &self,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+    ) {
+        let mut entry_map = self.entries.borrow_mut();
+        let mut file_map = self.files.borrow_mut();
+        for (peer, index, entry) in entries {
+            let (stripped, file_data) = entry.without_file();
+            if let Some(data) = file_data {
+                file_map.insert((*peer, *index), data.to_vec());
+            }
+            entry_map.insert((*peer, *index), stripped);
+        }
+    }
+
+    fn apply_outgoing<'a>(
+        &self,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
+    ) {
+        let mut outbox = self.outbox.borrow_mut();
+        for (peer, index, record) in outgoing {
+            if let Some(record) = record {
+                outbox.insert((*peer, *index), record.clone());
+            } else {
+                outbox.remove(&(*peer, *index));
+            }
+        }
+    }
+}
+
+impl VaultStore for MemoryVault {
     async fn entry(
         &self,
         peer: &PublicKey,
@@ -451,45 +495,215 @@ impl HistoryStore for MemoryHistory {
         if self.fail_read_at.get() == Some(index) {
             return Err(crate::vault::Error::Storage("read failed".into()));
         }
-        Ok(self
-            .entries
-            .borrow()
-            .get(&history_key(peer, index))
-            .cloned())
+        Ok(self.entries.borrow().get(&(*peer, index)).cloned())
     }
 
     async fn content(
         &self,
-        _: &PublicKey,
-        _: u64,
+        peer: &PublicKey,
+        index: u64,
         entry: &HistoryEntry,
     ) -> crate::vault::Result<Option<Kind>> {
-        Ok(entry.content.as_ref().and_then(|c| c.kind.clone()))
+        let mut kind = entry.content.as_ref().and_then(|c| c.kind.clone());
+        if entry.file > 0 {
+            let Some(data) = self.files.borrow().get(&(*peer, index)).cloned() else {
+                return Ok(None);
+            };
+            match kind.as_mut() {
+                Some(Kind::File(file)) => file.data = data,
+                Some(Kind::Image(image)) => *image = data,
+                _ => {}
+            }
+        }
+        Ok(kind)
     }
 
     async fn save<'a>(
         &self,
         state: &AppState,
         deferred: &DeferredInitialsRecord,
-        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
-        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()> {
         if self.fail_save.get() {
             return Err(crate::vault::Error::Storage("write failed".into()));
         }
         self.state.replace(state.clone());
         self.deferred.replace(deferred.clone());
-        self.entries
-            .borrow_mut()
-            .extend(entries.into_iter().cloned());
-        let mut outbox = self.outbox.borrow_mut();
-        for (key, record) in outgoing {
-            if let Some(record) = record {
-                outbox.insert(key.clone(), record.clone());
-            } else {
-                outbox.remove(key);
-            }
+        self.apply_entries(entries);
+        self.apply_outgoing(outgoing);
+        Ok(())
+    }
+
+    async fn history(
+        &self,
+        peer: &PublicKey,
+        history_len: u64,
+        limit: u64,
+    ) -> crate::vault::Result<Vec<(u64, HistoryEntry)>> {
+        if self.fail_history.get() {
+            return Err(crate::vault::Error::Storage("history read failed".into()));
         }
+        if limit == 0 || history_len == 0 {
+            return Ok(vec![]);
+        }
+        let last = history_len - 1;
+        let first = history_len.saturating_sub(limit);
+        let mut page: Vec<(u64, HistoryEntry)> = self
+            .entries
+            .borrow()
+            .iter()
+            .filter(|((p, idx), _)| p == peer && *idx >= first && *idx <= last)
+            .map(|((_, idx), entry)| (*idx, entry.clone()))
+            .collect();
+        page.sort_by_key(|(idx, _)| *idx);
+        Ok(page)
+    }
+
+    async fn file(&self, peer: &PublicKey, index: u64) -> crate::vault::Result<Vec<u8>> {
+        self.files
+            .borrow()
+            .get(&(*peer, index))
+            .cloned()
+            .ok_or_else(|| crate::vault::Error::Corrupt("file is missing".into()))
+    }
+
+    async fn outgoing(&self, peer: &PublicKey, index: u64) -> crate::vault::Result<OutgoingRecord> {
+        self.outbox
+            .borrow()
+            .get(&(*peer, index))
+            .cloned()
+            .ok_or_else(|| crate::vault::Error::Corrupt("outbox record is missing".into()))
+    }
+
+    async fn put_chunk(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+        index: u32,
+        chunk: &[u8],
+    ) -> crate::vault::Result<()> {
+        if self.fail_put_chunk.get() {
+            return Err(crate::vault::Error::Storage("put_chunk failed".into()));
+        }
+        self.chunks
+            .borrow_mut()
+            .insert((*peer, id.to_vec(), index), chunk.to_vec());
+        Ok(())
+    }
+
+    async fn chunk(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+        index: u32,
+    ) -> crate::vault::Result<Option<Vec<u8>>> {
+        Ok(self
+            .chunks
+            .borrow()
+            .get(&(*peer, id.to_vec(), index))
+            .cloned())
+    }
+
+    async fn chunks_kept(&self, peer: &PublicKey, id: &[u8]) -> crate::vault::Result<u32> {
+        let count = self
+            .chunks
+            .borrow()
+            .keys()
+            .filter(|(p, i, _)| p == peer && i.as_slice() == id)
+            .count();
+        Ok(count as u32)
+    }
+
+    async fn save_upload(
+        &self,
+        peer: &PublicKey,
+        upload: &PendingUpload,
+    ) -> crate::vault::Result<()> {
+        if self.fail_save.get() {
+            return Err(crate::vault::Error::Storage("save_upload failed".into()));
+        }
+        self.uploads
+            .borrow_mut()
+            .insert((*peer, upload.id.clone()), upload.clone());
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn promote_upload<'a>(
+        &self,
+        state: &AppState,
+        deferred: &DeferredInitialsRecord,
+        peer: &PublicKey,
+        old_id: &[u8],
+        new_upload: &PendingUpload,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
+    ) -> crate::vault::Result<()> {
+        if self.fail_promote_upload.get() || self.fail_save.get() {
+            return Err(crate::vault::Error::Storage("promote_upload failed".into()));
+        }
+        {
+            let mut uploads = self.uploads.borrow_mut();
+            uploads.remove(&(*peer, old_id.to_vec()));
+            uploads.insert((*peer, new_upload.id.clone()), new_upload.clone());
+        }
+        self.state.replace(state.clone());
+        self.deferred.replace(deferred.clone());
+        self.apply_entries(entries);
+        self.apply_outgoing(outgoing);
+        Ok(())
+    }
+
+    async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> crate::vault::Result<()> {
+        if self.fail_save.get() {
+            return Err(crate::vault::Error::Storage("forget_upload failed".into()));
+        }
+        self.uploads.borrow_mut().remove(&(*peer, id.to_vec()));
+        Ok(())
+    }
+
+    async fn upload(
+        &self,
+        peer: &PublicKey,
+        id: &[u8],
+    ) -> crate::vault::Result<Option<PendingUpload>> {
+        Ok(self.uploads.borrow().get(&(*peer, id.to_vec())).cloned())
+    }
+
+    async fn uploads(
+        &self,
+        peer: Option<&PublicKey>,
+    ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>> {
+        Ok(self
+            .uploads
+            .borrow()
+            .iter()
+            .filter(|((p, _), _)| peer.is_none_or(|target| target == p))
+            .map(|((p, _), upload)| (*p, upload.clone()))
+            .collect())
+    }
+
+    async fn forget<'a>(
+        &self,
+        state: &AppState,
+        deferred: &DeferredInitialsRecord,
+        peer: &PublicKey,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
+    ) -> crate::vault::Result<()> {
+        if self.fail_forget.get() || self.fail_save.get() {
+            return Err(crate::vault::Error::Storage("forget failed".into()));
+        }
+        self.entries.borrow_mut().retain(|(p, _), _| p != peer);
+        self.files.borrow_mut().retain(|(p, _), _| p != peer);
+        self.outbox.borrow_mut().retain(|(p, _), _| p != peer);
+        self.chunks.borrow_mut().retain(|(p, _, _), _| p != peer);
+        self.uploads.borrow_mut().retain(|(p, _), _| p != peer);
+        self.state.replace(state.clone());
+        self.deferred.replace(deferred.clone());
+        self.apply_entries(entries);
+        self.apply_outgoing(outgoing);
         Ok(())
     }
 }
@@ -511,7 +725,7 @@ fn stored_contact(me: PublicKey, peer: PublicKey) -> ContactState {
 }
 
 /// Reopen only the committed vault bytes, discarding all transient engine state.
-fn reload(vault: MemoryHistory) -> Inner<MemoryHistory> {
+fn reload(vault: MemoryVault) -> Inner<MemoryVault> {
     let mut state = AppState::decode(vault.state.borrow().encode_to_vec().as_slice()).unwrap();
     let mut deferred =
         DeferredInitialsRecord::decode(vault.deferred.borrow().encode_to_vec().as_slice()).unwrap();
@@ -541,8 +755,8 @@ fn reload(vault: MemoryHistory) -> Inner<MemoryHistory> {
     )
 }
 
-fn load_contacts(client: &Client<Connect>, contacts: Vec<ContactState>) -> Inner<MemoryHistory> {
-    reload(MemoryHistory {
+fn load_contacts(client: &Client<Connect>, contacts: Vec<ContactState>) -> Inner<MemoryVault> {
+    reload(MemoryVault {
         state: RefCell::new(AppState {
             client: Some(client.state().into()),
             contacts,
@@ -606,7 +820,7 @@ fn change_session(session: &mut Session<Connect>, change: impl FnOnce(&mut proto
     );
 }
 
-fn unlocked_client() -> (Inner<MemoryHistory>, PublicKey) {
+fn unlocked_client() -> (Inner<MemoryVault>, PublicKey) {
     let client = Client::new(Fetch::client(TEST_SERVER));
     let me = client.identity_key();
     let peer = identity();
@@ -615,7 +829,7 @@ fn unlocked_client() -> (Inner<MemoryHistory>, PublicKey) {
     assert!(warnings.is_empty());
     (
         Inner::new(
-            MemoryHistory::default(),
+            MemoryVault::default(),
             TEST_SERVER.into(),
             "chat.example".into(),
             AppState::default(),
@@ -1145,9 +1359,9 @@ fn requeue_reads_before_mutation_and_drops_only_messages_with_missing_originals(
         );
         let first = history("keep me");
         inner.vault.entries.borrow_mut().extend([
-            (history_key(&peer, 0), first.clone()),
+            ((peer, 0), first.clone()),
             (
-                history_key(&peer, 2),
+                (peer, 2),
                 HistoryEntry {
                     outgoing: true,
                     ..Default::default()
@@ -1166,7 +1380,7 @@ fn requeue_reads_before_mutation_and_drops_only_messages_with_missing_originals(
         let outcome = inner.requeue_before_push(&peer).await.unwrap().unwrap();
         assert!(!inner.vault.state.borrow().contacts[0].needs_requeue_sealed);
         assert_eq!(
-            inner.vault.entries.borrow()[&history_key(&peer, 2)].delivery(),
+            inner.vault.entries.borrow()[&(peer, 2)].delivery(),
             Delivery::Failed
         );
         assert_eq!(
@@ -1178,14 +1392,15 @@ fn requeue_reads_before_mutation_and_drops_only_messages_with_missing_originals(
             outcome.outbox,
             [
                 (
-                    outbox_key(&peer, 0),
+                    peer,
+                    0,
                     Some(OutgoingRecord {
                         content: first.content.unwrap().kind.unwrap().to_bytes(),
                         ..Default::default()
                     })
                 ),
-                (outbox_key(&peer, 1), None),
-                (outbox_key(&peer, 2), None),
+                (peer, 1, None),
+                (peer, 2, None),
             ]
         );
         assert_eq!(outcome.history.len(), 1);
@@ -1198,7 +1413,7 @@ fn requeue_reads_before_mutation_and_drops_only_messages_with_missing_originals(
             ..Default::default()
         }];
         let outcome = inner.requeue(&peer, true, &BTreeMap::new()).await.unwrap();
-        assert_eq!(outcome.outbox, [(outbox_key(&peer, 2), None)]);
+        assert_eq!(outcome.outbox, [(peer, 2, None)]);
         assert_eq!(outcome.history[0].1.delivery(), Delivery::Failed);
         assert!(inner.contacts[0].state.awaiting.is_empty());
         assert_eq!(
@@ -1214,17 +1429,14 @@ fn fail_waiting_preserves_queue_on_read_or_commit_failure() {
         let (mut inner, peer) = unlocked_client();
         let outbox = vec![waiting(0, false), waiting(1, true)];
         inner.contacts[0].state.outbox = outbox.clone();
-        let key = history_key(&peer, 0);
+        let key = (peer, 0);
         inner
             .vault
             .entries
             .borrow_mut()
-            .insert(key.clone(), history("queued"));
+            .insert(key, history("queued"));
         inner
-            .save_with(
-                &[],
-                &[(outbox_key(&peer, 0), Some(OutgoingRecord::default()))],
-            )
+            .save_with(&[], &[(peer, 0, Some(OutgoingRecord::default()))])
             .await
             .unwrap();
         inner.vault.fail_read_at.set(Some(0));
@@ -1239,13 +1451,7 @@ fn fail_waiting_preserves_queue_on_read_or_commit_failure() {
             inner.vault.entries.borrow()[&key].delivery(),
             Delivery::Pending
         );
-        assert!(
-            inner
-                .vault
-                .outbox
-                .borrow()
-                .contains_key(&outbox_key(&peer, 0))
-        );
+        assert!(inner.vault.outbox.borrow().contains_key(&(peer, 0)));
         inner.vault.fail_save.set(false);
         inner.fail_waiting(&peer, "refused".into()).await.unwrap();
         assert_eq!(inner.contacts[0].state.outbox, [waiting(1, true)]);
@@ -1341,7 +1547,7 @@ fn carried_initial_and_cursor_commit_together_and_survive_a_failed_join_and_relo
         );
 
         // Retry both ways: keeping the consumed prekeys in memory, or restarting from disk.
-        let restarted = reload(MemoryHistory {
+        let restarted = reload(MemoryVault {
             state: RefCell::new(disk),
             ..Default::default()
         });
@@ -1363,11 +1569,7 @@ fn carried_initial_and_cursor_commit_together_and_survive_a_failed_join_and_relo
             let history = recovered.vault.entries.borrow();
             assert_eq!(history.len(), 1);
             assert_eq!(
-                history[&history_key(&peer, 0)]
-                    .content
-                    .as_ref()
-                    .unwrap()
-                    .kind,
+                history[&(peer, 0)].content.as_ref().unwrap().kind,
                 Some(Kind::Text("first message".into()))
             );
         }
@@ -1697,9 +1899,10 @@ fn strict_mode_blocks_releasing_a_classical_request() {
 fn a_later_save_commits_staged_history_outbox_and_inbox_ids_together() {
     futures::executor::block_on(async {
         let (mut inner, peer) = unlocked_client();
-        let record = (history_key(&peer, 0), history("greeting"));
+        let record = (peer, 0, history("greeting"));
         let outgoing = (
-            outbox_key(&peer, 1),
+            peer,
+            1,
             Some(OutgoingRecord {
                 content: Kind::Text("retry".into()).to_bytes(),
                 ..Default::default()
@@ -1709,7 +1912,7 @@ fn a_later_save_commits_staged_history_outbox_and_inbox_ids_together() {
         inner.vault.fail_save.set(true);
         assert!(
             inner
-                .save_inbox_changes(vec![(peer, record.clone())], vec![(peer, outgoing.clone())])
+                .save_inbox_changes(vec![record.clone()], vec![outgoing.clone()])
                 .await
                 .is_err()
         );
@@ -1717,11 +1920,8 @@ fn a_later_save_commits_staged_history_outbox_and_inbox_ids_together() {
         assert!(inner.vault.state.borrow().pending_inbox_acks.is_empty());
         inner.vault.fail_save.set(false);
         inner.save(&[]).await.unwrap();
-        assert_eq!(inner.vault.entries.borrow()[&record.0], record.1);
-        assert_eq!(
-            inner.vault.outbox.borrow()[&outgoing.0],
-            outgoing.1.unwrap()
-        );
+        assert_eq!(inner.vault.entries.borrow()[&(peer, 0)], record.2);
+        assert_eq!(inner.vault.outbox.borrow()[&(peer, 1)], outgoing.2.unwrap());
         assert_eq!(inner.vault.state.borrow().pending_inbox_acks, [9]);
         assert!(!inner.needs_save() && inner.contacts_dirty_late);
         assert_eq!(inner.saved_late, [peer]);
@@ -2455,11 +2655,7 @@ fn pq_build_replays_deferred_inbox_ciphertext_once_after_reload() {
         let entries = inner.vault.entries.borrow();
         assert_eq!(entries.len(), 1);
         assert_eq!(
-            entries[&history_key(&peer, 0)]
-                .content
-                .as_ref()
-                .unwrap()
-                .kind,
+            entries[&(peer, 0)].content.as_ref().unwrap().kind,
             Some(Kind::Text("first message".into()))
         );
     });
@@ -3869,10 +4065,10 @@ fn recover_corrupt_outbox_rebuilds_from_history_or_drops_and_marks_failed() {
             .vault
             .entries
             .borrow_mut()
-            .insert(history_key(&peer, 0), history("recoverable message"));
+            .insert((peer, 0), history("recoverable message"));
         // Entry 1 has missing content (unrecoverable), so it must be dropped & marked Failed.
         inner.vault.entries.borrow_mut().insert(
-            history_key(&peer, 1),
+            (peer, 1),
             HistoryEntry {
                 outgoing: true,
                 delivery: Delivery::Pending.into(),
@@ -3890,13 +4086,7 @@ fn recover_corrupt_outbox_rebuilds_from_history_or_drops_and_marks_failed() {
         }
         assert!(!inner.contacts[0].state.outbox[0].sealed);
         assert_eq!(inner.contacts[0].state.outbox[0].clock, 0);
-        assert!(
-            inner
-                .vault
-                .outbox
-                .borrow()
-                .contains_key(&outbox_key(&peer, 0))
-        );
+        assert!(inner.vault.outbox.borrow().contains_key(&(peer, 0)));
 
         match inner.recover_corrupt_outbox(&peer, 1).await.unwrap() {
             CorruptOutboxRecovery::Dropped { history } => {
@@ -3918,7 +4108,7 @@ fn recover_corrupt_outbox_rebuilds_from_history_or_drops_and_marks_failed() {
             vec![0, 2]
         );
         assert_eq!(
-            inner.vault.entries.borrow()[&history_key(&peer, 1)].delivery(),
+            inner.vault.entries.borrow()[&(peer, 1)].delivery(),
             Delivery::Failed
         );
     });
@@ -4174,4 +4364,1271 @@ fn contact_updates_and_zeroizes_last_message_on_send_receive_and_evict() {
     contact.record_last_message(&outgoing);
     contact.state.zeroize_secrets();
     assert!(contact.state.last_message.is_none());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const LOCAL_SERVER: &str = "http://localhost";
+
+/// Construct an unlocked `Engine<MemoryVault>` on `http://localhost` with one active established
+/// session to `bob_peer` (with `GREETING_DELIVERY_CONFIRMED`), ready for deterministic native
+/// async tests using [`crate::transport::mock_fetch`].
+#[cfg(not(target_arch = "wasm32"))]
+async fn established_engine_on_localhost()
+-> (std::rc::Rc<Engine<MemoryVault>>, PublicKey, Client<Connect>) {
+    use crate::vault::GREETING_DELIVERY_CONFIRMED;
+
+    let mut bob = Client::new(Fetch::client(LOCAL_SERVER));
+    let bob_peer = bob.identity_key();
+    let published = bob.prepare_publish_v2("localhost", 2, 2).unwrap();
+    let p = &published.request;
+    let bundle = protocol::handshake_v2::ClaimBundleResponse {
+        signed_prekey: p.manifest.as_ref().unwrap().signed_prekey.clone(),
+        signed_prekey_signature: p.signed_prekey_signature.clone(),
+        one_time_prekey: p.one_time_prekeys.first().cloned(),
+        pq_last_resort: p.pq_last_resort.first().cloned(),
+        pq_one_time_prekey: p.pq_one_time_prekeys.first().cloned(),
+        manifest: p.manifest.clone(),
+    };
+    bob.commit_publish_v2(published);
+
+    let mut alice_boot = Client::new(ConnectClient::new(BundleResponse("/ClaimBundle", bundle)));
+    let prepared = alice_boot
+        .prepare_initiate_v2(
+            "localhost",
+            &bob_peer,
+            &Default::default(),
+            &Kind::Text("init".into()).to_bytes(),
+            Fetch::client(LOCAL_SERVER),
+        )
+        .await
+        .unwrap();
+    let alice_state = ClientState::try_from(&proto::ClientState::from(alice_boot.state())).unwrap();
+    let alice = Client::restore(Fetch::client(LOCAL_SERVER), alice_state);
+    let contact = super::contact::Contact {
+        peer: bob_peer,
+        session: prepared.session,
+        deferred_carried: 0,
+        state: ContactState {
+            peer: bob_peer.to_vec(),
+            name: "Bob".into(),
+            greeting_delivery: GREETING_DELIVERY_CONFIRMED,
+            ..ContactState::default()
+        },
+    };
+    let inner = Inner::new(
+        MemoryVault::default(),
+        LOCAL_SERVER.into(),
+        "localhost".into(),
+        AppState {
+            name: "Alice".into(),
+            ..AppState::default()
+        },
+        alice,
+        vec![contact],
+        vec![],
+        DeferredInitialsRecord::default(),
+    );
+    let engine = Engine::with_inner(Ui::new(), inner);
+    (engine, bob_peer, bob)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn engine_open_and_load_earlier_paginates_and_acknowledges_only_displayed_pages() {
+    use leptos::prelude::WithUntracked;
+    use std::rc::Rc;
+
+    futures::executor::block_on(async {
+        let pushed_receipts = Rc::new(Cell::new(0usize));
+        let pushed_counter = pushed_receipts.clone();
+        let _mock = crate::transport::mock_fetch(move |_server, path, _body| {
+            if path.ends_with("/PushV2") {
+                pushed_counter.set(pushed_counter.get() + 1);
+                Ok((
+                    200,
+                    protocol::mailbox_v2::PushV2Response { sequence: 1 }.encode_to_vec(),
+                ))
+            } else {
+                Err(protocol::Error::new(
+                    protocol::ErrorKind::Unimplemented,
+                    format!("unexpected path {path}"),
+                ))
+            }
+        });
+
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let total = HISTORY_SHOWN + 15;
+        let me = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let me = inner.client.identity_key();
+            let mut records = Vec::with_capacity(total as usize);
+            {
+                let contact = inner.contact(&peer).unwrap();
+                for i in 0..total {
+                    let clock = i + 1;
+                    let (idx, entry) = contact
+                        .add_received(
+                            Content {
+                                clock,
+                                kind: Some(Kind::Text(format!("msg-{i}"))),
+                                events: None,
+                            },
+                            false,
+                        )
+                        .unwrap();
+                    records.push((peer, idx, entry));
+                }
+            }
+            inner.save(&records).await.unwrap();
+            me
+        };
+
+        // Self-peer and unknown peer are ignored cleanly.
+        assert_eq!(engine.open(Some(me)).await, OpenOutcome::Ignored);
+        assert_eq!(engine.open(Some(identity())).await, OpenOutcome::Ignored);
+
+        // Opening the chat loads only the tail `HISTORY_SHOWN` entries, acknowledges only those
+        // entries, and leaves the 15 older messages unread until `load_earlier` fetches them.
+        assert_eq!(engine.open(Some(peer)).await, OpenOutcome::Opened);
+        assert_eq!(engine.ui().open.get_untracked(), Some(peer));
+        assert_eq!(
+            engine.ui().messages.with_untracked(Vec::len),
+            HISTORY_SHOWN as usize
+        );
+        assert!(engine.ui().has_older_messages.get_untracked());
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert_eq!(contact.state.unread, 15);
+            assert_eq!(contact.state.unseen.len(), 15);
+            assert_eq!(contact.state.unseen[0], 1);
+            assert_eq!(*contact.state.unseen.last().unwrap(), 15);
+        }
+        assert_eq!(
+            pushed_receipts.get(),
+            1,
+            "tail read receipt should flush via PushV2"
+        );
+
+        // Loading the earlier page prepends the remaining 15 entries and clears remaining unread.
+        assert_eq!(engine.load_earlier(peer).await, Ok(true));
+        assert_eq!(
+            engine.ui().messages.with_untracked(Vec::len),
+            total as usize
+        );
+        assert!(!engine.ui().has_older_messages.get_untracked());
+        assert_eq!(engine.ui().messages.with_untracked(|rows| rows[0].index), 0);
+        assert_eq!(
+            engine
+                .ui()
+                .messages
+                .with_untracked(|rows| rows.last().unwrap().index),
+            total - 1
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert_eq!(contact.state.unread, 0);
+            assert!(contact.state.unseen.is_empty());
+            assert_eq!(
+                contact.state.events.as_ref().map(|e| e.read.len()),
+                Some(15)
+            );
+        }
+        // Further pagination at start of history is a clean no-op.
+        assert_eq!(engine.load_earlier(peer).await, Ok(false));
+
+        // Closing returns to the chat list cleanly.
+        assert_eq!(engine.open(None).await, OpenOutcome::Opened);
+        assert_eq!(engine.ui().open.get_untracked(), None);
+        assert!(engine.ui().messages.with_untracked(Vec::is_empty));
+
+        // Fault injection on `VaultStore::history` opens with empty rows without clearing unread.
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut extra = Vec::new();
+            {
+                let contact = inner.contact(&peer).unwrap();
+                for n in 0..3u64 {
+                    let clock = total + 1 + n;
+                    let (idx, entry) = contact
+                        .add_received(
+                            Content {
+                                clock,
+                                kind: Some(Kind::Text(format!("unread-{n}"))),
+                                events: None,
+                            },
+                            false,
+                        )
+                        .unwrap();
+                    extra.push((peer, idx, entry));
+                }
+            }
+            inner.save_with(&extra, &[]).await.unwrap();
+            inner.vault.fail_history.set(true);
+        }
+        assert_eq!(engine.open(Some(peer)).await, OpenOutcome::Opened);
+        assert!(engine.ui().messages.with_untracked(Vec::is_empty));
+        assert!(!engine.ui().has_older_messages.get_untracked());
+        assert!(engine.ui().notice.get_untracked().is_some());
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert_eq!(contact.state.unread, 3);
+            assert_eq!(contact.state.unseen.len(), 3);
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn streaming_media_range_and_stream_chunk_decrypt_cache_and_fault_injection() {
+    use crate::content::AttachmentPointer;
+    use crate::glue::{MediaError, MediaRange};
+    use session::attachment::{CHUNK_SIZE, encrypt_chunk};
+    use std::rc::Rc;
+
+    futures::executor::block_on(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+
+        let id = [0x42u8; 16];
+        let key = [0x7Au8; session::attachment::KEY_LENGTH];
+        let mut chunk0_plain = vec![0xA1u8; CHUNK_SIZE];
+        chunk0_plain[..4].copy_from_slice(b"OggS");
+        for (i, byte) in chunk0_plain[4..64].iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        let chunk1_plain: Vec<u8> = (0u8..64).map(|b| b.wrapping_mul(3)).collect();
+        let total_size = (chunk0_plain.len() + chunk1_plain.len()) as u64;
+        let ct0 = encrypt_chunk(&key, 0, false, &chunk0_plain);
+        let ct1 = encrypt_chunk(&key, 1, true, &chunk1_plain);
+
+        let get_counts: Rc<RefCell<HashMap<u32, usize>>> = Rc::default();
+        let push_count = Rc::new(Cell::new(0usize));
+        let counts_ref = get_counts.clone();
+        let push_ref = push_count.clone();
+        let ct0_net = ct0.clone();
+        let ct1_net = ct1.clone();
+        let _mock = crate::transport::mock_fetch(move |_server, path, body| {
+            if path.ends_with("/GetChunk") {
+                let req = protocol::attachment::GetChunkRequest::decode(body.as_slice()).unwrap();
+                *counts_ref.borrow_mut().entry(req.index).or_insert(0) += 1;
+                let data = match req.index {
+                    0 => ct0_net.clone(),
+                    1 => ct1_net.clone(),
+                    other => panic!("unexpected chunk index {other}"),
+                };
+                Ok((
+                    200,
+                    protocol::attachment::GetChunkResponse {
+                        data: data.into(),
+                        uploaded: true,
+                    }
+                    .encode_to_vec(),
+                ))
+            } else if path.ends_with("/PushV2") {
+                push_ref.set(push_ref.get() + 1);
+                Ok((
+                    200,
+                    protocol::mailbox_v2::PushV2Response { sequence: 1 }.encode_to_vec(),
+                ))
+            } else {
+                Err(protocol::Error::new(
+                    protocol::ErrorKind::Unimplemented,
+                    format!("unexpected path {path}"),
+                ))
+            }
+        });
+
+        let pointer = AttachmentPointer {
+            id: id.to_vec(),
+            key: key.to_vec(),
+            size: total_size,
+            name: "track.ogg".into(),
+            mime: "audio/ogg".into(),
+            expires: 0,
+        };
+        let url = engine
+            .stream(peer, 0, &pointer, 7)
+            .await
+            .expect("native glue::streaming() enables streaming URL");
+        let token = url.strip_prefix("/media/").unwrap();
+        let not_aborted = || false;
+
+        // 1. First range fetch hits server for chunk 0, caches in vault & LRU decrypted cache.
+        let (size, start, mime, slice0) = engine
+            .media_range(
+                token,
+                &MediaRange::From {
+                    start: 0,
+                    end: Some(15),
+                },
+                &not_aborted,
+            )
+            .await
+            .ok()
+            .expect("first range succeeds");
+        assert_eq!(size, total_size);
+        assert_eq!(start, 0);
+        assert_eq!(mime, "audio/ogg");
+        assert_eq!(slice0, &chunk0_plain[..16]);
+        assert_eq!(get_counts.borrow().get(&0).copied(), Some(1));
+        let key_hash = super::attachment_key_hash(&key);
+        assert!(engine.decrypted_chunk(&(peer, id, key_hash, 0)).is_some());
+
+        // 2. Second range in chunk 0 serves directly from in-memory LRU cache (0 extra RPCs).
+        let (_, start2, _, slice1) = engine
+            .media_range(
+                token,
+                &MediaRange::From {
+                    start: 16,
+                    end: Some(31),
+                },
+                &not_aborted,
+            )
+            .await
+            .ok()
+            .expect("LRU cache hit succeeds");
+        assert_eq!(start2, 16);
+        assert_eq!(slice1, &chunk0_plain[16..32]);
+        assert_eq!(get_counts.borrow().get(&0).copied(), Some(1));
+
+        // 3. After evicting the plaintext LRU cache, chunk 0 still serves from MemoryVault without
+        //    re-fetching from the server.
+        engine.decrypted.borrow_mut().clear();
+        let (_, start3, _, slice2) = engine
+            .media_range(
+                token,
+                &MediaRange::From {
+                    start: 32,
+                    end: Some(47),
+                },
+                &not_aborted,
+            )
+            .await
+            .ok()
+            .expect("vault chunk cache hit succeeds");
+        assert_eq!(start3, 32);
+        assert_eq!(slice2, &chunk0_plain[32..48]);
+        assert_eq!(get_counts.borrow().get(&0).copied(), Some(1));
+
+        // 4. Fault-injecting `fail_put_chunk` fails chunk 1 persistence cleanly with HTTP 502.
+        {
+            let guard = engine.inner.lock().await;
+            guard.as_ref().unwrap().vault.fail_put_chunk.set(true);
+        }
+        assert!(matches!(
+            engine
+                .media_range(token, &MediaRange::Suffix(32), &not_aborted)
+                .await,
+            Err(MediaError::Status(502))
+        ));
+        assert_eq!(get_counts.borrow().get(&1).copied(), Some(1));
+        {
+            let guard = engine.inner.lock().await;
+            guard.as_ref().unwrap().vault.fail_put_chunk.set(false);
+        }
+
+        // 5. Clearing `fail_put_chunk` lets Suffix(32) fetch chunk 1, complete `all_kept`, and
+        //    trigger the `downloaded` receipt for message clock 7.
+        let (_, suffix_start, _, suffix_bytes) = engine
+            .media_range(token, &MediaRange::Suffix(32), &not_aborted)
+            .await
+            .ok()
+            .expect("suffix range on chunk 1 succeeds");
+        assert_eq!(suffix_start, total_size - 32);
+        assert_eq!(suffix_bytes, &chunk1_plain[32..64]);
+        assert_eq!(get_counts.borrow().get(&1).copied(), Some(2));
+        let fetching = engine.streams.borrow().get(token).unwrap().fetching.clone();
+        assert!(engine.all_kept(&fetching).await);
+        assert_eq!(
+            push_count.get(),
+            1,
+            "all_kept should flush downloaded receipt"
+        );
+
+        // 6. Invalid / out-of-range and aborted requests return the expected HTTP statuses.
+        assert!(matches!(
+            engine
+                .media_range(token, &MediaRange::Invalid, &not_aborted)
+                .await,
+            Err(MediaError::OutOfRange { size: s }) if s == total_size
+        ));
+        assert!(matches!(
+            engine
+                .media_range(
+                    token,
+                    &MediaRange::From {
+                        start: total_size,
+                        end: None
+                    },
+                    &not_aborted,
+                )
+                .await,
+            Err(MediaError::OutOfRange { size: s }) if s == total_size
+        ));
+        assert!(matches!(
+            engine
+                .media_range(token, &MediaRange::Whole, &|| true)
+                .await,
+            Err(MediaError::Status(404))
+        ));
+
+        // 7. Streaming from a sender-side local `ChunkSource::Bytes` reads directly without network.
+        let local_id = [0x99u8; 16];
+        let local_key = [0x55u8; session::attachment::KEY_LENGTH];
+        let local_bytes = b"OggS-local-stream-bytes".to_vec();
+        engine.files.borrow_mut().insert(
+            (peer, local_id, super::attachment_key_hash(&local_key)),
+            ChunkSource::from_bytes("local.ogg", "audio/ogg", local_bytes.clone()),
+        );
+        let local_ptr = AttachmentPointer {
+            id: local_id.to_vec(),
+            key: local_key.to_vec(),
+            size: local_bytes.len() as u64,
+            name: "local.ogg".into(),
+            mime: "audio/ogg".into(),
+            expires: 0,
+        };
+        let local_url = engine.stream(peer, 1, &local_ptr, 0).await.unwrap();
+        let local_tok = local_url.strip_prefix("/media/").unwrap();
+        let (_, _, _, got_local) = engine
+            .media_range(local_tok, &MediaRange::Whole, &not_aborted)
+            .await
+            .ok()
+            .expect("ChunkSource::Bytes streams directly");
+        assert_eq!(got_local, local_bytes);
+        engine.end_stream(&local_url);
+        assert!(
+            engine
+                .stream_chunk(local_tok, 0, &not_aborted)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn outbox_flush_retries_idempotently_handles_partial_failure_and_fail_waiting() {
+    use std::rc::Rc;
+
+    futures::executor::block_on(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner
+                .add(&peer, Kind::Text("first".into()), false)
+                .await
+                .unwrap();
+            inner
+                .add(&peer, Kind::Text("second".into()), false)
+                .await
+                .unwrap();
+        }
+
+        // First flush: message #0 succeeds, message #1 fails transiently on the network.
+        let recorded: Rc<RefCell<Vec<PushV2Request>>> = Rc::default();
+        let rec_ref = recorded.clone();
+        let fail_second = Rc::new(Cell::new(true));
+        let fail_ref = fail_second.clone();
+        let seq = Rc::new(Cell::new(0u64));
+        let seq_ref = seq.clone();
+        let _mock = crate::transport::mock_fetch(move |_server, path, body| {
+            assert!(path.ends_with("/PushV2"), "unexpected path {path}");
+            let req = PushV2Request::decode(body.as_slice()).unwrap();
+            rec_ref.borrow_mut().push(req);
+            if rec_ref.borrow().len() == 2 && fail_ref.get() {
+                return Err(protocol::Error::new(
+                    protocol::ErrorKind::Connect,
+                    "transient drop",
+                ));
+            }
+            let next = seq_ref.get() + 1;
+            seq_ref.set(next);
+            Ok((
+                200,
+                protocol::mailbox_v2::PushV2Response { sequence: next }.encode_to_vec(),
+            ))
+        });
+
+        // Partial failure commits message #0 while leaving message #1 sealed in the outbox.
+        assert!(engine.flush(&peer).await.is_err());
+        assert_eq!(recorded.borrow().len(), 2);
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert_eq!(contact.state.outbox.len(), 1);
+            assert_eq!(contact.state.outbox[0].history_index, 1);
+            assert!(contact.state.outbox[0].sealed);
+            assert_eq!(
+                inner.vault.entries.borrow()[&(peer, 0)].delivery(),
+                Delivery::Sent
+            );
+            assert_eq!(
+                inner.vault.entries.borrow()[&(peer, 1)].delivery(),
+                Delivery::Pending
+            );
+            assert!(!inner.vault.outbox.borrow().contains_key(&(peer, 0)));
+            assert!(inner.vault.outbox.borrow().contains_key(&(peer, 1)));
+        }
+
+        // Retry succeeds and reuses the EXACT same ciphertext + client_message_id (idempotency).
+        fail_second.set(false);
+        assert_eq!(engine.flush(&peer).await, Ok(true));
+        assert_eq!(recorded.borrow().len(), 3);
+        assert_eq!(
+            recorded.borrow()[1].client_message_id,
+            recorded.borrow()[2].client_message_id,
+            "retrying sealed message must preserve deterministic client_message_id"
+        );
+        assert_eq!(
+            recorded.borrow()[1].message,
+            recorded.borrow()[2].message,
+            "retrying sealed message must reuse sealed ciphertext without re-encrypting"
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(contact.state.outbox.is_empty());
+            assert!(inner.vault.outbox.borrow().is_empty());
+            assert_eq!(
+                inner.vault.entries.borrow()[&(peer, 1)].delivery(),
+                Delivery::Sent
+            );
+        }
+
+        // Pending read events flush cleanly via `push_events` and clear `sealed_events`.
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contact(&peer).unwrap().state.events = Some(Events {
+                read: vec![42],
+                downloaded: vec![],
+            });
+            inner.save(&[]).await.unwrap();
+        }
+        assert_eq!(engine.flush(&peer).await, Ok(true));
+        assert_eq!(recorded.borrow().len(), 4);
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(contact.state.events.is_none());
+            assert!(contact.state.sealed_events.is_none());
+        }
+
+        // SignInRequired holds the message, opens SignIn dialog, and `fail_waiting` cancels it.
+        let held_idx = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner
+                .add(&peer, Kind::Text("needs-auth".into()), false)
+                .await
+                .unwrap()
+                .index
+        };
+        let _auth_mock = crate::transport::mock_fetch(|_server, _path, _body| {
+            let err = protocol::connect::error(
+                protocol::ErrorKind::SignInRequired,
+                "sign in to this server",
+            );
+            Ok((err.status, err.body))
+        });
+        assert_eq!(engine.flush(&peer).await, Ok(false));
+        assert!(engine.waits_sign_in.borrow().contains(&peer));
+        assert!(engine.ui().held.get_untracked().contains(&(peer, held_idx)));
+        assert_eq!(engine.ui().dialog.get_untracked(), Some(Dialog::SignIn));
+
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            engine.fail_waiting(inner, &peer, held_idx).await.unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(contact.state.outbox.is_empty());
+            assert!(!inner.vault.outbox.borrow().contains_key(&(peer, held_idx)));
+            assert_eq!(
+                inner.vault.entries.borrow()[&(peer, held_idx)].delivery(),
+                Delivery::Failed
+            );
+        }
+        assert!(!engine.ui().held.get_untracked().contains(&(peer, held_idx)));
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn attachments_promote_upload_rollback_cancel_upload_and_note_gone_by_id() {
+    use std::rc::Rc;
+
+    futures::executor::block_on(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let payload = b"native-attachment-payload-bytes".to_vec();
+        let source = ChunkSource::from_bytes("report.pdf", "application/pdf", payload.clone());
+
+        // 1. `send_attachment` encountering SignInRequired stages a waiting upload (`!started()`).
+        {
+            let _auth_mock = crate::transport::mock_fetch(|_server, path, _body| {
+                assert!(path.ends_with("/StartUpload"));
+                let err = protocol::connect::error(
+                    protocol::ErrorKind::SignInRequired,
+                    "sign in required",
+                );
+                Ok((err.status, err.body))
+            });
+            engine.send_attachment(peer, source.clone()).await.unwrap();
+        }
+        let (waiting_id, waiting_hist_idx) = {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let uploads = inner.vault.uploads(Some(&peer)).await.unwrap();
+            assert_eq!(uploads.len(), 1);
+            let pending = &uploads[0].1;
+            assert!(!pending.started());
+            let id: [u8; 16] = pending.id.as_slice().try_into().unwrap();
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(
+                contact
+                    .state
+                    .outbox
+                    .iter()
+                    .any(|o| { o.history_index == pending.history_index && o.awaits_upload })
+            );
+            (id, pending.history_index)
+        };
+        assert!(
+            engine
+                .ui()
+                .held
+                .get_untracked()
+                .contains(&(peer, waiting_hist_idx))
+        );
+
+        // 2. Inject `fail_promote_upload`: `start_waiting` MUST roll back `outbox.awaits_upload`,
+        //    keep the waiting placeholder upload intact, and cancel the newly allocated server ID.
+        let server_id_1 = [0x11u8; 16];
+        let server_token_1 = [0x22u8; 16];
+        let server_id_2 = [0x33u8; 16];
+        let server_token_2 = [0x44u8; 16];
+        let start_call = Rc::new(Cell::new(0usize));
+        type PutChunkLog = Vec<(Vec<u8>, u32)>;
+        let cancelled_ids: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+        let put_chunks: Rc<RefCell<PutChunkLog>> = Rc::default();
+        let start_ref = start_call.clone();
+        let cancel_ref = cancelled_ids.clone();
+        let put_ref = put_chunks.clone();
+        let _mock = crate::transport::mock_fetch(move |_server, path, body| {
+            if path.ends_with("/StartUpload") {
+                let n = start_ref.get();
+                start_ref.set(n + 1);
+                let (id, tok) = if n == 0 {
+                    (server_id_1, server_token_1)
+                } else {
+                    (server_id_2, server_token_2)
+                };
+                Ok((
+                    200,
+                    protocol::attachment::StartUploadResponse {
+                        id: id.to_vec().into(),
+                        upload_token: tok.to_vec().into(),
+                        expires: 0,
+                    }
+                    .encode_to_vec(),
+                ))
+            } else if path.ends_with("/DeleteAttachment") {
+                let req =
+                    protocol::attachment::DeleteAttachmentRequest::decode(body.as_slice()).unwrap();
+                cancel_ref.borrow_mut().push(req.id.to_vec());
+                Ok((
+                    200,
+                    protocol::attachment::DeleteAttachmentResponse {}.encode_to_vec(),
+                ))
+            } else if path.ends_with("/PutChunk") {
+                let req = protocol::attachment::PutChunkRequest::decode(body.as_slice()).unwrap();
+                put_ref.borrow_mut().push((req.id.to_vec(), req.index));
+                Ok((
+                    200,
+                    protocol::attachment::PutChunkResponse {}.encode_to_vec(),
+                ))
+            } else if path.ends_with("/PushV2") {
+                Ok((
+                    200,
+                    protocol::mailbox_v2::PushV2Response { sequence: 1 }.encode_to_vec(),
+                ))
+            } else {
+                Err(protocol::Error::new(
+                    protocol::ErrorKind::Unimplemented,
+                    format!("unexpected path {path}"),
+                ))
+            }
+        });
+
+        {
+            let guard = engine.inner.lock().await;
+            guard.as_ref().unwrap().vault.fail_promote_upload.set(true);
+        }
+        assert!(
+            engine
+                .start_waiting(peer, waiting_id, source.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            cancelled_ids.borrow().as_slice(),
+            &[server_id_1.to_vec()],
+            "failed promote_upload must cancel the orphaned server upload"
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            inner.vault.fail_promote_upload.set(false);
+            // Waiting placeholder and outbox flag remain cleanly rolled back.
+            let still_waiting = inner.vault.upload(&peer, &waiting_id).await.unwrap();
+            assert!(still_waiting.is_some_and(|u| !u.started()));
+            assert!(
+                inner
+                    .vault
+                    .upload(&peer, &server_id_1)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(
+                contact
+                    .state
+                    .outbox
+                    .iter()
+                    .any(|o| { o.history_index == waiting_hist_idx && o.awaits_upload })
+            );
+        }
+
+        // 3. Retry with fault cleared: promotes atomically, announces, uploads & caches chunk 0,
+        //    and forgets the completed upload record.
+        engine
+            .start_waiting(peer, waiting_id, source.clone())
+            .await
+            .unwrap();
+        assert_eq!(put_chunks.borrow().as_slice(), &[(server_id_2.to_vec(), 0)]);
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(inner.vault.uploads(Some(&peer)).await.unwrap().is_empty());
+            assert_eq!(
+                inner.vault.chunks_kept(&peer, &server_id_2).await.unwrap(),
+                1
+            );
+            let entry = inner
+                .vault
+                .entry(&peer, waiting_hist_idx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.delivery(), Delivery::Sent);
+            assert!(matches!(
+                entry.content.as_ref().and_then(|c| c.kind.as_ref()),
+                Some(Kind::Attachment(p)) if p.id == server_id_2
+            ));
+        }
+
+        // 4. `note_gone_by_id` locates the entry even with `hint_index = None` (backwards scan)
+        //    and persists `gone = true` + `ui.gone` idempotently.
+        engine
+            .note_gone_by_id(&peer, None, &server_id_2)
+            .await
+            .unwrap();
+        assert!(
+            engine
+                .ui()
+                .gone
+                .get_untracked()
+                .contains(&(peer, waiting_hist_idx))
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(
+                inner
+                    .vault
+                    .entry(&peer, waiting_hist_idx)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .gone
+            );
+        }
+        // Idempotent second call with explicit hint succeeds without error.
+        engine
+            .note_gone_by_id(&peer, Some(waiting_hist_idx), &server_id_2)
+            .await
+            .unwrap();
+
+        // 5. `cancel_upload` on a waiting upload fails its outbox message & forgets it.
+        engine.wait_for_sign_in(peer, source).await.unwrap();
+        let (wait2_id, wait2_idx) = {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let uploads = inner.vault.uploads(Some(&peer)).await.unwrap();
+            assert_eq!(uploads.len(), 1);
+            let id: [u8; 16] = uploads[0].1.id.as_slice().try_into().unwrap();
+            (id, uploads[0].1.history_index)
+        };
+        engine.cancel_upload(peer, wait2_id).await.unwrap();
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(
+                inner
+                    .vault
+                    .upload(&peer, &wait2_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(
+                inner
+                    .vault
+                    .entry(&peer, wait2_idx)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .delivery(),
+                Delivery::Failed
+            );
+            let contact = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(
+                contact
+                    .state
+                    .outbox
+                    .iter()
+                    .all(|o| o.history_index != wait2_idx)
+            );
+        }
+
+        // 6. `cancel_upload` on a started & announced upload forgets it, cancels on server, and
+        //    marks its history entry `gone = true`.
+        let started_id = [0x77u8; 16];
+        let started_hist_idx = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let pointer = crate::content::AttachmentPointer {
+                id: started_id.to_vec(),
+                key: vec![0x88; 32],
+                size: 1024,
+                name: "video.mp4".into(),
+                mime: "video/mp4".into(),
+                expires: 0,
+            };
+            let idx = inner
+                .add(&peer, Kind::Attachment(pointer), false)
+                .await
+                .unwrap()
+                .index;
+            let pending = PendingUpload {
+                id: started_id.to_vec(),
+                token: vec![0x99; 16],
+                key: vec![0x88; 32],
+                name: "video.mp4".into(),
+                mime: "video/mp4".into(),
+                size: 1024,
+                uploaded: 0,
+                encrypted: 0,
+                prefix_hash: vec![],
+                announced: true,
+                history_index: idx,
+                expires: 0,
+                upload_state: crate::vault::UPLOAD_STATE_ANNOUNCED,
+                sealed_chunk_hash: vec![],
+            };
+            inner.vault.save_upload(&peer, &pending).await.unwrap();
+            idx
+        };
+        engine.cancel_upload(peer, started_id).await.unwrap();
+        assert!(engine.is_cancelled(&started_id));
+        assert!(cancelled_ids.borrow().contains(&started_id.to_vec()));
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(
+                inner
+                    .vault
+                    .upload(&peer, &started_id)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            let entry = inner
+                .vault
+                .entry(&peer, started_hist_idx)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.delivery(), Delivery::Failed);
+            assert!(entry.gone);
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn engine_delete_cleans_up_peer_and_rolls_back_on_forget_fault() {
+    use crate::content::{AttachmentPointer, File};
+    use leptos::prelude::{Set, Update, WithUntracked};
+    use std::rc::Rc;
+
+    futures::executor::block_on(async {
+        let cancelled_on_server: Rc<RefCell<Vec<Vec<u8>>>> = Rc::default();
+        let cancel_ref = cancelled_on_server.clone();
+        let _mock = crate::transport::mock_fetch(move |_server, path, body| {
+            if path.ends_with("/DeleteAttachment") {
+                let req =
+                    protocol::attachment::DeleteAttachmentRequest::decode(body.as_slice()).unwrap();
+                cancel_ref.borrow_mut().push(req.id.to_vec());
+                Ok((
+                    200,
+                    protocol::attachment::DeleteAttachmentResponse {}.encode_to_vec(),
+                ))
+            } else {
+                Err(protocol::Error::new(
+                    protocol::ErrorKind::Unimplemented,
+                    format!("unexpected path {path}"),
+                ))
+            }
+        });
+
+        let (engine, alice_peer, _bob) = established_engine_on_localhost().await;
+        let bob_peer = identity();
+        let alice_upload_id = [0xA1u8; 16];
+        let bob_upload_id = [0xB2u8; 16];
+        let alice_key_hash = super::attachment_key_hash(&[0x31; 32]);
+        let bob_key_hash = super::attachment_key_hash(&[0x32; 32]);
+
+        let alice_file_idx = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let me = inner.client.identity_key();
+            let (mut extra, _, _) =
+                restore_contacts(vec![stored_contact(me, bob_peer)], &me, LOCAL_SERVER);
+            inner.contacts.push(extra.pop().unwrap());
+
+            // Seed Alice with an inline file (stored separately in `vault.files`), an outbox
+            // message, a cached chunk, an unfinished started upload, and a deferred initial.
+            let file_idx = inner
+                .add(
+                    &alice_peer,
+                    Kind::File(File {
+                        name: "secret.txt".into(),
+                        mime: "text/plain".into(),
+                        data: b"secret-contents".to_vec(),
+                    }),
+                    false,
+                )
+                .await
+                .unwrap()
+                .index;
+            inner
+                .vault
+                .put_chunk(&alice_peer, &alice_upload_id, 0, b"alice-chunk")
+                .await
+                .unwrap();
+            inner
+                .vault
+                .save_upload(
+                    &alice_peer,
+                    &PendingUpload {
+                        id: alice_upload_id.to_vec(),
+                        token: vec![0xAA; 16],
+                        key: vec![0x31; 32],
+                        name: "unfinished.bin".into(),
+                        mime: "application/octet-stream".into(),
+                        size: 2048,
+                        uploaded: 0,
+                        encrypted: 0,
+                        prefix_hash: vec![],
+                        announced: false,
+                        history_index: 0,
+                        expires: 0,
+                        upload_state: UPLOAD_STATE_STARTED,
+                        sealed_chunk_hash: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+
+            // Seed Bob with his own history, outbox, chunk, upload, and deferred initial.
+            inner
+                .add(&bob_peer, Kind::Text("keep-bob".into()), false)
+                .await
+                .unwrap();
+            inner
+                .vault
+                .put_chunk(&bob_peer, &bob_upload_id, 0, b"bob-chunk")
+                .await
+                .unwrap();
+            inner
+                .vault
+                .save_upload(
+                    &bob_peer,
+                    &PendingUpload {
+                        id: bob_upload_id.to_vec(),
+                        token: vec![0xBB; 16],
+                        key: vec![0x32; 32],
+                        name: "bob.bin".into(),
+                        mime: "application/octet-stream".into(),
+                        size: 512,
+                        uploaded: 0,
+                        encrypted: 0,
+                        prefix_hash: vec![],
+                        announced: false,
+                        history_index: 0,
+                        expires: 0,
+                        upload_state: UPLOAD_STATE_STARTED,
+                        sealed_chunk_hash: vec![],
+                    },
+                )
+                .await
+                .unwrap();
+
+            inner.deferred_initials = vec![
+                DeferredInitial {
+                    initial: Some(WireInitialMessageV2 {
+                        identity_key: Bytes::copy_from_slice(&alice_peer),
+                        ..Default::default()
+                    }),
+                    deferred_at: 100,
+                },
+                DeferredInitial {
+                    initial: Some(WireInitialMessageV2 {
+                        identity_key: Bytes::copy_from_slice(&bob_peer),
+                        ..Default::default()
+                    }),
+                    deferred_at: 200,
+                },
+            ];
+            inner.save(&[]).await.unwrap();
+            file_idx
+        };
+
+        // Verify `Engine::file` reads the separately stored inline file record.
+        assert_eq!(
+            engine
+                .file(alice_peer, alice_file_idx)
+                .await
+                .unwrap()
+                .as_slice(),
+            b"secret-contents"
+        );
+
+        // Seed transient engine & UI state for both peers.
+        engine.open(Some(alice_peer)).await;
+        engine.files.borrow_mut().insert(
+            (alice_peer, alice_upload_id, alice_key_hash),
+            ChunkSource::from_bytes("a.bin", "application/octet-stream", vec![1, 2, 3]),
+        );
+        engine.files.borrow_mut().insert(
+            (bob_peer, bob_upload_id, bob_key_hash),
+            ChunkSource::from_bytes("b.bin", "application/octet-stream", vec![4, 5, 6]),
+        );
+        engine.decrypted.borrow_mut().push_back((
+            (alice_peer, alice_upload_id, alice_key_hash, 0),
+            Rc::new(zeroize::Zeroizing::new(vec![1])),
+        ));
+        engine.decrypted.borrow_mut().push_back((
+            (bob_peer, bob_upload_id, bob_key_hash, 0),
+            Rc::new(zeroize::Zeroizing::new(vec![2])),
+        ));
+        engine
+            .sending
+            .borrow_mut()
+            .push_back(Sending::Content(alice_peer, Kind::Text("drop".into())));
+        engine
+            .sending
+            .borrow_mut()
+            .push_back(Sending::Content(bob_peer, Kind::Text("stay".into())));
+        engine.ui().held.update(|h| {
+            h.insert((alice_peer, 0));
+            h.insert((bob_peer, 0));
+        });
+        engine.ui().gone.update(|g| {
+            g.insert((alice_peer, 0));
+            g.insert((bob_peer, 0));
+        });
+        let alice_stream = engine
+            .stream(
+                alice_peer,
+                0,
+                &AttachmentPointer {
+                    id: alice_upload_id.to_vec(),
+                    key: vec![0x31; 32],
+                    size: 16,
+                    name: "a.ogg".into(),
+                    mime: "audio/ogg".into(),
+                    expires: 0,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let bob_stream = engine
+            .stream(
+                bob_peer,
+                0,
+                &AttachmentPointer {
+                    id: bob_upload_id.to_vec(),
+                    key: vec![0x32; 32],
+                    size: 16,
+                    name: "b.ogg".into(),
+                    mime: "audio/ogg".into(),
+                    expires: 0,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let _ = (&alice_stream, &bob_stream);
+
+        // 1. Fault-inject `fail_forget`: `delete` fails and rolls back session/state cleanly.
+        let session_before = {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            inner.vault.fail_forget.set(true);
+            proto::SessionState::from(
+                inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == alice_peer)
+                    .unwrap()
+                    .session
+                    .state(),
+            )
+        };
+        assert!(engine.delete(alice_peer).await.is_err());
+        assert_eq!(engine.ui().open.get_untracked(), Some(alice_peer));
+        assert!(cancelled_on_server.borrow().is_empty());
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let alice_contact = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == alice_peer)
+                .unwrap();
+            assert_eq!(
+                proto::SessionState::from(alice_contact.session.state()),
+                session_before,
+                "failed VaultStore::forget must roll back contact session cleanly"
+            );
+            assert!(inner.state.farewells.is_empty());
+            assert!(inner.vault.entries.borrow().contains_key(&(alice_peer, 0)));
+            inner.vault.fail_forget.set(false);
+        }
+
+        // 2. Retry `delete(alice_peer)`: purges all Alice state, cancels unfinished upload on
+        //    server, queues farewell, and leaves Bob completely untouched.
+        engine.delete(alice_peer).await.unwrap();
+        assert_eq!(engine.ui().open.get_untracked(), None);
+        assert!(engine.ui().messages.with_untracked(Vec::is_empty));
+        assert_eq!(
+            engine.ui().deleted_peer.get_untracked().map(|(_, p)| p),
+            Some(alice_peer)
+        );
+        assert_eq!(
+            cancelled_on_server.borrow().as_slice(),
+            &[alice_upload_id.to_vec()]
+        );
+        assert!(engine.is_cancelled(&alice_upload_id));
+        assert_eq!(engine.files.borrow().len(), 1);
+        assert!(engine.files.borrow().keys().all(|(p, _, _)| *p == bob_peer));
+        assert_eq!(engine.decrypted.borrow().len(), 1);
+        assert!(
+            engine
+                .decrypted
+                .borrow()
+                .iter()
+                .all(|((p, _, _, _), _)| *p == bob_peer)
+        );
+        assert_eq!(engine.streams.borrow().len(), 1);
+        assert!(
+            engine
+                .streams
+                .borrow()
+                .values()
+                .all(|s| s.fetching.peer == bob_peer)
+        );
+        assert_eq!(engine.sending.borrow().len(), 1);
+        assert_eq!(engine.sending.borrow()[0].peer(), bob_peer);
+        assert_eq!(engine.ui().held.get_untracked().len(), 1);
+        assert!(engine.ui().held.get_untracked().contains(&(bob_peer, 0)));
+        assert_eq!(engine.ui().gone.get_untracked().len(), 1);
+        assert!(engine.ui().gone.get_untracked().contains(&(bob_peer, 0)));
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(inner.contacts.iter().all(|c| c.peer != alice_peer));
+            assert!(inner.contacts.iter().any(|c| c.peer == bob_peer));
+            assert_eq!(inner.state.farewells.len(), 1);
+            assert_eq!(inner.vault.state.borrow().farewells.len(), 1);
+            assert!(
+                inner
+                    .vault
+                    .entries
+                    .borrow()
+                    .keys()
+                    .all(|(p, _)| *p == bob_peer)
+            );
+            assert!(
+                inner
+                    .vault
+                    .files
+                    .borrow()
+                    .keys()
+                    .all(|(p, _)| *p == bob_peer)
+            );
+            assert!(
+                inner
+                    .vault
+                    .outbox
+                    .borrow()
+                    .keys()
+                    .all(|(p, _)| *p == bob_peer)
+            );
+            assert!(
+                inner
+                    .vault
+                    .chunks
+                    .borrow()
+                    .keys()
+                    .all(|(p, _, _)| *p == bob_peer)
+            );
+            assert!(
+                inner
+                    .vault
+                    .uploads
+                    .borrow()
+                    .keys()
+                    .all(|(p, _)| *p == bob_peer)
+            );
+            assert_eq!(inner.deferred_initials.len(), 1);
+            assert_eq!(
+                inner.deferred_initials[0]
+                    .initial
+                    .as_ref()
+                    .unwrap()
+                    .identity_key
+                    .as_ref(),
+                bob_peer.as_slice()
+            );
+        }
+        // Reset dialog/signal cleanly.
+        engine.ui().dialog.set(None);
+    });
 }

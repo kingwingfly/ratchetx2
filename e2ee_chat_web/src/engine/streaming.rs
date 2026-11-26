@@ -1,7 +1,7 @@
 //! Range requests and decrypted chunk caching for streaming media.
 
 use super::attachments::{FetchError, Fetching, Waiter, read_chunk};
-use super::{CHUNKS_DECRYPTED_KEPT, ChunkOf, DecryptedChunk, Engine};
+use super::{CHUNKS_DECRYPTED_KEPT, ChunkOf, DecryptedChunk, Engine, VaultStore};
 use crate::content::AttachmentPointer;
 use crate::glue::{MediaError, MediaRange, MediaRequest};
 use crate::state::Link;
@@ -25,7 +25,7 @@ pub(super) struct Stream {
     pub(super) clock: u64,
 }
 
-impl Engine {
+impl<V: VaultStore> Engine<V> {
     /// A URL that plays the attachment `pointer`, in the chat with `peer`, as it is fetched,
     /// through the service worker, see `media-worker.js`: a chunk at a time, as the player asks
     /// for it, so that it plays, and seeks, while it downloads. The peer is told once it is all
@@ -89,7 +89,7 @@ impl Engine {
 
     /// The bytes of the stream `token` for `range`, as far as the chunk they start in goes, with
     /// total size, resolved start offset, and MIME type; or the HTTP error that says why not.
-    async fn media_range(
+    pub(super) async fn media_range(
         &self,
         token: &str,
         range: &MediaRange,
@@ -166,7 +166,7 @@ impl Engine {
     /// client's own file, while on the page that chose it, or else as [`chunk`](Self::chunk)
     /// has it. Once all its chunks are here, as one came from the server now, the peer is told.
     /// None if the stream ended or the request was aborted.
-    async fn stream_chunk(
+    pub(super) async fn stream_chunk(
         &self,
         token: &str,
         index: u32,
@@ -240,7 +240,7 @@ impl Engine {
     }
 
     /// The chunk `chunk_of`, if the streams decrypted it lately, which keeps it longer.
-    fn decrypted_chunk(&self, chunk_of: &ChunkOf) -> Option<DecryptedChunk> {
+    pub(super) fn decrypted_chunk(&self, chunk_of: &ChunkOf) -> Option<DecryptedChunk> {
         let mut decrypted = self.decrypted.borrow_mut();
         let at = decrypted.iter().position(|(of, _)| of == chunk_of)?;
         let kept = decrypted.remove(at)?;
@@ -299,7 +299,7 @@ impl Engine {
     }
 
     /// Whether all the chunks of the attachment `fetching` fetches are kept here.
-    async fn all_kept(&self, fetching: &Fetching) -> bool {
+    pub(super) async fn all_kept(&self, fetching: &Fetching) -> bool {
         let guard = self.inner.lock().await;
         let Some(inner) = guard.as_ref() else {
             return false;

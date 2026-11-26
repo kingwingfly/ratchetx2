@@ -5,9 +5,9 @@ use super::handshake::{
 };
 use super::outbox::{RequeueOutcome, needs_new_session};
 use super::{
-    AWAY_CHECK, Engine, HIDDEN_GRACE, HistoryStore, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE,
-    POLL_SLOW, POLL_STEP, ProtocolRpcScope, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE,
-    origin, records, same_server, should_require_update_for_rpc,
+    AWAY_CHECK, Engine, HIDDEN_GRACE, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE, POLL_SLOW, POLL_STEP,
+    ProtocolRpcScope, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE, VaultStore, origin,
+    records, same_server, should_require_update_for_rpc,
 };
 use crate::content::{Content, Kind};
 use crate::notify::{Event, Subscription};
@@ -15,7 +15,7 @@ use crate::state::{Link, ServerPqStatus};
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, monotonic_now_ms, now, sleep};
 use crate::vault::{
-    ContactState, Farewell, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, outbox_key,
+    ContactState, Farewell, HistoryEntry, OutgoingRecord, SECURITY_ALERT_DOWNGRADE,
 };
 use bytes::Bytes;
 use futures_util::future::{Either, select};
@@ -29,7 +29,7 @@ use session::{Client, ErrorKind, PqSuite, PublicKey, Sealed, Session, proto};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
-impl Engine {
+impl<V: VaultStore> Engine<V> {
     /// Whether the user is here: the page shown and in focus, or hidden for less than
     /// [`HIDDEN_GRACE`], or out of focus for less than [`UNFOCUSED_GRACE`]. Notifications are
     /// for then only, as a WebSocket open is held on the server.
@@ -609,7 +609,7 @@ impl Engine {
             };
             let mut outbox_updates = requeued.outbox.clone();
             for &(history_index, _) in &settled_outbox {
-                outbox_updates.push((outbox_key(peer, history_index), None));
+                outbox_updates.push((*peer, history_index, None));
             }
             changed.extend(requeued.history.iter().cloned());
             let changed: Vec<_> = changed.into_iter().collect();
@@ -694,7 +694,7 @@ impl Engine {
 /// deferred carried or inbox initial exists for `peer`, or if the contact is quarantined awaiting
 /// user approval, so neither deferred-suite nor quarantined-classical envelopes are dropped.
 /// Returns `true` when receiving should pause.
-pub(super) fn resolve_stalled_peer<V: HistoryStore>(
+pub(super) fn resolve_stalled_peer<V: VaultStore>(
     inner: &mut Inner<V>,
     peer: &PublicKey,
     join: JoinCarriedOutcome,
@@ -743,7 +743,7 @@ pub(super) fn farewell_push_v2_request(farewell: &Farewell) -> PushV2Request {
     req
 }
 
-impl<V: HistoryStore> Inner<V> {
+impl<V: VaultStore> Inner<V> {
     /// An empty page can still acknowledge deliveries or advance past expired envelopes.
     pub(super) async fn persist_empty_page_progress(
         &mut self,
@@ -767,8 +767,8 @@ impl<V: HistoryStore> Inner<V> {
         index: usize,
         snapshot: (proto::SessionState, ContactState),
         initials: &[Incoming],
-        records: &[(String, HistoryEntry)],
-        outbox: &[(String, Option<OutgoingRecord>)],
+        records: &[(PublicKey, u64, HistoryEntry)],
+        outbox: &[(PublicKey, u64, Option<OutgoingRecord>)],
     ) -> Result<(), String> {
         let peer = self.contacts[index].peer;
         let saved_carried_ts = self.carried_deferred_timestamps.clone();

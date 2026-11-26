@@ -455,6 +455,7 @@ pub fn describe(error: &dyn std::error::Error) -> String {
 
 /// Wait `millis` milliseconds. Cancels the underlying browser timer via `clearTimeout` if the
 /// returned future is dropped early (e.g. inside `futures_util::future::select`).
+#[cfg(target_arch = "wasm32")]
 pub async fn sleep(millis: i32) {
     use std::{cell::Cell, rc::Rc};
     use wasm_bindgen::closure::Closure;
@@ -503,6 +504,32 @@ pub async fn sleep(millis: i32) {
         guard.handle = None;
     }
     drop(guard);
+}
+
+/// Instant async yield on non-wasm32 targets so native tests run deterministically without real
+/// wall-clock sleeps.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep(_millis: i32) {
+    struct YieldOnce(bool);
+
+    impl std::future::Future for YieldOnce {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if self.0 {
+                std::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    YieldOnce(false).await;
 }
 
 /// A JavaScript error as text.

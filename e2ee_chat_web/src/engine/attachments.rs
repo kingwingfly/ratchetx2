@@ -2,8 +2,8 @@
 
 use super::{
     Engine, HISTORY_SHOWN, Inner, MAX_FILE_SIZE, NOT_SIGNED_IN_HERE, POLL_CHUNK_MAX,
-    POLL_CHUNK_MIN, RETRY_MAX, RETRY_MIN, STALLED, WAITS_SIGN_IN, attachment_key_hash, origin,
-    records, same_server,
+    POLL_CHUNK_MIN, RETRY_MAX, RETRY_MIN, STALLED, VaultStore, WAITS_SIGN_IN, attachment_key_hash,
+    origin, records, same_server,
 };
 use crate::content::{AttachmentPointer, Content, Kind};
 use crate::preview;
@@ -13,9 +13,10 @@ use crate::transport::{Connect, Fetch, Progress};
 use crate::util::{describe, js_error, size_u64, sleep};
 use crate::vault::{
     OutgoingRecord, PendingUpload, UPLOAD_STATE_ANNOUNCED, UPLOAD_STATE_STARTED,
-    UPLOAD_STATE_WAITING, outbox_key,
+    UPLOAD_STATE_WAITING,
 };
 use leptos::prelude::*;
+#[cfg(target_arch = "wasm32")]
 use leptos::task::spawn_local;
 use session::attachment::{CHUNK_SIZE, Upload};
 use session::{ErrorKind, PublicKey, attachment};
@@ -26,6 +27,70 @@ use std::rc::Rc;
 use std::sync::Arc;
 use wasm_bindgen_futures::JsFuture;
 use zeroize::Zeroizing;
+
+/// Local plaintext file source for an active upload or cached sender preview.
+#[derive(Clone)]
+pub(super) enum ChunkSource {
+    File(web_sys::File),
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    Bytes {
+        name: String,
+        mime: String,
+        data: Arc<Vec<u8>>,
+    },
+}
+
+impl ChunkSource {
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(super) fn from_bytes(
+        name: impl Into<String>,
+        mime: impl Into<String>,
+        data: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self::Bytes {
+            name: name.into(),
+            mime: mime.into(),
+            data: Arc::new(data.into()),
+        }
+    }
+
+    pub(super) fn name(&self) -> String {
+        match self {
+            Self::File(file) => file.name(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            Self::Bytes { name, .. } => name.clone(),
+        }
+    }
+
+    pub(super) fn mime(&self) -> String {
+        match self {
+            Self::File(file) => file.type_(),
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            Self::Bytes { mime, .. } => mime.clone(),
+        }
+    }
+
+    pub(super) fn size(&self) -> u64 {
+        match self {
+            Self::File(file) => file.size() as u64,
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            Self::Bytes { data, .. } => data.len() as u64,
+        }
+    }
+
+    pub(super) async fn read_all(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Self::File(file) => {
+                let buffer = JsFuture::from(file.array_buffer())
+                    .await
+                    .map_err(|e| format!("Cannot read {}: {}", file.name(), js_error(e)))?;
+                Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+            }
+            #[cfg(all(test, not(target_arch = "wasm32")))]
+            Self::Bytes { data, .. } => Ok((**data).clone()),
+        }
+    }
+}
 
 /// Network deletion job prepared under `Engine::inner` and executed outside the lock so slow
 /// server deletes never freeze chat/streaming/UI.
@@ -238,7 +303,7 @@ pub(super) enum Waiter<'a> {
     Chat(&'a dyn Fn() -> bool),
 }
 
-impl Engine {
+impl<V: VaultStore> Engine<V> {
     /// Whether upload `id` was cancelled (or its chat deleted) on this page.
     pub(super) fn is_cancelled(&self, id: &[u8; 16]) -> bool {
         self.cancelled.borrow().contains(id)
@@ -251,9 +316,9 @@ impl Engine {
     pub(super) async fn send_attachment(
         self: &Rc<Self>,
         peer: PublicKey,
-        file: web_sys::File,
+        file: ChunkSource,
     ) -> Result<(), String> {
-        let size = file.size() as u64;
+        let size = file.size();
         let (started, signs_in_here, server) = {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
@@ -298,7 +363,7 @@ impl Engine {
             key: upload.key().to_vec(),
             expires: upload.expires().unwrap_or_default(),
             name: file.name(),
-            mime: file.type_(),
+            mime: file.mime(),
             size,
             uploaded: 0,
             encrypted: 0,
@@ -352,6 +417,7 @@ impl Engine {
         self.running.borrow_mut().insert(*upload.id());
         self.show_upload(&peer, &pending, UploadState::Running);
         let engine = self.clone();
+        #[cfg(target_arch = "wasm32")]
         spawn_local(async move {
             if let Err(e) = engine
                 .run_upload(peer, pending, file, VerifiedResume::fresh())
@@ -360,6 +426,13 @@ impl Engine {
                 engine.ui.notify(e);
             }
         });
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(e) = engine
+            .run_upload(peer, pending, file, VerifiedResume::fresh())
+            .await
+        {
+            engine.ui.notify(e);
+        }
         Ok(())
     }
 
@@ -368,7 +441,11 @@ impl Engine {
     /// sent after it waits for it, see `flush`. Its upload, kept under an ID of this client's,
     /// starts once signed in, see [`start_waiting`](Self::start_waiting); after the page goes,
     /// once the file is chosen again.
-    async fn wait_for_sign_in(&self, peer: PublicKey, file: web_sys::File) -> Result<(), String> {
+    pub(super) async fn wait_for_sign_in(
+        &self,
+        peer: PublicKey,
+        file: ChunkSource,
+    ) -> Result<(), String> {
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| e.to_string())?;
         let mut guard = self.inner.lock().await;
@@ -377,8 +454,8 @@ impl Engine {
         let waiting = PendingUpload {
             id: id.to_vec(),
             name: file.name(),
-            mime: file.type_(),
-            size: file.size() as u64,
+            mime: file.mime(),
+            size: file.size(),
             announced: false,
             history_index: contact.state.history_len,
             token: Vec::new(),
@@ -501,11 +578,11 @@ impl Engine {
     /// Start the upload `waiting`, to `peer`, of `file`, which waited for this browser to sign
     /// in: its message, which kept its place in the chat, gets the attachment and goes, with
     /// what waited for it, and the upload runs. Refused again, it waits again.
-    async fn start_waiting(
+    pub(super) async fn start_waiting(
         self: &Rc<Self>,
         peer: PublicKey,
         waiting: [u8; 16],
-        file: web_sys::File,
+        file: ChunkSource,
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().await;
         if self.is_cancelled(&waiting) {
@@ -521,7 +598,7 @@ impl Engine {
         else {
             return Ok(());
         };
-        if file.size() as u64 != kept.size {
+        if file.size() != kept.size {
             return Err(format!("that is not {}, or it changed", kept.name));
         }
         // Its message still waits for it, unless this record outlived its start, as forgetting
@@ -646,7 +723,7 @@ impl Engine {
                         &waiting,
                         &pending,
                         &records(&peer, &changed),
-                        &[(outbox_key(&peer, kept.history_index), Some(record))],
+                        &[(peer, kept.history_index, Some(record))],
                     )
                     .await
                     .map_err(|e| describe(&e))
@@ -688,7 +765,7 @@ impl Engine {
                     inner
                         .save_with(
                             &records(&peer, &changed),
-                            &[(outbox_key(&peer, kept.history_index), None)],
+                            &[(peer, kept.history_index, None)],
                         )
                         .await
                         .map_err(|e| describe(&e))
@@ -757,6 +834,7 @@ impl Engine {
         let _ = scopeguard::ScopeGuard::into_inner(new_running_guard);
         self.wake();
         let engine = self.clone();
+        #[cfg(target_arch = "wasm32")]
         spawn_local(async move {
             if let Err(e) = engine
                 .run_upload(peer, pending, file, VerifiedResume::fresh())
@@ -765,6 +843,13 @@ impl Engine {
                 engine.ui.notify(e);
             }
         });
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Err(e) = engine
+            .run_upload(peer, pending, file, VerifiedResume::fresh())
+            .await
+        {
+            engine.ui.notify(e);
+        }
         Ok(())
     }
 
@@ -917,6 +1002,16 @@ impl Engine {
         peer: PublicKey,
         id: [u8; 16],
         file: Option<web_sys::File>,
+    ) -> Result<(), String> {
+        self.resume_upload_source(peer, id, file.map(ChunkSource::File))
+            .await
+    }
+
+    pub(super) async fn resume_upload_source(
+        self: &Rc<Self>,
+        peer: PublicKey,
+        id: [u8; 16],
+        file: Option<ChunkSource>,
     ) -> Result<(), String> {
         // Guard the upload ID in `self.running` up front so double-clicking Resume on either a
         // sign-in-held (`!started()`) upload or a started upload cannot race `start_waiting` and
@@ -1159,7 +1254,7 @@ impl Engine {
     /// jobs to run AFTER releasing `self.inner.lock()`.
     pub(super) async fn prepare_cancel_uploads_for_failed(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         peer: &PublicKey,
         failed_indices: &[u64],
     ) -> Vec<ServerDeleteJob> {
@@ -1326,9 +1421,9 @@ impl Engine {
         &self,
         peer: &PublicKey,
         pending: &PendingUpload,
-        file: &web_sys::File,
+        file: &ChunkSource,
     ) -> Result<VerifiedResume, String> {
-        let mut verifier = ResumeVerifier::new(pending, file.size() as u64)?;
+        let mut verifier = ResumeVerifier::new(pending, file.size())?;
         self.show_upload(peer, pending, UploadState::Checking);
         for index in 0..pending.encrypted {
             let chunk = read_chunk(file, index, pending.size).await?;
@@ -1345,7 +1440,7 @@ impl Engine {
         &self,
         peer: PublicKey,
         mut pending: PendingUpload,
-        file: web_sys::File,
+        file: ChunkSource,
         resume: VerifiedResume,
     ) -> Result<(), String> {
         let id: [u8; 16] = pending
@@ -1507,7 +1602,7 @@ impl Engine {
 
     async fn note_gone_inner(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         peer: &PublicKey,
         hint_index: Option<u64>,
         id: &[u8; 16],
@@ -1541,7 +1636,7 @@ impl Engine {
         peer: &PublicKey,
         pending: &mut PendingUpload,
         upload: &Upload,
-        file: &web_sys::File,
+        file: &ChunkSource,
         mut hasher: Sha256,
         mut verified_chunks: HashMap<u32, Zeroizing<Vec<u8>>>,
     ) -> Result<bool, String> {
@@ -1658,7 +1753,7 @@ impl Engine {
     /// Whether the vault may keep what goes with the attachment `id`, in the chat with `peer`:
     /// its upload was not cancelled, and the chat is still there. Asked under the lock, which
     /// cancelling and deleting take to forget them, so that nothing is kept after.
-    pub(super) fn may_keep(&self, inner: &Inner, peer: &PublicKey, id: &[u8]) -> bool {
+    pub(super) fn may_keep(&self, inner: &Inner<V>, peer: &PublicKey, id: &[u8]) -> bool {
         let cancelled = <[u8; 16]>::try_from(id).is_ok_and(|id| self.is_cancelled(&id));
         !cancelled && inner.contacts.iter().any(|contact| contact.peer == *peer)
     }
@@ -1854,13 +1949,11 @@ impl Engine {
         let key_hash = attachment_key_hash(&pointer.key);
         let file = self.files.borrow().get(&(peer, *id, key_hash)).cloned();
         if let Some(file) = file {
-            let buffer = JsFuture::from(file.array_buffer()).await.map_err(|e| {
-                FetchError::Other(format!("Cannot read {}: {}", pointer.name, js_error(e)))
-            })?;
+            let data = file.read_all().await.map_err(FetchError::Other)?;
             let attachment = Attachment {
                 name: std::mem::take(&mut pointer.name),
                 mime: std::mem::take(&mut pointer.mime),
-                data: Arc::new(js_sys::Uint8Array::new(&buffer).to_vec()),
+                data: Arc::new(data),
             };
             return Ok(Some((attachment, false)));
         }
@@ -2172,12 +2265,25 @@ impl Engine {
 
 /// Chunk `index` of `file`, of `size` bytes, as the attachment cuts it.
 pub(super) async fn read_chunk(
-    file: &web_sys::File,
+    file: &ChunkSource,
     index: u32,
     size: u64,
 ) -> Result<Vec<u8>, String> {
     let start = u64::from(index) * CHUNK_SIZE as u64;
-    read(file, start, (start + CHUNK_SIZE as u64).min(size)).await
+    let end = (start + CHUNK_SIZE as u64).min(size);
+    match file {
+        ChunkSource::File(file) => read(file, start, end).await,
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        ChunkSource::Bytes { name, data, .. } => {
+            let start = usize::try_from(start)
+                .map_err(|_| format!("cannot read {name}: offset overflow"))?;
+            let end =
+                usize::try_from(end).map_err(|_| format!("cannot read {name}: offset overflow"))?;
+            data.get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| format!("cannot read {name}: slice out of bounds"))
+        }
+    }
 }
 
 /// Whether the attachment `pointer` went up, rather than waits for a sign-in, so that either

@@ -687,11 +687,18 @@ pub fn register_media_worker() {
 /// Whether the service worker controls the page, so that media streams through it; else it is
 /// fetched whole before it plays.
 pub fn streaming() -> bool {
-    navigator()
-        .optional_service_worker()
-        .ok()
-        .flatten()
-        .is_some_and(|container| container.controller().is_some())
+    #[cfg(target_arch = "wasm32")]
+    {
+        navigator()
+            .optional_service_worker()
+            .ok()
+            .flatten()
+            .is_some_and(|container| container.controller().is_some())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        true
+    }
 }
 
 /// The byte range requested by the service worker for a media stream.

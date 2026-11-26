@@ -3,7 +3,7 @@
 use super::contact::FarewellMode;
 use super::handshake::{PublishError, encrypt_session_farewells};
 use super::outbox::RequeueOutcome;
-use super::{Engine, HistoryStore, Inner, PqSaveOutcome, ProtocolRpcScope, records};
+use super::{Engine, Inner, PqSaveOutcome, ProtocolRpcScope, VaultStore, records};
 use crate::content::{Content, Kind, stamp};
 use crate::state::{Delivery, ServerPqStatus};
 use crate::transport::Fetch;
@@ -12,12 +12,12 @@ use crate::vault::{
     CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
     ContactState, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, PendingPqRollback,
     SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
-    SECURITY_ALERT_PQ_REQUIRED, history_key,
+    SECURITY_ALERT_PQ_REQUIRED,
 };
 use leptos::prelude::*;
 use session::{ErrorKind, PqConfig, PublicKey, Session, SessionState};
 
-impl Engine {
+impl<V: VaultStore> Engine<V> {
     /// Update local post-quantum security preferences, persist them, and publish a signed
     /// `CapabilityManifest` (ON with PQSPK+PQOPKs, or OFF clearing server PQ prekeys while keeping
     /// local PQ keys for in-flight handshakes).
@@ -436,7 +436,7 @@ impl Engine {
                 finalize_upgrade_to_pq_request_state(&mut contact.state, hello, clock, now())
             {
                 contact.mark_index_acked(entry_index);
-                history_records.push((history_key(&peer, entry_index), entry.clone()));
+                history_records.push((peer, entry_index, entry.clone()));
                 added_view = Some(contact.message(entry_index, entry));
             }
         }
@@ -692,7 +692,7 @@ pub(super) fn validate_pq_config_for_server(
     Ok(())
 }
 
-impl<V: HistoryStore> Inner<V> {
+impl<V: VaultStore> Inner<V> {
     pub(super) async fn save_pq_config(&mut self, config: PqConfig) -> Result<(), String> {
         let previous = self.client.pq_config().clone();
         let changed = previous != config;

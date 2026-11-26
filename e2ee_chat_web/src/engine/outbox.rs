@@ -3,8 +3,8 @@
 use super::attachments::ServerDeleteJob;
 use super::contact::{forget_told, keep_last};
 use super::{
-    Engine, HistoryStore, Inner, NOT_SIGNED_IN_HERE, ProtocolRpcScope, origin, records,
-    same_server, should_require_update_for_rpc,
+    Engine, Inner, NOT_SIGNED_IN_HERE, ProtocolRpcScope, VaultStore, origin, records, same_server,
+    should_require_update_for_rpc,
 };
 use crate::content::{Content, Events, Kind, stamp};
 use crate::state::{Delivery, MessageView, Step, Ui};
@@ -13,13 +13,13 @@ use crate::vault::{
     Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
     ContactState, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, Outgoing, OutgoingRecord,
     SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
-    SECURITY_ALERT_PQ_REQUIRED, SealedEvents, history_key, outbox_key,
+    SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
 };
 use leptos::prelude::*;
 use session::{ErrorKind, PublicKey};
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
-impl Engine {
+impl<V: VaultStore> Engine<V> {
     /// Push the messages waiting for `peer`, in order, each encrypted as its turn comes, then
     /// the events to tell the peer. Returns whether any went.
     pub(super) async fn flush(&self, peer: &PublicKey) -> Result<bool, String> {
@@ -48,7 +48,7 @@ impl Engine {
         };
         // Flush any unsaved requeued outbox records before `seal_next` reads from IndexedDB,
         // ensuring we never encrypt stale empty-content records after an earlier save failure.
-        if inner.unsaved_state || inner.unsaved_outbox.iter().any(|(p, _)| p == peer) {
+        if inner.unsaved_state || inner.unsaved_outbox.iter().any(|(p, _, _)| p == peer) {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
         // Never send or send receipts on a brand-new quarantined classical contact.
@@ -278,10 +278,10 @@ impl Engine {
                             });
                         }
                         entries.push((index, entry));
-                        gone.push((outbox_key(peer, index), None));
+                        gone.push((*peer, index, None));
                     }
                     Ok(None) => {
-                        gone.push((outbox_key(peer, index), None));
+                        gone.push((*peer, index, None));
                     }
                     // M-18: Do NOT delete outbox entries when reading the history entry fails!
                     Err(e) => {
@@ -346,7 +346,7 @@ impl Engine {
     /// quarantined chat, whose sender learns nothing until it is accepted/approved. Encrypted and
     /// saved once, then pushed as it is until it goes, so that no key of the ratchet is used twice.
     /// Once pushed, clearing `sealed_events` is persisted immediately to the vault.
-    async fn push_events(&self, inner: &mut Inner, peer: &PublicKey) -> Result<bool, String> {
+    async fn push_events(&self, inner: &mut Inner<V>, peer: &PublicKey) -> Result<bool, String> {
         let Some(contact) = inner.contact(peer) else {
             return Ok(false);
         };
@@ -445,7 +445,7 @@ impl Engine {
     /// the outbox, so that what was sent after it goes.
     pub(super) async fn fail_waiting(
         &self,
-        inner: &mut Inner,
+        inner: &mut Inner<V>,
         peer: &PublicKey,
         index: u64,
     ) -> Result<(), String> {
@@ -465,7 +465,7 @@ impl Engine {
                     .map_err(|e| describe(&e))?;
                 let changed: Vec<_> = entries.into_iter().collect();
                 inner
-                    .save_with(&records(peer, &changed), &[(outbox_key(peer, index), None)])
+                    .save_with(&records(peer, &changed), &[(*peer, index, None)])
                     .await
                     .map_err(|e| describe(&e))?;
                 Ok::<_, String>(changed)
@@ -500,7 +500,7 @@ pub(super) enum CorruptOutboxRecovery {
     Dropped { history: Vec<(u64, HistoryEntry)> },
 }
 
-impl Inner {
+impl<V: VaultStore> Inner<V> {
     /// Add `content` to the chat with `peer`, to be pushed in its turn, see `flush`: one that
     /// `awaits_upload` waits, with those after it, for its attachment's upload to start. Saved,
     /// or else forgotten; returns how it shows.
@@ -550,10 +550,7 @@ impl Inner {
             contact.record_last_message(&entry);
             let view = contact.message(index, entry.clone());
             inner
-                .save_with(
-                    &[(history_key(peer, index), entry)],
-                    &[(outbox_key(peer, index), Some(record))],
-                )
+                .save_with(&[(*peer, index, entry)], &[(*peer, index, Some(record))])
                 .await
                 .map_err(|e| describe(&e))?;
             Ok(view)
@@ -719,16 +716,14 @@ impl Inner {
             (outgoing.sealed, outgoing.clock) = (true, clock);
             let record = OutgoingRecord::sealed(sealed);
             inner
-                .save_with(&[], &[(outbox_key(peer, index), Some(record))])
+                .save_with(&[], &[(*peer, index, Some(record))])
                 .await
                 .map_err(|e| describe(&e))
         })
         .await?;
         Ok(SealOutcome::Ready)
     }
-}
 
-impl<V: HistoryStore> Inner<V> {
     /// Recover from a missing or corrupt `outbox/<peer>/<index>` record instead of permanently
     /// wedging all subsequent sends to `peer`: rebuild an unsealed outbox record from
     /// `vault.entry` + `vault.content` when intact, otherwise mark the history entry `Failed` and
@@ -773,7 +768,7 @@ impl<V: HistoryStore> Inner<V> {
                         outgoing.clock = 0;
                     }
                     inner
-                        .save_with(&[], &[(outbox_key(peer, index), Some(rebuilt))])
+                        .save_with(&[], &[(*peer, index, Some(rebuilt))])
                         .await
                         .map_err(|e| describe(&e))
                 })
@@ -794,7 +789,7 @@ impl<V: HistoryStore> Inner<V> {
                         .ok_or_else(|| "no such chat".to_string())?;
                     contact.state.outbox.retain(|o| o.history_index != index);
                     inner
-                        .save_with(&records(peer, &history), &[(outbox_key(peer, index), None)])
+                        .save_with(&records(peer, &history), &[(*peer, index, None)])
                         .await
                         .map_err(|e| describe(&e))
                 })
@@ -823,10 +818,7 @@ impl<V: HistoryStore> Inner<V> {
         self.step(peer, &mut entries, steps)
             .await
             .map_err(|e| describe(&e))?;
-        let gone: Vec<_> = waiting
-            .iter()
-            .map(|index| (outbox_key(peer, *index), None))
-            .collect();
+        let gone: Vec<_> = waiting.iter().map(|index| (*peer, *index, None)).collect();
         let entries: Vec<_> = entries.into_iter().collect();
         self.with_contact_tx(peer, async |inner| {
             let contact = inner
@@ -981,7 +973,7 @@ impl<V: HistoryStore> Inner<V> {
 
 #[derive(Default)]
 pub(super) struct RequeueOutcome {
-    pub(super) outbox: Vec<(String, Option<OutgoingRecord>)>,
+    pub(super) outbox: Vec<(PublicKey, u64, Option<OutgoingRecord>)>,
     pub(super) history: Vec<(u64, HistoryEntry)>,
     dropped_missing: BTreeSet<u64>,
 }
@@ -1018,7 +1010,7 @@ impl RequeueOutcome {
                 None
             }
         };
-        self.outbox.push((outbox_key(peer, index), record));
+        self.outbox.push((*peer, index, record));
     }
 
     fn apply(&self, state: &mut ContactState, again: &BTreeSet<u64>, sealed: &BTreeSet<u64>) {
@@ -1052,7 +1044,7 @@ impl RequeueOutcome {
 }
 
 /// Whether the chat with `peer` has no session to send on.
-pub(super) fn needs_new_session(inner: &Inner, peer: &PublicKey) -> bool {
+pub(super) fn needs_new_session<V>(inner: &Inner<V>, peer: &PublicKey) -> bool {
     inner
         .contacts
         .iter()

@@ -8,29 +8,37 @@ use std::{
 };
 
 use futures_channel::oneshot;
+#[cfg(any(target_arch = "wasm32", not(test)))]
 use futures_util::future::{Either, select};
+#[cfg(any(target_arch = "wasm32", not(test)))]
 use js_sys::{ArrayBuffer, Uint8Array};
+#[cfg(any(target_arch = "wasm32", not(test)))]
+use session::protocol::connect::{CONTENT_TYPE, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER};
 use session::{
     ServerClock,
     protocol::{
         self, Error, ErrorKind,
-        connect::{
-            CONTENT_TYPE, ConnectClient, LocalPost, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-        },
+        connect::{ConnectClient, LocalPost},
     },
 };
 use wasm_bindgen::{JsCast, closure::Closure};
-use web_sys::{ProgressEvent, XmlHttpRequest, XmlHttpRequestResponseType, XmlHttpRequestUpload};
+#[cfg(any(target_arch = "wasm32", not(test)))]
+use web_sys::XmlHttpRequestResponseType;
+use web_sys::{ProgressEvent, XmlHttpRequest, XmlHttpRequestUpload};
 
-use crate::util::{js_error, monotonic_now_ms, sleep};
+use crate::util::js_error;
+#[cfg(any(target_arch = "wasm32", not(test)))]
+use crate::util::{monotonic_now_ms, sleep};
 
 /// The handshake and mailbox client of a server.
 pub type Connect = ConnectClient<Fetch>;
 
 /// How long a call may go without moving, in milliseconds: sending nothing, receiving nothing,
 /// and no answer. A large one over a slow link takes as long as it keeps moving.
+#[cfg(any(target_arch = "wasm32", not(test)))]
 const STALL_MILLIS: u64 = 30_000;
 /// Milliseconds between checks of whether a call moves.
+#[cfg(any(target_arch = "wasm32", not(test)))]
 const STALL_CHECK: i32 = 1_000;
 /// Maximum Connect HTTP response body size accepted before decoding (5 MiB, matching server max ~4 MiB + framing).
 pub const MAX_CONNECT_RESPONSE_BYTES: usize = 5 << 20;
@@ -163,145 +171,208 @@ enum XhrOutcome {
     Oversized,
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+type MockPostHandler = Box<dyn FnMut(&str, &str, Vec<u8>) -> protocol::Result<(u16, Vec<u8>)>>;
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+thread_local! {
+    /// Thread-local mock responder for `impl LocalPost for Fetch` during native async tests.
+    static MOCK_POST: RefCell<Option<MockPostHandler>> = RefCell::default();
+}
+
+/// RAII guard restoring any previous thread-local mock [`Fetch`] responder on drop.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub struct MockFetchGuard {
+    previous: Option<MockPostHandler>,
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+impl Drop for MockFetchGuard {
+    fn drop(&mut self) {
+        MOCK_POST.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+/// Install a thread-local mock responder for `impl LocalPost for Fetch` in native tests.
+/// Any previous responder is restored automatically when the returned guard is dropped.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub fn mock_fetch(
+    handler: impl FnMut(&str, &str, Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> + 'static,
+) -> MockFetchGuard {
+    let previous = MOCK_POST.with(|slot| slot.borrow_mut().replace(Box::new(handler)));
+    MockFetchGuard { previous }
+}
+
 impl LocalPost for Fetch {
     async fn post(&self, path: &str, body: Vec<u8>) -> protocol::Result<(u16, Vec<u8>)> {
-        let failed = |error| Error::new(ErrorKind::Connect, js_error(error));
-        let request = XmlHttpRequest::new().map_err(failed)?;
-        request
-            .open("POST", &format!("{}{path}", self.server))
-            .map_err(failed)?;
-        request
-            .set_request_header("content-type", CONTENT_TYPE)
-            .map_err(failed)?;
-        request
-            .set_request_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
-            .map_err(failed)?;
-        request.set_response_type(XmlHttpRequestResponseType::Arraybuffer);
-        let upload = request.upload().map_err(failed)?;
-        // When it last moved (monotonic), and whether it ended with an answer, failed, or exceeded cap.
-        let moved = Rc::new(Cell::new(monotonic_now_ms()));
-        let (ended, mut end) = oneshot::channel::<XhrOutcome>();
-        let ended = Rc::new(Cell::new(Some(ended)));
-        let progress = {
-            let moved = moved.clone();
-            let ended = ended.clone();
-            let req = request.clone();
-            Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
-                moved.set(monotonic_now_ms());
-                let loaded = event.loaded();
-                let total = if event.length_computable() {
-                    event.total()
-                } else {
-                    0.0
-                };
-                if loaded > MAX_CONNECT_RESPONSE_BYTES as f64
-                    || total > MAX_CONNECT_RESPONSE_BYTES as f64
-                {
-                    let _ = req.abort();
-                    if let Some(ended) = ended.take() {
-                        let _ = ended.send(XhrOutcome::Oversized);
-                    }
-                }
-            })
-        };
-        let sent = {
-            let (moved, progress) = (moved.clone(), self.progress.clone());
-            Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
-                moved.set(monotonic_now_ms());
-                if let Some(progress) = &progress
-                    && event.length_computable()
-                {
-                    progress(event.loaded() as u64, event.total() as u64);
-                }
-            })
-        };
-        let ends = |outcome: XhrOutcome| {
-            let ended = ended.clone();
-            Closure::<dyn FnMut()>::new(move || {
-                if let Some(ended) = ended.take() {
-                    let _ = ended.send(outcome);
-                }
-            })
-        };
-        let (load, error) = (ends(XhrOutcome::Loaded), ends(XhrOutcome::Failed));
-        // Declared after the closures, so that it goes first.
-        let _handlers = Handlers {
-            request: &request,
-            upload: Some(&upload),
-        };
-        request.set_onprogress(Some(progress.as_ref().unchecked_ref()));
-        upload.set_onprogress(Some(sent.as_ref().unchecked_ref()));
-        request.set_onload(Some(load.as_ref().unchecked_ref()));
-        request.set_onerror(Some(error.as_ref().unchecked_ref()));
-        request
-            .send_with_opt_u8_array(Some(&body))
-            .map_err(failed)?;
-        let ended = loop {
-            match select(end, Box::pin(sleep(STALL_CHECK))).await {
-                // Its sender lives as long as the closures.
-                Either::Left((Ok(XhrOutcome::Loaded), _)) => break Ok(()),
-                Either::Left((Ok(XhrOutcome::Oversized), _)) => {
-                    break Err(Error::ambiguous_response(
-                        ErrorKind::LimitExceeded,
-                        format!(
-                            "response exceeds maximum size of {MAX_CONNECT_RESPONSE_BYTES} bytes"
-                        ),
-                    ));
-                }
-                Either::Left(_) => {
-                    break Err(Error::new(
-                        ErrorKind::Connect,
-                        "the server cannot be reached",
-                    ));
-                }
-                Either::Right(_)
-                    if monotonic_now_ms().saturating_sub(moved.get()) > STALL_MILLIS =>
-                {
-                    break Err(Error::new(
-                        ErrorKind::Connect,
-                        format!("nothing moved for {} s", STALL_MILLIS / 1000),
-                    ));
-                }
-                Either::Right((_, pending)) => end = pending,
+        #[cfg(all(test, not(target_arch = "wasm32")))]
+        {
+            if let Some(progress) = &self.progress {
+                let len = body.len() as u64;
+                progress(len, len);
             }
-        };
-        ended?;
-        observe(&self.server, &request);
-        let invalid = |e| Error::ambiguous_response(ErrorKind::InvalidResponse, js_error(e));
-        let status = request.status().map_err(invalid)?;
-        // Enforce bounded response size BEFORE copying into Rust memory or decoding.
-        if let Ok(Some(cl)) = request.get_response_header("content-length")
-            && let Ok(parsed) = cl.trim().parse::<u64>()
-        {
-            check_response_size(parsed)?;
-        }
-        let body: ArrayBuffer = request
-            .response()
-            .map_err(invalid)?
-            .dyn_into()
-            .map_err(|_| {
-                Error::ambiguous_response(
-                    ErrorKind::InvalidResponse,
-                    "unexpected response buffer type",
-                )
+            let (status, resp_body) = MOCK_POST.with(|slot| {
+                let mut handler = slot.borrow_mut();
+                match handler.as_mut() {
+                    Some(respond) => respond(&self.server, path, body),
+                    None => Err(Error::new(
+                        ErrorKind::Connect,
+                        format!("no mock responder installed for POST {}{path}", self.server),
+                    )),
+                }
             })?;
-        check_response_size(u64::from(body.byte_length()))?;
-        let body = Uint8Array::new(&body).to_vec();
-        let deprecated_header = request
-            .get_response_header("x-e2ee-deprecated")
-            .ok()
-            .flatten();
-        if let Some(reason) = deprecated_notice(deprecated_header.as_deref(), &body)
-            && let Some(handler) = UPDATE_REQUIRED.with_borrow(Clone::clone)
-        {
-            handler(reason);
+            check_response_size(resp_body.len() as u64)?;
+            if asks_sign_in(status, &resp_body)
+                && let Some(refused) = REFUSED.with_borrow(Clone::clone)
+            {
+                refused();
+            }
+            Ok((status, resp_body))
         }
-        if asks_sign_in(status, &body)
-            && let Some(refused) = REFUSED.with_borrow(Clone::clone)
+
+        #[cfg(any(target_arch = "wasm32", not(test)))]
         {
-            refused();
+            let failed = |error| Error::new(ErrorKind::Connect, js_error(error));
+            let request = XmlHttpRequest::new().map_err(failed)?;
+            request
+                .open("POST", &format!("{}{path}", self.server))
+                .map_err(failed)?;
+            request
+                .set_request_header("content-type", CONTENT_TYPE)
+                .map_err(failed)?;
+            request
+                .set_request_header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION)
+                .map_err(failed)?;
+            request.set_response_type(XmlHttpRequestResponseType::Arraybuffer);
+            let upload = request.upload().map_err(failed)?;
+            // When it last moved (monotonic), and whether it ended with an answer, failed, or exceeded cap.
+            let moved = Rc::new(Cell::new(monotonic_now_ms()));
+            let (ended, mut end) = oneshot::channel::<XhrOutcome>();
+            let ended = Rc::new(Cell::new(Some(ended)));
+            let progress = {
+                let moved = moved.clone();
+                let ended = ended.clone();
+                let req = request.clone();
+                Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
+                    moved.set(monotonic_now_ms());
+                    let loaded = event.loaded();
+                    let total = if event.length_computable() {
+                        event.total()
+                    } else {
+                        0.0
+                    };
+                    if loaded > MAX_CONNECT_RESPONSE_BYTES as f64
+                        || total > MAX_CONNECT_RESPONSE_BYTES as f64
+                    {
+                        let _ = req.abort();
+                        if let Some(ended) = ended.take() {
+                            let _ = ended.send(XhrOutcome::Oversized);
+                        }
+                    }
+                })
+            };
+            let sent = {
+                let (moved, progress) = (moved.clone(), self.progress.clone());
+                Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
+                    moved.set(monotonic_now_ms());
+                    if let Some(progress) = &progress
+                        && event.length_computable()
+                    {
+                        progress(event.loaded() as u64, event.total() as u64);
+                    }
+                })
+            };
+            let ends = |outcome: XhrOutcome| {
+                let ended = ended.clone();
+                Closure::<dyn FnMut()>::new(move || {
+                    if let Some(ended) = ended.take() {
+                        let _ = ended.send(outcome);
+                    }
+                })
+            };
+            let (load, error) = (ends(XhrOutcome::Loaded), ends(XhrOutcome::Failed));
+            // Declared after the closures, so that it goes first.
+            let _handlers = Handlers {
+                request: &request,
+                upload: Some(&upload),
+            };
+            request.set_onprogress(Some(progress.as_ref().unchecked_ref()));
+            upload.set_onprogress(Some(sent.as_ref().unchecked_ref()));
+            request.set_onload(Some(load.as_ref().unchecked_ref()));
+            request.set_onerror(Some(error.as_ref().unchecked_ref()));
+            request
+                .send_with_opt_u8_array(Some(&body))
+                .map_err(failed)?;
+            let ended = loop {
+                match select(end, Box::pin(sleep(STALL_CHECK))).await {
+                    // Its sender lives as long as the closures.
+                    Either::Left((Ok(XhrOutcome::Loaded), _)) => break Ok(()),
+                    Either::Left((Ok(XhrOutcome::Oversized), _)) => {
+                        break Err(Error::ambiguous_response(
+                            ErrorKind::LimitExceeded,
+                            format!(
+                                "response exceeds maximum size of {MAX_CONNECT_RESPONSE_BYTES} bytes"
+                            ),
+                        ));
+                    }
+                    Either::Left(_) => {
+                        break Err(Error::new(
+                            ErrorKind::Connect,
+                            "the server cannot be reached",
+                        ));
+                    }
+                    Either::Right(_)
+                        if monotonic_now_ms().saturating_sub(moved.get()) > STALL_MILLIS =>
+                    {
+                        break Err(Error::new(
+                            ErrorKind::Connect,
+                            format!("nothing moved for {} s", STALL_MILLIS / 1000),
+                        ));
+                    }
+                    Either::Right((_, pending)) => end = pending,
+                }
+            };
+            ended?;
+            observe(&self.server, &request);
+            let invalid = |e| Error::ambiguous_response(ErrorKind::InvalidResponse, js_error(e));
+            let status = request.status().map_err(invalid)?;
+            // Enforce bounded response size BEFORE copying into Rust memory or decoding.
+            if let Ok(Some(cl)) = request.get_response_header("content-length")
+                && let Ok(parsed) = cl.trim().parse::<u64>()
+            {
+                check_response_size(parsed)?;
+            }
+            let body: ArrayBuffer =
+                request
+                    .response()
+                    .map_err(invalid)?
+                    .dyn_into()
+                    .map_err(|_| {
+                        Error::ambiguous_response(
+                            ErrorKind::InvalidResponse,
+                            "unexpected response buffer type",
+                        )
+                    })?;
+            check_response_size(u64::from(body.byte_length()))?;
+            let body = Uint8Array::new(&body).to_vec();
+            let deprecated_header = request
+                .get_response_header("x-e2ee-deprecated")
+                .ok()
+                .flatten();
+            if let Some(reason) = deprecated_notice(deprecated_header.as_deref(), &body)
+                && let Some(handler) = UPDATE_REQUIRED.with_borrow(Clone::clone)
+            {
+                handler(reason);
+            }
+            if asks_sign_in(status, &body)
+                && let Some(refused) = REFUSED.with_borrow(Clone::clone)
+            {
+                refused();
+            }
+            Ok((status, body))
         }
-        Ok((status, body))
     }
 }
 

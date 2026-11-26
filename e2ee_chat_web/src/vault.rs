@@ -1136,7 +1136,7 @@ pub struct HistoryEntry {
 
 impl HistoryEntry {
     /// The entry without the bytes of its file, if any, which it notes, and the bytes.
-    fn without_file(&self) -> (Self, Option<Zeroizing<Vec<u8>>>) {
+    pub(crate) fn without_file(&self) -> (Self, Option<Zeroizing<Vec<u8>>>) {
         let mut entry = self.clone();
         let data = match entry
             .content
@@ -1742,13 +1742,16 @@ impl Vault {
         &self,
         state: &AppState,
         deferred: &DeferredInitialsRecord,
-        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
-        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> Result<()> {
         let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
         let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
-        let outgoing_vec: Vec<_> = outgoing.into_iter().collect();
+        let outgoing_vec: Vec<(String, Option<&OutgoingRecord>)> = outgoing
+            .into_iter()
+            .map(|(peer, index, record)| (outbox_key(peer, *index), record.as_ref()))
+            .collect();
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
         for (key, record) in &outgoing_vec {
             if record.is_some() {
@@ -1808,14 +1811,14 @@ impl Vault {
     fn put_outgoing(
         &self,
         store: &idb::ObjectStore,
-        outgoing: &[&(String, Option<OutgoingRecord>)],
+        outgoing: &[(String, Option<&OutgoingRecord>)],
         revision: u64,
     ) -> Result<()> {
         for (key, record) in outgoing {
             match record {
                 Some(record) => {
                     let aad = outbox_aad(key, self.record_epoch, revision);
-                    let sealed = self.seal_with_aad(&aad, record)?;
+                    let sealed = self.seal_with_aad(&aad, *record)?;
                     store.put(&bytes(&sealed), Some(&key.as_str().into()))?;
                 }
                 None => {
@@ -1830,12 +1833,13 @@ impl Vault {
     fn put_entries<'a>(
         &self,
         store: &idb::ObjectStore,
-        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
     ) -> Result<()> {
-        for (key, entry) in entries {
+        for (peer, index, entry) in entries {
+            let key = history_key(peer, *index);
             let (mut entry, data) = entry.without_file();
             if let Some(data) = data {
-                let name = key.replacen("history/", "file/", 1);
+                let name = file_key(peer, *index);
                 let mut record = FileRecord {
                     data: data.to_vec(),
                 };
@@ -1843,7 +1847,7 @@ impl Vault {
                 record.data.zeroize();
                 store.put(&bytes(&sealed), Some(&name.as_str().into()))?;
             }
-            let sealed_entry = self.seal_record(key, &entry)?;
+            let sealed_entry = self.seal_record(&key, &entry)?;
             entry.zeroize_secrets();
             store.put(&bytes(&sealed_entry), Some(&key.as_str().into()))?;
         }
@@ -2021,13 +2025,16 @@ impl Vault {
         peer: &PublicKey,
         old_id: &[u8],
         new_upload: &PendingUpload,
-        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
-        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> Result<()> {
         let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
         let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
-        let outgoing_vec: Vec<_> = outgoing.into_iter().collect();
+        let outgoing_vec: Vec<(String, Option<&OutgoingRecord>)> = outgoing
+            .into_iter()
+            .map(|(p, index, record)| (outbox_key(p, *index), record.as_ref()))
+            .collect();
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
         for (key, record) in &outgoing_vec {
             if record.is_some() {
@@ -2222,13 +2229,16 @@ impl Vault {
         state: &AppState,
         deferred: &DeferredInitialsRecord,
         peer: &PublicKey,
-        entries: impl IntoIterator<Item = &'a (String, HistoryEntry)>,
-        outgoing: impl IntoIterator<Item = &'a (String, Option<OutgoingRecord>)>,
+        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> Result<()> {
         let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
         let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
-        let outgoing_vec: Vec<_> = outgoing.into_iter().collect();
+        let outgoing_vec: Vec<(String, Option<&OutgoingRecord>)> = outgoing
+            .into_iter()
+            .map(|(p, index, record)| (outbox_key(p, *index), record.as_ref()))
+            .collect();
         let peer_outbox_prefix = format!("outbox/{}/", hex(peer));
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
         next_outbox_revs.retain(|k, _| !k.starts_with(&peer_outbox_prefix));
