@@ -121,8 +121,8 @@ hayro = { version = "0.9", optional = true }
 js-sys = { workspace = true, optional = true }
 lofty = { version = "0.25", optional = true }
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"], optional = true }
-# Without the ELK layout, which is under the EPL-2.0.
-merman = { version = "0.11", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape", "math"], optional = true }
+# Without the ELK layout (EPL-2.0) or embedded KaTeX math fonts (`math` feature).
+merman = { version = "0.11", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"], optional = true }
 serde_json = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 web-sys = { workspace = true, features = ["console", "DedicatedWorkerGlobalScope", "MessageEvent"], optional = true }

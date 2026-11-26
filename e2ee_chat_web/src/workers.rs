@@ -31,10 +31,17 @@ use crate::util::js_error;
 const TIMEOUT: i32 = 60_000;
 /// Call ID reserved for the worker's initial `READY` handshake.
 const READY_ID: u32 = 0;
+/// CSS selector for the build-injected worker script manifest `<meta>` tag.
+const WORKER_MANIFEST_SELECTOR: &str = r#"meta[name="e2ee-worker-manifest"]"#;
+/// Actionable notice surfaced when a worker fails before its initial `READY` handshake while the
+/// browser is online (typically because a newer deploy replaced hashed worker assets).
+const DEPLOY_SKEW_NOTICE: &str =
+    "A newer version of this app was deployed — reload to open this preview";
 
 #[cfg(all(test, target_arch = "wasm32"))]
 thread_local! {
     static TEST_TIMEOUT_MS: Cell<Option<i32>> = const { Cell::new(None) };
+    static TEST_ONLINE: Cell<Option<bool>> = const { Cell::new(None) };
     static TEST_SCRIPTS: RefCell<HashMap<Worker, std::collections::VecDeque<String>>> =
         RefCell::new(HashMap::new());
 }
@@ -47,7 +54,59 @@ fn timeout_ms() -> i32 {
     TIMEOUT
 }
 
-fn worker_script(kind: Worker) -> String {
+fn is_online() -> bool {
+    #[cfg(all(test, target_arch = "wasm32"))]
+    if let Some(online) = TEST_ONLINE.with(Cell::get) {
+        return online;
+    }
+    web_sys::window().is_none_or(|window| window.navigator().on_line())
+}
+
+fn parse_worker_manifest(json: &str) -> Result<HashMap<String, String>, String> {
+    let manifest: HashMap<String, String> =
+        serde_json::from_str(json).map_err(|e| format!("invalid worker manifest: {e}"))?;
+    if manifest.is_empty() {
+        return Err("empty worker manifest".to_string());
+    }
+    for (key, url) in &manifest {
+        if key.is_empty() || url.trim().is_empty() {
+            return Err("invalid worker manifest entry".to_string());
+        }
+    }
+    Ok(manifest)
+}
+
+fn load_worker_manifest() -> Result<HashMap<String, String>, String> {
+    let document = web_sys::window()
+        .and_then(|window| window.document())
+        .ok_or_else(|| "worker manifest unavailable".to_string())?;
+    let meta = document
+        .query_selector(WORKER_MANIFEST_SELECTOR)
+        .map_err(js_error)?
+        .ok_or_else(|| "missing worker manifest".to_string())?;
+    let content = meta
+        .get_attribute("content")
+        .ok_or_else(|| "missing worker manifest content".to_string())?;
+    parse_worker_manifest(&content)
+}
+
+/// Resolve a logical worker key (e.g. `"pdf"`, `"diagram"`, `"vault_kdf"`) to its content-hashed
+/// loader script URL from `<meta name="e2ee-worker-manifest">`, caching the parsed manifest once.
+pub(crate) fn resolve_worker_script(key: &str) -> Result<String, String> {
+    WORKER_MANIFEST.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.is_none() {
+            *cache = Some(load_worker_manifest()?);
+        }
+        cache
+            .as_ref()
+            .and_then(|manifest| manifest.get(key))
+            .cloned()
+            .ok_or_else(|| format!("missing worker manifest entry for {key}"))
+    })
+}
+
+fn worker_script(kind: Worker) -> Result<String, String> {
     #[cfg(all(test, target_arch = "wasm32"))]
     if let Some(url) = TEST_SCRIPTS.with(|scripts| {
         let mut scripts = scripts.borrow_mut();
@@ -58,9 +117,9 @@ fn worker_script(kind: Worker) -> String {
             queue.front().cloned()
         }
     }) {
-        return url;
+        return Ok(url);
     }
-    kind.script().to_string()
+    resolve_worker_script(kind.key())
 }
 
 /// Advance a non-zero call ID, skipping [`READY_ID`] (`0`) on 32-bit wraparound.
@@ -149,6 +208,7 @@ struct Running {
 struct Calls {
     pending: RefCell<HashMap<u32, (Function, Function)>>,
     next: Cell<u32>,
+    ready: Cell<bool>,
     stopped: RefCell<Option<String>>,
 }
 
@@ -197,6 +257,7 @@ impl Calls {
 }
 
 thread_local! {
+    static WORKER_MANIFEST: RefCell<Option<HashMap<String, String>>> = const { RefCell::new(None) };
     static RUNNING: RefCell<HashMap<Worker, Rc<Running>>> = RefCell::new(HashMap::new());
     static STARTS: Cell<u32> = const { Cell::new(0) };
 }
@@ -208,14 +269,18 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
     {
         return Ok(running);
     }
-    let worker = web_sys::Worker::new(&worker_script(kind)).map_err(js_error)?;
+    let script = worker_script(kind)?;
+    let worker = web_sys::Worker::new(&script).map_err(js_error)?;
     let calls = Rc::new(Calls::default());
     let ready = calls.add_ready();
     let on_message = {
         let calls = calls.clone();
         Closure::<dyn FnMut(MessageEvent)>::new(
             move |event: MessageEvent| match WorkerEvent::decode(event.data()) {
-                Ok(WorkerEvent::Ready) => calls.settle(READY_ID, true, &JsValue::UNDEFINED),
+                Ok(WorkerEvent::Ready) => {
+                    calls.ready.set(true);
+                    calls.settle(READY_ID, true, &JsValue::UNDEFINED);
+                }
                 Ok(WorkerEvent::Reply { id, result }) if id != READY_ID => match result {
                     Ok(value) => calls.settle(id, true, &value),
                     Err(error) => calls.settle(id, false, &error),
@@ -240,11 +305,16 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
         let calls = calls.clone();
         Closure::<dyn FnMut(Event)>::new(move |event: Event| {
             event.prevent_default();
+            let reason = if !calls.ready.get() && is_online() {
+                DEPLOY_SKEW_NOTICE
+            } else {
+                "the preview failed"
+            };
             // Synchronously mark stopped & reject pending callers before yielding, preventing
             // same-tick posts to a crashed worker while deferring handler drop via `spawn_local`.
-            calls.fail_all("the preview failed");
+            calls.fail_all(reason);
             let calls = calls.clone();
-            spawn_local(async move { stop(kind, &calls, "the preview failed") });
+            spawn_local(async move { stop(kind, &calls, reason) });
         })
     };
     worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
@@ -478,6 +548,38 @@ mod tests {
         assert_eq!(next_start_id(0), 1);
         assert_eq!(next_start_id(u32::MAX), 1);
     }
+
+    #[test]
+    fn parse_worker_manifest_accepts_valid_map_and_rejects_malformed() {
+        let parsed = parse_worker_manifest(
+            r#"{"pdf":"/assets/preview_pdf-abc123_loader.js","vault_kdf":"/assets/vault_kdf-def456_loader.js"}"#,
+        )
+        .expect("valid manifest JSON");
+        assert_eq!(
+            parsed.get("pdf").map(String::as_str),
+            Some("/assets/preview_pdf-abc123_loader.js")
+        );
+        assert_eq!(
+            parsed.get("vault_kdf").map(String::as_str),
+            Some("/assets/vault_kdf-def456_loader.js")
+        );
+
+        for invalid in [
+            "",
+            "{}",
+            "[]",
+            r#"{"":"\/assets\/x.js"}"#,
+            r#"{"pdf":""}"#,
+            r#"{"pdf":"   "}"#,
+            r#"{"pdf":123}"#,
+            "not json",
+        ] {
+            assert!(
+                parse_worker_manifest(invalid).is_err(),
+                "expected rejection for {invalid:?}"
+            );
+        }
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -487,9 +589,51 @@ mod wasm_tests {
     use futures_util::future::{join, join3};
     use js_sys::Array;
     use wasm_bindgen_test::*;
-    use web_sys::{Blob, BlobPropertyBag, Url};
+    use web_sys::{Blob, BlobPropertyBag, Element, Url};
 
     use super::*;
+
+    fn reset_manifest_cache() {
+        WORKER_MANIFEST.with(|cache| {
+            *cache.borrow_mut() = None;
+        });
+    }
+
+    struct ManifestMetaGuard {
+        element: Element,
+    }
+
+    impl ManifestMetaGuard {
+        fn install(content: &str) -> Self {
+            reset_manifest_cache();
+            let document = web_sys::window()
+                .and_then(|w| w.document())
+                .expect("test document");
+            if let Ok(Some(existing)) = document.query_selector(WORKER_MANIFEST_SELECTOR) {
+                existing.remove();
+            }
+            let meta = document.create_element("meta").expect("create meta");
+            meta.set_attribute("name", "e2ee-worker-manifest")
+                .expect("set meta name");
+            meta.set_attribute("content", content)
+                .expect("set meta content");
+            let container = document
+                .query_selector("head")
+                .ok()
+                .flatten()
+                .or_else(|| document.document_element())
+                .expect("document head or root");
+            container.append_child(&meta).expect("append manifest meta");
+            Self { element: meta }
+        }
+    }
+
+    impl Drop for ManifestMetaGuard {
+        fn drop(&mut self) {
+            self.element.remove();
+            reset_manifest_cache();
+        }
+    }
 
     fn make_blob_script(source: &str) -> String {
         let parts = Array::of1(&JsValue::from_str(source));
@@ -524,6 +668,7 @@ mod wasm_tests {
                     .insert(kind, VecDeque::from_iter(urls.iter().cloned()));
             });
             TEST_TIMEOUT_MS.with(|slot| slot.set(timeout));
+            TEST_ONLINE.with(|slot| slot.set(None));
             Self { kind, urls }
         }
     }
@@ -531,6 +676,7 @@ mod wasm_tests {
     impl Drop for MockWorkerHarness {
         fn drop(&mut self) {
             TEST_TIMEOUT_MS.with(|slot| slot.set(None));
+            TEST_ONLINE.with(|slot| slot.set(None));
             TEST_SCRIPTS.with(|map| {
                 map.borrow_mut().remove(&self.kind);
             });
@@ -538,6 +684,124 @@ mod wasm_tests {
             for url in &self.urls {
                 let _ = Url::revoke_object_url(url);
             }
+        }
+    }
+
+    #[wasm_bindgen_test]
+    async fn resolve_worker_script_reads_caches_and_requires_meta_manifest() {
+        stop_kind(Worker::Search);
+        reset_manifest_cache();
+
+        // No fallback to unhashed paths when the manifest meta tag is absent.
+        let missing_err = resolve_worker_script("search")
+            .expect_err("missing manifest must fail explicitly without fallback");
+        assert!(
+            missing_err.contains("missing worker manifest"),
+            "{missing_err}"
+        );
+
+        // Invalid JSON fails explicitly and must not poison the cache.
+        {
+            let _bad = ManifestMetaGuard::install("{not-json");
+            let invalid_err = resolve_worker_script("search")
+                .expect_err("invalid JSON manifest must fail explicitly");
+            assert!(
+                invalid_err.contains("invalid worker manifest"),
+                "{invalid_err}"
+            );
+        }
+
+        // Valid manifest resolves both preview keys and arbitrary future keys (e.g. `vault_kdf`),
+        // caches after the first read, and spawns workers through `resolve_worker_script`.
+        const MANIFEST_SEARCH_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id] = event.data;
+                const offsets = new Uint32Array([1, 4]);
+                self.postMessage([id, true, [offsets, false]], [offsets.buffer]);
+            };
+            self.postMessage("ready");
+        "#;
+        let blob_url = make_blob_script(MANIFEST_SEARCH_WORKER);
+        let manifest_json = serde_json::json!({
+            "search": blob_url,
+            "vault_kdf": "/assets/vault_kdf-deadbeef_loader.js",
+        })
+        .to_string();
+        let meta_guard = ManifestMetaGuard::install(&manifest_json);
+
+        assert_eq!(
+            resolve_worker_script("search").as_deref(),
+            Ok(blob_url.as_str())
+        );
+        assert_eq!(
+            resolve_worker_script("vault_kdf").as_deref(),
+            Ok("/assets/vault_kdf-deadbeef_loader.js")
+        );
+        assert!(resolve_worker_script("unknown").is_err());
+
+        // Mutating the DOM meta tag after caching must not change the cached lookup.
+        meta_guard
+            .element
+            .set_attribute("content", r#"{"search":"/assets/changed_loader.js"}"#)
+            .expect("mutate meta tag");
+        assert_eq!(
+            resolve_worker_script("search").as_deref(),
+            Ok(blob_url.as_str())
+        );
+
+        // Spawning a worker without `TEST_SCRIPTS` uses the manifest entry.
+        let found = find("hello", "ell", false, false)
+            .await
+            .expect("worker loaded from meta manifest must succeed");
+        assert_eq!(found, (vec![(1, 4)], false));
+
+        stop_kind(Worker::Search);
+        drop(meta_guard);
+        let _ = Url::revoke_object_url(&blob_url);
+    }
+
+    #[wasm_bindgen_test]
+    async fn workers_pre_ready_error_surfaces_deploy_skew_notice_only_when_online() {
+        const PRE_READY_FAIL_WORKER: &str = r#"
+            throw new Error("simulated pre-ready asset load failure");
+        "#;
+        const HEALTHY_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id] = event.data;
+                const offsets = new Uint32Array([4, 9]);
+                self.postMessage([id, true, [offsets, false]], [offsets.buffer]);
+            };
+            self.postMessage("ready");
+        "#;
+
+        // Online: failing before READY surfaces the actionable deploy-skew reload notice.
+        {
+            let _harness = MockWorkerHarness::new(
+                Worker::Search,
+                &[PRE_READY_FAIL_WORKER, HEALTHY_WORKER],
+                Some(2_000),
+            );
+            TEST_ONLINE.with(|slot| slot.set(Some(true)));
+            let err = find("online-skew", "q", false, false)
+                .await
+                .expect_err("pre-ready online error must fail");
+            assert_eq!(err, DEPLOY_SKEW_NOTICE);
+
+            let recovered = find("after-skew", "q", false, false)
+                .await
+                .expect("subsequent call after pre-ready error must spawn fresh worker");
+            assert_eq!(recovered, (vec![(4, 9)], false));
+        }
+
+        // Offline: failing before READY must NOT claim a newer version was deployed.
+        {
+            let _harness =
+                MockWorkerHarness::new(Worker::Search, &[PRE_READY_FAIL_WORKER], Some(2_000));
+            TEST_ONLINE.with(|slot| slot.set(Some(false)));
+            let err = find("offline-fail", "q", false, false)
+                .await
+                .expect_err("pre-ready offline error must fail");
+            assert_eq!(err, "the preview failed");
         }
     }
 

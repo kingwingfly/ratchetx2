@@ -62,17 +62,43 @@ pub enum Worker {
 }
 
 impl Worker {
-    /// The script that starts the worker, which the trunk build makes.
-    pub fn script(self) -> &'static str {
+    /// The logical key for this worker in the page's `<meta name="e2ee-worker-manifest">`.
+    pub fn key(self) -> &'static str {
         match self {
-            Self::Pdf => "/preview_pdf_loader.js",
-            Self::Diagram => "/preview_diagram_loader.js",
-            Self::Audio => "/preview_audio_loader.js",
-            Self::Search => "/preview_search_loader.js",
-            Self::Code(Group::Web) => "/preview_code_web_loader.js",
-            Self::Code(Group::Systems) => "/preview_code_systems_loader.js",
-            Self::Code(Group::Apps) => "/preview_code_apps_loader.js",
-            Self::Code(Group::Scripts) => "/preview_code_scripts_loader.js",
+            Self::Pdf => "pdf",
+            Self::Diagram => "diagram",
+            Self::Audio => "audio",
+            Self::Search => "search",
+            Self::Code(Group::Web) => "code_web",
+            Self::Code(Group::Systems) => "code_systems",
+            Self::Code(Group::Apps) => "code_apps",
+            Self::Code(Group::Scripts) => "code_scripts",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::*;
+
+    #[test]
+    fn worker_keys_are_unique_and_canonical() {
+        let all = [
+            (Worker::Pdf, "pdf"),
+            (Worker::Diagram, "diagram"),
+            (Worker::Audio, "audio"),
+            (Worker::Search, "search"),
+            (Worker::Code(Group::Web), "code_web"),
+            (Worker::Code(Group::Systems), "code_systems"),
+            (Worker::Code(Group::Apps), "code_apps"),
+            (Worker::Code(Group::Scripts), "code_scripts"),
+        ];
+        let mut seen = HashSet::new();
+        for (worker, expected) in all {
+            assert_eq!(worker.key(), expected);
+            assert!(seen.insert(expected));
         }
     }
 }

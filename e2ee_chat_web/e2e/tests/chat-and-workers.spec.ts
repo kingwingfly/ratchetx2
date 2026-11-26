@@ -22,6 +22,70 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
     try {
       await establishChat(alicePage, bobPage, 'Alice', 'Bob');
 
+      // 0. Verify content-hashed asset manifest, zero inline scripts, unhashed root
+      //    `media-worker.js`, and disjoint Cloudflare `_headers` caching policy.
+      const assetMeta = await alicePage.evaluate(async () => {
+        const meta = document.querySelector('meta[name="e2ee-worker-manifest"]');
+        const manifestRaw = meta?.getAttribute('content') ?? '';
+        const manifest = manifestRaw ? (JSON.parse(manifestRaw) as Record<string, string>) : {};
+        const scripts = Array.from(document.scripts).map((s) => ({
+          src: s.getAttribute('src') ?? '',
+          inlineLen: (s.textContent ?? '').trim().length,
+        }));
+        const preload =
+          document.querySelector('link[rel="modulepreload"]')?.getAttribute('href') ?? '';
+        const stylesheet =
+          document.querySelector('link[rel="stylesheet"]')?.getAttribute('href') ?? '';
+        const swReg = await navigator.serviceWorker.ready;
+        const rootResp = await fetch('/', { cache: 'no-store' });
+        const swResp = await fetch('/media-worker.js', { cache: 'no-store' });
+        const searchWorkerUrl = manifest.search ?? '';
+        const workerResp = searchWorkerUrl
+          ? await fetch(searchWorkerUrl, { cache: 'no-store' })
+          : null;
+        return {
+          manifest,
+          scripts,
+          preload,
+          stylesheet,
+          swScriptUrl: swReg.active?.scriptURL ?? '',
+          rootCacheControl: rootResp.headers.get('cache-control') ?? '',
+          rootCsp: rootResp.headers.get('content-security-policy') ?? '',
+          swStatus: swResp.status,
+          swCacheControl: swResp.headers.get('cache-control') ?? '',
+          workerStatus: workerResp?.status ?? 0,
+          workerCacheControl: workerResp?.headers.get('cache-control') ?? '',
+          workerNosniff: workerResp?.headers.get('x-content-type-options') ?? '',
+        };
+      });
+      for (const key of [
+        'pdf',
+        'audio',
+        'search',
+        'diagram',
+        'code_web',
+        'code_systems',
+        'code_apps',
+        'code_scripts',
+      ]) {
+        expect(assetMeta.manifest[key], `manifest.${key}`).toMatch(
+          new RegExp(`^/assets/preview_${key}-[0-9a-f]+_loader\\.js$`),
+        );
+      }
+      expect(assetMeta.scripts).toHaveLength(1);
+      expect(assetMeta.scripts[0].src).toMatch(/^\/assets\/init-[0-9a-f]+\.js$/);
+      expect(assetMeta.scripts[0].inlineLen).toBe(0);
+      expect(assetMeta.preload).toMatch(/^\/assets\/e2ee_chat_web-[0-9a-f]+\.js$/);
+      expect(assetMeta.stylesheet).toMatch(/^\/assets\/style-[0-9a-f]+\.css$/);
+      expect(assetMeta.swScriptUrl).toMatch(/\/media-worker\.js$/);
+      expect(assetMeta.rootCacheControl).toBe('no-cache');
+      expect(assetMeta.rootCsp).toContain("script-src 'self' 'wasm-unsafe-eval'");
+      expect(assetMeta.swStatus).toBe(200);
+      expect(assetMeta.swCacheControl).toBe('no-cache');
+      expect(assetMeta.workerStatus).toBe(200);
+      expect(assetMeta.workerCacheControl).toBe('public, max-age=31536000, immutable');
+      expect(assetMeta.workerNosniff).toBe('nosniff');
+
       // 1. Bidirectional encrypted text exchange over live wrangler dev DO + WS.
       const aliceMsg = 'Hello Bob over real PQ ratchet!';
       await sendTextMessage(alicePage, aliceMsg);
@@ -164,16 +228,24 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
     const bobPage = await bobCtx.newPage();
 
     try {
-      // Intercept Bob's `preview_code_systems_loader.js`: fail the first start with an uncaught
-      // error to trigger `worker.onerror`, then allow the real compiled worker to load on retry.
+      // Intercept Bob's hashed `preview_code_systems-*_loader.js`:
+      // 1st start: 404 before READY (deploy skew) -> actionable reload notice, vault stays unlocked.
+      // 2nd start: runtime crash after READY -> `preview failed` error without hanging FIFO queue.
+      // 3rd start: allow the real compiled hashed worker to load and highlight cleanly.
       let loaderRequests = 0;
-      await bobPage.route('**/preview_code_systems_loader.js', async (route) => {
+      await bobPage.route('**/preview_code_systems*loader.js', async (route) => {
         loaderRequests += 1;
         if (loaderRequests === 1) {
           await route.fulfill({
+            status: 404,
+            contentType: 'text/plain; charset=utf-8',
+            body: 'Not Found',
+          });
+        } else if (loaderRequests === 2) {
+          await route.fulfill({
             status: 200,
             contentType: 'application/javascript; charset=utf-8',
-            body: 'throw new Error("e2e simulated preview worker crash");',
+            body: 'self.postMessage("ready"); self.onmessage = () => { throw new Error("e2e simulated preview worker crash"); };',
           });
         } else {
           await route.continue();
@@ -188,22 +260,34 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
 
       const viewer = bobPage.locator('dialog.viewer');
 
-      // 1st open: crashed worker fails cleanly (surfaces `data-error`) without hanging UI.
+      // 1st open: pre-READY 404 deploy skew surfaces actionable reload notice without locking vault.
       await rsCard.click();
       await expect(viewer).toHaveAttribute('open', '');
-      await expect(viewer.locator('pre.code')).toHaveAttribute('data-error', /preview failed/i);
+      await expect(viewer.locator('pre.code')).toHaveAttribute(
+        'data-error',
+        /newer version of this app was deployed/i,
+      );
       expect(loaderRequests).toBe(1);
       await viewer.getByRole('button', { name: 'Close', exact: true }).click();
       await expect(viewer).not.toHaveAttribute('open', '');
+      await expect(bobPage.getByRole('button', { name: 'Lock the vault' })).toBeVisible();
 
-      // 2nd open: fresh worker spawns, FIFO queue is not stuck, syntax highlighting succeeds.
+      // 2nd open: post-READY uncaught crash fails cleanly without hanging UI.
+      await rsCard.click();
+      await expect(viewer).toHaveAttribute('open', '');
+      await expect(viewer.locator('pre.code')).toHaveAttribute('data-error', /preview failed/i);
+      expect(loaderRequests).toBe(2);
+      await viewer.getByRole('button', { name: 'Close', exact: true }).click();
+      await expect(viewer).not.toHaveAttribute('open', '');
+
+      // 3rd open: fresh worker spawns, FIFO queue is not stuck, syntax highlighting succeeds.
       await rsCard.click();
       await expect(viewer).toHaveAttribute('open', '');
       const rsCode = viewer.locator('pre.code code[data-lang="rust"]');
       await expect(rsCode).toBeVisible();
       await expect(rsCode.locator('span[class^="hl-"]').first()).toBeVisible();
       await expect(viewer.locator('pre.code')).not.toHaveAttribute('data-error');
-      expect(loaderRequests).toBeGreaterThanOrEqual(2);
+      expect(loaderRequests).toBeGreaterThanOrEqual(3);
     } finally {
       await aliceCtx.close();
       await bobCtx.close();
