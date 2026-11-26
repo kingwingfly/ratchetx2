@@ -51,6 +51,9 @@ pub type Progress = Rc<dyn Fn(u64, u64)>;
 /// Told when a server indicates this client's protocol is deprecated (`x-e2ee-deprecated`).
 type UpdateHook = Rc<dyn Fn(String)>;
 
+/// Told when a server response `Date` reveals clock drift exceeding the trusted threshold.
+type ClockSkewHook = Rc<dyn Fn(i64)>;
+
 thread_local! {
     /// The clocks of the servers called, by address, kept to their time by their responses.
     static CLOCKS: RefCell<HashMap<String, ServerClock>> = RefCell::default();
@@ -58,6 +61,8 @@ thread_local! {
     static REFUSED: RefCell<Option<Rc<dyn Fn()>>> = RefCell::default();
     /// Told when a server indicates the client's protocol is deprecated (`x-e2ee-deprecated`).
     static UPDATE_REQUIRED: RefCell<Option<UpdateHook>> = RefCell::default();
+    /// Told when the observed server clock differs from local time past the trusted drift cap.
+    static CLOCK_SKEW: RefCell<Option<ClockSkewHook>> = RefCell::default();
 }
 
 /// Tell `refused` whenever a server refuses a call as this browser is not signed in to it.
@@ -68,6 +73,12 @@ pub fn on_sign_in_required(refused: impl Fn() + 'static) {
 /// Tell `handler` whenever a server returns an `x-e2ee-deprecated` header on a Connect response.
 pub fn on_update_required(handler: impl Fn(String) + 'static) {
     UPDATE_REQUIRED.with_borrow_mut(|hook| *hook = Some(Rc::new(handler)));
+}
+
+/// Tell `handler` whenever a server response `Date` reveals clock drift exceeding the trusted
+/// threshold ([`session::DEFAULT_MAX_TRUSTED_DRIFT_MS`]).
+pub fn on_clock_skew(handler: impl Fn(i64) + 'static) {
+    CLOCK_SKEW.with_borrow_mut(|hook| *hook = Some(Rc::new(handler)));
 }
 
 /// Extract a refresh/upgrade notice when the server explicitly flags a deprecated protocol via
@@ -125,7 +136,13 @@ pub fn clock(server: &str) -> ServerClock {
 /// Learn the time of `server` from the `Date` of `request`'s response, if it tells it.
 fn observe(server: &str, request: &XmlHttpRequest) {
     if let Ok(Some(date)) = request.get_response_header("date") {
-        clock(server).observe_date(&date);
+        let clk = clock(server);
+        if clk.observe_date(&date)
+            && clk.is_drift_exceeded()
+            && let Some(handler) = CLOCK_SKEW.with_borrow(Clone::clone)
+        {
+            handler(clk.offset_ms());
+        }
     }
 }
 

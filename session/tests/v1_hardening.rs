@@ -340,13 +340,6 @@ async fn classical_initial_and_in_band_hello_reject_unsafe_sequences_without_cha
         let restored = session::SessionState::try_from(&wire).unwrap();
         assert_eq!(restored.peer_pq_state(), &before);
     }
-    #[cfg(feature = "rkyv")]
-    {
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(session.state()).unwrap();
-        let restored =
-            rkyv::from_bytes::<session::SessionState, rkyv::rancor::Error>(&bytes).unwrap();
-        assert_eq!(restored.peer_pq_state(), &before);
-    }
 }
 
 #[allow(deprecated)]
@@ -758,7 +751,7 @@ async fn state_validation_on_prost_restore_rejects_corruption() {
         ErrorKind::MalformedState
     );
 
-    let mut mismatched_pq = base_session;
+    let mut mismatched_pq = base_session.clone();
     mismatched_pq.active_security = Some(proto::SessionSecurity {
         is_pq: true,
         suite: 1,
@@ -769,5 +762,46 @@ async fn state_validation_on_prost_restore_rejects_corruption() {
             .unwrap_err()
             .kind(),
         ErrorKind::MalformedState
+    );
+
+    // `PeerPqState.pinned_manifest_digest`: wrong byte length or set with `seq == 0` rejected;
+    // valid 32-byte digest with `seq > 0` roundtrips cleanly.
+    let mut bad_digest_len = base_session.clone();
+    bad_digest_len.peer_pq = Some(proto::PeerPqState {
+        pinned_manifest_seq: 1,
+        pinned_manifest_digest: vec![0xAA; 16],
+        ..proto::PeerPqState::default()
+    });
+    assert_eq!(
+        session::SessionState::try_from(&bad_digest_len)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::MalformedState
+    );
+
+    let mut digest_without_seq = base_session.clone();
+    digest_without_seq.peer_pq = Some(proto::PeerPqState {
+        pinned_manifest_seq: 0,
+        pinned_manifest_digest: vec![0xBB; 32],
+        ..proto::PeerPqState::default()
+    });
+    assert_eq!(
+        session::SessionState::try_from(&digest_without_seq)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::MalformedState
+    );
+
+    let mut valid_digest = base_session;
+    valid_digest.peer_pq = Some(proto::PeerPqState {
+        pinned_manifest_seq: 3,
+        pinned_manifest_digest: vec![0xCC; 32],
+        ..proto::PeerPqState::default()
+    });
+    let restored_with_digest = session::SessionState::try_from(&valid_digest).unwrap();
+    assert_eq!(restored_with_digest.peer_pq_state().pinned_manifest_seq, 3);
+    assert_eq!(
+        restored_with_digest.peer_pq_state().pinned_manifest_digest,
+        Some([0xCC; 32])
     );
 }

@@ -1,16 +1,14 @@
 //! Targeted regression tests for Phase 2 security, crypto, serialization, storage, clock, and
 //! attachment hardening fixes.
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768", feature = "rkyv"))]
 mod common;
 
 use bytes::Bytes;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768", feature = "rkyv"))]
-use session::{Client, PeerPqState};
-use session::{ErrorKind, PqConfig, ServerClock};
+use session::{Client, ErrorKind, PeerPqState, PqConfig, ServerClock};
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768", feature = "rkyv"))]
-use common::{AUDIENCE, SharedStore, V2OnlyHandshake, V2OnlyMailbox};
+use common::AUDIENCE;
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+use common::{SharedStore, V2OnlyHandshake, V2OnlyMailbox};
 
 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
 #[allow(deprecated)]
@@ -232,11 +230,30 @@ async fn relay_pq_off_fallback_allocates_fresh_manifest_seq_and_records_off_dige
     // Flip relay to PQ_ENABLED = false.
     enabled.store(false, Ordering::Relaxed);
     let prep = bob.prepare_publish_v2(AUDIENCE, 3, 3).unwrap();
-    // Prepared PQ-ON took seq = 2; relay fallback MUST sign PQ-OFF at seq = 3 (never reusing 2).
+    // Prepared PQ-ON took seq = 2; transmit returns ServerPqDisabled with ZERO mutation and ZERO
+    // OFF write on the server so callers can persist `prepare_publish_v2_classical_off` first.
     assert_eq!(bob.manifest_seq(), 2);
     let outcome = bob.transmit_publish_v2(&prep).await.unwrap();
-    assert_eq!(outcome, session::PublishV2Outcome::V2ClassicalOff);
-    bob.commit_publish_v2(prep);
+    assert_eq!(outcome, session::PublishV2Outcome::ServerPqDisabled);
+    assert_eq!(bob.manifest_seq(), 2);
+    let still_on = storage::LocalPqHandshakeStore::get_manifest(&store, &bob.identity_key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(still_on.pq_enabled);
+    assert_eq!(still_on.manifest_seq, 1);
+
+    // Prepare classical OFF -> allocates fresh seq = 3 (never reusing 2), retracts unused PQ
+    // prekeys, and lets caller persist before transmitting!
+    let off_prep = bob.prepare_publish_v2_classical_off(prep, &[]).unwrap();
+    assert_eq!(bob.manifest_seq(), 3);
+    assert_eq!(bob.current_pq_one_time_count(PqConfig::default_suite()), 0);
+    assert_eq!(bob.current_one_time_count(), 3);
+    assert_eq!(
+        bob.transmit_publish_v2(&off_prep).await.unwrap(),
+        session::PublishV2Outcome::V2ClassicalOff
+    );
+    bob.commit_publish_v2(off_prep);
     assert_eq!(bob.manifest_seq(), 3);
 
     // Confirm stored manifest has seq = 3 and verifies cleanly once GetManifest is re-enabled.
@@ -565,34 +582,6 @@ async fn state_restore_rejects_empty_manifest_digests_when_manifest_seq_nonzero(
     );
 }
 
-#[cfg(feature = "rkyv")]
-#[tokio::test]
-async fn rkyv_zero_copy_session_state_verify_rejects_tampered_pq_metadata() {
-    let store = SharedStore::default();
-    let hs = V2OnlyHandshake::new(store.clone(), AUDIENCE);
-    let mb = V2OnlyMailbox::new(store, AUDIENCE);
-
-    let mut alice = Client::new(hs.clone());
-    let mut bob = Client::new(hs);
-    bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
-    let sess = alice
-        .initiate_v2(
-            AUDIENCE,
-            &bob.identity_key(),
-            &PeerPqState::default(),
-            b"zero-copy",
-            mb,
-        )
-        .await
-        .unwrap();
-
-    // Valid roundtrip passes zero-copy `ArchivedSessionState::verify` cleanly.
-    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(sess.state()).unwrap();
-    let restored: session::SessionState =
-        rkyv::from_bytes::<session::SessionState, rkyv::rancor::Error>(&bytes).unwrap();
-    assert_eq!(restored.security(), sess.security());
-}
-
 #[cfg(feature = "serde")]
 #[test]
 fn serde_bounded_visitors_reject_oversized_collections() {
@@ -831,4 +820,306 @@ async fn prekey_rollback_cleans_new_pq_last_resort_and_refill_requires_last_reso
     // And `prepare_refill_v2(1, 1)` STILL fails because the newly minted `pq_last_resort` was
     // retracted cleanly!
     assert!(bob.prepare_refill_v2(AUDIENCE, 1, 1).is_err());
+}
+
+#[tokio::test]
+async fn server_clock_combined_policy_and_manifest_equivocation_rejected_across_all_sites() {
+    use protocol::handshake_v2::{
+        CapabilityManifest, ClaimBundleRequest, ClaimBundleResponse, GetManifestRequest,
+        GetManifestResponse, GetServerInfoRequest, GetServerInfoResponse,
+        ListInitialMessagesRequest, ListInitialMessagesResponse, LocalHandshakeV2,
+        PublishV2Request, PublishV2Response, RefillPrekeysRequest, RefillPrekeysResponse,
+        SendInitialV2Request, SendInitialV2Response, manifest_digest, sign_manifest,
+    };
+    use std::sync::{Arc, Mutex};
+
+    struct StaticManifestHandshake {
+        manifest: Arc<Mutex<CapabilityManifest>>,
+        spk: [u8; 32],
+        spk_sig: [u8; 64],
+    }
+
+    impl LocalHandshakeV2 for StaticManifestHandshake {
+        async fn get_server_info(
+            &self,
+            _: GetServerInfoRequest,
+        ) -> protocol::Result<GetServerInfoResponse> {
+            Ok(GetServerInfoResponse {
+                server_id: AUDIENCE.to_string(),
+                pq_enabled: false,
+                supported_suites: vec![],
+                pq_ratchet_supported: false,
+                ..GetServerInfoResponse::default()
+            })
+        }
+        async fn publish_v2(&self, _: PublishV2Request) -> protocol::Result<PublishV2Response> {
+            unreachable!()
+        }
+        async fn refill_prekeys(
+            &self,
+            _: RefillPrekeysRequest,
+        ) -> protocol::Result<RefillPrekeysResponse> {
+            unreachable!()
+        }
+        async fn get_manifest(
+            &self,
+            _: GetManifestRequest,
+        ) -> protocol::Result<GetManifestResponse> {
+            Ok(GetManifestResponse {
+                manifest: Some(self.manifest.lock().unwrap().clone()),
+            })
+        }
+        async fn claim_bundle(
+            &self,
+            _: ClaimBundleRequest,
+        ) -> protocol::Result<ClaimBundleResponse> {
+            let m = self.manifest.lock().unwrap().clone();
+            Ok(ClaimBundleResponse {
+                signed_prekey: Bytes::copy_from_slice(&self.spk),
+                signed_prekey_signature: Some(Bytes::copy_from_slice(&self.spk_sig)),
+                one_time_prekey: None,
+                manifest: Some(m),
+                pq_last_resort: None,
+                pq_one_time_prekey: None,
+            })
+        }
+        async fn send_initial_v2(
+            &self,
+            _: SendInitialV2Request,
+        ) -> protocol::Result<SendInitialV2Response> {
+            Ok(SendInitialV2Response { id: 1 })
+        }
+        async fn list_initial_messages(
+            &self,
+            _: ListInitialMessagesRequest,
+        ) -> protocol::Result<ListInitialMessagesResponse> {
+            unreachable!()
+        }
+        async fn ack_initial_messages(
+            &self,
+            _: protocol::handshake_v2::AckInitialMessagesRequest,
+        ) -> protocol::Result<protocol::handshake_v2::AckInitialMessagesResponse> {
+            unreachable!()
+        }
+    }
+
+    let now_ms = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let bob_id = xeddsa::XEdDSAPrivateKey::generate();
+    let bob_pub = bob_id.compute_public_key().to_bytes();
+    let bob_spk = xeddsa::XEdDSAPrivateKey::generate()
+        .compute_public_key()
+        .to_bytes();
+    let bob_spk_sig = bob_id.sign(bob_spk);
+
+    // 1. Within-24h relay rewind (-12h) MUST still reject a manifest that expired 1h ago vs local.
+    let hour = 60 * 60 * 1000u64;
+    let mut expired_manifest = CapabilityManifest {
+        audience: AUDIENCE.to_string(),
+        identity_key: Bytes::new(),
+        manifest_seq: 1,
+        generation: 1,
+        issued_at: now_ms - 48 * hour,
+        expires_at: now_ms - hour,
+        pq_enabled: false,
+        strict_pq: false,
+        pq_ratchet_supported: false,
+        offered_suites: vec![],
+        signed_prekey: Bytes::copy_from_slice(&bob_spk),
+        pq_last_resort: vec![],
+        signature: Bytes::new(),
+    };
+    sign_manifest(&bob_id, &mut expired_manifest).unwrap();
+    let shared_manifest = Arc::new(Mutex::new(expired_manifest.clone()));
+    let hs = StaticManifestHandshake {
+        manifest: shared_manifest.clone(),
+        spk: bob_spk,
+        spk_sig: bob_spk_sig,
+    };
+
+    let rewound_clock = ServerClock::default();
+    rewound_clock.observe(now_ms - 12 * hour);
+    assert!(!rewound_clock.is_drift_exceeded());
+    let mut alice = Client::new(hs).with_clock(rewound_clock.clone());
+    assert_eq!(
+        alice
+            .get_peer_manifest(AUDIENCE, &bob_pub)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::PeerManifestExpired
+    );
+    let mut peer_state = PeerPqState::default();
+    peer_state.approve_classical_exception();
+    assert_eq!(
+        alice
+            .get_peer_manifest_for(AUDIENCE, &bob_pub, &mut peer_state)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::PeerManifestExpired
+    );
+    assert_eq!(peer_state.pinned_manifest_seq, 0);
+    assert_eq!(peer_state.pinned_manifest_digest, None);
+    assert_eq!(
+        alice
+            .prepare_initiate_v2(AUDIENCE, &bob_pub, &peer_state, b"hi", ())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::PeerManifestExpired
+    );
+
+    // 2. Beyond-24h drift (±25h) fails closed with ClockSkew across get_peer_manifest,
+    //    prepare_initiate_v2, and prepare_publish_v2_preserving (no silent clamping).
+    let mut valid_manifest_a = CapabilityManifest {
+        issued_at: now_ms - hour,
+        expires_at: now_ms + 24 * hour,
+        ..expired_manifest.clone()
+    };
+    sign_manifest(&bob_id, &mut valid_manifest_a).unwrap();
+    let digest_a = manifest_digest(&valid_manifest_a).unwrap();
+    *shared_manifest.lock().unwrap() = valid_manifest_a.clone();
+
+    for skewed_time in [now_ms + 25 * hour, now_ms - 25 * hour] {
+        alice.clock().observe(skewed_time);
+        assert!(alice.clock().is_drift_exceeded());
+        assert_eq!(
+            alice
+                .get_peer_manifest(AUDIENCE, &bob_pub)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ClockSkew
+        );
+        assert_eq!(
+            alice
+                .prepare_initiate_v2(AUDIENCE, &bob_pub, &peer_state, b"hi", ())
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ClockSkew
+        );
+        assert_eq!(
+            alice
+                .prepare_publish_v2_preserving(AUDIENCE, 2, 0, &[], &[])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ClockSkew
+        );
+        assert_eq!(alice.manifest_seq(), 0);
+        assert_eq!(alice.prekey_generation(), 0);
+    }
+
+    // 3. Honest clock pins (seq = 1, digest_a); equivocating manifest at same seq = 1 with a
+    //    different digest MUST fail with DowngradeDetected BEFORE clock/expiry checks!
+    alice.clock().observe(now_ms);
+    let fetched = alice
+        .get_peer_manifest_for(AUDIENCE, &bob_pub, &mut peer_state)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(fetched.manifest_seq, 1);
+    assert_eq!(peer_state.pinned_manifest_seq, 1);
+    assert_eq!(peer_state.pinned_manifest_digest, Some(digest_a));
+
+    let mut equivocating_manifest_b = CapabilityManifest {
+        // Different issued_at/expires_at -> different canonical digest at SAME manifest_seq == 1!
+        // Also expired to verify DowngradeDetected takes precedence over PeerManifestExpired.
+        issued_at: now_ms - 10 * hour,
+        expires_at: now_ms - 2 * hour,
+        ..valid_manifest_a
+    };
+    sign_manifest(&bob_id, &mut equivocating_manifest_b).unwrap();
+    assert_ne!(manifest_digest(&equivocating_manifest_b).unwrap(), digest_a);
+    *shared_manifest.lock().unwrap() = equivocating_manifest_b;
+
+    // Even under excessive clock drift, equivocation is caught BEFORE clock/window checks!
+    alice.clock().observe(now_ms + 25 * hour);
+    assert_eq!(
+        alice
+            .get_peer_manifest_for(AUDIENCE, &bob_pub, &mut peer_state)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::DowngradeDetected
+    );
+    assert_eq!(
+        alice
+            .prepare_initiate_v2(AUDIENCE, &bob_pub, &peer_state, b"hi", ())
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::DowngradeDetected
+    );
+    // Pin stays unchanged on digest_a.
+    assert_eq!(peer_state.pinned_manifest_digest, Some(digest_a));
+}
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[tokio::test]
+async fn prepare_publish_v2_classical_off_rollback_contract_on_error_and_refusal() {
+    use common::ToggleableHandshake;
+    use std::sync::atomic::Ordering;
+
+    let store = SharedStore::default();
+    let (hs, enabled) = ToggleableHandshake::new(store.clone(), AUDIENCE);
+    let suite = PqConfig::default_suite();
+    let mut bob = Client::new(hs);
+
+    // Establish gen 1 (manifest_seq = 1).
+    bob.publish_v2(AUDIENCE, 4, 3).await.unwrap();
+    let spk_gen1 = bob.current_signed_prekey().unwrap();
+    assert_eq!(bob.manifest_seq(), 1);
+    assert_eq!(bob.prekey_generation(), 1);
+    assert_eq!(bob.current_one_time_count(), 4);
+    assert_eq!(bob.current_pq_one_time_count(suite), 3);
+
+    // Flip server to PQ_ENABLED = false.
+    enabled.store(false, Ordering::Relaxed);
+
+    // (a) Error path: ClockSkew during `prepare_publish_v2_classical_off` MUST roll back
+    //     `prepared` completely, restoring gen 1, SPK, OPKs, PQOPKs, and manifest_seq = 1!
+    let prep1 = bob.prepare_publish_v2(AUDIENCE, 2, 2).unwrap();
+    assert_eq!(bob.manifest_seq(), 2);
+    assert_eq!(bob.prekey_generation(), 2);
+    assert_eq!(
+        bob.transmit_publish_v2(&prep1).await.unwrap(),
+        session::PublishV2Outcome::ServerPqDisabled
+    );
+    let now_ms = bob.clock().now();
+    bob.clock().observe(now_ms + 25 * 60 * 60 * 1000);
+    assert_eq!(
+        bob.prepare_publish_v2_classical_off(prep1, &[])
+            .unwrap_err()
+            .kind(),
+        ErrorKind::ClockSkew
+    );
+    assert_eq!(bob.manifest_seq(), 1);
+    assert_eq!(bob.prekey_generation(), 1);
+    assert_eq!(bob.current_signed_prekey(), Some(spk_gen1));
+    assert_eq!(bob.current_one_time_count(), 4);
+    assert_eq!(bob.current_pq_one_time_count(suite), 3);
+
+    // (b) `Ok(off_prepared)` followed by post-prepare save failure or refusal rollback MUST
+    //     restore pre-prepare state completely (prev_manifest_seq, prev_prekey_generation,
+    //     evicted gen 1 SPK/OPKs/PQOPKs).
+    bob.clock().observe(now_ms);
+    let prep2 = bob.prepare_publish_v2(AUDIENCE, 2, 2).unwrap();
+    assert_eq!(
+        bob.transmit_publish_v2(&prep2).await.unwrap(),
+        session::PublishV2Outcome::ServerPqDisabled
+    );
+    let off_prep = bob.prepare_publish_v2_classical_off(prep2, &[]).unwrap();
+    assert_eq!(bob.manifest_seq(), 3);
+    assert_eq!(bob.prekey_generation(), 2);
+    assert_eq!(bob.current_pq_one_time_count(suite), 0);
+    bob.rollback_publish_v2_on_refusal(off_prep);
+    assert_eq!(bob.manifest_seq(), 1);
+    assert_eq!(bob.prekey_generation(), 1);
+    assert_eq!(bob.current_signed_prekey(), Some(spk_gen1));
+    assert_eq!(bob.current_one_time_count(), 4);
+    assert_eq!(bob.current_pq_one_time_count(suite), 3);
 }

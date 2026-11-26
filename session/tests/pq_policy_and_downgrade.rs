@@ -113,15 +113,41 @@ async fn ambiguous_unimplemented_stops_at_the_current_publish_attempt() {
         legacy_v1_enabled: false,
         allow_unsigned_fetch: false,
     };
+    // When PQ-ON is definitively refused (Unimplemented, server PQ_ENABLED=false) and the
+    // follow-up classical PQ-OFF publish fails ambiguously (lost reply), `manifest_seq` stays at
+    // `3` (matching what the server may have stored) and classical OPKs stay retained (2), while
+    // the never-uploaded PQ OPKs from the refused PQ-ON attempt were retracted (1 remaining from
+    // the prior prepared publish).
     let fallback_ambiguous = RpcErrors::with_server_info(
-        pq_off_info,
+        pq_off_info.clone(),
         [
             ("publish_on", Unimplemented.into()),
             ("publish_off", ambiguous()),
         ],
     );
-    check_publish_v2_error(&fallback_ambiguous, false, ErrorKind::Unimplemented, false).await;
+    let mut client = Client::new(&fallback_ambiguous);
+    client.prepare_publish_v2(AUDIENCE, 1, 1).unwrap();
+    let err = client.publish_v2(AUDIENCE, 1, 1).await.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Unimplemented);
+    assert!(!err.is_server_refusal());
+    assert_eq!(client.manifest_seq(), 3);
+    assert_eq!(client.current_one_time_count(), 2);
+    for suite in client.pq_config().offered_suites() {
+        assert_eq!(client.current_pq_one_time_count(suite), 1);
+    }
     assert!(fallback_ambiguous.is_empty());
+
+    // Conversely, when the follow-up classical PQ-OFF publish is definitively refused (e.g.
+    // SignInRequired), rollback restores `manifest_seq` (1) and both classical & PQ OPKs (1).
+    let fallback_refused = RpcErrors::with_server_info(
+        pq_off_info,
+        [
+            ("publish_on", Unimplemented.into()),
+            ("publish_off", protocol::ErrorKind::SignInRequired.into()),
+        ],
+    );
+    check_publish_v2_error(&fallback_refused, false, ErrorKind::SignInRequired, true).await;
+    assert!(fallback_refused.is_empty());
 }
 
 #[allow(deprecated)]
@@ -823,7 +849,10 @@ async fn expired_manifest_is_distinct_from_downgrade_and_foreign_digest_is_rejec
 
     let alice_id = xeddsa::XEdDSAPrivateKey::generate();
     let alice_id_copy = xeddsa::XEdDSAPrivateKey::from_bytes(*alice_id.to_bytes()).unwrap();
-    let mut alice = Client::builder(hs.clone()).identity(alice_id).build();
+    let mut alice = Client::builder(hs.clone())
+        .identity(alice_id)
+        .clock(session::ServerClock::with_max_drift(u64::MAX))
+        .build();
     let mut bob = Client::new(hs.clone());
     bob.publish_v2(AUDIENCE, 3, 3).await.unwrap();
 
@@ -1260,9 +1289,14 @@ async fn pq_disabled_server_rollback_publish_refill_list_and_limit_exceeded_roll
     let prep_off = bob.prepare_publish_v2(AUDIENCE, 5, 5).unwrap();
     assert_eq!(
         bob.transmit_publish_v2(&prep_off).await.unwrap(),
+        session::PublishV2Outcome::ServerPqDisabled
+    );
+    let off_prepared = bob.prepare_publish_v2_classical_off(prep_off, &[]).unwrap();
+    assert_eq!(
+        bob.transmit_publish_v2(&off_prepared).await.unwrap(),
         session::PublishV2Outcome::V2ClassicalOff
     );
-    bob.commit_publish_v2(prep_off);
+    bob.commit_publish_v2(off_prepared);
     assert_eq!(bob.current_pq_one_time_count(suite), 0);
     assert_eq!(bob.current_one_time_count(), 5);
 
@@ -1897,7 +1931,7 @@ async fn publish_prepare_error_and_stale_rollback_preserve_state() {
     let hs = V2OnlyHandshake::new(store, AUDIENCE);
 
     // 1. `prepare_publish_v2` error (expires_at > MAX_SAFE_INTEGER) leaves prekeys clean.
-    let near_max_clock = session::ServerClock::default();
+    let near_max_clock = session::ServerClock::with_max_drift(u64::MAX);
     near_max_clock.observe(protocol::MAX_SAFE_INTEGER - 10);
     let mut bob = Client::new(hs.clone()).with_clock(near_max_clock);
     assert_eq!(
@@ -1906,6 +1940,21 @@ async fn publish_prepare_error_and_stale_rollback_preserve_state() {
     );
     assert!(bob.current_signed_prekey().is_none());
     assert_eq!(bob.prekey_generation(), 0);
+
+    // 1b. Default `ServerClock` fails closed with `ClockSkew` (>24h drift) leaving prekeys clean.
+    let skewed_clock = session::ServerClock::default();
+    skewed_clock.observe(skewed_clock.now() + 25 * 60 * 60 * 1000);
+    let mut bob_skewed = Client::new(hs.clone()).with_clock(skewed_clock);
+    assert_eq!(
+        bob_skewed
+            .prepare_publish_v2(AUDIENCE, 2, 2)
+            .unwrap_err()
+            .kind(),
+        ErrorKind::ClockSkew
+    );
+    assert!(bob_skewed.current_signed_prekey().is_none());
+    assert_eq!(bob_skewed.prekey_generation(), 0);
+    assert_eq!(bob_skewed.manifest_seq(), 0);
 
     // 2. Rolling back a stale `PreparedPublishV2` after a newer publish does not clobber state.
     let mut carol = Client::new(hs.clone());
@@ -2131,6 +2180,7 @@ async fn crossed_mixed_pq_classical_prefers_pq_and_stale_hello_preserves_state()
     let mut peer_after_pq_off = PeerPqState {
         pq_pinned: true,
         pinned_manifest_seq: 2,
+        pinned_manifest_digest: None,
         peer_pq_capable: false,
         allow_classical_exception: true,
         downgrade_detected: false,

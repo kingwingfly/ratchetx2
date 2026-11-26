@@ -15,6 +15,6 @@ For each service there is a client trait ([`Handshake`](handshake::Handshake), [
 # Features
 
 - **protox** (default): compile the `.proto` files with [protox](https://crates.io/crates/protox); without it, `protoc` must be installed.
-- **serde**, **rkyv**: derive their traits on the message types.
+- **serde**: derive its traits on the message types.
 - **server**: the servers' logic (`handshake::HandshakeServer`, `mailbox::MailboxServer`).
 - **connect**: Connect clients over any HTTP client, and answering calls inside any HTTP server (module `connect`); no I/O of its own, so it builds for `wasm32-unknown-unknown`.

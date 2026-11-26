@@ -18,8 +18,7 @@ hmac.workspace = true
 party = { path = "../party", default-features = false }
 prost.workspace = true
 protocol = { path = "../protocol", default-features = false, features = ["pq"] }
-ratchetx2 = { path = "../ratchetx2", version = "0.4" }
-rkyv = { workspace = true, optional = true }
+ratchetx2 = { path = "../ratchetx2", version = "0.5" }
 serde = { workspace = true, optional = true }
 sha2.workspace = true
 thiserror.workspace = true
@@ -43,7 +42,6 @@ default = ["protox"]
 protox = ["party/protox", "protocol/protox"]
 # Serialize the client's and the sessions' states, to keep them between runs.
 serde = ["dep:serde", "party/serde", "x3dh/serde", "xeddsa/serde"]
-rkyv = ["dep:rkyv", "party/rkyv", "x3dh/rkyv", "xeddsa/rkyv"]
 # The states as protobuf messages too, from proto/session.proto.
 prost = [
     "dep:prost-build",

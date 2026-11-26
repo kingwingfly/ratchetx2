@@ -18,10 +18,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .extern_path(".party.v1", "::party::proto")
             .extern_path(".ratchetx2.v1", "::ratchetx2::proto")
             .extern_path(".x3dh.v1", "::x3dh::proto")
-            // Messages holding key material are zeroized on drop, have no `Bytes` (which cannot
-            // be zeroized), and have hand-written `Debug` without keys. All-primitive metadata
-            // messages (`PeerPqState`, `SessionSecurity`) derive `Copy` from prost, so they
-            // derive `Zeroize` (without `ZeroizeOnDrop`) and are zeroized by `SessionState`'s
+            // Messages holding key material or heap byte buffers are zeroized on drop, have no
+            // `Bytes` (which cannot be zeroized), and have hand-written `Debug` without keys.
+            // All-primitive metadata messages (`SessionSecurity`) derive `Copy` from prost, so
+            // they derive `Zeroize` (without `ZeroizeOnDrop`) and are zeroized by `SessionState`'s
             // drop.
             .message_attribute(
                 ".session.v1.ClientState",
@@ -35,7 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ".session.v1.EarlierSession",
                 "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
             )
-            .message_attribute(".session.v1.PeerPqState", "#[derive(::zeroize::Zeroize)]")
+            .message_attribute(
+                ".session.v1.PeerPqState",
+                "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
+            )
             .message_attribute(
                 ".session.v1.SessionSecurity",
                 "#[derive(::zeroize::Zeroize)]",

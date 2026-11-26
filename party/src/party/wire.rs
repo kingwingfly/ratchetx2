@@ -11,10 +11,10 @@ use serde::{
     ser::SerializeStruct,
 };
 
-use super::{EvictedSet, Party, Ratchet, SkippedKeys, skipped::LegacySkippedKeys};
+use super::{EvictedSet, KemState, Party, Ratchet, SkippedKeys, skipped::LegacySkippedKeys};
 use crate::error::{Error, Result};
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[cfg(has_pq)]
 use super::{KemRatchet, PqSuite};
 
 const VERSION: u8 = 2;
@@ -97,13 +97,11 @@ const FIELDS: &[&str] = &[
 
 impl Serialize for Party {
     fn serialize<S: Serializer>(&self, serializer: S) -> core::result::Result<S::Ok, S::Error> {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let (capability, kem_ratchet) = (
-            self.pq_suite().map_or(CLASSICAL, PqSuite::id),
-            self.kem_ratchet.as_ref(),
-        );
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let (capability, kem_ratchet) = (CLASSICAL, None::<()>);
+        let capability = self.pq_suite_id().unwrap_or(CLASSICAL);
+        #[cfg(has_pq)]
+        let kem_ratchet = self.kem_ratchet.as_option();
+        #[cfg(not(has_pq))]
+        let kem_ratchet = None::<()>;
 
         let mut state = serializer.serialize_struct("Party", FIELDS.len())?;
         state.serialize_field("version", &VERSION)?;
@@ -128,10 +126,10 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
     T::deserialize(d).map(Some)
 }
 
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+#[cfg(not(has_pq))]
 enum KemRatchet {}
 
-#[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+#[cfg(not(has_pq))]
 impl<'de> Deserialize<'de> for KemRatchet {
     fn deserialize<D: Deserializer<'de>>(_: D) -> core::result::Result<Self, D::Error> {
         Err(de::Error::custom(
@@ -231,13 +229,13 @@ impl<'de> Deserialize<'de> for Party {
         match (raw.version, raw.capability) {
             (None, None) => {} // Unversioned map, possibly from a PQ build.
             (Some(VERSION), Some(capability)) => {
-                #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+                #[cfg(has_pq)]
                 let actual = raw
                     .kem_ratchet
                     .as_ref()
                     .and_then(Option::as_ref)
                     .map_or(CLASSICAL, |kem| kem.suite().id());
-                #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+                #[cfg(not(has_pq))]
                 let actual = CLASSICAL;
                 if capability != actual {
                     return Err(de::Error::custom(
@@ -257,6 +255,10 @@ impl<'de> Deserialize<'de> for Party {
                 ));
             }
         }
+        #[cfg(has_pq)]
+        let kem_ratchet = KemState::from_option(raw.kem_ratchet.flatten());
+        #[cfg(not(has_pq))]
+        let kem_ratchet = KemState::disabled();
         let party = Self {
             ratchet: raw.ratchet,
             skipped_message_keys: raw.skipped_message_keys,
@@ -265,8 +267,7 @@ impl<'de> Deserialize<'de> for Party {
             message_number_receiver: raw.message_number_receiver,
             associated_data: raw.associated_data,
             current_chain_evicted: raw.current_chain_evicted.unwrap_or_default(),
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            kem_ratchet: raw.kem_ratchet.flatten(),
+            kem_ratchet,
         };
         party.validate().map_err(de::Error::custom)?;
         Ok(party)
@@ -345,18 +346,17 @@ impl TryFrom<SevenFields> for LegacyPartyV1 {
             message_number_receiver,
             associated_data: associated_data.0,
             current_chain_evicted,
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            kem_ratchet: None,
+            kem_ratchet: KemState::disabled(),
         };
         party.validate()?;
         Ok(Self(party))
     }
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[cfg(has_pq)]
 pub use legacy_pq::LegacyPartyPqV1;
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[cfg(has_pq)]
 mod legacy_pq {
     use super::*;
     use serde::de::Visitor;
@@ -412,7 +412,7 @@ mod legacy_pq {
                 message_number_receiver,
                 associated_data: associated_data.0,
                 current_chain_evicted,
-                kem_ratchet: kem.map(|legacy| legacy.0),
+                kem_ratchet: KemState::from_option(kem.map(|legacy| legacy.0)),
             };
             party.validate()?;
             Ok(Self(party))

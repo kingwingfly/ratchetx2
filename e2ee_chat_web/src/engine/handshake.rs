@@ -540,11 +540,16 @@ pub(super) struct PublishError {
 
 impl PublishError {
     fn prepare(e: session::Error) -> Self {
+        let message = if e.kind() == ErrorKind::ClockSkew {
+            super::CLOCK_SKEW_MESSAGE.to_string()
+        } else {
+            describe(&e)
+        };
         Self {
             kind: Some(e.kind()),
             definitive_refusal: false,
             malformed: false,
-            message: describe(&e),
+            message,
         }
     }
 
@@ -1120,7 +1125,7 @@ impl<V: VaultStore> Engine<V> {
         now_anyway: bool,
     ) -> Result<(), PublishError> {
         let (preserve_spks, preserve_digests) = preserved_deferred_prekeys(inner, now());
-        let prepared = inner
+        let mut prepared = inner
             .client
             .prepare_publish_v2_preserving(
                 &inner.audience,
@@ -1129,15 +1134,49 @@ impl<V: VaultStore> Engine<V> {
                 &preserve_spks,
                 &preserve_digests,
             )
-            .map_err(PublishError::prepare)?;
+            .map_err(|e| {
+                if e.kind() == ErrorKind::ClockSkew {
+                    self.warn_clock_skew(inner.client.clock().offset_ms());
+                }
+                PublishError::prepare(e)
+            })?;
         // H-2: Persist new prekeys & manifest state BEFORE transmitting; roll back in-memory
         // prekeys if storage fails so never-transmitted rotations are not committed later.
         if let Err(e) = inner.save(&[]).await {
             inner.client.rollback_publish_v2_on_refusal(prepared);
             return Err(PublishError::storage(e));
         }
-        match inner.client.transmit_publish_v2(&prepared).await {
-            Ok(outcome) => {
+        let outcome = match inner.client.transmit_publish_v2(&prepared).await {
+            Ok(PublishV2Outcome::ServerPqDisabled) => {
+                // Relay has runtime PQ_ENABLED="false": prepare signed classical PQ-OFF manifest,
+                // persist updated manifest_seq / digest / retracted PQ prekeys BEFORE
+                // transmitting, and then transmit the classical-OFF publish.
+                prepared = match inner
+                    .client
+                    .prepare_publish_v2_classical_off(prepared, &preserve_digests)
+                {
+                    Ok(off_prepared) => off_prepared,
+                    Err(e) => {
+                        if e.kind() == ErrorKind::ClockSkew {
+                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                        }
+                        // `prepare_publish_v2_classical_off` already rolled back `prepared` in
+                        // memory; persist the rollback so IndexedDB stays consistent with memory.
+                        return self
+                            .finish_publish_rollback(inner, PublishError::prepare(e), now_anyway)
+                            .await;
+                    }
+                };
+                if let Err(e) = inner.save(&[]).await {
+                    inner.client.rollback_publish_v2_on_refusal(prepared);
+                    return Err(PublishError::storage(e));
+                }
+                inner.client.transmit_publish_v2(&prepared).await
+            }
+            other => other,
+        };
+        match outcome {
+            Ok(outcome @ (PublishV2Outcome::V2Pq | PublishV2Outcome::V2ClassicalOff)) => {
                 inner.client.commit_publish_v2(prepared);
                 self.publish_waits_sign_in.set(false);
                 self.publish_waits_settings.set(false);
@@ -1161,6 +1200,7 @@ impl<V: VaultStore> Engine<V> {
                             "published classical prekeys and signed PQ-off capability manifest"
                         }
                     }
+                    PublishV2Outcome::ServerPqDisabled => unreachable!(),
                 };
                 inner
                     .save_full_publish_success()
@@ -1169,6 +1209,15 @@ impl<V: VaultStore> Engine<V> {
                 self.ui.me.set(Some(inner.me()));
                 self.ui.log(log_msg);
                 Ok(())
+            }
+            Ok(PublishV2Outcome::ServerPqDisabled) => {
+                inner.client.rollback_publish_v2_on_refusal(prepared);
+                self.finish_publish_rollback(
+                    inner,
+                    PublishError::prepare(session::Error::from(ErrorKind::Protocol)),
+                    now_anyway,
+                )
+                .await
             }
             Err(e) => {
                 self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
@@ -1586,6 +1635,10 @@ impl<V: VaultStore> Engine<V> {
                     ErrorKind::DowngradeDetected => StartChatError::DowngradeDetected,
                     ErrorKind::PeerManifestExpired => StartChatError::PeerManifestExpired,
                     ErrorKind::PqRequired => StartChatError::PqRequired,
+                    ErrorKind::ClockSkew => {
+                        self.warn_clock_skew(inner.client.clock().offset_ms());
+                        StartChatError::Other(super::CLOCK_SKEW_MESSAGE.to_string())
+                    }
                     ErrorKind::NotFound => StartChatError::Other(
                         "nobody published keys for that key on this server".to_string(),
                     ),

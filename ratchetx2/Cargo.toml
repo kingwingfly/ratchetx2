@@ -1,6 +1,6 @@
 [package]
 name = "ratchetx2"
-version = "0.4.1"
+version = "0.5.0"
 edition.workspace = true
 keywords = ["E2EE", "double-ratchet", "signal"]
 license.workspace = true
@@ -20,7 +20,6 @@ hkdf.workspace = true
 hmac.workspace = true
 ml-kem = { workspace = true, optional = true }
 prost = { workspace = true, optional = true }
-rkyv = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha2.workspace = true
 subtle.workspace = true
@@ -38,7 +37,6 @@ serde_json.workspace = true
 [features]
 # Serialize ratchets, to keep a session between runs.
 serde = ["dep:serde"]
-rkyv = ["dep:rkyv"]
 # The ratchet's state as protobuf messages, from proto/ratchetx2.proto, compiled with protox.
 prost = ["dep:prost", "dep:prost-build", "dep:protox"]
 # Optional post-quantum KEM ratchet suites (pure Rust, wasm32-compatible).

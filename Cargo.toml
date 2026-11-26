@@ -37,7 +37,6 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 prost = "0.14"
 prost-build = "0.14"
 protox = "0.10"
-rkyv = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = { version = "0.11", features = ["zeroize"] }

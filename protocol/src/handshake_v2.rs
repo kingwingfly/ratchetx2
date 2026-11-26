@@ -215,17 +215,35 @@ pub fn verify_manifest(
     Ok(identity_key)
 }
 
+/// Checks that a [`CapabilityManifest`]'s validity window is consistent with both the local
+/// device clock (`local_now`) and a bounded server clock (`server_now`), both in milliseconds
+/// since the Unix epoch:
+/// - `manifest.expires_at > local_now.max(server_now)` so even a rewound relay clock cannot
+///   extend an expired manifest while an honest relay still catches a lagging local clock;
+/// - `manifest.issued_at <= server_now.saturating_add(MAX_CLOCK_SKEW)`.
+///
+/// Use this after [`verify_manifest`] when signature verification has already succeeded to avoid
+/// verifying the manifest's XEdDSA signature twice.
+pub fn check_manifest_window_bounded(
+    manifest: &CapabilityManifest,
+    local_now: u64,
+    server_now: u64,
+) -> Result<()> {
+    if manifest.issued_at > server_now.saturating_add(crate::MAX_CLOCK_SKEW)
+        || manifest.expires_at <= local_now.max(server_now)
+    {
+        return Err(ErrorKind::StaleTimestamp.into());
+    }
+    Ok(())
+}
+
 /// Checks that a [`CapabilityManifest`]'s validity window is consistent with `now` (in
 /// milliseconds since the Unix epoch): `issued_at <= now + MAX_CLOCK_SKEW` and `expires_at > now`.
 ///
 /// Use this after [`verify_manifest`] when signature verification has already succeeded to avoid
 /// verifying the manifest's XEdDSA signature twice.
 pub fn check_manifest_window(manifest: &CapabilityManifest, now: u64) -> Result<()> {
-    if manifest.issued_at > now.saturating_add(crate::MAX_CLOCK_SKEW) || manifest.expires_at <= now
-    {
-        return Err(ErrorKind::StaleTimestamp.into());
-    }
-    Ok(())
+    check_manifest_window_bounded(manifest, now, now)
 }
 
 /// Verifies a [`CapabilityManifest`] (as in [`verify_manifest`]) and checks that its validity
@@ -2567,6 +2585,54 @@ mod server {
                 .unwrap();
             assert_eq!(v1_bundle.signed_prekey.as_ref(), &bob_spk2);
             assert_eq!(v1_bundle.one_time_prekey.as_deref(), Some(&bob_opk_72[..]));
+        }
+
+        #[test]
+        fn check_manifest_window_bounded_enforces_local_and_server_clocks() {
+            let bob = XEdDSAPrivateKey::generate();
+            let bob_spk = crate::test_public_key(0x55);
+            let issued = 1_750_000_000_000u64;
+            let expires = issued + 60 * 60 * 1000;
+            let mut manifest = signed_manifest(
+                &bob,
+                "relay.example",
+                1,
+                1,
+                false,
+                false,
+                bob_spk,
+                &[],
+                issued,
+            );
+            manifest.expires_at = expires;
+
+            // Valid when both local and server clocks lie within the window.
+            assert!(check_manifest_window_bounded(&manifest, issued + 1000, issued + 1000).is_ok());
+
+            // Relay rewind (server_now behind expiry) cannot revive a manifest expired vs local_now.
+            assert_eq!(
+                check_manifest_window_bounded(&manifest, expires + 1, expires - 10_000)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
+
+            // Lagging local clock (local_now behind expiry) is still caught by honest server_now.
+            assert_eq!(
+                check_manifest_window_bounded(&manifest, expires - 10_000, expires)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
+
+            // Future issued_at past server_now + MAX_CLOCK_SKEW is rejected.
+            let before_skew = issued - crate::MAX_CLOCK_SKEW - 1;
+            assert_eq!(
+                check_manifest_window_bounded(&manifest, issued, before_skew)
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
         }
     }
 }

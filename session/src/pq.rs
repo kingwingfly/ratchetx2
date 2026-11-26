@@ -22,10 +22,6 @@ pub const DEFAULT_MANIFEST_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// `preferred_suite` defaulting to [`PqSuite::MlKem1024`] if compiled else [`PqSuite::MlKem768`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct PqConfig {
     /// Whether post-quantum handshakes (PQXDH) are enabled.
     pub pq_enabled: bool,
@@ -118,16 +114,16 @@ impl Default for PqConfig {
 /// and calling [`PeerPqState::pin_peer_pq`]).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct PeerPqState {
     /// Whether this peer is pinned as post-quantum capable (from a verified PQ manifest, a PQ
     /// session, or a `#chat=...&pq=1` invite link).
     pub pq_pinned: bool,
     /// Highest verified `CapabilityManifest.manifest_seq` observed for this peer.
     pub pinned_manifest_seq: u64,
+    /// SHA-256 digest of the verified `CapabilityManifest` observed at `pinned_manifest_seq`, if
+    /// known (used to reject manifest equivocation at equal `manifest_seq`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pinned_manifest_digest: Option<[u8; 32]>,
     /// Explicit user-approved exception permitting classical fallback with this peer when local
     /// PQ is enabled and the peer lacks PQ or published a signed `OFF` manifest.
     pub allow_classical_exception: bool,
@@ -160,15 +156,35 @@ impl PeerPqState {
     pub fn clear_classical_exception(&mut self) {
         self.allow_classical_exception = false;
     }
+
+    /// Verify a peer's manifest `(seq, digest)` against the highest-seen pinned manifest and pin
+    /// it monotonically.
+    ///
+    /// Rejects any rollback (`seq < self.pinned_manifest_seq`), out-of-range sequence (`0` or
+    /// above [`protocol::MAX_SAFE_INTEGER`]), or equivocation at equal sequence number
+    /// (`seq == self.pinned_manifest_seq` with a differing pinned digest) with
+    /// [`ErrorKind::DowngradeDetected`] without mutating `self`.
+    pub fn check_and_pin_manifest(&mut self, seq: u64, digest: [u8; 32]) -> Result<()> {
+        if seq == 0 || seq > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::DowngradeDetected.into());
+        }
+        if seq < self.pinned_manifest_seq {
+            return Err(ErrorKind::DowngradeDetected.into());
+        }
+        if seq == self.pinned_manifest_seq
+            && self.pinned_manifest_digest.is_some_and(|d| d != digest)
+        {
+            return Err(ErrorKind::DowngradeDetected.into());
+        }
+        self.pinned_manifest_seq = seq;
+        self.pinned_manifest_digest = Some(digest);
+        Ok(())
+    }
 }
 
 /// Cryptographic security metadata of a single established session.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct SessionSecurity {
     /// Whether this session used PQXDH (hybrid X25519 + ML-KEM).
     pub is_pq: bool,
@@ -298,8 +314,7 @@ mod v2 {
             ClaimBundleResponse, GetManifestRequest, GetServerInfoRequest, GetServerInfoResponse,
             ListInitialMessagesRequest, LocalHandshakeV2, PqLastResortCommitment, PqPrekey,
             PublishV2Request, RefillPrekeysRequest, RefillPrekeysResponse, SendInitialV2Request,
-            check_manifest_window, manifest_digest, sign_manifest, verify_manifest,
-            verify_manifest_at,
+            check_manifest_window_bounded, manifest_digest, sign_manifest, verify_manifest,
         },
         mailbox_v2::{
             CLIENT_MESSAGE_ID_LENGTH, EnvelopeV2, FetchSignedRequest, LocalMailboxV2,
@@ -337,15 +352,20 @@ mod v2 {
             && error.kind() == protocol::ErrorKind::Unimplemented
     }
 
-    /// Which v2 manifest mode succeeded in [`Client::transmit_publish_v2`].
+    /// Which v2 manifest outcome resulted from [`Client::transmit_publish_v2`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum PublishV2Outcome {
         /// Published post-quantum + classical prekeys and a PQ-enabled signed manifest via `PublishV2`.
         V2Pq,
         /// Published classical prekeys and a signed PQ-off manifest via `PublishV2` (either
-        /// because local PQ is disabled / not compiled in, or because the v2 server rejected PQ-ON
-        /// with `Unimplemented` under runtime `PQ_ENABLED="false"`).
+        /// because local PQ is disabled / not compiled in, or after transitioning via
+        /// [`Client::prepare_publish_v2_classical_off`]).
         V2ClassicalOff,
+        /// The server is a v2 relay with runtime `PQ_ENABLED="false"` that refused a PQ-ON publish
+        /// while `strict_pq` is `false`. No local state was mutated and no OFF publish was sent;
+        /// call [`Client::prepare_publish_v2_classical_off`], persist [`Client::state`], and
+        /// transmit the resulting [`PreparedPublishV2`].
+        ServerPqDisabled,
     }
 
     /// Rollback action for prekeys newly minted during a v2 publish preparation.
@@ -425,6 +445,29 @@ mod v2 {
                         pq_one_time_prekeys,
                         new_pq_last_resort_suites,
                     );
+                }
+            }
+        }
+
+        /// Clear PQ rollback tracking after unused PQ prekeys have been retracted locally,
+        /// leaving only the classical rollback remainder.
+        fn clear_pq(&mut self) {
+            match self {
+                Self::Rotated {
+                    pq_one_time_prekeys,
+                    pq_last_resort_suites,
+                    ..
+                } => {
+                    pq_one_time_prekeys.clear();
+                    pq_last_resort_suites.clear();
+                }
+                Self::Extended {
+                    pq_one_time_prekeys,
+                    new_pq_last_resort_suites,
+                    ..
+                } => {
+                    pq_one_time_prekeys.clear();
+                    new_pq_last_resort_suites.clear();
                 }
             }
         }
@@ -796,7 +839,7 @@ mod v2 {
                 return Err(ErrorKind::PqRequired.into());
             }
 
-            let timestamp = self.current_timestamp()?;
+            let timestamp = self.trusted_timestamp()?;
             let issued_at = timestamp;
             let expires_at = issued_at
                 .checked_add(DEFAULT_MANIFEST_TTL_MS)
@@ -1045,6 +1088,116 @@ mod v2 {
         /// Mark a prepared v2 publish as confirmed by the server.
         pub fn commit_publish_v2(&mut self, _prepared: PreparedPublishV2) {
             self.state.publishing = false;
+        }
+
+        /// Transition a prepared PQ-ON publish into a signed classical `PQ-OFF` publish after
+        /// [`Client::transmit_publish_v2`] returned [`PublishV2Outcome::ServerPqDisabled`].
+        ///
+        /// Persist [`Client::state`] AFTER this returns `Ok(off_prepared)` and BEFORE transmitting
+        /// with [`Client::transmit_publish_v2`], then call [`Client::commit_publish_v2`] on
+        /// success or [`Client::rollback_publish_v2_on_refusal`] on storage failure or definitive
+        /// refusal.
+        ///
+        /// On any error for the active `prepared` (e.g. `strict_pq`, [`ErrorKind::ClockSkew`],
+        /// overflow, or signing error), rolls back `prepared` via
+        /// [`Client::rollback_publish_v2_on_refusal`] before returning `Err`.
+        pub fn prepare_publish_v2_classical_off(
+            &mut self,
+            mut prepared: PreparedPublishV2,
+            preserve_manifest_digests: &[[u8; 32]],
+        ) -> Result<PreparedPublishV2> {
+            if self.state.manifest_seq != prepared.manifest_seq {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let built = (|| -> Result<(u64, [u8; 32], PublishV2Request)> {
+                if self.state.pq_config.strict_pq {
+                    return Err(ErrorKind::PqRequired.into());
+                }
+                let orig_manifest = prepared
+                    .request
+                    .manifest
+                    .as_ref()
+                    .ok_or(ErrorKind::Protocol)?;
+                if !orig_manifest.pq_enabled {
+                    return Err(ErrorKind::Protocol.into());
+                }
+                let timestamp = self.trusted_timestamp()?;
+                let expires_at = timestamp
+                    .checked_add(DEFAULT_MANIFEST_TTL_MS)
+                    .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
+                    .ok_or(ErrorKind::Protocol)?;
+                // Allocate a fresh manifest_seq so we never sign two conflicting policies
+                // (PQ-ON and PQ-OFF) at the same sequence number.
+                let off_manifest_seq = self
+                    .state
+                    .manifest_seq
+                    .max(prepared.manifest_seq)
+                    .checked_add(1)
+                    .filter(|&s| s <= protocol::MAX_SAFE_INTEGER)
+                    .ok_or(ErrorKind::Protocol)?;
+                let mut off_manifest = CapabilityManifest {
+                    audience: orig_manifest.audience.clone(),
+                    identity_key: Bytes::new(),
+                    manifest_seq: off_manifest_seq,
+                    generation: prepared.generation,
+                    issued_at: timestamp,
+                    expires_at,
+                    pq_enabled: false,
+                    strict_pq: false,
+                    pq_ratchet_supported: false,
+                    offered_suites: vec![],
+                    signed_prekey: Bytes::copy_from_slice(&prepared.classical.signed_prekey),
+                    pq_last_resort: vec![],
+                    signature: Bytes::new(),
+                };
+                sign_manifest(&self.state.identity, &mut off_manifest)?;
+                let off_digest = manifest_digest(&off_manifest)?;
+                let off_req = PublishV2Request::sign(
+                    &self.state.identity,
+                    off_manifest,
+                    Some(prepared.classical.signed_prekey_signature),
+                    &prepared.classical.one_time_prekeys,
+                    vec![],
+                    vec![],
+                    timestamp,
+                )?;
+                Ok((off_manifest_seq, off_digest, off_req))
+            })();
+            let (off_manifest_seq, off_digest, off_req) = match built {
+                Ok(values) => values,
+                Err(err) => {
+                    self.rollback_publish_v2_on_refusal(prepared);
+                    return Err(err);
+                }
+            };
+
+            // Retract unused PQ prekeys locally and keep only the classical rollback remainder.
+            prepared.rollback.retract_unused_pq(&mut self.state.prekeys);
+            prepared.rollback.clear_pq();
+            // Roll back the unpublished PQ-ON digest FIRST, then record the OFF digest with a
+            // fresh eviction record so rolling back `off_prepared` restores the pre-prepare ring.
+            self.state.rollback_manifest_digest(
+                prepared.manifest_digest,
+                prepared.evicted_manifest_digest,
+            );
+            let evicted_manifest_digest = self
+                .state
+                .record_manifest_digest_preserving(off_digest, preserve_manifest_digests);
+            self.state.manifest_seq = off_manifest_seq;
+            self.state.publishing = true;
+
+            Ok(PreparedPublishV2 {
+                request: off_req,
+                manifest_seq: off_manifest_seq,
+                generation: prepared.generation,
+                prev_manifest_seq: prepared.prev_manifest_seq,
+                prev_prekey_generation: prepared.prev_prekey_generation,
+                manifest_digest: off_digest,
+                evicted_manifest_digest,
+                classical: prepared.classical,
+                rollback: prepared.rollback,
+                was_publishing: prepared.was_publishing,
+            })
         }
 
         /// Retract newly added OPKs/PQOPKs/last-resort PQSPKs (or pop the unpublished generation
@@ -1495,7 +1648,7 @@ mod v2 {
         }
 
         /// Non-consuming read and verification of `peer`'s signed [`CapabilityManifest`] against
-        /// the locally configured `audience` and server clock.
+        /// the locally configured `audience` and bounded local/server clock pair.
         pub async fn get_peer_manifest(
             &self,
             audience: &str,
@@ -1512,16 +1665,54 @@ mod v2 {
                 })
                 .await?;
             if let Some(manifest) = &response.manifest {
-                let verified_id = match verify_manifest_at(manifest, audience, self.clock.now()) {
-                    Ok(id) => id,
-                    Err(e) if e.kind() == protocol::ErrorKind::StaleTimestamp => {
-                        return Err(Error::new(ErrorKind::PeerManifestExpired, e));
-                    }
-                    Err(e) => return Err(Error::new(ErrorKind::DowngradeDetected, e)),
-                };
+                let verified_id = verify_manifest(manifest, audience)
+                    .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                 if verified_id != *peer {
                     return Err(ErrorKind::DowngradeDetected.into());
                 }
+                let (local_now, server_now) = self.clock.trusted_clock_pair()?;
+                check_manifest_window_bounded(manifest, local_now, server_now)
+                    .map_err(|e| Error::new(ErrorKind::PeerManifestExpired, e))?;
+            }
+            Ok(response.manifest)
+        }
+
+        /// Non-consuming read and verification of `peer`'s signed [`CapabilityManifest`] against
+        /// `audience`, `peer_state` (enforcing monotonic sequence and anti-equivocation digest
+        /// pinning before clock/window checks), and the bounded local/server clock pair.
+        ///
+        /// Updates `peer_state` only after all cryptographic, anti-equivocation, and validity
+        /// checks succeed.
+        pub async fn get_peer_manifest_for(
+            &self,
+            audience: &str,
+            peer: &PublicKey,
+            peer_state: &mut PeerPqState,
+        ) -> Result<Option<CapabilityManifest>> {
+            if audience.trim().is_empty() {
+                return Err(ErrorKind::Protocol.into());
+            }
+            check_canonical_identity(peer)?;
+            let response = self
+                .handshake
+                .get_manifest(GetManifestRequest {
+                    identity_key: Bytes::copy_from_slice(peer),
+                })
+                .await?;
+            if let Some(manifest) = &response.manifest {
+                let verified_id = verify_manifest(manifest, audience)
+                    .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
+                if verified_id != *peer {
+                    return Err(ErrorKind::DowngradeDetected.into());
+                }
+                let digest = manifest_digest(manifest)
+                    .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
+                let mut candidate = peer_state.clone();
+                candidate.check_and_pin_manifest(manifest.manifest_seq, digest)?;
+                let (local_now, server_now) = self.clock.trusted_clock_pair()?;
+                check_manifest_window_bounded(manifest, local_now, server_now)
+                    .map_err(|e| Error::new(ErrorKind::PeerManifestExpired, e))?;
+                *peer_state = candidate;
             }
             Ok(response.manifest)
         }
@@ -1537,13 +1728,18 @@ mod v2 {
 
         /// Transmit a previously prepared v2 publish request (after persisting `self.state()`).
         ///
-        /// If `prepared` carried a PQ-enabled manifest and a v2 server rolled back to runtime
-        /// `PQ_ENABLED="false"` refuses PQ-ON with confirmed `Unimplemented` while `strict_pq` is
-        /// `false`, automatically publishes a signed `PQ-OFF` manifest via `PublishV2` using the
-        /// exact same classical prekeys and returns [`PublishV2Outcome::V2ClassicalOff`]. Never
-        /// falls back to legacy v1 `Handshake::publish`.
+        /// Performs zero local state mutation. If `prepared` carried a PQ-enabled manifest and a
+        /// v2 server rolled back to runtime `PQ_ENABLED="false"` refuses PQ-ON with confirmed
+        /// `Unimplemented`:
+        /// - returns `Err(ErrorKind::PqRequired)` when `strict_pq` is `true`, or
+        /// - returns `Ok(PublishV2Outcome::ServerPqDisabled)` when `strict_pq` is `false` without
+        ///   transmitting an OFF manifest. Callers should then run
+        ///   [`Client::prepare_publish_v2_classical_off`], persist [`Client::state`], and transmit
+        ///   the resulting classical-OFF [`PreparedPublishV2`].
+        ///
+        /// Never falls back to legacy v1 `Handshake::publish`.
         pub async fn transmit_publish_v2(
-            &mut self,
+            &self,
             prepared: &PreparedPublishV2,
         ) -> Result<PublishV2Outcome> {
             let prepared_pq = prepared
@@ -1560,7 +1756,7 @@ mod v2 {
                 Err(e) if unimplemented_refusal(&e) => {
                     if prepared_pq && let Some(orig_manifest) = prepared.request.manifest.as_ref() {
                         // Confirm via `GetServerInfo` that the relay has runtime `PQ_ENABLED=false`
-                        // before switching to a signed `PQ-OFF` manifest or mapping `strict_pq` to
+                        // before signalling `ServerPqDisabled` or mapping `strict_pq` to
                         // `PqRequired` (a proxy 404 or missing `PublishV2` RPC must not downgrade).
                         match self.check_server_info(&orig_manifest.audience).await {
                             Ok(info) if !info.pq_enabled => {
@@ -1570,61 +1766,7 @@ mod v2 {
                                         e,
                                     ));
                                 }
-                                let timestamp = self.current_timestamp()?;
-                                let expires_at = timestamp
-                                    .checked_add(DEFAULT_MANIFEST_TTL_MS)
-                                    .filter(|&t| t <= protocol::MAX_SAFE_INTEGER)
-                                    .ok_or(ErrorKind::Protocol)?;
-                                // Allocate a fresh manifest_seq so we never sign two conflicting
-                                // policies (PQ-ON and PQ-OFF) at the same sequence number.
-                                let off_manifest_seq = self
-                                    .state
-                                    .manifest_seq
-                                    .max(prepared.manifest_seq)
-                                    .checked_add(1)
-                                    .filter(|&s| s <= protocol::MAX_SAFE_INTEGER)
-                                    .ok_or(ErrorKind::Protocol)?;
-                                let mut off_manifest = CapabilityManifest {
-                                    audience: orig_manifest.audience.clone(),
-                                    identity_key: Bytes::new(),
-                                    manifest_seq: off_manifest_seq,
-                                    generation: prepared.generation,
-                                    issued_at: timestamp,
-                                    expires_at,
-                                    pq_enabled: false,
-                                    strict_pq: false,
-                                    pq_ratchet_supported: false,
-                                    offered_suites: vec![],
-                                    signed_prekey: Bytes::copy_from_slice(
-                                        &prepared.classical.signed_prekey,
-                                    ),
-                                    pq_last_resort: vec![],
-                                    signature: Bytes::new(),
-                                };
-                                sign_manifest(&self.state.identity, &mut off_manifest)?;
-                                let off_digest = manifest_digest(&off_manifest)?;
-                                let off_req = PublishV2Request::sign(
-                                    &self.state.identity,
-                                    off_manifest,
-                                    Some(prepared.classical.signed_prekey_signature),
-                                    &prepared.classical.one_time_prekeys,
-                                    vec![],
-                                    vec![],
-                                    timestamp,
-                                )?;
-                                self.handshake.publish_v2(off_req).await?;
-                                // PQOPKs, any newly minted last-resort PQSPKs, and the PQ-ON
-                                // manifest were never uploaded under PQ_ENABLED=false; retract
-                                // them locally and record the published PQ-OFF manifest digest.
-                                self.state.manifest_seq = off_manifest_seq;
-                                prepared.rollback.retract_unused_pq(&mut self.state.prekeys);
-                                self.state.rollback_manifest_digest(
-                                    prepared.manifest_digest,
-                                    prepared.evicted_manifest_digest,
-                                );
-                                self.state
-                                    .record_manifest_digest_preserving(off_digest, &[]);
-                                return Ok(PublishV2Outcome::V2ClassicalOff);
+                                return Ok(PublishV2Outcome::ServerPqDisabled);
                             }
                             Ok(_) => return Err(e.into()),
                             Err(info_err) if info_err.kind() == ErrorKind::DowngradeDetected => {
@@ -1649,23 +1791,37 @@ mod v2 {
         /// Generate and publish prekeys + signed [`CapabilityManifest`] via `HandshakeV2`.
         ///
         /// If the server is a v2 relay with runtime `PQ_ENABLED="false"` and `strict_pq` is
-        /// `false`, falls back cleanly from PQ-ON to a signed `PQ-OFF` manifest on `PublishV2`.
-        /// Never falls back to legacy v1 `Handshake::publish`.
+        /// `false`, transitions via [`Client::prepare_publish_v2_classical_off`] to publish a
+        /// signed `PQ-OFF` manifest on `PublishV2`. Never falls back to legacy v1
+        /// `Handshake::publish`.
         ///
         /// For persist-before-transmit flows, use [`Client::prepare_publish_v2`], persist
-        /// [`Client::state`], then call [`Client::transmit_publish_v2`] and
-        /// [`Client::commit_publish_v2`].
+        /// [`Client::state`], call [`Client::transmit_publish_v2`], handle
+        /// [`PublishV2Outcome::ServerPqDisabled`] with [`Client::prepare_publish_v2_classical_off`]
+        /// + persist + transmit, and finish with [`Client::commit_publish_v2`].
         pub async fn publish_v2(
             &mut self,
             audience: &str,
             one_time_count: usize,
             pq_one_time_count: usize,
         ) -> Result<()> {
-            let prepared = self.prepare_publish_v2(audience, one_time_count, pq_one_time_count)?;
-            match self.transmit_publish_v2(&prepared).await {
-                Ok(_) => {
+            let mut prepared =
+                self.prepare_publish_v2(audience, one_time_count, pq_one_time_count)?;
+            let outcome = match self.transmit_publish_v2(&prepared).await {
+                Ok(PublishV2Outcome::ServerPqDisabled) => {
+                    prepared = self.prepare_publish_v2_classical_off(prepared, &[])?;
+                    self.transmit_publish_v2(&prepared).await
+                }
+                other => other,
+            };
+            match outcome {
+                Ok(PublishV2Outcome::V2Pq | PublishV2Outcome::V2ClassicalOff) => {
                     self.commit_publish_v2(prepared);
                     Ok(())
+                }
+                Ok(PublishV2Outcome::ServerPqDisabled) => {
+                    self.rollback_publish_v2_on_refusal(prepared);
+                    Err(ErrorKind::Protocol.into())
                 }
                 Err(e)
                     if e.is_server_refusal()
@@ -1855,41 +2011,42 @@ mod v2 {
             match &response.manifest {
                 Some(manifest) => {
                     // 1. Verify signature, audience binding, structural invariants, identity,
-                    //    monotonic manifest_seq, and SPK match BEFORE checking expiry so a
-                    //    replayed older expired manifest still hard-fails as DowngradeDetected!
+                    //    monotonic manifest_seq + anti-equivocation digest, and SPK match BEFORE
+                    //    checking clock skew or expiry so a replayed or equivocating manifest
+                    //    always hard-fails as DowngradeDetected!
                     let verified_id = verify_manifest(manifest, audience)
                         .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                     if verified_id != *peer {
                         return Err(ErrorKind::DowngradeDetected.into());
                     }
-                    if manifest.manifest_seq < peer_state.pinned_manifest_seq {
-                        return Err(ErrorKind::DowngradeDetected.into());
-                    }
-                    // 2. Check manifest validity window against server clock without re-verifying
-                    //    the manifest's XEdDSA signature (a peer offline past
-                    //    DEFAULT_MANIFEST_TTL_MS surfaces PeerManifestExpired rather than a false
-                    //    downgrade alarm).
-                    check_manifest_window(manifest, self.clock.now())
-                        .map_err(|e| Error::new(ErrorKind::PeerManifestExpired, e))?;
+                    let digest = manifest_digest(manifest)
+                        .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
+                    updated_peer_state.check_and_pin_manifest(manifest.manifest_seq, digest)?;
                     let resp_spk: PublicKey = protocol::fixed(&response.signed_prekey)
                         .map_err(|e| Error::new(ErrorKind::DowngradeDetected, e))?;
                     if manifest.signed_prekey.as_ref() != resp_spk.as_slice() {
                         return Err(ErrorKind::DowngradeDetected.into());
                     }
+                    // 2. Check manifest validity window against the bounded local + server clock
+                    //    pair without re-verifying the manifest's XEdDSA signature (excessive
+                    //    clock drift fails closed with ClockSkew; a peer offline past
+                    //    DEFAULT_MANIFEST_TTL_MS surfaces PeerManifestExpired rather than a false
+                    //    downgrade alarm).
+                    let (local_now, server_now) = self.clock.trusted_clock_pair()?;
+                    check_manifest_window_bounded(manifest, local_now, server_now)
+                        .map_err(|e| Error::new(ErrorKind::PeerManifestExpired, e))?;
 
                     if manifest.pq_enabled {
                         // During an explicitly approved `PQ_ENABLED="false"` relay rollback on an
                         // unpinned peer, keep `pq_pinned` unchanged so the approved classical chat
-                        // can still rekey while rollback remains active; `pinned_manifest_seq` and
-                        // `peer_pq_capable` still prevent rollback to older OFF manifests or
-                        // manifest stripping.
+                        // can still rekey while rollback remains active; `pinned_manifest_seq`,
+                        // `pinned_manifest_digest`, and `peer_pq_capable` still prevent rollback
+                        // to older/equivocating OFF manifests or manifest stripping.
                         if !server_pq_disabled_fallback {
                             updated_peer_state.pq_pinned = true;
                             updated_peer_state.allow_classical_exception = false;
                         }
                         updated_peer_state.peer_pq_capable = true;
-                        updated_peer_state.pinned_manifest_seq =
-                            peer_state.pinned_manifest_seq.max(manifest.manifest_seq);
 
                         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                         if local_pq_enabled && !server_pq_disabled_fallback {
@@ -1928,8 +2085,6 @@ mod v2 {
                         {
                             return Err(ErrorKind::DowngradeDetected.into());
                         }
-                        updated_peer_state.pinned_manifest_seq =
-                            peer_state.pinned_manifest_seq.max(manifest.manifest_seq);
                         updated_peer_state.peer_pq_capable = false;
 
                         if strict_pq {

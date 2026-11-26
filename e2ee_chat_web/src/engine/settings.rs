@@ -323,6 +323,9 @@ impl<V: VaultStore> Engine<V> {
                 inner.roll_back(&peer, snapshot)?;
                 self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 let kind = e.kind();
+                if kind == ErrorKind::ClockSkew {
+                    self.warn_clock_skew(inner.client.clock().offset_ms());
+                }
                 let persist_alert = inner
                     .contact(&peer)
                     .is_some_and(|c| c.session.needs_new_session() || c.state.quarantined);
@@ -616,6 +619,7 @@ pub(super) fn describe_upgrade_pq_error(
             "No mutually supported post-quantum encryption suite is available with this peer."
                 .to_string()
         }
+        ErrorKind::ClockSkew => super::CLOCK_SKEW_MESSAGE.to_string(),
         _ => fallback,
     }
 }

@@ -238,6 +238,9 @@ impl<V: VaultStore> Engine<V> {
         }
         let status = match inner.client.check_server_info(&inner.audience).await {
             Ok(info) if info.pq_enabled => {
+                if !inner.client.clock().is_drift_exceeded() {
+                    self.clock_skew_warned.set(false);
+                }
                 let suites = info
                     .supported_suites
                     .iter()

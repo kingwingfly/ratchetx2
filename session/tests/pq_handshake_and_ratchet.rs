@@ -1393,9 +1393,9 @@ mod pq_flow {
         assert_eq!(alice_session.active_id(), Some(&active_before));
     }
 
-    #[cfg(feature = "rkyv")]
+    #[cfg(feature = "prost")]
     #[tokio::test]
-    async fn rkyv_roundtrip_preserves_pq_client_and_session_state() {
+    async fn prost_roundtrip_preserves_pq_client_and_session_state() {
         let store = SharedStore::default();
         let hs = DualHandshake::new(store.clone(), AUDIENCE);
         let mb = DualMailbox::new(store, AUDIENCE);
@@ -1408,20 +1408,32 @@ mod pq_flow {
                 AUDIENCE,
                 &bob.identity_key(),
                 &PeerPqState::default(),
-                b"rkyv",
+                b"prost-pq",
                 mb,
             )
             .await
             .unwrap();
+        assert!(
+            alice_session
+                .peer_pq_state()
+                .pinned_manifest_digest
+                .is_some()
+        );
 
-        let client_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
-        let client_restored: session::ClientState =
-            rkyv::from_bytes::<session::ClientState, rkyv::rancor::Error>(&client_bytes).unwrap();
+        let client_proto = session::proto::ClientState::from(bob.state());
+        let client_bytes = prost::Message::encode_to_vec(&client_proto);
+        let client_decoded =
+            <session::proto::ClientState as prost::Message>::decode(client_bytes.as_slice())
+                .unwrap();
+        let client_restored = session::ClientState::try_from(&client_decoded).unwrap();
         assert_eq!(client_restored.pq_config(), bob.pq_config());
 
-        let sess_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        let sess_restored: session::SessionState =
-            rkyv::from_bytes::<session::SessionState, rkyv::rancor::Error>(&sess_bytes).unwrap();
+        let sess_proto = session::proto::SessionState::from(alice_session.state());
+        let sess_bytes = prost::Message::encode_to_vec(&sess_proto);
+        let sess_decoded =
+            <session::proto::SessionState as prost::Message>::decode(sess_bytes.as_slice())
+                .unwrap();
+        let sess_restored = session::SessionState::try_from(&sess_decoded).unwrap();
         assert_eq!(sess_restored.security(), alice_session.security());
         assert_eq!(sess_restored.peer_pq_state(), alice_session.peer_pq_state());
     }

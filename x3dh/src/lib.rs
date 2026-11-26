@@ -35,8 +35,6 @@ use x25519_dalek::SharedSecret;
 /// Re-export x25519_dalek's private key, which [`LocalPrekeys::accept`] returns.
 pub use x25519_dalek::StaticSecret;
 use xeddsa::{PUBLIC_KEY_LENGTH, SIGNATURE_LENGTH, XEdDSAPrivateKey, XEdDSAPublicKey};
-#[cfg(feature = "rkyv")]
-use zeroize::ZeroizeOnDrop;
 use zeroize::{Zeroize, Zeroizing};
 
 /// An X25519 (or XEdDSA identity) public key.
@@ -60,16 +58,12 @@ pub const MAX_ONE_TIME_PER_GENERATION: usize = 1024;
 /// Maximum number of confirmed ephemeral keys retained per generation against replay.
 pub const MAX_CONFIRMED_PER_GENERATION: usize = 4096;
 /// Maximum number of last-resort PQSPK suites allowed in one generation.
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+#[cfg(any(feature = "serde", feature = "prost"))]
 const MAX_PQ_LAST_RESORT_PER_GENERATION: usize = 4;
 
 /// Bob's prekeys, as Alice receives them to start a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct PrekeyBundle {
     /// Bob's signed prekey.
     pub signed_prekey: PublicKey,
@@ -83,10 +77,6 @@ pub struct PrekeyBundle {
 /// Alice's initial message to Bob, which lets him derive the same shared secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct InitialMessage {
     /// Alice's identity key.
     pub identity_key: PublicKey,
@@ -138,16 +128,11 @@ pub struct PublishedPrekeys {
 /// keeps it from being accepted again. So an initial message anyone could have sent, claiming
 /// to be Alice's, uses up nothing.
 ///
-/// With the `serde` or `rkyv` feature, it serializes with its private keys, and with `prost` it
+/// With the `serde` feature, it serializes with its private keys, and with `prost` it
 /// converts to and from `proto::LocalPrekeys`: keep the output secret.
 #[derive(Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "RawLocalPrekeys"))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
-#[cfg_attr(feature = "rkyv", rkyv(bytecheck(verify)))]
 pub struct LocalPrekeys {
     /// Oldest first.
     generations: VecDeque<Generation>,
@@ -155,21 +140,12 @@ pub struct LocalPrekeys {
 
 /// The prekeys of one [`LocalPrekeys::generate`].
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 struct Generation {
     signed_prekey: PublicKey,
-    #[cfg_attr(feature = "rkyv", rkyv(with = StaticSecretDef))]
     signed_secret: StaticSecret,
     /// The ones not used yet. Stored in a `BTreeMap` to avoid hash-table secret relocation and
     /// preserve deterministic ordering.
     #[cfg_attr(feature = "serde", serde(with = "map_as_seq"))]
-    #[cfg_attr(
-        feature = "rkyv",
-        rkyv(with = rkyv::with::MapKV<rkyv::with::Identity, StaticSecretDef>)
-    )]
     one_time: BTreeMap<PublicKey, StaticSecret>,
     /// The canonical ephemeral keys of the initial messages confirmed, so that none is accepted
     /// twice, e.g. one without a one-time prekey sent again. They go with the generation.
@@ -198,118 +174,8 @@ impl core::fmt::Debug for EvictedGeneration {
     }
 }
 
-/// Archives a [`StaticSecret`] as its bytes, zeroizing temporary copies on drop.
-#[cfg(feature = "rkyv")]
-#[derive(Zeroize, ZeroizeOnDrop, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(remote = StaticSecret)]
-struct StaticSecretDef {
-    #[rkyv(getter = StaticSecret::to_bytes)]
-    bytes: [u8; PUBLIC_KEY_LENGTH],
-}
-
-#[cfg(feature = "rkyv")]
-impl From<StaticSecretDef> for StaticSecret {
-    fn from(secret: StaticSecretDef) -> Self {
-        StaticSecret::from(secret.bytes)
-    }
-}
-
-#[cfg(feature = "rkyv")]
-#[derive(Debug, thiserror::Error)]
-#[error("malformed archived LocalPrekeys state")]
-struct InvalidArchivedPrekeys;
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedLocalPrekeys
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        if self.generations.len() > KEPT_GENERATIONS {
-            rkyv::rancor::fail!(InvalidArchivedPrekeys);
-        }
-        let mut seen_spks = BTreeSet::new();
-        for generation in self.generations.iter() {
-            if !seen_spks.insert(generation.signed_prekey)
-                || generation.one_time.len() > MAX_ONE_TIME_PER_GENERATION
-                || generation.confirmed.len() > MAX_CONFIRMED_PER_GENERATION
-                || generation.pq_last_resort.len() > MAX_PQ_LAST_RESORT_PER_GENERATION
-                || generation.pq_one_time.len() > MAX_ONE_TIME_PER_GENERATION
-            {
-                rkyv::rancor::fail!(InvalidArchivedPrekeys);
-            }
-            let spk_secret_bytes = Zeroizing::new(generation.signed_secret.bytes);
-            let spk_secret = StaticSecret::from(*spk_secret_bytes);
-            if x25519_dalek::PublicKey::from(&spk_secret).to_bytes() != generation.signed_prekey {
-                rkyv::rancor::fail!(InvalidArchivedPrekeys);
-            }
-            let mut prev_opk: Option<PublicKey> = None;
-            for (opk_pub, opk_secret_def) in generation.one_time.iter() {
-                if prev_opk.is_some_and(|prev| *opk_pub <= prev) {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                prev_opk = Some(*opk_pub);
-                let opk_secret_bytes = Zeroizing::new(opk_secret_def.bytes);
-                let opk_secret = StaticSecret::from(*opk_secret_bytes);
-                if x25519_dalek::PublicKey::from(&opk_secret).to_bytes() != *opk_pub {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-            }
-            let mut prev_confirmed: Option<PublicKey> = None;
-            for ek in generation.confirmed.iter() {
-                if prev_confirmed.is_some_and(|prev| *ek <= prev)
-                    || !xeddsa::is_canonical_public_key(ek)
-                {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                prev_confirmed = Some(*ek);
-            }
-            let mut last_resort_ids = BTreeSet::new();
-            let mut prev_suite: Option<PqSuite> = None;
-            for (k_suite, pq) in generation.pq_last_resort.iter() {
-                let key_suite = pq::archived_suite(k_suite);
-                if prev_suite.is_some_and(|prev| key_suite <= prev) {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                prev_suite = Some(key_suite);
-                let val_suite = pq::archived_suite(&pq.suite);
-                if key_suite != val_suite {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                let ek = pq.ek.as_slice();
-                let seed = Zeroizing::new(pq.seed.bytes);
-                if validate_pq_seed_ek(val_suite, ek, &seed).is_err() {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                let id = pq_prekey_id(val_suite.as_u8(), ek);
-                if !last_resort_ids.insert(id) {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-            }
-            let mut prev_pq_id: Option<PqPrekeyId> = None;
-            for (id, pq) in generation.pq_one_time.iter() {
-                if prev_pq_id.is_some_and(|prev| *id <= prev) {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                prev_pq_id = Some(*id);
-                let suite = pq::archived_suite(&pq.suite);
-                let ek = pq.ek.as_slice();
-                let seed = Zeroizing::new(pq.seed.bytes);
-                if validate_pq_seed_ek(suite, ek, &seed).is_err()
-                    || pq_prekey_id(suite.as_u8(), ek) != *id
-                    || last_resort_ids.contains(id)
-                {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Validates that a stored PQ seed derives `ek` when `suite` is compiled into this build.
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+#[cfg(any(feature = "serde", feature = "prost"))]
 #[allow(unused_variables)]
 fn validate_pq_seed_ek(suite: PqSuite, ek: &[u8], seed: &[u8; PQ_SEED_LENGTH]) -> Result<()> {
     if ek.len() != suite.ek_len() {
@@ -2187,22 +2053,17 @@ mod test {
     }
 
     /// `prekeys` saved and restored, once through each format enabled.
-    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[cfg(any(feature = "serde", feature = "prost"))]
     fn restored(prekeys: &LocalPrekeys) -> Vec<LocalPrekeys> {
         Vec::from([
             #[cfg(feature = "serde")]
             serde_json::from_str(&serde_json::to_string(prekeys).unwrap()).unwrap(),
-            #[cfg(feature = "rkyv")]
-            rkyv::from_bytes::<_, rkyv::rancor::Error>(
-                &rkyv::to_bytes::<rkyv::rancor::Error>(prekeys).unwrap(),
-            )
-            .unwrap(),
             #[cfg(feature = "prost")]
             LocalPrekeys::try_from(&proto::LocalPrekeys::from(prekeys)).unwrap(),
         ])
     }
 
-    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[cfg(any(feature = "serde", feature = "prost"))]
     #[test]
     fn restored_prekeys_accept() {
         let alice = XEdDSAPrivateKey::generate();
@@ -2392,46 +2253,6 @@ mod test {
         flood_ek["generations"][0]["confirmed"] =
             serde_json::json!(vec![valid_ek; MAX_CONFIRMED_PER_GENERATION + 5]);
         assert!(serde_json::from_value::<LocalPrekeys>(flood_ek).is_err());
-    }
-
-    #[cfg(feature = "rkyv")]
-    #[test]
-    fn rkyv_deserialization_hardening() {
-        let bob = XEdDSAPrivateKey::generate();
-        let mut prekeys = LocalPrekeys::new();
-        prekeys.generate(&bob, 1);
-
-        // Corrupt a byte of the signed_prekey inside an in-memory invalid LocalPrekeys and archive.
-        let mut bad = LocalPrekeys::new();
-        bad.generate(&bob, 1);
-        bad.generations[0].signed_prekey[0] ^= 0x01;
-        let bad_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bad).unwrap();
-        assert!(rkyv::from_bytes::<LocalPrekeys, rkyv::rancor::Error>(&bad_bytes).is_err());
-
-        // Too many generations fails Verify.
-        let mut too_many = LocalPrekeys::new();
-        too_many.generate(&bob, 0);
-        too_many.generate(&bob, 0);
-        let (spk, sec) = generate_key_pair();
-        too_many.generations.push_back(Generation {
-            signed_prekey: spk,
-            signed_secret: sec,
-            one_time: BTreeMap::new(),
-            confirmed: BTreeSet::new(),
-            pq_last_resort: BTreeMap::new(),
-            pq_one_time: BTreeMap::new(),
-        });
-        let too_many_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&too_many).unwrap();
-        assert!(rkyv::from_bytes::<LocalPrekeys, rkyv::rancor::Error>(&too_many_bytes).is_err());
-
-        // Non-canonical confirmed EK fails Verify.
-        let mut bad_ek = LocalPrekeys::new();
-        bad_ek.generate(&bob, 0);
-        let mut ek = [0u8; 32];
-        ek[31] = 0x80;
-        bad_ek.generations[0].confirmed.insert(ek);
-        let bad_ek_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bad_ek).unwrap();
-        assert!(rkyv::from_bytes::<LocalPrekeys, rkyv::rancor::Error>(&bad_ek_bytes).is_err());
     }
 
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -3029,7 +2850,7 @@ mod test {
             }
         }
 
-        #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+        #[cfg(any(feature = "serde", feature = "prost"))]
         #[test]
         fn pq_restored_prekeys_round_trip_and_tamper_checks() {
             for suite in enabled_suites() {
@@ -3108,19 +2929,6 @@ mod test {
                     val["generations"][0]["pq_last_resort"][0][1]["seed"][0] =
                         serde_json::json!((s0 ^ 1) as u8);
                     assert!(serde_json::from_value::<LocalPrekeys>(val).is_err());
-                }
-
-                #[cfg(feature = "rkyv")]
-                {
-                    let mut tampered = LocalPrekeys::new();
-                    tampered.generate_pq(&bob, suite, 0, 1).unwrap();
-                    let entry = tampered.generations[0]
-                        .pq_last_resort
-                        .get_mut(&suite)
-                        .unwrap();
-                    entry.seed[0] ^= 0x01;
-                    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&tampered).unwrap();
-                    assert!(rkyv::from_bytes::<LocalPrekeys, rkyv::rancor::Error>(&bytes).is_err());
                 }
             }
         }

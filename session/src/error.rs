@@ -216,6 +216,10 @@ pub enum ErrorKind {
     /// No mutually supported post-quantum suite is available.
     #[error("unsupported post-quantum suite")]
     UnsupportedSuite,
+    /// The local device clock is invalid or disagrees with the server clock by more than the
+    /// trusted drift threshold ([`crate::DEFAULT_MAX_TRUSTED_DRIFT_MS`]).
+    #[error("device clock disagrees with server clock")]
+    ClockSkew,
 }
 
 /// Result type with [`Error`].

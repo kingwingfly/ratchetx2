@@ -667,6 +667,9 @@ impl<V: VaultStore> Inner<V> {
                         self.save_state().await.map_err(|e| describe(&e))?;
                         return Ok(SealOutcome::Paused);
                     }
+                    if kind == ErrorKind::ClockSkew {
+                        return Err(super::CLOCK_SKEW_MESSAGE.to_string());
+                    }
                     return Err(describe(&e));
                 }
             }

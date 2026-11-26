@@ -40,11 +40,6 @@ const PQ_OPK_DOMAIN: &[u8] = b"pqxdh.v1/pqopk\0";
 /// Supported ML-KEM parameter sets for PQXDH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash))
-)]
 #[repr(u8)]
 pub enum PqSuite {
     /// FIPS 203 ML-KEM-1024 (NIST security category 5; ek = 1568 B, ct = 1568 B).
@@ -98,14 +93,6 @@ impl PqSuite {
             Self::MlKem1024 => cfg!(feature = "ml-kem-1024"),
             Self::MlKem768 => cfg!(feature = "ml-kem-768"),
         }
-    }
-}
-
-#[cfg(feature = "rkyv")]
-pub(crate) fn archived_suite(suite: &ArchivedPqSuite) -> PqSuite {
-    match suite {
-        ArchivedPqSuite::MlKem1024 => PqSuite::MlKem1024,
-        ArchivedPqSuite::MlKem768 => PqSuite::MlKem768,
     }
 }
 
@@ -254,11 +241,6 @@ where
     deserializer.deserialize_seq(BoundedBytesVisitor::<MAX>)
 }
 
-#[cfg(feature = "rkyv")]
-#[derive(Debug, thiserror::Error)]
-#[error("invalid post-quantum wire payload length or identifier")]
-struct InvalidArchivedPqWire;
-
 /// A published post-quantum prekey (either a last-resort PQSPK or a one-time PQOPK), signed by
 /// Bob's identity key under its role-specific domain separator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,11 +248,6 @@ struct InvalidArchivedPqWire;
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "RawPublishedPqPrekey")
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct PublishedPqPrekey {
     /// The ML-KEM suite.
@@ -316,22 +293,6 @@ impl TryFrom<RawPublishedPqPrekey> for PublishedPqPrekey {
     }
 }
 
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedPublishedPqPrekey
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        let suite = archived_suite(&self.suite);
-        let ek = self.encapsulation_key.as_slice();
-        if ek.len() != suite.ek_len() || pq_prekey_id(suite.as_u8(), ek) != self.id {
-            rkyv::rancor::fail!(InvalidArchivedPqWire);
-        }
-        Ok(())
-    }
-}
-
 /// Keys Bob publishes after `LocalPrekeys::generate_pq` or `LocalPrekeys::extend_pq`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedPqPrekeys {
@@ -349,11 +310,6 @@ pub struct PublishedPqPrekeys {
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "RawPqPrekeyBundle")
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct PqPrekeyBundle {
     /// Bob's classical signed prekey.
@@ -414,32 +370,12 @@ impl TryFrom<RawPqPrekeyBundle> for PqPrekeyBundle {
     }
 }
 
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedPqPrekeyBundle
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        let suite = archived_suite(&self.pq_suite);
-        if self.pq_prekey.len() != suite.ek_len() {
-            rkyv::rancor::fail!(InvalidArchivedPqWire);
-        }
-        Ok(())
-    }
-}
-
 /// Alice's post-quantum initial message to Bob, which lets him derive the same PQXDH secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "RawPqInitialMessage")
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct PqInitialMessage {
     /// PQXDH protocol version ([`PQXDH_VERSION`] = 2).
@@ -500,21 +436,6 @@ impl TryFrom<RawPqInitialMessage> for PqInitialMessage {
     }
 }
 
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedPqInitialMessage
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        let suite = archived_suite(&self.pq_suite);
-        if self.pq_ciphertext.len() != suite.ct_len() {
-            rkyv::rancor::fail!(InvalidArchivedPqWire);
-        }
-        Ok(())
-    }
-}
-
 /// The outcome of PQXDH, the same for Alice and Bob.
 pub struct PqAgreement {
     /// The shared secret key (SK, 32 bytes).
@@ -540,10 +461,6 @@ impl fmt::Debug for PqAgreement {
 /// Locally persisted post-quantum prekey material (seed-only, 64-byte FIPS 203 `(d, z)`).
 #[derive(Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) struct PqPrekeySecret {
     #[zeroize(skip)]
     pub(crate) suite: PqSuite,
@@ -554,28 +471,7 @@ pub(crate) struct PqPrekeySecret {
     )]
     pub(crate) ek: Vec<u8>,
     #[cfg_attr(feature = "serde", serde(with = "seed64_serde"))]
-    #[cfg_attr(feature = "rkyv", rkyv(with = Seed64Def))]
     pub(crate) seed: Zeroizing<[u8; PQ_SEED_LENGTH]>,
-}
-
-#[cfg(feature = "rkyv")]
-#[derive(Zeroize, ZeroizeOnDrop, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(remote = Zeroizing<[u8; PQ_SEED_LENGTH]>)]
-pub(crate) struct Seed64Def {
-    #[rkyv(getter = seed64_bytes)]
-    pub(crate) bytes: [u8; PQ_SEED_LENGTH],
-}
-
-#[cfg(feature = "rkyv")]
-fn seed64_bytes(seed: &Zeroizing<[u8; PQ_SEED_LENGTH]>) -> [u8; PQ_SEED_LENGTH] {
-    **seed
-}
-
-#[cfg(feature = "rkyv")]
-impl From<Seed64Def> for Zeroizing<[u8; PQ_SEED_LENGTH]> {
-    fn from(def: Seed64Def) -> Self {
-        Zeroizing::new(def.bytes)
-    }
 }
 
 #[cfg(feature = "serde")]

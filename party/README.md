@@ -7,9 +7,8 @@ The message format is defined in `proto/party.proto` (package `party.v1`), so ot
 # Features
 
 - **protox** (default): compile the `.proto` files with [protox](https://crates.io/crates/protox); without it, `protoc` must be installed.
-- **serde**, **rkyv**: derive their traits on the message types.
-- **serde** and **rkyv** also serialize a [`Party`](party::Party), with its keys, to keep a session between runs.
-- **prost**: a party's state as protobuf messages too, defined in `proto/party_state.proto`: convert with `proto::Party::from(&party)` and `Party::try_from(&message)`. It holds the keys, which the messages zeroize on drop.
+- **prost**: portable, versioned protobuf persistence format for a party's state, defined in `proto/party_state.proto`: convert with `proto::Party::from(&party)` and `Party::try_from(&message)`. It holds the keys, which the messages zeroize on drop.
+- **serde**: derive its traits on the message types and serialize a [`Party`](party::Party), with its keys, to keep a session between runs.
 
 On `wasm32-unknown-unknown`, enable getrandom's `wasm_js` feature in the final application.
 

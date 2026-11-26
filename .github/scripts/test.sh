@@ -25,7 +25,6 @@ run cargo clippy --locked --all-features --all-targets -- -D warnings
 # Each optional feature must build on its own too. Without protox, protoc compiles the protos.
 run cargo clippy --locked --all-targets --no-default-features "${LIBS[@]}" -- -D warnings
 run cargo clippy --locked --all-targets --features serde -p ratchetx2 -p xeddsa -p x3dh -p party -p protocol -p session -- -D warnings
-run cargo clippy --locked --all-targets --features rkyv -p ratchetx2 -p xeddsa -p x3dh -p party -p protocol -p session -- -D warnings
 run cargo clippy --locked --all-targets --features prost -p ratchetx2 -p x3dh -p party -p session -- -D warnings
 run cargo clippy --locked --all-targets --features server -p protocol -- -D warnings
 run cargo clippy --locked --all-targets --features connect -p protocol -p session -- -D warnings
@@ -46,14 +45,21 @@ run cargo clippy --locked --all-targets --no-default-features -p e2ee_chat_previ
 run cargo clippy --locked --all-targets --features rpc -p e2ee_chat_preview -- -D warnings
 
 run cargo test --locked --all-features
+
+# Post-quantum + prost persistence feature matrix (including non-PQ fail-closed checks).
+run cargo test --locked --features prost -p ratchetx2 -p x3dh -p party -p session
+run cargo test --locked --features ml-kem-768,prost -p ratchetx2 -p x3dh -p party -p session
+run cargo test --locked --features ml-kem-1024,prost -p ratchetx2 -p x3dh -p party -p session
+run cargo test --locked --features pq,prost -p ratchetx2 -p x3dh -p party -p session
+
 run env RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps "${LIBS[@]}"
 run env RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features "${LIBS[@]}"
 
 # The libraries must keep building for the browser. This only checks (no linking), so
 # getrandom's "custom" backend stands in for the wasm_js backend an app would enable.
 run env RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check --locked --target wasm32-unknown-unknown "${LIBS[@]}"
-run env RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check --locked --target wasm32-unknown-unknown --features server,serde,rkyv,connect -p protocol
-run env RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check --locked --target wasm32-unknown-unknown --features serde,rkyv,prost -p session
+run env RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check --locked --target wasm32-unknown-unknown --features server,serde,connect -p protocol
+run env RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check --locked --target wasm32-unknown-unknown --features serde,prost -p session
 
 # The web client and the Worker, which enable the wasm_js backend themselves.
 run cargo clippy --locked --target wasm32-unknown-unknown -p e2ee_chat_web -p e2ee_chat_worker -- -D warnings

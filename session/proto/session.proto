@@ -48,6 +48,9 @@ message PeerPqState {
   bool peer_pq_capable = 5;
   // Monotonic high-water mark of Hello.session_seq accepted from this peer.
   uint64 peer_session_seq = 6;
+  // SHA-256 digest (32 bytes) of the verified CapabilityManifest at pinned_manifest_seq; empty
+  // if unset (e.g. restored from pre-digest state or before any manifest has been observed).
+  bytes pinned_manifest_digest = 7;
 }
 
 // Cryptographic security metadata of an established session.

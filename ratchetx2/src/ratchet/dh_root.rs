@@ -17,10 +17,6 @@ const HYBRID_CHAIN_KEY_INFO: &[u8] = b"ratchetx2.v1/hybrid/ChainKey";
 const HYBRID_HEADER_KEY_INFO: &[u8] = b"ratchetx2.v1/hybrid/HeaderKey";
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct DhRootRatchet {
     root_key: RootKey,
     private_key: DhPrivateKey,

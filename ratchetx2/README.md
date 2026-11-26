@@ -13,8 +13,8 @@ An E2EE chat built on this crate, a web client and its server as a Cloudflare Wo
 
 # Features
 
-- **serde**, **rkyv**: serialize a `Ratchet`, with its keys, to keep a session between runs.
-- **prost**: the same as protobuf messages, defined in `proto/ratchetx2.proto` (package `ratchetx2.v1`) so other languages can read them; [protox](https://crates.io/crates/protox) compiles it, so `protoc` is not needed.
+- **prost**: portable, versioned protobuf persistence format for `Ratchet` (and `KemRatchet` when PQ features are enabled), defined in `proto/ratchetx2.proto` (package `ratchetx2.v1`) so other languages can read them; [protox](https://crates.io/crates/protox) compiles it, so `protoc` is not needed.
+- **serde**: serialize a `Ratchet`, with its keys, to keep a session between runs.
 
 # WebAssembly
 

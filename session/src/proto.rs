@@ -34,6 +34,7 @@ impl fmt::Debug for PeerPqState {
         f.debug_struct("PeerPqState")
             .field("pq_pinned", &self.pq_pinned)
             .field("pinned_manifest_seq", &self.pinned_manifest_seq)
+            .field("pinned_manifest_digest", &self.pinned_manifest_digest.len())
             .field("allow_classical_exception", &self.allow_classical_exception)
             .field("downgrade_detected", &self.downgrade_detected)
             .field("peer_pq_capable", &self.peer_pq_capable)

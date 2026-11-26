@@ -9,14 +9,13 @@ description = "Double-ratchet message encryption with header encryption, without
 publish = false
 
 [dependencies]
-ratchetx2 = { path = "../ratchetx2", version = "0.4" }
+ratchetx2 = { path = "../ratchetx2", version = "0.5" }
 aes-gcm.workspace = true
 bytes.workspace = true
 getrandom.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 prost.workspace = true
-rkyv = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha2.workspace = true
 subtle.workspace = true
@@ -36,7 +35,6 @@ default = ["protox"]
 # Compile the .proto files with protox, so protoc is not needed.
 protox = ["dep:protox"]
 serde = ["dep:serde", "bytes/serde", "ratchetx2/serde"]
-rkyv = ["dep:rkyv", "rkyv/bytes-1", "ratchetx2/rkyv"]
 # The party's state as protobuf messages too, from proto/party_state.proto.
 prost = ["ratchetx2/prost"]
 # Optional post-quantum KEM ratchet integration.

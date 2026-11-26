@@ -453,6 +453,7 @@ struct MemoryVault {
     fail_put_chunk: Cell<bool>,
     fail_promote_upload: Cell<bool>,
     fail_forget: Cell<bool>,
+    saved_manifest_seqs: std::rc::Rc<RefCell<Vec<u64>>>,
 }
 
 impl MemoryVault {
@@ -527,6 +528,11 @@ impl VaultStore for MemoryVault {
     ) -> crate::vault::Result<()> {
         if self.fail_save.get() {
             return Err(crate::vault::Error::Storage("write failed".into()));
+        }
+        if let Some(client) = state.client.as_ref() {
+            self.saved_manifest_seqs
+                .borrow_mut()
+                .push(client.manifest_seq);
         }
         self.state.replace(state.clone());
         self.deferred.replace(deferred.clone());
@@ -4605,8 +4611,8 @@ fn streaming_media_range_and_stream_chunk_decrypt_cache_and_fault_injection() {
         }
         let chunk1_plain: Vec<u8> = (0u8..64).map(|b| b.wrapping_mul(3)).collect();
         let total_size = (chunk0_plain.len() + chunk1_plain.len()) as u64;
-        let ct0 = encrypt_chunk(&key, 0, false, &chunk0_plain);
-        let ct1 = encrypt_chunk(&key, 1, true, &chunk1_plain);
+        let ct0 = encrypt_chunk(&key, &id, 0, false, &chunk0_plain);
+        let ct1 = encrypt_chunk(&key, &id, 1, true, &chunk1_plain);
 
         let get_counts: Rc<RefCell<HashMap<u32, usize>>> = Rc::default();
         let push_count = Rc::new(Cell::new(0usize));
@@ -5630,5 +5636,111 @@ fn engine_delete_cleans_up_peer_and_rolls_back_on_forget_fault() {
         }
         // Reset dialog/signal cleanly.
         engine.ui().dialog.set(None);
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn publish_full_persists_pq_off_before_transmitting_and_handles_clock_skew() {
+    use protocol::handshake_v2::{GetServerInfoResponse, PublishV2Request, PublishV2Response};
+    use std::rc::Rc;
+
+    futures::executor::block_on(async {
+        let (inner, _peer) = unlocked_client();
+        let saved_seqs = inner.vault.saved_manifest_seqs.clone();
+        let engine = Engine::with_inner(Ui::new(), inner);
+
+        // 1. Relay has runtime PQ_ENABLED=false: first PublishV2 (PQ-ON, seq 1) returns Connect
+        //    `unimplemented`, GetServerInfo confirms `pq_enabled: false`, and `publish_full` MUST
+        //    persist seq 2 (PQ-OFF) to the vault BEFORE transmitting the second PublishV2!
+        type PublishLog = Rc<RefCell<Vec<(u64, bool, Vec<u64>)>>>;
+        let publish_log: PublishLog = Rc::default();
+        let publish_log_ref = publish_log.clone();
+        let saved_seqs_ref = saved_seqs.clone();
+        let _mock = crate::transport::mock_fetch(move |_server, path, body| {
+            if path.ends_with("/PublishV2") {
+                let req = PublishV2Request::decode(body.as_slice()).unwrap();
+                let manifest = req.manifest.as_ref().unwrap();
+                let persisted_before_rpc = saved_seqs_ref.borrow().clone();
+                publish_log_ref.borrow_mut().push((
+                    manifest.manifest_seq,
+                    manifest.pq_enabled,
+                    persisted_before_rpc,
+                ));
+                if manifest.pq_enabled {
+                    Ok((
+                        404,
+                        br#"{"code":"unimplemented","message":"server PQ disabled"}"#.to_vec(),
+                    ))
+                } else {
+                    Ok((200, PublishV2Response {}.encode_to_vec()))
+                }
+            } else if path.ends_with("/GetServerInfo") {
+                Ok((
+                    200,
+                    GetServerInfoResponse {
+                        server_id: "chat.example".to_string(),
+                        pq_enabled: false,
+                        supported_suites: vec![],
+                        pq_ratchet_supported: false,
+                        ..GetServerInfoResponse::default()
+                    }
+                    .encode_to_vec(),
+                ))
+            } else {
+                panic!("unexpected path: {path}");
+            }
+        });
+
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            engine.publish_full(inner, true).await.unwrap();
+            assert_eq!(inner.client.manifest_seq(), 2);
+            assert_eq!(inner.server_pq, ServerPqStatus::Disabled);
+            assert_eq!(
+                inner
+                    .client
+                    .current_pq_one_time_count(PqConfig::default_suite()),
+                0
+            );
+            assert_eq!(inner.client.current_one_time_count(), ONE_TIME_PREKEYS);
+        }
+
+        {
+            let log = publish_log.borrow();
+            assert_eq!(log.len(), 2);
+            // Call 1: PQ-ON seq 1 persisted before transmit.
+            assert_eq!(log[0].0, 1);
+            assert!(log[0].1);
+            assert_eq!(log[0].2, vec![1]);
+            // Call 2: PQ-OFF seq 2 persisted BEFORE transmit!
+            assert_eq!(log[1].0, 2);
+            assert!(!log[1].1);
+            assert_eq!(log[1].2, vec![1, 2]);
+        }
+
+        // 2. ClockSkew (>24h drift) fails closed cleanly without rejecting PQ settings or
+        //    mutating manifest_seq, and surfaces the plain-English clock-skew guidance.
+        let mut guard = engine.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
+        let now_ms = inner.client.clock().now();
+        inner.client.clock().observe(now_ms + 25 * 60 * 60 * 1000);
+        let err = engine.publish_full(inner, true).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::ClockSkew));
+        assert!(!err.rejects_settings());
+        assert!(err.message.contains("24 hours"), "{}", err.message);
+        assert_eq!(inner.client.manifest_seq(), 2);
+        assert!(
+            describe_upgrade_pq_error(
+                ErrorKind::ClockSkew,
+                &ServerPqStatus::Unknown,
+                "raw".to_string()
+            )
+            .contains("24 hours")
+        );
     });
 }

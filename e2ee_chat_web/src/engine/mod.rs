@@ -60,6 +60,10 @@ const WAITS_SIGN_IN: &str = "waits for you to sign in to the server";
 /// sign in to it.
 const NOT_SIGNED_IN_HERE: &str =
     "the server keeps it only for those signed in to it, and only its own page can sign in";
+/// Plain-English message surfaced when the local device clock disagrees with the server clock
+/// beyond [`session::DEFAULT_MAX_TRUSTED_DRIFT_MS`].
+pub(super) const CLOCK_SKEW_MESSAGE: &str = "Your device clock appears to be out of sync with the \
+     server by more than 24 hours. Correct your system time and try again.";
 /// Classical one-time prekeys in each initial/rotating publish.
 const ONE_TIME_PREKEYS: usize = 20;
 /// Post-quantum one-time prekeys per suite in each v2 initial/rotating publish.
@@ -220,6 +224,8 @@ pub struct Engine<V = Vault> {
     displayed_rows: RefCell<DisplayedRows>,
     /// Monotonic counter tagging `Ui::deleted_peer` notifications.
     deleted_peer_seq: Cell<u64>,
+    /// Whether a clock-skew warning has already been surfaced during the current drift episode.
+    clock_skew_warned: Cell<bool>,
 }
 
 /// Per-row reactive signal handles owned by the currently rendered chat.
@@ -523,6 +529,7 @@ impl<V: VaultStore> Engine<V> {
             displayed_history: RefCell::default(),
             displayed_rows: RefCell::default(),
             deleted_peer_seq: Cell::new(0),
+            clock_skew_warned: Cell::new(false),
         });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
         let weak = Rc::downgrade(&engine);
@@ -537,7 +544,25 @@ impl<V: VaultStore> Engine<V> {
                 engine.require_update(reason);
             }
         });
+        let weak = Rc::downgrade(&engine);
+        transport::on_clock_skew(move |offset_ms| {
+            if let Some(engine) = weak.upgrade() {
+                engine.warn_clock_skew(offset_ms);
+            }
+        });
         engine
+    }
+
+    /// Log and notify the user once per drift episode when the device clock disagrees with the
+    /// server beyond [`session::DEFAULT_MAX_TRUSTED_DRIFT_MS`].
+    pub(super) fn warn_clock_skew(&self, offset_ms: i64) {
+        if !self.clock_skew_warned.replace(true) {
+            let hours = offset_ms.unsigned_abs() / (60 * 60 * 1000);
+            self.ui.log(format!(
+                "device clock drift exceeds trusted limit ({hours}h): {CLOCK_SKEW_MESSAGE}"
+            ));
+            self.ui.notify(CLOCK_SKEW_MESSAGE);
+        }
     }
 
     /// Surface a persistent upgrade/refresh banner when the server rejects this client's protocol

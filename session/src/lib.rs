@@ -17,7 +17,7 @@ use core::mem;
 
 use bon::Builder;
 use bytes::Bytes;
-pub use clock::ServerClock;
+pub use clock::{DEFAULT_MAX_TRUSTED_DRIFT_MS, ServerClock};
 pub use error::{Error, ErrorKind, Result};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -43,7 +43,7 @@ use sha2::{Digest, Sha256};
 use x3dh::{LocalPrekeys, PrekeyBundle};
 pub use x3dh::{PqSuite, PublicKey};
 use xeddsa::XEdDSAPrivateKey;
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+#[cfg(any(feature = "prost", feature = "serde"))]
 use xeddsa::XEdDSAPublicKey;
 use zeroize::Zeroizing;
 
@@ -280,19 +280,14 @@ pub struct Client<H> {
 /// What a [`Client`] keeps besides its transport: the identity key, the prekeys and the last
 /// request's timestamp.
 ///
-/// Save it to [`restore`](Client::restore) the client later: serialize it with the `serde` or
-/// `rkyv` feature, or with `prost` convert it to a `proto::ClientState`. It holds private keys,
-/// so keep it secret.
+/// Save it to [`restore`](Client::restore) the client later: with `prost` convert it to a
+/// `proto::ClientState` (portable versioned persistence), or serialize it with `serde`. It holds
+/// private keys, so keep it secret.
 #[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "RawClientState")
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct ClientState {
     pub(crate) identity: XEdDSAPrivateKey,
@@ -392,45 +387,6 @@ impl ClientState {
         }
         self.pq_config.validate()?;
         Ok(())
-    }
-}
-
-#[cfg(feature = "rkyv")]
-fn archived_pq_suite(suite: &x3dh::pq::ArchivedPqSuite) -> PqSuite {
-    match suite {
-        x3dh::pq::ArchivedPqSuite::MlKem1024 => PqSuite::MlKem1024,
-        x3dh::pq::ArchivedPqSuite::MlKem768 => PqSuite::MlKem768,
-    }
-}
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedClientState
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        use rkyv::rancor::Source;
-        let check = || -> Result<()> {
-            let manifest_seq = self.manifest_seq.to_native();
-            if self.last_timestamp.to_native() > protocol::MAX_SAFE_INTEGER
-                || manifest_seq > protocol::MAX_SAFE_INTEGER
-                || self.prekey_generation.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
-                || (manifest_seq > 0 && self.recent_manifest_digests.is_empty())
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            let pq_config = PqConfig {
-                pq_enabled: self.pq_config.pq_enabled,
-                preferred_suite: archived_pq_suite(&self.pq_config.preferred_suite),
-                pq_ratchet_enabled: self.pq_config.pq_ratchet_enabled,
-                strict_pq: self.pq_config.strict_pq,
-            };
-            pq_config.validate()?;
-            Ok(())
-        };
-        check().map_err(C::Error::new)
     }
 }
 
@@ -873,6 +829,26 @@ impl<H> Client<H> {
         Ok(now)
     }
 
+    /// Milliseconds since the Unix epoch from [`ServerClock::trusted_clock_pair`], failing closed
+    /// with [`ErrorKind::ClockSkew`] if the local clock is invalid or disagrees with the server
+    /// clock beyond its trusted drift threshold. Respects monotonicity against `last_timestamp`
+    /// (unless `last_timestamp` lies more than [`protocol::MAX_CLOCK_SKEW`] ahead) without
+    /// mutating `last_timestamp` during prepare.
+    pub(crate) fn trusted_timestamp(&self) -> Result<u64> {
+        let (_local, server) = self.clock.trusted_clock_pair()?;
+        let ts = if self.state.last_timestamp.saturating_add(1)
+            > server.saturating_add(protocol::MAX_CLOCK_SKEW)
+        {
+            server
+        } else {
+            server.max(self.state.last_timestamp.saturating_add(1))
+        };
+        if ts > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::Protocol.into());
+        }
+        Ok(ts)
+    }
+
     /// Milliseconds since the Unix epoch by the server's [clock](Self::clock), strictly
     /// increasing (unless a stale persisted `last_timestamp` lies more than
     /// [`protocol::MAX_CLOCK_SKEW`] ahead of the current clock) and bounded by
@@ -1234,18 +1210,13 @@ pub struct Session<M> {
 /// What a [`Session`] keeps besides its transport: the double ratchets, both identity keys and
 /// the position in the peer's queue.
 ///
-/// Save it to [`restore`](Session::restore) the session later: serialize it with the `serde` or
-/// `rkyv` feature, or with `prost` convert it to a `proto::SessionState`. It holds the session's
-/// keys, so keep it secret; its `Debug` shows none of them, nor the delivery tokens.
+/// Save it to [`restore`](Session::restore) the session later: with `prost` convert it to a
+/// `proto::SessionState` (portable versioned persistence), or serialize it with `serde`. It holds
+/// the session's keys, so keep it secret; its `Debug` shows none of them, nor the delivery tokens.
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "RawSessionState")
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct SessionState {
     /// The session messages are sent on; none once retired, until a new one starts.
@@ -1302,10 +1273,6 @@ impl core::fmt::Debug for SessionState {
 /// The session a [`SessionState`] sends on.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) struct Active {
     pub(crate) party: Party,
     /// The session's ID, which both peers have: the X3DH ephemeral key of the one who started
@@ -1329,10 +1296,6 @@ pub(crate) struct Active {
 /// An earlier session of a [`SessionState`], which only decrypts.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) struct Earlier {
     pub(crate) party: Party,
     pub(crate) delivery_key: DeliveryKey,
@@ -1354,10 +1317,6 @@ impl From<Active> for Earlier {
 /// message. Its `Debug` shows nothing of it.
 #[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) struct DeliveryKey(pub(crate) [u8; 32]);
 
 impl DeliveryKey {
@@ -1390,10 +1349,6 @@ impl core::fmt::Debug for DeliveryKey {
 /// What was done last on a [`SessionState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) enum LastAction {
     None,
     Sent,
@@ -1403,7 +1358,7 @@ pub(crate) enum LastAction {
 
 /// Verify that a `Party`'s associated data binds the exact `(me, peer)` identity pair with length
 /// matching classical X3DH (64 bytes) or PQXDH (96 bytes).
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+#[cfg(any(feature = "prost", feature = "serde"))]
 fn check_party_identity_ad(
     ad: &[u8],
     me: &PublicKey,
@@ -1429,23 +1384,25 @@ fn check_party_identity_ad(
     Ok(())
 }
 
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
-struct ActiveStateView<'a, P: party::PartyView + ?Sized> {
+#[cfg(any(feature = "prost", feature = "serde"))]
+struct ActiveStateView<'a> {
     id: &'a PublicKey,
     peer_session_seq: u64,
     security: SessionSecurity,
-    party: &'a P,
+    party: &'a Party,
 }
 
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
-fn validate_session_state<'a, P: party::PartyView + ?Sized + 'a>(
+#[cfg(any(feature = "prost", feature = "serde"))]
+fn validate_session_state<'a>(
     me: &PublicKey,
     peer: &PublicKey,
     counters: [u64; 6],
+    pinned_manifest_digest: Option<[u8; 32]>,
     delivered: usize,
     earlier: impl ExactSizeIterator<Item = &'a [u8]>,
-    active: Option<ActiveStateView<'a, P>>,
+    active: Option<ActiveStateView<'a>>,
 ) -> Result<()> {
+    let pinned_manifest_seq = counters[4];
     if [me, peer]
         .into_iter()
         .any(|key| !xeddsa::is_canonical_public_key(key) || XEdDSAPublicKey::new(key).is_err())
@@ -1454,6 +1411,7 @@ fn validate_session_state<'a, P: party::PartyView + ?Sized + 'a>(
         || counters
             .into_iter()
             .any(|seq| seq > protocol::MAX_SAFE_INTEGER)
+        || (pinned_manifest_seq == 0 && pinned_manifest_digest.is_some())
     {
         return Err(ErrorKind::MalformedState.into());
     }
@@ -1519,6 +1477,7 @@ impl SessionState {
                 self.peer_pq.pinned_manifest_seq,
                 self.peer_pq.peer_session_seq,
             ],
+            self.peer_pq.pinned_manifest_digest,
             self.delivered.len(),
             self.others.iter().map(|e| e.party.associated_data()),
             self.active.as_ref().map(|a| ActiveStateView {
@@ -1552,42 +1511,6 @@ impl SessionState {
             }
             self.direction_changes = 0;
         }
-    }
-}
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedSessionState
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        use rkyv::rancor::Source;
-        validate_session_state(
-            &self.me,
-            &self.peer,
-            [
-                self.cursor.to_native(),
-                self.stalled_through.to_native(),
-                self.skip_through.to_native(),
-                self.next_session_seq.to_native(),
-                self.peer_pq.pinned_manifest_seq.to_native(),
-                self.peer_pq.peer_session_seq.to_native(),
-            ],
-            self.delivered.len(),
-            self.others.iter().map(|e| e.party.associated_data()),
-            self.active.as_ref().map(|a| ActiveStateView {
-                id: &a.id,
-                peer_session_seq: a.peer_session_seq.to_native(),
-                security: SessionSecurity {
-                    is_pq: a.security.is_pq,
-                    suite: a.security.suite.as_ref().map(archived_pq_suite),
-                    pq_ratchet: a.security.pq_ratchet,
-                },
-                party: &a.party,
-            }),
-        )
-        .map_err(C::Error::new)
     }
 }
 
@@ -1647,6 +1570,9 @@ impl From<&PeerPqState> for proto::PeerPqState {
             downgrade_detected: state.downgrade_detected,
             peer_pq_capable: state.peer_pq_capable,
             peer_session_seq: state.peer_session_seq,
+            pinned_manifest_digest: state
+                .pinned_manifest_digest
+                .map_or_else(Vec::new, |d| d.to_vec()),
         }
     }
 }
@@ -1656,14 +1582,24 @@ impl TryFrom<&proto::PeerPqState> for PeerPqState {
     type Error = Error;
 
     fn try_from(state: &proto::PeerPqState) -> Result<Self> {
+        let pinned_manifest_digest = if state.pinned_manifest_digest.is_empty() {
+            None
+        } else {
+            Some(
+                <[u8; 32]>::try_from(state.pinned_manifest_digest.as_slice())
+                    .map_err(|_| Error::from(ErrorKind::MalformedState))?,
+            )
+        };
         if state.pinned_manifest_seq > protocol::MAX_SAFE_INTEGER
             || state.peer_session_seq > protocol::MAX_SAFE_INTEGER
+            || (state.pinned_manifest_seq == 0 && pinned_manifest_digest.is_some())
         {
             return Err(ErrorKind::MalformedState.into());
         }
         Ok(Self {
             pq_pinned: state.pq_pinned,
             pinned_manifest_seq: state.pinned_manifest_seq,
+            pinned_manifest_digest,
             allow_classical_exception: state.allow_classical_exception,
             downgrade_detected: state.downgrade_detected,
             peer_pq_capable: state.peer_pq_capable,
@@ -2139,6 +2075,15 @@ impl<M> Session<M> {
             return Err(ErrorKind::InvalidInitialMessage.into());
         }
         let state = &mut self.state;
+        if new.peer_pq.pinned_manifest_seq == state.peer_pq.pinned_manifest_seq
+            && let (Some(existing_digest), Some(incoming_digest)) = (
+                state.peer_pq.pinned_manifest_digest,
+                new.peer_pq.pinned_manifest_digest,
+            )
+            && existing_digest != incoming_digest
+        {
+            return Err(ErrorKind::DowngradeDetected.into());
+        }
         if let Some(active) = &new.active {
             let started_here = !active.known_by_peer;
             if !started_here {
@@ -2177,8 +2122,12 @@ impl<M> Session<M> {
         state.peer_pq.pq_pinned |= new.peer_pq.pq_pinned;
         if new.peer_pq.pinned_manifest_seq > state.peer_pq.pinned_manifest_seq {
             state.peer_pq.pinned_manifest_seq = new.peer_pq.pinned_manifest_seq;
+            state.peer_pq.pinned_manifest_digest = new.peer_pq.pinned_manifest_digest;
             state.peer_pq.peer_pq_capable = new.peer_pq.peer_pq_capable;
         } else if new.peer_pq.pinned_manifest_seq == state.peer_pq.pinned_manifest_seq {
+            if state.peer_pq.pinned_manifest_digest.is_none() {
+                state.peer_pq.pinned_manifest_digest = new.peer_pq.pinned_manifest_digest;
+            }
             state.peer_pq.peer_pq_capable |= new.peer_pq.peer_pq_capable;
         }
         if ((!was_pq_pinned && new.peer_pq.pq_pinned)
@@ -4182,7 +4131,8 @@ mod test {
                 .unwrap()
                 .unwrap();
             received.extend(
-                attachment::decrypt_chunk(upload.key(), index, index == 2, &chunk).unwrap(),
+                attachment::decrypt_chunk(upload.key(), upload.id(), index, index == 2, &chunk)
+                    .unwrap(),
             );
         }
         assert_eq!(received, file);
@@ -4219,7 +4169,7 @@ mod test {
                 .unwrap()
                 .unwrap();
             received.extend(
-                attachment::decrypt_chunk(resumed.key(), index, index == 2, &chunk).unwrap(),
+                attachment::decrypt_chunk(resumed.key(), &id, index, index == 2, &chunk).unwrap(),
             );
         }
         assert_eq!(received, file);
@@ -4323,132 +4273,6 @@ mod test {
             contents(receive_all(&mut alice_session).await),
             [b"hello".to_vec()]
         );
-    }
-
-    #[cfg(feature = "rkyv")]
-    #[tokio::test]
-    async fn rkyv_verify_rejects_corrupted_client_and_session_states() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (_alice, mut alice_session, mut bob, _bob_session) =
-            talking(&handshake, &mailbox).await;
-
-        // Valid states round-trip cleanly through rkyv::from_bytes (with bytecheck::Verify).
-        let valid_client = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&valid_client).is_ok());
-        let valid_session = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&valid_session).is_ok());
-
-        // 1. ClientState: strict_pq with pq_enabled == false rejected.
-        bob.state.pq_config.pq_enabled = false;
-        bob.state.pq_config.strict_pq = true;
-        let bad_client = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_client).is_err());
-
-        // 2. ClientState: last_timestamp > MAX_SAFE_INTEGER rejected.
-        bob.state.pq_config.strict_pq = false;
-        bob.state.last_timestamp = protocol::MAX_SAFE_INTEGER + 1;
-        let bad_ts = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_ts).is_err());
-
-        // 3. SessionState: non-canonical `me` rejected.
-        let orig_me = alice_session.state.me;
-        alice_session.state.me[31] |= 0x80;
-        let bad_me = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_me).is_err());
-        alice_session.state.me = orig_me;
-
-        // 4. SessionState: cursor > MAX_SAFE_INTEGER, others > KEPT_SESSIONS, delivered > cap rejected.
-        let orig_cursor = alice_session.state.cursor;
-        alice_session.state.cursor = protocol::MAX_SAFE_INTEGER + 1;
-        let bad_cursor = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_cursor).is_err());
-        alice_session.state.cursor = orig_cursor;
-
-        alice_session.state.delivered =
-            vec![[0u8; DELIVERY_TOKEN_LENGTH]; MAX_STORED_DELIVERED + 1];
-        let bad_delivered = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_delivered).is_err());
-        alice_session.state.delivered.clear();
-
-        // 4b. `others.len() > KEPT_SESSIONS` rejected.
-        let extra = Earlier::from(alice_session.state.active.take().unwrap());
-        let saved_party_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&extra).unwrap();
-        alice_session.state.others.push(extra);
-        for _ in 0..KEPT_SESSIONS {
-            alice_session.state.others.push(
-                rkyv::from_bytes::<Earlier, rkyv::rancor::Error>(&saved_party_bytes).unwrap(),
-            );
-        }
-        assert!(alice_session.state.others.len() > KEPT_SESSIONS);
-        let bad_others = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_others).is_err());
-        alice_session.state.others.truncate(1);
-        let restored_earlier = alice_session.state.others.pop().unwrap();
-        alice_session.state.active = Some(Active {
-            party: restored_earlier.party,
-            id: bob.state().identity.compute_public_key().to_bytes(),
-            known_by_peer: true,
-            initial_message: vec![],
-            delivery_key: restored_earlier.delivery_key,
-            security: SessionSecurity::classical(),
-            peer_session_seq: 0,
-        });
-
-        // 5. SessionState: mismatched `active.security` vs `party` rejected.
-        alice_session.state.active.as_mut().unwrap().security =
-            SessionSecurity::pq(PqSuite::MlKem1024, true);
-        let bad_sec = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_sec).is_err());
-        alice_session.state.active.as_mut().unwrap().security = SessionSecurity::classical();
-
-        // 6. SessionState: active or earlier party whose AD does not bind `(me, peer)` rejected!
-        let mut carol = Client::new(InProcessHandshake(&handshake));
-        let mut carol_session = carol
-            .initiate(&bob.identity_key(), b"carol", InProcessMailbox(&mailbox))
-            .await
-            .unwrap();
-        let orig_peer = alice_session.state.peer;
-        alice_session.state.peer = carol.identity_key();
-        let bad_active_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_active_ad).is_err());
-        alice_session.state.peer = orig_peer;
-
-        // Tampered `others[0].party` AD (foreign Carol->Bob party inside Alice->Bob state) rejected!
-        alice_session
-            .state
-            .others
-            .push(Earlier::from(carol_session.state.active.take().unwrap()));
-        let bad_earlier_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_earlier_ad).is_err());
-        alice_session.state.others.clear();
-
-        // Wrong AD length on active party (32 bytes instead of 64/96) rejected!
-        let bad_ad_party = Party::new(
-            Ratchet::bob(
-                &SharedKeys::from_secret(&[7u8; 32]),
-                DhPrivateKey::from([8u8; 32]),
-            ),
-            vec![0xAA; 32],
-        );
-        alice_session.state.active.as_mut().unwrap().party = bad_ad_party;
-        let bad_len_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_len_ad).is_err());
-
-        // 7. Zero-copy `ArchivedClientState::verify` rejects `manifest_seq > 0` with empty
-        //    `recent_manifest_digests`, and `ArchivedSessionState::verify` rejects mismatched
-        //    `pq_ratchet` metadata against the archived `Party`!
-        let mut bob_clone = Client::new(InProcessHandshake(&handshake));
-        bob_clone.state.manifest_seq = 1;
-        bob_clone.state.recent_manifest_digests.clear();
-        let bad_digests = rkyv::to_bytes::<rkyv::rancor::Error>(bob_clone.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_digests).is_err());
-
-        let (_, mut s_pq_mismatch, _, _) = talking(&handshake, &mailbox).await;
-        s_pq_mismatch.state.active.as_mut().unwrap().security =
-            SessionSecurity::pq(PqSuite::MlKem1024, true);
-        let bad_pq_meta = rkyv::to_bytes::<rkyv::rancor::Error>(s_pq_mismatch.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_pq_meta).is_err());
     }
 
     #[cfg(feature = "serde")]

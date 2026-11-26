@@ -10,8 +10,6 @@ const PQ_PROTOS: [&str; 2] = ["proto/handshake_v2.proto", "proto/mailbox_v2.prot
 const INCLUDES: [&str; 2] = ["proto", "../party/proto"];
 const SERDE: &str =
     r#"#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]"#;
-const RKYV: &str =
-    r#"#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]"#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
@@ -43,8 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".notify.v1.SubscribeRequest.audience",
             r#"#[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]"#,
         )
-        .type_attribute(".", SERDE)
-        .type_attribute(".", RKYV);
+        .type_attribute(".", SERDE);
     #[cfg(feature = "protox")]
     config.compile_fds(protox::compile(&protos, INCLUDES)?)?;
     #[cfg(not(feature = "protox"))]

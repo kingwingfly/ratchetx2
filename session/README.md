@@ -13,13 +13,13 @@ Files too large for a message go as attachments ([`attachment`]): [`Client::star
 
 To check that nobody swapped an identity key between two peers, e.g. a server in the middle, they compare their [`safety_number`] out of band: 60 digits, computed as Signal's are, the same on both sides only if each has the other's real key.
 
-To keep them between runs, save their states ([`Client::state`], [`Session::state`]) and restore them with [`Client::restore`] and [`Session::restore`]. The states serialize with serde or rkyv, or convert to and from protobuf messages, as the features below enable. They hold private keys, so keep them secret, e.g. encrypted.
+To keep them between runs, save their states ([`Client::state`], [`Session::state`]) and restore them with [`Client::restore`] and [`Session::restore`]. Use the `prost` feature for the portable, versioned protobuf persistence format (or `serde`), as the features below enable. They hold private keys, so keep them secret, e.g. encrypted.
 
 # Features
 
 - **protox** (default): compile the `.proto` files with [protox](https://crates.io/crates/protox); without it, `protoc` must be installed.
-- **serde**, **rkyv**: serialize [`ClientState`] and [`SessionState`].
-- **prost**: the states as protobuf messages too, defined in `proto/session.proto` (package `session.v1`), in the `proto` module; they are zeroized on drop.
+- **prost**: portable, versioned protobuf persistence format for [`ClientState`] and [`SessionState`], defined in `proto/session.proto` (package `session.v1`), in the `proto` module; they are zeroized on drop.
+- **serde**: serialize [`ClientState`] and [`SessionState`].
 - **connect**: Connect clients over any HTTP client, in `protocol::connect`.
 
 On `wasm32-unknown-unknown`, enable getrandom's `wasm_js` feature in the final application.

@@ -2051,8 +2051,11 @@ impl<V: VaultStore> Engine<V> {
                 FetchError::Other(format!("{} is not the size it should be", fetching.name))
             })?;
         let decrypt_and_validate = |ciphertext: &[u8]| -> Result<Vec<u8>, FetchError> {
-            let plaintext = attachment::decrypt_chunk(&fetching.key, index, last, ciphertext)
-                .map_err(|_| FetchError::Other(format!("{} does not decrypt", fetching.name)))?;
+            let plaintext =
+                attachment::decrypt_chunk(&fetching.key, &fetching.id, index, last, ciphertext)
+                    .map_err(|_| {
+                        FetchError::Other(format!("{} does not decrypt", fetching.name))
+                    })?;
             if plaintext.len() != expected_len {
                 return Err(FetchError::Other(format!(
                     "{} is not the size it should be",
