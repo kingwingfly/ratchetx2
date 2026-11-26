@@ -27,7 +27,7 @@ use bytes::Bytes;
 use hkdf::Hkdf;
 use protocol::attachment::{
     DeleteAttachmentRequest, GetChunkRequest, ID_LENGTH, LocalAttachments, MAX_CHUNK_SIZE,
-    PutChunkRequest, TOKEN_LENGTH,
+    MIN_CHUNK_SIZE, PutChunkRequest, TOKEN_LENGTH,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -99,13 +99,18 @@ fn nonce(index: u32, last: bool) -> [u8; NONCE_LENGTH] {
     nonce
 }
 
-/// Per-upload nonce-reuse guard state tracking sealed chunk digests and resume watermark.
+/// Per-upload nonce-reuse guard state tracking sealed chunk digests and monotonic watermarks.
 #[derive(Default)]
 pub(crate) struct SealedChunks {
     /// Chunks strictly below this index were already encrypted in an earlier run and must not
-    /// be re-encrypted under this handle.
+    /// be re-encrypted under this handle unless their persisted plaintext digest matches.
     resumed_before: u32,
-    /// SHA-256 digest of the plaintext sealed for each chunk index encrypted on this handle.
+    /// Monotonic high-water mark (`highest_sealed_index + 1`): encrypting any unrecorded index
+    /// `< sealed_through` is refused so out-of-order/sparse gaps can never be back-filled with a
+    /// reused nonce after a restart.
+    sealed_through: u32,
+    /// SHA-256 digest of the plaintext sealed for each chunk index encrypted on this handle (or
+    /// restored via [`Upload::resume_with_digests`]).
     digests: HashMap<u32, [u8; 32]>,
 }
 
@@ -151,15 +156,16 @@ impl Upload {
     /// An upload started earlier, from its [ID](Self::id), [token](Self::token),
     /// [key](Self::key) and number of [chunks](Self::chunks), to go on with.
     ///
-    /// Prefer [`Upload::resume_from`] whenever the caller knows how many leading chunks were
-    /// already encrypted before restarting, so any accidental re-encryption of an earlier chunk
-    /// is rejected with [`ErrorKind::NonceReuse`].
-    pub fn resume(id: [u8; ID_LENGTH], token: [u8; TOKEN_LENGTH], key: Key, chunks: u32) -> Self {
-        Self::resume_from(id, Zeroizing::new(token), key, chunks, 0)
+    /// Prefer [`Upload::resume_from`] (or [`Upload::resume_with_digests`]) whenever the caller
+    /// knows how many leading chunks were already encrypted before restarting, so any accidental
+    /// re-encryption of an earlier chunk is rejected with [`ErrorKind::NonceReuse`].
+    pub fn resume(id: [u8; ID_LENGTH], token: impl Into<Token>, key: Key, chunks: u32) -> Self {
+        Self::resume_from(id, token, key, chunks, 0)
     }
 
-    /// An upload started earlier, refusing to encrypt any chunk index `< sealed_chunks` so a
-    /// resumed upload can never reuse an AES-GCM nonce across a restart.
+    /// An upload started earlier, refusing to encrypt any chunk index `< sealed_chunks` (and any
+    /// unrecorded out-of-order index below the highest sealed index on this handle) so a resumed
+    /// upload can never reuse an AES-GCM nonce across a restart.
     pub fn resume_from(
         id: [u8; ID_LENGTH],
         token: impl Into<Token>,
@@ -167,6 +173,26 @@ impl Upload {
         chunks: u32,
         sealed_chunks: u32,
     ) -> Self {
+        Self::resume_with_digests(id, token, key, chunks, sealed_chunks, HashMap::new())
+    }
+
+    /// An upload started earlier with persisted chunk plaintext SHA-256 `digests` (allowing
+    /// idempotent retries of already-sealed chunks only when byte-identical while rejecting any
+    /// unrecorded index `< sealed_chunks` with [`ErrorKind::NonceReuse`]).
+    pub fn resume_with_digests(
+        id: [u8; ID_LENGTH],
+        token: impl Into<Token>,
+        key: Key,
+        chunks: u32,
+        sealed_chunks: u32,
+        digests: HashMap<u32, [u8; 32]>,
+    ) -> Self {
+        let highest = digests
+            .keys()
+            .copied()
+            .max()
+            .map_or(0, |idx| idx.saturating_add(1));
+        let sealed_through = sealed_chunks.max(highest);
         Self {
             id,
             token: token.into(),
@@ -175,9 +201,18 @@ impl Upload {
             expires: None,
             sealed: Mutex::new(SealedChunks {
                 resumed_before: sealed_chunks,
-                digests: HashMap::new(),
+                sealed_through,
+                digests,
             }),
         }
+    }
+
+    /// High-water mark (`highest_sealed_index + 1`) of chunks sealed by or before this handle.
+    pub fn sealed_chunks(&self) -> u32 {
+        self.sealed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sealed_through
     }
 
     /// When the server deletes the attachment, in milliseconds since the Unix epoch, after which
@@ -206,38 +241,47 @@ impl Upload {
         self.chunks
     }
 
-    /// Encrypt chunk `index` after verifying it is in range (`index < chunks`), not below the
-    /// resumed sealed-chunk floor, and not previously encrypted with different plaintext.
+    /// Encrypt chunk `index` after verifying:
+    /// - `index < chunks` (else [`ErrorKind::InvalidArgument`]),
+    /// - `plaintext.len() <= CHUNK_SIZE` (else [`ErrorKind::LimitExceeded`]),
+    /// - `plaintext.len() == CHUNK_SIZE` for every non-last chunk (`index + 1 < chunks`, else
+    ///   [`ErrorKind::InvalidArgument`]),
+    /// - `index` is neither below the resumed sealed-chunk floor nor an unrecorded index below an
+    ///   already-sealed higher chunk index, nor previously encrypted with different plaintext
+    ///   (else [`ErrorKind::NonceReuse`]).
     ///
     /// Re-encrypting the same `index` with byte-identical `plaintext` (e.g. an idempotent retry)
     /// is allowed because AES-GCM with the same key, nonce, and plaintext produces the exact same
     /// ciphertext. Encrypting `index` with different data fails with [`ErrorKind::NonceReuse`].
     pub fn try_encrypt(&self, index: u32, plaintext: &[u8]) -> Result<Vec<u8>> {
-        if index >= self.chunks || plaintext.len() > CHUNK_SIZE {
-            return Err(ErrorKind::NonceReuse.into());
+        if index >= self.chunks {
+            return Err(ErrorKind::InvalidArgument.into());
+        }
+        if plaintext.len() > CHUNK_SIZE {
+            return Err(ErrorKind::LimitExceeded.into());
+        }
+        let last = index + 1 == self.chunks;
+        if !last && plaintext.len() != CHUNK_SIZE {
+            return Err(ErrorKind::InvalidArgument.into());
         }
         let digest: [u8; 32] = Sha256::digest(plaintext).into();
         let mut sealed = self
             .sealed
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if index < sealed.resumed_before {
-            return Err(ErrorKind::NonceReuse.into());
-        }
         if let Some(previous) = sealed.digests.get(&index) {
             if *previous != digest {
                 return Err(ErrorKind::NonceReuse.into());
             }
         } else {
+            if index < sealed.resumed_before || index < sealed.sealed_through {
+                return Err(ErrorKind::NonceReuse.into());
+            }
             sealed.digests.insert(index, digest);
+            sealed.sealed_through = index.saturating_add(1);
         }
         drop(sealed);
-        Ok(encrypt_chunk(
-            &self.key,
-            index,
-            index + 1 == self.chunks,
-            plaintext,
-        ))
+        Ok(encrypt_chunk(&self.key, index, last, plaintext))
     }
 
     /// Chunk `index`, encrypted: `plaintext` is its part of the file, [`CHUNK_SIZE`] bytes from
@@ -311,15 +355,21 @@ pub async fn download_chunk(
             index,
         })
         .await?;
-    Ok(response.uploaded.then(|| response.data.to_vec()))
+    if !response.uploaded {
+        return Ok(None);
+    }
+    if response.data.len() < MIN_CHUNK_SIZE || response.data.len() > MAX_CHUNK_SIZE {
+        return Err(ErrorKind::InvalidResponse.into());
+    }
+    Ok(Some(response.data.to_vec()))
 }
 
 /// The delete token of the attachment whose key is `key`, which the uploader and its recipients
 /// alike derive: HKDF-SHA256 of the key, with no salt, and `"attachment.v1/delete"` as info.
-pub fn delete_token(key: &[u8; KEY_LENGTH]) -> [u8; TOKEN_LENGTH] {
-    let mut token = [0; TOKEN_LENGTH];
+pub fn delete_token(key: &[u8; KEY_LENGTH]) -> Token {
+    let mut token = Zeroizing::new([0; TOKEN_LENGTH]);
     Hkdf::<Sha256>::new(None, key)
-        .expand(b"attachment.v1/delete", &mut token)
+        .expand(b"attachment.v1/delete", token.as_mut_slice())
         .expect("16 bytes are a valid HKDF-SHA256 output length");
     token
 }
@@ -327,7 +377,7 @@ pub fn delete_token(key: &[u8; KEY_LENGTH]) -> [u8; TOKEN_LENGTH] {
 /// SHA-256 of the delete token of the attachment whose key is `key`, which its upload's start
 /// gives the service.
 pub(crate) fn delete_hash(key: &[u8; KEY_LENGTH]) -> [u8; 32] {
-    let token = Zeroizing::new(delete_token(key));
+    let token = delete_token(key);
     Sha256::digest(token.as_slice()).into()
 }
 
@@ -341,7 +391,7 @@ pub async fn delete(
     id: &[u8; ID_LENGTH],
     key: &[u8; KEY_LENGTH],
 ) -> Result<()> {
-    let token = Zeroizing::new(delete_token(key));
+    let token = delete_token(key);
     attachments
         .delete_attachment(DeleteAttachmentRequest {
             id: Bytes::copy_from_slice(id),
@@ -351,11 +401,16 @@ pub async fn delete(
     Ok(())
 }
 
-/// A new random key.
-pub(crate) fn generate_key() -> Key {
+/// A new random key, returning an error if the OS RNG fails.
+pub(crate) fn try_generate_key() -> Result<Key> {
     let mut key = Zeroizing::new([0; KEY_LENGTH]);
-    getrandom::fill(key.as_mut_slice()).expect("the system random number generator failed");
-    key
+    getrandom::fill(key.as_mut_slice()).map_err(|_| ErrorKind::Protocol)?;
+    Ok(key)
+}
+
+#[cfg(test)]
+fn generate_key() -> Key {
+    try_generate_key().expect("the system random number generator failed")
 }
 
 #[cfg(test)]
@@ -386,6 +441,10 @@ mod test {
     #[test]
     fn upload_guards_against_nonce_reuse_and_resumed_floor() {
         let key = generate_key();
+        let full_chunk = vec![0x11; CHUNK_SIZE];
+        let mut diff_chunk = full_chunk.clone();
+        diff_chunk[0] ^= 0xFF;
+
         let upload = Upload::new(
             [1; ID_LENGTH],
             Zeroizing::new([2; TOKEN_LENGTH]),
@@ -393,26 +452,49 @@ mod test {
             3,
             None,
         );
-        let c0 = upload.try_encrypt(0, b"chunk-zero").unwrap();
+        // Short non-last chunk, oversized chunk, and out-of-range index are distinct from NonceReuse.
+        assert_eq!(
+            upload.try_encrypt(0, b"too-short").unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            upload
+                .try_encrypt(0, &vec![0u8; CHUNK_SIZE + 1])
+                .unwrap_err()
+                .kind(),
+            ErrorKind::LimitExceeded
+        );
+        assert_eq!(
+            upload.try_encrypt(3, b"oob").unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+
+        let c0 = upload.try_encrypt(0, &full_chunk).unwrap();
+        assert_eq!(upload.sealed_chunks(), 1);
         // Idempotent retry with identical plaintext produces the exact same ciphertext.
-        let c0_retry = upload.try_encrypt(0, b"chunk-zero").unwrap();
+        let c0_retry = upload.try_encrypt(0, &full_chunk).unwrap();
         assert_eq!(c0, c0_retry);
         // Encrypting the same chunk index with different plaintext is rejected!
-        let err = upload.try_encrypt(0, b"DIFFERENT!").unwrap_err();
+        let err = upload.try_encrypt(0, &diff_chunk).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NonceReuse);
-        // Out-of-range chunk index is rejected.
-        let err = upload.try_encrypt(3, b"oob").unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::NonceReuse);
+
+        // Skipping index 1 to seal index 2 permanently closes unrecorded gap 1 against nonce reuse.
+        let _c2 = upload.try_encrypt(2, b"chunk-two").unwrap();
+        assert_eq!(upload.sealed_chunks(), 3);
+        assert_eq!(
+            upload.try_encrypt(1, &full_chunk).unwrap_err().kind(),
+            ErrorKind::NonceReuse
+        );
 
         // Resumed upload refuses any chunk below `sealed_chunks`.
         let resumed =
             Upload::resume_from(*upload.id(), *upload.token(), Key::new(*upload.key()), 3, 2);
         assert_eq!(
-            resumed.try_encrypt(0, b"chunk-zero").unwrap_err().kind(),
+            resumed.try_encrypt(0, &full_chunk).unwrap_err().kind(),
             ErrorKind::NonceReuse
         );
         assert_eq!(
-            resumed.try_encrypt(1, b"chunk-one").unwrap_err().kind(),
+            resumed.try_encrypt(1, &full_chunk).unwrap_err().kind(),
             ErrorKind::NonceReuse
         );
         let c2 = resumed.try_encrypt(2, b"chunk-two").unwrap();
@@ -429,10 +511,66 @@ mod test {
             [1; ID_LENGTH],
             Zeroizing::new([2; TOKEN_LENGTH]),
             generate_key(),
-            2,
+            1,
             None,
         );
         let _ = upload.encrypt(0, b"original");
         let _ = upload.encrypt(0, b"tampered");
+    }
+
+    #[tokio::test]
+    async fn download_chunk_rejects_oversized_or_truncated_response() {
+        struct BadSizeAttachments(Vec<u8>);
+        impl LocalAttachments for BadSizeAttachments {
+            async fn start_upload(
+                &self,
+                _: protocol::attachment::StartUploadRequest,
+            ) -> protocol::Result<protocol::attachment::StartUploadResponse> {
+                unreachable!()
+            }
+            async fn put_chunk(
+                &self,
+                _: PutChunkRequest,
+            ) -> protocol::Result<protocol::attachment::PutChunkResponse> {
+                unreachable!()
+            }
+            async fn get_chunk(
+                &self,
+                _: GetChunkRequest,
+            ) -> protocol::Result<protocol::attachment::GetChunkResponse> {
+                Ok(protocol::attachment::GetChunkResponse {
+                    data: Bytes::from(self.0.clone()),
+                    uploaded: true,
+                })
+            }
+            async fn delete_attachment(
+                &self,
+                _: DeleteAttachmentRequest,
+            ) -> protocol::Result<protocol::attachment::DeleteAttachmentResponse> {
+                unreachable!()
+            }
+        }
+        assert_eq!(
+            download_chunk(
+                &BadSizeAttachments(vec![0; MAX_CHUNK_SIZE + 1]),
+                &[1; 16],
+                0
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            ErrorKind::InvalidResponse
+        );
+        assert_eq!(
+            download_chunk(
+                &BadSizeAttachments(vec![0; MIN_CHUNK_SIZE - 1]),
+                &[1; 16],
+                0
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+            ErrorKind::InvalidResponse
+        );
     }
 }

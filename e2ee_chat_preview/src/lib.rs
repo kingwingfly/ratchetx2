@@ -16,7 +16,12 @@
 //! The worker replies with `[id, true, value]` or `[id, false, error_string]`.
 
 pub mod audio;
-#[cfg(feature = "code")]
+#[cfg(any(
+    feature = "code-web",
+    feature = "code-systems",
+    feature = "code-apps",
+    feature = "code-scripts",
+))]
 pub mod code;
 #[cfg(feature = "diagram")]
 pub mod diagram;
@@ -28,6 +33,8 @@ pub mod rpc;
 pub mod search;
 #[cfg(feature = "worker")]
 pub mod worker;
+
+pub use rpc::WorkerService;
 
 use language::Group;
 

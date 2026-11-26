@@ -66,9 +66,15 @@ pub enum Error {
     /// curve, or not in the prime-order subgroup.
     #[error("invalid public key")]
     InvalidPublicKey,
+    /// The private key scalar is invalid (e.g. zero).
+    #[error("invalid private key")]
+    InvalidPrivateKey,
     /// The signature does not verify.
     #[error("invalid signature")]
     Signature,
+    /// The system random number generator failed.
+    #[error("random number generator failed")]
+    Rng,
 }
 
 /// A zero scalar cannot be used as an XEdDSA private key.
@@ -168,15 +174,25 @@ impl TryFrom<Scalar> for XEdDSAPrivateKey {
 }
 
 impl XEdDSAPrivateKey {
-    /// Generate a new XEdDSA private key.
+    /// Generate a new XEdDSA private key using wide 64-byte scalar reduction.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system random number generator fails. Prefer [`try_generate`](Self::try_generate)
+    /// when RNG errors must be handled without panicking.
     pub fn generate() -> Self {
-        let mut bytes = Zeroizing::new([0u8; PRIVATE_KEY_LENGTH]);
+        Self::try_generate().expect("the system random number generator failed")
+    }
+
+    /// Generate a new XEdDSA private key using wide 64-byte scalar reduction, returning
+    /// [`Error::Rng`] if the system random number generator fails.
+    pub fn try_generate() -> Result<Self> {
+        let mut bytes = Zeroizing::new([0u8; 64]);
         loop {
-            getrandom::fill(bytes.as_mut_slice())
-                .expect("the system random number generator failed");
-            let private_key = Scalar::from_bytes_mod_order(*bytes);
+            getrandom::fill(bytes.as_mut_slice()).map_err(|_| Error::Rng)?;
+            let private_key = Scalar::from_bytes_mod_order_wide(&bytes);
             if private_key != Scalar::ZERO {
-                return XEdDSAPrivateKey { private_key };
+                return Ok(XEdDSAPrivateKey { private_key });
             }
         }
     }
@@ -196,8 +212,15 @@ impl XEdDSAPrivateKey {
 
     /// The XEdDSA public key for the key pair.
     pub fn compute_public_key(&self) -> XEdDSAPublicKey {
+        let edwards = EdwardsPoint::mul_base(&self.private_key);
+        let montgomery_public_key = edwards.to_montgomery();
+        let mut edwards_y = edwards.compress().to_bytes();
+        edwards_y[ed25519_dalek::PUBLIC_KEY_LENGTH - 1] &= 0x7F;
+        let verifying_key = VerifyingKey::from_bytes(&edwards_y)
+            .expect("EdwardsPoint::mul_base yields a valid compressed Edwards point");
         XEdDSAPublicKey {
-            montgomery_public_key: MontgomeryPoint::mul_base(&self.private_key),
+            montgomery_public_key,
+            verifying_key,
         }
     }
 
@@ -209,7 +232,7 @@ impl XEdDSAPrivateKey {
         peer_public_key: &[u8],
     ) -> Result<Zeroizing<[u8; PUBLIC_KEY_LENGTH]>> {
         if self.private_key == Scalar::ZERO {
-            return Err(Error::InvalidPublicKey);
+            return Err(Error::InvalidPrivateKey);
         }
         // The private scalar is not clamped, so a non-canonical encoding, a point on the twist,
         // the identity, or a point with a small-order component must be rejected.
@@ -220,8 +243,37 @@ impl XEdDSAPrivateKey {
     }
 
     /// Sign, as Ed25519, with the key pair's private key.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system random number generator fails. Prefer [`try_sign`](Self::try_sign)
+    /// when RNG errors must be handled without panicking.
     pub fn sign(&self, message: impl AsRef<[u8]>) -> [u8; SIGNATURE_LENGTH] {
+        self.try_sign(message)
+            .expect("the system random number generator failed")
+    }
+
+    /// Sign, as Ed25519, with the key pair's private key, returning [`Error::Rng`] if the system
+    /// random number generator fails.
+    pub fn try_sign(&self, message: impl AsRef<[u8]>) -> Result<[u8; SIGNATURE_LENGTH]> {
         let message = message.as_ref();
+        // Z: 64 random bytes, per the XEdDSA spec.
+        let mut random = Zeroizing::new([0u8; 64]);
+        loop {
+            getrandom::fill(random.as_mut_slice()).map_err(|_| Error::Rng)?;
+            if let Some(sig) = self.sign_with_random(message, &random) {
+                return Ok(sig);
+            }
+        }
+    }
+
+    /// Core XEdDSA signing using caller-provided 64-byte randomizer `Z` (returns `None` only in
+    /// the negligible event that `r == 0 mod l`).
+    fn sign_with_random(
+        &self,
+        message: &[u8],
+        random: &[u8; 64],
+    ) -> Option<[u8; SIGNATURE_LENGTH]> {
         let mut private_key = Zeroizing::new(self.private_key);
         let mut edwards_public_key_y = EdwardsPoint::mul_base(&private_key).compress().to_bytes();
         // The sign bit is the top bit of the last byte. The verifier takes the Edwards point
@@ -230,49 +282,57 @@ impl XEdDSAPrivateKey {
         let sign = Choice::from(edwards_public_key_y[ed25519_dalek::PUBLIC_KEY_LENGTH - 1] >> 7);
         private_key.conditional_negate(sign);
         edwards_public_key_y[ed25519_dalek::PUBLIC_KEY_LENGTH - 1] &= 0x7F;
-        // Z: 64 random bytes, per the XEdDSA spec.
-        let mut random = Zeroizing::new([0u8; 64]);
-        let r = loop {
-            getrandom::fill(random.as_mut_slice())
-                .expect("the system random number generator failed");
-            // r = hash1(a || M || Z)
-            let mut to_digest = Zeroizing::new(Vec::with_capacity(
-                HASH1_PREFIX.len() + private_key.as_bytes().len() + message.len() + random.len(),
-            ));
-            to_digest.extend(HASH1_PREFIX);
-            to_digest.extend(private_key.as_bytes());
-            to_digest.extend(message);
-            to_digest.extend(random.iter());
-            let digest: Zeroizing<[u8; 64]> =
-                Zeroizing::new(Sha512::digest(to_digest.as_slice()).into());
-            let r = Zeroizing::new(Scalar::from_bytes_mod_order_wide(&digest));
-            if *r != Scalar::ZERO {
-                break r;
-            }
-        };
+
+        // r = hash1(a || M || Z), streamed directly into SHA-512 with zero heap allocations.
+        let digest: Zeroizing<[u8; 64]> = Zeroizing::new(
+            Sha512::new()
+                .chain_update(HASH1_PREFIX)
+                .chain_update(private_key.as_bytes())
+                .chain_update(message)
+                .chain_update(random)
+                .finalize()
+                .into(),
+        );
+        let r = Zeroizing::new(Scalar::from_bytes_mod_order_wide(&digest));
+        if *r == Scalar::ZERO {
+            return None;
+        }
         let r_ = EdwardsPoint::mul_base(&r).compress();
-        let mut to_digest = r_.to_bytes().to_vec();
-        to_digest.extend(edwards_public_key_y);
-        to_digest.extend(message);
-        let h = Scalar::from_bytes_mod_order_wide(&Sha512::digest(&to_digest).into());
-        let s = *r + h * *private_key;
-        Signature::from_components(r_.to_bytes(), s.to_bytes()).to_bytes()
+        let h = Scalar::from_bytes_mod_order_wide(
+            &Sha512::new()
+                .chain_update(r_.as_bytes())
+                .chain_update(edwards_public_key_y)
+                .chain_update(message)
+                .finalize()
+                .into(),
+        );
+        let h_a = Zeroizing::new(h * *private_key);
+        let s = *r + *h_a;
+        Some(Signature::from_components(r_.to_bytes(), s.to_bytes()).to_bytes())
     }
 }
 
 /// XEdDSA public key.
-#[derive(Debug)]
+///
+/// Always represents a canonically encoded Curve25519 point in the prime-order subgroup, with its
+/// corresponding Ed25519 [`VerifyingKey`] cached at construction time so repeated signature
+/// verifications avoid repeating point decompression and torsion checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct XEdDSAPublicKey {
     montgomery_public_key: MontgomeryPoint,
+    verifying_key: VerifyingKey,
 }
 
 impl XEdDSAPublicKey {
     /// Create a new XEdDSA public key from bytes; fails unless they are [`PUBLIC_KEY_LENGTH`]
     /// bytes, canonically encoded, and represent a prime-order non-identity Curve25519 point.
     pub fn new(bytes: &[u8]) -> Result<Self> {
-        let (montgomery_public_key, _) = decode_prime_order_point(bytes)?;
+        let (montgomery_public_key, edwards) = decode_prime_order_point(bytes)?;
+        let verifying_key = VerifyingKey::from_bytes(edwards.compress().as_bytes())
+            .map_err(|_| Error::InvalidPublicKey)?;
         Ok(XEdDSAPublicKey {
             montgomery_public_key,
+            verifying_key,
         })
     }
 
@@ -283,20 +343,10 @@ impl XEdDSAPublicKey {
 
     /// Verify strictly with the Ed25519 (Edwards) public key for the key pair.
     pub fn verify(&self, message: impl AsRef<[u8]>, signature: &[u8]) -> Result<()> {
-        if !is_canonical_public_key(self.montgomery_public_key.as_bytes()) {
-            return Err(Error::InvalidPublicKey);
-        }
-        let edwards_public_key = self
-            .montgomery_public_key
-            .to_edwards(0)
-            .ok_or(Error::InvalidPublicKey)?;
-        if !edwards_public_key.is_torsion_free() || edwards_public_key.is_identity() {
-            return Err(Error::InvalidPublicKey);
-        }
         let signature = Signature::from_slice(signature).map_err(|_| Error::Signature)?;
-        // Use ed25519-dalek's strict Ed25519 verification.
-        VerifyingKey::from_bytes(edwards_public_key.compress().as_bytes())
-            .and_then(|key| key.verify_strict(message.as_ref(), &signature))
+        // Use ed25519-dalek's strict Ed25519 verification against the cached prime-order key.
+        self.verifying_key
+            .verify_strict(message.as_ref(), &signature)
             .map_err(|_| Error::Signature)?;
         Ok(())
     }
@@ -407,41 +457,27 @@ mod test {
     fn zero_public_key_forgery_fails() {
         // Under cofactored Ed25519 verification, A = [0; 32] (u = 0 -> Edwards order-2 point)
         // accepts forged signatures such as (R = order-2 or identity, s = 0).
-        let mut forged_sig = [0u8; SIGNATURE_LENGTH];
-        forged_sig[..32].copy_from_slice(&ORDER_2);
-
+        // `XEdDSAPublicKey::new` rejects zero/small-order keys up front so they cannot even be
+        // constructed as a verifying key.
         assert_eq!(
             XEdDSAPublicKey::new(&[0; 32]).unwrap_err(),
             Error::InvalidPublicKey
         );
-
-        let raw_zero_pk = XEdDSAPublicKey {
-            montgomery_public_key: MontgomeryPoint([0; 32]),
-        };
         assert_eq!(
-            raw_zero_pk
-                .verify(b"forged message", &forged_sig)
-                .unwrap_err(),
-            Error::InvalidPublicKey
-        );
-
-        // Identity R with s = 0 also fails.
-        let mut identity_r_sig = [0u8; SIGNATURE_LENGTH];
-        identity_r_sig[0] = 1; // Compressed Edwards identity (0, 1)
-        assert_eq!(
-            raw_zero_pk
-                .verify(b"forged message", &identity_r_sig)
-                .unwrap_err(),
+            XEdDSAPublicKey::new(&ORDER_2).unwrap_err(),
             Error::InvalidPublicKey
         );
     }
 
     #[test]
     fn non_canonical_public_keys_rejected() {
-        let alice = XEdDSAPrivateKey::generate();
-        let bob = XEdDSAPrivateKey::generate();
+        let alice = XEdDSAPrivateKey::try_generate().unwrap();
+        let bob = XEdDSAPrivateKey::try_generate().unwrap();
         let bob_pk = bob.compute_public_key();
-        let sig = bob.sign(b"canonical check");
+        assert_eq!(bob_pk, XEdDSAPublicKey::new(bob_pk.as_ref()).unwrap());
+        let bob_pk_copy = bob_pk;
+        assert_eq!(bob_pk, bob_pk_copy);
+        let sig = bob.try_sign(b"canonical check").unwrap();
         assert!(is_canonical_public_key(&bob_pk.to_bytes()));
         bob_pk.verify(b"canonical check", &sig).unwrap();
 
@@ -455,13 +491,6 @@ mod test {
         );
         assert_eq!(
             alice.diffie_hellman(&bit255).unwrap_err(),
-            Error::InvalidPublicKey
-        );
-        let raw_bit255 = XEdDSAPublicKey {
-            montgomery_public_key: MontgomeryPoint(bit255),
-        };
-        assert_eq!(
-            raw_bit255.verify(b"canonical check", &sig).unwrap_err(),
             Error::InvalidPublicKey
         );
 
@@ -482,13 +511,6 @@ mod test {
         );
         assert_eq!(
             alice.diffie_hellman(&u_plus_p).unwrap_err(),
-            Error::InvalidPublicKey
-        );
-        let raw_u_plus_p = XEdDSAPublicKey {
-            montgomery_public_key: MontgomeryPoint(u_plus_p),
-        };
-        assert_eq!(
-            raw_u_plus_p.verify(b"basepoint", &base_sig).unwrap_err(),
             Error::InvalidPublicKey
         );
 
@@ -527,13 +549,6 @@ mod test {
                 XEdDSAPublicKey::new(&bad).unwrap_err(),
                 Error::InvalidPublicKey
             );
-            let raw = XEdDSAPublicKey {
-                montgomery_public_key: MontgomeryPoint(bad),
-            };
-            assert_eq!(
-                raw.verify(b"msg", &[0u8; SIGNATURE_LENGTH]).unwrap_err(),
-                Error::InvalidPublicKey
-            );
         }
 
         // Strict verification rejects small-order R even on an honest public key.
@@ -545,6 +560,75 @@ mod test {
             bob_pk.verify(b"msg", &bad_r_sig).unwrap_err(),
             Error::Signature
         );
+    }
+
+    #[test]
+    fn fixed_randomizer_kat_and_malleability_rejection() {
+        // Test both sign-bit orientations (k and -k) with a fixed 64-byte randomizer Z.
+        let k = Scalar::from_bytes_mod_order([0x2au8; 32]);
+        let z = [0x5cu8; 64];
+        let msg = b"xeddsa fixed-randomizer KAT";
+
+        let priv_pos = XEdDSAPrivateKey::try_from(k).unwrap();
+        let priv_neg = XEdDSAPrivateKey::try_from(-k).unwrap();
+        let pub_pos = priv_pos.compute_public_key();
+        let pub_neg = priv_neg.compute_public_key();
+        // Both k and -k share the exact same XEdDSA public key and cached Edwards verifying key.
+        assert_eq!(pub_pos, pub_neg);
+        assert_eq!(pub_pos, XEdDSAPublicKey::new(pub_pos.as_ref()).unwrap());
+
+        // Because k and -k normalize to the exact same sign-0 scalar `a`, signing with the same
+        // randomizer `Z` MUST produce the exact same signature bytes.
+        let sig_pos = priv_pos.sign_with_random(msg, &z).unwrap();
+        let sig_neg = priv_neg.sign_with_random(msg, &z).unwrap();
+        assert_eq!(sig_pos, sig_neg);
+        pub_pos.verify(msg, &sig_pos).unwrap();
+
+        // Independently recompute the XEdDSA spec equations (Signal XEdDSA §2.3) and verify exact
+        // bit-for-bit match against `sig_pos`:
+        let mut a = k;
+        let mut a_bytes = EdwardsPoint::mul_base(&a).compress().to_bytes();
+        if a_bytes[31] >> 7 == 1 {
+            a = -a;
+            a_bytes[31] &= 0x7F;
+        }
+        let mut h1 = Sha512::new();
+        h1.update(HASH1_PREFIX);
+        h1.update(a.as_bytes());
+        h1.update(msg);
+        h1.update(z);
+        let r = Scalar::from_bytes_mod_order_wide(&h1.finalize().into());
+        let cap_r = EdwardsPoint::mul_base(&r).compress();
+        let mut h2 = Sha512::new();
+        h2.update(cap_r.as_bytes());
+        h2.update(a_bytes);
+        h2.update(msg);
+        let h = Scalar::from_bytes_mod_order_wide(&h2.finalize().into());
+        let s = r + h * a;
+        let mut expected = [0u8; SIGNATURE_LENGTH];
+        expected[..32].copy_from_slice(cap_r.as_bytes());
+        expected[32..].copy_from_slice(s.as_bytes());
+        assert_eq!(sig_pos, expected);
+
+        // Signature malleability: adding subgroup order `l` to `s` (yielding `s' = s + l >= l`)
+        // MUST be rejected by strict verification.
+        let mut malleated = sig_pos;
+        let mut carry = 0u16;
+        for (dst, &ord) in malleated[32..].iter_mut().zip(BASEPOINT_ORDER_BYTES.iter()) {
+            let sum = u16::from(*dst) + u16::from(ord) + carry;
+            *dst = sum as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0, "s + l must fit in 256 bits when s < l < 2^253");
+        assert_eq!(
+            pub_pos.verify(msg, &malleated).unwrap_err(),
+            Error::Signature
+        );
+
+        // `s == l` directly must also be rejected.
+        let mut s_eq_l = sig_pos;
+        s_eq_l[32..].copy_from_slice(&BASEPOINT_ORDER_BYTES);
+        assert_eq!(pub_pos.verify(msg, &s_eq_l).unwrap_err(), Error::Signature);
     }
 
     #[test]
@@ -575,15 +659,19 @@ mod test {
             zero_priv
                 .diffie_hellman(valid.compute_public_key().as_ref())
                 .unwrap_err(),
-            Error::InvalidPublicKey
+            Error::InvalidPrivateKey
         );
         let forged = zero_priv.sign(b"zero scalar");
+        assert_eq!(
+            XEdDSAPublicKey::new(zero_priv.compute_public_key().as_ref()).unwrap_err(),
+            Error::InvalidPublicKey
+        );
         assert_eq!(
             zero_priv
                 .compute_public_key()
                 .verify(b"zero scalar", &forged)
                 .unwrap_err(),
-            Error::InvalidPublicKey
+            Error::Signature
         );
     }
 

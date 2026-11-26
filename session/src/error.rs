@@ -187,6 +187,10 @@ pub enum ErrorKind {
     /// resumed sealed-chunk watermark, which would reuse an AES-GCM nonce.
     #[error("attachment chunk nonce reuse refused")]
     NonceReuse,
+    /// An argument to a local operation was out of range or malformed (e.g. out-of-range chunk
+    /// index or short non-last attachment chunk).
+    #[error("invalid argument")]
+    InvalidArgument,
     /// Local policy requires post-quantum security (strict PQ mode), refusing classical fallback.
     #[error("post-quantum security is required")]
     PqRequired,

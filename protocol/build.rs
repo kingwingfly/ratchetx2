@@ -14,6 +14,7 @@ const RKYV: &str =
     r#"#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]"#;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=proto");
     println!("cargo:rerun-if-changed=../party/proto");
 
@@ -27,8 +28,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // A message's content stays in `Vec`s, as its clients take its files.
         .bytes([".attachment", ".handshake", ".mailbox", ".notify"])
         .extern_path(".party.v1", "::party::proto")
-        // It holds a key: its `Debug` is written by hand, without it.
-        .skip_debug([".content.v1.AttachmentPointer"])
+        // Messages holding secret keys or tokens redact them in hand-written `Debug` impls.
+        .skip_debug([
+            ".content.v1.AttachmentPointer",
+            ".attachment.v1.StartUploadResponse",
+            ".attachment.v1.PutChunkRequest",
+            ".attachment.v1.DeleteAttachmentRequest",
+        ])
+        .message_attribute(
+            ".content.v1.AttachmentPointer",
+            "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
+        )
         .field_attribute(
             ".notify.v1.SubscribeRequest.audience",
             r#"#[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]"#,

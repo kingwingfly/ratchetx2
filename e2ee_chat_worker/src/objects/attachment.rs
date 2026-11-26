@@ -9,8 +9,8 @@ use worker::{
 };
 
 use super::{
-    AttachmentCall, AttachmentRow, RETRY_ALARM, alarm_at, answer, blob, checked_integer, decode,
-    has_table,
+    AttachmentCall, AttachmentRow, RETRY_ALARM, alarm_at, answer_rpc, decode, has_table, rpc,
+    sql::{Blob, exec, params, query_one, query_opt},
 };
 
 /// How long attachments are kept, unless the `FILE_RETENTION_DAYS` variable says: longer than
@@ -50,17 +50,18 @@ impl DurableObject for Attachment {
         if request.method() != Method::Post {
             return Response::error("method not allowed", 405);
         }
-        let call = decode(&mut request).await?;
+        let call = match decode(&mut request).await {
+            Ok(call) => call,
+            Err(_) => return Response::error("malformed internal request", 400),
+        };
         match call {
-            AttachmentCall::Add {
-                id,
-                chunks,
-                token_hash,
-                delete_hash,
-            } => answer(self.add(&id, chunks, &token_hash, &delete_hash).await),
-            AttachmentCall::Get => answer(self.get()),
-            AttachmentCall::Note { index } => answer(self.note(index)),
-            AttachmentCall::Delete => answer(self.delete().await),
+            AttachmentCall::Add(req) => answer_rpc::<rpc::AddAttachment>(
+                self.add(&req.id, req.chunks, &req.token_hash, &req.delete_hash)
+                    .await,
+            ),
+            AttachmentCall::Get(_) => answer_rpc::<rpc::GetAttachment>(self.get()),
+            AttachmentCall::Note(req) => answer_rpc::<rpc::NoteChunk>(self.note(req.index)),
+            AttachmentCall::Delete(_) => answer_rpc::<rpc::DeleteAttachment>(self.delete().await),
         }
     }
 
@@ -75,6 +76,41 @@ impl Attachment {
         self.state.storage().sql()
     }
 
+    fn retention(&self) -> u64 {
+        crate::millis(crate::period(
+            &self.env,
+            "FILE_RETENTION_DAYS",
+            DEFAULT_FILE_RETENTION_DAYS,
+        ))
+    }
+
+    fn expiry_cutoff(&self) -> u64 {
+        Date::now().as_millis().saturating_sub(self.retention())
+    }
+
+    /// Load the stored attachment row. When `only_live` is `true`, hides rows being deleted or
+    /// already past `FILE_RETENTION_DAYS` even if the expiry alarm has not run yet.
+    fn load_row(&self, only_live: bool) -> Result<Option<AttachmentDbRow>> {
+        let sql = self.sql();
+        if !has_table(&sql, "attachment")? {
+            return Ok(None);
+        }
+        if only_live {
+            query_opt(
+                &sql,
+                "SELECT id, chunks, token_hash, delete_hash, uploaded FROM attachment \
+                 WHERE deleting = 0 AND created_at >= ?",
+                params![self.expiry_cutoff()]?,
+            )
+        } else {
+            query_opt(
+                &sql,
+                "SELECT id, chunks, token_hash, delete_hash, uploaded FROM attachment",
+                vec![],
+            )
+        }
+    }
+
     /// Keep the attachment, unless kept already, and set its alarm: first, so that failing to
     /// set it keeps nothing, rather than an attachment that never expires. Its table is created
     /// here, and only here, see `has_table`.
@@ -87,70 +123,42 @@ impl Attachment {
     ) -> Result<bool> {
         let sql = self.sql();
         sql.exec(SCHEMA, None)?;
-        let kept: CountRow = sql
-            .exec("SELECT count(*) AS count FROM attachment", None)?
-            .one()?;
+        let kept: CountRow = query_one(&sql, "SELECT count(*) AS count FROM attachment", vec![])?;
         if kept.count > 0 {
             return Ok(false);
         }
-        let retention = crate::period(
-            &self.env,
-            "FILE_RETENTION_DAYS",
-            DEFAULT_FILE_RETENTION_DAYS,
-        );
-        let at = Date::now()
-            .as_millis()
-            .saturating_add(crate::millis(retention));
+        let now = Date::now().as_millis();
+        let at = now.saturating_add(self.retention());
         self.state.storage().set_alarm(alarm_at(at)).await?;
-        let added = self.sql().exec(
+        let inserted: Option<OnlyRow> = query_opt(
+            &self.sql(),
             "INSERT INTO attachment (only, id, chunks, token_hash, delete_hash, created_at) \
-             VALUES (0, ?, ?, ?, ?, ?) ON CONFLICT (only) DO NOTHING",
-            vec![
-                blob(id),
-                checked_integer(chunks.into())?,
-                blob(token_hash),
-                blob(delete_hash),
-                checked_integer(Date::now().as_millis())?,
-            ],
+             VALUES (0, ?, ?, ?, ?, ?) ON CONFLICT (only) DO NOTHING RETURNING only",
+            params![id, chunks, token_hash, delete_hash, Date::now().as_millis()]?,
         )?;
-        Ok(added.rows_written() > 0)
+        Ok(inserted.is_some())
     }
 
-    /// The attachment, unless gone, or being deleted.
+    /// The attachment, unless gone, being deleted, or expired.
     fn get(&self) -> Result<Option<AttachmentRow>> {
-        let sql = self.sql();
-        if !has_table(&sql, "attachment")? {
-            return Ok(None);
-        }
-        let rows: Vec<Row> = sql
-            .exec(
-                "SELECT id, chunks, token_hash, delete_hash, uploaded FROM attachment \
-                 WHERE deleting = 0",
-                None,
-            )?
-            .to_array()?;
-        Ok(rows.into_iter().next().map(|row| AttachmentRow {
-            id: row.id,
-            chunks: row.chunks,
-            token_hash: row.token_hash,
-            delete_hash: row.delete_hash,
-            uploaded: row.uploaded as u64,
-        }))
+        Ok(self.load_row(true)?.map(AttachmentRow::from))
     }
 
     /// Note chunk `index` as put, in one statement, which also tells whether the attachment is
-    /// still kept: if it is gone, or being deleted, e.g. deleted while the chunk was on its way,
-    /// the Worker deletes the chunk, as deleting the attachment may have missed it.
+    /// still kept and unexpired: if it is gone, expired, or being deleted, the Worker deletes the
+    /// chunk, as deleting the attachment may have missed it.
     fn note(&self, index: u32) -> Result<bool> {
         let sql = self.sql();
         if !has_table(&sql, "attachment")? {
             return Ok(false);
         }
-        let noted = sql.exec(
-            "UPDATE attachment SET uploaded = uploaded | ? WHERE deleting = 0",
-            vec![checked_integer(storage::uploaded_bit(index))?],
+        let updated: Option<OnlyRow> = query_opt(
+            &sql,
+            "UPDATE attachment SET uploaded = uploaded | ? \
+             WHERE deleting = 0 AND created_at >= ? RETURNING only",
+            params![storage::uploaded_bit(index), self.expiry_cutoff()]?,
         )?;
-        Ok(noted.rows_written() > 0)
+        Ok(updated.is_some())
     }
 
     /// Delete the attachment: gone for every call at once, then its chunks, then its row, so
@@ -158,20 +166,10 @@ impl Attachment {
     /// leaves the row, rather than chunks no row names. If R2 fails, the alarm tries again
     /// later; the attachment is gone meanwhile.
     async fn delete(&self) -> Result<()> {
-        let sql = self.sql();
-        if !has_table(&sql, "attachment")? {
-            return Ok(());
-        }
-        let rows: Vec<Row> = sql
-            .exec(
-                "SELECT id, chunks, token_hash, delete_hash, uploaded FROM attachment",
-                None,
-            )?
-            .to_array()?;
-        let Some(attachment) = rows.into_iter().next() else {
+        let Some(attachment) = self.load_row(false)? else {
             return Ok(());
         };
-        sql.exec("UPDATE attachment SET deleting = 1", None)?;
+        exec(&self.sql(), "UPDATE attachment SET deleting = 1", vec![])?;
         let objects = (0..attachment.chunks)
             .map(|index| crate::store::chunk_object(&attachment.id, index))
             .collect();
@@ -199,14 +197,29 @@ struct CountRow {
 }
 
 #[derive(Deserialize)]
-struct Row {
-    #[serde(with = "serde_bytes")]
-    id: Vec<u8>,
+struct OnlyRow {
+    #[allow(dead_code)]
+    only: i64,
+}
+
+#[derive(Deserialize)]
+struct AttachmentDbRow {
+    id: Blob,
     chunks: u32,
-    #[serde(with = "serde_bytes")]
-    token_hash: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    delete_hash: Vec<u8>,
+    token_hash: Blob,
+    delete_hash: Blob,
     /// A bitmask, which SQLite keeps as a signed integer.
     uploaded: i64,
+}
+
+impl From<AttachmentDbRow> for AttachmentRow {
+    fn from(row: AttachmentDbRow) -> Self {
+        Self {
+            id: row.id.into_vec(),
+            chunks: row.chunks,
+            token_hash: row.token_hash.into_vec(),
+            delete_hash: row.delete_hash.into_vec(),
+            uploaded: row.uploaded as u64,
+        }
+    }
 }

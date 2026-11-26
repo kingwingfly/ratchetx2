@@ -17,7 +17,6 @@ const HYBRID_CHAIN_KEY_INFO: &[u8] = b"ratchetx2.v1/hybrid/ChainKey";
 const HYBRID_HEADER_KEY_INFO: &[u8] = b"ratchetx2.v1/hybrid/HeaderKey";
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
     feature = "rkyv",
     derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
@@ -25,37 +24,42 @@ const HYBRID_HEADER_KEY_INFO: &[u8] = b"ratchetx2.v1/hybrid/HeaderKey";
 pub struct DhRootRatchet {
     root_key: RootKey,
     private_key: DhPrivateKey,
-    /// - true: next step will update private key
-    /// - false: next step will not update private key
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Serialize)]
+#[serde(rename = "DhRootRatchet")]
+pub(crate) struct DhRootRatchetWireRef<'a> {
+    root_key: &'a RootKey,
+    private_key: &'a DhPrivateKey,
+    update_private_key: bool,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize, Zeroize, ZeroizeOnDrop)]
+#[serde(rename = "DhRootRatchet")]
+pub(crate) struct DhRootRatchetWire {
+    root_key: RootKey,
+    private_key: DhPrivateKey,
     update_private_key: bool,
 }
 
 impl fmt::Debug for DhRootRatchet {
     /// Shows no keys.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DhRootRatchet")
-            .field("update_private_key", &self.update_private_key)
-            .finish_non_exhaustive()
+        f.debug_struct("DhRootRatchet").finish_non_exhaustive()
     }
 }
 
 impl PartialEq for DhRootRatchet {
     fn eq(&self, other: &Self) -> bool {
-        let shared = (
-            self.private_key
-                .diffie_hellman(&other.private_key.public_key()),
-            other
-                .private_key
-                .diffie_hellman(&self.private_key.public_key()),
-        );
-        let root_eq = self.root_key.ct_eq(&other.root_key);
-        let dh_eq = match shared {
-            (Ok(a), Ok(b)) => a.ct_eq(b.as_slice()),
-            _ => Choice::from(0),
-        };
-        bool::from(root_eq & dh_eq)
+        bool::from(
+            self.root_key.ct_eq(&other.root_key) & self.private_key.ct_eq(&other.private_key),
+        )
     }
 }
+
+impl Eq for DhRootRatchet {}
 
 impl DhRootRatchet {
     /// New a DhRootRatchet for Alice.
@@ -63,7 +67,6 @@ impl DhRootRatchet {
         Self {
             root_key: secret_key,
             private_key: DhPrivateKey::generate(),
-            update_private_key: false,
         }
     }
 
@@ -72,7 +75,6 @@ impl DhRootRatchet {
         Self {
             root_key: secret_key,
             private_key,
-            update_private_key: true,
         }
     }
 
@@ -81,27 +83,28 @@ impl DhRootRatchet {
         self.private_key.public_key()
     }
 
-    /// Whether the next step rotates the local DH private key.
-    #[cfg(any(feature = "serde", feature = "prost"))]
-    pub(crate) fn update_private_key(&self) -> bool {
-        self.update_private_key
+    /// Constant-time root-key equality for peer-pairing checks.
+    pub(crate) fn root_key_ct_eq(&self, other: &Self) -> Choice {
+        self.root_key.ct_eq(&other.root_key)
     }
 
     /// Perform a DH-root ratchet step, optionally mixing `extra_secret` into the HKDF with
     /// distinct domain separation when `extra_secret` is non-empty.
     ///
-    /// On an invalid peer public key or RNG failure, returns an error and leaves the state
-    /// unchanged.
+    /// When `rotate_private_key` is `true`, replaces the local DH keypair after computing the DH
+    /// output with the current key. On an invalid peer public key or RNG failure, returns an error
+    /// and leaves the state unchanged.
     pub fn step_with(
         &mut self,
         public_key: &[u8],
         extra_secret: &[u8],
-    ) -> Result<(ChainKey, HeaderKey), CryptoError> {
+        rotate_private_key: bool,
+    ) -> Result<(Zeroizing<ChainKey>, Zeroizing<HeaderKey>), CryptoError> {
         // The DH always uses the current key; a step that updates the pair replaces it afterwards.
         let dh_shared = self.private_key.diffie_hellman(public_key)?;
         // Generate the replacement DH key pair (if needed) before mutating any state so errors
         // leave `self` untouched.
-        let next_private_key = if self.update_private_key {
+        let next_private_key = if rotate_private_key {
             Some(DhPrivateKey::try_generate()?)
         } else {
             None
@@ -136,40 +139,51 @@ impl DhRootRatchet {
         if let Some(next_private_key) = next_private_key {
             self.private_key = next_private_key;
         }
-        self.update_private_key = !self.update_private_key;
         self.root_key.zeroize();
         self.root_key = *root_key;
-        Ok((*chain_key, *header_key))
+        Ok((chain_key, header_key))
     }
-}
 
-#[cfg(feature = "rkyv")]
-impl ArchivedDhRootRatchet {
-    pub(crate) fn update_private_key(&self) -> bool {
-        self.update_private_key
-    }
-}
-
-#[cfg(feature = "prost")]
-impl From<&DhRootRatchet> for crate::proto::DhRootRatchet {
-    fn from(dh_root: &DhRootRatchet) -> Self {
-        Self {
-            root_key: dh_root.root_key.to_vec(),
-            private_key: dh_root.private_key.as_bytes().to_vec(),
-            update_private_key: dh_root.update_private_key,
+    #[cfg(feature = "serde")]
+    pub(crate) fn as_wire(&self, update_private_key: bool) -> DhRootRatchetWireRef<'_> {
+        DhRootRatchetWireRef {
+            root_key: &self.root_key,
+            private_key: &self.private_key,
+            update_private_key,
         }
     }
-}
 
-#[cfg(feature = "prost")]
-impl TryFrom<&crate::proto::DhRootRatchet> for DhRootRatchet {
-    type Error = crate::error::MalformedState;
+    #[cfg(feature = "serde")]
+    pub(crate) fn from_wire(wire: DhRootRatchetWire) -> (Self, bool) {
+        let update_private_key = wire.update_private_key;
+        let dh_root = Self {
+            root_key: wire.root_key,
+            private_key: wire.private_key.clone(),
+        };
+        (dh_root, update_private_key)
+    }
 
-    fn try_from(dh_root: &crate::proto::DhRootRatchet) -> Result<Self, Self::Error> {
-        Ok(Self {
-            root_key: crate::proto::key(&dh_root.root_key)?,
-            private_key: DhPrivateKey::from(crate::proto::key(&dh_root.private_key)?),
-            update_private_key: dh_root.update_private_key,
-        })
+    #[cfg(feature = "prost")]
+    pub(crate) fn to_proto(&self, update_private_key: bool) -> crate::proto::DhRootRatchet {
+        crate::proto::DhRootRatchet {
+            root_key: self.root_key.to_vec(),
+            private_key: self.private_key.as_bytes().to_vec(),
+            update_private_key,
+        }
+    }
+
+    #[cfg(feature = "prost")]
+    pub(crate) fn from_proto(
+        dh_root: &crate::proto::DhRootRatchet,
+    ) -> Result<(Self, bool), crate::error::MalformedState> {
+        let root_key = Zeroizing::new(crate::proto::key(&dh_root.root_key)?);
+        let priv_bytes = Zeroizing::new(crate::proto::key(&dh_root.private_key)?);
+        Ok((
+            Self {
+                root_key: *root_key,
+                private_key: DhPrivateKey::from(*priv_bytes),
+            },
+            dh_root.update_private_key,
+        ))
     }
 }

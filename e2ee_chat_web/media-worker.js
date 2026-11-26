@@ -45,7 +45,14 @@ function fetchRange(page, msg, signal) {
       channel.port1.close();
       resolve(result);
     };
-    const onAbort = () => finish({ aborted: true });
+    const onAbort = () => {
+      try {
+        channel.port1.postMessage({ aborted: true });
+      } catch {
+        // Port may already be closed or transferred.
+      }
+      finish({ aborted: true });
+    };
     const timer = setTimeout(() => finish({ error: 504 }), PATIENCE);
     if (signal) {
       signal.addEventListener('abort', onAbort, { once: true });
@@ -96,7 +103,7 @@ async function serve(request, clientId, token) {
   }
   if (
     request.mode === 'navigate' ||
-    (request.destination && request.destination !== 'audio' && request.destination !== 'video')
+    (request.destination !== 'audio' && request.destination !== 'video')
   ) {
     return errorResponse(403);
   }

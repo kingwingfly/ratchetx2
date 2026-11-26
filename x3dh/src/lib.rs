@@ -15,7 +15,7 @@ pub mod pq;
 pub mod proto;
 
 use core::fmt;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 pub use error::{Error, ErrorKind, Result};
 use hkdf::Hkdf;
@@ -55,6 +55,13 @@ const INFO: &[u8] = b"x3dh.v1";
 /// How many generations of prekeys [`LocalPrekeys`] keeps: the latest, and the one before it
 /// for initial messages that were on their way when the latest was published.
 pub const KEPT_GENERATIONS: usize = 2;
+/// Maximum number of unused classical or PQ one-time prekeys allowed in one generation.
+pub const MAX_ONE_TIME_PER_GENERATION: usize = 1024;
+/// Maximum number of confirmed ephemeral keys retained per generation against replay.
+pub const MAX_CONFIRMED_PER_GENERATION: usize = 4096;
+/// Maximum number of last-resort PQSPK suites allowed in one generation.
+#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+const MAX_PQ_LAST_RESORT_PER_GENERATION: usize = 4;
 
 /// Bob's prekeys, as Alice receives them to start a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,22 +163,23 @@ struct Generation {
     signed_prekey: PublicKey,
     #[cfg_attr(feature = "rkyv", rkyv(with = StaticSecretDef))]
     signed_secret: StaticSecret,
-    /// The ones not used yet.
-    #[cfg_attr(feature = "serde", serde(with = "pairs"))]
+    /// The ones not used yet. Stored in a `BTreeMap` to avoid hash-table secret relocation and
+    /// preserve deterministic ordering.
+    #[cfg_attr(feature = "serde", serde(with = "map_as_seq"))]
     #[cfg_attr(
         feature = "rkyv",
         rkyv(with = rkyv::with::MapKV<rkyv::with::Identity, StaticSecretDef>)
     )]
-    one_time: HashMap<PublicKey, StaticSecret>,
+    one_time: BTreeMap<PublicKey, StaticSecret>,
     /// The canonical ephemeral keys of the initial messages confirmed, so that none is accepted
     /// twice, e.g. one without a one-time prekey sent again. They go with the generation.
-    confirmed: HashSet<PublicKey>,
+    confirmed: BTreeSet<PublicKey>,
     /// Last-resort PQSPK seeds for this generation, at most one per suite.
-    #[cfg_attr(feature = "serde", serde(with = "pq_last_resort_pairs"))]
+    #[cfg_attr(feature = "serde", serde(with = "map_as_seq"))]
     pq_last_resort: BTreeMap<PqSuite, PqPrekeySecret>,
     /// Unused PQOPK seeds for this generation, keyed by deterministic [`PqPrekeyId`].
-    #[cfg_attr(feature = "serde", serde(with = "pq_one_time_pairs"))]
-    pq_one_time: HashMap<PqPrekeyId, PqPrekeySecret>,
+    #[cfg_attr(feature = "serde", serde(with = "map_as_seq"))]
+    pq_one_time: BTreeMap<PqPrekeyId, PqPrekeySecret>,
 }
 
 /// An older prekey generation evicted during a rotating publish, kept transiently in memory so the
@@ -212,14 +220,6 @@ impl From<StaticSecretDef> for StaticSecret {
 struct InvalidArchivedPrekeys;
 
 #[cfg(feature = "rkyv")]
-fn archived_suite(suite: &pq::ArchivedPqSuite) -> PqSuite {
-    match suite {
-        pq::ArchivedPqSuite::MlKem1024 => PqSuite::MlKem1024,
-        pq::ArchivedPqSuite::MlKem768 => PqSuite::MlKem768,
-    }
-}
-
-#[cfg(feature = "rkyv")]
 unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedLocalPrekeys
 where
     C: rkyv::rancor::Fallible + ?Sized,
@@ -229,9 +229,14 @@ where
         if self.generations.len() > KEPT_GENERATIONS {
             rkyv::rancor::fail!(InvalidArchivedPrekeys);
         }
-        let mut seen_spks = HashSet::with_capacity(self.generations.len());
+        let mut seen_spks = BTreeSet::new();
         for generation in self.generations.iter() {
-            if !seen_spks.insert(generation.signed_prekey) {
+            if !seen_spks.insert(generation.signed_prekey)
+                || generation.one_time.len() > MAX_ONE_TIME_PER_GENERATION
+                || generation.confirmed.len() > MAX_CONFIRMED_PER_GENERATION
+                || generation.pq_last_resort.len() > MAX_PQ_LAST_RESORT_PER_GENERATION
+                || generation.pq_one_time.len() > MAX_ONE_TIME_PER_GENERATION
+            {
                 rkyv::rancor::fail!(InvalidArchivedPrekeys);
             }
             let spk_secret_bytes = Zeroizing::new(generation.signed_secret.bytes);
@@ -239,38 +244,40 @@ where
             if x25519_dalek::PublicKey::from(&spk_secret).to_bytes() != generation.signed_prekey {
                 rkyv::rancor::fail!(InvalidArchivedPrekeys);
             }
-            let mut seen_opks = HashSet::with_capacity(generation.one_time.len());
+            let mut prev_opk: Option<PublicKey> = None;
             for (opk_pub, opk_secret_def) in generation.one_time.iter() {
-                if !seen_opks.insert(*opk_pub) {
+                if prev_opk.is_some_and(|prev| *opk_pub <= prev) {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
+                prev_opk = Some(*opk_pub);
                 let opk_secret_bytes = Zeroizing::new(opk_secret_def.bytes);
                 let opk_secret = StaticSecret::from(*opk_secret_bytes);
                 if x25519_dalek::PublicKey::from(&opk_secret).to_bytes() != *opk_pub {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
             }
+            let mut prev_confirmed: Option<PublicKey> = None;
             for ek in generation.confirmed.iter() {
-                if !xeddsa::is_canonical_public_key(ek) {
+                if prev_confirmed.is_some_and(|prev| *ek <= prev)
+                    || !xeddsa::is_canonical_public_key(ek)
+                {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
+                prev_confirmed = Some(*ek);
             }
-            let mut last_resort_ids = HashSet::with_capacity(generation.pq_last_resort.len());
+            let mut last_resort_ids = BTreeSet::new();
             let mut prev_suite: Option<PqSuite> = None;
             for (k_suite, pq) in generation.pq_last_resort.iter() {
-                let key_suite = archived_suite(k_suite);
+                let key_suite = pq::archived_suite(k_suite);
                 if prev_suite.is_some_and(|prev| key_suite <= prev) {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
                 prev_suite = Some(key_suite);
-                let val_suite = archived_suite(&pq.suite);
+                let val_suite = pq::archived_suite(&pq.suite);
                 if key_suite != val_suite {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
                 let ek = pq.ek.as_slice();
-                if ek.len() != val_suite.ek_len() {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
                 let seed = Zeroizing::new(pq.seed.bytes);
                 if validate_pq_seed_ek(val_suite, ek, &seed).is_err() {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
@@ -280,24 +287,19 @@ where
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
             }
-            let mut seen_pq_opks = HashSet::with_capacity(generation.pq_one_time.len());
+            let mut prev_pq_id: Option<PqPrekeyId> = None;
             for (id, pq) in generation.pq_one_time.iter() {
-                if !seen_pq_opks.insert(*id) {
+                if prev_pq_id.is_some_and(|prev| *id <= prev) {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
-                let suite = archived_suite(&pq.suite);
+                prev_pq_id = Some(*id);
+                let suite = pq::archived_suite(&pq.suite);
                 let ek = pq.ek.as_slice();
-                if ek.len() != suite.ek_len() {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                if pq_prekey_id(suite.as_u8(), ek) != *id {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
-                if last_resort_ids.contains(id) {
-                    rkyv::rancor::fail!(InvalidArchivedPrekeys);
-                }
                 let seed = Zeroizing::new(pq.seed.bytes);
-                if validate_pq_seed_ek(suite, ek, &seed).is_err() {
+                if validate_pq_seed_ek(suite, ek, &seed).is_err()
+                    || pq_prekey_id(suite.as_u8(), ek) != *id
+                    || last_resort_ids.contains(id)
+                {
                     rkyv::rancor::fail!(InvalidArchivedPrekeys);
                 }
             }
@@ -323,61 +325,121 @@ fn validate_pq_seed_ek(suite: PqSuite, ek: &[u8], seed: &[u8; PQ_SEED_LENGTH]) -
     Ok(())
 }
 
-/// Serializes a map as a sequence of key-value pairs, since formats such as JSON only take
-/// string keys.
+/// Serializes any map-like iterable as a sequence of `(K, V)` pairs, since formats such as JSON
+/// only take string map keys.
 #[cfg(feature = "serde")]
-mod pairs {
-    use std::collections::HashMap;
+mod map_as_seq {
+    use serde::{Serialize, Serializer};
 
-    use serde::Serializer;
-
-    use crate::{PublicKey, StaticSecret};
-
-    pub(super) fn serialize<S: Serializer>(
-        map: &HashMap<PublicKey, StaticSecret>,
+    pub(super) fn serialize<'a, M, K, V, S>(
+        map: &'a M,
         serializer: S,
-    ) -> core::result::Result<S::Ok, S::Error> {
+    ) -> core::result::Result<S::Ok, S::Error>
+    where
+        &'a M: IntoIterator<Item = (&'a K, &'a V)>,
+        K: Serialize + 'a,
+        V: Serialize + 'a,
+        S: Serializer,
+    {
         serializer.collect_seq(map)
     }
 }
 
 #[cfg(feature = "serde")]
-mod pq_last_resort_pairs {
-    use std::collections::BTreeMap;
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> core::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedSeqVisitor<T, const MAX: usize>(core::marker::PhantomData<T>);
 
-    use serde::Serializer;
+    impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedSeqVisitor<T, MAX>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Vec<T>;
 
-    use crate::{PqSuite, pq::PqPrekeySecret};
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a sequence of at most {MAX} items")
+        }
 
-    pub(super) fn serialize<S: Serializer>(
-        map: &BTreeMap<PqSuite, PqPrekeySecret>,
-        serializer: S,
-    ) -> core::result::Result<S::Ok, S::Error> {
-        serializer.collect_seq(map)
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> core::result::Result<Vec<T>, A::Error> {
+            if let Some(hint) = seq.size_hint()
+                && hint > MAX
+            {
+                return Err(serde::de::Error::invalid_length(hint, &self));
+            }
+            let cap = seq.size_hint().unwrap_or(0).min(MAX);
+            let mut out = Vec::with_capacity(cap);
+            while let Some(item) = seq.next_element::<T>()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                out.push(item);
+            }
+            Ok(out)
+        }
     }
+
+    deserializer.deserialize_seq(BoundedSeqVisitor::<T, MAX>(core::marker::PhantomData))
 }
 
 #[cfg(feature = "serde")]
-mod pq_one_time_pairs {
-    use std::collections::HashMap;
+fn deserialize_bounded_btreeset<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> core::result::Result<BTreeSet<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Ord,
+{
+    struct BoundedSetVisitor<T, const MAX: usize>(core::marker::PhantomData<T>);
 
-    use serde::Serializer;
+    impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedSetVisitor<T, MAX>
+    where
+        T: serde::Deserialize<'de> + Ord,
+    {
+        type Value = BTreeSet<T>;
 
-    use crate::{PqPrekeyId, pq::PqPrekeySecret};
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "a set of at most {MAX} items")
+        }
 
-    pub(super) fn serialize<S: Serializer>(
-        map: &HashMap<PqPrekeyId, PqPrekeySecret>,
-        serializer: S,
-    ) -> core::result::Result<S::Ok, S::Error> {
-        serializer.collect_seq(map)
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> core::result::Result<BTreeSet<T>, A::Error> {
+            if let Some(hint) = seq.size_hint()
+                && hint > MAX
+            {
+                return Err(serde::de::Error::invalid_length(hint, &self));
+            }
+            let mut out = BTreeSet::new();
+            while let Some(item) = seq.next_element::<T>()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::invalid_length(MAX + 1, &self));
+                }
+                if !out.insert(item) {
+                    return Err(serde::de::Error::custom("duplicate entry in bounded set"));
+                }
+            }
+            Ok(out)
+        }
     }
+
+    deserializer.deserialize_seq(BoundedSetVisitor::<T, MAX>(core::marker::PhantomData))
 }
 
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 #[serde(rename = "LocalPrekeys")]
 struct RawLocalPrekeys {
-    generations: VecDeque<RawGeneration>,
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, KEPT_GENERATIONS>")]
+    generations: Vec<RawGeneration>,
 }
 
 #[cfg(feature = "serde")]
@@ -386,12 +448,90 @@ struct RawLocalPrekeys {
 struct RawGeneration {
     signed_prekey: PublicKey,
     signed_secret: StaticSecret,
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_ONE_TIME_PER_GENERATION>")]
     one_time: Vec<(PublicKey, StaticSecret)>,
-    confirmed: HashSet<PublicKey>,
-    #[serde(default)]
+    #[serde(
+        deserialize_with = "deserialize_bounded_btreeset::<_, _, MAX_CONFIRMED_PER_GENERATION>"
+    )]
+    confirmed: BTreeSet<PublicKey>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_PQ_LAST_RESORT_PER_GENERATION>"
+    )]
     pq_last_resort: Vec<(PqSuite, PqPrekeySecret)>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_ONE_TIME_PER_GENERATION>"
+    )]
     pq_one_time: Vec<(PqPrekeyId, PqPrekeySecret)>,
+}
+
+/// Shared generation validator for `serde` and `prost` deserialization paths.
+#[cfg(any(feature = "serde", feature = "prost"))]
+fn build_validated_generation(
+    signed_prekey: PublicKey,
+    signed_secret: StaticSecret,
+    raw_one_time: impl IntoIterator<Item = (PublicKey, StaticSecret)>,
+    confirmed: BTreeSet<PublicKey>,
+    raw_pq_last_resort: impl IntoIterator<Item = (PqSuite, PqPrekeySecret)>,
+    raw_pq_one_time: impl IntoIterator<Item = (PqPrekeyId, PqPrekeySecret)>,
+) -> Result<Generation> {
+    if x25519_dalek::PublicKey::from(&signed_secret).to_bytes() != signed_prekey {
+        return Err(ErrorKind::MalformedState.into());
+    }
+    let mut one_time = BTreeMap::new();
+    for (opk_pub, opk_secret) in raw_one_time {
+        if one_time.len() >= MAX_ONE_TIME_PER_GENERATION {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        if x25519_dalek::PublicKey::from(&opk_secret).to_bytes() != opk_pub {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        if one_time.insert(opk_pub, opk_secret).is_some() {
+            return Err(ErrorKind::MalformedState.into());
+        }
+    }
+    if confirmed.len() > MAX_CONFIRMED_PER_GENERATION {
+        return Err(ErrorKind::MalformedState.into());
+    }
+    for ek in &confirmed {
+        if !xeddsa::is_canonical_public_key(ek) {
+            return Err(ErrorKind::MalformedState.into());
+        }
+    }
+    let mut pq_last_resort = BTreeMap::new();
+    let mut last_resort_ids = BTreeSet::new();
+    for (suite, secret) in raw_pq_last_resort {
+        if pq_last_resort.len() >= MAX_PQ_LAST_RESORT_PER_GENERATION || secret.suite != suite {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        validate_pq_seed_ek(suite, &secret.ek, &secret.seed)?;
+        let id = pq_prekey_id(suite.as_u8(), &secret.ek);
+        if pq_last_resort.insert(suite, secret).is_some() || !last_resort_ids.insert(id) {
+            return Err(ErrorKind::MalformedState.into());
+        }
+    }
+    let mut pq_one_time = BTreeMap::new();
+    for (id, secret) in raw_pq_one_time {
+        if pq_one_time.len() >= MAX_ONE_TIME_PER_GENERATION {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        validate_pq_seed_ek(secret.suite, &secret.ek, &secret.seed)?;
+        if pq_prekey_id(secret.suite.as_u8(), &secret.ek) != id
+            || last_resort_ids.contains(&id)
+            || pq_one_time.insert(id, secret).is_some()
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
+    }
+    Ok(Generation {
+        signed_prekey,
+        signed_secret,
+        one_time,
+        confirmed,
+        pq_last_resort,
+        pq_one_time,
+    })
 }
 
 #[cfg(feature = "serde")]
@@ -402,64 +542,20 @@ impl TryFrom<RawLocalPrekeys> for LocalPrekeys {
         if raw.generations.len() > KEPT_GENERATIONS {
             return Err(ErrorKind::MalformedState.into());
         }
-        let mut seen_spks = HashSet::with_capacity(raw.generations.len());
+        let mut seen_spks = BTreeSet::new();
         let mut generations = VecDeque::with_capacity(raw.generations.len());
         for raw_gen in raw.generations {
             if !seen_spks.insert(raw_gen.signed_prekey) {
                 return Err(ErrorKind::MalformedState.into());
             }
-            if x25519_dalek::PublicKey::from(&raw_gen.signed_secret).to_bytes()
-                != raw_gen.signed_prekey
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            let mut one_time = HashMap::with_capacity(raw_gen.one_time.len());
-            for (opk_pub, opk_secret) in raw_gen.one_time {
-                if x25519_dalek::PublicKey::from(&opk_secret).to_bytes() != opk_pub {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if one_time.insert(opk_pub, opk_secret).is_some() {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-            }
-            for ek in &raw_gen.confirmed {
-                if !xeddsa::is_canonical_public_key(ek) {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-            }
-            let mut pq_last_resort = BTreeMap::new();
-            let mut last_resort_ids = HashSet::with_capacity(raw_gen.pq_last_resort.len());
-            for (suite, secret) in raw_gen.pq_last_resort {
-                if secret.suite != suite {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                validate_pq_seed_ek(suite, &secret.ek, &secret.seed)?;
-                let id = pq_prekey_id(suite.as_u8(), &secret.ek);
-                if pq_last_resort.insert(suite, secret).is_some() || !last_resort_ids.insert(id) {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-            }
-            let mut pq_one_time = HashMap::with_capacity(raw_gen.pq_one_time.len());
-            for (id, secret) in raw_gen.pq_one_time {
-                validate_pq_seed_ek(secret.suite, &secret.ek, &secret.seed)?;
-                if pq_prekey_id(secret.suite.as_u8(), &secret.ek) != id {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if last_resort_ids.contains(&id) {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if pq_one_time.insert(id, secret).is_some() {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-            }
-            generations.push_back(Generation {
-                signed_prekey: raw_gen.signed_prekey,
-                signed_secret: raw_gen.signed_secret,
-                one_time,
-                confirmed: raw_gen.confirmed,
-                pq_last_resort,
-                pq_one_time,
-            });
+            generations.push_back(build_validated_generation(
+                raw_gen.signed_prekey,
+                raw_gen.signed_secret,
+                raw_gen.one_time,
+                raw_gen.confirmed,
+                raw_gen.pq_last_resort,
+                raw_gen.pq_one_time,
+            )?);
         }
         Ok(Self { generations })
     }
@@ -544,6 +640,13 @@ impl LocalPrekeys {
         })
     }
 
+    /// Whether the latest generation currently holds a last-resort PQSPK for `suite`.
+    pub fn has_pq_last_resort(&self, suite: PqSuite) -> bool {
+        self.generations
+            .back()
+            .is_some_and(|g| g.pq_last_resort.contains_key(&suite))
+    }
+
     /// Add `one_time_count` one-time prekeys to the last generation, to publish with its signed
     /// prekey, signed again by `identity`: for when publishing it may have failed, though the
     /// server may have it, or to replenish one-time prekeys without rotating the signed prekey.
@@ -570,30 +673,48 @@ impl LocalPrekeys {
         }
     }
 
-    /// Forget `one_time_prekeys` of the last generation, which [`extend`](Self::extend) added:
-    /// for when the server refused them, keeping none, so that publishing again, refused each
-    /// time, does not add up keys.
-    pub fn retract(&mut self, one_time_prekeys: &[PublicKey]) {
-        if let Some(generation) = self.generations.back_mut() {
+    /// Forget `one_time_prekeys` of the generation identified by `signed_prekey`, which
+    /// [`extend`](Self::extend) added: for when the server refused them, keeping none, so that
+    /// publishing again, refused each time, does not add up keys.
+    ///
+    /// Does nothing if no retained generation matches `signed_prekey`.
+    pub fn retract(&mut self, signed_prekey: &PublicKey, one_time_prekeys: &[PublicKey]) {
+        if let Some(generation) = self
+            .generations
+            .iter_mut()
+            .find(|g| g.signed_prekey == *signed_prekey)
+        {
             for prekey in one_time_prekeys {
                 generation.one_time.remove(prekey);
             }
         }
     }
 
-    /// Forget classical `one_time_prekeys` and post-quantum `pq_one_time_prekeys` of the last
-    /// generation (for when a publish/refill request was refused by the server).
+    /// Forget classical `one_time_prekeys`, post-quantum `pq_one_time_prekeys`, and any newly
+    /// minted unpublished `pq_last_resort_suites` from the generation identified by
+    /// `signed_prekey` (for when a publish/refill request was refused by the server).
+    ///
+    /// Does nothing if no retained generation matches `signed_prekey`.
     pub fn retract_pq(
         &mut self,
+        signed_prekey: &PublicKey,
         one_time_prekeys: &[PublicKey],
         pq_one_time_prekeys: &[PqPrekeyId],
+        pq_last_resort_suites: &[PqSuite],
     ) {
-        if let Some(generation) = self.generations.back_mut() {
+        if let Some(generation) = self
+            .generations
+            .iter_mut()
+            .find(|g| g.signed_prekey == *signed_prekey)
+        {
             for prekey in one_time_prekeys {
                 generation.one_time.remove(prekey);
             }
             for id in pq_one_time_prekeys {
                 generation.pq_one_time.remove(id);
+            }
+            for suite in pq_last_resort_suites {
+                generation.pq_last_resort.remove(suite);
             }
         }
     }
@@ -620,7 +741,7 @@ impl LocalPrekeys {
     ) -> (PublishedPrekeys, Option<EvictedGeneration>) {
         let (signed_prekey, signed_secret) = generate_key_pair();
         let signed_prekey_signature = identity.sign(signed_prekey);
-        let mut one_time = HashMap::with_capacity(one_time_count);
+        let mut one_time = BTreeMap::new();
         let one_time_prekeys = (0..one_time_count)
             .map(|_| {
                 let (public_key, secret) = generate_key_pair();
@@ -639,9 +760,9 @@ impl LocalPrekeys {
             signed_prekey,
             signed_secret,
             one_time,
-            confirmed: HashSet::new(),
+            confirmed: BTreeSet::new(),
             pq_last_resort: BTreeMap::new(),
-            pq_one_time: HashMap::new(),
+            pq_one_time: BTreeMap::new(),
         });
         (
             PublishedPrekeys {
@@ -685,16 +806,15 @@ impl LocalPrekeys {
         if !suite.is_supported() {
             return Err(ErrorKind::UnsupportedSuite.into());
         }
-        let (signed_prekey, signed_secret) = generate_key_pair();
-        let signed_prekey_signature = identity.sign(signed_prekey);
-        let mut one_time = HashMap::with_capacity(one_time_count);
-        let one_time_prekeys = (0..one_time_count)
-            .map(|_| {
-                let (public_key, secret) = generate_key_pair();
-                one_time.insert(public_key, secret);
-                public_key
-            })
-            .collect();
+        let (signed_prekey, signed_secret) = try_generate_key_pair()?;
+        let signed_prekey_signature = identity.try_sign(signed_prekey)?;
+        let mut one_time = BTreeMap::new();
+        let mut one_time_prekeys = Vec::with_capacity(one_time_count);
+        for _ in 0..one_time_count {
+            let (public_key, secret) = try_generate_key_pair()?;
+            one_time.insert(public_key, secret);
+            one_time_prekeys.push(public_key);
+        }
 
         let (lr_ek, lr_seed) = kem::generate_keypair(suite)?;
         let lr_id = pq_prekey_id(suite.as_u8(), &lr_ek);
@@ -715,7 +835,7 @@ impl LocalPrekeys {
             },
         );
 
-        let mut pq_one_time = HashMap::with_capacity(pq_one_time_count);
+        let mut pq_one_time = BTreeMap::new();
         let mut pq_one_time_prekeys = Vec::with_capacity(pq_one_time_count);
         for _ in 0..pq_one_time_count {
             let (ek, seed) = kem::generate_keypair(suite)?;
@@ -741,7 +861,7 @@ impl LocalPrekeys {
             signed_prekey,
             signed_secret,
             one_time,
-            confirmed: HashSet::new(),
+            confirmed: BTreeSet::new(),
             pq_last_resort,
             pq_one_time,
         });
@@ -804,47 +924,92 @@ impl LocalPrekeys {
         if !suite.is_supported() {
             return Err(ErrorKind::UnsupportedSuite.into());
         }
-        let Some(generation) = self.generations.back_mut() else {
+        if self.generations.is_empty() {
             return self.generate_pq(identity, suite, one_time_count, pq_one_time_count);
-        };
+        }
+        self.extend_latest_pq_inner(identity, suite, one_time_count, pq_one_time_count, true)
+    }
 
-        let one_time_prekeys = (0..one_time_count)
-            .map(|_| {
-                let (public_key, secret) = generate_key_pair();
-                generation.one_time.insert(public_key, secret);
-                public_key
-            })
-            .collect();
+    /// Replenish classical OPKs and/or PQOPKs in the latest generation strictly for a suite that
+    /// ALREADY has a published last-resort PQSPK in that generation.
+    ///
+    /// Unlike [`extend_pq`](Self::extend_pq), this never creates a new generation and never mints
+    /// a new last-resort PQSPK — failing with [`ErrorKind::PrekeyNotFound`] if no generation
+    /// exists or [`ErrorKind::PqPrekeyNotFound`] if `suite` has no last-resort PQSPK in the
+    /// latest generation.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    pub fn refill_pq_only(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        suite: PqSuite,
+        one_time_count: usize,
+        pq_one_time_count: usize,
+    ) -> Result<PublishedPqPrekeys> {
+        if !suite.is_supported() {
+            return Err(ErrorKind::UnsupportedSuite.into());
+        }
+        if self.generations.is_empty() {
+            return Err(ErrorKind::PrekeyNotFound.into());
+        }
+        self.extend_latest_pq_inner(identity, suite, one_time_count, pq_one_time_count, false)
+    }
 
-        let pq_last_resort_pub = if let Some(existing) = generation.pq_last_resort.get(&suite) {
-            let id = pq_prekey_id(suite.as_u8(), &existing.ek);
-            let signature = sign_pq_spk(identity, suite, &existing.ek)?;
-            PublishedPqPrekey {
-                suite,
-                id,
-                encapsulation_key: existing.ek.clone(),
-                signature,
-            }
-        } else {
-            let (ek, seed) = kem::generate_keypair(suite)?;
-            let id = pq_prekey_id(suite.as_u8(), &ek);
-            let signature = sign_pq_spk(identity, suite, &ek)?;
-            generation.pq_last_resort.insert(
-                suite,
-                PqPrekeySecret {
-                    suite,
-                    ek: ek.clone(),
-                    seed,
-                },
-            );
-            PublishedPqPrekey {
-                suite,
-                id,
-                encapsulation_key: ek,
-                signature,
-            }
-        };
+    /// Shared atomic implementation for [`extend_pq`](Self::extend_pq) and
+    /// [`refill_pq_only`](Self::refill_pq_only): performs all fallible RNG/signing work before
+    /// mutating the latest generation.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    fn extend_latest_pq_inner(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        suite: PqSuite,
+        one_time_count: usize,
+        pq_one_time_count: usize,
+        allow_mint_last_resort: bool,
+    ) -> Result<PublishedPqPrekeys> {
+        let generation = self.generations.back().ok_or(ErrorKind::PrekeyNotFound)?;
+        let signed_prekey = generation.signed_prekey;
+        let signed_prekey_signature = identity.try_sign(signed_prekey)?;
 
+        let mut new_classical = Vec::with_capacity(one_time_count);
+        for _ in 0..one_time_count {
+            new_classical.push(try_generate_key_pair()?);
+        }
+
+        let (new_lr_secret, pq_last_resort_pub) =
+            if let Some(existing) = generation.pq_last_resort.get(&suite) {
+                let id = pq_prekey_id(suite.as_u8(), &existing.ek);
+                let signature = sign_pq_spk(identity, suite, &existing.ek)?;
+                (
+                    None,
+                    PublishedPqPrekey {
+                        suite,
+                        id,
+                        encapsulation_key: existing.ek.clone(),
+                        signature,
+                    },
+                )
+            } else if allow_mint_last_resort {
+                let (ek, seed) = kem::generate_keypair(suite)?;
+                let id = pq_prekey_id(suite.as_u8(), &ek);
+                let signature = sign_pq_spk(identity, suite, &ek)?;
+                (
+                    Some(PqPrekeySecret {
+                        suite,
+                        ek: ek.clone(),
+                        seed,
+                    }),
+                    PublishedPqPrekey {
+                        suite,
+                        id,
+                        encapsulation_key: ek,
+                        signature,
+                    },
+                )
+            } else {
+                return Err(ErrorKind::PqPrekeyNotFound.into());
+            };
+
+        let mut new_pq_opks = Vec::with_capacity(pq_one_time_count);
         let mut pq_one_time_prekeys = Vec::with_capacity(pq_one_time_count);
         for _ in 0..pq_one_time_count {
             let (ek, seed) = kem::generate_keypair(suite)?;
@@ -856,15 +1021,32 @@ impl LocalPrekeys {
                 encapsulation_key: ek.clone(),
                 signature,
             });
-            generation
-                .pq_one_time
-                .insert(id, PqPrekeySecret { suite, ek, seed });
+            new_pq_opks.push((id, PqPrekeySecret { suite, ek, seed }));
+        }
+
+        // All fallible operations succeeded; commit into the latest generation.
+        let generation = self
+            .generations
+            .back_mut()
+            .expect("latest generation verified above");
+        let one_time_prekeys = new_classical
+            .into_iter()
+            .map(|(public_key, secret)| {
+                generation.one_time.insert(public_key, secret);
+                public_key
+            })
+            .collect();
+        if let Some(lr_secret) = new_lr_secret {
+            generation.pq_last_resort.insert(suite, lr_secret);
+        }
+        for (id, secret) in new_pq_opks {
+            generation.pq_one_time.insert(id, secret);
         }
 
         Ok(PublishedPqPrekeys {
             classical: PublishedPrekeys {
-                signed_prekey: generation.signed_prekey,
-                signed_prekey_signature: identity.sign(generation.signed_prekey),
+                signed_prekey,
+                signed_prekey_signature,
                 one_time_prekeys,
             },
             pq_last_resort: pq_last_resort_pub,
@@ -901,18 +1083,14 @@ impl LocalPrekeys {
         let generation = &self.generations[self.generation(message)?];
 
         let mut key_material = KeyMaterial::new_classical();
-        key_material
-            .extend(diffie_hellman(&generation.signed_secret, alice_identity_key)?.as_bytes());
-        key_material.extend(&*identity.diffie_hellman(&message.ephemeral_key)?);
-        key_material
-            .extend(diffie_hellman(&generation.signed_secret, &message.ephemeral_key)?.as_bytes());
-        if let Some(one_time_prekey) = &message.one_time_prekey {
-            let secret = generation
-                .one_time
-                .get(one_time_prekey)
-                .ok_or(ErrorKind::OneTimePrekeyNotFound)?;
-            key_material.extend(diffie_hellman(secret, &message.ephemeral_key)?.as_bytes());
-        }
+        compute_classical_accept_dh(
+            &mut key_material,
+            identity,
+            generation,
+            alice_identity_key,
+            &message.ephemeral_key,
+            message.one_time_prekey.as_ref(),
+        )?;
 
         let agreement = key_material.agree(
             alice_identity_key,
@@ -972,18 +1150,14 @@ impl LocalPrekeys {
         let pq_secret = lookup_pq_prekey(generation, message)?;
 
         let mut key_material = KeyMaterial::new_pq();
-        key_material
-            .extend(diffie_hellman(&generation.signed_secret, alice_identity_key)?.as_bytes());
-        key_material.extend(&*identity.diffie_hellman(&message.ephemeral_key)?);
-        key_material
-            .extend(diffie_hellman(&generation.signed_secret, &message.ephemeral_key)?.as_bytes());
-        if let Some(one_time_prekey) = &message.one_time_prekey {
-            let secret = generation
-                .one_time
-                .get(one_time_prekey)
-                .ok_or(ErrorKind::OneTimePrekeyNotFound)?;
-            key_material.extend(diffie_hellman(secret, &message.ephemeral_key)?.as_bytes());
-        }
+        compute_classical_accept_dh(
+            &mut key_material,
+            identity,
+            generation,
+            alice_identity_key,
+            &message.ephemeral_key,
+            message.one_time_prekey.as_ref(),
+        )?;
         let pq_ss = kem::decapsulate(pq_secret.suite, &pq_secret.seed, &message.pq_ciphertext)?;
         key_material.extend(&pq_ss);
 
@@ -1013,8 +1187,8 @@ impl LocalPrekeys {
     /// Use up an initial message [accepted](Self::accept) and shown to be Alice's: delete the
     /// private key of its one-time prekey, and keep it from being accepted again.
     ///
-    /// Fails if it cannot be accepted any more, e.g. it was confirmed already or contains
-    /// non-canonical keys.
+    /// Fails if it cannot be accepted any more, e.g. it was confirmed already, contains
+    /// non-canonical/non-prime-order keys, or the generation's confirmed-key cap is reached.
     pub fn confirm(&mut self, message: &InitialMessage) -> Result<()> {
         check_canonical_keys(
             &message.identity_key,
@@ -1023,8 +1197,12 @@ impl LocalPrekeys {
             message.one_time_prekey.as_ref(),
         )?;
         XEdDSAPublicKey::new(&message.identity_key)?;
+        XEdDSAPublicKey::new(&message.ephemeral_key)?;
         let index = self.generation(message)?;
         let generation = &mut self.generations[index];
+        if generation.confirmed.len() >= MAX_CONFIRMED_PER_GENERATION {
+            return Err(ErrorKind::MalformedState.into());
+        }
         if let Some(one_time_prekey) = &message.one_time_prekey {
             generation.one_time.remove(one_time_prekey);
         }
@@ -1038,7 +1216,7 @@ impl LocalPrekeys {
     /// replay.
     ///
     /// Fails if it cannot be accepted any more (e.g. replayed, wrong version, missing prekey,
-    /// or non-canonical keys).
+    /// non-canonical/non-prime-order keys, or the generation's confirmed-key cap is reached).
     pub fn confirm_pq(&mut self, message: &PqInitialMessage) -> Result<()> {
         if message.version != PQXDH_VERSION {
             return Err(ErrorKind::UnsupportedVersion.into());
@@ -1050,11 +1228,15 @@ impl LocalPrekeys {
             message.one_time_prekey.as_ref(),
         )?;
         XEdDSAPublicKey::new(&message.identity_key)?;
+        XEdDSAPublicKey::new(&message.ephemeral_key)?;
         if message.pq_ciphertext.len() != message.pq_suite.ct_len() {
             return Err(ErrorKind::InvalidCiphertext.into());
         }
         let index = self.pq_generation(message)?;
         let generation = &mut self.generations[index];
+        if generation.confirmed.len() >= MAX_CONFIRMED_PER_GENERATION {
+            return Err(ErrorKind::MalformedState.into());
+        }
         if let Some(one_time_prekey) = &message.one_time_prekey {
             generation.one_time.remove(one_time_prekey);
         }
@@ -1145,17 +1327,14 @@ impl From<&LocalPrekeys> for proto::LocalPrekeys {
             .iter()
             .map(|generation| {
                 let signed_secret = Zeroizing::new(generation.signed_secret.to_bytes());
-                let mut one_time: Vec<_> = generation.one_time.iter().collect();
-                one_time.sort_unstable_by_key(|(public_key, _)| *public_key);
-                let mut confirmed: Vec<_> = generation.confirmed.iter().collect();
-                confirmed.sort_unstable();
                 let mut pq_one_time: Vec<_> = generation.pq_one_time.iter().collect();
                 pq_one_time.sort_unstable_by_key(|(id, pq)| (pq.suite.as_u8(), *id));
                 proto::Generation {
                     signed_prekey: generation.signed_prekey.to_vec(),
                     signed_secret: signed_secret.to_vec(),
-                    one_time_prekeys: one_time
-                        .into_iter()
+                    one_time_prekeys: generation
+                        .one_time
+                        .iter()
                         .map(|(public_key, secret)| {
                             let secret_bytes = Zeroizing::new(secret.to_bytes());
                             proto::OneTimePrekey {
@@ -1164,8 +1343,9 @@ impl From<&LocalPrekeys> for proto::LocalPrekeys {
                             }
                         })
                         .collect(),
-                    confirmed_ephemeral_keys: confirmed
-                        .into_iter()
+                    confirmed_ephemeral_keys: generation
+                        .confirmed
+                        .iter()
                         .map(|ephemeral_key| ephemeral_key.to_vec())
                         .collect(),
                     pq_last_resort: generation
@@ -1225,18 +1405,14 @@ impl TryFrom<&proto::LocalPrekeys> for LocalPrekeys {
                 .as_slice()
                 .try_into()
                 .map_err(|_| ErrorKind::MalformedState)?;
-            if pq.encapsulation_key.len() != suite.ek_len() {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if pq_prekey_id(suite.as_u8(), &pq.encapsulation_key) != id {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            if pq.seed.len() != PQ_SEED_LENGTH {
+            if pq.encapsulation_key.len() != suite.ek_len()
+                || pq_prekey_id(suite.as_u8(), &pq.encapsulation_key) != id
+                || pq.seed.len() != PQ_SEED_LENGTH
+            {
                 return Err(ErrorKind::MalformedState.into());
             }
             let mut seed = Zeroizing::new([0u8; PQ_SEED_LENGTH]);
             seed.copy_from_slice(&pq.seed);
-            validate_pq_seed_ek(suite, &pq.encapsulation_key, &seed)?;
             Ok((
                 id,
                 PqPrekeySecret {
@@ -1251,71 +1427,54 @@ impl TryFrom<&proto::LocalPrekeys> for LocalPrekeys {
             return Err(ErrorKind::MalformedState.into());
         }
 
-        let mut seen_spks = HashSet::with_capacity(prekeys.generations.len());
+        let mut seen_spks = BTreeSet::new();
         let mut generations = VecDeque::with_capacity(prekeys.generations.len());
         for generation in &prekeys.generations {
+            if generation.one_time_prekeys.len() > MAX_ONE_TIME_PER_GENERATION
+                || generation.confirmed_ephemeral_keys.len() > MAX_CONFIRMED_PER_GENERATION
+                || generation.pq_last_resort.len() > MAX_PQ_LAST_RESORT_PER_GENERATION
+                || generation.pq_one_time_prekeys.len() > MAX_ONE_TIME_PER_GENERATION
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
             let signed_prekey = key(&generation.signed_prekey)?;
             if !seen_spks.insert(signed_prekey) {
                 return Err(ErrorKind::MalformedState.into());
             }
             let signed_secret_bytes = secret_key(&generation.signed_secret)?;
             let signed_secret = StaticSecret::from(*signed_secret_bytes);
-            if x25519_dalek::PublicKey::from(&signed_secret).to_bytes() != signed_prekey {
-                return Err(ErrorKind::MalformedState.into());
-            }
 
-            let mut one_time = HashMap::with_capacity(generation.one_time_prekeys.len());
+            let mut raw_one_time = Vec::with_capacity(generation.one_time_prekeys.len());
             for opk in &generation.one_time_prekeys {
                 let pub_key = key(&opk.public_key)?;
                 let sec_bytes = secret_key(&opk.secret)?;
-                let sec = StaticSecret::from(*sec_bytes);
-                if x25519_dalek::PublicKey::from(&sec).to_bytes() != pub_key {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if one_time.insert(pub_key, sec).is_some() {
-                    return Err(ErrorKind::MalformedState.into());
-                }
+                raw_one_time.push((pub_key, StaticSecret::from(*sec_bytes)));
             }
 
-            let mut confirmed = HashSet::with_capacity(generation.confirmed_ephemeral_keys.len());
+            let mut confirmed = BTreeSet::new();
             for ephemeral_key in &generation.confirmed_ephemeral_keys {
-                let ek = key(ephemeral_key)?;
-                if !xeddsa::is_canonical_public_key(&ek) {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                confirmed.insert(ek);
+                confirmed.insert(key(ephemeral_key)?);
             }
 
-            let mut pq_last_resort = BTreeMap::new();
-            let mut last_resort_ids = HashSet::with_capacity(generation.pq_last_resort.len());
+            let mut raw_pq_last_resort = Vec::with_capacity(generation.pq_last_resort.len());
             for pq in &generation.pq_last_resort {
-                let (id, secret) = parse_pq(pq)?;
-                if pq_last_resort.insert(secret.suite, secret).is_some()
-                    || !last_resort_ids.insert(id)
-                {
-                    return Err(ErrorKind::MalformedState.into());
-                }
+                let (_id, secret) = parse_pq(pq)?;
+                raw_pq_last_resort.push((secret.suite, secret));
             }
 
-            let mut pq_one_time = HashMap::with_capacity(generation.pq_one_time_prekeys.len());
+            let mut raw_pq_one_time = Vec::with_capacity(generation.pq_one_time_prekeys.len());
             for pq in &generation.pq_one_time_prekeys {
-                let (id, secret) = parse_pq(pq)?;
-                if last_resort_ids.contains(&id) {
-                    return Err(ErrorKind::MalformedState.into());
-                }
-                if pq_one_time.insert(id, secret).is_some() {
-                    return Err(ErrorKind::MalformedState.into());
-                }
+                raw_pq_one_time.push(parse_pq(pq)?);
             }
 
-            generations.push_back(Generation {
+            generations.push_back(build_validated_generation(
                 signed_prekey,
                 signed_secret,
-                one_time,
+                raw_one_time,
                 confirmed,
-                pq_last_resort,
-                pq_one_time,
-            });
+                raw_pq_last_resort,
+                raw_pq_one_time,
+            )?);
         }
         Ok(Self { generations })
     }
@@ -1332,26 +1491,24 @@ impl PrekeyBundle {
         identity: &XEdDSAPrivateKey,
         bob_identity_key: &PublicKey,
     ) -> Result<(InitialMessage, Agreement)> {
-        if !xeddsa::is_canonical_public_key(bob_identity_key)
-            || !xeddsa::is_canonical_public_key(&self.signed_prekey)
-            || self
-                .one_time_prekey
-                .as_ref()
-                .is_some_and(|k| !xeddsa::is_canonical_public_key(k))
-        {
-            return Err(ErrorKind::InvalidPublicKey.into());
-        }
+        validate_bundle_keys(
+            bob_identity_key,
+            &self.signed_prekey,
+            self.one_time_prekey.as_ref(),
+        )?;
         XEdDSAPublicKey::new(bob_identity_key)?
             .verify(self.signed_prekey, &self.signed_prekey_signature)?;
 
-        let (ephemeral_key, ephemeral_secret) = generate_key_pair();
+        let (ephemeral_key, ephemeral_secret) = try_generate_key_pair()?;
         let mut key_material = KeyMaterial::new_classical();
-        key_material.extend(&*identity.diffie_hellman(&self.signed_prekey)?);
-        key_material.extend(diffie_hellman(&ephemeral_secret, bob_identity_key)?.as_bytes());
-        key_material.extend(diffie_hellman(&ephemeral_secret, &self.signed_prekey)?.as_bytes());
-        if let Some(one_time_prekey) = &self.one_time_prekey {
-            key_material.extend(diffie_hellman(&ephemeral_secret, one_time_prekey)?.as_bytes());
-        }
+        compute_classical_initiate_dh(
+            &mut key_material,
+            identity,
+            &ephemeral_secret,
+            bob_identity_key,
+            &self.signed_prekey,
+            self.one_time_prekey.as_ref(),
+        )?;
 
         let identity_key = identity.compute_public_key().to_bytes();
         let message = InitialMessage {
@@ -1371,7 +1528,7 @@ impl PqPrekeyBundle {
     ///
     /// Verifies:
     /// - `self.pq_suite` is enabled in this build,
-    /// - all X25519 keys are canonically encoded,
+    /// - all X25519 keys are canonically encoded and prime-order,
     /// - `self.signed_prekey_signature` when `Some` (compat mode), or requires
     ///   `manifest_digest.is_some()` when `None` (strict mode where SPK is bound by a verified
     ///   capability manifest),
@@ -1389,15 +1546,11 @@ impl PqPrekeyBundle {
         if !self.pq_suite.is_supported() {
             return Err(ErrorKind::UnsupportedSuite.into());
         }
-        if !xeddsa::is_canonical_public_key(bob_identity_key)
-            || !xeddsa::is_canonical_public_key(&self.signed_prekey)
-            || self
-                .one_time_prekey
-                .as_ref()
-                .is_some_and(|k| !xeddsa::is_canonical_public_key(k))
-        {
-            return Err(ErrorKind::InvalidPublicKey.into());
-        }
+        validate_bundle_keys(
+            bob_identity_key,
+            &self.signed_prekey,
+            self.one_time_prekey.as_ref(),
+        )?;
         if let Some(digest) = manifest_digest
             && (digest.is_empty() || u8::try_from(digest.len()).is_err())
         {
@@ -1430,15 +1583,17 @@ impl PqPrekeyBundle {
         }
 
         let pq_id = pq_prekey_id(self.pq_suite.as_u8(), &self.pq_prekey);
-        let (ephemeral_key, ephemeral_secret) = generate_key_pair();
+        let (ephemeral_key, ephemeral_secret) = try_generate_key_pair()?;
 
         let mut key_material = KeyMaterial::new_pq();
-        key_material.extend(&*identity.diffie_hellman(&self.signed_prekey)?);
-        key_material.extend(diffie_hellman(&ephemeral_secret, bob_identity_key)?.as_bytes());
-        key_material.extend(diffie_hellman(&ephemeral_secret, &self.signed_prekey)?.as_bytes());
-        if let Some(one_time_prekey) = &self.one_time_prekey {
-            key_material.extend(diffie_hellman(&ephemeral_secret, one_time_prekey)?.as_bytes());
-        }
+        compute_classical_initiate_dh(
+            &mut key_material,
+            identity,
+            &ephemeral_secret,
+            bob_identity_key,
+            &self.signed_prekey,
+            self.one_time_prekey.as_ref(),
+        )?;
         let (pq_ciphertext, pq_ss) = kem::encapsulate(self.pq_suite, &self.pq_prekey)?;
         key_material.extend(&pq_ss);
 
@@ -1475,6 +1630,63 @@ impl PqPrekeyBundle {
         };
         Ok((message, agreement))
     }
+}
+
+/// Validates canonical encoding and prime-order subgroup membership on bundle keys.
+fn validate_bundle_keys(
+    bob_identity_key: &PublicKey,
+    signed_prekey: &PublicKey,
+    one_time_prekey: Option<&PublicKey>,
+) -> Result<()> {
+    if !xeddsa::is_canonical_public_key(bob_identity_key)
+        || !xeddsa::is_canonical_public_key(signed_prekey)
+    {
+        return Err(ErrorKind::InvalidPublicKey.into());
+    }
+    if let Some(opk) = one_time_prekey {
+        XEdDSAPublicKey::new(opk)?;
+    }
+    Ok(())
+}
+
+/// Computes the 3 or 4 classical X3DH DH outputs for Bob (`accept` / `accept_pq`).
+fn compute_classical_accept_dh(
+    key_material: &mut KeyMaterial,
+    identity: &XEdDSAPrivateKey,
+    generation: &Generation,
+    alice_identity_key: &PublicKey,
+    ephemeral_key: &PublicKey,
+    one_time_prekey: Option<&PublicKey>,
+) -> Result<()> {
+    key_material.extend(diffie_hellman(&generation.signed_secret, alice_identity_key)?.as_bytes());
+    key_material.extend(&*identity.diffie_hellman(ephemeral_key)?);
+    key_material.extend(diffie_hellman(&generation.signed_secret, ephemeral_key)?.as_bytes());
+    if let Some(one_time_prekey) = one_time_prekey {
+        let secret = generation
+            .one_time
+            .get(one_time_prekey)
+            .ok_or(ErrorKind::OneTimePrekeyNotFound)?;
+        key_material.extend(diffie_hellman(secret, ephemeral_key)?.as_bytes());
+    }
+    Ok(())
+}
+
+/// Computes the 3 or 4 classical X3DH DH outputs for Alice (`initiate` / `initiate_pq`).
+fn compute_classical_initiate_dh(
+    key_material: &mut KeyMaterial,
+    identity: &XEdDSAPrivateKey,
+    ephemeral_secret: &StaticSecret,
+    bob_identity_key: &PublicKey,
+    signed_prekey: &PublicKey,
+    one_time_prekey: Option<&PublicKey>,
+) -> Result<()> {
+    key_material.extend(&*identity.diffie_hellman(signed_prekey)?);
+    key_material.extend(diffie_hellman(ephemeral_secret, bob_identity_key)?.as_bytes());
+    key_material.extend(diffie_hellman(ephemeral_secret, signed_prekey)?.as_bytes());
+    if let Some(one_time_prekey) = one_time_prekey {
+        key_material.extend(diffie_hellman(ephemeral_secret, one_time_prekey)?.as_bytes());
+    }
+    Ok(())
 }
 
 /// Checks canonical Curve25519 encoding of all X25519 public keys in an initial message.
@@ -1591,11 +1803,15 @@ fn diffie_hellman(secret: &StaticSecret, public_key: &PublicKey) -> Result<Share
     Ok(shared_secret)
 }
 
-fn generate_key_pair() -> (PublicKey, StaticSecret) {
+fn try_generate_key_pair() -> Result<(PublicKey, StaticSecret)> {
     let mut bytes = Zeroizing::new([0u8; PUBLIC_KEY_LENGTH]);
-    getrandom::fill(bytes.as_mut_slice()).expect("the system random number generator failed");
+    getrandom::fill(bytes.as_mut_slice()).map_err(|_| ErrorKind::Rng)?;
     let secret = StaticSecret::from(*bytes);
-    (x25519_dalek::PublicKey::from(&secret).to_bytes(), secret)
+    Ok((x25519_dalek::PublicKey::from(&secret).to_bytes(), secret))
+}
+
+fn generate_key_pair() -> (PublicKey, StaticSecret) {
+    try_generate_key_pair().expect("the system random number generator failed")
 }
 
 #[cfg(test)]
@@ -1618,13 +1834,28 @@ mod test {
         (bob, prekeys, bundle)
     }
 
+    /// Mixed-order point (`B + order_8`) and twist point (`u = 2`), both canonically encoded
+    /// and contributory under clamped X25519, used to test prime-order validation.
+    const MIXED_ORDER_IK: PublicKey = [
+        52, 252, 108, 183, 200, 222, 88, 151, 119, 112, 217, 82, 22, 204, 220, 108, 133, 144, 190,
+        205, 145, 156, 7, 89, 148, 20, 86, 59, 75, 164, 71, 15,
+    ];
+    const TWIST_IK: PublicKey = {
+        let mut k = [0u8; 32];
+        k[0] = 2;
+        k
+    };
+
     #[test]
     fn retracted_one_time_prekeys_go() {
         let (bob, mut prekeys, _) = bob_setup(2);
         let extended = prekeys.extend(&bob, 3);
         let one_time = |prekeys: &LocalPrekeys| prekeys.generations.back().unwrap().one_time.len();
         assert_eq!(one_time(&prekeys), 5);
-        prekeys.retract(&extended.one_time_prekeys);
+        // Wrong signed_prekey must not retract from the latest generation.
+        prekeys.retract(&[0x42; 32], &extended.one_time_prekeys);
+        assert_eq!(one_time(&prekeys), 5);
+        prekeys.retract(&extended.signed_prekey, &extended.one_time_prekeys);
         assert_eq!(one_time(&prekeys), 2);
         assert_eq!(prekeys.generations.len(), 1);
     }
@@ -1778,29 +2009,40 @@ mod test {
             ErrorKind::InvalidPublicKey
         );
 
-        // Mixed-order (B + order_8) and twist (u = 2) Alice IKs fail accept and confirm even
-        // though they are canonically encoded and contributory under clamped X25519.
-        let mixed_order_ik: PublicKey = [
-            52, 252, 108, 183, 200, 222, 88, 151, 119, 112, 217, 82, 22, 204, 220, 108, 133, 144,
-            190, 205, 145, 156, 7, 89, 148, 20, 86, 59, 75, 164, 71, 15,
-        ];
-        let mut twist_ik = [0u8; 32];
-        twist_ik[0] = 2;
-        for bad_ik in [mixed_order_ik, twist_ik] {
-            assert!(xeddsa::is_canonical_public_key(&bad_ik));
-            assert!(XEdDSAPublicKey::new(&bad_ik).is_err());
-            let mut bad_msg = fresh.clone();
-            bad_msg.identity_key = bad_ik;
+        // Mixed-order (B + order_8) and twist (u = 2) keys fail accept, confirm (both IK and EK),
+        // and initiate (OPK) even though they are canonically encoded.
+        for bad_key in [MIXED_ORDER_IK, TWIST_IK] {
+            assert!(xeddsa::is_canonical_public_key(&bad_key));
+            assert!(XEdDSAPublicKey::new(&bad_key).is_err());
+            let mut bad_ik_msg = fresh.clone();
+            bad_ik_msg.identity_key = bad_key;
             assert_eq!(
                 prekeys
-                    .accept(&bob, &bad_ik, &bad_msg)
+                    .accept(&bob, &bad_key, &bad_ik_msg)
                     .err()
                     .unwrap()
                     .kind(),
                 ErrorKind::InvalidPublicKey
             );
             assert_eq!(
-                prekeys.confirm(&bad_msg).unwrap_err().kind(),
+                prekeys.confirm(&bad_ik_msg).unwrap_err().kind(),
+                ErrorKind::InvalidPublicKey
+            );
+            let mut bad_ek_msg = fresh.clone();
+            bad_ek_msg.ephemeral_key = bad_key;
+            assert_eq!(
+                prekeys.confirm(&bad_ek_msg).unwrap_err().kind(),
+                ErrorKind::InvalidPublicKey
+            );
+            let bad_opk_bundle = PrekeyBundle {
+                one_time_prekey: Some(bad_key),
+                ..no_opk.clone()
+            };
+            assert_eq!(
+                bad_opk_bundle
+                    .initiate(&alice, &bob_key)
+                    .unwrap_err()
+                    .kind(),
                 ErrorKind::InvalidPublicKey
             );
         }
@@ -1874,30 +2116,7 @@ mod test {
     }
 
     #[test]
-    fn pq_suite_metadata_and_unconditional_signature_helpers() {
-        assert_eq!(PqSuite::from_u8(1), Some(PqSuite::MlKem1024));
-        assert_eq!(PqSuite::from_u8(2), Some(PqSuite::MlKem768));
-        assert_eq!(PqSuite::from_u8(0), None);
-        assert_eq!(PqSuite::from_u8(3), None);
-
-        assert_eq!(PqSuite::MlKem1024.as_u8(), 1);
-        assert_eq!(PqSuite::MlKem1024.ek_len(), 1568);
-        assert_eq!(PqSuite::MlKem1024.ct_len(), 1568);
-        assert_eq!(PqSuite::MlKem1024.label(), "ML-KEM-1024");
-        assert_eq!(
-            PqSuite::MlKem1024.is_supported(),
-            cfg!(feature = "ml-kem-1024")
-        );
-
-        assert_eq!(PqSuite::MlKem768.as_u8(), 2);
-        assert_eq!(PqSuite::MlKem768.ek_len(), 1184);
-        assert_eq!(PqSuite::MlKem768.ct_len(), 1088);
-        assert_eq!(PqSuite::MlKem768.label(), "ML-KEM-768");
-        assert_eq!(
-            PqSuite::MlKem768.is_supported(),
-            cfg!(feature = "ml-kem-768")
-        );
-
+    fn pq_unconditional_id_and_signature_helpers() {
         // Deterministic pq_prekey_id differs across suites even for identical bytes.
         let fake_ek = vec![0x42u8; 1568];
         let id1 = pq_prekey_id(1, &fake_ek);
@@ -2157,11 +2376,22 @@ mod test {
         assert!(serde_json::from_value::<LocalPrekeys>(bad_spk).is_err());
 
         // Non-canonical confirmed EK fails.
-        let mut bad_ek = val;
+        let mut bad_ek = val.clone();
         let mut ek = [0u8; 32];
         ek[31] = 0x80;
         bad_ek["generations"][0]["confirmed"] = serde_json::json!([ek]);
         assert!(serde_json::from_value::<LocalPrekeys>(bad_ek).is_err());
+
+        // Duplicate-flood `confirmed` fails immediately (both on duplicate and on > MAX hint).
+        let valid_ek = public_key(&XEdDSAPrivateKey::generate());
+        let mut dup_ek = val.clone();
+        dup_ek["generations"][0]["confirmed"] = serde_json::json!([valid_ek, valid_ek]);
+        assert!(serde_json::from_value::<LocalPrekeys>(dup_ek).is_err());
+
+        let mut flood_ek = val;
+        flood_ek["generations"][0]["confirmed"] =
+            serde_json::json!(vec![valid_ek; MAX_CONFIRMED_PER_GENERATION + 5]);
+        assert!(serde_json::from_value::<LocalPrekeys>(flood_ek).is_err());
     }
 
     #[cfg(feature = "rkyv")]
@@ -2186,10 +2416,10 @@ mod test {
         too_many.generations.push_back(Generation {
             signed_prekey: spk,
             signed_secret: sec,
-            one_time: HashMap::new(),
-            confirmed: HashSet::new(),
+            one_time: BTreeMap::new(),
+            confirmed: BTreeSet::new(),
             pq_last_resort: BTreeMap::new(),
-            pq_one_time: HashMap::new(),
+            pq_one_time: BTreeMap::new(),
         });
         let too_many_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&too_many).unwrap();
         assert!(rkyv::from_bytes::<LocalPrekeys, rkyv::rancor::Error>(&too_many_bytes).is_err());
@@ -2363,19 +2593,13 @@ mod test {
                     ErrorKind::MalformedState
                 );
 
-                // Mixed-order (B + order_8) and twist (u = 2) Alice IKs fail accept_pq and confirm_pq.
-                let mixed_order_ik: PublicKey = [
-                    52, 252, 108, 183, 200, 222, 88, 151, 119, 112, 217, 82, 22, 204, 220, 108,
-                    133, 144, 190, 205, 145, 156, 7, 89, 148, 20, 86, 59, 75, 164, 71, 15,
-                ];
-                let mut twist_ik = [0u8; 32];
-                twist_ik[0] = 2;
-                for bad_ik in [mixed_order_ik, twist_ik] {
+                // Mixed-order (B + order_8) and twist (u = 2) keys fail accept_pq and confirm_pq.
+                for bad_key in [MIXED_ORDER_IK, TWIST_IK] {
                     let mut bad_msg = valid_msg.clone();
-                    bad_msg.identity_key = bad_ik;
+                    bad_msg.identity_key = bad_key;
                     assert_eq!(
                         prekeys
-                            .accept_pq(&bob, &bad_ik, &bad_msg, None)
+                            .accept_pq(&bob, &bad_key, &bad_msg, None)
                             .err()
                             .unwrap()
                             .kind(),
@@ -2385,7 +2609,36 @@ mod test {
                         prekeys.confirm_pq(&bad_msg).unwrap_err().kind(),
                         ErrorKind::InvalidPublicKey
                     );
+                    let mut bad_ek_msg = valid_msg.clone();
+                    bad_ek_msg.ephemeral_key = bad_key;
+                    assert_eq!(
+                        prekeys.confirm_pq(&bad_ek_msg).unwrap_err().kind(),
+                        ErrorKind::InvalidPublicKey
+                    );
                 }
+
+                // Invalid ML-KEM encapsulation key (non-canonical 12-bit coefficient >= 3329) even
+                // with a valid Bob signature must fail `initiate_pq` with InvalidPublicKey.
+                let mut invalid_mlkem_ek = vec![0xFFu8; suite.ek_len()];
+                invalid_mlkem_ek[0] = 0xFF;
+                invalid_mlkem_ek[1] = 0xFF;
+                let invalid_ek_sig = sign_pq_spk(&bob, suite, &invalid_mlkem_ek).unwrap();
+                let invalid_ek_bundle = PqPrekeyBundle {
+                    signed_prekey: published.classical.signed_prekey,
+                    signed_prekey_signature: Some(published.classical.signed_prekey_signature),
+                    one_time_prekey: None,
+                    pq_suite: suite,
+                    pq_prekey: invalid_mlkem_ek,
+                    pq_prekey_signature: invalid_ek_sig,
+                    pq_last_resort: true,
+                };
+                assert_eq!(
+                    invalid_ek_bundle
+                        .initiate_pq(&alice, &bob_ik, None)
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::InvalidPublicKey
+                );
             }
         }
 
@@ -2659,26 +2912,69 @@ mod test {
                 let alice_ik = public_key(&alice);
                 let bob_ik = public_key(&bob);
 
-                // Upgrade an existing classical generation via extend_pq without rotating SPK.
+                // Classical generation rejects refill_pq_only until a last-resort PQSPK exists.
                 let mut prekeys = LocalPrekeys::new();
                 let classical = prekeys.generate(&bob, 1);
+                assert!(!prekeys.has_pq_last_resort(suite));
+                assert_eq!(
+                    prekeys
+                        .refill_pq_only(&bob, suite, 1, 1)
+                        .unwrap_err()
+                        .kind(),
+                    ErrorKind::PqPrekeyNotFound
+                );
+
+                // Upgrade an existing classical generation via extend_pq without rotating SPK.
                 let upgraded = prekeys.extend_pq(&bob, suite, 2, 2).unwrap();
+                assert!(prekeys.has_pq_last_resort(suite));
                 assert_eq!(upgraded.classical.signed_prekey, classical.signed_prekey);
                 assert_eq!(prekeys.generation_count(), 1);
                 assert_eq!(prekeys.current_one_time_count(), 3);
                 assert_eq!(prekeys.current_pq_one_time_count(suite), 2);
 
-                // Second extend_pq keeps BOTH SPK and last-resort PQSPK.
-                let refilled = prekeys.extend_pq(&bob, suite, 1, 3).unwrap();
+                // Retracting with a newly minted last-resort suite cleans it up cleanly.
+                let mut scratch = LocalPrekeys::new();
+                let scratch_cls = scratch.generate(&bob, 1);
+                let scratch_up = scratch.extend_pq(&bob, suite, 1, 1).unwrap();
+                let scratch_pq_ids: Vec<_> = scratch_up
+                    .pq_one_time_prekeys
+                    .iter()
+                    .map(|k| k.id)
+                    .collect();
+                scratch.retract_pq(
+                    &scratch_cls.signed_prekey,
+                    &scratch_up.classical.one_time_prekeys,
+                    &scratch_pq_ids,
+                    &[suite],
+                );
+                assert!(!scratch.has_pq_last_resort(suite));
+                assert_eq!(scratch.current_one_time_count(), 1);
+                assert_eq!(scratch.current_pq_one_time_count(suite), 0);
+
+                // Second refill via refill_pq_only keeps BOTH SPK and last-resort PQSPK.
+                let refilled = prekeys.refill_pq_only(&bob, suite, 1, 3).unwrap();
                 assert_eq!(refilled.classical.signed_prekey, classical.signed_prekey);
                 assert_eq!(refilled.pq_last_resort.id, upgraded.pq_last_resort.id);
                 assert_eq!(prekeys.current_one_time_count(), 4);
                 assert_eq!(prekeys.current_pq_one_time_count(suite), 5);
 
-                // Retracting removes only the retracted batch.
+                // Retracting with mismatched SPK is a no-op; matching SPK removes only that batch.
                 let retract_pq_ids: Vec<PqPrekeyId> =
                     refilled.pq_one_time_prekeys.iter().map(|k| k.id).collect();
-                prekeys.retract_pq(&refilled.classical.one_time_prekeys, &retract_pq_ids);
+                prekeys.retract_pq(
+                    &[0x99; 32],
+                    &refilled.classical.one_time_prekeys,
+                    &retract_pq_ids,
+                    &[],
+                );
+                assert_eq!(prekeys.current_one_time_count(), 4);
+                assert_eq!(prekeys.current_pq_one_time_count(suite), 5);
+                prekeys.retract_pq(
+                    &refilled.classical.signed_prekey,
+                    &refilled.classical.one_time_prekeys,
+                    &retract_pq_ids,
+                    &[],
+                );
                 assert_eq!(prekeys.current_one_time_count(), 3);
                 assert_eq!(prekeys.current_pq_one_time_count(suite), 2);
 
@@ -2695,6 +2991,27 @@ mod test {
                 let (msg, alice_ag) = bundle.initiate_pq(&alice, &bob_ik, None).unwrap();
                 let (bob_ag, _) = prekeys.accept_pq(&bob, &alice_ik, &msg, None).unwrap();
                 assert_eq!(*alice_ag.secret_key, *bob_ag.secret_key);
+
+                // rollback_generation fails once a message has been confirmed against the generation.
+                let (gen2, evicted) = prekeys
+                    .generate_pq_with_rollback(&bob, suite, 1, 1)
+                    .unwrap();
+                let b2 = PqPrekeyBundle {
+                    signed_prekey: gen2.classical.signed_prekey,
+                    signed_prekey_signature: Some(gen2.classical.signed_prekey_signature),
+                    one_time_prekey: None,
+                    pq_suite: suite,
+                    pq_prekey: gen2.pq_last_resort.encapsulation_key.clone(),
+                    pq_prekey_signature: gen2.pq_last_resort.signature,
+                    pq_last_resort: true,
+                };
+                let (m2, _) = b2.initiate_pq(&alice, &bob_ik, None).unwrap();
+                prekeys.confirm_pq(&m2).unwrap();
+                assert!(!prekeys.rollback_generation(&gen2.classical.signed_prekey, evicted));
+                assert_eq!(
+                    prekeys.current_signed_prekey(),
+                    Some(gen2.classical.signed_prekey)
+                );
             }
         }
 

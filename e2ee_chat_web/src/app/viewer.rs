@@ -1,49 +1,96 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
-use e2ee_chat_preview::language;
+use e2ee_chat_preview::{
+    language,
+    rpc::{DIAGRAM_SOURCE_MAX, HIGHLIGHT_MAX},
+};
 use leptos::{ev, html, prelude::*, task::spawn_local};
+use session::PublicKey;
+use unicode_general_category::{GeneralCategory, get_general_category};
 use wasm_bindgen::{JsCast, JsValue};
-use web_sys::Url;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::{
     icon::{Icon, icon},
     preview::{self, DiffLine, Kind},
     search::Search,
     state::{Attachment, RemoteFile, Streamed},
-    util::{js_error, percent_decode, size, size_u64},
+    util::{js_error, percent_decode, sanitize_filename, size, size_u64},
     workers,
 };
 
 use super::{
     Toast,
-    common::act,
+    common::{act, download_blob},
     engine,
     media::{
         begin_preview_request, blob_url, cancel_pending_previews, image_url, release, stop_media,
+        stop_media_on_cleanup,
     },
     pdf::PdfView,
     ui,
 };
+
+/// Maximum number of fenced code / Mermaid blocks enhanced per Markdown document or slide.
+pub(super) const MAX_ENHANCE_BLOCKS: usize = 64;
+
+#[derive(Clone)]
+struct ViewedPreview {
+    attachment: Attachment,
+    kind: Kind,
+}
+
+impl PartialEq for ViewedPreview {
+    fn eq(&self, other: &Self) -> bool {
+        self.attachment == other.attachment && self.attachment.mime == other.attachment.mime
+    }
+}
 
 #[component]
 pub(super) fn Viewer() -> impl IntoView {
     let ui = ui();
     let dialog = NodeRef::<html::Dialog>::new();
     let download_anchor = NodeRef::<html::A>::new();
-    // The blob URL on screen, revoked once another file shows or the viewer closes.
-    let shown_url = StoredValue::new(None::<String>);
     // Whether it waits for an attachment, which shows how far it got until it opens.
     let waiting = Memo::new(move |_| ui.opening.with(Option::is_some));
     // What it shows, and whether that is text, which can be searched.
     let shown_content = NodeRef::<html::Div>::new();
-    let searchable = RwSignal::new(false);
-    // The streamed attachments being downloaded whole, by ID, which their Download waits for.
-    let downloading = RwSignal::new(HashSet::<Vec<u8>>::new());
+    let slides_full = RwSignal::new(false);
+    let preview_kind = Memo::new(move |_| {
+        ui.viewer.with(|attachment| {
+            attachment.as_ref().map(|a| ViewedPreview {
+                attachment: a.clone(),
+                kind: preview::kind(&a.name, &a.mime, &a.data),
+            })
+        })
+    });
+    let searchable = Memo::new(move |_| {
+        preview_kind.with(|entry| {
+            entry.as_ref().is_some_and(|entry| {
+                matches!(
+                    entry.kind,
+                    Kind::Code { .. }
+                        | Kind::Markdown { .. }
+                        | Kind::Diff(_)
+                        | Kind::Table(_)
+                        | Kind::Archive(_)
+                        | Kind::Cards(_)
+                )
+            })
+        })
+    });
+    // The streamed attachments being downloaded whole, keyed by `(peer, id)` -> generation token
+    // so closing the viewer or switching streams cancels in-flight downloads cleanly.
+    let downloading = RwSignal::new(HashMap::<(PublicKey, Vec<u8>), u64>::new());
+    let next_download_id = StoredValue::new(0u64);
     let fetching_whole = move || {
         ui.streaming.with(|streamed| {
             streamed.as_ref().is_some_and(|streamed| {
-                downloading.with(|downloading| downloading.contains(&streamed.remote.pointer.id))
+                downloading.with(|downloading| {
+                    downloading
+                        .contains_key(&(streamed.remote.peer, streamed.remote.pointer.id.clone()))
+                })
             })
         })
     };
@@ -56,14 +103,23 @@ pub(super) fn Viewer() -> impl IntoView {
         if was_open {
             cancel_pending_previews();
         }
+        if slides_full_screen() {
+            document().exit_fullscreen();
+        }
+        slides_full.set(false);
+        downloading.update(HashMap::clear);
         ui.viewer.set(None);
         ui.opening.set(None);
         ui.streaming.set(None);
     };
-    // A stream plays until the viewer shows something else, or closes.
+    // Clear `ui.opening` once a file shows, and stop any active stream when something else shows.
     Effect::new(move || {
-        let other = ui.viewer.with(Option::is_some) || ui.opening.with(Option::is_some);
-        if other && ui.streaming.with_untracked(Option::is_some) {
+        let has_viewer = ui.viewer.with(Option::is_some);
+        let has_opening = ui.opening.with(Option::is_some);
+        if has_viewer && has_opening {
+            ui.opening.set(None);
+        }
+        if (has_viewer || has_opening) && ui.streaming.with_untracked(Option::is_some) {
             ui.streaming.set(None);
         }
     });
@@ -90,54 +146,33 @@ pub(super) fn Viewer() -> impl IntoView {
         }
     });
     let content = move || {
-        if let Some(url) = shown_url.get_value() {
-            let _ = Url::revoke_object_url(&url);
-            shown_url.set_value(None);
-        }
-        let Some(attachment) = ui.viewer.get() else {
-            searchable.set(false);
+        let Some(ViewedPreview { attachment, kind }) = preview_kind.get() else {
             if let Some(streamed) = ui.streaming.get() {
                 return Some(view! { <StreamedView streamed /> }.into_any());
             }
             return waiting.get().then(opening_view);
         };
-        let kind = preview::kind(&attachment.name, &attachment.mime, &attachment.data);
-        searchable.set(matches!(
-            kind,
-            Kind::Code { .. }
-                | Kind::Markdown { .. }
-                | Kind::Diff(_)
-                | Kind::Table(_)
-                | Kind::Archive(_)
-                | Kind::Cards(_)
-        ));
-        let shown = |url: Option<String>| {
-            shown_url.set_value(url.clone().filter(|url| url.starts_with("blob:")));
-            url
-        };
+        let safe_name = sanitize_filename(&attachment.name);
         Some(match kind {
-            Kind::Image(mime) => match shown(image_url(&attachment.data, mime)) {
-                Some(url) => view! {
-                    <div class="media">
-                        <img src=url alt=attachment.name.clone() />
-                    </div>
-                }
-                .into_any(),
+            Kind::Image(mime) => match image_url(&attachment.data, mime) {
+                Some(url) => view! { <ImageView url alt=safe_name /> }.into_any(),
                 None => no_preview(),
             },
-            Kind::Video(mime) => match shown(blob_url(&attachment.data, mime)) {
+            Kind::Video(mime) => match blob_url(&attachment.data, mime) {
                 Some(url) => view! { <VideoView url /> }.into_any(),
                 None => no_preview(),
             },
-            Kind::Audio(mime) => match shown(blob_url(&attachment.data, mime)) {
+            Kind::Audio(mime) => match blob_url(&attachment.data, mime) {
                 Some(url) => view! {
-                    <AudioView url name=attachment.name.clone() data=attachment.data.clone() />
+                    <AudioView url name=safe_name data=attachment.data.clone() own_url=true />
                 }
                 .into_any(),
                 None => no_preview(),
             },
             Kind::Pdf => view! { <PdfView data=attachment.data.clone() /> }.into_any(),
-            Kind::Markdown { html, source } => view! { <MarkdownView html source /> }.into_any(),
+            Kind::Markdown { html, source } => {
+                view! { <MarkdownView html source slides_full /> }.into_any()
+            }
             Kind::Code { text, language } => view! { <CodeView text language /> }.into_any(),
             Kind::Table(table) => table_view(table),
             Kind::Archive(listing) => archive_view(listing),
@@ -151,13 +186,17 @@ pub(super) fn Viewer() -> impl IntoView {
             .with(|attachment| {
                 attachment
                     .as_ref()
-                    .map(|a| format!("{} · {}", a.name, size(a.data.len())))
+                    .map(|a| format!("{} · {}", sanitize_filename(&a.name), size(a.data.len())))
             })
             .or_else(|| {
                 ui.streaming.with(|streamed| {
                     streamed.as_ref().map(|streamed| {
                         let pointer = &streamed.remote.pointer;
-                        format!("{} · {}", pointer.name, size_u64(pointer.size))
+                        format!(
+                            "{} · {}",
+                            sanitize_filename(&pointer.name),
+                            size_u64(pointer.size)
+                        )
                     })
                 })
             })
@@ -165,12 +204,21 @@ pub(super) fn Viewer() -> impl IntoView {
                 ui.opening.with(|opening| {
                     opening
                         .as_ref()
-                        .map(|o| format!("{} · {}", o.name, size_u64(o.size)))
+                        .map(|o| format!("{} · {}", sanitize_filename(&o.name), size_u64(o.size)))
                 })
             })
             .unwrap_or_default()
     };
-    let on_cancel = move |_: ev::Event| {
+    let on_cancel = move |event: ev::Event| {
+        // Exit slide fullscreen first on Escape instead of closing the entire Viewer.
+        if slides_full.get_untracked() || slides_full_screen() {
+            event.prevent_default();
+            if slides_full_screen() {
+                document().exit_fullscreen();
+            }
+            slides_full.set(false);
+            return;
+        }
         // Invalidate pending previews immediately when native cancellation (e.g. Escape) begins,
         // before the queued `close` event runs, so an in-flight download finishing in that gap
         // cannot reopen the viewer and make `on_close` skip cleanup.
@@ -202,7 +250,12 @@ pub(super) fn Viewer() -> impl IntoView {
                                 if let Some(attachment) = ui.viewer.get_untracked() {
                                     download(&attachment, download_anchor);
                                 } else if let Some(streamed) = ui.streaming.get_untracked() {
-                                    download_whole(streamed.remote, downloading, download_anchor);
+                                    download_whole(
+                                        streamed.remote,
+                                        downloading,
+                                        next_download_id,
+                                        download_anchor,
+                                    );
                                 }
                             }
                         >
@@ -226,14 +279,28 @@ pub(super) fn Viewer() -> impl IntoView {
     }
 }
 
-/// A video shown in the viewer, stopping playback via its own `NodeRef` on cleanup.
+/// An image shown in the viewer, revoking its blob URL on cleanup (`data:` URLs are ignored).
+#[component]
+fn ImageView(url: String, alt: String) -> impl IntoView {
+    let owned = url.clone();
+    on_cleanup(move || release(&owned));
+    view! {
+        <div class="media">
+            <img src=url alt=alt />
+        </div>
+    }
+}
+
+/// A video shown in the viewer, stopping playback via its own `NodeRef` before revoking its blob URL.
 #[component]
 fn VideoView(url: String) -> impl IntoView {
     let video_ref = NodeRef::<html::Video>::new();
+    let owned = url.clone();
     on_cleanup(move || {
-        if let Some(video) = video_ref.get_untracked() {
+        if let Some(video) = video_ref.try_get_untracked().flatten() {
             stop_media(&video);
         }
+        release(&owned);
     });
     view! {
         <div class="media">
@@ -248,11 +315,7 @@ fn VideoView(url: String) -> impl IntoView {
 #[component]
 fn StreamedView(streamed: Streamed) -> impl IntoView {
     let video_ref = NodeRef::<html::Video>::new();
-    on_cleanup(move || {
-        if let Some(video) = video_ref.get_untracked() {
-            stop_media(&video);
-        }
-    });
+    stop_media_on_cleanup(video_ref);
     let unplayable = {
         let (url, remote) = (streamed.url.clone(), streamed.remote.clone());
         move |_: ev::ErrorEvent| {
@@ -285,42 +348,68 @@ fn StreamedView(streamed: Streamed) -> impl IntoView {
         }
         .into_any()
     } else {
-        let name = streamed.remote.pointer.name;
+        let name = sanitize_filename(&streamed.remote.pointer.name);
         let on_error = UnsyncCallback::new(unplayable);
         view! { <AudioView url=streamed.url name on_error /> }.into_any()
     }
 }
 
 /// Download the attachment `remote` whole, as a stream plays only what it needs of it, unless
-/// it is among those `downloading` already, as it is meanwhile.
+/// it is among those `downloading` already. Cancels cleanly if the viewer closes, switches streams,
+/// or the contact is deleted.
 fn download_whole(
     remote: RemoteFile,
-    downloading: RwSignal<HashSet<Vec<u8>>>,
+    downloading: RwSignal<HashMap<(PublicKey, Vec<u8>), u64>>,
+    next_download_id: StoredValue<u64>,
     download_anchor: NodeRef<html::A>,
 ) {
-    let id = remote.pointer.id.clone();
-    if downloading.with_untracked(|downloading| downloading.contains(&id)) {
+    let key = (remote.peer, remote.pointer.id.clone());
+    if downloading.with_untracked(|downloading| downloading.contains_key(&key)) {
         return;
     }
+    let dl_id = next_download_id.get_value().wrapping_add(1).max(1);
+    next_download_id.set_value(dl_id);
     downloading.update(|downloading| {
-        downloading.insert(id.clone());
+        downloading.insert(key.clone(), dl_id);
     });
     let ui = ui();
+    let display_name = sanitize_filename(&remote.pointer.name);
     act(async move {
-        ui.notify(format!("Downloading {}…", remote.pointer.name));
+        ui.notify(format!("Downloading {display_name}…"));
+        let peer = remote.peer;
+        let id = remote.pointer.id.clone();
+        let still_active = {
+            let key = key.clone();
+            move || {
+                downloading
+                    .try_with_untracked(|map| map.get(&key) == Some(&dl_id))
+                    .unwrap_or(false)
+                    && ui
+                        .contacts
+                        .with_untracked(|contacts| contacts.iter().any(|c| c.peer == peer))
+                    && ui.streaming.with_untracked(|streamed| {
+                        streamed.as_ref().is_some_and(|streamed| {
+                            streamed.remote.peer == peer && streamed.remote.pointer.id == id
+                        })
+                    })
+            }
+        };
         let fetched = engine()
             .media(
                 remote.peer,
                 remote.index,
                 remote.pointer,
                 remote.clock,
-                &|| true,
+                &still_active,
             )
             .await;
-        downloading.try_update(|downloading| {
-            downloading.remove(&id);
+        let should_save = still_active();
+        let _ = downloading.try_update(|downloading| {
+            if downloading.get(&key) == Some(&dl_id) {
+                downloading.remove(&key);
+            }
         });
-        if let Some(attachment) = fetched? {
+        if should_save && let Some(attachment) = fetched? {
             download(&attachment, download_anchor);
         }
         Ok(())
@@ -339,11 +428,18 @@ fn AudioView(
     /// What to do if it does not play.
     #[prop(optional)]
     on_error: Option<UnsyncCallback<ev::ErrorEvent>>,
+    /// Revoke `url` on cleanup after stopping playback (true for blob URLs owned by this view).
+    #[prop(default = false)]
+    own_url: bool,
 ) -> impl IntoView {
     let audio_ref = NodeRef::<html::Audio>::new();
+    let owned = url.clone();
     on_cleanup(move || {
-        if let Some(audio) = audio_ref.get_untracked() {
+        if let Some(audio) = audio_ref.try_get_untracked().flatten() {
             stop_media(&audio);
+        }
+        if own_url {
+            release(&owned);
         }
     });
     let tags = RwSignal::new(None::<preview::Tags>);
@@ -447,7 +543,10 @@ fn no_preview() -> AnyView {
 
 #[component]
 fn CodeView(text: String, language: Option<&'static str>) -> impl IntoView {
-    let Some(lang) = language.and_then(language::of_block) else {
+    let Some(lang) = language
+        .filter(|_| text.len() <= HIGHLIGHT_MAX)
+        .and_then(language::of_block)
+    else {
         return view! { <pre class="code"><code data-lang=language>{text}</code></pre> }.into_any();
     };
     let highlighted = RwSignal::new(None::<String>);
@@ -455,7 +554,13 @@ fn CodeView(text: String, language: Option<&'static str>) -> impl IntoView {
     let plain = StoredValue::new(text.clone());
     let here = StoredValue::new(());
     spawn_local(async move {
-        let result = workers::highlight(lang, &text).await;
+        let result = match workers::highlight(lang, &text).await {
+            Ok(html) => match preview::validate_highlight_html(&html) {
+                Ok(()) => Ok(html),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
         if here.try_get_value().is_some() {
             match result {
                 Ok(html) => highlighted.set(Some(html)),
@@ -557,16 +662,73 @@ fn select(element: &web_sys::Element, selector: &str) -> Vec<web_sys::Element> {
         .collect()
 }
 
-/// Highlight `pre > code[data-lang]` blocks and draw Mermaid diagrams as images. Blocks that fail
-/// stay as they are, saying why in `data-error`. External links already receive
-/// `target="_blank" rel="noopener noreferrer"` during sanitization in `preview::sanitize_html`.
+/// Enhancement decision for a single `pre > code[data-lang]` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EnhancePlan {
+    Diagram,
+    Highlight(&'static language::Language),
+    Skip(&'static str),
+}
+
+/// Decide whether a fenced block with language tag `info` and `byte_len` bytes should be sent to
+/// a worker, given `scheduled` blocks already queued in this document.
+pub(super) fn plan_enhance_block(
+    info: &str,
+    byte_len: usize,
+    scheduled: usize,
+) -> Option<EnhancePlan> {
+    if info.eq_ignore_ascii_case("mermaid") {
+        if scheduled >= MAX_ENHANCE_BLOCKS {
+            return Some(EnhancePlan::Skip("too many enhanced blocks in document"));
+        }
+        if byte_len > DIAGRAM_SOURCE_MAX {
+            return Some(EnhancePlan::Skip("diagram source is too large"));
+        }
+        return Some(EnhancePlan::Diagram);
+    }
+    let language = language::of_block(info)?;
+    if scheduled >= MAX_ENHANCE_BLOCKS {
+        return Some(EnhancePlan::Skip("too many enhanced blocks in document"));
+    }
+    if byte_len > HIGHLIGHT_MAX {
+        return Some(EnhancePlan::Skip("code block is too large to highlight"));
+    }
+    Some(EnhancePlan::Highlight(language))
+}
+
+/// Highlight `pre > code[data-lang]` blocks and draw Mermaid diagrams as images sequentially via a
+/// bounded queue (up to [`MAX_ENHANCE_BLOCKS`] per document, enforcing [`HIGHLIGHT_MAX`] and
+/// [`DIAGRAM_SOURCE_MAX`]). Validated HTML is required before setting `inner_html`; blocks that
+/// fail or exceed limits stay plain text with `data-error`.
 fn enhance(element: &web_sys::Element) {
+    let mut queue = Vec::new();
     for code in select(element, "pre > code[data-lang]") {
-        spawn_local(async move {
-            let info = code.get_attribute("data-lang").unwrap_or_default();
-            let text = code.text_content().unwrap_or_default();
-            let shown = if info.eq_ignore_ascii_case("mermaid") {
-                workers::diagram(&text).await.and_then(|svg| {
+        let info = code.get_attribute("data-lang").unwrap_or_default();
+        let text = code.text_content().unwrap_or_default();
+        match plan_enhance_block(&info, text.len(), queue.len()) {
+            Some(EnhancePlan::Skip(reason)) => {
+                if let Some(block) = code.parent_element() {
+                    let _ = block.set_attribute("data-error", reason);
+                }
+            }
+            Some(plan) => queue.push((code, plan, text)),
+            None => {}
+        }
+    }
+    if queue.is_empty() {
+        return;
+    }
+    let container = element.clone();
+    spawn_local(async move {
+        for (code, plan, text) in queue {
+            if !container.is_connected() {
+                break;
+            }
+            if !code.is_connected() {
+                continue;
+            }
+            let shown = match plan {
+                EnhancePlan::Diagram => workers::diagram(&text).await.and_then(|svg| {
                     if !code.is_connected() {
                         return Ok(());
                     }
@@ -580,27 +742,29 @@ fn enhance(element: &web_sys::Element) {
                         block.replace_with_with_node_1(&image).map_err(js_error)?;
                     }
                     Ok(())
-                })
-            } else if let Some(language) = language::of_block(&info) {
-                workers::highlight(language, &text).await.map(|html| {
-                    if code.is_connected() {
-                        code.set_inner_html(&html);
-                    }
-                })
-            } else {
-                Ok(())
+                }),
+                EnhancePlan::Highlight(language) => {
+                    workers::highlight(language, &text).await.and_then(|html| {
+                        preview::validate_highlight_html(&html)?;
+                        if code.is_connected() {
+                            code.set_inner_html(&html);
+                        }
+                        Ok(())
+                    })
+                }
+                EnhancePlan::Skip(_) => Ok(()),
             };
             if let (Err(e), true, Some(block)) = (shown, code.is_connected(), code.parent_element())
             {
                 let _ = block.set_attribute("data-error", &e);
             }
-        });
-    }
+        }
+    });
 }
 
 /// A Markdown file, as a document, or as reveal.js slides.
 #[component]
-fn MarkdownView(html: String, source: String) -> impl IntoView {
+fn MarkdownView(html: String, source: String, slides_full: RwSignal<bool>) -> impl IntoView {
     let as_slides = RwSignal::new(false);
     view! {
         <div class="preview-bar">
@@ -615,7 +779,7 @@ fn MarkdownView(html: String, source: String) -> impl IntoView {
         </div>
         {move || {
             if as_slides.get() {
-                view! { <Slides source=source.clone() /> }.into_any()
+                view! { <Slides source=source.clone() full=slides_full /> }.into_any()
             } else {
                 let html = html.clone();
                 view! {
@@ -641,15 +805,30 @@ fn slides_full_screen() -> bool {
         .is_some_and(|element| element.matches(".slides").unwrap_or(false))
 }
 
+/// Invoke `element.requestFullscreen()` and return its Promise if the browser returns one, so
+/// rejected fullscreen requests are caught cleanly and fall back to window fullscreen.
+fn request_fullscreen_promise(
+    element: &web_sys::Element,
+) -> Result<Option<js_sys::Promise>, JsValue> {
+    let method = js_sys::Reflect::get(element, &JsValue::from_str("requestFullscreen"))?
+        .dyn_into::<js_sys::Function>()?;
+    let result = method.call0(element)?;
+    if result.is_undefined() || result.is_null() {
+        Ok(None)
+    } else {
+        Ok(result.dyn_into::<js_sys::Promise>().ok())
+    }
+}
+
 /// reveal.js slides: the arrow keys go to the next column, left and right, and to the next slide
 /// in it, up and down. F shows them full screen, the browser's, or, where a page may not have it,
 /// as on iPhones, the window's, scaled as reveal.js scales them; F or Esc leaves it.
 #[component]
-fn Slides(source: String) -> impl IntoView {
+fn Slides(source: String, full: RwSignal<bool>) -> impl IntoView {
     let deck = StoredValue::new(preview::slides(&source));
     let position = RwSignal::new((0, 0));
     let node = NodeRef::<html::Div>::new();
-    let full = RwSignal::new(false);
+    let here = StoredValue::new(());
     let toggle = move || {
         let document = document();
         if slides_full_screen() {
@@ -658,9 +837,19 @@ fn Slides(source: String) -> impl IntoView {
             full.set(false);
         } else if document.fullscreen_enabled()
             && let Some(slides) = node.get_untracked()
-            && slides.request_fullscreen().is_ok()
         {
-            // Full once the browser says so.
+            match request_fullscreen_promise(&slides) {
+                Ok(Some(promise)) => {
+                    spawn_local(async move {
+                        if JsFuture::from(promise).await.is_err() && here.try_get_value().is_some()
+                        {
+                            full.set(true);
+                        }
+                    });
+                }
+                Ok(None) => {}
+                Err(_) => full.set(true),
+            }
         } else {
             full.set(true);
         }
@@ -744,6 +933,7 @@ fn Slides(source: String) -> impl IntoView {
         keys.remove();
         changes.remove();
         resizes.remove();
+        let _ = full.try_set(false);
         if slides_full_screen() {
             document().exit_fullscreen();
         }
@@ -866,6 +1056,19 @@ fn table_view(table: preview::Table) -> AnyView {
     .into_any()
 }
 
+/// Strip control and Unicode format (including BiDi override) characters from an archive entry
+/// path for safe display while preserving directory separators.
+pub(super) fn sanitize_archive_path(path: &str) -> String {
+    path.chars()
+        .filter(|&ch| {
+            !matches!(
+                get_general_category(ch),
+                GeneralCategory::Control | GeneralCategory::Format
+            )
+        })
+        .collect()
+}
+
 fn archive_view(listing: preview::Listing) -> AnyView {
     let files = listing
         .entries
@@ -893,9 +1096,20 @@ fn archive_view(listing: preview::Listing) -> AnyView {
                     .into_iter()
                     .map(|entry| {
                         let length = if entry.directory { String::new() } else { size_u64(entry.size) };
+                        let path = sanitize_archive_path(&entry.path);
+                        let badge = entry.note.map(|tag| {
+                            let safe_tag = sanitize_archive_path(&tag);
+                            let tag_title = safe_tag.clone();
+                            view! {
+                                " "
+                                <span class="sec-badge classical" title=tag_title>
+                                    {safe_tag}
+                                </span>
+                            }
+                        });
                         view! {
                             <li class:directory=entry.directory>
-                                <span>{entry.path}</span>
+                                <span>{path}{badge}</span>
                                 <span>{length}</span>
                             </li>
                         }
@@ -907,13 +1121,16 @@ fn archive_view(listing: preview::Listing) -> AnyView {
     .into_any()
 }
 
-fn cards_view(cards: Vec<preview::Card>) -> AnyView {
-    if cards.is_empty() {
+fn cards_view(cards: preview::Cards) -> AnyView {
+    if cards.items.is_empty() {
         return no_preview();
     }
+    let notice = cards.notice();
     view! {
         <div class="cards">
+            {notice.map(|notice| view! { <p class="preview-note">{notice}</p> })}
             {cards
+                .items
                 .into_iter()
                 .map(|card| {
                     let title = if card.title.is_empty() { "Untitled".to_string() } else { card.title };
@@ -936,45 +1153,39 @@ fn cards_view(cards: Vec<preview::Card>) -> AnyView {
     .into_any()
 }
 
-fn diff_view(lines: Vec<(DiffLine, String)>) -> AnyView {
+fn diff_view(diff: preview::Diff) -> AnyView {
+    let notice = diff.notice();
     view! {
-        <pre class="code diff">
-            {lines
-                .into_iter()
-                .map(|(kind, line)| {
-                    let class = match kind {
-                        DiffLine::File => "diff-file",
-                        DiffLine::Hunk => "diff-hunk",
-                        DiffLine::Added => "diff-added",
-                        DiffLine::Removed => "diff-removed",
-                        DiffLine::Context => "diff-context",
-                    };
-                    view! { <span class=class>{line}</span> }
-                })
-                .collect_view()}
-        </pre>
+        <div class="diff-preview">
+            {notice.map(|notice| view! { <p class="preview-note">{notice}</p> })}
+            <pre class="code diff">
+                {diff
+                    .lines
+                    .into_iter()
+                    .map(|(kind, line)| {
+                        let class = match kind {
+                            DiffLine::File => "diff-file",
+                            DiffLine::Hunk => "diff-hunk",
+                            DiffLine::Added => "diff-added",
+                            DiffLine::Removed => "diff-removed",
+                            DiffLine::Context => "diff-context",
+                        };
+                        view! { <span class=class>{line}</span> }
+                    })
+                    .collect_view()}
+            </pre>
+        </div>
     }
     .into_any()
 }
 
 /// Save `attachment` as a file. Its blob is typeless, so the browser saves it rather than
-/// opening it in this origin.
+/// opening it in this origin, and its filename is sanitized against BiDi/path spoofing.
 fn download(attachment: &Attachment, download_anchor: NodeRef<html::A>) {
-    let Some(anchor) = download_anchor.try_get_untracked().flatten() else {
-        return;
-    };
-    let Some(url) = blob_url(&attachment.data, "application/octet-stream") else {
-        return;
-    };
-    anchor.set_href(&url);
-    anchor.set_download(&attachment.name);
-    anchor.click();
-    let _ = anchor.remove_attribute("href");
-    let _ = anchor.remove_attribute("download");
-    set_timeout(
-        move || {
-            let _ = Url::revoke_object_url(&url);
-        },
-        Duration::from_secs(60),
+    let _ = download_blob(
+        &attachment.data,
+        "application/octet-stream",
+        &attachment.name,
+        download_anchor,
     );
 }

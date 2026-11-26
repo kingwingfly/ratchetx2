@@ -14,7 +14,7 @@ use bytes::Bytes;
 use x3dh::PublicKey;
 use xeddsa::XEdDSAPrivateKey;
 
-use crate::{ErrorKind, NormalizedAudience, Result, check_safe_integer, verify_recent};
+use crate::{ErrorKind, NormalizedAudience, Result, SigningBuf, check_safe_integer, verify_recent};
 
 #[allow(missing_docs)]
 mod proto {
@@ -129,26 +129,19 @@ fn subscribe_message_v2(
     identity_key: &PublicKey,
     timestamp: u64,
 ) -> Result<Vec<u8>> {
-    // A DNS hostname or IP literal plus a port fits well within this bound.
-    const MAX_AUDIENCE_LENGTH: usize = 1024;
-    if audience.len() > MAX_AUDIENCE_LENGTH {
-        return Err(ErrorKind::Malformed.into());
-    }
-    let len = u32::try_from(audience.len()).map_err(|_| ErrorKind::Malformed)?;
-    let mut message = b"notify.v2/subscribe".to_vec();
-    message.extend(len.to_le_bytes());
-    message.extend(audience.as_bytes());
-    message.extend(identity_key);
-    message.extend(timestamp.to_le_bytes());
-    Ok(message)
+    let mut buf = SigningBuf::with_domain(b"notify.v2/subscribe", 4 + audience.len() + 40);
+    buf.push_audience_le(audience)?;
+    buf.push_bytes(identity_key);
+    buf.push_u64_le(timestamp);
+    Ok(buf.into_vec())
 }
 
 /// The bytes a subscription's signature covers.
 fn subscribe_message(identity_key: &PublicKey, timestamp: u64) -> Vec<u8> {
-    let mut message = b"notify.v1/subscribe".to_vec();
-    message.extend(identity_key);
-    message.extend(timestamp.to_le_bytes());
-    message
+    let mut buf = SigningBuf::with_domain(b"notify.v1/subscribe", 40);
+    buf.push_bytes(identity_key);
+    buf.push_u64_le(timestamp);
+    buf.into_vec()
 }
 
 impl Notification {

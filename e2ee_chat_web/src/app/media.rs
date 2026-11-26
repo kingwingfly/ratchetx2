@@ -12,7 +12,7 @@ use crate::{
     icon::{Icon, icon},
     preview::{self, Sort},
     state::{Attachment, Body, LocalFile, RemoteFile, Streamed},
-    util::size_u64,
+    util::{sanitize_filename, size_u64},
     workers,
 };
 
@@ -89,12 +89,12 @@ const STREAM_GRACE: Duration = Duration::from_secs(10);
 
 /// Let go of `url`, a blob URL or a stream's, as what showed it went. Players stop their own
 /// `NodeRef` elements in `on_cleanup`, and what they asked for already is still answered for
-/// [`STREAM_GRACE`], so that none fails.
+/// [`STREAM_GRACE`], so that none fails. `data:` URLs are ignored.
 pub(super) fn release(url: &str) {
     if url.starts_with("/media/") {
         let url = url.to_string();
         set_timeout(move || engine().end_stream(&url), STREAM_GRACE);
-    } else {
+    } else if url.starts_with("blob:") {
         let _ = Url::revoke_object_url(url);
     }
 }
@@ -106,10 +106,25 @@ pub(super) fn stop_media(player: &web_sys::HtmlMediaElement) {
     player.load();
 }
 
+/// Register an `on_cleanup` hook that stops `node_ref`'s media element using
+/// `try_get_untracked().flatten()` so component disposal never panics.
+pub(super) fn stop_media_on_cleanup<E>(node_ref: NodeRef<E>)
+where
+    E: leptos::html::ElementType + 'static,
+    E::Output: AsRef<web_sys::HtmlMediaElement> + JsCast + Clone + 'static,
+{
+    on_cleanup(move || {
+        if let Some(el) = node_ref.try_get_untracked().flatten() {
+            stop_media(el.as_ref());
+        }
+    });
+}
+
 /// Show `file`, of a chat's history, in the viewer, its bytes read unless they are here.
 fn show_file(file: LocalFile) {
     let ui = ui();
     let token = begin_preview_request();
+    ui.opening.set(None);
     match file.data {
         Some(attachment) => ui.viewer.set(Some(attachment)),
         None => act(async move {
@@ -117,6 +132,7 @@ fn show_file(file: LocalFile) {
             if !is_preview_current(token, file.peer) {
                 return Ok(());
             }
+            ui.opening.set(None);
             ui.viewer.set(Some(Attachment {
                 name: file.name,
                 mime: file.mime,
@@ -221,8 +237,8 @@ pub(super) fn inline_media(body: &Body) -> Option<(Source, Sort)> {
 /// A file of a chat's history, as a card of its extension, name and size, which opens it in the
 /// viewer.
 pub(super) fn file_card(source: Source) -> AnyView {
-    let extension = extension(source.name());
-    let name = source.name().to_string();
+    let name = sanitize_filename(source.name());
+    let extension = extension(&name);
     let length = size_u64(source.size());
     view! {
         <button class="file-card" on:click=move |_| source.open()>
@@ -323,23 +339,31 @@ pub(super) fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
     }
     on_cleanup(move || {
         stop_active();
-        if let Some(Some((url, _))) = shown.try_get_untracked() {
+        if let Some(Some((url, _))) = shown.try_update(Option::take) {
             release(&url);
         }
     });
-    let name = source.name().to_string();
-    let caption = format!("{} · {}", source.name(), size_u64(source.size()));
+    let name = sanitize_filename(source.name());
+    let caption = format!("{name} · {}", size_u64(source.size()));
     // What it read shows at once; a stream's opens as any attachment does.
     let opened = StoredValue::new(source.clone());
     let open = move |_| match read.get_value() {
         Some(attachment) => {
             let _ = begin_preview_request();
+            ui.opening.set(None);
             ui.viewer.set(Some(attachment));
         }
         None => opened.with_value(Source::open),
     };
-    // One that turns out not to play, e.g. as it is no video after all, shows as a file.
-    let unplayable = move |_| failed.set(true);
+    // One that turns out not to play, e.g. as it is no video after all, stops playback, releases
+    // its blob/stream URL, and falls back to a file card.
+    let unplayable = move |_| {
+        stop_active();
+        if let Some(Some((url, _))) = shown.try_update(Option::take) {
+            release(&url);
+        }
+        failed.set(true);
+    };
     view! {
         <div class="inline-media" node_ref=node>
             {move || {
@@ -407,31 +431,50 @@ pub(super) fn InlineMedia(source: Source, sort: Sort) -> impl IntoView {
     }
 }
 
+type WatchingObserver = StoredValue<
+    Option<(
+        IntersectionObserver,
+        Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
+    )>,
+    LocalStorage,
+>;
+
+fn disconnect_watching(watching: WatchingObserver) {
+    if let Some(Some((observer, _))) = watching.try_update_value(Option::take) {
+        observer.disconnect();
+        let _ = observer.take_records();
+    }
+}
+
 /// Run `action` once `node` is about to show, as it scrolls into view, so that a long chat or
 /// list does not run it for all; not at all if `node` goes first.
 fn when_shown(node: NodeRef<html::Div>, action: impl Fn() + Clone + 'static) {
-    // What watches it, and what that calls, until it goes.
-    let watching = StoredValue::new_local(
-        None::<(
-            IntersectionObserver,
-            Closure<dyn FnMut(js_sys::Array, IntersectionObserver)>,
-        )>,
-    );
+    // What watches it, and what that calls, until it fires or unmounts.
+    let watching: WatchingObserver = StoredValue::new_local(None);
     Effect::new(move || {
+        disconnect_watching(watching);
         let Some(element) = node.get() else {
             return;
         };
         let action = action.clone();
+        let fired = Cell::new(false);
         let seen = Closure::<dyn FnMut(js_sys::Array, IntersectionObserver)>::new(
             move |entries: js_sys::Array, observer: IntersectionObserver| {
+                if fired.get() {
+                    return;
+                }
                 let seen = entries.iter().any(|entry| {
                     entry
                         .unchecked_into::<IntersectionObserverEntry>()
                         .is_intersecting()
                 });
                 if seen {
+                    fired.set(true);
                     observer.disconnect();
+                    let _ = observer.take_records();
                     action();
+                    // Defer dropping this Closure until after the JS callback unwinds.
+                    spawn_local(async move { disconnect_watching(watching) });
                 }
             },
         );
@@ -441,11 +484,7 @@ fn when_shown(node: NodeRef<html::Div>, action: impl Fn() + Clone + 'static) {
         observer.observe(&element);
         watching.set_value(Some((observer, seen)));
     });
-    on_cleanup(move || {
-        if let Some(Some((observer, _))) = watching.try_update_value(Option::take) {
-            observer.disconnect();
-        }
-    });
+    on_cleanup(move || disconnect_watching(watching));
 }
 
 /// What a preview of media shows, once read: an image or a video, by a blob URL of this origin,
@@ -548,7 +587,9 @@ pub(super) fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
         if let Some(url) = probe_stream.try_update_value(Option::take).flatten() {
             engine().end_stream(&url);
         }
-        if let Some(Some(Preview::Image(url) | Preview::Video(url))) = preview.try_get_untracked() {
+        if let Some(Some(Preview::Image(url) | Preview::Video(url))) =
+            preview.try_update(Option::take)
+        {
             release(&url);
         }
     });
@@ -558,6 +599,15 @@ pub(super) fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
         if seconds.is_finite() {
             length.set(Some(duration(seconds)));
         }
+    };
+    let thumb_unplayable = move |_| {
+        stop_active();
+        if let Some(Some(Preview::Image(url) | Preview::Video(url))) =
+            preview.try_update(Option::take)
+        {
+            release(&url);
+        }
+        length.set(None);
     };
     let glyph = match sort {
         Sort::Video => Icon::Resume,
@@ -578,6 +628,7 @@ pub(super) fn MediaThumb(source: Option<Source>, sort: Sort) -> impl IntoView {
                             preload="metadata"
                             playsinline
                             on:loadedmetadata=measured
+                            on:error=thumb_unplayable
                         ></video>
                     }
                         .into_any()
@@ -603,8 +654,14 @@ async fn cover(data: &[u8]) -> Option<Preview> {
 }
 
 /// A length of time, as `m:ss`, or `h:mm:ss` from an hour.
-fn duration(seconds: f64) -> String {
-    let seconds = seconds.round() as u64;
+pub(super) fn duration(seconds: f64) -> String {
+    let seconds = if !seconds.is_finite() || seconds <= 0.0 {
+        0
+    } else if seconds >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        seconds.round() as u64
+    };
     let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
     if hours > 0 {
         format!("{hours}:{minutes:02}:{seconds:02}")

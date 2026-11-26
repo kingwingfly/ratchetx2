@@ -50,8 +50,9 @@ As the protocol has it, the mailbox takes pushes from anyone, and the handshake 
 # Storage conformance
 
 ```sh
-WORKER_BUILD_ARGS="--features conformance" npx wrangler dev --persist-to /tmp/conformance
-curl -X POST http://localhost:8787/conformance
+worker-build --dev --features conformance
+npx wrangler dev --persist-to /tmp/conformance --no-bundle
+curl -X POST -H "Authorization: Bearer $CONFORMANCE_TOKEN" http://localhost:8787/conformance
 ```
 
-The suites need empty objects, so a fresh `--persist-to`, and a failure panics, which fails the request. Never deploy this feature.
+`POST /conformance` requires either a valid sign-in cookie or a matching `CONFORMANCE_TOKEN` secret (`Authorization: Bearer <token>` or `X-Conformance-Token: <token>`). The suites need empty objects, so a fresh `--persist-to`, and a failure panics, which fails the request. Never deploy this feature.

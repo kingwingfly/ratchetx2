@@ -158,7 +158,8 @@ fn carry_initial<I: PartialEq>(carried: &mut Vec<I>, initial: Option<I>) -> bool
 }
 
 /// A message received, see [`Session::receive`].
-#[derive(Debug)]
+///
+/// Its `Debug` implementation redacts decrypted `content` plaintext bytes.
 pub struct Received {
     /// Its content, or why there is none.
     pub content: Result<Vec<u8>>,
@@ -171,6 +172,19 @@ pub struct Received {
     /// at, those that came with the rest of its page too, any of which may be the session it,
     /// or one after it, is on: accepting them with [`Client::accept`] may let them decrypt.
     pub initial_messages: Vec<InitialMessage>,
+}
+
+impl core::fmt::Debug for Received {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut s = f.debug_struct("Received");
+        match &self.content {
+            Ok(bytes) => s.field("content_len", &bytes.len()),
+            Err(err) => s.field("error", &err.kind()),
+        };
+        s.field("earlier", &self.earlier)
+            .field("initial_messages", &self.initial_messages.len())
+            .finish()
+    }
 }
 
 impl Received {
@@ -196,6 +210,7 @@ pub struct PreparedPublish {
     extended: bool,
     was_publishing: bool,
     prev_last_timestamp: u64,
+    signed_prekey: PublicKey,
     one_time_prekeys: Vec<PublicKey>,
 }
 
@@ -313,13 +328,13 @@ impl ClientState {
 
     /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`
     /// while preferring to keep any digests listed in `preserve` (e.g. deferred unsupported-suite
-    /// initials waiting for replay). Returns any evicted digest so a refused publish can restore
-    /// it.
+    /// initials waiting for replay) and NEVER evicting the newly pushed digest. Returns the
+    /// evicted `(index, digest)` so a refused publish can restore FIFO order.
     pub(crate) fn record_manifest_digest_preserving(
         &mut self,
         digest: [u8; 32],
         preserve: &[[u8; 32]],
-    ) -> Option<[u8; 32]> {
+    ) -> Option<(usize, [u8; 32])> {
         if let Some(pos) = self
             .recent_manifest_digests
             .iter()
@@ -330,29 +345,33 @@ impl ClientState {
         self.recent_manifest_digests.push(digest);
         let mut evicted = None;
         while self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
-            if let Some(evict) = self
-                .recent_manifest_digests
+            // Only consider entries strictly older than the newly appended `last()` slot.
+            let candidate_end = self.recent_manifest_digests.len() - 1;
+            let evict_idx = self.recent_manifest_digests[..candidate_end]
                 .iter()
                 .position(|d| !preserve.contains(d))
-            {
-                evicted = Some(self.recent_manifest_digests.remove(evict));
-            } else {
-                evicted = Some(self.recent_manifest_digests.remove(0));
-            }
+                .unwrap_or(0);
+            evicted = Some((evict_idx, self.recent_manifest_digests.remove(evict_idx)));
         }
         evicted
     }
 
-    /// Pop a previously appended manifest digest and restore any digest it evicted.
-    pub(crate) fn rollback_manifest_digest(&mut self, added: [u8; 32], evicted: Option<[u8; 32]>) {
+    /// Pop a previously appended manifest digest and restore any digest it evicted at its original
+    /// FIFO position.
+    pub(crate) fn rollback_manifest_digest(
+        &mut self,
+        added: [u8; 32],
+        evicted: Option<(usize, [u8; 32])>,
+    ) {
         if self.recent_manifest_digests.last() == Some(&added) {
             self.recent_manifest_digests.pop();
         }
-        if let Some(restored) = evicted
+        if let Some((pos, restored)) = evicted
             && self.recent_manifest_digests.len() < MAX_RECENT_MANIFEST_DIGESTS
             && !self.recent_manifest_digests.contains(&restored)
         {
-            self.recent_manifest_digests.insert(0, restored);
+            let idx = pos.min(self.recent_manifest_digests.len());
+            self.recent_manifest_digests.insert(idx, restored);
         }
     }
 
@@ -367,6 +386,7 @@ impl ClientState {
             || self.manifest_seq > protocol::MAX_SAFE_INTEGER
             || self.prekey_generation > protocol::MAX_SAFE_INTEGER
             || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            || (self.manifest_seq > 0 && self.recent_manifest_digests.is_empty())
         {
             return Err(ErrorKind::MalformedState.into());
         }
@@ -392,10 +412,12 @@ where
     fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
         use rkyv::rancor::Source;
         let check = || -> Result<()> {
+            let manifest_seq = self.manifest_seq.to_native();
             if self.last_timestamp.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.manifest_seq.to_native() > protocol::MAX_SAFE_INTEGER
+                || manifest_seq > protocol::MAX_SAFE_INTEGER
                 || self.prekey_generation.to_native() > protocol::MAX_SAFE_INTEGER
                 || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+                || (manifest_seq > 0 && self.recent_manifest_digests.is_empty())
             {
                 return Err(ErrorKind::MalformedState.into());
             }
@@ -413,6 +435,53 @@ where
 }
 
 #[cfg(feature = "serde")]
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(
+    deserializer: D,
+) -> core::result::Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct BoundedVecVisitor<T, const MAX: usize>(core::marker::PhantomData<T>);
+
+    impl<'de, T, const MAX: usize> serde::de::Visitor<'de> for BoundedVecVisitor<T, MAX>
+    where
+        T: serde::Deserialize<'de>,
+    {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "a sequence of at most {MAX} items")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            if let Some(hint) = seq.size_hint()
+                && hint > MAX
+            {
+                return Err(serde::de::Error::custom(format!(
+                    "sequence exceeds maximum length {MAX}"
+                )));
+            }
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX));
+            while let Some(item) = seq.next_element()? {
+                if out.len() >= MAX {
+                    return Err(serde::de::Error::custom(format!(
+                        "sequence exceeds maximum length {MAX}"
+                    )));
+                }
+                out.push(item);
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(core::marker::PhantomData))
+}
+
+#[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 #[serde(rename = "ClientState")]
 struct RawClientState {
@@ -426,7 +495,10 @@ struct RawClientState {
     manifest_seq: u64,
     #[serde(default)]
     prekey_generation: u64,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
+    )]
     recent_manifest_digests: Vec<[u8; 32]>,
 }
 
@@ -478,10 +550,12 @@ impl TryFrom<&proto::ClientState> for ClientState {
     type Error = Error;
 
     fn try_from(state: &proto::ClientState) -> Result<Self> {
-        let identity = <[u8; xeddsa::PRIVATE_KEY_LENGTH]>::try_from(state.identity.as_slice())
-            .ok()
-            .and_then(XEdDSAPrivateKey::from_bytes)
-            .ok_or(ErrorKind::MalformedState)?;
+        let identity_bytes = Zeroizing::new(
+            <[u8; xeddsa::PRIVATE_KEY_LENGTH]>::try_from(state.identity.as_slice())
+                .map_err(|_| Error::from(ErrorKind::MalformedState))?,
+        );
+        let identity =
+            XEdDSAPrivateKey::from_bytes(*identity_bytes).ok_or(ErrorKind::MalformedState)?;
         let preferred_suite = match state.preferred_pq_suite {
             0 => PqConfig::default_suite(),
             v => u8::try_from(v)
@@ -579,7 +653,7 @@ impl<H> Client<H> {
     /// Update this client's post-quantum configuration, validating suite support and `strict_pq`
     /// invariants.
     pub fn set_pq_config(&mut self, config: PqConfig) -> Result<()> {
-        if config.pq_enabled && !config.preferred_suite.is_supported() {
+        if config.pq_enabled && !PqConfig::is_compiled_suite(config.preferred_suite) {
             return Err(ErrorKind::UnsupportedSuite.into());
         }
         config.validate()?;
@@ -667,6 +741,7 @@ impl<H> Client<H> {
             extended,
             was_publishing,
             prev_last_timestamp,
+            signed_prekey: published.signed_prekey,
             one_time_prekeys: published.one_time_prekeys,
         })
     }
@@ -693,6 +768,7 @@ impl<H> Client<H> {
             extended: had_gen,
             was_publishing,
             prev_last_timestamp,
+            signed_prekey: published.signed_prekey,
             one_time_prekeys: published.one_time_prekeys,
         })
     }
@@ -713,7 +789,9 @@ impl<H> Client<H> {
     )]
     pub fn rollback_publish_on_refusal(&mut self, prepared: PreparedPublish) {
         if prepared.extended {
-            self.state.prekeys.retract(&prepared.one_time_prekeys);
+            self.state
+                .prekeys
+                .retract(&prepared.signed_prekey, &prepared.one_time_prekeys);
             self.state.publishing = prepared.was_publishing;
         }
         if self.state.last_timestamp == prepared.request.timestamp {
@@ -735,7 +813,7 @@ impl<H> Client<H> {
     ) -> Result<attachment::Upload> {
         let chunks = u32::try_from(attachment::chunk_count(size))
             .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
-        let key = attachment::generate_key();
+        let key = attachment::try_generate_key()?;
         let response = attachments
             .start_upload(StartUploadRequest {
                 chunks,
@@ -801,7 +879,9 @@ impl<H> Client<H> {
     /// `protocol::MAX_SAFE_INTEGER`.
     pub(crate) fn next_timestamp(&mut self) -> Result<u64> {
         let now = self.clock.now();
-        let next = if self.state.last_timestamp >= now.saturating_add(protocol::MAX_CLOCK_SKEW) {
+        let next = if self.state.last_timestamp.saturating_add(1)
+            > now.saturating_add(protocol::MAX_CLOCK_SKEW)
+        {
             now
         } else {
             now.max(self.state.last_timestamp.saturating_add(1))
@@ -895,6 +975,9 @@ impl<H: LocalHandshake> Client<H> {
         content: &[u8],
         mailbox: M,
     ) -> Result<PreparedInitiate<M>> {
+        if self.state.pq_config.strict_pq {
+            return Err(ErrorKind::PqRequired.into());
+        }
         let response = self
             .handshake
             .fetch_bundle(FetchBundleRequest {
@@ -984,6 +1067,17 @@ impl<H: LocalHandshake> Client<H> {
         if session.state.me != self.identity_key {
             return Err(ErrorKind::UnexpectedPeer.into());
         }
+        if self.state.pq_config.strict_pq {
+            return Err(ErrorKind::PqRequired.into());
+        }
+        let local_pq_enabled =
+            self.state.pq_config.pq_enabled && !self.state.pq_config.offered_suites().is_empty();
+        if local_pq_enabled
+            && session.state.peer_pq.pq_pinned
+            && !session.state.peer_pq.allow_classical_exception
+        {
+            return Err(ErrorKind::DowngradeDetected.into());
+        }
         let prepared = self
             .prepare_initiate(&session.state.peer, content, session.mailbox.clone())
             .await?;
@@ -1051,14 +1145,19 @@ impl<H: LocalHandshake> Client<H> {
             self.state
                 .prekeys
                 .accept(&self.state.identity, peer, &initial_message.x3dh)?;
+        let spk_bytes = Zeroizing::new(signed_prekey.to_bytes());
         let ratchet = Ratchet::bob(
             &SharedKeys::from_secret(&agreement.secret_key),
-            DhPrivateKey::from(signed_prekey.to_bytes()),
+            DhPrivateKey::from(*spk_bytes),
         );
         let mut party = Party::new(ratchet, agreement.associated_data);
         let content = party
             .decrypt(&initial_message.first_message)
             .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
+        // Enforce strict-PQ policy AFTER authenticating the sender and BEFORE confirming prekeys.
+        if self.state.pq_config.strict_pq {
+            return Err(ErrorKind::PqRequired.into());
+        }
         let peer_session_seq = checked_initial_hello(&content)?.map_or(0, |h| h.session_seq);
         self.state.prekeys.confirm(&initial_message.x3dh)?;
         let active = Active {
@@ -1080,7 +1179,9 @@ impl<H: LocalHandshake> Client<H> {
 fn now() -> u64 {
     web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis() as u64)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(protocol::MAX_SAFE_INTEGER)
+        })
 }
 
 /// A message encrypted for the peer by [`Session::encrypt`], to [push](Session::push) now or
@@ -1171,6 +1272,12 @@ pub struct SessionState {
     pub(crate) peer_pq: PeerPqState,
     /// Next outgoing monotonic `Hello.session_seq` for this peer (`0` treated as `1`).
     pub(crate) next_session_seq: u64,
+}
+
+impl Drop for SessionState {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.delivered);
+    }
 }
 
 impl core::fmt::Debug for SessionState {
@@ -1323,23 +1430,21 @@ fn check_party_identity_ad(
 }
 
 #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
-struct ActiveStateView<'a, F> {
+struct ActiveStateView<'a, P: party::PartyView + ?Sized> {
     id: &'a PublicKey,
     peer_session_seq: u64,
     security: SessionSecurity,
-    associated_data: &'a [u8],
-    // Only materialize an archived party after checking all bounds and identity bindings.
-    load_party: F,
+    party: &'a P,
 }
 
 #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
-fn validate_session_state<'a, P: std::borrow::Borrow<Party>>(
+fn validate_session_state<'a, P: party::PartyView + ?Sized + 'a>(
     me: &PublicKey,
     peer: &PublicKey,
     counters: [u64; 6],
     delivered: usize,
     earlier: impl ExactSizeIterator<Item = &'a [u8]>,
-    active: Option<ActiveStateView<'a, impl FnOnce() -> Result<P>>>,
+    active: Option<ActiveStateView<'a, P>>,
 ) -> Result<()> {
     if [me, peer]
         .into_iter()
@@ -1365,15 +1470,17 @@ fn validate_session_state<'a, P: std::borrow::Borrow<Party>>(
         {
             return Err(ErrorKind::MalformedState.into());
         }
-        check_party_identity_ad(active.associated_data, me, peer, Some(security.is_pq))?;
-        let party = (active.load_party)()?;
-        let party = party.borrow();
-        if security.pq_ratchet != party.is_pq_ratchet_active() {
+        check_party_identity_ad(
+            active.party.associated_data(),
+            me,
+            peer,
+            Some(security.is_pq),
+        )?;
+        if security.pq_ratchet != active.party.is_pq_ratchet_active() {
             return Err(ErrorKind::MalformedState.into());
         }
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        if let Some(suite) = party.pq_suite()
-            && security.suite.map(PqSuite::as_u8) != Some(suite.id())
+        if let Some(suite_id) = active.party.pq_suite_id()
+            && security.suite.map(PqSuite::as_u8) != Some(suite_id)
         {
             return Err(ErrorKind::MalformedState.into());
         }
@@ -1418,8 +1525,7 @@ impl SessionState {
                 id: &a.id,
                 peer_session_seq: a.peer_session_seq,
                 security: a.security,
-                associated_data: a.party.associated_data(),
-                load_party: || Ok(&a.party),
+                party: &a.party,
             }),
         )
     }
@@ -1437,7 +1543,7 @@ impl SessionState {
     /// new one.
     fn received_earlier(&mut self) {
         if self.last == LastAction::Sent {
-            self.direction_changes += 1;
+            self.direction_changes = self.direction_changes.saturating_add(1);
         }
         self.last = LastAction::ReceivedEarlier;
         if self.direction_changes > MAX_DIRECTION_CHANGES {
@@ -1478,11 +1584,7 @@ where
                     suite: a.security.suite.as_ref().map(archived_pq_suite),
                     pq_ratchet: a.security.pq_ratchet,
                 },
-                associated_data: a.party.associated_data(),
-                load_party: || {
-                    rkyv::deserialize::<Party, rkyv::rancor::Error>(&a.party)
-                        .map_err(|e| Error::new(ErrorKind::MalformedState, e))
-                },
+                party: &a.party,
             }),
         )
         .map_err(C::Error::new)
@@ -1494,6 +1596,7 @@ where
 #[serde(rename = "SessionState")]
 struct RawSessionState {
     active: Option<Active>,
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, KEPT_SESSIONS>")]
     others: Vec<Earlier>,
     me: PublicKey,
     peer: PublicKey,
@@ -1502,6 +1605,7 @@ struct RawSessionState {
     direction_changes: u32,
     stalled_through: u64,
     skip_through: u64,
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_DELIVERED>")]
     delivered: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
     #[serde(default)]
     peer_pq: PeerPqState,
@@ -2021,7 +2125,11 @@ impl<M> Session<M> {
 
     /// Core session-replacement logic enforcing monotonic `peer_session_seq` anti-rollback,
     /// crossed-start tie-breaking, and PQ-pin downgrade defense.
-    fn merge_incoming_state(&mut self, new: SessionState, local_pq_enabled: bool) -> Result<bool> {
+    fn merge_incoming_state(
+        &mut self,
+        mut new: SessionState,
+        local_pq_enabled: bool,
+    ) -> Result<bool> {
         if new.peer_pq.peer_session_seq > protocol::MAX_SAFE_INTEGER
             || new
                 .active
@@ -2057,8 +2165,8 @@ impl<M> Session<M> {
         state.stalled_through = state.stalled_through.max(new.stalled_through);
         state.skip_through = state.skip_through.max(new.skip_through);
         state.next_session_seq = state.next_session_seq.max(new.next_session_seq);
-        merge_delivered(&mut state.delivered, new.delivered);
-        for earlier in new.others.into_iter().rev() {
+        merge_delivered(&mut state.delivered, mem::take(&mut new.delivered));
+        for earlier in mem::take(&mut new.others).into_iter().rev() {
             state.archive(earlier);
         }
 
@@ -2085,7 +2193,7 @@ impl<M> Session<M> {
             .peer_session_seq
             .max(new.peer_pq.peer_session_seq);
 
-        if let Some(active) = new.active {
+        if let Some(active) = new.active.take() {
             // One this client started is not known by the peer yet.
             let started_here = !active.known_by_peer;
             if active.security.is_pq {
@@ -2094,6 +2202,14 @@ impl<M> Session<M> {
                 state.peer_pq.downgrade_detected = false;
             } else if started_here {
                 state.peer_pq.allow_classical_exception |= new.peer_pq.allow_classical_exception;
+                if state.peer_pq.allow_classical_exception && !state.peer_pq.peer_pq_capable {
+                    state.peer_pq.downgrade_detected = false;
+                }
+            } else if state.peer_pq.allow_classical_exception
+                && !state.peer_pq.peer_pq_capable
+                && !new.peer_pq.downgrade_detected
+            {
+                state.peer_pq.downgrade_detected = false;
             }
             if !started_here && active.peer_session_seq > state.peer_pq.peer_session_seq {
                 state.peer_pq.peer_session_seq = active.peer_session_seq;
@@ -2205,7 +2321,7 @@ impl<M> Session<M> {
         let message = active.party.encrypt(content)?;
         let delivery_hash = Sha256::digest(active.delivery_key.token(&message)).into();
         if state.last == LastAction::ReceivedEarlier {
-            state.direction_changes += 1;
+            state.direction_changes = state.direction_changes.saturating_add(1);
         }
         state.last = LastAction::Sent;
         Ok(Sealed {
@@ -4089,7 +4205,7 @@ mod test {
         );
         let key = attachment::Key::new(*interrupted.key());
         drop(interrupted);
-        let resumed = attachment::Upload::resume(id, token, key, chunks);
+        let resumed = attachment::Upload::resume_from(id, Zeroizing::new(token), key, chunks, 1);
         for (index, part) in
             (1..).zip(file[attachment::CHUNK_SIZE..].chunks(attachment::CHUNK_SIZE))
         {
@@ -4288,7 +4404,7 @@ mod test {
 
         // 6. SessionState: active or earlier party whose AD does not bind `(me, peer)` rejected!
         let mut carol = Client::new(InProcessHandshake(&handshake));
-        let carol_session = carol
+        let mut carol_session = carol
             .initiate(&bob.identity_key(), b"carol", InProcessMailbox(&mailbox))
             .await
             .unwrap();
@@ -4302,7 +4418,7 @@ mod test {
         alice_session
             .state
             .others
-            .push(Earlier::from(carol_session.state.active.unwrap()));
+            .push(Earlier::from(carol_session.state.active.take().unwrap()));
         let bad_earlier_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
         assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_earlier_ad).is_err());
         alice_session.state.others.clear();
@@ -4318,6 +4434,21 @@ mod test {
         alice_session.state.active.as_mut().unwrap().party = bad_ad_party;
         let bad_len_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
         assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_len_ad).is_err());
+
+        // 7. Zero-copy `ArchivedClientState::verify` rejects `manifest_seq > 0` with empty
+        //    `recent_manifest_digests`, and `ArchivedSessionState::verify` rejects mismatched
+        //    `pq_ratchet` metadata against the archived `Party`!
+        let mut bob_clone = Client::new(InProcessHandshake(&handshake));
+        bob_clone.state.manifest_seq = 1;
+        bob_clone.state.recent_manifest_digests.clear();
+        let bad_digests = rkyv::to_bytes::<rkyv::rancor::Error>(bob_clone.state()).unwrap();
+        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_digests).is_err());
+
+        let (_, mut s_pq_mismatch, _, _) = talking(&handshake, &mailbox).await;
+        s_pq_mismatch.state.active.as_mut().unwrap().security =
+            SessionSecurity::pq(PqSuite::MlKem1024, true);
+        let bad_pq_meta = rkyv::to_bytes::<rkyv::rancor::Error>(s_pq_mismatch.state()).unwrap();
+        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_pq_meta).is_err());
     }
 
     #[cfg(feature = "serde")]
@@ -4327,14 +4458,14 @@ mod test {
         let mailbox = MailboxServer::new(MemoryStore::default());
         let (alice, alice_session, bob, _bob_session) = talking(&handshake, &mailbox).await;
         let mut carol = Client::new(InProcessHandshake(&handshake));
-        let carol_session = carol
+        let mut carol_session = carol
             .initiate(&bob.identity_key(), b"carol", InProcessMailbox(&mailbox))
             .await
             .unwrap();
 
-        let to_raw = |s: SessionState| RawSessionState {
-            active: s.active,
-            others: s.others,
+        let to_raw = |mut s: SessionState| RawSessionState {
+            active: s.active.take(),
+            others: std::mem::take(&mut s.others),
             me: s.me,
             peer: s.peer,
             cursor: s.cursor,
@@ -4342,8 +4473,8 @@ mod test {
             direction_changes: s.direction_changes,
             stalled_through: s.stalled_through,
             skip_through: s.skip_through,
-            delivered: s.delivered,
-            peer_pq: s.peer_pq,
+            delivered: std::mem::take(&mut s.delivered),
+            peer_pq: std::mem::take(&mut s.peer_pq),
             next_session_seq: s.next_session_seq,
         };
 
@@ -4364,7 +4495,7 @@ mod test {
         let mut bad_others_raw = to_raw(alice2_session.state);
         bad_others_raw
             .others
-            .push(Earlier::from(carol_session.state.active.unwrap()));
+            .push(Earlier::from(carol_session.state.active.take().unwrap()));
         let err = SessionState::try_from(bad_others_raw).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::MalformedState);
 
@@ -4380,5 +4511,64 @@ mod test {
         );
         let err = SessionState::try_from(bad_len_raw).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::MalformedState);
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[test]
+    fn accept_initial_v2_rejects_foreign_digest_even_with_empty_recent_digests() {
+        let suite = PqConfig::default_suite();
+        let alice_id = xeddsa::XEdDSAPrivateKey::generate();
+        let bob_id = xeddsa::XEdDSAPrivateKey::generate();
+        let bob_id_copy = xeddsa::XEdDSAPrivateKey::from_bytes(*bob_id.to_bytes()).unwrap();
+        let mut bob = Client::builder(()).identity(bob_id).build();
+        let prep = bob.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let lr_wire = prep.request.pq_last_resort[0].clone();
+        bob.commit_publish_v2(prep);
+        // Force empty recent_manifest_digests (e.g. restored legacy state before manifest tracking):
+        // an authenticated PQXDH initial carrying a foreign `Some(digest)` MUST STILL be rejected!
+        bob.state.recent_manifest_digests.clear();
+
+        let spk = bob.current_signed_prekey().unwrap();
+        let mut spk_sig = [0u8; 64];
+        spk_sig.copy_from_slice(&bob_id_copy.sign(spk));
+        let mut lr_sig = [0u8; 64];
+        lr_sig.copy_from_slice(&lr_wire.signature);
+        let pq_bundle = x3dh::PqPrekeyBundle {
+            signed_prekey: spk,
+            signed_prekey_signature: Some(spk_sig),
+            one_time_prekey: None,
+            pq_suite: suite,
+            pq_prekey: lr_wire.encapsulation_key.to_vec(),
+            pq_prekey_signature: lr_sig,
+            pq_last_resort: true,
+        };
+        let foreign_digest = [0xCC; 32];
+        let (pq_init, agreement) = pq_bundle
+            .initiate_pq(&alice_id, &bob.identity_key(), Some(&foreign_digest))
+            .unwrap();
+        let ratchet =
+            Ratchet::alice(&SharedKeys::from_secret(&agreement.secret_key), &spk).unwrap();
+        let mut party = Party::new(ratchet, agreement.associated_data);
+        let first_message = party.encrypt(b"foreign").unwrap();
+        let msg = InitialMessageV2 {
+            id: 1,
+            sender: alice_id.compute_public_key().to_bytes(),
+            kind: InitialMessageKind::Pq {
+                x3dh: pq_init,
+                first_message,
+                manifest_digest: Some(foreign_digest),
+            },
+        };
+        assert_eq!(
+            bob.accept_initial_v2(
+                &alice_id.compute_public_key().to_bytes(),
+                &PeerPqState::default(),
+                &msg,
+                (),
+            )
+            .unwrap_err()
+            .kind(),
+            ErrorKind::DowngradeDetected
+        );
     }
 }

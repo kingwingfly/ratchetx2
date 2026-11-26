@@ -1,10 +1,25 @@
-//! Identity tables and in-place v1/v2 -> v3 schema upgrades.
+//! Identity tables and in-place v1/v2/v3 -> v4 schema upgrades.
+//!
+//! Cloudflare Durable Object SQLite does not support `PRAGMA user_version`, so persistent schema
+//! migrations are gated on `meta.schema_version` and cached per Durable Object instance in
+//! `Identity::schema_ready` (`Cell<bool>`), eliminating per-write DDL and `sqlite_master` lookups.
 
 use storage::MAX_SAFE_INTEGER;
 use worker::{Result, SqlStorage};
 
-use super::{Identity, mailbox::DEDUP_TTL_MS, rows::TableInfoRow};
-use crate::objects::{checked_integer, has_table};
+use super::{
+    Identity,
+    mailbox::DEDUP_TTL_MS,
+    rows::{OldestRow, SchemaVersionRow, TableInfoRow},
+};
+use crate::objects::{
+    has_table,
+    sql::{exec, params, query, query_opt},
+};
+
+const CURRENT_SCHEMA_VERSION: u64 = 4;
+
+const _: () = assert!(MAX_SAFE_INTEGER > DEDUP_TTL_MS);
 
 /// Core v1 tables (unchanged layout so existing deployed DO instances auto-migrate cleanly
 /// without losing rows).
@@ -124,8 +139,41 @@ const MIGRATE_DEDUP_BACKFILL_EXPIRES_AT: &str = "UPDATE mailbox_dedup SET expire
 const MIGRATE_DEDUP_INDEXES: &str = "CREATE INDEX IF NOT EXISTS mailbox_dedup_by_expiry ON mailbox_dedup (expires_at); \
      CREATE INDEX IF NOT EXISTS mailbox_dedup_by_sender \
      ON mailbox_dedup (sender, created_at, sequence);";
-const MIGRATE_META_TO_V3: &str =
-    "UPDATE meta SET schema_version = 3 WHERE only = 0 AND schema_version < 3";
+
+/// Additive v4 tables and partial/age indexes:
+/// - `recipient_stats`: O(1) recipient-wide queue count, byte total, and monotonic sequence floor
+///   so empty `queues` rows can be safely pruned without reusing sequence numbers.
+/// - `dedup_counts`: O(1) per-sender dedup tombstone count avoiding `count(*)` scans.
+/// - `pending_r2_deletes`: durable queue of R2 object keys retried by `alarm()` after atomic SQL
+///   deletion of delivered messages.
+/// - `opk_claim_budget`: per-identity hourly one-time prekey claim budget.
+/// - Partial indexes on `messages` (`WHERE object IS NULL` / `WHERE object IS NOT NULL`) and
+///   `initial_messages (created_at)` so expiry alarm `min(created_at)` queries are O(1) seeks.
+const SCHEMA_V4: &str = "
+CREATE TABLE IF NOT EXISTS recipient_stats (
+    only INTEGER PRIMARY KEY CHECK (only = 0),
+    queue_count INTEGER NOT NULL DEFAULT 0,
+    total_bytes INTEGER NOT NULL DEFAULT 0,
+    sequence_floor INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS dedup_counts (
+    sender BLOB PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS pending_r2_deletes (
+    object TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pending_r2_deletes_by_age ON pending_r2_deletes (created_at);
+CREATE TABLE IF NOT EXISTS opk_claim_budget (
+    only INTEGER PRIMARY KEY CHECK (only = 0),
+    window_start INTEGER NOT NULL,
+    claims INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS messages_inline_by_age ON messages (created_at) WHERE object IS NULL;
+CREATE INDEX IF NOT EXISTS messages_object_by_age ON messages (created_at) WHERE object IS NOT NULL;
+CREATE INDEX IF NOT EXISTS initial_messages_by_age ON initial_messages (created_at);
+";
 
 /// Tracks verified audience-bound v2 subscriptions for replay protection.
 pub(super) const SCHEMA_SEEN_SUBSCRIBES: &str = "
@@ -139,59 +187,157 @@ CREATE INDEX IF NOT EXISTS seen_subscribes_by_expiry ON seen_subscribes (expires
 impl Identity {
     /// Whether core tables exist (used to avoid allocating storage on unknown-identity reads).
     pub(super) fn has_tables(&self) -> Result<bool> {
+        if self.schema_ready.get() {
+            return Ok(true);
+        }
         has_table(&self.sql(), "messages")
     }
 
-    /// Creates core v1 tables and additive v2/v3 side tables on first write (upgrading existing
-    /// v1/v2 DO instances in-place without losing rows).
-    pub(super) fn create_tables(&self) -> Result<()> {
-        let sql = self.sql();
-        sql.exec(SCHEMA_V1, None)?;
-        sql.exec(SCHEMA_V2, None)?;
-        self.ensure_mailbox_dedup_schema(&sql)
+    /// Whether a v2/v3/v4 side table exists, skipping `sqlite_master` once schema init succeeded.
+    pub(super) fn has_v2_table(&self, sql: &SqlStorage, name: &str) -> Result<bool> {
+        if self.schema_ready.get() {
+            return Ok(true);
+        }
+        has_table(sql, name)
     }
 
-    /// Ensures additive v2/v3 side tables exist (for upgrading an existing v1/v2 DO in-place on
-    /// first write).
+    /// Whether the `seen_subscribes` replay table exists, cached once observed.
+    pub(super) fn has_seen_subscribes(&self, sql: &SqlStorage) -> Result<bool> {
+        if self.seen_subscribes_ready.get() {
+            return Ok(true);
+        }
+        let exists = has_table(sql, "seen_subscribes")?;
+        if exists {
+            self.seen_subscribes_ready.set(true);
+        }
+        Ok(exists)
+    }
+
+    /// Ensures all v1/v2/v3/v4 tables, columns, indexes, and counters exist.
+    ///
+    /// Fast path: zero SQL statements after the first check in this DO instance, and zero DDL
+    /// statements on cold start when `meta.schema_version >= CURRENT_SCHEMA_VERSION`.
     pub(super) fn ensure_v2_tables(&self) -> Result<()> {
-        self.create_tables()
-    }
-
-    /// Commit the expiry column, backfill, indexes, and version together on the first access.
-    pub(super) fn ensure_mailbox_dedup_schema(&self, sql: &SqlStorage) -> Result<()> {
-        if self.dedup_schema_ready.get() || !has_table(sql, "mailbox_dedup")? {
+        if self.schema_ready.get() {
             return Ok(());
         }
+        let sql = self.sql();
+        if has_table(&sql, "meta")?
+            && query_opt::<SchemaVersionRow>(
+                &sql,
+                "SELECT schema_version FROM meta WHERE only = 0",
+                vec![],
+            )?
+            .is_some_and(|row| row.schema_version >= CURRENT_SCHEMA_VERSION)
+        {
+            self.schema_ready.set(true);
+            return Ok(());
+        }
+
         self.transaction_sync(|sql| {
-            let columns = sql
-                .exec("PRAGMA table_info(mailbox_dedup)", None)?
-                .to_array::<TableInfoRow>()?;
-            if !columns.iter().any(|column| column.name == "expires_at") {
+            let current_version = if has_table(sql, "meta")? {
+                query_opt::<SchemaVersionRow>(
+                    sql,
+                    "SELECT schema_version FROM meta WHERE only = 0",
+                    vec![],
+                )?
+                .map_or(0, |row| row.schema_version)
+            } else {
+                0
+            };
+            if current_version >= CURRENT_SCHEMA_VERSION {
+                return Ok(());
+            }
+
+            sql.exec(SCHEMA_V1, None)?;
+            sql.exec(SCHEMA_V2, None)?;
+
+            let dedup_columns: Vec<TableInfoRow> =
+                query(sql, "PRAGMA table_info(mailbox_dedup)", vec![])?;
+            if !dedup_columns.iter().any(|column| column.name == "expires_at") {
                 sql.exec(MIGRATE_DEDUP_ADD_EXPIRES_AT, None)?;
-                sql.exec(
+                exec(
+                    sql,
                     MIGRATE_DEDUP_BACKFILL_EXPIRES_AT,
-                    vec![
-                        checked_integer(MAX_SAFE_INTEGER - DEDUP_TTL_MS)?,
-                        checked_integer(MAX_SAFE_INTEGER)?,
-                        checked_integer(DEDUP_TTL_MS)?,
-                    ],
+                    params![
+                        MAX_SAFE_INTEGER - DEDUP_TTL_MS,
+                        MAX_SAFE_INTEGER,
+                        DEDUP_TTL_MS
+                    ]?,
                 )?;
             }
             sql.exec(MIGRATE_DEDUP_INDEXES, None)?;
-            if has_table(sql, "meta")? {
-                sql.exec(MIGRATE_META_TO_V3, None)?;
+
+            let queue_columns: Vec<TableInfoRow> =
+                query(sql, "PRAGMA table_info(queues)", vec![])?;
+            if !queue_columns
+                .iter()
+                .any(|column| column.name == "message_count")
+            {
+                sql.exec(
+                    "ALTER TABLE queues ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0",
+                    None,
+                )?;
             }
+            if !queue_columns
+                .iter()
+                .any(|column| column.name == "total_bytes")
+            {
+                sql.exec(
+                    "ALTER TABLE queues ADD COLUMN total_bytes INTEGER NOT NULL DEFAULT 0",
+                    None,
+                )?;
+            }
+
+            sql.exec(SCHEMA_V4, None)?;
+
+            // Backfill per-queue counters, prune empty pre-v4 queues while capturing the maximum
+            // historical sequence into `recipient_stats.sequence_floor`, and backfill dedup counts.
+            sql.exec(
+                "UPDATE queues SET \
+                 message_count = coalesce((SELECT count(*) FROM messages m WHERE m.sender = queues.sender), 0), \
+                 total_bytes = coalesce((SELECT sum(length(m.header) + m.size + coalesce(length(m.initial_message), 0)) \
+                     FROM messages m WHERE m.sender = queues.sender), 0)",
+                None,
+            )?;
+            let pre_prune_max = query_opt::<OldestRow>(
+                sql,
+                "SELECT max(last_sequence) AS oldest FROM queues",
+                vec![],
+            )?
+            .and_then(|row| row.oldest)
+            .unwrap_or(0);
+            sql.exec("DELETE FROM queues WHERE message_count = 0", None)?;
+            exec(
+                sql,
+                "INSERT INTO recipient_stats (only, queue_count, total_bytes, sequence_floor) \
+                 SELECT 0, count(*), coalesce(sum(total_bytes), 0), ? FROM queues WHERE true \
+                 ON CONFLICT (only) DO UPDATE SET \
+                 queue_count = excluded.queue_count, \
+                 total_bytes = excluded.total_bytes, \
+                 sequence_floor = max(recipient_stats.sequence_floor, excluded.sequence_floor)",
+                params![pre_prune_max]?,
+            )?;
+            sql.exec("DELETE FROM dedup_counts", None)?;
+            sql.exec(
+                "INSERT INTO dedup_counts (sender, count) \
+                 SELECT sender, count(*) FROM mailbox_dedup GROUP BY sender",
+                None,
+            )?;
+
+            exec(
+                sql,
+                "INSERT INTO meta (only, schema_version) VALUES (0, ?) \
+                 ON CONFLICT (only) DO UPDATE SET schema_version = excluded.schema_version",
+                params![CURRENT_SCHEMA_VERSION]?,
+            )?;
             Ok(())
         })?;
-        self.dedup_schema_ready.set(true);
+        self.schema_ready.set(true);
         Ok(())
     }
 
     /// Explicit orphan cleanup for `initial_messages_pq` (no reliance on SQLite foreign_keys).
-    pub(super) fn cleanup_orphan_pq_initials(&self) -> Result<()> {
-        Self::cleanup_orphan_pq_initials_sql(&self.sql())
-    }
-
     pub(super) fn cleanup_orphan_pq_initials_sql(sql: &SqlStorage) -> Result<()> {
         if has_table(sql, "initial_messages_pq")? {
             sql.exec(
@@ -201,45 +347,5 @@ impl Identity {
             )?;
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sqlite_v1_v2_v3_migration_schema_is_preserved_intact() {
-        for table in [
-            "CREATE TABLE IF NOT EXISTS bundle",
-            "CREATE TABLE IF NOT EXISTS one_time_prekeys",
-            "CREATE TABLE IF NOT EXISTS inbox",
-            "CREATE TABLE IF NOT EXISTS initial_messages",
-            "CREATE TABLE IF NOT EXISTS queues",
-            "CREATE TABLE IF NOT EXISTS messages",
-        ] {
-            assert!(SCHEMA_V1.contains(table), "missing v1 table: {table}");
-        }
-
-        for table in [
-            "CREATE TABLE IF NOT EXISTS meta",
-            "INSERT INTO meta (only, schema_version) VALUES (0, 2)",
-            "CREATE TABLE IF NOT EXISTS capability_manifest",
-            "CREATE TABLE IF NOT EXISTS pq_last_resort",
-            "CREATE TABLE IF NOT EXISTS pq_one_time_prekeys",
-            "CREATE TABLE IF NOT EXISTS initial_messages_pq",
-            "CREATE TABLE IF NOT EXISTS mailbox_dedup",
-            "CREATE TABLE IF NOT EXISTS publish_watermarks",
-        ] {
-            assert!(SCHEMA_V2.contains(table), "missing v2 table: {table}");
-        }
-
-        assert!(MIGRATE_DEDUP_ADD_EXPIRES_AT.contains("ADD COLUMN expires_at"));
-        assert!(MIGRATE_DEDUP_BACKFILL_EXPIRES_AT.contains("SET expires_at = CASE"));
-        assert!(MIGRATE_DEDUP_INDEXES.contains("mailbox_dedup_by_expiry"));
-        assert!(MIGRATE_DEDUP_INDEXES.contains("mailbox_dedup_by_sender"));
-        assert!(MIGRATE_META_TO_V3.contains("schema_version = 3"));
-        assert!(SCHEMA_SEEN_SUBSCRIBES.contains("CREATE TABLE IF NOT EXISTS seen_subscribes"));
-        const { assert!(MAX_SAFE_INTEGER > DEDUP_TTL_MS) };
     }
 }

@@ -3,7 +3,191 @@
 use base64::prelude::*;
 use js_sys::Intl::{DateTimeFormatOptions, DayFormat, MonthFormat, YearFormat};
 use session::PublicKey;
+use unicode_general_category::{GeneralCategory, get_general_category};
+use url::{Host, Url};
 use wasm_bindgen::JsCast;
+
+/// The most characters in this client's name. It goes in the greeting, the first message of each
+/// chat it starts, which the server takes up to 4 KiB of; at 4 bytes a character at most, this
+/// leaves the greeting far below that.
+pub const NAME_MAX: usize = 64;
+
+/// Normalize a suggested contact or peer name for sharing/display: strip Unicode format (`Cf`,
+/// including all bidirectional overrides/isolates, ZWJ/ZWNJ, BOM, and tag characters) and control
+/// (`Cc`) characters, collapse whitespace runs into single spaces, trim, and cap at [`NAME_MAX`]
+/// characters.
+pub fn sanitize_shared_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len().min(NAME_MAX * 4));
+    let mut count = 0usize;
+    let mut pending_space = false;
+    for ch in name.chars() {
+        let cat = get_general_category(ch);
+        if cat == GeneralCategory::Format {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if count > 0 {
+                pending_space = true;
+            }
+            continue;
+        }
+        if cat == GeneralCategory::Control {
+            continue;
+        }
+        if pending_space {
+            if count + 2 > NAME_MAX {
+                break;
+            }
+            out.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        if count >= NAME_MAX {
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+/// Sanitize an untrusted peer-supplied filename for UI display and `<a download>`: strips Unicode
+/// format/BiDi (`Cf`) and control (`Cc`) characters, replaces path separators and filesystem-unsafe
+/// characters, strips leading/trailing dots and whitespace, guards Windows reserved device names,
+/// and caps length (falling back to `"file"` if empty).
+pub fn sanitize_filename(name: &str) -> String {
+    const MAX_FILENAME_CHARS: usize = 200;
+    let mut cleaned = String::with_capacity(name.len().min(MAX_FILENAME_CHARS * 4));
+    let mut prev_space = false;
+    for ch in name.chars() {
+        let cat = get_general_category(ch);
+        if matches!(cat, GeneralCategory::Control | GeneralCategory::Format) {
+            continue;
+        }
+        let mapped = match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_whitespace() => ' ',
+            c => c,
+        };
+        if mapped == ' ' {
+            if !prev_space && !cleaned.is_empty() {
+                cleaned.push(' ');
+                prev_space = true;
+            }
+        } else {
+            cleaned.push(mapped);
+            prev_space = false;
+        }
+    }
+    let trimmed = cleaned.trim_matches(|c: char| c == ' ' || c == '.');
+    if trimmed.is_empty() {
+        return "file".to_string();
+    }
+    let mut safe = if is_windows_reserved_filename(trimmed) {
+        format!("_{trimmed}")
+    } else {
+        trimmed.to_string()
+    };
+    if safe.chars().count() > MAX_FILENAME_CHARS {
+        let ext = safe
+            .rsplit_once('.')
+            .map(|(_, e)| e)
+            .filter(|e| !e.is_empty() && e.chars().count() <= 32)
+            .map(|e| format!(".{e}"));
+        if let Some(ext) = ext {
+            let ext_chars = ext.chars().count();
+            let keep = MAX_FILENAME_CHARS.saturating_sub(ext_chars);
+            let stem: String = safe.chars().take(keep).collect();
+            let stem = stem.trim_end_matches([' ', '.']);
+            safe = if stem.is_empty() {
+                format!("file{ext}")
+            } else {
+                format!("{stem}{ext}")
+            };
+        } else {
+            safe = safe.chars().take(MAX_FILENAME_CHARS).collect();
+            safe = safe.trim_end_matches([' ', '.']).to_string();
+        }
+    }
+    if safe.is_empty() {
+        "file".to_string()
+    } else {
+        safe
+    }
+}
+
+fn is_windows_reserved_filename(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or(name).trim_end();
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Validate and canonicalize a relay server URL: must be `https://` (or `http://` on localhost /
+/// loopback for local development), with no credentials, query, fragment, or non-root path.
+/// Returns the canonical origin (e.g. `https://chat.example.com`), stripping default ports.
+pub fn validate_relay_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("server address is empty".to_string());
+    }
+    let parsed = Url::parse(trimmed)
+        .map_err(|_| "server address must be a valid https:// URL".to_string())?;
+    let is_local_http = parsed.scheme() == "http"
+        && matches!(
+            parsed.host(),
+            Some(Host::Domain(h)) if h.eq_ignore_ascii_case("localhost")
+        )
+        || (parsed.scheme() == "http"
+            && matches!(
+                parsed.host(),
+                Some(Host::Ipv4(ip)) if ip.is_loopback()
+            ))
+        || (parsed.scheme() == "http"
+            && matches!(
+                parsed.host(),
+                Some(Host::Ipv6(ip)) if ip.is_loopback()
+            ));
+    if parsed.scheme() != "https" && !is_local_http {
+        return Err("server address must use https:// (or http://localhost)".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("server address must not include credentials".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("server address must not include a query or fragment".to_string());
+    }
+    if !matches!(parsed.path(), "" | "/") {
+        return Err("server address must be an origin without a path".to_string());
+    }
+    let origin = parsed.origin().ascii_serialization();
+    if origin == "null" {
+        return Err("server address must have a valid host".to_string());
+    }
+    Ok(origin)
+}
 
 /// A key as the TUI client shows it: standard base64.
 pub fn key_to_text(key: &PublicKey) -> String {
@@ -237,15 +421,56 @@ pub fn describe(error: &dyn std::error::Error) -> String {
     description
 }
 
-/// Wait `millis` milliseconds.
+/// Wait `millis` milliseconds. Cancels the underlying browser timer via `clearTimeout` if the
+/// returned future is dropped early (e.g. inside `futures_util::future::select`).
 pub async fn sleep(millis: i32) {
-    let promise = js_sys::Promise::new(&mut |resolve, _| {
-        web_sys::window()
-            .expect("a window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, millis)
-            .expect("setTimeout");
-    });
-    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+    use std::{cell::Cell, rc::Rc};
+    use wasm_bindgen::closure::Closure;
+
+    struct TimerGuard {
+        window: web_sys::Window,
+        handle: Option<i32>,
+        _closure: Closure<dyn FnMut()>,
+    }
+
+    impl Drop for TimerGuard {
+        fn drop(&mut self) {
+            if let Some(handle) = self.handle.take() {
+                self.window.clear_timeout_with_handle(handle);
+            }
+        }
+    }
+
+    let (tx, rx) = futures_channel::oneshot::channel::<()>();
+    let tx = Rc::new(Cell::new(Some(tx)));
+    let fired = Rc::new(Cell::new(false));
+    let closure = {
+        let tx = tx.clone();
+        let fired = fired.clone();
+        Closure::<dyn FnMut()>::new(move || {
+            fired.set(true);
+            if let Some(tx) = tx.take() {
+                let _ = tx.send(());
+            }
+        })
+    };
+    let window = web_sys::window().expect("a window");
+    let handle = window
+        .set_timeout_with_callback_and_timeout_and_arguments_0(
+            closure.as_ref().unchecked_ref(),
+            millis,
+        )
+        .ok();
+    let mut guard = TimerGuard {
+        window,
+        handle,
+        _closure: closure,
+    };
+    let _ = rx.await;
+    if fired.get() {
+        guard.handle = None;
+    }
+    drop(guard);
 }
 
 /// A JavaScript error as text.
@@ -376,5 +601,73 @@ mod test {
         assert_eq!(from_hex("+a+b"), None);
         assert_eq!(percent_decode("foo%20bar"), Some("foo bar".into()));
         assert_eq!(percent_decode("foo%+a"), None);
+    }
+
+    #[test]
+    fn sanitize_shared_name_strips_unicode_format_and_controls() {
+        // BiDi RLO, ZWJ/ZWNJ, BOM, tag chars, and C0/C1 controls are removed; whitespace collapses.
+        assert_eq!(
+            sanitize_shared_name("  \u{FEFF}Ali\u{202E}ce\u{200D}\u{200C}\t\nBob\x07\x7F  "),
+            "Alice Bob"
+        );
+        assert_eq!(sanitize_shared_name("\u{E0041}\u{E0042}Eve"), "Eve");
+        let long = "a".repeat(NAME_MAX + 20);
+        assert_eq!(sanitize_shared_name(&long).chars().count(), NAME_MAX);
+    }
+
+    #[test]
+    fn sanitize_filename_blocks_bidi_separators_and_reserved_names() {
+        assert_eq!(
+            sanitize_filename("invoice_\u{202E}fdp.exe"),
+            "invoice_fdp.exe"
+        );
+        assert_eq!(sanitize_filename("../../etc/passwd"), "_.._etc_passwd");
+        assert_eq!(sanitize_filename("..\\..\\evil.bat"), "_.._evil.bat");
+        assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename("nul"), "_nul");
+        assert_eq!(sanitize_filename("lpt9.pdf"), "_lpt9.pdf");
+        assert_eq!(sanitize_filename("...   \u{202E}\x00 ..."), "file");
+        let long = format!("{}.pdf", "x".repeat(250));
+        let sanitized = sanitize_filename(&long);
+        assert!(sanitized.chars().count() <= 200);
+        assert!(sanitized.ends_with(".pdf"));
+    }
+
+    #[test]
+    fn validate_relay_url_enforces_https_or_local_http_origin() {
+        assert_eq!(
+            validate_relay_url("https://Chat.Example.COM:443/").unwrap(),
+            "https://chat.example.com"
+        );
+        assert_eq!(
+            validate_relay_url("https://relay.example.com:8443").unwrap(),
+            "https://relay.example.com:8443"
+        );
+        assert_eq!(
+            validate_relay_url("http://localhost:8787/").unwrap(),
+            "http://localhost:8787"
+        );
+        assert_eq!(
+            validate_relay_url("http://127.0.0.1:8787").unwrap(),
+            "http://127.0.0.1:8787"
+        );
+        assert_eq!(
+            validate_relay_url("http://[::1]:8787").unwrap(),
+            "http://[::1]:8787"
+        );
+        for bad in [
+            "",
+            "chat.example.com",
+            "http://chat.example.com",
+            "ws://localhost:8787",
+            "wss://chat.example.com",
+            "javascript:alert(1)",
+            "https://user:pass@chat.example.com",
+            "https://chat.example.com?x=1",
+            "https://chat.example.com#frag",
+            "https://chat.example.com/subpath",
+        ] {
+            assert!(validate_relay_url(bad).is_err(), "should reject {bad:?}");
+        }
     }
 }

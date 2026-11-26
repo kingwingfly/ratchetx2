@@ -34,6 +34,8 @@ impl PartialEq for Chain {
     }
 }
 
+impl Eq for Chain {}
+
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(
@@ -66,19 +68,21 @@ impl PartialEq for MessageRatchet {
     }
 }
 
+impl Eq for MessageRatchet {}
+
 impl MessageRatchet {
     /// New a MessageRatchet.
     pub fn from_key(
-        chain_key: ChainKey,
+        chain_key: Zeroizing<ChainKey>,
         header_key: HeaderKey,
-        next_header_key: HeaderKey,
+        next_header_key: Zeroizing<HeaderKey>,
     ) -> Self {
         Self {
             chain: Some(Chain {
-                chain_key,
+                chain_key: *chain_key,
                 header_key,
             }),
-            next_header_key,
+            next_header_key: *next_header_key,
         }
     }
 
@@ -97,15 +101,22 @@ impl MessageRatchet {
     }
 
     /// HeaderKey of the current chain, if there is one.
-    pub fn header_key(&self) -> Option<HeaderKey> {
-        self.chain.as_ref().map(|chain| chain.header_key)
+    pub fn header_key(&self) -> Option<Zeroizing<HeaderKey>> {
+        self.chain
+            .as_ref()
+            .map(|chain| Zeroizing::new(chain.header_key))
+    }
+
+    /// Next HeaderKey, wrapped in `Zeroizing`.
+    pub fn next_header_key(&self) -> Zeroizing<HeaderKey> {
+        Zeroizing::new(self.next_header_key)
     }
 
     /// Perform ratchet step, update ChainKey, and return MessageKey; None if there is no chain yet.
-    pub fn step(&mut self) -> Option<MessageKey> {
+    pub fn step(&mut self) -> Option<Zeroizing<MessageKey>> {
         let chain = self.chain.as_mut()?;
         let message_key = hmac_sha256(&chain.chain_key, &[1]);
-        let next_chain_key = Zeroizing::new(hmac_sha256(&chain.chain_key, &[2]));
+        let next_chain_key = hmac_sha256(&chain.chain_key, &[2]);
         chain.chain_key.zeroize();
         chain.chain_key = *next_chain_key;
         Some(message_key)
@@ -118,12 +129,14 @@ impl ArchivedMessageRatchet {
         self.chain.is_some()
     }
 
-    pub(crate) fn header_key(&self) -> Option<HeaderKey> {
-        self.chain.as_ref().map(|chain| chain.header_key)
+    pub(crate) fn header_key(&self) -> Option<Zeroizing<HeaderKey>> {
+        self.chain
+            .as_ref()
+            .map(|chain| Zeroizing::new(chain.header_key))
     }
 
-    pub(crate) fn next_header_key(&self) -> HeaderKey {
-        self.next_header_key
+    pub(crate) fn next_header_key(&self) -> Zeroizing<HeaderKey> {
+        Zeroizing::new(self.next_header_key)
     }
 }
 
@@ -149,21 +162,26 @@ impl TryFrom<&crate::proto::MessageRatchet> for MessageRatchet {
 
     fn try_from(message_ratchet: &crate::proto::MessageRatchet) -> Result<Self, Self::Error> {
         let chain = match &message_ratchet.chain {
-            Some(chain) => Some(Chain {
-                chain_key: crate::proto::key(&chain.chain_key)?,
-                header_key: crate::proto::key(&chain.header_key)?,
-            }),
+            Some(chain) => {
+                let chain_key = Zeroizing::new(crate::proto::key(&chain.chain_key)?);
+                let header_key = Zeroizing::new(crate::proto::key(&chain.header_key)?);
+                Some(Chain {
+                    chain_key: *chain_key,
+                    header_key: *header_key,
+                })
+            }
             None => None,
         };
+        let next_header_key = Zeroizing::new(crate::proto::key(&message_ratchet.next_header_key)?);
         Ok(Self {
             chain,
-            next_header_key: crate::proto::key(&message_ratchet.next_header_key)?,
+            next_header_key: *next_header_key,
         })
     }
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; KEY_LENGTH] {
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Zeroizing<[u8; KEY_LENGTH]> {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of any length");
     mac.update(data);
-    mac.finalize().into_bytes().into()
+    Zeroizing::new(mac.finalize().into_bytes().into())
 }

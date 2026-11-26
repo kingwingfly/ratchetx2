@@ -21,7 +21,7 @@ fn pq_suite_option(suite: PqSuite) -> (&'static str, &'static str) {
 }
 
 /// Compact pill `(css_class, label, tooltip)` for the server's advertised PQ support.
-fn server_pq_pill(status: &ServerPqStatus) -> (&'static str, &'static str, String) {
+pub(super) fn server_pq_pill(status: &ServerPqStatus) -> (&'static str, &'static str, String) {
     match status {
         ServerPqStatus::Enabled { suites, pq_ratchet } => {
             let names: Vec<_> = suites
@@ -59,6 +59,18 @@ fn server_pq_pill(status: &ServerPqStatus) -> (&'static str, &'static str, Strin
             "Checking server post-quantum support…".to_string(),
         ),
     }
+}
+
+/// Whether the "Require post-quantum" switch should be disabled: disabled while busy, when PQ is
+/// off, or when the server does not support PQ (except when strict mode is already on, so the user
+/// can still turn it off).
+pub(super) fn strict_pq_toggle_disabled(
+    busy: bool,
+    pq_enabled: bool,
+    server_pq_disabled: bool,
+    strict_pq: bool,
+) -> bool {
+    busy || !pq_enabled || (server_pq_disabled && !strict_pq)
 }
 
 #[component]
@@ -145,7 +157,12 @@ pub(super) fn Settings() -> impl IntoView {
     };
     let pq_controls_disabled = Signal::derive(move || busy.get() || !pq_enabled.get());
     let strict_pq_disabled = Signal::derive(move || {
-        pq_controls_disabled.get() || (server_pq_disabled.get() && !strict_pq.get())
+        strict_pq_toggle_disabled(
+            busy.get(),
+            pq_enabled.get(),
+            server_pq_disabled.get(),
+            strict_pq.get(),
+        )
     });
     let server_row = move || {
         if !can_sign_in_here {

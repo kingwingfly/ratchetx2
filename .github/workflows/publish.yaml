@@ -8,21 +8,50 @@ on:
         type: boolean
         default: false
 
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
+  # Run all clippy, test, doc, and dry-run checks in a credential-free job.
+  verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
 
-      - name: install cargo components
+      - name: Install Rust components
         run: rustup component add clippy
 
-      - name: login to crates.io
-        run: cargo login ${{ secrets.CRATESIO }}
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
-      - name: publish ratchetx2
-        if: ${{ inputs.ratchetx2 }}
-        run: .github/scripts/publish_test.sh ratchetx2 && .github/scripts/publish.sh ratchetx2
+      - name: Verify ratchetx2 package
+        run: .github/scripts/publish_test.sh ratchetx2
+
+  # Only expose CARGO_REGISTRY_TOKEN to the publish step itself, on a clean runner without restored caches.
+  publish:
+    needs: verify
+    if: ${{ inputs.ratchetx2 == true }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # `verify` already ran clippy, tests, docs, and `cargo publish --dry-run` credential-free;
+      # `--no-verify` avoids executing any build scripts or proc-macros with CARGO_REGISTRY_TOKEN set.
+      - name: Publish ratchetx2
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO }}
+        run: .github/scripts/publish.sh ratchetx2 --no-verify

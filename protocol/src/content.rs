@@ -184,4 +184,28 @@ mod test {
         let encoded = kind.to_bytes();
         assert_eq!(Kind::from_bytes(&encoded), Some(kind));
     }
+
+    #[test]
+    fn attachment_pointer_zeroizes_and_implements_zeroize_on_drop() {
+        use zeroize::{Zeroize, ZeroizeOnDrop};
+
+        fn assert_zeroize_on_drop<T: ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<AttachmentPointer>();
+
+        let mut ptr = AttachmentPointer {
+            id: vec![0x11; 16],
+            key: vec![0x22; 32],
+            size: 1234,
+            name: "secret.pdf".into(),
+            mime: "application/pdf".into(),
+            expires: 9999,
+        };
+        ptr.zeroize();
+        assert!(ptr.id.is_empty());
+        assert!(ptr.key.is_empty());
+        assert_eq!(ptr.size, 0);
+        assert!(ptr.name.is_empty());
+        assert!(ptr.mime.is_empty());
+        assert_eq!(ptr.expires, 0);
+    }
 }

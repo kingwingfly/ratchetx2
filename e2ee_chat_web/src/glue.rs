@@ -8,7 +8,7 @@ use std::{
     rc::Rc,
 };
 
-use futures::channel::oneshot;
+use futures_channel::oneshot;
 use js_sys::{Array, ArrayBuffer, Function, Object, Promise, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue, closure::Closure, prelude::wasm_bindgen};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -106,6 +106,9 @@ fn is_secure_context() -> bool {
 /// showing `Open in another tab`, avoiding brief IPC-teardown flashes on fast reloads.
 const LOCK_RELOAD_GRACE_MS: i32 = 250;
 
+/// Handler callback for media range requests forwarded from `media-worker.js`.
+type MediaHandler = Rc<dyn Fn(MediaRequest)>;
+
 thread_local! {
     /// Whether `pagehide` has fired for this page (unconditionally set so neither late lock grants
     /// nor vault writes can proceed once the page begins unloading or entering bfcache).
@@ -123,6 +126,9 @@ thread_local! {
     /// it immediately and lets it clean up its event listeners.
     static LOCK_INACTIVE_WAKE: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
     static LOCK_LIFECYCLE_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// Replaceable media-request handler invoked by the one-time service-worker message listener.
+    static MEDIA_HANDLER: RefCell<Option<MediaHandler>> = const { RefCell::new(None) };
+    static MEDIA_LISTENER_INSTALLED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Whether `pagehide` has fired for this page (releasing or forfeiting its exclusive vault lock).
@@ -174,6 +180,7 @@ fn install_lock_lifecycle() {
         Closure::<dyn FnMut(PageTransitionEvent)>::new(move |_event: PageTransitionEvent| {
             LOCK_RELEASED.with(|released| released.set(true));
             LOCK_HELD.with(|held| held.set(false));
+            MEDIA_HANDLER.with(|handler| *handler.borrow_mut() = None);
             if let Some((cancelled, controller)) =
                 LOCK_WAIT_ABORT.with(|slot| slot.borrow_mut().take())
             {
@@ -282,23 +289,45 @@ async fn request_lock_if_available(
     told.await.unwrap_or(unavailable)
 }
 
-struct InactiveListeners {
+struct EventListenerGuard {
     window: web_sys::Window,
+    window_event: &'static str,
     doc: Option<web_sys::Document>,
-    on_blur: Closure<dyn FnMut()>,
+    on_window: Closure<dyn FnMut()>,
     on_vis: Closure<dyn FnMut()>,
+    clear_inactive_wake: bool,
 }
 
-impl Drop for InactiveListeners {
+impl Drop for EventListenerGuard {
     fn drop(&mut self) {
-        let _ = self
-            .window
-            .remove_event_listener_with_callback("blur", self.on_blur.as_ref().unchecked_ref());
+        if self.clear_inactive_wake {
+            LOCK_INACTIVE_WAKE.with(|slot| {
+                *slot.borrow_mut() = None;
+            });
+        }
+        let _ = self.window.remove_event_listener_with_callback(
+            self.window_event,
+            self.on_window.as_ref().unchecked_ref(),
+        );
         if let Some(ref doc) = self.doc {
             let _ = doc.remove_event_listener_with_callback(
                 "visibilitychange",
                 self.on_vis.as_ref().unchecked_ref(),
             );
+        }
+    }
+}
+
+struct TimeoutGuard {
+    window: web_sys::Window,
+    handle: Rc<Cell<Option<i32>>>,
+    _closure: Closure<dyn FnMut()>,
+}
+
+impl Drop for TimeoutGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.window.clear_timeout_with_handle(handle);
         }
     }
 }
@@ -356,7 +385,18 @@ async fn request_lock_with_signal(
             prev_controller.abort();
         }
     });
-    let mut _inactive_listeners: Option<InactiveListeners> = None;
+    let settled = Rc::new(Cell::new(false));
+    let _cancel_on_drop = scopeguard::guard(
+        (settled.clone(), cancelled.clone(), controller.clone()),
+        |(settled, cancelled, controller)| {
+            if !settled.get() {
+                cancelled.set(true);
+                clear_lock_wait_abort(&cancelled);
+                controller.abort();
+            }
+        },
+    );
+    let mut _inactive_listeners: Option<EventListenerGuard> = None;
     if abort_when_inactive && let Some(window) = web_sys::window() {
         let make_abort = || {
             let cancelled = cancelled.clone();
@@ -383,14 +423,16 @@ async fn request_lock_with_signal(
                 on_vis.as_ref().unchecked_ref(),
             );
         }
-        _inactive_listeners = Some(InactiveListeners {
+        _inactive_listeners = Some(EventListenerGuard {
             window,
+            window_event: "blur",
             doc,
-            on_blur,
+            on_window: on_blur,
             on_vis,
+            clear_inactive_wake: false,
         });
     }
-    let mut _timeout_closure: Option<Closure<dyn FnMut()>> = None;
+    let mut _timeout_guard: Option<TimeoutGuard> = None;
     if let Some(ms) = timeout_ms
         && let Some(window) = web_sys::window()
     {
@@ -410,7 +452,11 @@ async fn request_lock_with_signal(
             ms,
         ) {
             timer_handle.set(Some(handle));
-            _timeout_closure = Some(on_timeout);
+            _timeout_guard = Some(TimeoutGuard {
+                window,
+                handle: timer_handle.clone(),
+                _closure: on_timeout,
+            });
         }
     }
     let granted = {
@@ -470,14 +516,14 @@ async fn request_lock_with_signal(
     let outcome = told
         .await
         .unwrap_or(SignalWaitResult::Status(fallback_on_error));
-    clear_timer();
-    drop(_timeout_closure);
+    settled.set(true);
+    drop(_timeout_guard);
     drop(_inactive_listeners);
     outcome
 }
 
 /// Suspend until this tab is both visible and focused (or `pagehide` closes it), cleaning up all
-/// temporary event listeners before returning.
+/// temporary event listeners even if this future is dropped before completing.
 async fn wait_until_tab_active() {
     if is_tab_active() || lock_released() {
         return;
@@ -521,20 +567,18 @@ async fn wait_until_tab_active() {
         let _ = doc
             .add_event_listener_with_callback("visibilitychange", on_vis.as_ref().unchecked_ref());
     }
+    let _listeners = EventListenerGuard {
+        window,
+        window_event: "focus",
+        doc,
+        on_window: on_focus,
+        on_vis,
+        clear_inactive_wake: true,
+    };
     if is_tab_active() || lock_released() {
         wake();
     }
     let _ = rx.await;
-    LOCK_INACTIVE_WAKE.with(|slot| {
-        *slot.borrow_mut() = None;
-    });
-    let _ = window.remove_event_listener_with_callback("focus", on_focus.as_ref().unchecked_ref());
-    if let Some(doc) = doc {
-        let _ = doc.remove_event_listener_with_callback(
-            "visibilitychange",
-            on_vis.as_ref().unchecked_ref(),
-        );
-    }
 }
 
 /// Take the lock `name` for as long as the page lives, failing closed if another tab holds it
@@ -669,6 +713,8 @@ pub struct MediaRequest {
     pub token: String,
     pub range: MediaRange,
     reply: MessagePort,
+    aborted: Rc<Cell<bool>>,
+    _on_abort: Option<Closure<dyn FnMut(MessageEvent)>>,
 }
 
 /// What answers a [`MediaRequest`]: the stream's total size, resolved start offset, MIME type,
@@ -676,7 +722,15 @@ pub struct MediaRequest {
 pub type MediaReply<'a> = Result<(u64, u64, &'a str, &'a [u8]), MediaError>;
 
 impl MediaRequest {
+    /// Whether the service worker signalled that the underlying fetch request was aborted.
+    pub fn is_aborted(&self) -> bool {
+        self.aborted.get()
+    }
+
     pub fn reply(self, reply: MediaReply<'_>) {
+        if self.aborted.get() {
+            return;
+        }
         let message: MediaReplyMsg = Object::new().unchecked_into();
         let transfer = Array::new();
         match reply {
@@ -701,9 +755,27 @@ impl MediaRequest {
     }
 }
 
+impl Drop for MediaRequest {
+    fn drop(&mut self) {
+        self.reply.set_onmessage(None);
+        self.reply.close();
+    }
+}
+
 /// Answer the service worker's requests for media, as they come, with `answer`.
+///
+/// Idempotent: registers the underlying `serviceWorker` `message` event listener once per page
+/// lifetime and atomically replaces the active handler so repeated unlocks never install
+/// colliding listeners.
 pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
+    MEDIA_HANDLER.with(|handler| {
+        *handler.borrow_mut() = Some(Rc::new(answer));
+    });
+    if MEDIA_LISTENER_INSTALLED.with(|installed| installed.replace(true)) {
+        return;
+    }
     let Ok(Some(container)) = navigator().optional_service_worker() else {
+        MEDIA_LISTENER_INSTALLED.with(|installed| installed.set(false));
         return;
     };
     let listener = Closure::<dyn Fn(MessageEvent)>::new(move |event: MessageEvent| {
@@ -747,16 +819,40 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
         } else {
             MediaRange::Invalid
         };
-        answer(MediaRequest {
+        let aborted = Rc::new(Cell::new(false));
+        let on_abort = {
+            let aborted = aborted.clone();
+            Closure::<dyn FnMut(MessageEvent)>::new(move |msg: MessageEvent| {
+                let data = msg.data();
+                if data.is_object()
+                    && !data.is_null()
+                    && Reflect::get(&data, &JsValue::from_str("aborted"))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+                {
+                    aborted.set(true);
+                }
+            })
+        };
+        reply.set_onmessage(Some(on_abort.as_ref().unchecked_ref()));
+        let req = MediaRequest {
             token,
             range,
             reply,
-        });
+            aborted,
+            _on_abort: Some(on_abort),
+        };
+        if let Some(handler) = MEDIA_HANDLER.with(|h| h.borrow().clone()) {
+            handler(req);
+        } else {
+            req.reply(Err(MediaError::Status(404)));
+        }
     });
     let _ =
         container.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref());
     // Messages are let through once the page loads, or once asked to, which web-sys cannot.
     let _ = container.try_start_messages();
-    // Listening as long as the page lives.
+    // Listening once for as long as the page lives.
     listener.forget();
 }

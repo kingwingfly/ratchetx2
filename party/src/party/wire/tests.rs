@@ -132,7 +132,7 @@ fn legacy_skipped_chain_layouts_preserve_delayed_messages() {
     bob.decrypt(&next).unwrap();
 
     // The six-field layout also predates the eviction field on each skipped chain.
-    let hk = bob.ratchet.header_key_receiver().unwrap();
+    let hk = *bob.ratchet.header_key_receiver().unwrap();
     let keys = BTreeMap::from([(0u64, *bob.skipped_message_keys.get(&hk, 0).unwrap())]);
     let chains = [(hk, keys, 0usize)];
     let old_skipped = (chains.as_slice(),);
@@ -447,5 +447,62 @@ fn json_accepts_legacy_maps_and_checks_versioned_fields() {
         }
         let restored = serde_json::from_value::<Party>(legacy.clone()).unwrap();
         assert_eq!(postcard::to_allocvec(&restored).unwrap(), CLASSIC);
+    }
+}
+
+#[test]
+fn legacy_positional_readers_bound_associated_data() {
+    let oversized_ad = vec![0x42u8; super::MAX_ASSOCIATED_DATA_LEN + 1];
+    let party = postcard::from_bytes::<Party>(CLASSIC).unwrap();
+    let base_v1 = serde_json::to_value((
+        &party.ratchet,
+        &party.skipped_message_keys,
+        party.previous_chain_length,
+        party.message_number_sender,
+        party.message_number_receiver,
+        &oversized_ad,
+        &party.current_chain_evicted,
+    ))
+    .unwrap();
+    assert!(serde_json::from_value::<LegacyPartyV1>(base_v1).is_err());
+
+    let base_v0 = serde_json::to_value((
+        &party.ratchet,
+        Vec::<([u8; 32], Vec<(u64, [u8; 32])>)>::new(),
+        party.previous_chain_length,
+        party.message_number_sender,
+        party.message_number_receiver,
+        &oversized_ad,
+    ))
+    .unwrap();
+    assert!(serde_json::from_value::<LegacyPartyV0>(base_v0).is_err());
+
+    // Postcard huge-length varint prefix for associated_data must reject pre-allocation!
+    let mut bad_v0 = postcard::to_allocvec(&(
+        &party.ratchet,
+        Vec::<([u8; 32], Vec<(u64, [u8; 32])>)>::new(),
+        party.previous_chain_length,
+        party.message_number_sender,
+        party.message_number_receiver,
+    ))
+    .unwrap();
+    // Encode varint 1_000_000 (0xC0 0x84 0x3D) followed by empty tail.
+    bad_v0.extend_from_slice(&[0xC0, 0x84, 0x3D]);
+    assert!(postcard::from_bytes::<LegacyPartyV0>(&bad_v0).is_err());
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    {
+        let base_pq = serde_json::to_value((
+            &party.ratchet,
+            &party.skipped_message_keys,
+            party.previous_chain_length,
+            party.message_number_sender,
+            party.message_number_receiver,
+            &oversized_ad,
+            &party.current_chain_evicted,
+            Option::<()>::None,
+        ))
+        .unwrap();
+        assert!(serde_json::from_value::<LegacyPartyPqV1>(base_pq).is_err());
     }
 }

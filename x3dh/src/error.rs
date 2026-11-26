@@ -37,7 +37,9 @@ impl From<xeddsa::Error> for Error {
     fn from(error: xeddsa::Error) -> Self {
         let kind = match error {
             xeddsa::Error::InvalidPublicKey => ErrorKind::InvalidPublicKey,
+            xeddsa::Error::InvalidPrivateKey => ErrorKind::MalformedState,
             xeddsa::Error::Signature => ErrorKind::InvalidSignature,
+            xeddsa::Error::Rng => ErrorKind::Rng,
         };
         Self::new(kind, error)
     }
@@ -81,6 +83,9 @@ pub enum ErrorKind {
     /// The post-quantum ciphertext has an invalid length or encoding for its suite.
     #[error("invalid post-quantum ciphertext")]
     InvalidCiphertext,
+    /// The system random number generator failed.
+    #[error("random number generator failed")]
+    Rng,
 }
 
 /// Result type with [`Error`].

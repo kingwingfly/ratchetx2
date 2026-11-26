@@ -1,11 +1,22 @@
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
-use super::{ENTRIES_MAX, ZIP_CENTRAL_DIR_MAX};
+use unicode_general_category::{GeneralCategory, get_general_category};
+
+use super::{ENTRIES_MAX, PreviewBudget, ZIP_CENTRAL_DIR_MAX};
 
 const EOCD_LEN: usize = 22;
 const ZIP64_EOCD_LEN: usize = 56;
 const ZIP64_LOCATOR_LEN: usize = 20;
 const ZIP64_FOOTER_LEN: usize = ZIP64_EOCD_LEN + ZIP64_LOCATOR_LEN + EOCD_LEN;
+
+/// Maximum byte length allowed for a single TAR GNU LongName/LongLink or PAX extension header.
+const TAR_EXT_HEADER_MAX: u64 = 4 * 1024;
+/// Maximum byte length retained for a single displayed archive entry path.
+const ARCHIVE_SINGLE_PATH_MAX: usize = 4 * 1024;
+/// Maximum cumulative path bytes across all listed entries in one archive.
+const ARCHIVE_PATH_BYTES_MAX: usize = 4 * 1024 * 1024;
+/// Maximum byte length shown for a sanitized link target in [`Entry::note`].
+const ARCHIVE_LINK_TARGET_MAX: usize = 256;
 
 /// The entries of an archive, all of them, or the first, if listing more would take too long.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +31,73 @@ pub struct Entry {
     pub path: String,
     pub size: u64,
     pub directory: bool,
+    /// Optional security/metadata indicator (e.g. symlink, hardlink, path traversal).
+    pub note: Option<String>,
+}
+
+/// Sanitize a peer-supplied archive entry path for display: strips Unicode format/BiDi (`Cf`)
+/// and control (`Cc`) characters while preserving relative `/` path separators, caps length, and
+/// detects path traversal patterns (`..`, leading `/` or `\`, backslash separators, or Windows
+/// drive prefixes).
+fn sanitize_entry_path(raw: &str, max_bytes: usize) -> (String, bool) {
+    let mut cleaned = String::with_capacity(raw.len().min(max_bytes));
+    let mut truncated = false;
+    for ch in raw.chars() {
+        let cat = get_general_category(ch);
+        if matches!(cat, GeneralCategory::Control | GeneralCategory::Format) {
+            continue;
+        }
+        let mapped = if ch.is_whitespace() { ' ' } else { ch };
+        if cleaned.len().saturating_add(mapped.len_utf8()) > max_bytes {
+            truncated = true;
+            break;
+        }
+        cleaned.push(mapped);
+    }
+    if truncated {
+        cleaned.push('…');
+    }
+    let has_traversal = is_traversal_path(raw) || is_traversal_path(&cleaned);
+    (cleaned, has_traversal)
+}
+
+fn is_traversal_path(path: &str) -> bool {
+    if path.starts_with('/') || path.starts_with('\\') || path.contains('\\') {
+        return true;
+    }
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return true;
+    }
+    path.split(['/', '\\']).any(|segment| segment == "..")
+}
+
+fn build_entry_note(
+    symlink_target: Option<&str>,
+    hardlink_target: Option<&str>,
+    has_traversal: bool,
+) -> Option<String> {
+    let mut notes = Vec::new();
+    if let Some(target) = symlink_target {
+        let (clean_target, _) = sanitize_entry_path(target, ARCHIVE_LINK_TARGET_MAX);
+        if clean_target.is_empty() {
+            notes.push("symlink".to_string());
+        } else {
+            notes.push(format!("symlink -> {clean_target}"));
+        }
+    }
+    if let Some(target) = hardlink_target {
+        let (clean_target, _) = sanitize_entry_path(target, ARCHIVE_LINK_TARGET_MAX);
+        if clean_target.is_empty() {
+            notes.push("hardlink".to_string());
+        } else {
+            notes.push(format!("hardlink -> {clean_target}"));
+        }
+    }
+    if has_traversal {
+        notes.push("path traversal".to_string());
+    }
+    (!notes.is_empty()).then(|| notes.join("; "))
 }
 
 struct CentralDirectory {
@@ -228,47 +306,237 @@ fn list_zip(mut archive: ::zip::ZipArchive<impl Read + Seek>) -> Option<Listing>
     if archive.len() > ENTRIES_MAX {
         return None;
     }
-    let entries = (0..archive.len())
-        .map(|index| {
-            let file = archive.by_index_raw(index).ok()?;
-            Some(Entry {
-                path: file.name().ok()?.into_owned(),
-                size: file.size(),
-                directory: file.is_dir(),
-            })
-        })
-        .collect::<Option<Vec<_>>>()?;
-    Some(Listing {
-        complete: true,
+    let mut path_budget = PreviewBudget::new(ARCHIVE_PATH_BYTES_MAX);
+    let mut entries = Vec::with_capacity(archive.len().min(1024));
+    let mut complete = true;
+    for index in 0..archive.len() {
+        let file = archive.by_index_raw(index).ok()?;
+        let raw_path = file.name().ok()?;
+        let (path, has_traversal) = sanitize_entry_path(&raw_path, ARCHIVE_SINGLE_PATH_MAX);
+        if !path_budget.take(path.len()) {
+            complete = false;
+            break;
+        }
+        let is_symlink = file.is_symlink()
+            || file
+                .unix_mode()
+                .is_some_and(|mode| (mode & 0o170000) == 0o120000);
+        let note = build_entry_note(is_symlink.then_some(""), None, has_traversal);
+        entries.push(Entry {
+            path,
+            size: file.size(),
+            directory: file.is_dir(),
+            note,
+        });
+    }
+    Some(Listing { entries, complete })
+}
+
+#[derive(Default)]
+struct PaxOverrides {
+    path: Option<Vec<u8>>,
+    linkpath: Option<Vec<u8>>,
+    size: Option<u64>,
+}
+
+/// Parse bounded POSIX PAX extended-header records (`<len> <key>=<value>\n`).
+fn parse_pax_records(mut data: &[u8]) -> PaxOverrides {
+    let mut out = PaxOverrides::default();
+    while !data.is_empty() {
+        let Some(space) = data.iter().position(|&b| b == b' ') else {
+            break;
+        };
+        let Ok(len_str) = std::str::from_utf8(&data[..space]) else {
+            break;
+        };
+        let Ok(record_len) = len_str.parse::<usize>() else {
+            break;
+        };
+        if record_len <= space + 1 || record_len > data.len() {
+            break;
+        }
+        let body = &data[space + 1..record_len];
+        let body = body.strip_suffix(b"\n").unwrap_or(body);
+        if let Some(eq) = body.iter().position(|&b| b == b'=') {
+            let key = &body[..eq];
+            let val = &body[eq + 1..];
+            match key {
+                b"path" => out.path = Some(val.to_vec()),
+                b"linkpath" => out.linkpath = Some(val.to_vec()),
+                b"size" => {
+                    if let Ok(s) = std::str::from_utf8(val)
+                        && let Ok(parsed) = s.parse::<u64>()
+                    {
+                        out.size = Some(parsed);
+                    }
+                }
+                _ => {}
+            }
+        }
+        data = &data[record_len..];
+    }
+    out
+}
+
+struct TarScan {
+    entries: Vec<Entry>,
+    complete: bool,
+    saw_valid_header: bool,
+    max_file_end: u64,
+}
+
+/// Walk raw TAR entries so GNU LongName (`L`), GNU LongLink (`K`), and PAX (`x`/`g`) extension
+/// headers are size-checked against [`TAR_EXT_HEADER_MAX`] *before* any payload bytes are read
+/// into memory.
+fn scan_raw_tar_entries<R: Read>(entries_iter: ::tar::Entries<'_, R>) -> TarScan {
+    let mut entries = Vec::new();
+    let mut entry_budget = PreviewBudget::new(ENTRIES_MAX);
+    let mut path_budget = PreviewBudget::new(ARCHIVE_PATH_BYTES_MAX);
+    let mut complete = true;
+    let mut saw_valid_header = false;
+    let mut max_file_end = 0u64;
+
+    let mut pending_longname: Option<Vec<u8>> = None;
+    let mut pending_longlink: Option<Vec<u8>> = None;
+    let mut pending_pax = PaxOverrides::default();
+
+    for raw in entries_iter {
+        let Ok(mut entry) = raw else {
+            complete = false;
+            break;
+        };
+        saw_valid_header = true;
+        let entry_type = entry.header().entry_type();
+        let raw_size = entry.size();
+        max_file_end = max_file_end.max(entry.raw_file_position().saturating_add(raw_size));
+
+        if entry_type.is_gnu_longname()
+            || entry_type.is_gnu_longlink()
+            || entry_type.is_pax_local_extensions()
+            || entry_type.is_pax_global_extensions()
+        {
+            if raw_size > TAR_EXT_HEADER_MAX {
+                complete = false;
+                break;
+            }
+            let mut buf = vec![0u8; raw_size as usize];
+            if entry.read_exact(&mut buf).is_err() {
+                complete = false;
+                break;
+            }
+            if entry_type.is_gnu_longname() {
+                while buf.last() == Some(&0) {
+                    buf.pop();
+                }
+                pending_longname = Some(buf);
+            } else if entry_type.is_gnu_longlink() {
+                while buf.last() == Some(&0) {
+                    buf.pop();
+                }
+                pending_longlink = Some(buf);
+            } else if entry_type.is_pax_local_extensions() {
+                let parsed = parse_pax_records(&buf);
+                if parsed.path.is_some() {
+                    pending_pax.path = parsed.path;
+                }
+                if parsed.linkpath.is_some() {
+                    pending_pax.linkpath = parsed.linkpath;
+                }
+                if parsed.size.is_some() {
+                    pending_pax.size = parsed.size;
+                }
+            }
+            continue;
+        }
+
+        if !entry_budget.try_push() {
+            complete = false;
+            break;
+        }
+
+        let pax = std::mem::take(&mut pending_pax);
+        let longname = pending_longname.take();
+        let longlink = pending_longlink.take();
+
+        let raw_path_bytes = pax
+            .path
+            .or(longname)
+            .unwrap_or_else(|| entry.path_bytes().into_owned());
+        let raw_path = String::from_utf8_lossy(&raw_path_bytes);
+        let (path, has_traversal) = sanitize_entry_path(&raw_path, ARCHIVE_SINGLE_PATH_MAX);
+        if !path_budget.take(path.len()) {
+            complete = false;
+            break;
+        }
+
+        let raw_link_bytes = pax
+            .linkpath
+            .or(longlink)
+            .or_else(|| entry.link_name_bytes().map(|b| b.into_owned()));
+        let raw_link = raw_link_bytes
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned());
+
+        let symlink_target = entry_type
+            .is_symlink()
+            .then(|| raw_link.as_deref().unwrap_or(""));
+        let hardlink_target = entry_type
+            .is_hard_link()
+            .then(|| raw_link.as_deref().unwrap_or(""));
+        let note = build_entry_note(symlink_target, hardlink_target, has_traversal);
+
+        let size = pax.size.unwrap_or(raw_size);
+        let pax_size_mismatch = pax.size.is_some_and(|ps| ps != raw_size);
+        entries.push(Entry {
+            path,
+            size,
+            directory: entry_type.is_dir(),
+            note,
+        });
+
+        // Raw iteration advances by header size; if a PAX `size` differed from the header size,
+        // stop cleanly here rather than risk misaligning subsequent headers.
+        if pax_size_mismatch {
+            complete = false;
+            break;
+        }
+    }
+
+    TarScan {
         entries,
-    })
+        complete,
+        saw_valid_header,
+        max_file_end,
+    }
 }
 
 /// The entries of the tar archive `reader` reads, at most [`ENTRIES_MAX`], from no more than
 /// its first `limit` bytes. Listing an entry reads through the one before it, so the listing
-/// stops at the entry that crosses the limit, or that is damaged. Not an archive, if not even
-/// its first entry reads.
+/// stops at the entry that crosses the limit, or that is damaged. Not an archive if no valid
+/// tar header is seen (preventing all-zero `.gz` files from reporting an empty tar listing).
 pub(super) fn tar(reader: impl Read, limit: u64) -> Option<Listing> {
     let mut archive = ::tar::Archive::new(reader.take(limit));
-    let mut entries = Vec::new();
-    let mut complete = true;
-    for entry in archive.entries().ok()? {
-        let entry = entry.ok().and_then(|entry| {
-            Some(Entry {
-                path: entry.path().ok()?.to_string_lossy().into_owned(),
-                size: entry.size(),
-                directory: entry.header().entry_type().is_dir(),
-            })
-        });
-        match entry {
-            Some(entry) if entries.len() < ENTRIES_MAX => entries.push(entry),
-            _ => {
-                complete = false;
-                break;
-            }
-        }
-    }
+    let TarScan {
+        entries,
+        mut complete,
+        saw_valid_header,
+        ..
+    } = scan_raw_tar_entries(archive.entries().ok()?.raw(true));
     // Read up to the limit: what came after it went unread.
     complete &= archive.into_inner().limit() > 0;
-    (complete || !entries.is_empty()).then_some(Listing { entries, complete })
+    (saw_valid_header && (complete || !entries.is_empty())).then_some(Listing { entries, complete })
+}
+
+/// The entries of an uncompressed in-memory tar archive, using seekable iteration so entry
+/// payloads are skipped in O(1) without linearly reading through them.
+pub(super) fn tar_slice(data: &[u8]) -> Option<Listing> {
+    let mut archive = ::tar::Archive::new(Cursor::new(data));
+    let TarScan {
+        entries,
+        mut complete,
+        saw_valid_header,
+        max_file_end,
+    } = scan_raw_tar_entries(archive.entries_with_seek().ok()?.raw(true));
+    complete &= max_file_end <= data.len() as u64;
+    (saw_valid_header && (complete || !entries.is_empty())).then_some(Listing { entries, complete })
 }

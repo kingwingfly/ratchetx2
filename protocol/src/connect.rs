@@ -57,43 +57,73 @@ pub const PROTOCOL_VERSION_HEADER: &str = "connect-protocol-version";
 /// The protocol's version.
 pub const PROTOCOL_VERSION: &str = "1";
 
-/// A procedure of the attachment service (`/attachment.v1.AttachmentService/*`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AttachmentProcedure {
-    /// [`LocalAttachments::start_upload`].
-    StartUpload,
-    /// [`LocalAttachments::put_chunk`].
-    PutChunk,
-    /// [`LocalAttachments::get_chunk`].
-    GetChunk,
-    /// [`LocalAttachments::delete_attachment`].
-    DeleteAttachment,
+/// A Connect RPC procedure mapping a typed enum variant to its HTTP path.
+trait ConnectProcedure: Copy {
+    fn path(self) -> &'static str;
 }
 
-impl AttachmentProcedure {
-    /// Every attachment procedure.
-    pub const ALL: [Self; 4] = [
-        Self::StartUpload,
-        Self::PutChunk,
-        Self::GetChunk,
-        Self::DeleteAttachment,
-    ];
-
-    /// The path of its calls: `/` ‖ the service's full name ‖ `/` ‖ the method's name.
-    pub fn path(self) -> &'static str {
-        match self {
-            Self::StartUpload => "/attachment.v1.AttachmentService/StartUpload",
-            Self::PutChunk => "/attachment.v1.AttachmentService/PutChunk",
-            Self::GetChunk => "/attachment.v1.AttachmentService/GetChunk",
-            Self::DeleteAttachment => "/attachment.v1.AttachmentService/DeleteAttachment",
+macro_rules! define_procedures {
+    (
+        $(#[$enum_meta:meta])*
+        pub enum $name:ident {
+            $(
+                $(#[$var_meta:meta])*
+                $variant:ident => $path:literal,
+            )*
         }
-    }
+    ) => {
+        $(#[$enum_meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $(
+                $(#[$var_meta])*
+                $variant,
+            )*
+        }
 
-    /// The attachment procedure whose calls go to `path`, if any.
-    pub fn from_path(path: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|procedure| procedure.path() == path)
+        #[allow(deprecated)]
+        impl $name {
+            /// Every procedure in this service set.
+            pub const ALL: [Self; [$($path),*].len()] = [
+                $(Self::$variant,)*
+            ];
+
+            /// The path of its calls: `/` ‖ the service's full name ‖ `/` ‖ the method's name.
+            pub const fn path(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $path,)*
+                }
+            }
+
+            /// The procedure whose calls go to `path`, if any.
+            pub fn from_path(path: &str) -> Option<Self> {
+                match path {
+                    $($path => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+
+        #[allow(deprecated)]
+        impl ConnectProcedure for $name {
+            fn path(self) -> &'static str {
+                Self::path(self)
+            }
+        }
+    };
+}
+
+define_procedures! {
+    /// A procedure of the attachment service (`/attachment.v1.AttachmentService/*`).
+    pub enum AttachmentProcedure {
+        /// [`LocalAttachments::start_upload`].
+        StartUpload => "/attachment.v1.AttachmentService/StartUpload",
+        /// [`LocalAttachments::put_chunk`].
+        PutChunk => "/attachment.v1.AttachmentService/PutChunk",
+        /// [`LocalAttachments::get_chunk`].
+        GetChunk => "/attachment.v1.AttachmentService/GetChunk",
+        /// [`LocalAttachments::delete_attachment`].
+        DeleteAttachment => "/attachment.v1.AttachmentService/DeleteAttachment",
     }
 }
 
@@ -107,156 +137,78 @@ pub fn is_legacy_v1_path(path: &str) -> bool {
     path.starts_with("/handshake.v1.") || path.starts_with("/mailbox.v1.")
 }
 
-/// A combined legacy v1 + attachment procedure: a method of the legacy handshake, legacy mailbox,
-/// or attachment service.
-///
-/// New servers should route [`AttachmentProcedure`] with [`handle_attachments`] and (with the `pq`
-/// feature) `ProcedureV2` with `handle_v2`, using [`is_legacy_v1_path`] to reject legacy v1 paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Procedure {
-    /// Legacy v1 [`LocalHandshake::publish`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-    )]
-    Publish,
-    /// Legacy v1 [`LocalHandshake::fetch_bundle`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-    )]
-    FetchBundle,
-    /// Legacy v1 [`LocalHandshake::send_initial_message`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-    )]
-    SendInitialMessage,
-    /// Legacy v1 [`LocalHandshake::take_initial_messages`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-    )]
-    TakeInitialMessages,
-    /// Legacy v1 [`LocalMailbox::push`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-    )]
-    Push,
-    /// Legacy v1 [`LocalMailbox::fetch`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-    )]
-    Fetch,
-    /// [`LocalAttachments::start_upload`].
-    StartUpload,
-    /// [`LocalAttachments::put_chunk`].
-    PutChunk,
-    /// [`LocalAttachments::get_chunk`].
-    GetChunk,
-    /// [`LocalAttachments::delete_attachment`].
-    DeleteAttachment,
-}
-
-#[allow(deprecated)]
-impl Procedure {
-    /// Every procedure.
-    pub const ALL: [Self; 10] = [
-        Self::Publish,
-        Self::FetchBundle,
-        Self::SendInitialMessage,
-        Self::TakeInitialMessages,
-        Self::Push,
-        Self::Fetch,
-        Self::StartUpload,
-        Self::PutChunk,
-        Self::GetChunk,
-        Self::DeleteAttachment,
-    ];
-
-    /// The path of its calls: `/` ‖ the service's full name ‖ `/` ‖ the method's name.
-    pub fn path(self) -> &'static str {
-        match self {
-            Self::Publish => "/handshake.v1.HandshakeService/Publish",
-            Self::FetchBundle => "/handshake.v1.HandshakeService/FetchBundle",
-            Self::SendInitialMessage => "/handshake.v1.HandshakeService/SendInitialMessage",
-            Self::TakeInitialMessages => "/handshake.v1.HandshakeService/TakeInitialMessages",
-            Self::Push => "/mailbox.v1.MailboxService/Push",
-            Self::Fetch => "/mailbox.v1.MailboxService/Fetch",
-            Self::StartUpload => "/attachment.v1.AttachmentService/StartUpload",
-            Self::PutChunk => "/attachment.v1.AttachmentService/PutChunk",
-            Self::GetChunk => "/attachment.v1.AttachmentService/GetChunk",
-            Self::DeleteAttachment => "/attachment.v1.AttachmentService/DeleteAttachment",
-        }
+define_procedures! {
+    /// A combined legacy v1 + attachment procedure: a method of the legacy handshake, legacy mailbox,
+    /// or attachment service.
+    ///
+    /// New servers should route [`AttachmentProcedure`] with [`handle_attachments`] and (with the `pq`
+    /// feature) `ProcedureV2` with `handle_v2`, using [`is_legacy_v1_path`] to reject legacy v1 paths.
+    pub enum Procedure {
+        /// Legacy v1 [`LocalHandshake::publish`].
+        #[deprecated(
+            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+        )]
+        Publish => "/handshake.v1.HandshakeService/Publish",
+        /// Legacy v1 [`LocalHandshake::fetch_bundle`].
+        #[deprecated(
+            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+        )]
+        FetchBundle => "/handshake.v1.HandshakeService/FetchBundle",
+        /// Legacy v1 [`LocalHandshake::send_initial_message`].
+        #[deprecated(
+            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+        )]
+        SendInitialMessage => "/handshake.v1.HandshakeService/SendInitialMessage",
+        /// Legacy v1 [`LocalHandshake::take_initial_messages`].
+        #[deprecated(
+            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+        )]
+        TakeInitialMessages => "/handshake.v1.HandshakeService/TakeInitialMessages",
+        /// Legacy v1 [`LocalMailbox::push`].
+        #[deprecated(
+            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+        )]
+        Push => "/mailbox.v1.MailboxService/Push",
+        /// Legacy v1 [`LocalMailbox::fetch`].
+        #[deprecated(
+            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
+        )]
+        Fetch => "/mailbox.v1.MailboxService/Fetch",
+        /// [`LocalAttachments::start_upload`].
+        StartUpload => "/attachment.v1.AttachmentService/StartUpload",
+        /// [`LocalAttachments::put_chunk`].
+        PutChunk => "/attachment.v1.AttachmentService/PutChunk",
+        /// [`LocalAttachments::get_chunk`].
+        GetChunk => "/attachment.v1.AttachmentService/GetChunk",
+        /// [`LocalAttachments::delete_attachment`].
+        DeleteAttachment => "/attachment.v1.AttachmentService/DeleteAttachment",
     }
-
-    /// The procedure whose calls go to `path`, if any.
-    pub fn from_path(path: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|procedure| procedure.path() == path)
-    }
-}
-
-/// A v2 procedure: a method of `handshake.v2.HandshakeService` or `mailbox.v2.MailboxService`.
-#[cfg(feature = "pq")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ProcedureV2 {
-    /// [`LocalHandshakeV2::get_server_info`].
-    GetServerInfo,
-    /// [`LocalHandshakeV2::publish_v2`].
-    PublishV2,
-    /// [`LocalHandshakeV2::refill_prekeys`].
-    RefillPrekeys,
-    /// [`LocalHandshakeV2::get_manifest`].
-    GetManifest,
-    /// [`LocalHandshakeV2::claim_bundle`].
-    ClaimBundle,
-    /// [`LocalHandshakeV2::send_initial_v2`].
-    SendInitialV2,
-    /// [`LocalHandshakeV2::list_initial_messages`].
-    ListInitialMessages,
-    /// [`LocalHandshakeV2::ack_initial_messages`].
-    AckInitialMessages,
-    /// [`LocalMailboxV2::push_v2`].
-    PushV2,
-    /// [`LocalMailboxV2::fetch_signed`].
-    FetchSigned,
 }
 
 #[cfg(feature = "pq")]
-impl ProcedureV2 {
-    /// Every v2 procedure.
-    pub const ALL: [Self; 10] = [
-        Self::GetServerInfo,
-        Self::PublishV2,
-        Self::RefillPrekeys,
-        Self::GetManifest,
-        Self::ClaimBundle,
-        Self::SendInitialV2,
-        Self::ListInitialMessages,
-        Self::AckInitialMessages,
-        Self::PushV2,
-        Self::FetchSigned,
-    ];
-
-    /// The path of its calls: `/` ‖ the service's full name ‖ `/` ‖ the method's name.
-    pub fn path(self) -> &'static str {
-        match self {
-            Self::GetServerInfo => "/handshake.v2.HandshakeService/GetServerInfo",
-            Self::PublishV2 => "/handshake.v2.HandshakeService/PublishV2",
-            Self::RefillPrekeys => "/handshake.v2.HandshakeService/RefillPrekeys",
-            Self::GetManifest => "/handshake.v2.HandshakeService/GetManifest",
-            Self::ClaimBundle => "/handshake.v2.HandshakeService/ClaimBundle",
-            Self::SendInitialV2 => "/handshake.v2.HandshakeService/SendInitialV2",
-            Self::ListInitialMessages => "/handshake.v2.HandshakeService/ListInitialMessages",
-            Self::AckInitialMessages => "/handshake.v2.HandshakeService/AckInitialMessages",
-            Self::PushV2 => "/mailbox.v2.MailboxService/PushV2",
-            Self::FetchSigned => "/mailbox.v2.MailboxService/FetchSigned",
-        }
-    }
-
-    /// The v2 procedure whose calls go to `path`, if any.
-    pub fn from_path(path: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|procedure| procedure.path() == path)
+define_procedures! {
+    /// A v2 procedure: a method of `handshake.v2.HandshakeService` or `mailbox.v2.MailboxService`.
+    pub enum ProcedureV2 {
+        /// [`LocalHandshakeV2::get_server_info`].
+        GetServerInfo => "/handshake.v2.HandshakeService/GetServerInfo",
+        /// [`LocalHandshakeV2::publish_v2`].
+        PublishV2 => "/handshake.v2.HandshakeService/PublishV2",
+        /// [`LocalHandshakeV2::refill_prekeys`].
+        RefillPrekeys => "/handshake.v2.HandshakeService/RefillPrekeys",
+        /// [`LocalHandshakeV2::get_manifest`].
+        GetManifest => "/handshake.v2.HandshakeService/GetManifest",
+        /// [`LocalHandshakeV2::claim_bundle`].
+        ClaimBundle => "/handshake.v2.HandshakeService/ClaimBundle",
+        /// [`LocalHandshakeV2::send_initial_v2`].
+        SendInitialV2 => "/handshake.v2.HandshakeService/SendInitialV2",
+        /// [`LocalHandshakeV2::list_initial_messages`].
+        ListInitialMessages => "/handshake.v2.HandshakeService/ListInitialMessages",
+        /// [`LocalHandshakeV2::ack_initial_messages`].
+        AckInitialMessages => "/handshake.v2.HandshakeService/AckInitialMessages",
+        /// [`LocalMailboxV2::push_v2`].
+        PushV2 => "/mailbox.v2.MailboxService/PushV2",
+        /// [`LocalMailboxV2::fetch_signed`].
+        FetchSigned => "/mailbox.v2.MailboxService/FetchSigned",
     }
 }
 
@@ -461,15 +413,15 @@ impl<P> ConnectClient<P> {
 }
 
 impl<P: LocalPost> ConnectClient<P> {
-    /// Call a procedure at `path` with `request`.
-    async fn call_path<T: Message + Default>(
+    /// Call `procedure` with `request`.
+    async fn call<T: Message + Default>(
         &self,
-        path: &str,
+        procedure: impl ConnectProcedure,
         request: impl Message,
     ) -> Result<T> {
         let (status, body) = self
             .0
-            .post(path, request.encode_to_vec())
+            .post(procedure.path(), request.encode_to_vec())
             .await
             .map_err(|e| {
                 if e.kind() == ErrorKind::Connect {
@@ -498,34 +450,6 @@ impl<P: LocalPost> ConnectClient<P> {
                 message: format!("HTTP status {status}"),
             },
         ))
-    }
-
-    /// Call `procedure` with `request`.
-    async fn call<T: Message + Default>(
-        &self,
-        procedure: Procedure,
-        request: impl Message,
-    ) -> Result<T> {
-        self.call_path(procedure.path(), request).await
-    }
-
-    /// Call attachment `procedure` with `request`.
-    async fn call_attachment<T: Message + Default>(
-        &self,
-        procedure: AttachmentProcedure,
-        request: impl Message,
-    ) -> Result<T> {
-        self.call_path(procedure.path(), request).await
-    }
-
-    /// Call v2 `procedure` with `request`.
-    #[cfg(feature = "pq")]
-    async fn call_v2<T: Message + Default>(
-        &self,
-        procedure: ProcedureV2,
-        request: impl Message,
-    ) -> Result<T> {
-        self.call_path(procedure.path(), request).await
     }
 }
 
@@ -567,25 +491,22 @@ impl<P: LocalPost> LocalMailbox for ConnectClient<P> {
 
 impl<P: LocalPost> LocalAttachments for ConnectClient<P> {
     async fn start_upload(&self, request: StartUploadRequest) -> Result<StartUploadResponse> {
-        self.call_attachment(AttachmentProcedure::StartUpload, request)
-            .await
+        self.call(AttachmentProcedure::StartUpload, request).await
     }
 
     async fn put_chunk(&self, request: PutChunkRequest) -> Result<PutChunkResponse> {
-        self.call_attachment(AttachmentProcedure::PutChunk, request)
-            .await
+        self.call(AttachmentProcedure::PutChunk, request).await
     }
 
     async fn get_chunk(&self, request: GetChunkRequest) -> Result<GetChunkResponse> {
-        self.call_attachment(AttachmentProcedure::GetChunk, request)
-            .await
+        self.call(AttachmentProcedure::GetChunk, request).await
     }
 
     async fn delete_attachment(
         &self,
         request: DeleteAttachmentRequest,
     ) -> Result<DeleteAttachmentResponse> {
-        self.call_attachment(AttachmentProcedure::DeleteAttachment, request)
+        self.call(AttachmentProcedure::DeleteAttachment, request)
             .await
     }
 }
@@ -596,56 +517,55 @@ impl<P: LocalPost> LocalHandshakeV2 for ConnectClient<P> {
         &self,
         request: GetServerInfoRequest,
     ) -> Result<GetServerInfoResponse> {
-        self.call_v2(ProcedureV2::GetServerInfo, request).await
+        self.call(ProcedureV2::GetServerInfo, request).await
     }
 
     async fn publish_v2(&self, request: PublishV2Request) -> Result<PublishV2Response> {
-        self.call_v2(ProcedureV2::PublishV2, request).await
+        self.call(ProcedureV2::PublishV2, request).await
     }
 
     async fn refill_prekeys(&self, request: RefillPrekeysRequest) -> Result<RefillPrekeysResponse> {
-        self.call_v2(ProcedureV2::RefillPrekeys, request).await
+        self.call(ProcedureV2::RefillPrekeys, request).await
     }
 
     async fn get_manifest(&self, request: GetManifestRequest) -> Result<GetManifestResponse> {
-        self.call_v2(ProcedureV2::GetManifest, request).await
+        self.call(ProcedureV2::GetManifest, request).await
     }
 
     async fn claim_bundle(&self, request: ClaimBundleRequest) -> Result<ClaimBundleResponse> {
-        self.call_v2(ProcedureV2::ClaimBundle, request).await
+        self.call(ProcedureV2::ClaimBundle, request).await
     }
 
     async fn send_initial_v2(
         &self,
         request: SendInitialV2Request,
     ) -> Result<SendInitialV2Response> {
-        self.call_v2(ProcedureV2::SendInitialV2, request).await
+        self.call(ProcedureV2::SendInitialV2, request).await
     }
 
     async fn list_initial_messages(
         &self,
         request: ListInitialMessagesRequest,
     ) -> Result<ListInitialMessagesResponse> {
-        self.call_v2(ProcedureV2::ListInitialMessages, request)
-            .await
+        self.call(ProcedureV2::ListInitialMessages, request).await
     }
 
     async fn ack_initial_messages(
         &self,
         request: AckInitialMessagesRequest,
     ) -> Result<AckInitialMessagesResponse> {
-        self.call_v2(ProcedureV2::AckInitialMessages, request).await
+        self.call(ProcedureV2::AckInitialMessages, request).await
     }
 }
 
 #[cfg(feature = "pq")]
 impl<P: LocalPost> LocalMailboxV2 for ConnectClient<P> {
     async fn push_v2(&self, request: PushV2Request) -> Result<PushV2Response> {
-        self.call_v2(ProcedureV2::PushV2, request).await
+        self.call(ProcedureV2::PushV2, request).await
     }
 
     async fn fetch_signed(&self, request: FetchSignedRequest) -> Result<FetchSignedResponse> {
-        self.call_v2(ProcedureV2::FetchSigned, request).await
+        self.call(ProcedureV2::FetchSigned, request).await
     }
 }
 
@@ -681,6 +601,7 @@ enum Code {
 }
 
 impl Code {
+    #[cfg(all(test, feature = "server"))]
     const ALL: [Self; 10] = [
         Self::InvalidArgument,
         Self::Unauthenticated,
@@ -712,7 +633,19 @@ impl Code {
     /// The code named `name`, if it is one of these. Other codes, such as `aborted`, are
     /// [`ErrorKind::Server`] errors to the clients.
     fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|code| code.name() == name)
+        match name {
+            "invalid_argument" => Some(Self::InvalidArgument),
+            "unauthenticated" => Some(Self::Unauthenticated),
+            "failed_precondition" => Some(Self::FailedPrecondition),
+            "not_found" => Some(Self::NotFound),
+            "resource_exhausted" => Some(Self::ResourceExhausted),
+            "unavailable" => Some(Self::Unavailable),
+            "internal" => Some(Self::Internal),
+            "permission_denied" => Some(Self::PermissionDenied),
+            "unimplemented" => Some(Self::Unimplemented),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
     }
 
     /// The HTTP status of an error response with this code.
@@ -818,8 +751,10 @@ mod test {
         });
 
         // Error kinds survive the trip through Connect's error codes.
+        let alice_pk = crate::test_public_key(1);
+        let bob_pk = crate::test_public_key(2);
         let request = FetchBundleRequest {
-            identity_key: Bytes::from_static(&[1; 32]),
+            identity_key: Bytes::copy_from_slice(&alice_pk),
         };
         let error = client.fetch_bundle(request).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
@@ -834,16 +769,16 @@ mod test {
             content: Bytes::from_static(b"content"),
         };
         let request = PushRequest {
-            sender: Bytes::from_static(&[1; 32]),
-            recipient: Bytes::from_static(&[2; 32]),
+            sender: Bytes::copy_from_slice(&alice_pk),
+            recipient: Bytes::copy_from_slice(&bob_pk),
             message: Some(message.clone()),
             initial_message: None,
             delivery_hash: Bytes::new(),
         };
         assert_eq!(client.push(request).await.unwrap().sequence, 1);
         let request = FetchRequest {
-            sender: Bytes::from_static(&[1; 32]),
-            recipient: Bytes::from_static(&[2; 32]),
+            sender: Bytes::copy_from_slice(&alice_pk),
+            recipient: Bytes::copy_from_slice(&bob_pk),
             after: 0,
             limit: 0,
             delivered: vec![],
@@ -1083,6 +1018,20 @@ mod test {
             ) -> storage::Result<Option<storage::ClaimedPqBundle>> {
                 storage::PqHandshakeStore::claim_bundle(&*self.0, id, suites).await
             }
+            async fn claim_bundle_checked(
+                &self,
+                id: &x3dh::PublicKey,
+                suites: &[u8],
+                reject_pq_on_manifest: bool,
+            ) -> storage::Result<storage::ClaimOutcome> {
+                storage::PqHandshakeStore::claim_bundle_checked(
+                    &*self.0,
+                    id,
+                    suites,
+                    reject_pq_on_manifest,
+                )
+                .await
+            }
             async fn add_initial_message_v2(
                 &self,
                 m: storage::StoredInitialMessageV2,
@@ -1143,6 +1092,16 @@ mod test {
             ) -> storage::Result<Vec<storage::StoredMessage>> {
                 storage::IdempotentMailboxStore::read(&*self.0, s, r, a, l).await
             }
+            async fn read_bounded(
+                &self,
+                s: &x3dh::PublicKey,
+                r: &x3dh::PublicKey,
+                a: u64,
+                l: u32,
+                max_size: usize,
+            ) -> storage::Result<Vec<storage::StoredMessage>> {
+                storage::IdempotentMailboxStore::read_bounded(&*self.0, s, r, a, l, max_size).await
+            }
         }
 
         struct InProcessV2 {
@@ -1196,6 +1155,8 @@ mod test {
                 &sign_pq_spk(&bob, PqSuite::MlKem1024, &[0x99; 1568]).unwrap(),
             ),
         };
+        let bob_spk = crate::test_public_key(0x11);
+        let bob_opk = crate::test_public_key(0x22);
         let mut manifest = CapabilityManifest {
             audience: "connect.test".into(),
             identity_key: Bytes::new(),
@@ -1207,7 +1168,7 @@ mod test {
             strict_pq: false,
             pq_ratchet_supported: true,
             offered_suites: vec![1],
-            signed_prekey: Bytes::from_static(&[0x11; 32]),
+            signed_prekey: Bytes::copy_from_slice(&bob_spk),
             pq_last_resort: vec![PqLastResortCommitment {
                 suite: 1,
                 prekey_id: Bytes::copy_from_slice(&id),
@@ -1219,8 +1180,8 @@ mod test {
         let pub_req = PublishV2Request::sign(
             &bob,
             manifest.clone(),
-            Some(bob.sign([0x11; 32])),
-            &[[0x22; 32]],
+            Some(bob.sign(bob_spk)),
+            &[bob_opk],
             vec![lr],
             vec![],
             now,
@@ -1361,12 +1322,13 @@ mod test {
             })
             .await
             .unwrap();
+        let chunk_payload = b"encrypted-chunk-0";
         client
             .put_chunk(PutChunkRequest {
                 id: started.id.clone(),
                 upload_token: started.upload_token.clone(),
                 index: 0,
-                data: Bytes::from_static(b"chunk-0"),
+                data: Bytes::from_static(chunk_payload),
             })
             .await
             .unwrap();
@@ -1378,10 +1340,10 @@ mod test {
             .await
             .unwrap();
         assert!(got.uploaded);
-        assert_eq!(got.data, Bytes::from_static(b"chunk-0"));
+        assert_eq!(got.data, Bytes::from_static(chunk_payload));
         client
             .delete_attachment(DeleteAttachmentRequest {
-                id: started.id,
+                id: started.id.clone(),
                 token: delete_token,
             })
             .await

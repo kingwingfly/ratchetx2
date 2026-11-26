@@ -1,13 +1,13 @@
 [package]
 name = "e2ee_chat_web"
 version = "0.3.0"
-edition = "2024"
+edition.workspace = true
 publish = false
 description = "The E2EE chat's web client, in Leptos."
 keywords = ["E2EE", "double-ratchet", "xeddsa", "XEdDSA", "signal"]
-license = "MIT"
-authors = ["Louis <836250617@qq.com>"]
-repository = "https://github.com/kingwingfly/ratchetx2"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 
 [features]
 default = ["pq"]
@@ -16,33 +16,41 @@ ml-kem-768 = ["session/ml-kem-768", "party/ml-kem-768"]
 pq = ["ml-kem-1024", "ml-kem-768", "session/pq", "party/pq"]
 
 [dependencies]
-aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
+aes-gcm.workspace = true
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
-base64 = "0.23"
-bytes = "1"
-console_error_panic_hook = "0.1"
+base64.workspace = true
+bytes.workspace = true
+console_error_panic_hook.workspace = true
 # File previews: CSV tables, tar.gz listings, Markdown, maths in it as MathML, and ZIP listings.
+crc32fast = "1"
 csv = "1.4"
+data-url = "0.3"
 # Which of the previews' workers highlights what; the workers themselves are its binaries.
 e2ee_chat_preview = { path = "../e2ee_chat_preview", features = ["rpc"] }
 flate2 = "1.1"
-futures = "0.3"
-getrandom = { version = "0.4", features = ["wasm_js"] }
+form_urlencoded = "1"
+futures-channel = "0.3"
+futures-util = { workspace = true, features = ["std"] }
+getrandom = { workspace = true, features = ["wasm_js"] }
 idb = "0.6"
-js-sys = "0.3"
+js-sys.workspace = true
 leptos = { version = "0.8", features = ["csr"] }
 party = { path = "../party" }
-prost = "0.14"
+percent-encoding = "2"
+prost.workspace = true
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 pulldown-latex = "0.8"
+scopeguard = "1"
 # `prost`: the vault keeps the states as protobuf messages.
 session = { path = "../session", features = ["connect", "prost"] }
-serde_json = "1"
-sha2 = "0.11"
+serde_json.workspace = true
+sha2.workspace = true
 tar = { version = "0.4", default-features = false }
-wasm-bindgen = "0.2"
+unicode-general-category = "1"
+url = { workspace = true, default-features = true }
+wasm-bindgen.workspace = true
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
+web-sys = { workspace = true, features = [
     "AbortController",
     "AbortSignal",
     "BinaryType",
@@ -85,8 +93,11 @@ web-sys = { version = "0.3", features = [
     "PopStateEvent",
     "ProgressEvent",
     "Range",
+    "ResizeObserver",
+    "ResizeObserverEntry",
     "ServiceWorker",
     "ServiceWorkerContainer",
+    "Storage",
     "TreeWalker",
     "Url",
     "WebSocket",
@@ -97,5 +108,8 @@ web-sys = { version = "0.3", features = [
     "XmlHttpRequestResponseType",
     "XmlHttpRequestUpload",
 ] }
-zeroize = "1.9"
+zeroize.workspace = true
 zip = { version = "9.8", default-features = false }
+
+[dev-dependencies]
+futures.workspace = true

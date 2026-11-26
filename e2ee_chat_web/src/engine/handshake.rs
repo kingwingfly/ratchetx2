@@ -14,7 +14,8 @@ use crate::util::{describe, key_from_text, now, short};
 use crate::vault::{
     CLASSICAL_APPROVAL_NONE, CarriedDeferredTimestamp, ContactState, DeferredInitial, Farewell,
     GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
-    HistoryEntry, IndexRange, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SealedEvents, history_key,
+    HistoryEntry, IndexRange, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE,
+    SealedEvents, history_key,
 };
 use leptos::prelude::*;
 use prost::Message as _;
@@ -235,6 +236,28 @@ pub(super) fn record_carried_timestamps(
     }
 }
 
+/// Backfill missing or zero retention timestamps for every restored contact's
+/// `pending_carried_initials` on unlock so old signed prekeys cannot stay pinned indefinitely.
+/// Returns `true` if `timestamps` was modified.
+pub(super) fn backfill_carried_timestamps_for_contacts<'a>(
+    timestamps: &mut Vec<CarriedDeferredTimestamp>,
+    contacts: impl IntoIterator<Item = &'a Contact>,
+    now_ms: u64,
+) -> bool {
+    let before = timestamps.len();
+    let mut modified = false;
+    for entry in timestamps.iter_mut() {
+        if entry.deferred_at == 0 && now_ms != 0 {
+            entry.deferred_at = now_ms;
+            modified = true;
+        }
+    }
+    for contact in contacts {
+        record_carried_timestamps(timestamps, &contact.state.pending_carried_initials, now_ms);
+    }
+    modified || timestamps.len() != before
+}
+
 /// Prune `carried_deferred_timestamps` entries whose signed prekeys are no longer referenced by
 /// any contact's `pending_carried_initials`. Returns how many entries were removed.
 pub(super) fn prune_carried_timestamps_for_contacts<'a>(
@@ -398,6 +421,7 @@ impl<V: HistoryStore> Inner<V> {
         self.state.used_one_time_prekeys = 0;
         self.state.needs_publish = false;
         self.state.pending_pq_rollback = None;
+        self.pending_pq_contact_flags.clear();
         self.save_state().await
     }
 
@@ -600,7 +624,6 @@ impl Engine {
         &self,
         inner: &mut Inner<impl HistoryStore>,
         inbox: ListedInitialMessages,
-        open_peer: Option<PublicKey>,
         batch: &mut InitialBatch,
     ) {
         for message in inbox.messages {
@@ -616,8 +639,7 @@ impl Engine {
             {
                 continue;
             }
-            let read = open_peer == Some(peer);
-            match self.process_initial(inner, &peer, &message, read, batch) {
+            match self.process_initial(inner, &peer, &message, batch) {
                 InitialOutcome::Ack => {
                     batch.dirty |= stage_inbox_ack(&mut inner.state.pending_inbox_acks, id);
                 }
@@ -660,7 +682,7 @@ impl Engine {
         let mut batch = InitialBatch::default();
         // Defer read receipts until `save_initial_batch` confirms the chat is still open and
         // visible after persistence.
-        self.process_inbox_messages(inner, inbox, None, &mut batch);
+        self.process_inbox_messages(inner, inbox, &mut batch);
         if !batch.dirty {
             return Ok(false);
         }
@@ -679,7 +701,6 @@ impl Engine {
     pub(super) async fn replay_deferred_initials(
         &self,
         inner: &mut Inner<impl HistoryStore>,
-        open_peer: Option<PublicKey>,
     ) -> Result<Option<BTreeSet<PublicKey>>, String> {
         let mut batch = InitialBatch::default();
         let (pruned, modified) = sanitize_deferred_initials(&mut inner.deferred_initials, now());
@@ -717,13 +738,8 @@ impl Engine {
             match decoded {
                 Ok(message) => {
                     let peer = message.sender;
-                    if self.process_initial(
-                        inner,
-                        &peer,
-                        &message,
-                        open_peer == Some(peer),
-                        &mut batch,
-                    ) == InitialOutcome::DeferUnsupportedSuite
+                    if self.process_initial(inner, &peer, &message, &mut batch)
+                        == InitialOutcome::DeferUnsupportedSuite
                     {
                         inner.deferred_initials.push(entry);
                         continue;
@@ -769,7 +785,7 @@ impl Engine {
             };
             let mut batch = InitialBatch::default();
             if let Some(message) = Incoming::decode_carried(bytes) {
-                if self.process_initial(inner, peer, &message, false, &mut batch)
+                if self.process_initial(inner, peer, &message, &mut batch)
                     == InitialOutcome::DeferUnsupportedSuite
                 {
                     inner.contacts[index].deferred_carried += 1;
@@ -813,7 +829,6 @@ impl Engine {
         inner: &mut Inner<impl HistoryStore>,
         peer: &PublicKey,
         message: &Incoming,
-        read: bool,
         batch: &mut InitialBatch,
     ) -> InitialOutcome {
         if *peer == inner.client.identity_key() {
@@ -1017,7 +1032,8 @@ impl Engine {
                 }
             }
         }
-        let (index, entry) = match contact.add_received(content, read) {
+        // Defer read receipts until `save_initial_batch` confirms the chat is open and visible.
+        let (index, entry) = match contact.add_received(content, false) {
             Ok(record) => record,
             Err(reason) => {
                 self.ui.log(format!(
@@ -1195,7 +1211,24 @@ impl Engine {
                     Ok(()) => {
                         inner.state.needs_publish = rollback.previous_needs_publish;
                         inner.state.pending_pq_rollback = None;
+                        let restored_flags = std::mem::take(&mut inner.pending_pq_contact_flags);
+                        for (peer, (prev_alert, prev_approval)) in restored_flags {
+                            if let Some(contact) = inner.contact(&peer) {
+                                if let Some(alert) = prev_alert
+                                    && contact.state.security_alert == SECURITY_ALERT_NONE
+                                {
+                                    contact.state.security_alert = alert;
+                                }
+                                if let Some(approval) = prev_approval
+                                    && contact.state.classical_approval_needed
+                                        == CLASSICAL_APPROVAL_NONE
+                                {
+                                    contact.state.classical_approval_needed = approval;
+                                }
+                            }
+                        }
                         self.ui.me.set(Some(inner.me()));
+                        self.ui.contacts.set(inner.views());
                         self.ui.log("The server refused the pending post-quantum settings. Restored the previous settings.");
                     }
                     Err(e) => {
@@ -1434,6 +1467,7 @@ impl Engine {
         submission_id: u64,
         key: &str,
         name: String,
+        server: Option<&str>,
         pin_pq: bool,
         allow_classical: bool,
     ) -> Result<PublicKey, StartChatError> {
@@ -1447,6 +1481,9 @@ impl Engine {
         let inner = guard
             .as_mut()
             .ok_or_else(|| StartChatError::Other("locked".into()))?;
+        // Validate any invitation relay URL BEFORE any contact lookup or mutation so a foreign
+        // invitation can never rename, accept, or mutate an existing local contact.
+        validate_start_chat_server(server, &inner.server)?;
         inner.check_outgoing_peer(&peer)?;
         if allow_classical
             && super::settings::check_classical_approval(inner.client.pq_config()).is_err()
@@ -1511,14 +1548,8 @@ impl Engine {
             return Ok(peer);
         }
 
-        struct InFlightGuard<'a>(&'a Engine);
-        impl Drop for InFlightGuard<'_> {
-            fn drop(&mut self) {
-                self.0.in_flight_start_chat.set(None);
-            }
-        }
         self.in_flight_start_chat.set(Some((submission_id, false)));
-        let _in_flight = InFlightGuard(self);
+        let _in_flight = scopeguard::guard((), |()| self.in_flight_start_chat.set(None));
 
         let mut peer_state = PeerPqState::default();
         if pin_pq {
@@ -1751,33 +1782,8 @@ impl Engine {
             state.contacts.retain(|contact| contact.peer != *peer);
             state.farewells = saved_farewells.clone();
             let deferred = inner.deferred_record();
-            let unsaved = inner
-                .unsaved
-                .iter()
-                .filter(|(unsaved, _)| unsaved != peer)
-                .map(|(_, record)| record);
-            let unsaved_outbox = inner
-                .unsaved_outbox
-                .iter()
-                .filter(|(unsaved, _)| unsaved != peer)
-                .map(|(_, record)| record);
-            match inner
-                .vault
-                .forget(&state, &deferred, peer, unsaved, unsaved_outbox)
-                .await
-            {
+            match inner.forget_peer(peer, state, deferred).await {
                 Ok(()) => {
-                    inner.contacts.retain(|contact| contact.peer != *peer);
-                    inner.state.farewells = saved_farewells;
-                    inner.finish_state_save(state.pending_inbox_acks);
-                    inner.saved_late.extend(
-                        inner
-                            .unsaved
-                            .drain(..)
-                            .map(|(unsaved, _)| unsaved)
-                            .filter(|unsaved| unsaved != peer),
-                    );
-                    inner.unsaved_outbox.clear();
                     self.ui.contacts.set(inner.views());
                     return;
                 }
@@ -1800,6 +1806,26 @@ impl Engine {
             ));
         }
     }
+}
+
+/// Validate an optional invitation `invited_server` against this vault's `local_server`:
+/// rejects invalid relay URLs and foreign relays before any contact lookup or mutation.
+pub(super) fn validate_start_chat_server(
+    invited_server: Option<&str>,
+    local_server: &str,
+) -> Result<(), StartChatError> {
+    let Some(raw) = invited_server.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let canonical = crate::util::validate_relay_url(raw).map_err(|reason| {
+        StartChatError::Other(format!("Invalid invitation server address: {reason}."))
+    })?;
+    if !same_server(&canonical, local_server) {
+        return Err(StartChatError::Other(format!(
+            "This invitation is for a different server ({canonical}); you cannot start it on this server."
+        )));
+    }
+    Ok(())
 }
 
 /// Extract `(counts_unread, readable_clock)` for a newly received `HistoryEntry` so display-time

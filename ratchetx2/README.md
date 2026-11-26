@@ -43,7 +43,7 @@ assert_eq!(bob.step_message_ratchet_sender(), None);
 
 // Alice sends first
 bob.step_dh_root(&alice.public_key()).unwrap();
-assert_eq!(alice, bob); // Alice and Bob have the "same" state
+assert!(alice.is_paired_with(&bob)); // Alice and Bob hold complementary paired states
 // The receiver steps to the same message keys as the sender.
 for _ in 0..2 {
     let message_key = alice.step_message_ratchet_sender().unwrap();
@@ -53,7 +53,7 @@ for _ in 0..2 {
 // Bob sends
 bob.step_dh_root(&alice.public_key()).unwrap();
 alice.step_dh_root(&bob.public_key()).unwrap();
-assert_eq!(alice, bob);
+assert!(alice.is_paired_with(&bob));
 for _ in 0..2 {
     let message_key = bob.step_message_ratchet_sender().unwrap();
     assert_eq!(message_key, alice.step_message_ratchet_receiver().unwrap());
@@ -62,7 +62,7 @@ for _ in 0..2 {
 // Alice sends
 alice.step_dh_root(&bob.public_key()).unwrap();
 bob.step_dh_root(&alice.public_key()).unwrap();
-assert_eq!(alice, bob);
+assert!(alice.is_paired_with(&bob));
 for _ in 0..2 {
     let message_key = alice.step_message_ratchet_sender().unwrap();
     assert_eq!(message_key, bob.step_message_ratchet_receiver().unwrap());

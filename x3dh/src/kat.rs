@@ -193,10 +193,10 @@ fn check_transcript(v: &Vector) {
     local.generations.push_back(Generation {
         signed_prekey: spk.to_bytes(),
         signed_secret: signed,
-        one_time: HashMap::from([(opk.to_bytes(), one_time)]),
-        confirmed: HashSet::new(),
+        one_time: BTreeMap::from([(opk.to_bytes(), one_time)]),
+        confirmed: BTreeSet::new(),
         pq_last_resort: BTreeMap::new(),
-        pq_one_time: HashMap::from([(
+        pq_one_time: BTreeMap::from([(
             id,
             PqPrekeySecret {
                 suite: v.suite,

@@ -8,7 +8,7 @@ mod store;
 
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use prost::bytes::Bytes;
 use protocol::{
     ErrorKind,
@@ -43,29 +43,124 @@ pub(crate) const BUCKET: &str = "BUCKET";
 /// The largest request body: the largest message, 4 MiB - 64 KiB, with room for the rest of a
 /// push.
 const MAX_BODY: usize = 4 << 20;
+/// Cap on speculative `Vec::with_capacity` from an untrusted `Content-Length` header.
+const MAX_PREALLOC_BODY: usize = 64 << 10;
 
-/// Per-procedure request body caps for attachment routes so small RPCs never buffer multi-MiB bodies.
-fn max_body_attachment(procedure: AttachmentProcedure) -> usize {
-    match procedure {
-        AttachmentProcedure::StartUpload
-        | AttachmentProcedure::GetChunk
-        | AttachmentProcedure::DeleteAttachment => 4 << 10,
-        AttachmentProcedure::PutChunk => (2 << 20) + (4 << 10),
+/// Unified Connect RPC procedure abstraction shared by [`ProcedureV2`] and [`AttachmentProcedure`].
+trait Procedure: Copy {
+    fn max_body(self) -> usize;
+    fn requires_sign_in(self) -> bool;
+    fn disabled_without_pq(self) -> bool {
+        false
+    }
+    async fn dispatch(
+        self,
+        env: &Env,
+        request: &Request,
+        content_type: Option<&str>,
+        body: &Bytes,
+        pq_enabled: bool,
+    ) -> Result<connect::Response>;
+}
+
+impl Procedure for AttachmentProcedure {
+    fn max_body(self) -> usize {
+        match self {
+            AttachmentProcedure::StartUpload
+            | AttachmentProcedure::GetChunk
+            | AttachmentProcedure::DeleteAttachment => 4 << 10,
+            AttachmentProcedure::PutChunk => (2 << 20) + (4 << 10),
+        }
+    }
+
+    fn requires_sign_in(self) -> bool {
+        matches!(
+            self,
+            AttachmentProcedure::StartUpload | AttachmentProcedure::PutChunk
+        )
+    }
+
+    async fn dispatch(
+        self,
+        env: &Env,
+        _request: &Request,
+        content_type: Option<&str>,
+        body: &Bytes,
+        _pq_enabled: bool,
+    ) -> Result<connect::Response> {
+        let limits = MailboxLimits::default();
+        let store = Store::new(env, limits.max_message_size)?;
+        let retention = period(
+            env,
+            "FILE_RETENTION_DAYS",
+            objects::DEFAULT_FILE_RETENTION_DAYS,
+        );
+        let attachments = AttachmentServer::builder(store)
+            .limits(AttachmentLimits {
+                retention: Some(retention),
+                ..AttachmentLimits::default()
+            })
+            .build()
+            .map_err(|_| worker::Error::RustError("invalid attachment server limits".into()))?;
+        Ok(connect::handle_attachments(&attachments, self, content_type, body).await)
     }
 }
 
-/// Per-procedure request body caps for v2 routes so small RPCs never buffer multi-MiB bodies.
-fn max_body_v2(procedure: ProcedureV2) -> usize {
-    match procedure {
-        ProcedureV2::GetServerInfo
-        | ProcedureV2::GetManifest
-        | ProcedureV2::ClaimBundle
-        | ProcedureV2::ListInitialMessages => 4 << 10,
-        ProcedureV2::AckInitialMessages => 8 << 10,
-        ProcedureV2::SendInitialV2 => 16 << 10,
-        ProcedureV2::FetchSigned => 32 << 10,
-        ProcedureV2::PublishV2 | ProcedureV2::RefillPrekeys => 256 << 10,
-        ProcedureV2::PushV2 => MAX_BODY,
+impl Procedure for ProcedureV2 {
+    fn max_body(self) -> usize {
+        match self {
+            ProcedureV2::GetServerInfo
+            | ProcedureV2::GetManifest
+            | ProcedureV2::ClaimBundle
+            | ProcedureV2::ListInitialMessages => 4 << 10,
+            ProcedureV2::AckInitialMessages => 8 << 10,
+            ProcedureV2::SendInitialV2 => 16 << 10,
+            ProcedureV2::FetchSigned => 32 << 10,
+            ProcedureV2::PublishV2 | ProcedureV2::RefillPrekeys => 256 << 10,
+            ProcedureV2::PushV2 => MAX_BODY,
+        }
+    }
+
+    fn requires_sign_in(self) -> bool {
+        matches!(
+            self,
+            ProcedureV2::PublishV2
+                | ProcedureV2::RefillPrekeys
+                | ProcedureV2::ClaimBundle
+                | ProcedureV2::SendInitialV2
+                | ProcedureV2::PushV2
+        )
+    }
+
+    /// V2 procedures completely disabled when `PQ_ENABLED="false"` without inspecting the request
+    /// body. Other v2 procedures enforce fine-grained rollback rules inside `HandshakeV2Server` /
+    /// `MailboxV2Server` so existing PQ users can drain in-flight handshakes and publish signed
+    /// OFF manifests.
+    fn disabled_without_pq(self) -> bool {
+        matches!(self, ProcedureV2::GetManifest)
+    }
+
+    async fn dispatch(
+        self,
+        env: &Env,
+        request: &Request,
+        content_type: Option<&str>,
+        body: &Bytes,
+        pq_enabled: bool,
+    ) -> Result<connect::Response> {
+        let server_id = server_id(env, request)?;
+        let limits = MailboxLimits::default();
+        let store = Store::new(env, limits.max_message_size)?;
+        let info = server_info_config(server_id.clone(), pq_enabled);
+        let supported_suites = info.supported_suites.clone();
+        let handshake = HandshakeV2Server::new(store.clone(), info);
+        let mailbox = MailboxV2Server::builder(store)
+            .server_id(server_id)
+            .supported_suites(supported_suites)
+            .allow_pq_drain(true)
+            .limits(limits)
+            .build();
+        Ok(connect::handle_v2(&handshake, &mailbox, self, content_type, body).await)
     }
 }
 
@@ -114,17 +209,60 @@ fn parse_subscribe_query(url: &worker::Url) -> SubscribeQuery {
     }
 }
 
+#[cfg(any(test, feature = "conformance"))]
+fn extract_conformance_token<'a>(
+    authorization: Option<&'a str>,
+    explicit_header: Option<&'a str>,
+) -> Option<&'a str> {
+    if let Some(token) = explicit_header.map(str::trim).filter(|t| !t.is_empty()) {
+        return Some(token);
+    }
+    let auth = authorization?.trim();
+    let (scheme, token) = auth.split_once(' ')?;
+    if scheme.eq_ignore_ascii_case("bearer") {
+        let token = token.trim();
+        (!token.is_empty()).then_some(token)
+    } else {
+        None
+    }
+}
+
+/// Requires either a valid sign-in cookie OR a matching `CONFORMANCE_TOKEN` secret.
+/// Fails closed if neither is satisfied.
+#[cfg(any(test, feature = "conformance"))]
+fn conformance_authorized(
+    expected_token: Option<&str>,
+    presented_token: Option<&str>,
+    signed_in: bool,
+) -> bool {
+    if signed_in {
+        return true;
+    }
+    match (expected_token, presented_token) {
+        (Some(expected), Some(presented)) => auth::constant_time_secret_eq(expected, presented),
+        _ => false,
+    }
+}
+
 /// Answers the Connect calls; the web client's files are served before the Worker runs.
 #[event(fetch)]
 async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response> {
     #[cfg(feature = "conformance")]
     if request.path() == "/conformance" && request.method() == Method::Post {
+        let expected_token = auth::secret(&env, "CONFORMANCE_TOKEN");
+        let auth_header = request.headers().get("authorization")?;
+        let token_header = request.headers().get("x-conformance-token")?;
+        let presented = extract_conformance_token(auth_header.as_deref(), token_header.as_deref());
+        let is_signed_in = auth::signed_in(&request, &env).is_some();
+        if !conformance_authorized(expected_token.as_deref(), presented, is_signed_in) {
+            return with_security_headers(Response::error("unauthorized", 403)?);
+        }
         // A failure panics, which fails the request.
         let store = Store::new(&env, MailboxLimits::default().max_message_size)?;
         storage::testing::attachment_store(&store).await;
         storage::testing::pq_handshake_store(&store).await;
         storage::testing::idempotent_mailbox_store(&store).await;
-        return Response::ok("the storage conformance suites passed");
+        return with_security_headers(Response::ok("the storage conformance suites passed")?);
     }
     if request.path() == NOTIFICATIONS_PATH {
         return subscribe(request, &env).await;
@@ -144,8 +282,10 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
     let response = match resolve_route(&path) {
         Some(route) => match request.method() {
             Method::Post => match route {
-                Route::V2(procedure) => call_v2(request, &env, procedure).await?,
-                Route::Attachment(procedure) => call_attachment(request, &env, procedure).await?,
+                Route::V2(procedure) => call_connect(request, &env, procedure, pq_enabled).await?,
+                Route::Attachment(procedure) => {
+                    call_connect(request, &env, procedure, pq_enabled).await?
+                }
                 Route::LegacyV1Deprecated => {
                     let mut response = respond(legacy_v1_connect_error())?;
                     response
@@ -172,55 +312,20 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
     with_cors(response, pq_enabled)
 }
 
-async fn call_attachment(
+async fn call_connect<P: Procedure>(
     mut request: Request,
     env: &Env,
-    procedure: AttachmentProcedure,
+    procedure: P,
+    pq_enabled: bool,
 ) -> Result<Response> {
-    // Check sign-in BEFORE buffering the request body!
-    if writes_attachment(procedure) && auth::signed_in(&request, env).is_none() {
-        let message = "sign in to this server to use it";
-        return respond(connect::error(ErrorKind::SignInRequired, message));
-    }
-    let content_type = request.headers().get("content-type")?;
-    if let Some(response) = connect::check_content_type(content_type.as_deref()) {
-        return respond(response);
-    }
-    let limits = MailboxLimits::default();
-    let response = match read_body(&mut request, max_body_attachment(procedure)).await? {
-        Some(body) => {
-            let body = Bytes::from(body);
-            let store = Store::new(env, limits.max_message_size)?;
-            let retention = period(
-                env,
-                "FILE_RETENTION_DAYS",
-                objects::DEFAULT_FILE_RETENTION_DAYS,
-            );
-            let attachments = AttachmentServer::builder(store)
-                .limits(AttachmentLimits {
-                    retention: Some(retention),
-                    ..AttachmentLimits::default()
-                })
-                .build()
-                .map_err(|e| worker::Error::RustError(e.to_string()))?;
-            connect::handle_attachments(&attachments, procedure, content_type.as_deref(), &body)
-                .await
-        }
-        None => connect::error(ErrorKind::LimitExceeded, "request too large"),
-    };
-    respond(response)
-}
-
-async fn call_v2(mut request: Request, env: &Env, procedure: ProcedureV2) -> Result<Response> {
-    let pq_enabled = pq_runtime_enabled(env);
-    if !pq_enabled && is_pq_only_v2(procedure) {
+    if !pq_enabled && procedure.disabled_without_pq() {
         return respond(connect::error(
             ErrorKind::Unimplemented,
             "post-quantum routes are disabled",
         ));
     }
     // Check sign-in BEFORE buffering the request body!
-    if writes_v2(procedure) && auth::signed_in(&request, env).is_none() {
+    if procedure.requires_sign_in() && auth::signed_in(&request, env).is_none() {
         let message = "sign in to this server to use it";
         return respond(connect::error(ErrorKind::SignInRequired, message));
     }
@@ -228,29 +333,12 @@ async fn call_v2(mut request: Request, env: &Env, procedure: ProcedureV2) -> Res
     if let Some(response) = connect::check_content_type(content_type.as_deref()) {
         return respond(response);
     }
-    let server_id = server_id(env, &request)?;
-    let limits = MailboxLimits::default();
-    let response = match read_body(&mut request, max_body_v2(procedure)).await? {
+    let response = match read_body(&mut request, procedure.max_body()).await? {
         Some(body) => {
             let body = Bytes::from(body);
-            let store = Store::new(env, limits.max_message_size)?;
-            let info = server_info_config(server_id.clone(), pq_enabled);
-            let supported_suites = info.supported_suites.clone();
-            let handshake = HandshakeV2Server::new(store.clone(), info);
-            let mailbox = MailboxV2Server::builder(store)
-                .server_id(server_id)
-                .supported_suites(supported_suites)
-                .allow_pq_drain(true)
-                .limits(limits)
-                .build();
-            connect::handle_v2(
-                &handshake,
-                &mailbox,
-                procedure,
-                content_type.as_deref(),
-                &body,
-            )
-            .await
+            procedure
+                .dispatch(env, &request, content_type.as_deref(), &body, pq_enabled)
+                .await?
         }
         None => connect::error(ErrorKind::LimitExceeded, "request too large"),
     };
@@ -269,12 +357,12 @@ fn server_info_config(server_id: String, pq_enabled: bool) -> ServerInfoConfig {
     info
 }
 
-/// Adds `Date`, `x-e2ee-pq`, and Connect CORS headers (exposing `x-e2ee-deprecated`).
+/// Adds `Date`, `x-e2ee-pq`, security headers, and Connect CORS headers.
 fn with_cors(response: Response, pq_enabled: bool) -> Result<Response> {
     with_metadata(response, pq_enabled)?.with_cors(&cors_policy([Method::Post, Method::Options]))
 }
 
-/// Adds `Date`, `x-e2ee-pq`, and `/notifications` CORS headers (exposing `x-e2ee-deprecated`).
+/// Adds `Date`, `x-e2ee-pq`, security headers, and `/notifications` CORS headers.
 fn with_notifications_cors(response: Response, pq_enabled: bool) -> Result<Response> {
     with_metadata(response, pq_enabled)?.with_cors(&cors_policy([Method::Get, Method::Options]))
 }
@@ -288,14 +376,23 @@ fn cors_policy(methods: impl IntoIterator<Item = Method>) -> Cors {
         .with_max_age(86400)
 }
 
-/// Adds `Date` and `x-e2ee-pq` response headers.
+/// Adds defensive security headers to Worker-generated responses.
+fn with_security_headers(mut response: Response) -> Result<Response> {
+    let headers = response.headers_mut();
+    headers.set("x-content-type-options", "nosniff")?;
+    headers.set("cache-control", "no-store")?;
+    headers.set("referrer-policy", "no-referrer")?;
+    Ok(response)
+}
+
+/// Adds `Date`, `x-e2ee-pq`, and defensive security response headers.
 fn with_metadata(mut response: Response, pq_enabled: bool) -> Result<Response> {
     let now = worker::js_sys::Date::new_0().to_utc_string();
     response.headers_mut().set("date", &String::from(now))?;
     response
         .headers_mut()
         .set(PQ_HEADER, if pq_enabled { "1" } else { "0" })?;
-    Ok(response)
+    with_security_headers(response)
 }
 
 /// The HTTP response of a Connect call's `response`.
@@ -305,35 +402,6 @@ fn respond(response: connect::Response) -> Result<Response> {
     Ok(Response::from_bytes(response.body)?
         .with_status(response.status)
         .with_headers(headers))
-}
-
-/// Whether calls to attachment `procedure` require sign-in.
-fn writes_attachment(procedure: AttachmentProcedure) -> bool {
-    matches!(
-        procedure,
-        AttachmentProcedure::StartUpload | AttachmentProcedure::PutChunk
-    )
-}
-
-/// Whether calls to v2 `procedure` write or consume prekeys, requiring sign-in.
-fn writes_v2(procedure: ProcedureV2) -> bool {
-    matches!(
-        procedure,
-        ProcedureV2::PublishV2
-            | ProcedureV2::RefillPrekeys
-            | ProcedureV2::ClaimBundle
-            | ProcedureV2::SendInitialV2
-            | ProcedureV2::PushV2
-    )
-}
-
-/// V2 procedures that are completely disabled when `PQ_ENABLED="false"` without inspecting the
-/// request body. Other v2 procedures (`PublishV2`, `RefillPrekeys`, `ClaimBundle`,
-/// `SendInitialV2`, `ListInitialMessages`, `AckInitialMessages`, `PushV2`, `FetchSigned`) enforce
-/// fine-grained `PQ_ENABLED="false"` rollback rules inside `HandshakeV2Server` / `MailboxV2Server`
-/// so existing PQ users can drain in-flight handshakes and publish signed OFF manifests.
-fn is_pq_only_v2(procedure: ProcedureV2) -> bool {
-    matches!(procedure, ProcedureV2::GetManifest)
 }
 
 /// Whether post-quantum suites and manifest reads are enabled at runtime (`PQ_ENABLED`).
@@ -408,6 +476,7 @@ fn is_internal_subscribe_header(name: &str) -> bool {
         objects::HEADER_DEPLOYMENT_AUTH,
         objects::HEADER_PENDING_IDENTITY,
         objects::HEADER_SUBSCRIBE_AUDIENCE,
+        objects::HEADER_SESSION_EXPIRES,
         objects::HEADER_SUBSCRIBE_SIG,
         objects::HEADER_SUBSCRIBE_TS,
     ]
@@ -415,13 +484,14 @@ fn is_internal_subscribe_header(name: &str) -> bool {
     .any(|header| name.eq_ignore_ascii_case(header))
 }
 
-/// Strip all 5 historical internal subscribe headers case-insensitively and append the trusted
-/// Worker-computed auth, pending identity, and canonical audience headers for forwarding to the
-/// Identity Durable Object (safe across rolling deploys with older DO instances).
+/// Strip all internal subscribe headers case-insensitively and append the trusted Worker-computed
+/// auth, pending identity, canonical audience, and optional session expiry headers for forwarding
+/// to the Identity Durable Object.
 fn forwarded_subscribe_headers<'a>(
     incoming: impl IntoIterator<Item = (&'a str, &'a str)>,
     identity_key: &[u8; 32],
     audience: &str,
+    session_expires: Option<u64>,
 ) -> Vec<(String, String)> {
     let mut forwarded: Vec<(String, String)> = incoming
         .into_iter()
@@ -437,11 +507,13 @@ fn forwarded_subscribe_headers<'a>(
         objects::HEADER_SUBSCRIBE_AUDIENCE.to_owned(),
         audience.to_owned(),
     ));
+    if let Some(expires) = session_expires {
+        forwarded.push((
+            objects::HEADER_SESSION_EXPIRES.to_owned(),
+            expires.to_string(),
+        ));
+    }
     forwarded
-}
-
-fn deployment_auth_satisfied(password_configured: bool, signed_in: bool) -> bool {
-    !password_configured || signed_in
 }
 
 /// Hand a WebSocket asking for an identity's notifications to its object.
@@ -476,38 +548,47 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         SubscribeQuery::Missing => {
             let upgrade = request.headers().get("upgrade")?;
             if !upgrade.is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket")) {
-                return Response::error("expected a WebSocket", 426);
+                return with_security_headers(Response::error("expected a WebSocket", 426)?);
             }
-            return Response::error("malformed subscription", 400);
+            return with_security_headers(Response::error("malformed subscription", 400)?);
         }
     };
     let upgrade = request.headers().get("upgrade")?;
     if !upgrade.is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket")) {
-        return Response::error("expected a WebSocket", 426);
+        return with_security_headers(Response::error("expected a WebSocket", 426)?);
+    }
+    // Validate Origin on WebSocket upgrades whenever a browser sends one (CSWSH defense),
+    // allowing `Sec-Fetch-Site: same-origin` (e.g. `trunk serve` dev proxy) and `SERVER_ID`.
+    let origin = request.headers().get("origin")?;
+    let sec_fetch_site = request.headers().get("sec-fetch-site")?;
+    let configured_server_id = env.var("SERVER_ID").ok().map(|v| v.to_string());
+    if !auth::ws_upgrade_origin_allowed(
+        origin.as_deref(),
+        sec_fetch_site.as_deref(),
+        &url,
+        configured_server_id.as_deref(),
+    ) {
+        return with_security_headers(Response::error("cross-origin WebSocket refused", 403)?);
     }
 
     // Require a valid sign-in cookie before upgrading unauthenticated first-frame WS sockets
     // whenever server PASSWORD authentication is configured, preventing unauthenticated
     // third parties from exhausting an identity's pending WebSocket cap.
-    let deployment_authenticated = deployment_auth_satisfied(
-        auth::password_configured(env),
-        auth::signed_in(&request, env).is_some(),
-    );
-    if !deployment_authenticated {
-        return Response::error("sign in to this server to use it", 403);
+    let claims = auth::signed_in(&request, env);
+    if auth::password_configured(env) && claims.is_none() {
+        return with_security_headers(Response::error("sign in to this server to use it", 403)?);
     }
     let Some(identity_key) = crate::decode_hex_fixed::<32>(&identity_hex) else {
-        return Response::error("malformed identity", 400);
+        return with_security_headers(Response::error("malformed identity", 400)?);
     };
     if XEdDSAPublicKey::new(&identity_key).is_err() {
-        return Response::error("invalid identity key", 400);
+        return with_security_headers(Response::error("invalid identity key", 400)?);
     }
     // Validate and normalize the relay audience before forwarding to the Durable Object.
     let audience = server_id(env, &request)?;
 
-    // Clone incoming headers, stripping all 5 historical internal auth headers so a client can
-    // never spoof a retired header toward an older DO instance during rolling deploys, and attach
-    // the canonical audience header so older DO instances continue accepting v2 subscribers.
+    // Clone incoming headers, stripping all internal auth headers so a client can never spoof
+    // them toward the Durable Object.
     let incoming_headers: Vec<(String, String)> = request.headers().entries().collect();
     let forward_headers = Headers::new();
     for (name, value) in forwarded_subscribe_headers(
@@ -516,6 +597,7 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
             .map(|(k, v)| (k.as_str(), v.as_str())),
         &identity_key,
         &audience,
+        claims.map(|c| c.expires),
     ) {
         forward_headers.set(&name, &value)?;
     }
@@ -531,34 +613,64 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         .await
 }
 
-/// The body of `request`; `None` once it grows past `limit` bytes, which stops reading it, so a
-/// large body never sits in memory.
+fn parse_content_length(header: Option<&str>) -> Option<u64> {
+    header?.trim().parse::<u64>().ok()
+}
+
+fn content_length_exceeds_limit(header: Option<&str>, limit: usize) -> bool {
+    parse_content_length(header).is_some_and(|len| len > limit as u64)
+}
+
+async fn read_body_stream<S, E>(
+    stream: S,
+    limit: usize,
+    initial_capacity: usize,
+) -> std::result::Result<Option<Vec<u8>>, E>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, E>>,
+{
+    let mut stream = std::pin::pin!(stream);
+    let mut body = Vec::with_capacity(initial_capacity.min(limit).min(MAX_PREALLOC_BODY));
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
+}
+
+/// The body of `request`; `None` if `Content-Length` or the streamed bytes exceed `limit`,
+/// rejecting oversized bodies before buffering them in memory.
 pub(crate) async fn read_body(request: &mut Request, limit: usize) -> Result<Option<Vec<u8>>> {
+    let content_length = request.headers().get("content-length")?;
+    if content_length_exceeds_limit(content_length.as_deref(), limit) {
+        return Ok(None);
+    }
     if request.inner().body().is_none() {
         return Ok(Some(vec![]));
     }
-    let mut stream = request.stream()?;
-    let mut body = vec![];
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if body.len() + chunk.len() > limit {
-            return Ok(None);
-        }
-        body.extend(chunk);
-    }
-    Ok(Some(body))
+    let hint = parse_content_length(content_length.as_deref())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    let stream = request.stream()?;
+    read_body_stream(stream, limit, hint).await
+}
+
+fn period_from_str(raw: Option<&str>, default: u64) -> Duration {
+    let days = raw
+        .and_then(|days| days.trim().parse::<f64>().ok())
+        .filter(|days| days.is_finite() && *days >= 0.0)
+        .unwrap_or(default as f64);
+    Duration::try_from_secs_f64(days * 24.0 * 60.0 * 60.0).unwrap_or(Duration::MAX)
 }
 
 /// How long the variable `name` says, in days, which may be a fraction, e.g. `0.5`; `default`
 /// days unless it says a number that is not negative.
 pub(crate) fn period(env: &Env, name: &str, default: u64) -> Duration {
-    let days = env
-        .var(name)
-        .ok()
-        .and_then(|days| days.to_string().parse::<f64>().ok())
-        .filter(|days| days.is_finite() && *days >= 0.0)
-        .unwrap_or(default as f64);
-    Duration::try_from_secs_f64(days * 24.0 * 60.0 * 60.0).unwrap_or(Duration::MAX)
+    let raw = env.var(name).ok().map(|days| days.to_string());
+    period_from_str(raw.as_deref(), default)
 }
 
 /// `period` in milliseconds, as the runtime's clock counts.
@@ -567,27 +679,14 @@ pub(crate) fn millis(period: Duration) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::{
         future::Future,
         pin::pin,
         task::{Context as TaskContext, Poll, Waker},
     };
 
-    use prost::Message as _;
-    use protocol::{
-        attachment::{
-            DeleteAttachmentRequest, GetChunkRequest, GetChunkResponse, PutChunkRequest,
-            StartUploadRequest, StartUploadResponse,
-        },
-        handshake_v2::{
-            CapabilityManifest, ClaimBundleRequest, ClaimBundleResponse, GetServerInfoRequest,
-            GetServerInfoResponse, PublishV2Request, sign_manifest,
-        },
-        mailbox_v2::{FetchSignedRequest, FetchSignedResponse, PushV2Request, PushV2Response},
-    };
-    use sha2::{Digest, Sha256};
-    use storage::MemoryStore;
+    use futures_util::stream;
     use worker::Url;
     use xeddsa::XEdDSAPrivateKey;
 
@@ -603,7 +702,10 @@ mod tests {
         }
     }
 
-    fn legacy_unbound_subscribe(identity: &XEdDSAPrivateKey, timestamp: u64) -> SubscribeRequest {
+    pub(crate) fn legacy_unbound_subscribe(
+        identity: &XEdDSAPrivateKey,
+        timestamp: u64,
+    ) -> SubscribeRequest {
         let key = identity.compute_public_key().to_bytes();
         let mut msg = b"notify.v1/subscribe".to_vec();
         msg.extend_from_slice(&key);
@@ -651,8 +753,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&err.body).unwrap();
         assert_eq!(json["code"], "unimplemented");
         assert_eq!(json["message"], LEGACY_V1_CONNECT_MESSAGE);
-        assert_eq!(DEPRECATED_HEADER, "x-e2ee-deprecated");
-        assert_eq!(DEPRECATED_V1_VALUE, "v1");
     }
 
     #[test]
@@ -679,90 +779,10 @@ mod tests {
 
         let missing_url = Url::parse("https://relay.example/notifications").unwrap();
         assert_eq!(parse_subscribe_query(&missing_url), SubscribeQuery::Missing);
-        assert_eq!(
-            LEGACY_V1_NOTIFICATIONS_MESSAGE,
-            "Legacy v1 notifications are deprecated and removed. Please refresh or upgrade the app to continue."
-        );
     }
 
     #[test]
-    fn attachment_sign_in_is_required_for_upload_writes() {
-        assert!(writes_attachment(AttachmentProcedure::StartUpload));
-        assert!(writes_attachment(AttachmentProcedure::PutChunk));
-        assert!(!writes_attachment(AttachmentProcedure::GetChunk));
-        assert!(!writes_attachment(AttachmentProcedure::DeleteAttachment));
-    }
-
-    #[test]
-    fn attachment_v1_connect_handlers_round_trip() {
-        block_on(async {
-            let store = MemoryStore::default();
-            let attachments = AttachmentServer::builder(store).build().unwrap();
-
-            let delete_token = Bytes::from_static(&[0x33; 32]);
-            let delete_hash = Bytes::copy_from_slice(&Sha256::digest(&delete_token));
-            let start_req = StartUploadRequest {
-                chunks: 1,
-                delete_hash,
-            };
-            let start_resp = connect::handle_attachments(
-                &attachments,
-                AttachmentProcedure::StartUpload,
-                Some(connect::CONTENT_TYPE),
-                &start_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(start_resp.status, 200);
-            let started = StartUploadResponse::decode(start_resp.body.as_slice()).unwrap();
-
-            let payload = Bytes::from_static(b"encrypted-attachment-chunk");
-            let put_req = PutChunkRequest {
-                id: started.id.clone(),
-                index: 0,
-                data: payload.clone(),
-                upload_token: started.upload_token,
-            };
-            let put_resp = connect::handle_attachments(
-                &attachments,
-                AttachmentProcedure::PutChunk,
-                Some(connect::CONTENT_TYPE),
-                &put_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(put_resp.status, 200);
-
-            let get_req = GetChunkRequest {
-                id: started.id.clone(),
-                index: 0,
-            };
-            let get_resp = connect::handle_attachments(
-                &attachments,
-                AttachmentProcedure::GetChunk,
-                Some(connect::CONTENT_TYPE),
-                &get_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(get_resp.status, 200);
-            let got = GetChunkResponse::decode(get_resp.body.as_slice()).unwrap();
-            assert_eq!(got.data, payload);
-
-            let del_req = DeleteAttachmentRequest {
-                id: started.id,
-                token: delete_token,
-            };
-            let del_resp = connect::handle_attachments(
-                &attachments,
-                AttachmentProcedure::DeleteAttachment,
-                Some(connect::CONTENT_TYPE),
-                &del_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(del_resp.status, 200);
-        });
-    }
-
-    #[test]
-    fn pq_enabled_false_rollback_advertises_disabled_flags_and_serves_v2_classical_flow() {
+    fn server_info_config_reflects_pq_enabled_and_disables_legacy_v1() {
         let on = server_info_config("relay.example".into(), true);
         assert!(on.pq_enabled);
         assert!(!on.supported_suites.is_empty());
@@ -777,148 +797,12 @@ mod tests {
         assert!(!off.legacy_v1_enabled);
         assert!(!off.allow_unsigned_fetch);
 
-        assert!(is_pq_only_v2(ProcedureV2::GetManifest));
+        assert!(ProcedureV2::GetManifest.disabled_without_pq());
         for proc in ProcedureV2::ALL {
             if proc != ProcedureV2::GetManifest {
-                assert!(!is_pq_only_v2(proc));
+                assert!(!proc.disabled_without_pq());
             }
         }
-
-        block_on(async {
-            let server_id = "relay.example".to_string();
-            let info = server_info_config(server_id.clone(), false);
-            let handshake = HandshakeV2Server::new(MemoryStore::default(), info.clone());
-            let mailbox = MailboxV2Server::builder(MemoryStore::default())
-                .server_id(server_id.clone())
-                .supported_suites(info.supported_suites)
-                .allow_pq_drain(true)
-                .build();
-
-            let info_resp = connect::handle_v2(
-                &handshake,
-                &mailbox,
-                ProcedureV2::GetServerInfo,
-                Some(connect::CONTENT_TYPE),
-                &GetServerInfoRequest {}.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(info_resp.status, 200);
-            let server_info = GetServerInfoResponse::decode(info_resp.body.as_slice()).unwrap();
-            assert!(!server_info.pq_enabled);
-            assert!(server_info.supported_suites.is_empty());
-            assert!(!server_info.pq_ratchet_supported);
-            assert!(!server_info.legacy_v1_enabled);
-            assert!(!server_info.allow_unsigned_fetch);
-
-            // Publish signed OFF manifest while PQ_ENABLED="false".
-            let bob = XEdDSAPrivateKey::generate();
-            let alice = XEdDSAPrivateKey::generate();
-            let spk = XEdDSAPrivateKey::generate().compute_public_key().to_bytes();
-            let opk = XEdDSAPrivateKey::generate().compute_public_key().to_bytes();
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64;
-            let mut manifest = CapabilityManifest {
-                audience: server_id.clone(),
-                identity_key: Bytes::new(),
-                manifest_seq: 1,
-                generation: 1,
-                issued_at: now,
-                expires_at: now + 60_000,
-                pq_enabled: false,
-                strict_pq: false,
-                pq_ratchet_supported: false,
-                offered_suites: vec![],
-                signed_prekey: Bytes::copy_from_slice(&spk),
-                pq_last_resort: vec![],
-                signature: Bytes::new(),
-            };
-            sign_manifest(&bob, &mut manifest).unwrap();
-            let spk_sig = bob.sign(spk);
-            let publish_req =
-                PublishV2Request::sign(&bob, manifest, Some(spk_sig), &[opk], vec![], vec![], now)
-                    .unwrap();
-            let publish_resp = connect::handle_v2(
-                &handshake,
-                &mailbox,
-                ProcedureV2::PublishV2,
-                Some(connect::CONTENT_TYPE),
-                &publish_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(publish_resp.status, 200);
-
-            // ClaimBundle returns classical fallback bundle without PQ prekeys.
-            let bob_pub = bob.compute_public_key().to_bytes();
-            let claim_req = ClaimBundleRequest {
-                identity_key: Bytes::copy_from_slice(&bob_pub),
-                preferred_suites: vec![1, 2],
-            };
-            let claim_resp = connect::handle_v2(
-                &handshake,
-                &mailbox,
-                ProcedureV2::ClaimBundle,
-                Some(connect::CONTENT_TYPE),
-                &claim_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(claim_resp.status, 200);
-            let claimed = ClaimBundleResponse::decode(claim_resp.body.as_slice()).unwrap();
-            assert_eq!(claimed.signed_prekey.as_ref(), &spk);
-            assert_eq!(claimed.one_time_prekey.as_deref(), Some(opk.as_slice()));
-            assert!(claimed.pq_last_resort.is_none());
-            assert!(claimed.pq_one_time_prekey.is_none());
-
-            // PushV2 and FetchSigned continue working cleanly during PQ_ENABLED="false" rollback.
-            let alice_pub = alice.compute_public_key().to_bytes();
-            let mut push_req = PushV2Request {
-                sender: Bytes::copy_from_slice(&alice_pub),
-                recipient: Bytes::copy_from_slice(&bob_pub),
-                message: Some(Default::default()),
-                initial_message: None,
-                delivery_hash: Bytes::new(),
-                client_message_id: Bytes::copy_from_slice(&[0x77; 16]),
-            };
-            let msg = push_req.message.as_mut().unwrap();
-            msg.header = Bytes::from_static(b"hdr");
-            msg.content = Bytes::from_static(b"ciphertext");
-            let push_resp = connect::handle_v2(
-                &handshake,
-                &mailbox,
-                ProcedureV2::PushV2,
-                Some(connect::CONTENT_TYPE),
-                &push_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(push_resp.status, 200);
-            let pushed = PushV2Response::decode(push_resp.body.as_slice()).unwrap();
-            assert_eq!(pushed.sequence, 1);
-
-            let fetch_req =
-                FetchSignedRequest::sign(&bob, &server_id, &alice_pub, 0, 10, 0, vec![], now)
-                    .unwrap();
-            let fetch_resp = connect::handle_v2(
-                &handshake,
-                &mailbox,
-                ProcedureV2::FetchSigned,
-                Some(connect::CONTENT_TYPE),
-                &fetch_req.encode_to_vec(),
-            )
-            .await;
-            assert_eq!(fetch_resp.status, 200);
-            let fetched = FetchSignedResponse::decode(fetch_resp.body.as_slice()).unwrap();
-            assert_eq!(fetched.messages.len(), 1);
-            assert_eq!(
-                fetched.messages[0]
-                    .message
-                    .as_ref()
-                    .unwrap()
-                    .content
-                    .as_ref(),
-                b"ciphertext"
-            );
-        });
     }
 
     #[test]
@@ -927,17 +811,13 @@ mod tests {
             objects::HEADER_DEPLOYMENT_AUTH,
             objects::HEADER_PENDING_IDENTITY,
             objects::HEADER_SUBSCRIBE_AUDIENCE,
+            objects::HEADER_SESSION_EXPIRES,
             objects::HEADER_SUBSCRIBE_SIG,
             objects::HEADER_SUBSCRIBE_TS,
         ] {
             assert!(is_internal_subscribe_header(header));
             assert!(is_internal_subscribe_header(&header.to_ascii_uppercase()));
         }
-        assert!(is_internal_subscribe_header("X-E2EE-Deployment-Auth"));
-        assert!(is_internal_subscribe_header("X-E2EE-Pending-Identity"));
-        assert!(is_internal_subscribe_header("X-E2EE-Subscribe-Audience"));
-        assert!(is_internal_subscribe_header("X-E2EE-Subscribe-Sig"));
-        assert!(is_internal_subscribe_header("X-E2EE-Subscribe-Ts"));
         assert!(!is_internal_subscribe_header("upgrade"));
         assert!(!is_internal_subscribe_header("cookie"));
 
@@ -948,12 +828,14 @@ mod tests {
                 ("cookie", "session=abc"),
                 ("X-E2EE-Deployment-Auth", "0"),
                 ("x-e2ee-pending-identity", "00"),
+                ("X-E2EE-Session-Expires", "999999999999"),
                 ("X-E2EE-Subscribe-Sig", "deadbeef"),
                 ("x-e2ee-subscribe-ts", "9999999999"),
                 ("X-E2EE-Subscribe-Audience", "evil.example"),
             ],
             &id,
             "relay.example:443",
+            Some(123_456),
         );
         assert!(forwarded.contains(&("upgrade".into(), "websocket".into())));
         assert!(forwarded.contains(&("cookie".into(), "session=abc".into())));
@@ -985,14 +867,16 @@ mod tests {
                 "relay.example:443".to_string()
             )]
         );
-    }
-
-    #[test]
-    fn deployment_auth_requires_sign_in_when_a_password_is_configured() {
-        assert!(deployment_auth_satisfied(false, false));
-        assert!(deployment_auth_satisfied(false, true));
-        assert!(!deployment_auth_satisfied(true, false));
-        assert!(deployment_auth_satisfied(true, true));
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_SESSION_EXPIRES))
+                .collect::<Vec<_>>(),
+            vec![&(
+                objects::HEADER_SESSION_EXPIRES.to_string(),
+                "123456".to_string()
+            )]
+        );
     }
 
     #[test]
@@ -1087,31 +971,105 @@ mod tests {
     }
 
     #[test]
-    fn connect_content_type_and_per_procedure_body_caps_enforce_bounds() {
-        assert!(connect::check_content_type(Some(connect::CONTENT_TYPE)).is_none());
-        assert!(connect::check_content_type(Some("application/proto; charset=utf-8")).is_none());
-        let bad = connect::check_content_type(Some("application/json")).expect("415 response");
-        assert_eq!(bad.status, 415);
-        assert!(connect::check_content_type(None).is_some());
+    fn read_body_limits_reject_oversized_content_length_and_streams() {
+        assert!(!content_length_exceeds_limit(None, 16));
+        assert!(!content_length_exceeds_limit(Some("16"), 16));
+        assert!(!content_length_exceeds_limit(Some(" 0 "), 16));
+        assert!(!content_length_exceeds_limit(Some("not-a-number"), 16));
+        assert!(content_length_exceeds_limit(Some("17"), 16));
+        assert!(content_length_exceeds_limit(
+            Some("18446744073709551615"),
+            16
+        ));
+
+        block_on(async {
+            let empty = read_body_stream(
+                stream::iter(Vec::<std::result::Result<Vec<u8>, ()>>::new()),
+                8,
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(empty, Some(vec![]));
+
+            let exact = read_body_stream(
+                stream::iter([Ok::<_, ()>(b"abcd".to_vec()), Ok(b"efgh".to_vec())]),
+                8,
+                8,
+            )
+            .await
+            .unwrap();
+            assert_eq!(exact, Some(b"abcdefgh".to_vec()));
+
+            // Stops immediately once cumulative chunks cross `limit` (the error chunk is never polled).
+            let oversized = read_body_stream(
+                stream::iter([
+                    Ok::<_, &'static str>(b"12345".to_vec()),
+                    Ok(b"6789".to_vec()),
+                    Err("must not be polled after overflow"),
+                ]),
+                8,
+                0,
+            )
+            .await
+            .unwrap();
+            assert_eq!(oversized, None);
+        });
+    }
+
+    #[test]
+    fn conformance_auth_requires_sign_in_or_valid_token() {
+        assert!(!conformance_authorized(None, None, false));
+        assert!(!conformance_authorized(Some("secret"), None, false));
+        assert!(!conformance_authorized(
+            Some("secret"),
+            Some("wrong"),
+            false
+        ));
+        assert!(!conformance_authorized(None, Some("secret"), false));
+        assert!(conformance_authorized(
+            Some("secret"),
+            Some("secret"),
+            false
+        ));
+        assert!(conformance_authorized(None, None, true));
+        assert!(conformance_authorized(Some("secret"), Some("wrong"), true));
 
         assert_eq!(
-            max_body_attachment(AttachmentProcedure::StartUpload),
-            4 << 10
-        );
-        assert_eq!(max_body_attachment(AttachmentProcedure::GetChunk), 4 << 10);
-        assert_eq!(
-            max_body_attachment(AttachmentProcedure::DeleteAttachment),
-            4 << 10
+            extract_conformance_token(Some("Bearer tok123"), None),
+            Some("tok123")
         );
         assert_eq!(
-            max_body_attachment(AttachmentProcedure::PutChunk),
-            (2 << 20) + (4 << 10)
+            extract_conformance_token(Some("bearer   tok123 "), None),
+            Some("tok123")
         );
-        assert_eq!(max_body_v2(ProcedureV2::GetServerInfo), 4 << 10);
-        assert_eq!(max_body_v2(ProcedureV2::SendInitialV2), 16 << 10);
-        assert_eq!(max_body_v2(ProcedureV2::FetchSigned), 32 << 10);
-        assert_eq!(max_body_v2(ProcedureV2::PublishV2), 256 << 10);
-        assert_eq!(max_body_v2(ProcedureV2::RefillPrekeys), 256 << 10);
-        assert_eq!(max_body_v2(ProcedureV2::PushV2), MAX_BODY);
+        assert_eq!(extract_conformance_token(Some("Basic abc"), None), None);
+        assert_eq!(
+            extract_conformance_token(Some("Bearer a"), Some("b")),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn period_parses_fractional_days_and_falls_back_on_invalid_values() {
+        assert_eq!(
+            period_from_str(Some("0.5"), 30),
+            Duration::from_secs(12 * 3600)
+        );
+        assert_eq!(period_from_str(Some("0"), 30), Duration::ZERO);
+        assert_eq!(period_from_str(None, 30), Duration::from_secs(30 * 86_400));
+        assert_eq!(
+            period_from_str(Some("-1"), 30),
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(
+            period_from_str(Some("NaN"), 30),
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(
+            period_from_str(Some("inf"), 30),
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(period_from_str(Some("1e300"), 30), Duration::MAX);
     }
 }

@@ -10,7 +10,7 @@ use pulldown_latex::{
     },
 };
 
-use super::sanitize::{escape, push_escaped_char, push_escaped_text};
+use super::sanitize::{escape, math_dimension_unit_max, push_escaped_char, push_escaped_text};
 
 /// Maximum raw TeX input bytes accepted for a single MathML expression before falling back to
 /// escaped raw TeX.
@@ -27,6 +27,9 @@ const MATH_CONSECUTIVE_CS_MAX: usize = 16;
 /// Maximum empty brace/bracket groups (`{}` / `[]`) allowed so `pulldown-latex`'s `Parser::next()`
 /// cannot stack-overflow draining consecutive empty `SubGroup` entries.
 const MATH_EMPTY_GROUPS_MAX: usize = 32;
+/// Maximum total `{` brace groups allowed in one TeX expression so nested `{{...}}` cannot
+/// bypass flat empty-group counting and stack-overflow `pulldown-latex`.
+const MATH_GROUPS_MAX: usize = 256;
 /// Maximum brace nesting depth allowed in raw TeX before parsing (prevents deep `wasm32` stack
 /// recursion before reaching `MathmlRenderer`).
 const MATH_BRACE_DEPTH_MAX: usize = 64;
@@ -119,16 +122,26 @@ fn color_args_non_ascii(tex: &str, mut pos: usize, count: usize) -> bool {
                 break;
             }
         }
-        // Skip optional color model `[...]` (e.g. `\color[rgb]{...}`).
+        // Skip optional color model `[...]` (e.g. `\color[rgb]{...}`). Reject `%`, nested `[`,
+        // `\`, braces, non-ASCII, or unclosed `[` immediately so commented `]`/`{...}` cannot
+        // desync validation from `pulldown-latex`'s `lex::color`.
         if bytes.get(pos) == Some(&b'[') {
-            while pos < bytes.len() && bytes[pos] != b']' {
-                if !bytes[pos].is_ascii() {
-                    return true;
+            pos += 1;
+            let mut closed = false;
+            while pos < bytes.len() {
+                match bytes[pos] {
+                    b']' => {
+                        pos += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'%' | b'[' | b'\\' | b'{' | b'}' => return true,
+                    b if !b.is_ascii() => return true,
+                    _ => pos += 1,
                 }
-                pos += 1;
             }
-            if pos < bytes.len() {
-                pos += 1;
+            if !closed {
+                return true;
             }
         }
         let Some(arg) = next_braced_arg(tex, &mut pos) else {
@@ -397,6 +410,7 @@ fn exceeds_tex_preflight(tex: &str) -> bool {
     let mut directives = 0usize;
     let mut comments = 0usize;
     let mut empty_groups = 0usize;
+    let mut total_groups = 0usize;
     let mut brace_depth = 0usize;
     let mut unbraced_recursive = 0usize;
     let mut sqrt_opt_ends: Vec<usize> = Vec::new();
@@ -412,6 +426,10 @@ fn exceeds_tex_preflight(tex: &str) -> bool {
                 }
             }
             b'{' => {
+                total_groups += 1;
+                if total_groups > MATH_GROUPS_MAX {
+                    return true;
+                }
                 brace_depth += 1;
                 if brace_depth > MATH_BRACE_DEPTH_MAX {
                     return true;
@@ -479,9 +497,15 @@ fn exceeds_tex_preflight(tex: &str) -> bool {
                     }
                 } else if cmd == "begin" {
                     let mut lookahead = i;
-                    if let Some(env_name) = next_braced_arg(tex, &mut lookahead)
-                        && matches!(env_name.trim(), "alignat" | "alignat*" | "alignedat")
-                    {
+                    let Some(env_name) = next_braced_arg(tex, &mut lookahead) else {
+                        return true;
+                    };
+                    // Reject `%` inside `\begin{...}` so `\begin{alignat%\n}{é}` cannot evade
+                    // `alignat` count validation.
+                    if env_name.contains('%') {
+                        return true;
+                    }
+                    if matches!(env_name.trim(), "alignat" | "alignat*" | "alignedat") {
                         // `alignat` passes its count argument to `lex::unsigned_integer`, which
                         // panics on non-ASCII bytes or overflows on huge integers.
                         let Some(count_arg) = next_braced_arg(tex, &mut lookahead) else {
@@ -789,6 +813,40 @@ impl<'a> MathmlRenderer<'a> {
         Ok(self.out)
     }
 
+    fn begin_mtable(
+        &mut self,
+        class: Option<&str>,
+        with_eqn: bool,
+        start_lines: bool,
+        open_cell: bool,
+    ) -> Result<(), ()> {
+        self.out.push_str("<mtable");
+        match (class, with_eqn) {
+            (Some(cls), true) => {
+                let _ = write!(self.out, " class=\"{cls} ml-with-eqn\"");
+            }
+            (Some(cls), false) => {
+                let _ = write!(self.out, " class=\"{cls}\"");
+            }
+            (None, true) => self.out.push_str(" class=\"ml-with-eqn\""),
+            (None, false) => {}
+        }
+        self.out.push_str("><mtr");
+        if start_lines
+            && let Some(LatexEvent::EnvironmentFlow(EnvironmentFlow::StartLines { lines })) =
+                self.events.get(self.cursor)
+        {
+            write_env_horizontal_lines(&mut self.out, lines)?;
+            self.cursor += 1;
+        }
+        if open_cell {
+            self.out.push_str("><mtd>");
+        } else {
+            self.out.push('>');
+        }
+        Ok(())
+    }
+
     fn write_event(&mut self, event: &'a LatexEvent<'a>) -> Result<(), ()> {
         match event {
             LatexEvent::Content(content) => self.write_content(*content, false),
@@ -815,17 +873,6 @@ impl<'a> MathmlRenderer<'a> {
                     }
                 }
 
-                let emit_start_lines = |out: &mut String, cursor: &mut usize| -> Result<(), ()> {
-                    if let Some(LatexEvent::EnvironmentFlow(EnvironmentFlow::StartLines {
-                        lines,
-                    })) = self.events.get(*cursor)
-                    {
-                        write_env_horizontal_lines(out, lines)?;
-                        *cursor += 1;
-                    }
-                    Ok(())
-                };
-
                 let env_group = match grouping {
                     Grouping::Normal => MathEnvGrouping::Normal,
                     Grouping::LeftRight(opening, closing) => {
@@ -839,25 +886,16 @@ impl<'a> MathmlRenderer<'a> {
                         MathEnvGrouping::LeftRight { closing: *closing }
                     }
                     Grouping::Align { eq_numbers } => {
-                        self.out.push_str("<mtable class=\"ml-alignlike ml-align");
-                        if *eq_numbers {
-                            self.out.push_str(" ml-with-eqn");
-                        }
-                        self.out.push_str("\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(Some("ml-alignlike ml-align"), *eq_numbers, true, true)?;
                         MathEnvGrouping::Align
                     }
                     Grouping::Matrix { alignment } => {
-                        self.out.push_str("<mtable class=\"ml-arraylike");
-                        self.out.push_str(match alignment {
-                            ColumnAlignment::Left => " ml-cells-left\"",
-                            ColumnAlignment::Center => "\"",
-                            ColumnAlignment::Right => " ml-cells-right\"",
-                        });
-                        self.out.push_str("><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        let cls = match alignment {
+                            ColumnAlignment::Left => "ml-arraylike ml-cells-left",
+                            ColumnAlignment::Center => "ml-arraylike",
+                            ColumnAlignment::Right => "ml-arraylike ml-cells-right",
+                        };
+                        self.begin_mtable(Some(cls), false, true, true)?;
                         MathEnvGrouping::Matrix
                     }
                     Grouping::Cases { left } => {
@@ -865,10 +903,7 @@ impl<'a> MathmlRenderer<'a> {
                         if *left {
                             self.out.push_str("<mo stretchy=\"true\">{</mo>");
                         }
-                        self.out
-                            .push_str("<mtable class=\"ml-cells-left ml-cases\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(Some("ml-cells-left ml-cases"), false, true, true)?;
                         MathEnvGrouping::Cases {
                             left: *left,
                             used_align: false,
@@ -878,9 +913,7 @@ impl<'a> MathmlRenderer<'a> {
                         if cols.len() > MATH_ARRAY_COLS_MAX {
                             return Err(());
                         }
-                        self.out.push_str("<mtable class=\"ml-arraylike\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push('>');
+                        self.begin_mtable(Some("ml-arraylike"), false, true, false)?;
                         let index = array_newline(&mut self.out, cols)?;
                         MathEnvGrouping::Array {
                             cols: cols.clone(),
@@ -888,84 +921,50 @@ impl<'a> MathmlRenderer<'a> {
                         }
                     }
                     Grouping::Aligned => {
-                        self.out
-                            .push_str("<mtable class=\"ml-alignlike ml-align\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(Some("ml-alignlike ml-align"), false, true, true)?;
                         MathEnvGrouping::Align
                     }
                     Grouping::SubArray { alignment } => {
-                        self.out.push_str("<mtable");
-                        match alignment {
-                            ColumnAlignment::Left => {
-                                self.out.push_str(" class=\"ml-cells-left\"");
-                            }
-                            ColumnAlignment::Center => {}
-                            ColumnAlignment::Right => {
-                                self.out.push_str(" class=\"ml-cells-right\"");
-                            }
-                        }
-                        self.out.push_str("><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        let cls = match alignment {
+                            ColumnAlignment::Left => Some("ml-cells-left"),
+                            ColumnAlignment::Center => None,
+                            ColumnAlignment::Right => Some("ml-cells-right"),
+                        };
+                        self.begin_mtable(cls, false, true, true)?;
                         MathEnvGrouping::SubArray
                     }
                     Grouping::Alignat { pairs, eq_numbers } => {
-                        self.out.push_str("<mtable class=\"ml-alignlike");
-                        if *eq_numbers {
-                            self.out.push_str(" ml-with-eqn");
-                        }
-                        self.out.push_str("\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(Some("ml-alignlike"), *eq_numbers, true, true)?;
                         MathEnvGrouping::Alignat {
                             pairs: *pairs,
                             columns_used: 0,
                         }
                     }
                     Grouping::Alignedat { pairs } => {
-                        self.out.push_str("<mtable class=\"ml-alignlike\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(Some("ml-alignlike"), false, true, true)?;
                         MathEnvGrouping::Alignat {
                             pairs: *pairs,
                             columns_used: 0,
                         }
                     }
                     Grouping::Gather { eq_numbers } => {
-                        self.out.push_str("<mtable");
-                        if *eq_numbers {
-                            self.out.push_str(" class=\"ml-with-eqn\"");
-                        }
-                        self.out.push_str("><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(None, *eq_numbers, true, true)?;
                         MathEnvGrouping::Gather
                     }
                     Grouping::Gathered => {
-                        self.out.push_str("<mtable><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(None, false, true, true)?;
                         MathEnvGrouping::Gather
                     }
                     Grouping::Multline => {
-                        self.out.push_str("<mtable class=\"ml-multline\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(Some("ml-multline"), false, true, true)?;
                         MathEnvGrouping::Multline
                     }
                     Grouping::Split => {
-                        self.out.push_str("<mtable class=\"ml-alignlike\"><mtr");
-                        emit_start_lines(&mut self.out, &mut self.cursor)?;
-                        self.out.push_str("><mtd>");
+                        self.begin_mtable(Some("ml-alignlike"), false, true, true)?;
                         MathEnvGrouping::Split { used_align: false }
                     }
                     Grouping::Equation { eq_numbers } => {
-                        self.out.push_str("<mtable");
-                        if *eq_numbers {
-                            self.out.push_str(" class=\"ml-with-eqn\"");
-                        }
-                        self.out.push_str("><mtr><mtd>");
+                        self.begin_mtable(None, *eq_numbers, false, true)?;
                         MathEnvGrouping::Equation
                     }
                 };
@@ -1065,7 +1064,7 @@ impl<'a> MathmlRenderer<'a> {
                 self.env_stack.push(MathEnv::Visual { ty: visual, count });
                 self.open_tag(visual_tag(visual), None);
                 if let Visual::Fraction(Some(dim)) = visual
-                    && let Some(thickness) = format_dimension(dim)
+                    && let Some(thickness) = format_dimension(dim, false)
                 {
                     let _ = write!(self.out, " linethickness=\"{thickness}\"");
                 }
@@ -1102,13 +1101,13 @@ impl<'a> MathmlRenderer<'a> {
                 depth,
             } => {
                 self.out.push_str("<mspace");
-                if let Some(width) = width.and_then(format_dimension) {
+                if let Some(width) = width.and_then(|d| format_dimension(d, true)) {
                     let _ = write!(self.out, " width=\"{width}\"");
                 }
-                if let Some(height) = height.and_then(format_dimension) {
+                if let Some(height) = height.and_then(|d| format_dimension(d, false)) {
                     let _ = write!(self.out, " height=\"{height}\"");
                 }
-                if let Some(depth) = depth.and_then(format_dimension) {
+                if let Some(depth) = depth.and_then(|d| format_dimension(d, false)) {
                     let _ = write!(self.out, " depth=\"{depth}\"");
                 }
                 self.out.push_str(" />");
@@ -1148,7 +1147,7 @@ impl<'a> MathmlRenderer<'a> {
                         self.env_stack.last_mut()
                     {
                         let mut index = array_newline(&mut self.out, cols)?;
-                        if let Some(height) = format_dimension(spacing)
+                        if let Some(height) = format_dimension(spacing, false)
                             && spacing.value > 0.0
                         {
                             let _ = write!(self.out, "<mspace height=\"{height}\" />");
@@ -1160,7 +1159,7 @@ impl<'a> MathmlRenderer<'a> {
                         array_close_line(&mut self.out, rest)?;
                     } else {
                         self.out.push_str("<mtd class=\"ml-nonumber\">");
-                        if let Some(height) = format_dimension(spacing)
+                        if let Some(height) = format_dimension(spacing, false)
                             && spacing.value > 0.0
                         {
                             let _ = write!(self.out, "<mspace height=\"{height}\" />");
@@ -1224,7 +1223,7 @@ impl<'a> MathmlRenderer<'a> {
                     Some(MathEnv::Group(MathEnvGrouping::Alignat {
                         pairs,
                         columns_used,
-                    })) if *columns_used / 2 <= *pairs => {
+                    })) if u32::from(*columns_used) + 1 < u32::from(*pairs) * 2 => {
                         *columns_used += 1;
                         self.out.push_str("</mtd><mtd>");
                         Ok(())
@@ -1309,11 +1308,13 @@ impl<'a> MathmlRenderer<'a> {
             }
             Content::Ordinary { content, stretchy } => {
                 if stretchy {
-                    self.out.push_str("<mo stretchy=\"true\">");
+                    self.open_tag("mo", None);
+                    self.out.push_str(" stretchy=\"true\">");
                     push_escaped_char(&mut self.out, content);
                     if negate {
                         self.out.push('\u{0338}');
                     }
+                    self.set_previous_atom(MathAtom::Ord);
                     self.out.push_str("</mo>");
                 } else {
                     self.open_tag("mi", None);
@@ -1545,33 +1546,39 @@ fn visual_tag(visual: Visual) -> &'static str {
     }
 }
 
-fn format_dimension(dim: Dimension) -> Option<String> {
-    const BP_PER_PT: f32 = 72.0 / 72.27;
-    const BP_PER_SP: f32 = (1.0 / 65536.0) * BP_PER_PT;
-    const BP_PER_DD: f32 = (1238.0 / 1157.0) * BP_PER_PT;
-    const BP_PER_CC: f32 = 12.0 * BP_PER_DD;
-    const EM_PER_MU: f32 = 1.0 / 18.0;
+fn format_dimension(dim: Dimension, allow_negative: bool) -> Option<String> {
+    const BP_PER_PT: f64 = 72.0 / 72.27;
+    const BP_PER_SP: f64 = (1.0 / 65536.0) * BP_PER_PT;
+    const BP_PER_DD: f64 = (1238.0 / 1157.0) * BP_PER_PT;
+    const BP_PER_CC: f64 = 12.0 * BP_PER_DD;
+    const EM_PER_MU: f64 = 1.0 / 18.0;
     if !dim.value.is_finite() {
         return None;
     }
+    let raw = f64::from(dim.value);
     let (value, unit) = match dim.unit {
-        DimensionUnit::Em => (dim.value, "em"),
-        DimensionUnit::Mu => (dim.value * EM_PER_MU, "em"),
-        DimensionUnit::Ex => (dim.value, "ex"),
-        DimensionUnit::Mm => (dim.value, "mm"),
-        DimensionUnit::Cm => (dim.value, "cm"),
-        DimensionUnit::In => (dim.value, "in"),
-        DimensionUnit::Bp => (dim.value, "pt"),
-        DimensionUnit::Pt => (dim.value * BP_PER_PT, "pt"),
-        DimensionUnit::Pc => (dim.value * BP_PER_PT, "pc"),
-        DimensionUnit::Sp => (dim.value * BP_PER_SP, "pt"),
-        DimensionUnit::Dd => (dim.value * BP_PER_DD, "pt"),
-        DimensionUnit::Cc => (dim.value * BP_PER_CC, "pt"),
+        DimensionUnit::Em => (raw, "em"),
+        DimensionUnit::Mu => (raw * EM_PER_MU, "em"),
+        DimensionUnit::Ex => (raw, "ex"),
+        DimensionUnit::Mm => (raw, "mm"),
+        DimensionUnit::Cm => (raw, "cm"),
+        DimensionUnit::In => (raw, "in"),
+        DimensionUnit::Bp => (raw, "pt"),
+        DimensionUnit::Pt => (raw * BP_PER_PT, "pt"),
+        DimensionUnit::Pc => (raw * BP_PER_PT, "pc"),
+        DimensionUnit::Sp => (raw * BP_PER_SP, "pt"),
+        DimensionUnit::Dd => (raw * BP_PER_DD, "pt"),
+        DimensionUnit::Cc => (raw * BP_PER_CC, "pt"),
     };
-    if !value.is_finite() {
+    if !value.is_finite() || (!allow_negative && value < 0.0) {
         return None;
     }
-    let clamped = value.clamp(-50.0, 50.0);
+    let max = math_dimension_unit_max(unit)?;
+    let clamped = if allow_negative {
+        value.clamp(-max, max)
+    } else {
+        value.clamp(0.0, max)
+    };
     let formatted = format!("{clamped:.4}");
     let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
     let trimmed = if trimmed == "-0" || trimmed.is_empty() {
@@ -1580,6 +1587,36 @@ fn format_dimension(dim: Dimension) -> Option<String> {
         trimmed
     };
     Some(format!("{trimmed}{unit}"))
+}
+
+fn push_array_cell_classes(
+    out: &mut String,
+    left: Option<Line>,
+    align: ColumnAlignment,
+    right: Option<Line>,
+) {
+    let mut classes = Vec::with_capacity(3);
+    if let Some(line) = left {
+        classes.push(match line {
+            Line::Solid => "ml-left-solid",
+            Line::Dashed => "ml-left-dashed",
+        });
+    }
+    match align {
+        ColumnAlignment::Left => classes.push("ml-cell-left"),
+        ColumnAlignment::Center => {}
+        ColumnAlignment::Right => classes.push("ml-cell-right"),
+    }
+    if let Some(line) = right {
+        classes.push(match line {
+            Line::Solid => "ml-right-solid",
+            Line::Dashed => "ml-right-dashed",
+        });
+    }
+    if !classes.is_empty() {
+        let _ = write!(out, " class=\"{}\"", classes.join(" "));
+    }
+    out.push('>');
 }
 
 fn array_newline(out: &mut String, cols: &[ArrayColumn]) -> Result<usize, ()> {
@@ -1604,52 +1641,29 @@ fn array_newline(out: &mut String, cols: &[ArrayColumn]) -> Result<usize, ()> {
         }
     }
 
-    let suffix = match (cols.get(index), cols.get(index + 1)) {
-        (Some(ArrayColumn::Separator(line)), Some(ArrayColumn::Column(col))) => {
-            out.push_str(match (line, col) {
-                (Line::Solid, ColumnAlignment::Left) => " class=\"ml-left-solid ml-cell-left",
-                (Line::Solid, ColumnAlignment::Center) => " class=\"ml-left-solid",
-                (Line::Solid, ColumnAlignment::Right) => " class=\"ml-left-solid ml-cell-right",
-                (Line::Dashed, ColumnAlignment::Left) => " class=\"ml-left-dashed ml-cell-left",
-                (Line::Dashed, ColumnAlignment::Center) => " class=\"ml-left-dashed",
-                (Line::Dashed, ColumnAlignment::Right) => " class=\"ml-left-dashed ml-cell-right",
-            });
+    match (cols.get(index), cols.get(index + 1)) {
+        (Some(ArrayColumn::Separator(left)), Some(ArrayColumn::Column(align))) => {
             index += 2;
-            if let Some(ArrayColumn::Separator(line)) = cols.get(index) {
-                index += 1;
-                match line {
-                    Line::Solid => " ml-right-solid\">",
-                    Line::Dashed => " ml-right-dashed\">",
+            let right = match cols.get(index) {
+                Some(ArrayColumn::Separator(line)) => {
+                    index += 1;
+                    Some(*line)
                 }
-            } else {
-                "\">"
-            }
+                _ => None,
+            };
+            push_array_cell_classes(out, Some(*left), *align, right);
         }
-        (Some(ArrayColumn::Column(col)), Some(ArrayColumn::Separator(line))) => {
+        (Some(ArrayColumn::Column(align)), Some(ArrayColumn::Separator(right))) => {
             index += 2;
-            match (col, line) {
-                (ColumnAlignment::Left, Line::Solid) => " class=\"ml-cell-left ml-right-solid\">",
-                (ColumnAlignment::Left, Line::Dashed) => " class=\"ml-cell-left ml-right-dashed\">",
-                (ColumnAlignment::Center, Line::Solid) => " class=\"ml-right-solid\">",
-                (ColumnAlignment::Center, Line::Dashed) => " class=\"ml-right-dashed\">",
-                (ColumnAlignment::Right, Line::Solid) => " class=\"ml-cell-right ml-right-solid\">",
-                (ColumnAlignment::Right, Line::Dashed) => {
-                    " class=\"ml-cell-right ml-right-dashed\">"
-                }
-            }
+            push_array_cell_classes(out, None, *align, Some(*right));
         }
-        (Some(ArrayColumn::Column(col)), _) => {
+        (Some(ArrayColumn::Column(align)), _) => {
             index += 1;
-            match col {
-                ColumnAlignment::Left => " class=\"ml-cell-left\">",
-                ColumnAlignment::Center => ">",
-                ColumnAlignment::Right => " class=\"ml-cell-right\">",
-            }
+            push_array_cell_classes(out, None, *align, None);
         }
-        (None, None) => ">",
+        (None, None) => out.push('>'),
         _ => return Err(()),
-    };
-    out.push_str(suffix);
+    }
     Ok(index)
 }
 
@@ -1672,31 +1686,17 @@ fn array_align(out: &mut String, cols: &[ArrayColumn], cols_index: &mut usize) -
         }
     }
 
-    let suffix = match (cols.get(*cols_index), cols.get(*cols_index + 1)) {
-        (Some(ArrayColumn::Column(col)), Some(ArrayColumn::Separator(line))) => {
+    match (cols.get(*cols_index), cols.get(*cols_index + 1)) {
+        (Some(ArrayColumn::Column(align)), Some(ArrayColumn::Separator(right))) => {
             *cols_index += 2;
-            match (col, line) {
-                (ColumnAlignment::Left, Line::Solid) => " class=\"ml-cell-left ml-right-solid\">",
-                (ColumnAlignment::Left, Line::Dashed) => " class=\"ml-cell-left ml-right-dashed\">",
-                (ColumnAlignment::Center, Line::Solid) => " class=\"ml-right-solid\">",
-                (ColumnAlignment::Center, Line::Dashed) => " class=\"ml-right-dashed\">",
-                (ColumnAlignment::Right, Line::Solid) => " class=\"ml-cell-right ml-right-solid\">",
-                (ColumnAlignment::Right, Line::Dashed) => {
-                    " class=\"ml-cell-right ml-right-dashed\">"
-                }
-            }
+            push_array_cell_classes(out, None, *align, Some(*right));
         }
-        (Some(ArrayColumn::Column(col)), _) => {
+        (Some(ArrayColumn::Column(align)), _) => {
             *cols_index += 1;
-            match col {
-                ColumnAlignment::Left => " class=\"ml-cell-left\">",
-                ColumnAlignment::Center => ">",
-                ColumnAlignment::Right => " class=\"ml-cell-right\">",
-            }
+            push_array_cell_classes(out, None, *align, None);
         }
         _ => return Err(()),
-    };
-    out.push_str(suffix);
+    }
     Ok(())
 }
 
@@ -1745,6 +1745,26 @@ fn write_env_horizontal_lines(out: &mut String, lines: &[Line]) -> Result<(), ()
     Ok(())
 }
 
+/// Map a Greek letter or operator symbol into a Mathematical Alphanumeric block starting at `base`.
+fn map_greek(base: u32, c: char) -> Option<u32> {
+    let offset = match c {
+        '\u{0391}'..='\u{03A1}' => c as u32 - 0x0391,
+        '\u{03F4}' => 17,
+        '\u{03A3}'..='\u{03A9}' => 18 + (c as u32 - 0x03A3),
+        '\u{2207}' => 25,
+        '\u{03B1}'..='\u{03C9}' => 26 + (c as u32 - 0x03B1),
+        '\u{2202}' => 51,
+        '\u{03F5}' => 52,
+        '\u{03D1}' => 53,
+        '\u{03F0}' => 54,
+        '\u{03D5}' => 55,
+        '\u{03F1}' => 56,
+        '\u{03D6}' => 57,
+        _ => return None,
+    };
+    Some(base + offset)
+}
+
 /// Map a character to its Unicode Mathematical Alphanumeric Symbols variant for `font`.
 fn map_font_char(font: Font, c: char) -> char {
     let code = match (font, c) {
@@ -1753,33 +1773,13 @@ fn map_font_char(font: Font, c: char) -> char {
 
         (Font::BoldItalic, 'A'..='Z') => c as u32 + 0x1D427,
         (Font::BoldItalic, 'a'..='z') => c as u32 + 0x1D421,
-        (Font::BoldItalic, '\u{0391}'..='\u{03A1}' | '\u{03A3}'..='\u{03A9}') => c as u32 + 0x1D38B,
-        (Font::BoldItalic, '\u{03F4}') => c as u32 + 0x1D339,
-        (Font::BoldItalic, '\u{2207}') => c as u32 + 0x1B52E,
-        (Font::BoldItalic, '\u{03B1}'..='\u{03C9}') => c as u32 + 0x1D385,
-        (Font::BoldItalic, '\u{2202}') => c as u32 + 0x1B54D,
-        (Font::BoldItalic, '\u{03F5}') => c as u32 + 0x1D35B,
-        (Font::BoldItalic, '\u{03D1}') => c as u32 + 0x1D380,
-        (Font::BoldItalic, '\u{03F0}') => c as u32 + 0x1D362,
-        (Font::BoldItalic, '\u{03D5}') => c as u32 + 0x1D37E,
-        (Font::BoldItalic, '\u{03F1}') => c as u32 + 0x1D363,
-        (Font::BoldItalic, '\u{03D6}') => c as u32 + 0x1D37F,
+        (Font::BoldItalic, _) => map_greek(0x1D71C, c).unwrap_or(c as u32),
 
         (Font::Bold, 'A'..='Z') => c as u32 + 0x1D3BF,
         (Font::Bold, 'a'..='z') => c as u32 + 0x1D3B9,
-        (Font::Bold, '\u{0391}'..='\u{03A1}' | '\u{03A3}'..='\u{03A9}') => c as u32 + 0x1D317,
-        (Font::Bold, '\u{03F4}') => c as u32 + 0x1D2C5,
-        (Font::Bold, '\u{2207}') => c as u32 + 0x1B4BA,
-        (Font::Bold, '\u{03B1}'..='\u{03C9}') => c as u32 + 0x1D311,
-        (Font::Bold, '\u{2202}') => c as u32 + 0x1B4D9,
-        (Font::Bold, '\u{03F5}') => c as u32 + 0x1D2E7,
-        (Font::Bold, '\u{03D1}') => c as u32 + 0x1D30C,
-        (Font::Bold, '\u{03F0}') => c as u32 + 0x1D2EE,
-        (Font::Bold, '\u{03D5}') => c as u32 + 0x1D30A,
-        (Font::Bold, '\u{03F1}') => c as u32 + 0x1D2EF,
-        (Font::Bold, '\u{03D6}') => c as u32 + 0x1D30B,
         (Font::Bold, '\u{03DC}' | '\u{03DD}') => c as u32 + 0x1D3EE,
         (Font::Bold, '0'..='9') => c as u32 + 0x1D79E,
+        (Font::Bold, _) => map_greek(0x1D6A8, c).unwrap_or(c as u32),
 
         (Font::Fraktur, 'A' | 'B' | 'D'..='G' | 'J'..='Q' | 'S'..='Y') => c as u32 + 0x1D4C3,
         (Font::Fraktur, 'C') => c as u32 + 0x20EA,
@@ -1831,56 +1831,22 @@ fn map_font_char(font: Font, c: char) -> char {
         (Font::Italic, 'A'..='Z') => c as u32 + 0x1D3F3,
         (Font::Italic, 'a'..='g' | 'i'..='z') => c as u32 + 0x1D3ED,
         (Font::Italic, 'h') => c as u32 + 0x20A6,
-        (Font::Italic, '\u{0391}'..='\u{03A1}' | '\u{03A3}'..='\u{03A9}') => c as u32 + 0x1D351,
-        (Font::Italic, '\u{03F4}') => c as u32 + 0x1D2FF,
-        (Font::Italic, '\u{2207}') => c as u32 + 0x1B4F4,
-        (Font::Italic, '\u{03B1}'..='\u{03C9}') => c as u32 + 0x1D34B,
-        (Font::Italic, '\u{2202}') => c as u32 + 0x1B513,
-        (Font::Italic, '\u{03F5}') => c as u32 + 0x1D321,
-        (Font::Italic, '\u{03D1}') => c as u32 + 0x1D346,
-        (Font::Italic, '\u{03F0}') => c as u32 + 0x1D328,
-        (Font::Italic, '\u{03D5}') => c as u32 + 0x1D344,
-        (Font::Italic, '\u{03F1}') => c as u32 + 0x1D329,
-        (Font::Italic, '\u{03D6}') => c as u32 + 0x1D345,
+        (Font::Italic, _) => map_greek(0x1D6E2, c).unwrap_or(c as u32),
 
         (Font::BoldFraktur, 'A'..='Z') => c as u32 + 0x1D52B,
         (Font::BoldFraktur, 'a'..='z') => c as u32 + 0x1D525,
 
         (Font::SansSerifBoldItalic, 'A'..='Z') => c as u32 + 0x1D5FB,
         (Font::SansSerifBoldItalic, 'a'..='z') => c as u32 + 0x1D5F5,
-        (Font::SansSerifBoldItalic, '\u{0391}'..='\u{03A1}' | '\u{03A3}'..='\u{03A9}') => {
-            c as u32 + 0x1D3FF
-        }
-        (Font::SansSerifBoldItalic, '\u{03F4}') => c as u32 + 0x1D3AD,
-        (Font::SansSerifBoldItalic, '\u{2207}') => c as u32 + 0x1B5A2,
-        (Font::SansSerifBoldItalic, '\u{03B1}'..='\u{03C9}') => c as u32 + 0x1D3F9,
-        (Font::SansSerifBoldItalic, '\u{2202}') => c as u32 + 0x1B5C1,
-        (Font::SansSerifBoldItalic, '\u{03F5}') => c as u32 + 0x1D3CF,
-        (Font::SansSerifBoldItalic, '\u{03D1}') => c as u32 + 0x1D3F4,
-        (Font::SansSerifBoldItalic, '\u{03F0}') => c as u32 + 0x1D3D6,
-        (Font::SansSerifBoldItalic, '\u{03D5}') => c as u32 + 0x1D3F2,
-        (Font::SansSerifBoldItalic, '\u{03F1}') => c as u32 + 0x1D3D7,
-        (Font::SansSerifBoldItalic, '\u{03D6}') => c as u32 + 0x1D3F3,
+        (Font::SansSerifBoldItalic, _) => map_greek(0x1D790, c).unwrap_or(c as u32),
 
         (Font::SansSerifItalic, 'A'..='Z') => c as u32 + 0x1D5C7,
         (Font::SansSerifItalic, 'a'..='z') => c as u32 + 0x1D5C1,
 
         (Font::BoldSansSerif, 'A'..='Z') => c as u32 + 0x1D593,
         (Font::BoldSansSerif, 'a'..='z') => c as u32 + 0x1D58D,
-        (Font::BoldSansSerif, '\u{0391}'..='\u{03A1}' | '\u{03A3}'..='\u{03A9}') => {
-            c as u32 + 0x1D3C5
-        }
-        (Font::BoldSansSerif, '\u{03F4}') => c as u32 + 0x1D373,
-        (Font::BoldSansSerif, '\u{2207}') => c as u32 + 0x1B568,
-        (Font::BoldSansSerif, '\u{03B1}'..='\u{03C9}') => c as u32 + 0x1D3BF,
-        (Font::BoldSansSerif, '\u{2202}') => c as u32 + 0x1B587,
-        (Font::BoldSansSerif, '\u{03F5}') => c as u32 + 0x1D395,
-        (Font::BoldSansSerif, '\u{03D1}') => c as u32 + 0x1D3BA,
-        (Font::BoldSansSerif, '\u{03F0}') => c as u32 + 0x1D39C,
-        (Font::BoldSansSerif, '\u{03D5}') => c as u32 + 0x1D3B8,
-        (Font::BoldSansSerif, '\u{03F1}') => c as u32 + 0x1D39D,
-        (Font::BoldSansSerif, '\u{03D6}') => c as u32 + 0x1D3B9,
         (Font::BoldSansSerif, '0'..='9') => c as u32 + 0x1D7BC,
+        (Font::BoldSansSerif, _) => map_greek(0x1D756, c).unwrap_or(c as u32),
 
         _ => c as u32,
     };

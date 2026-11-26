@@ -7,10 +7,8 @@ use std::{
     rc::Rc,
 };
 
-use futures::{
-    channel::oneshot,
-    future::{Either, select},
-};
+use futures_channel::oneshot;
+use futures_util::future::{Either, select};
 use js_sys::{ArrayBuffer, Uint8Array};
 use session::{
     ServerClock,
@@ -334,6 +332,15 @@ impl Drop for Handlers<'_> {
 /// How long a call outside Connect may take, in milliseconds.
 const CALL_TIMEOUT: u32 = 30_000;
 
+/// Check that a non-Connect auxiliary response body length does not exceed
+/// [`MAX_CALL_RESPONSE_BYTES`].
+fn check_call_response_size(len: u64) -> Result<(), String> {
+    if len > MAX_CALL_RESPONSE_BYTES as u64 {
+        return Err("the server's response was too large".to_string());
+    }
+    Ok(())
+}
+
 /// Call `path` of `server` outside Connect, e.g. to sign in: `method`, with `body` if any.
 /// Returns the server's status and text. Cookies come and go as with the page's own calls.
 pub async fn call(
@@ -347,38 +354,67 @@ pub async fn call(
         .open(method, &format!("{}{path}", server.trim_end_matches('/')))
         .map_err(js_error)?;
     request.set_timeout(CALL_TIMEOUT);
-    let (ended, end) = oneshot::channel();
+    let (ended, end) = oneshot::channel::<XhrOutcome>();
     let ended = Rc::new(Cell::new(Some(ended)));
-    let ends = |answered: bool| {
+    let progress = {
         let ended = ended.clone();
-        Closure::<dyn FnMut()>::new(move || {
-            if let Some(ended) = ended.take() {
-                let _ = ended.send(answered);
+        let req = request.clone();
+        Closure::<dyn FnMut(ProgressEvent)>::new(move |event: ProgressEvent| {
+            let loaded = event.loaded();
+            let total = if event.length_computable() {
+                event.total()
+            } else {
+                0.0
+            };
+            if loaded > MAX_CALL_RESPONSE_BYTES as f64 || total > MAX_CALL_RESPONSE_BYTES as f64 {
+                let _ = req.abort();
+                if let Some(ended) = ended.take() {
+                    let _ = ended.send(XhrOutcome::Oversized);
+                }
             }
         })
     };
-    let (load, error, timeout) = (ends(true), ends(false), ends(false));
+    let ends = |outcome: XhrOutcome| {
+        let ended = ended.clone();
+        Closure::<dyn FnMut()>::new(move || {
+            if let Some(ended) = ended.take() {
+                let _ = ended.send(outcome);
+            }
+        })
+    };
+    let (load, error, timeout) = (
+        ends(XhrOutcome::Loaded),
+        ends(XhrOutcome::Failed),
+        ends(XhrOutcome::Failed),
+    );
     // Declared after the closures, so that it goes first, also if this call is dropped.
     let _handlers = Handlers {
         request: &request,
         upload: None,
     };
+    request.set_onprogress(Some(progress.as_ref().unchecked_ref()));
     request.set_onload(Some(load.as_ref().unchecked_ref()));
     request.set_onerror(Some(error.as_ref().unchecked_ref()));
     request.set_ontimeout(Some(timeout.as_ref().unchecked_ref()));
     request.send_with_opt_str(body).map_err(js_error)?;
-    if !end.await.unwrap_or(false) {
-        return Err("the server cannot be reached".to_string());
+    match end.await.unwrap_or(XhrOutcome::Failed) {
+        XhrOutcome::Loaded => {}
+        XhrOutcome::Oversized => return Err("the server's response was too large".to_string()),
+        XhrOutcome::Failed => return Err("the server cannot be reached".to_string()),
     }
     observe(server, &request);
     let status = request.status().map_err(js_error)?;
+    // Enforce Content-Length cap BEFORE copying responseText into WASM memory.
+    if let Ok(Some(cl)) = request.get_response_header("content-length")
+        && let Ok(parsed) = cl.trim().parse::<u64>()
+    {
+        check_call_response_size(parsed)?;
+    }
     let text = request
         .response_text()
         .map_err(js_error)?
         .unwrap_or_default();
-    if text.len() > MAX_CALL_RESPONSE_BYTES {
-        return Err("the server's response was too large".to_string());
-    }
+    check_call_response_size(text.len() as u64)?;
     Ok((status, text))
 }
 
@@ -393,6 +429,10 @@ mod tests {
         let err = check_response_size(MAX_CONNECT_RESPONSE_BYTES as u64 + 1).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::LimitExceeded);
         assert!(!err.is_server_refusal());
+
+        assert!(check_call_response_size(0).is_ok());
+        assert!(check_call_response_size(MAX_CALL_RESPONSE_BYTES as u64).is_ok());
+        assert!(check_call_response_size(MAX_CALL_RESPONSE_BYTES as u64 + 1).is_err());
     }
 
     #[test]

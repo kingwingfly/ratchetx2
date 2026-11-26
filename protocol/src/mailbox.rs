@@ -16,6 +16,9 @@ pub use proto::*;
 #[cfg(feature = "server")]
 #[allow(deprecated)]
 pub use server::{MailboxLimits, MailboxServer};
+#[cfg(all(feature = "server", feature = "pq"))]
+#[allow(deprecated)]
+pub(crate) use server::{hash_delivery_tokens, page_envelopes};
 
 /// Length of a delivery token.
 pub const DELIVERY_TOKEN_LENGTH: usize = 16;
@@ -116,26 +119,58 @@ mod server {
         }
     }
 
+    pub(crate) fn hash_delivery_tokens(delivered: &[Bytes]) -> Result<Vec<[u8; 32]>> {
+        delivered
+            .iter()
+            .map(|token| {
+                let token: [u8; DELIVERY_TOKEN_LENGTH] = fixed(token)?;
+                Ok(Sha256::digest(token).into())
+            })
+            .collect()
+    }
+
+    pub(crate) fn page_envelopes<E: prost::Message>(
+        stored: Vec<storage::StoredMessage>,
+        max_size: usize,
+        build: impl Fn(storage::StoredMessage) -> E,
+    ) -> Vec<E> {
+        let mut messages = Vec::with_capacity(stored.len());
+        let mut size = 0usize;
+        for stored in stored {
+            let envelope = build(stored);
+            size = size.saturating_add(prost::encoding::message::encoded_len(1, &envelope));
+            if !messages.is_empty() && size > max_size {
+                break;
+            }
+            messages.push(envelope);
+        }
+        messages
+    }
+
     impl<S: LocalMailboxStore> LocalMailbox for MailboxServer<S> {
         /// Append a message to its queue.
         async fn push(&self, request: PushRequest) -> Result<PushResponse> {
             let (sender, recipient) = (fixed(&request.sender)?, fixed(&request.recipient)?);
+            crate::check_canonical_key(&sender)?;
+            crate::check_canonical_key(&recipient)?;
             let message = request.message.ok_or(ErrorKind::Malformed)?;
             if message.header.len() > self.limits.max_header_size {
                 return Err(ErrorKind::LimitExceeded.into());
             }
-            let initial_message = request
-                .initial_message
-                .map(|initial_message| Bytes::from(initial_message.encode_to_vec()));
-            if initial_message
-                .as_ref()
-                .is_some_and(|im| im.len() > self.limits.max_initial_message_size)
-            {
-                return Err(ErrorKind::LimitExceeded.into());
-            }
-            let size = message.header.len()
-                + message.content.len()
-                + initial_message.as_ref().map_or(0, Bytes::len);
+            let initial_message = match request.initial_message {
+                Some(initial_message) => {
+                    if initial_message.encoded_len() > self.limits.max_initial_message_size {
+                        return Err(ErrorKind::LimitExceeded.into());
+                    }
+                    Some(Bytes::from(initial_message.encode_to_vec()))
+                }
+                None => None,
+            };
+            let size = message
+                .header
+                .len()
+                .saturating_add(message.content.len())
+                .saturating_add(initial_message.as_ref().map_or(0, Bytes::len));
             if size > self.limits.max_message_size {
                 return Err(ErrorKind::LimitExceeded.into());
             }
@@ -161,18 +196,13 @@ mod server {
         /// the queue.
         async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
             let (sender, recipient) = (fixed(&request.sender)?, fixed(&request.recipient)?);
+            crate::check_canonical_key(&sender)?;
+            crate::check_canonical_key(&recipient)?;
             if request.delivered.len() > MAX_DELIVERED {
                 return Err(ErrorKind::LimitExceeded.into());
             }
             if !request.delivered.is_empty() {
-                let hashes = request
-                    .delivered
-                    .iter()
-                    .map(|token| {
-                        let token: [u8; DELIVERY_TOKEN_LENGTH] = fixed(token)?;
-                        Ok(Sha256::digest(token).into())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let hashes = hash_delivery_tokens(&request.delivered)?;
                 self.store
                     .delete_delivered(&sender, &recipient, &hashes)
                     .await?;
@@ -187,10 +217,8 @@ mod server {
                 .await?;
             // Count the encoded size too, so a few large messages cannot make a page too
             // large for the transport; the first message always fits, so fetching progresses.
-            let mut messages = Vec::with_capacity(stored.len());
-            let mut size = 0;
-            for stored in stored {
-                let envelope = Envelope {
+            let messages = page_envelopes(stored, self.limits.max_message_size, |stored| {
+                Envelope {
                     sequence: stored.sequence,
                     // None once its content expired, which the recipient goes past.
                     message: stored.content.map(|content| EncryptedMessage {
@@ -201,13 +229,8 @@ mod server {
                     initial_message: stored
                         .initial_message
                         .and_then(|bytes| InitialMessage::decode(bytes).ok()),
-                };
-                size += prost::encoding::message::encoded_len(1, &envelope);
-                if !messages.is_empty() && size > self.limits.max_message_size {
-                    break;
                 }
-                messages.push(envelope);
-            }
+            });
             Ok(FetchResponse { messages })
         }
     }
@@ -219,13 +242,17 @@ mod server {
 
         use super::*;
 
-        const ALICE: [u8; 32] = [1; 32];
-        const BOB: [u8; 32] = [2; 32];
+        fn alice() -> [u8; 32] {
+            crate::test_public_key(1)
+        }
+        fn bob() -> [u8; 32] {
+            crate::test_public_key(2)
+        }
 
         fn push(content: &'static [u8]) -> PushRequest {
             PushRequest {
-                sender: Bytes::from_static(&ALICE),
-                recipient: Bytes::from_static(&BOB),
+                sender: Bytes::copy_from_slice(&alice()),
+                recipient: Bytes::copy_from_slice(&bob()),
                 message: Some(EncryptedMessage {
                     header: Bytes::from_static(b"header"),
                     content: Bytes::from_static(content),
@@ -299,7 +326,7 @@ mod server {
         async fn messages_keep_their_initial_message() {
             let server = MailboxServer::new(MemoryStore::default());
             let initial_message = InitialMessage {
-                identity_key: Bytes::from_static(&ALICE),
+                identity_key: Bytes::copy_from_slice(&alice()),
                 ..InitialMessage::default()
             };
             let pushed = server
@@ -316,8 +343,8 @@ mod server {
 
         fn fetch(after: u64, limit: u32) -> FetchRequest {
             FetchRequest {
-                sender: Bytes::from_static(&ALICE),
-                recipient: Bytes::from_static(&BOB),
+                sender: Bytes::copy_from_slice(&alice()),
+                recipient: Bytes::copy_from_slice(&bob()),
                 after,
                 limit,
                 delivered: vec![],
@@ -372,7 +399,7 @@ mod server {
             // Oversized carried initial message (> 8 KiB) fails.
             let big_initial = PushRequest {
                 initial_message: Some(InitialMessage {
-                    identity_key: Bytes::from_static(&ALICE),
+                    identity_key: Bytes::copy_from_slice(&alice()),
                     first_message: Some(EncryptedMessage {
                         header: Bytes::from(vec![0; 64]),
                         content: Bytes::from(vec![0; MAX_INITIAL_MESSAGE_SIZE + 1]),

@@ -1,16 +1,27 @@
-#! /bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-export TERM=xterm-256color
+export TERM="${TERM:-xterm-256color}"
 
-# Statements waiting to be executed
-statements=(
-    "cargo publish -p $1"
-)
+if [ "$#" -lt 1 ] || [ -z "$1" ]; then
+    echo "Usage: $0 <crate-name> [cargo-publish-args...]" >&2
+    exit 2
+fi
 
-# loop echo and executing statements
-for statement in "${statements[@]}"; do
-    echo "$(tput setaf 3)$statement$(tput sgr0)"
-    eval $statement
+crate="$1"
+shift
+
+YELLOW=""
+RESET=""
+if command -v tput >/dev/null 2>&1; then
+    YELLOW="$(tput setaf 3 || true)"
+    RESET="$(tput sgr0 || true)"
+fi
+
+run() {
+    printf '%s%s%s\n' "$YELLOW" "$*" "$RESET"
+    "$@"
     echo
-done
+}
+
+run cargo publish --locked -p "$crate" "$@"

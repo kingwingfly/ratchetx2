@@ -11,12 +11,12 @@ use sha2::{Digest, Sha256};
 use storage::MAX_SAFE_INTEGER;
 use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
 use worker::{
-    Date, Request, Response, Result, WebSocket, WebSocketIncomingMessage, WebSocketPair,
-    console_error, js_sys,
+    Date, Request, Response, Result, SqlStorage, WebSocket, WebSocketIncomingMessage,
+    WebSocketPair, console_error, js_sys,
 };
 
-use super::{Identity, PendingExpiry, rows::CountRow, schema::SCHEMA_SEEN_SUBSCRIBES};
-use crate::objects::checked_integer;
+use super::{AlarmUpdate, Identity, rows::CountRow, schema::SCHEMA_SEEN_SUBSCRIBES};
+use crate::objects::sql::{exec, params, query_one};
 
 /// Internal header set to `"1"` when deployment password auth is satisfied (either `PASSWORD`
 /// is not configured, or the request carried a valid sign-in cookie).
@@ -27,6 +27,9 @@ pub const HEADER_PENDING_IDENTITY: &str = "x-e2ee-pending-identity";
 /// Forwarded by the Worker so older Durable Object instances during rolling deploys continue
 /// accepting v2 subscribers seamlessly.
 pub const HEADER_SUBSCRIBE_AUDIENCE: &str = "x-e2ee-subscribe-audience";
+/// Internal header carrying the sign-in cookie's expiry timestamp (ms since Unix epoch) so
+/// hibernated WebSockets are closed once the session expires.
+pub const HEADER_SESSION_EXPIRES: &str = "x-e2ee-session-expires";
 /// Retired internal header once used for query-param verified `SubscribeRequest` signatures.
 /// Kept as a constant so the Worker strips any client-spoofed header before forwarding to an
 /// older Durable Object instance during a rolling deploy.
@@ -53,10 +56,10 @@ const MAX_WEBSOCKETS: usize = 16;
 /// Maximum concurrent unauthenticated first-frame-auth pending WebSockets per Identity DO.
 const MAX_PENDING_WEBSOCKETS: usize = 8;
 /// Maximum time (in ms) a first-frame-auth WebSocket may stay unauthenticated.
-const MAX_UNAUTH_AGE_MS: f64 = 5_000.0;
+const MAX_UNAUTH_AGE_MS: u64 = 5_000;
 /// Maximum bytes accepted in an authentication WebSocket frame.
 const MAX_AUTH_FRAME_BYTES: usize = 1536;
-/// Maximum unexpired subscription signatures stored by one identity.
+/// Maximum unexpired subscription replay entries stored by one identity.
 const MAX_SEEN_SUBSCRIBES: usize = 256;
 
 #[wasm_bindgen]
@@ -83,8 +86,26 @@ struct WsClose {
     reason: &'static str,
 }
 
-fn deployment_auth_header_satisfied(value: Option<&str>) -> bool {
-    value == Some("1")
+impl WsClose {
+    const fn new(code: u16, reason: &'static str) -> Self {
+        Self { code, reason }
+    }
+}
+
+fn reject(socket: &WebSocket, close: WsClose) {
+    let _ = socket.close(Some(close.code), Some(close.reason));
+}
+
+/// Computes the replay-protection key over `identity || audience || timestamp` rather than raw
+/// signature bytes, preventing signature malleability replays.
+fn subscribe_replay_key(identity: &[u8; 32], audience: &str, timestamp: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"notify.v2/replay\0");
+    hasher.update(identity);
+    hasher.update((audience.len() as u32).to_be_bytes());
+    hasher.update(audience.as_bytes());
+    hasher.update(timestamp.to_be_bytes());
+    crate::hex(&hasher.finalize())
 }
 
 /// Validates a first-frame [`SubscribeRequest`]: requires an audience-bound v2 request
@@ -94,33 +115,47 @@ fn verify_first_frame_subscribe(
     expected_identity: &[u8],
     expected_audience: &str,
     now_ms: u64,
-) -> std::result::Result<[u8; 64], WsClose> {
+) -> std::result::Result<([u8; 32], String), WsClose> {
     if !subscription.is_audience_bound() {
-        return Err(WsClose {
-            code: LEGACY_V1_WS_CLOSE_CODE,
-            reason: LEGACY_V1_WS_CLOSE_REASON,
-        });
+        return Err(WsClose::new(
+            LEGACY_V1_WS_CLOSE_CODE,
+            LEGACY_V1_WS_CLOSE_REASON,
+        ));
     }
     let audience = crate::subscribe_audience(expected_audience.to_owned());
-    let identity_key =
-        crate::verify_subscribe_request(subscription, &audience, now_ms).map_err(|_| WsClose {
-            code: 1008,
-            reason: "invalid subscription",
-        })?;
+    let identity_key = crate::verify_subscribe_request(subscription, &audience, now_ms)
+        .map_err(|_| WsClose::new(1008, "invalid subscription"))?;
     if identity_key.as_slice() != expected_identity {
-        return Err(WsClose {
-            code: 1008,
-            reason: "identity mismatch",
-        });
+        return Err(WsClose::new(1008, "identity mismatch"));
     }
-    <[u8; 64]>::try_from(subscription.signature.as_ref()).map_err(|_| WsClose {
-        code: 1008,
-        reason: "invalid signature",
-    })
+    Ok((identity_key, subscription.audience.clone()))
+}
+
+fn decode_auth_frame(
+    message: WebSocketIncomingMessage,
+) -> std::result::Result<SubscribeRequest, WsClose> {
+    let raw_bytes = match message {
+        WebSocketIncomingMessage::Binary(bytes) => {
+            if bytes.len() > MAX_AUTH_FRAME_BYTES {
+                return Err(WsClose::new(1008, "frame too large"));
+            }
+            bytes
+        }
+        WebSocketIncomingMessage::String(text) => {
+            if text.len() > (MAX_AUTH_FRAME_BYTES * 4).div_ceil(3) {
+                return Err(WsClose::new(1008, "frame too large"));
+            }
+            BASE64_URL_SAFE_NO_PAD
+                .decode(text.trim().as_bytes())
+                .map_err(|_| WsClose::new(1008, "malformed subscription"))?
+        }
+    };
+    SubscribeRequest::decode(raw_bytes.as_slice())
+        .map_err(|_| WsClose::new(1008, "malformed subscription"))
 }
 
 /// Per-WebSocket attachment stored via hibernation API.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct WsAttachment {
     opened_at: f64,
     authenticated: bool,
@@ -128,171 +163,208 @@ struct WsAttachment {
     expected_identity: Option<Vec<u8>>,
     #[serde(default)]
     expected_audience: Option<String>,
+    #[serde(default)]
+    session_expires: Option<u64>,
+}
+
+impl WsAttachment {
+    fn is_pending_expired(&self, now_ms: u64) -> bool {
+        !self.authenticated && (now_ms as f64) - self.opened_at > MAX_UNAUTH_AGE_MS as f64
+    }
+
+    fn is_session_expired(&self, now_ms: u64) -> bool {
+        self.session_expires.is_some_and(|exp| now_ms >= exp)
+    }
+
+    fn close_if_expired(&self, now_ms: u64) -> Option<WsClose> {
+        if self.is_session_expired(now_ms) {
+            Some(WsClose::new(1008, "session expired"))
+        } else if self.is_pending_expired(now_ms) {
+            Some(WsClose::new(1008, "auth timeout"))
+        } else {
+            None
+        }
+    }
+
+    fn next_deadline(&self) -> Option<u64> {
+        let pending_deadline = (!self.authenticated).then(|| {
+            (self.opened_at.max(0.0) as u64)
+                .saturating_add(MAX_UNAUTH_AGE_MS)
+                .saturating_add(1)
+        });
+        let session_deadline = self.session_expires.map(|exp| exp.saturating_add(1));
+        match (pending_deadline, session_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+fn check_subscribe_capacity(sql: &SqlStorage, replay_key: &str) -> Result<SubscribeRecordOutcome> {
+    let existing: CountRow = query_one(
+        sql,
+        "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
+        params![replay_key]?,
+    )?;
+    if existing.count > 0 {
+        return Ok(SubscribeRecordOutcome::Replayed);
+    }
+    let total: CountRow = query_one(sql, "SELECT count(*) AS count FROM seen_subscribes", vec![])?;
+    if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
+        return Ok(SubscribeRecordOutcome::CapacityExceeded);
+    }
+    Ok(SubscribeRecordOutcome::Fresh)
 }
 
 impl Identity {
+    /// Iterates live, unexpired sockets while closing any socket that is missing state, past its
+    /// sign-in cookie expiry, or past the pending first-frame auth deadline.
+    fn sockets(&self, now_ms: u64) -> impl Iterator<Item = (WebSocket, WsAttachment)> {
+        self.state
+            .get_websockets()
+            .into_iter()
+            .filter_map(move |socket| {
+                let Some(att) = read_ws_attachment(&socket) else {
+                    reject(&socket, WsClose::new(1008, "missing state"));
+                    return None;
+                };
+                if let Some(close) = att.close_if_expired(now_ms) {
+                    reject(&socket, close);
+                    return None;
+                }
+                Some((socket, att))
+            })
+    }
+
+    /// Prunes expired pending sockets, cookie-expired sockets, and stale authenticated sockets.
+    pub(super) fn prune_sockets(&self, now_ms: u64) {
+        let now_f64 = now_ms as f64;
+        for (socket, att) in self.sockets(now_ms) {
+            if att.authenticated && now_f64 - self.last_seen(&socket, &att) > STALE {
+                reject(&socket, WsClose::new(1001, "no pings"));
+            }
+        }
+    }
+
+    /// Earliest alarm deadline across currently open pending or cookie-bounded WebSockets.
+    pub(super) fn next_socket_deadline(&self) -> Option<u64> {
+        self.state
+            .get_websockets()
+            .into_iter()
+            .filter_map(|socket| read_ws_attachment(&socket)?.next_deadline())
+            .min()
+    }
+
     pub(super) async fn handle_websocket_message(
         &self,
         socket: WebSocket,
         message: WebSocketIncomingMessage,
     ) -> Result<()> {
-        let Some(mut attachment) = read_ws_attachment(&socket) else {
-            let _ = socket.close(Some(1008), Some("missing state"));
-            return Ok(());
-        };
-        if attachment.authenticated {
-            // Authenticated clients send nothing but pings (auto-responded).
-            return Ok(());
-        }
-        let now_f64 = js_sys::Date::now();
-        if now_f64 - attachment.opened_at > MAX_UNAUTH_AGE_MS {
-            let _ = socket.close(Some(1008), Some("auth timeout"));
-            return Ok(());
-        }
-        let (Some(expected_identity), Some(expected_audience)) = (
-            attachment.expected_identity.take(),
-            attachment.expected_audience.take(),
-        ) else {
-            let _ = socket.close(Some(1008), Some("unauthorized"));
-            return Ok(());
-        };
-        let raw_bytes = match message {
-            WebSocketIncomingMessage::Binary(bytes) => {
-                if bytes.len() > MAX_AUTH_FRAME_BYTES {
-                    let _ = socket.close(Some(1008), Some("frame too large"));
-                    return Ok(());
-                }
-                bytes
-            }
-            WebSocketIncomingMessage::String(text) => {
-                if text.len() > (MAX_AUTH_FRAME_BYTES * 4).div_ceil(3) {
-                    let _ = socket.close(Some(1008), Some("frame too large"));
-                    return Ok(());
-                }
-                match BASE64_URL_SAFE_NO_PAD.decode(text.trim().as_bytes()) {
-                    Ok(bytes) => bytes,
-                    Err(_) => {
-                        let _ = socket.close(Some(1008), Some("malformed subscription"));
-                        return Ok(());
-                    }
-                }
-            }
-        };
-        let Ok(subscription) = SubscribeRequest::decode(raw_bytes.as_slice()) else {
-            let _ = socket.close(Some(1008), Some("malformed subscription"));
-            return Ok(());
-        };
         let now_ms = Date::now().as_millis();
-        let sig = match verify_first_frame_subscribe(
-            &subscription,
-            &expected_identity,
-            &expected_audience,
-            now_ms,
-        ) {
-            Ok(sig) => sig,
-            Err(close) => {
-                let _ = socket.close(Some(close.code), Some(close.reason));
-                return Ok(());
-            }
+        let Some(mut attachment) = read_ws_attachment(&socket) else {
+            reject(&socket, WsClose::new(1008, "missing state"));
+            return Ok(());
         };
+        if let Some(close) = attachment.close_if_expired(now_ms) {
+            reject(&socket, close);
+            return Ok(());
+        }
+        if attachment.authenticated {
+            // Auto-response answers `"ping"` without waking the DO; close any other frame so an
+            // authenticated client cannot repeatedly wake the Durable Object with junk frames.
+            if !matches!(&message, WebSocketIncomingMessage::String(text) if text == PING) {
+                reject(&socket, WsClose::new(1008, "unexpected message"));
+            }
+            return Ok(());
+        }
+
+        let (subscription, identity_key, canonical_audience) =
+            match verify_pending_auth(&mut attachment, message, now_ms) {
+                Ok(verified) => verified,
+                Err(close) => {
+                    reject(&socket, close);
+                    return Ok(());
+                }
+            };
+        let replay_key =
+            subscribe_replay_key(&identity_key, &canonical_audience, subscription.timestamp);
         match self
-            .record_subscribe_signature(&sig, subscription.timestamp, now_ms)
+            .record_subscribe_replay(&replay_key, subscription.timestamp, now_ms)
             .await
         {
             Ok(SubscribeRecordOutcome::Fresh) => {}
             Ok(SubscribeRecordOutcome::CapacityExceeded) => {
-                let _ = socket.close(Some(1008), Some("too many recent subscriptions"));
+                reject(&socket, WsClose::new(1008, "too many recent subscriptions"));
                 return Ok(());
             }
             Ok(SubscribeRecordOutcome::Replayed) => {
-                let _ = socket.close(Some(1008), Some("replayed subscription"));
+                reject(&socket, WsClose::new(1008, "replayed subscription"));
                 return Ok(());
             }
             Err(error) => {
                 console_error!("cannot record subscription: {error}");
-                let _ = socket.close(Some(1011), Some("state error"));
+                reject(&socket, WsClose::new(1011, "state error"));
                 return Ok(());
             }
-        };
+        }
+
         attachment.authenticated = true;
-        attachment.opened_at = now_f64;
+        attachment.opened_at = now_ms as f64;
         if socket.serialize_attachment(&attachment).is_err() {
-            let _ = socket.close(Some(1011), Some("state error"));
+            reject(&socket, WsClose::new(1011, "state error"));
             return Ok(());
         }
         if socket.send_with_str(AUTH_OK).is_err() {
-            let _ = socket.close(Some(1011), Some("send error"));
+            reject(&socket, WsClose::new(1011, "send error"));
             return Ok(());
         }
-        self.prune_and_cap_authenticated(now_f64, MAX_WEBSOCKETS, Some(&socket));
+        if let Some(exp) = attachment.session_expires
+            && let Err(e) = self
+                .update_alarm(AlarmUpdate::PullEarlier(exp.saturating_add(1)))
+                .await
+        {
+            console_error!("cannot schedule session expiry alarm: {e}");
+        }
+        self.prune_and_cap_authenticated(now_ms, MAX_WEBSOCKETS, Some(&socket));
         Ok(())
     }
 
-    /// Keep the signature through the last millisecond at which verification can succeed.
-    async fn record_subscribe_signature(
+    /// Keep the replay key through the last millisecond at which verification can succeed.
+    async fn record_subscribe_replay(
         &self,
-        sig: &[u8; 64],
+        replay_key: &str,
         timestamp: u64,
         now_ms: u64,
     ) -> Result<SubscribeRecordOutcome> {
         let expires_at = timestamp
             .saturating_add(MAX_CLOCK_SKEW)
             .min(MAX_SAFE_INTEGER);
-        let sig_hash = crate::hex(&Sha256::digest(sig));
-        let now_val = checked_integer(now_ms)?;
         let precheck = self.transaction_sync(|sql| {
             sql.exec(SCHEMA_SEEN_SUBSCRIBES, None)?;
-            sql.exec(
+            exec(
+                sql,
                 "DELETE FROM seen_subscribes WHERE expires_at < ?",
-                vec![now_val.clone()],
+                params![now_ms]?,
             )?;
-            let existing: CountRow = sql
-                .exec(
-                    "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
-                    vec![sig_hash.as_str().into()],
-                )?
-                .one()?;
-            if existing.count > 0 {
-                return Ok(SubscribeRecordOutcome::Replayed);
-            }
-            let total: CountRow = sql
-                .exec("SELECT count(*) AS count FROM seen_subscribes", None)?
-                .one()?;
-            if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
-                return Ok(SubscribeRecordOutcome::CapacityExceeded);
-            }
-            Ok(SubscribeRecordOutcome::Fresh)
+            check_subscribe_capacity(sql, replay_key)
         })?;
+        self.seen_subscribes_ready.set(true);
         if !matches!(precheck, SubscribeRecordOutcome::Fresh) {
             return Ok(precheck);
         }
         // Arm the expiry alarm BEFORE inserting the row so a transient alarm error cannot leave
         // an unexpiring `seen_subscribes` record behind.
-        self.set_expiry_alarm(
-            false,
-            Some(PendingExpiry::Subscribe(expires_at.saturating_add(1))),
-        )
-        .await?;
-        let expires_val = checked_integer(expires_at)?;
+        self.update_alarm(AlarmUpdate::PullEarlier(expires_at.saturating_add(1)))
+            .await?;
         self.transaction_sync(|sql| {
-            let existing: CountRow = sql
-                .exec(
-                    "SELECT count(*) AS count FROM seen_subscribes WHERE sig_hash = ?",
-                    vec![sig_hash.as_str().into()],
-                )?
-                .one()?;
-            if existing.count > 0 {
-                return Ok(SubscribeRecordOutcome::Replayed);
+            let outcome = check_subscribe_capacity(sql, replay_key)?;
+            if !matches!(outcome, SubscribeRecordOutcome::Fresh) {
+                return Ok(outcome);
             }
-            let total: CountRow = sql
-                .exec("SELECT count(*) AS count FROM seen_subscribes", None)?
-                .one()?;
-            if total.count >= MAX_SEEN_SUBSCRIBES as u64 {
-                return Ok(SubscribeRecordOutcome::CapacityExceeded);
-            }
-            sql.exec(
+            exec(
+                sql,
                 "INSERT INTO seen_subscribes (sig_hash, expires_at) VALUES (?, ?)",
-                vec![sig_hash.as_str().into(), expires_val],
+                params![replay_key, expires_at]?,
             )?;
             Ok(SubscribeRecordOutcome::Fresh)
         })
@@ -305,11 +377,8 @@ impl Identity {
     /// [`MAX_WEBSOCKETS`], evicting the oldest authenticated socket only when an authenticated
     /// connection completes verification.
     pub(super) async fn accept_websocket(&self, request: &Request) -> Result<Response> {
-        let now_f64 = js_sys::Date::now();
-        let deployment_authenticated = deployment_auth_header_satisfied(
-            request.headers().get(HEADER_DEPLOYMENT_AUTH)?.as_deref(),
-        );
-        if !deployment_authenticated {
+        let now_ms = Date::now().as_millis();
+        if request.headers().get(HEADER_DEPLOYMENT_AUTH)?.as_deref() != Some("1") {
             return Response::error("sign in to this server to use it", 403);
         }
         let Some(id_hex) = request.headers().get(HEADER_PENDING_IDENTITY)? else {
@@ -321,20 +390,38 @@ impl Identity {
         let Ok(audience) = crate::server_id(&self.env, request) else {
             return Response::error("malformed subscription audience", 400);
         };
-        if self.prune_and_count_pending(now_f64) >= MAX_PENDING_WEBSOCKETS {
+        let session_expires = match request.headers().get(HEADER_SESSION_EXPIRES)? {
+            Some(raw) => {
+                let Ok(expires) = raw.parse::<u64>() else {
+                    return Response::error("malformed session expiry", 400);
+                };
+                if expires <= now_ms {
+                    return Response::error("session expired", 403);
+                }
+                Some(expires)
+            }
+            None => None,
+        };
+        if self.prune_and_count_pending(now_ms) >= MAX_PENDING_WEBSOCKETS {
             return Response::error("too many pending connections", 429);
         }
+        // Pull the alarm earlier so idle pending sockets are always closed after MAX_UNAUTH_AGE_MS
+        // even if no further events ever arrive on this Identity DO.
+        let pending_deadline = now_ms.saturating_add(MAX_UNAUTH_AGE_MS).saturating_add(1);
+        self.update_alarm(AlarmUpdate::PullEarlier(pending_deadline))
+            .await?;
+
         let attachment = WsAttachment {
-            opened_at: now_f64,
+            opened_at: now_ms as f64,
             authenticated: false,
             expected_identity: Some(id.to_vec()),
             expected_audience: Some(audience),
+            session_expires,
         };
-
         let pair = WebSocketPair::new()?;
         self.state.accept_web_socket(&pair.server);
         if let Err(e) = pair.server.serialize_attachment(&attachment) {
-            let _ = pair.server.close(Some(1011), Some("state error"));
+            reject(&pair.server, WsClose::new(1011, "state error"));
             return Err(e);
         }
         Response::from_websocket(pair.client)
@@ -342,49 +429,36 @@ impl Identity {
 
     /// Prunes expired pending sockets and sockets missing state, returning the remaining count of
     /// unauthenticated pending sockets. Never touches or evicts authenticated sockets.
-    fn prune_and_count_pending(&self, now: f64) -> usize {
-        let mut pending = 0usize;
-        for socket in self.state.get_websockets() {
-            let Some(att) = read_ws_attachment(&socket) else {
-                let _ = socket.close(Some(1008), Some("missing state"));
-                continue;
-            };
-            if !att.authenticated {
-                if now - att.opened_at > MAX_UNAUTH_AGE_MS {
-                    let _ = socket.close(Some(1008), Some("auth timeout"));
-                } else {
-                    pending += 1;
-                }
-            }
-        }
-        pending
+    fn prune_and_count_pending(&self, now_ms: u64) -> usize {
+        self.sockets(now_ms)
+            .filter(|(_, att)| !att.authenticated)
+            .count()
     }
 
     /// Prunes stale authenticated sockets, expired pending sockets, and sockets missing state,
     /// then caps authenticated sockets at `keep_max` by closing the oldest authenticated sockets
     /// (never closing `preserve`, if supplied).
-    fn prune_and_cap_authenticated(&self, now: f64, keep_max: usize, preserve: Option<&WebSocket>) {
+    fn prune_and_cap_authenticated(
+        &self,
+        now_ms: u64,
+        keep_max: usize,
+        preserve: Option<&WebSocket>,
+    ) {
+        let now_f64 = now_ms as f64;
         let mut authenticated: Vec<(f64, WebSocket)> = Vec::new();
-        for socket in self.state.get_websockets() {
-            let Some(att) = read_ws_attachment(&socket) else {
-                let _ = socket.close(Some(1008), Some("missing state"));
-                continue;
-            };
+        for (socket, att) in self.sockets(now_ms) {
             if !att.authenticated {
-                if now - att.opened_at > MAX_UNAUTH_AGE_MS {
-                    let _ = socket.close(Some(1008), Some("auth timeout"));
-                }
                 continue;
             }
-            let is_preserved = preserve.is_some_and(|p| p.as_ref() == socket.as_ref());
-            let seen = self.last_seen(&socket);
-            if !is_preserved && seen.is_some_and(|s| now - s > STALE) {
-                let _ = socket.close(Some(1001), Some("no pings"));
+            if preserve.is_some_and(|p| p.as_ref() == socket.as_ref()) {
                 continue;
             }
-            if !is_preserved {
-                authenticated.push((seen.unwrap_or(0.0), socket));
+            let seen = self.last_seen(&socket, &att);
+            if now_f64 - seen > STALE {
+                reject(&socket, WsClose::new(1001, "no pings"));
+                continue;
             }
+            authenticated.push((seen, socket));
         }
         let effective_cap = if preserve.is_some() {
             keep_max.saturating_sub(1)
@@ -395,92 +469,73 @@ impl Identity {
             authenticated.sort_by(|a, b| a.0.total_cmp(&b.0));
             let to_close = authenticated.len() - effective_cap;
             for (_, socket) in authenticated.into_iter().take(to_close) {
-                let _ = socket.close(Some(1008), Some("too many connections"));
+                reject(&socket, WsClose::new(1008, "too many connections"));
             }
         }
     }
 
     /// Tell every authenticated subscriber of `notification`, failing closed on missing state and
-    /// pruning stale or unauthenticated timed-out sockets.
+    /// pruning stale, session-expired, or unauthenticated timed-out sockets.
     pub(super) fn notify(&self, notification: &Notification) {
         let notification = notification.encode_to_vec();
-        let now = js_sys::Date::now();
-        for socket in self.state.get_websockets() {
-            let Some(att) = read_ws_attachment(&socket) else {
-                let _ = socket.close(Some(1008), Some("missing state"));
-                continue;
-            };
+        let now_ms = Date::now().as_millis();
+        let now_f64 = now_ms as f64;
+        for (socket, att) in self.sockets(now_ms) {
             if !att.authenticated {
-                if now - att.opened_at > MAX_UNAUTH_AGE_MS {
-                    let _ = socket.close(Some(1008), Some("auth timeout"));
-                }
                 continue;
             }
-            if self
-                .last_seen(&socket)
-                .is_some_and(|seen| now - seen > STALE)
-            {
-                let _ = socket.close(Some(1001), Some("no pings"));
+            if now_f64 - self.last_seen(&socket, &att) > STALE {
+                reject(&socket, WsClose::new(1001, "no pings"));
                 continue;
             }
             let _ = socket.send_with_bytes(&notification);
         }
     }
 
-    fn last_seen(&self, socket: &WebSocket) -> Option<f64> {
+    fn last_seen(&self, socket: &WebSocket, att: &WsAttachment) -> f64 {
         let state: &AutoResponseState = self.state.as_raw().unchecked_ref();
         match state.get_websocket_auto_response_timestamp(socket.as_ref()) {
-            Ok(Some(pinged)) => Some(pinged.get_time()),
-            Ok(None) | Err(_) => read_ws_attachment(socket).map(|a| a.opened_at),
+            Ok(Some(pinged)) => pinged.get_time(),
+            Ok(None) | Err(_) => att.opened_at,
         }
     }
 }
 
-/// Reads the socket attachment, supporting both the [`WsAttachment`] struct and bare `f64`
-/// attachments from already-open hibernating sockets across worker deploys.
+fn verify_pending_auth(
+    attachment: &mut WsAttachment,
+    message: WebSocketIncomingMessage,
+    now_ms: u64,
+) -> std::result::Result<(SubscribeRequest, [u8; 32], String), WsClose> {
+    let (Some(expected_identity), Some(expected_audience)) = (
+        attachment.expected_identity.take(),
+        attachment.expected_audience.take(),
+    ) else {
+        return Err(WsClose::new(1008, "unauthorized"));
+    };
+    let subscription = decode_auth_frame(message)?;
+    let (identity_key, canonical_audience) = verify_first_frame_subscribe(
+        &subscription,
+        &expected_identity,
+        &expected_audience,
+        now_ms,
+    )?;
+    Ok((subscription, identity_key, canonical_audience))
+}
+
+/// Reads the socket attachment strictly as [`WsAttachment`] (failing closed if missing or legacy).
 fn read_ws_attachment(socket: &WebSocket) -> Option<WsAttachment> {
-    if let Ok(Some(att)) = socket.deserialize_attachment::<WsAttachment>() {
-        return Some(att);
-    }
     socket
-        .deserialize_attachment::<f64>()
+        .deserialize_attachment::<WsAttachment>()
         .ok()
         .flatten()
-        .map(|opened_at| WsAttachment {
-            opened_at,
-            authenticated: true,
-            expected_identity: None,
-            expected_audience: None,
-        })
 }
 
 #[cfg(test)]
 mod tests {
-    use prost::bytes::Bytes;
     use xeddsa::XEdDSAPrivateKey;
 
     use super::*;
-
-    fn legacy_unbound_subscribe(identity: &XEdDSAPrivateKey, timestamp: u64) -> SubscribeRequest {
-        let key = identity.compute_public_key().to_bytes();
-        let mut msg = b"notify.v1/subscribe".to_vec();
-        msg.extend_from_slice(&key);
-        msg.extend_from_slice(&timestamp.to_le_bytes());
-        SubscribeRequest {
-            identity_key: Bytes::copy_from_slice(&key),
-            timestamp,
-            signature: Bytes::copy_from_slice(&identity.sign(msg)),
-            audience: String::new(),
-        }
-    }
-
-    #[test]
-    fn deployment_auth_header_requires_exactly_one() {
-        assert!(deployment_auth_header_satisfied(Some("1")));
-        for value in [None, Some("0"), Some("true"), Some("1 ")] {
-            assert!(!deployment_auth_header_satisfied(value));
-        }
-    }
+    use crate::tests::legacy_unbound_subscribe;
 
     #[test]
     fn first_frame_rejects_unbound_legacy_v1_subscribe_with_4010() {
@@ -508,25 +563,21 @@ mod tests {
 
         let valid =
             SubscribeRequest::sign_for_audience(&alice, "https://Relay.Example", now).unwrap();
-        let sig = verify_first_frame_subscribe(&valid, &alice_key, "relay.example", now).unwrap();
-        assert_eq!(sig.as_slice(), valid.signature.as_ref());
+        let (verified_key, audience) =
+            verify_first_frame_subscribe(&valid, &alice_key, "relay.example", now).unwrap();
+        assert_eq!(verified_key, alice_key);
+        assert_eq!(audience, "relay.example");
 
         // Wrong audience -> 1008 invalid subscription.
         assert_eq!(
             verify_first_frame_subscribe(&valid, &alice_key, "other.example", now),
-            Err(WsClose {
-                code: 1008,
-                reason: "invalid subscription",
-            })
+            Err(WsClose::new(1008, "invalid subscription"))
         );
 
         // Wrong identity -> 1008 identity mismatch.
         assert_eq!(
             verify_first_frame_subscribe(&valid, &bob_key, "relay.example", now),
-            Err(WsClose {
-                code: 1008,
-                reason: "identity mismatch",
-            })
+            Err(WsClose::new(1008, "identity mismatch"))
         );
 
         // Stale timestamp -> 1008 invalid subscription.
@@ -537,10 +588,7 @@ mod tests {
                 "relay.example",
                 now + MAX_CLOCK_SKEW + 1
             ),
-            Err(WsClose {
-                code: 1008,
-                reason: "invalid subscription",
-            })
+            Err(WsClose::new(1008, "invalid subscription"))
         );
 
         // Tampered audience on a v1 signature -> 1008 invalid subscription (not 4010).
@@ -548,18 +596,74 @@ mod tests {
         tampered.audience = "relay.example".into();
         assert_eq!(
             verify_first_frame_subscribe(&tampered, &alice_key, "relay.example", now),
-            Err(WsClose {
-                code: 1008,
-                reason: "invalid subscription",
-            })
+            Err(WsClose::new(1008, "invalid subscription"))
+        );
+    }
+
+    #[test]
+    fn ws_attachment_tracks_pending_and_session_expiry_and_deadlines() {
+        let pending = WsAttachment {
+            opened_at: 10_000.0,
+            authenticated: false,
+            expected_identity: None,
+            expected_audience: None,
+            session_expires: Some(50_000),
+        };
+        assert_eq!(pending.close_if_expired(10_000 + MAX_UNAUTH_AGE_MS), None);
+        assert_eq!(
+            pending.close_if_expired(10_000 + MAX_UNAUTH_AGE_MS + 1),
+            Some(WsClose::new(1008, "auth timeout"))
+        );
+        assert_eq!(
+            pending.next_deadline(),
+            Some(10_000 + MAX_UNAUTH_AGE_MS + 1)
         );
 
-        // Non-default ports are preserved end-to-end.
-        let http_443 =
-            SubscribeRequest::sign_for_audience(&alice, "http://relay.example:443", now).unwrap();
-        assert!(
-            verify_first_frame_subscribe(&http_443, &alice_key, "relay.example:443", now).is_ok()
+        // Session expiry takes precedence when earlier than pending timeout.
+        let short_session = WsAttachment {
+            session_expires: Some(12_000),
+            ..pending.clone()
+        };
+        assert_eq!(short_session.next_deadline(), Some(12_001));
+        assert_eq!(
+            short_session.close_if_expired(12_000),
+            Some(WsClose::new(1008, "session expired"))
         );
-        assert!(verify_first_frame_subscribe(&http_443, &alice_key, "relay.example", now).is_err());
+
+        // Authenticated sockets ignore pending timeout and close at cookie expiry.
+        let authed = WsAttachment {
+            opened_at: 10_000.0,
+            authenticated: true,
+            expected_identity: None,
+            expected_audience: None,
+            session_expires: Some(50_000),
+        };
+        assert_eq!(authed.close_if_expired(49_999), None);
+        assert_eq!(
+            authed.close_if_expired(50_000),
+            Some(WsClose::new(1008, "session expired"))
+        );
+        assert_eq!(authed.next_deadline(), Some(50_001));
+
+        // Passwordless deployment (`session_expires: None`) never expires by session cookie.
+        let no_cookie = WsAttachment {
+            session_expires: None,
+            ..authed
+        };
+        assert_eq!(no_cookie.close_if_expired(u64::MAX), None);
+        assert_eq!(no_cookie.next_deadline(), None);
+    }
+
+    #[test]
+    fn subscribe_replay_key_binds_identity_audience_and_timestamp() {
+        let id_a = [1u8; 32];
+        let id_b = [2u8; 32];
+        let k1 = subscribe_replay_key(&id_a, "relay.example", 1_000);
+        let k2 = subscribe_replay_key(&id_a, "relay.example", 1_000);
+        assert_eq!(k1, k2);
+        assert_eq!(k1.len(), 64);
+        assert_ne!(k1, subscribe_replay_key(&id_b, "relay.example", 1_000));
+        assert_ne!(k1, subscribe_replay_key(&id_a, "other.example", 1_000));
+        assert_ne!(k1, subscribe_replay_key(&id_a, "relay.example", 1_001));
     }
 }

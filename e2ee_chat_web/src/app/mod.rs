@@ -65,10 +65,10 @@ pub fn App() -> impl IntoView {
     // Unread messages and requests show in the tab's title.
     Effect::new(move || {
         let unread: u32 = ui.contacts.with(|contacts| {
-            contacts
-                .iter()
-                .map(|contact| contact.unread + u32::from(contact.request))
-                .sum()
+            contacts.iter().fold(0u32, |acc, contact| {
+                acc.saturating_add(contact.unread)
+                    .saturating_add(u32::from(contact.request))
+            })
         });
         document().set_title(&match unread {
             0 => "ratchetx2 chat".to_string(),
@@ -268,13 +268,13 @@ fn ActivityList() -> impl IntoView {
 #[component]
 fn Welcome() -> impl IntoView {
     let ui = ui();
-    let key = move || {
+    let key = Memo::new(move |_| {
         ui.me.with(|me| {
             me.as_ref()
                 .map(|me| key_to_text(&me.key))
                 .unwrap_or_default()
         })
-    };
+    });
     let handshake = if !PqConfig::compiled_suites().is_empty() {
         "PQXDH / X3DH"
     } else {
@@ -295,7 +295,7 @@ fn Welcome() -> impl IntoView {
                 </p>
                 <div>
                     <div class="section-label">"Your identity key"</div>
-                    {move || view! { <Copyable text=key() what="your key" /> }}
+                    <Copyable text=key.into() what="your key" />
                     <div class="section-label">"Your invitation link"</div>
                     <InvitationLink />
                     <div class="row">
@@ -356,14 +356,21 @@ fn Dropzone() -> impl IntoView {
                 .is_some_and(|contact| !contact.request && !contact.is_quarantined())
     };
     let _ = window_event_listener(ev::dragenter, move |event| {
-        if accepts(&event) {
+        if drag_has_files(&event) {
             event.prevent_default();
-            depth.update(|depth| *depth += 1);
+            if accepts(&event) {
+                depth.update(|depth| *depth += 1);
+            }
         }
     });
     let _ = window_event_listener(ev::dragover, move |event| {
-        if accepts(&event) {
+        if drag_has_files(&event) {
             event.prevent_default();
+            if !accepts(&event)
+                && let Some(transfer) = event.data_transfer()
+            {
+                transfer.set_drop_effect("none");
+            }
         }
     });
     let _ = window_event_listener(ev::dragleave, move |_| {
@@ -371,9 +378,10 @@ fn Dropzone() -> impl IntoView {
     });
     let _ = window_event_listener(ev::drop, move |event| {
         depth.set(0);
-        if accepts(&event) {
+        if drag_has_files(&event) {
             event.prevent_default();
-            if let Some(peer) = ui.open.get_untracked()
+            if accepts(&event)
+                && let Some(peer) = ui.open.get_untracked()
                 && let Some(files) = event.data_transfer().and_then(|transfer| transfer.files())
             {
                 send_files_to(peer, files);

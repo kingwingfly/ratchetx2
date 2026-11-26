@@ -6,11 +6,13 @@
 //! against it.
 //!
 //! Each isolate throttles failed password attempts per client IP from Cloudflare's
-//! `CF-Connecting-IP` header. Requests without a usable address share one fallback bucket.
+//! `CF-Connecting-IP` header (normalizing IPv6 addresses to `/64` prefixes). Requests without a
+//! usable address share one fallback bucket.
 
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
+    net::{IpAddr, Ipv6Addr},
     time::Duration,
 };
 
@@ -47,7 +49,7 @@ thread_local! {
 }
 
 /// What a cookie says of who signed in.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
     /// Who: `password`, for the server's password.
     pub subject: String,
@@ -65,18 +67,49 @@ pub fn password_configured(env: &Env) -> bool {
 pub fn signed_in(request: &Request, env: &Env) -> Option<Claims> {
     let key = secret(env, AUTH_KEY)?;
     let header = request.headers().get("cookie").ok()??;
-    let value = header.split(';').find_map(|pair| {
+    verify_cookie(&key, &header, Date::now().as_millis())
+}
+
+/// Verifies the `__Host-e2ee-chat` cookie inside `cookie_header` against `key` and `now_ms`.
+pub(crate) fn verify_cookie(key: &str, cookie_header: &str, now_ms: u64) -> Option<Claims> {
+    if key.is_empty() {
+        return None;
+    }
+    let value = cookie_header.split(';').find_map(|pair| {
         let (name, value) = pair.trim().split_once('=')?;
-        (name == COOKIE).then_some(value)
+        (name == COOKIE).then_some(value.trim())
     })?;
-    let (claims, tag) = value.split_once('.')?;
-    let tag = BASE64_URL_SAFE_NO_PAD.decode(tag).ok()?;
-    mac(&key, b"cookie", claims.as_bytes())
+    let (claims_b64, tag_b64) = value.split_once('.')?;
+    let tag = BASE64_URL_SAFE_NO_PAD.decode(tag_b64).ok()?;
+    mac(key, b"cookie", claims_b64.as_bytes())
         .verify_slice(&tag)
         .ok()?;
-    let claims = BASE64_URL_SAFE_NO_PAD.decode(claims).ok()?;
-    let claims: Claims = serde_json::from_slice(&claims).ok()?;
-    (claims.expires > Date::now().as_millis()).then_some(claims)
+    let claims_bytes = BASE64_URL_SAFE_NO_PAD.decode(claims_b64).ok()?;
+    let claims: Claims = serde_json::from_slice(&claims_bytes).ok()?;
+    (claims.expires > now_ms).then_some(claims)
+}
+
+fn encode_cookie_value(key: &str, claims: &Claims) -> Result<String> {
+    let encoded = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+    let tag = mac(key, b"cookie", encoded.as_bytes())
+        .finalize()
+        .into_bytes();
+    Ok(format!("{encoded}.{}", BASE64_URL_SAFE_NO_PAD.encode(tag)))
+}
+
+/// Constant-time comparison of two secret tokens via HMAC verification (returns `false` when
+/// `expected` is empty).
+#[cfg(any(test, feature = "conformance"))]
+pub(crate) fn constant_time_secret_eq(expected: &str, presented: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let expected_mac = mac(expected, b"secret-token", expected.as_bytes())
+        .finalize()
+        .into_bytes();
+    mac(expected, b"secret-token", presented.as_bytes())
+        .verify_slice(&expected_mac)
+        .is_ok()
 }
 
 /// Answer the calls under `/auth`, from the page of this server only, as the cookie is kept to
@@ -99,47 +132,159 @@ pub async fn handle(request: Request, env: &Env) -> Result<Response> {
     }
 }
 
-/// Whether `request` comes from this server's own page:
+/// Whether `request` comes from this server's own page.
+fn same_origin(request: &Request) -> Result<bool> {
+    let sec_fetch_site = request.headers().get("sec-fetch-site")?;
+    let origin = request.headers().get("origin")?;
+    let referer = request.headers().get("referer")?;
+    let req_url = request.url()?;
+    Ok(same_origin_headers(
+        sec_fetch_site.as_deref(),
+        origin.as_deref(),
+        referer.as_deref(),
+        &req_url,
+    ))
+}
+
+/// Pure origin check for `/auth` POST requests:
 /// 1. If `Sec-Fetch-Site` is present, requires `same-origin` or `none`.
 /// 2. If `Sec-Fetch-Site` is absent, falls back to checking `Origin` (and then `Referer`) against
 ///    the request's own scheme, host, and effective port.
 /// 3. Non-browser clients omitting all three headers are allowed.
-fn same_origin(request: &Request) -> Result<bool> {
-    if let Some(site) = request.headers().get("sec-fetch-site")? {
-        return Ok(matches!(site.as_str(), "same-origin" | "none"));
+fn same_origin_headers(
+    sec_fetch_site: Option<&str>,
+    origin: Option<&str>,
+    referer: Option<&str>,
+    req_url: &Url,
+) -> bool {
+    if let Some(site) = sec_fetch_site {
+        return matches!(site, "same-origin" | "none");
     }
-    let req_url = request.url()?;
-    if let Some(origin) = request.headers().get("origin")? {
-        return Ok(url_matches_origin(&origin, &req_url));
+    if let Some(origin) = origin {
+        return url_matches_origin(origin, req_url);
     }
-    if let Some(referer) = request.headers().get("referer")? {
-        return Ok(url_matches_origin(&referer, &req_url));
+    if let Some(referer) = referer {
+        return url_matches_origin(referer, req_url);
     }
-    Ok(true)
+    true
 }
 
-/// Returns `true` iff `candidate` parses as a URL with the exact same scheme, host, and effective
-/// port as `target`.
-fn url_matches_origin(candidate: &str, target: &Url) -> bool {
+/// Returns `true` iff `candidate` parses as an `http(s)` URL with the exact same scheme, host, and
+/// effective port as `target`.
+pub(crate) fn url_matches_origin(candidate: &str, target: &Url) -> bool {
     let Ok(parsed) = Url::parse(candidate) else {
         return false;
     };
-    parsed.scheme() == target.scheme()
+    matches!(parsed.scheme(), "http" | "https")
+        && parsed.scheme() == target.scheme()
         && parsed.host_str() == target.host_str()
         && parsed.port_or_known_default() == target.port_or_known_default()
 }
 
+/// Returns `true` iff a WebSocket upgrade's `Origin` header matches `target` (treating `ws` as
+/// `http` and `wss` as `https` on `target`, while requiring `origin` itself to be `http(s)`).
+pub(crate) fn ws_origin_matches(origin: &str, target: &Url) -> bool {
+    let Ok(parsed) = Url::parse(origin) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let target_scheme = match target.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
+    };
+    parsed.scheme() == target_scheme
+        && parsed.host_str() == target.host_str()
+        && parsed.port_or_known_default() == target.port_or_known_default()
+}
+
+/// Returns `true` iff a WebSocket upgrade passes Origin validation:
+/// - Non-browser clients omitting `Origin` are allowed.
+/// - Browser same-origin requests (`Sec-Fetch-Site: same-origin`, including dev proxies such as
+///   `trunk serve`) are allowed.
+/// - Otherwise `Origin` must match either `request_url` or the configured `SERVER_ID` (keeping
+///   scheme requirements intact so an `http://` origin cannot match an `https://` server).
+pub(crate) fn ws_upgrade_origin_allowed(
+    origin: Option<&str>,
+    sec_fetch_site: Option<&str>,
+    request_url: &Url,
+    configured_server_id: Option<&str>,
+) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    if sec_fetch_site == Some("same-origin") {
+        return true;
+    }
+    if ws_origin_matches(origin, request_url) {
+        return true;
+    }
+    let Some(server_id) = configured_server_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    if server_id.contains("://") {
+        return Url::parse(server_id).is_ok_and(|url| ws_origin_matches(origin, &url));
+    }
+    let Ok(parsed_origin) = Url::parse(origin) else {
+        return false;
+    };
+    let expected_scheme = match request_url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
+    };
+    if !matches!(parsed_origin.scheme(), "http" | "https")
+        || parsed_origin.scheme() != expected_scheme
+    {
+        return false;
+    }
+    let Ok(origin_audience) =
+        protocol::normalize_audience(&parsed_origin.origin().ascii_serialization())
+    else {
+        return false;
+    };
+    let Ok(expected_audience) = protocol::normalize_audience(server_id) else {
+        return false;
+    };
+    origin_audience == expected_audience
+}
+
 fn client_ip_key(request: &Request) -> String {
-    request
-        .headers()
-        .get("CF-Connecting-IP")
-        .ok()
-        .flatten()
-        .as_deref()
+    let header = request.headers().get("CF-Connecting-IP").ok().flatten();
+    normalize_client_ip_key(header.as_deref())
+}
+
+/// Normalizes `CF-Connecting-IP` into a rate-limit bucket key:
+/// - IPv4 addresses are preserved canonically.
+/// - IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) fold into their IPv4 bucket.
+/// - IPv6 addresses are masked to their `/64` prefix so a single `/64` holder cannot rotate
+///   through 2^64 independent rate-limit buckets.
+/// - Missing, empty, or overly long headers share `"<unknown>"`.
+fn normalize_client_ip_key(header: Option<&str>) -> String {
+    let Some(raw) = header
         .map(str::trim)
         .filter(|ip| !ip.is_empty() && ip.len() <= 128)
-        .unwrap_or("<unknown>")
-        .to_owned()
+    else {
+        return "<unknown>".to_owned();
+    };
+    match raw.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.to_string(),
+        Ok(IpAddr::V6(v6)) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                v4.to_string()
+            } else {
+                let [a, b, c, d, ..] = v6.segments();
+                let prefix = Ipv6Addr::new(a, b, c, d, 0, 0, 0, 0);
+                format!("{prefix}/64")
+            }
+        }
+        Err(_) => raw.to_owned(),
+    }
 }
 
 #[derive(Default)]
@@ -233,6 +378,7 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
             503,
         );
     };
+    // Enforce rate limiting BEFORE buffering the request body.
     let client_key = client_ip_key(&request);
     let now = Date::now().as_millis();
     if FAILED_ATTEMPTS.with_borrow_mut(|tracker| tracker.recent_failures(&client_key, now))
@@ -265,13 +411,9 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
             .as_millis()
             .saturating_add(lasts.saturating_mul(1000)),
     };
-    let encoded = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
-    let tag = mac(&key, b"cookie", encoded.as_bytes())
-        .finalize()
-        .into_bytes();
     let cookie = format!(
-        "{COOKIE}={encoded}.{}; {}",
-        BASE64_URL_SAFE_NO_PAD.encode(tag),
+        "{COOKIE}={}; {}",
+        encode_cookie_value(&key, &claims)?,
         attributes(lasts)
     );
     answer(Some(&claims), Some(cookie))
@@ -279,7 +421,7 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
 
 /// The secret `name`, unless it is unset or empty: with an empty `AUTH_KEY`, anyone could sign a
 /// cookie, and with an empty `PASSWORD`, sign in with nothing.
-fn secret(env: &Env, name: &str) -> Option<String> {
+pub(crate) fn secret(env: &Env, name: &str) -> Option<String> {
     env.secret(name)
         .ok()
         .map(|secret| secret.to_string())
@@ -319,6 +461,214 @@ fn answer(claims: Option<&Claims>, cookie: Option<String>) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verify_cookie_accepts_valid_signed_cookie_and_rejects_tampering_or_expiry() {
+        let key = "test-signing-key";
+        let claims = Claims {
+            subject: "password".to_string(),
+            expires: 10_000,
+        };
+        let value = encode_cookie_value(key, &claims).unwrap();
+        let header = format!("other=1; {COOKIE}={value}; theme=dark");
+
+        assert_eq!(verify_cookie(key, &header, 9_999), Some(claims));
+        // Expired at boundary and past boundary.
+        assert_eq!(verify_cookie(key, &header, 10_000), None);
+        assert_eq!(verify_cookie(key, &header, 10_001), None);
+        // Wrong key or empty key.
+        assert_eq!(verify_cookie("wrong-key", &header, 5_000), None);
+        assert_eq!(verify_cookie("", &header, 5_000), None);
+        // Wrong cookie name.
+        assert_eq!(
+            verify_cookie(key, &format!("e2ee-chat={value}"), 5_000),
+            None
+        );
+        // Tampered payload or tag.
+        let (payload, tag) = value.split_once('.').unwrap();
+        let tampered_tag = format!("{COOKIE}={payload}.{}A", &tag[..tag.len() - 1]);
+        assert_eq!(verify_cookie(key, &tampered_tag, 5_000), None);
+        let tampered_payload = format!("{COOKIE}={}A.{tag}", &payload[..payload.len() - 1]);
+        assert_eq!(verify_cookie(key, &tampered_payload, 5_000), None);
+        // Missing dot / malformed.
+        assert_eq!(
+            verify_cookie(key, &format!("{COOKIE}=not-a-cookie"), 5_000),
+            None
+        );
+    }
+
+    #[test]
+    fn same_origin_and_url_matches_origin_enforce_browser_and_ws_origin_rules() {
+        let target = Url::parse("https://chat.example/auth/password").unwrap();
+        let target_port = Url::parse("https://chat.example:8443/auth/password").unwrap();
+
+        // Sec-Fetch-Site takes precedence over Origin/Referer.
+        assert!(same_origin_headers(
+            Some("same-origin"),
+            Some("https://evil.example"),
+            None,
+            &target
+        ));
+        assert!(same_origin_headers(Some("none"), None, None, &target));
+        assert!(!same_origin_headers(
+            Some("cross-site"),
+            Some("https://chat.example"),
+            None,
+            &target
+        ));
+        assert!(!same_origin_headers(
+            Some("same-site"),
+            Some("https://chat.example"),
+            None,
+            &target
+        ));
+
+        // Fallback to Origin when Sec-Fetch-Site is absent.
+        assert!(same_origin_headers(
+            None,
+            Some("https://chat.example"),
+            None,
+            &target
+        ));
+        assert!(same_origin_headers(
+            None,
+            Some("https://chat.example:443"),
+            None,
+            &target
+        ));
+        assert!(!same_origin_headers(
+            None,
+            Some("http://chat.example"),
+            None,
+            &target
+        ));
+        assert!(!same_origin_headers(
+            None,
+            Some("https://chat.example:8443"),
+            None,
+            &target
+        ));
+        assert!(!same_origin_headers(None, Some("null"), None, &target));
+        assert!(!same_origin_headers(
+            None,
+            Some("https://evil.example"),
+            Some("https://chat.example/"),
+            &target
+        ));
+
+        // Fallback to Referer when both Sec-Fetch-Site and Origin are absent.
+        assert!(same_origin_headers(
+            None,
+            None,
+            Some("https://chat.example/chat?id=1"),
+            &target
+        ));
+        assert!(!same_origin_headers(
+            None,
+            None,
+            Some("https://evil.example/chat"),
+            &target
+        ));
+        assert!(same_origin_headers(
+            None,
+            None,
+            Some("https://chat.example:8443/app"),
+            &target_port
+        ));
+
+        // Non-browser clients omitting all three headers are allowed.
+        assert!(same_origin_headers(None, None, None, &target));
+
+        // WebSocket Origin validation handles http/ws and https/wss equivalence.
+        let wss_url = Url::parse("wss://chat.example/notifications?identity=00").unwrap();
+        let https_url = Url::parse("https://chat.example/notifications?identity=00").unwrap();
+        let ws_local = Url::parse("ws://localhost:8787/notifications?identity=00").unwrap();
+        assert!(ws_origin_matches("https://chat.example", &wss_url));
+        assert!(ws_origin_matches("https://chat.example:443", &https_url));
+        assert!(ws_origin_matches("http://localhost:8787", &ws_local));
+        assert!(!ws_origin_matches("http://chat.example", &wss_url));
+        assert!(!ws_origin_matches("https://evil.example", &https_url));
+        assert!(!ws_origin_matches("wss://chat.example", &wss_url));
+        assert!(!ws_origin_matches("null", &https_url));
+
+        // WebSocket upgrade policy: allows omitted Origin, Sec-Fetch-Site: same-origin (e.g.
+        // trunk serve dev proxy), exact request URL match, or configured SERVER_ID match.
+        let wrangler_dev = Url::parse("http://localhost:8787/notifications?identity=00").unwrap();
+        assert!(ws_upgrade_origin_allowed(None, None, &https_url, None));
+        assert!(ws_upgrade_origin_allowed(
+            Some("http://localhost:8080"),
+            Some("same-origin"),
+            &wrangler_dev,
+            None
+        ));
+        assert!(!ws_upgrade_origin_allowed(
+            Some("http://localhost:8080"),
+            Some("cross-site"),
+            &wrangler_dev,
+            None
+        ));
+        assert!(ws_upgrade_origin_allowed(
+            Some("https://public.example"),
+            None,
+            &https_url,
+            Some("https://public.example")
+        ));
+        assert!(ws_upgrade_origin_allowed(
+            Some("https://public.example"),
+            None,
+            &https_url,
+            Some("public.example")
+        ));
+        // Scheme downgrade against SERVER_ID is rejected.
+        assert!(!ws_upgrade_origin_allowed(
+            Some("http://public.example"),
+            None,
+            &https_url,
+            Some("https://public.example")
+        ));
+        assert!(!ws_upgrade_origin_allowed(
+            Some("http://public.example"),
+            None,
+            &https_url,
+            Some("public.example")
+        ));
+        assert!(!ws_upgrade_origin_allowed(
+            Some("https://evil.example"),
+            Some("cross-site"),
+            &https_url,
+            Some("https://public.example")
+        ));
+    }
+
+    #[test]
+    fn client_ip_key_normalizes_ipv6_to_slash_64_and_folds_ipv4_mapped() {
+        assert_eq!(normalize_client_ip_key(Some("192.0.2.1")), "192.0.2.1");
+        assert_eq!(normalize_client_ip_key(Some(" 192.0.2.1 ")), "192.0.2.1");
+        assert_eq!(
+            normalize_client_ip_key(Some("::ffff:192.0.2.1")),
+            "192.0.2.1"
+        );
+        // Distinct host IDs inside the same IPv6 /64 share one rate-limit bucket.
+        let a = normalize_client_ip_key(Some("2001:0db8:abcd:0012:ffff:1111:2222:3333"));
+        let b = normalize_client_ip_key(Some("2001:db8:abcd:12::1"));
+        let c = normalize_client_ip_key(Some("2001:db8:abcd:13::1"));
+        assert_eq!(a, "2001:db8:abcd:12::/64");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        // Missing, empty, or overly long headers share the fallback bucket.
+        assert_eq!(normalize_client_ip_key(None), "<unknown>");
+        assert_eq!(normalize_client_ip_key(Some("   ")), "<unknown>");
+        assert_eq!(normalize_client_ip_key(Some(&"a".repeat(129))), "<unknown>");
+    }
+
+    #[test]
+    fn constant_time_secret_eq_matches_only_identical_non_empty_tokens() {
+        assert!(constant_time_secret_eq("secret-token", "secret-token"));
+        assert!(!constant_time_secret_eq("secret-token", "secret-tokeN"));
+        assert!(!constant_time_secret_eq("secret-token", "secret"));
+        assert!(!constant_time_secret_eq("secret-token", ""));
+        assert!(!constant_time_secret_eq("", ""));
+    }
 
     #[test]
     fn in_flight_password_attempts_observe_the_limit_until_the_window_expires() {

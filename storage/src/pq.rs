@@ -204,8 +204,20 @@ pub struct PqStorageSnapshot {
     pub pending_initial_messages: usize,
 }
 
+/// Outcome of [`LocalPqHandshakeStore::claim_bundle_checked`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// No bundle or manifest exists for this identity.
+    NotFound,
+    /// The caller requested PQ suites while the server has PQ disabled, and the target identity
+    /// currently publishes a PQ-enabled manifest; no one-time prekeys were consumed.
+    PqDisabledForPqManifest,
+    /// A bundle was claimed (possibly without OPKs when strict/suite policy yielded no match).
+    Claimed(Box<ClaimedPqBundle>),
+}
+
 /// Storage for the v2 post-quantum handshake service. Every method is atomic.
-#[trait_variant::make(PqHandshakeStore: Send)]
+#[allow(async_fn_in_trait)]
 pub trait LocalPqHandshakeStore {
     /// Atomically publish a signed capability manifest and its classical + PQ prekeys.
     ///
@@ -233,6 +245,35 @@ pub trait LocalPqHandshakeStore {
         preferred_suites: &[u8],
     ) -> Result<Option<ClaimedPqBundle>>;
 
+    /// Like [`claim_bundle`](Self::claim_bundle), but when `reject_pq_on_manifest` is `true`
+    /// atomically rejects a PQ-enabled manifest with [`ClaimOutcome::PqDisabledForPqManifest`]
+    /// before popping any classical or PQ one-time prekey.
+    async fn claim_bundle_checked(
+        &self,
+        identity_key: &PublicKey,
+        preferred_suites: &[u8],
+        reject_pq_on_manifest: bool,
+    ) -> Result<ClaimOutcome> {
+        if reject_pq_on_manifest
+            && self
+                .get_manifest(identity_key)
+                .await?
+                .is_some_and(|m| m.pq_enabled)
+        {
+            return Ok(ClaimOutcome::PqDisabledForPqManifest);
+        }
+        match self.claim_bundle(identity_key, preferred_suites).await? {
+            None => Ok(ClaimOutcome::NotFound),
+            Some(claimed) => {
+                if reject_pq_on_manifest && claimed.manifest.as_ref().is_some_and(|m| m.pq_enabled)
+                {
+                    return Ok(ClaimOutcome::PqDisabledForPqManifest);
+                }
+                Ok(ClaimOutcome::Claimed(Box::new(claimed)))
+            }
+        }
+    }
+
     /// Insert a v1 or v2 initial message into its recipient's inbox unless the inbox already
     /// holds `limit` messages. Returns `Some(assigned_id)` on success or `None` if full.
     async fn add_initial_message_v2(
@@ -258,10 +299,139 @@ pub trait LocalPqHandshakeStore {
     async fn pq_snapshot(&self, identity_key: &PublicKey) -> Result<PqStorageSnapshot>;
 }
 
+/// `Send` variant of [`LocalPqHandshakeStore`].
+pub trait PqHandshakeStore: Send {
+    /// Atomically publish a signed capability manifest and its classical + PQ prekeys.
+    fn publish_v2(
+        &self,
+        record: PublishV2Record,
+    ) -> impl std::future::Future<Output = Result<PublishV2Status>> + Send;
+
+    /// Append fresh classical OPKs and/or signed PQOPKs to the current generation without
+    /// rotating the signed prekey or last-resort PQSPKs.
+    fn refill_prekeys(
+        &self,
+        record: RefillPrekeysRecord,
+    ) -> impl std::future::Future<Output = Result<RefillStatus>> + Send;
+
+    /// Non-consuming read of `identity_key`'s signed capability manifest.
+    fn get_manifest(
+        &self,
+        identity_key: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<Option<StoredCapabilityManifest>>> + Send;
+
+    /// Atomically claim `identity_key`'s bundle.
+    fn claim_bundle(
+        &self,
+        identity_key: &PublicKey,
+        preferred_suites: &[u8],
+    ) -> impl std::future::Future<Output = Result<Option<ClaimedPqBundle>>> + Send;
+
+    /// Like [`claim_bundle`](Self::claim_bundle), atomically rejecting PQ-enabled manifests when
+    /// `reject_pq_on_manifest` is `true` before popping any one-time prekey.
+    fn claim_bundle_checked(
+        &self,
+        identity_key: &PublicKey,
+        preferred_suites: &[u8],
+        reject_pq_on_manifest: bool,
+    ) -> impl std::future::Future<Output = Result<ClaimOutcome>> + Send;
+
+    /// Insert a v1 or v2 initial message into its recipient's inbox unless full.
+    fn add_initial_message_v2(
+        &self,
+        initial_message: StoredInitialMessageV2,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Option<u64>>> + Send;
+
+    /// Non-destructively list up to `limit` pending initial messages for `recipient`.
+    fn list_initial_messages(
+        &self,
+        recipient: &PublicKey,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<StoredInitialMessageV2>>> + Send;
+
+    /// Explicitly delete only the inbox initial messages with IDs in `ids` for `recipient`.
+    fn ack_initial_messages(
+        &self,
+        recipient: &PublicKey,
+        ids: &[u64],
+    ) -> impl std::future::Future<Output = Result<usize>> + Send;
+
+    /// Non-consuming snapshot of an identity's v2 handshake state.
+    fn pq_snapshot(
+        &self,
+        identity_key: &PublicKey,
+    ) -> impl std::future::Future<Output = Result<PqStorageSnapshot>> + Send;
+}
+
+impl<T: PqHandshakeStore> LocalPqHandshakeStore for T {
+    async fn publish_v2(&self, record: PublishV2Record) -> Result<PublishV2Status> {
+        PqHandshakeStore::publish_v2(self, record).await
+    }
+
+    async fn refill_prekeys(&self, record: RefillPrekeysRecord) -> Result<RefillStatus> {
+        PqHandshakeStore::refill_prekeys(self, record).await
+    }
+
+    async fn get_manifest(
+        &self,
+        identity_key: &PublicKey,
+    ) -> Result<Option<StoredCapabilityManifest>> {
+        PqHandshakeStore::get_manifest(self, identity_key).await
+    }
+
+    async fn claim_bundle(
+        &self,
+        identity_key: &PublicKey,
+        preferred_suites: &[u8],
+    ) -> Result<Option<ClaimedPqBundle>> {
+        PqHandshakeStore::claim_bundle(self, identity_key, preferred_suites).await
+    }
+
+    async fn claim_bundle_checked(
+        &self,
+        identity_key: &PublicKey,
+        preferred_suites: &[u8],
+        reject_pq_on_manifest: bool,
+    ) -> Result<ClaimOutcome> {
+        PqHandshakeStore::claim_bundle_checked(
+            self,
+            identity_key,
+            preferred_suites,
+            reject_pq_on_manifest,
+        )
+        .await
+    }
+
+    async fn add_initial_message_v2(
+        &self,
+        initial_message: StoredInitialMessageV2,
+        limit: usize,
+    ) -> Result<Option<u64>> {
+        PqHandshakeStore::add_initial_message_v2(self, initial_message, limit).await
+    }
+
+    async fn list_initial_messages(
+        &self,
+        recipient: &PublicKey,
+        limit: usize,
+    ) -> Result<Vec<StoredInitialMessageV2>> {
+        PqHandshakeStore::list_initial_messages(self, recipient, limit).await
+    }
+
+    async fn ack_initial_messages(&self, recipient: &PublicKey, ids: &[u64]) -> Result<usize> {
+        PqHandshakeStore::ack_initial_messages(self, recipient, ids).await
+    }
+
+    async fn pq_snapshot(&self, identity_key: &PublicKey) -> Result<PqStorageSnapshot> {
+        PqHandshakeStore::pq_snapshot(self, identity_key).await
+    }
+}
+
 /// Storage for the v2 idempotent mailbox service. Every method is atomic.
 ///
 /// Self-contained with no dependency on legacy v1 [`LocalMailboxStore`](crate::LocalMailboxStore).
-#[trait_variant::make(IdempotentMailboxStore: Send)]
+#[allow(async_fn_in_trait)]
 pub trait LocalIdempotentMailboxStore {
     /// Append a message to the queue from `sender` to `recipient`, deduplicating retries when
     /// `client_message_id` is `Some` and has already been committed for `(sender, recipient)`.
@@ -299,4 +469,117 @@ pub trait LocalIdempotentMailboxStore {
         after: u64,
         limit: u32,
     ) -> Result<Vec<StoredMessage>>;
+
+    /// Like [`read`](Self::read), stopping once the accumulated raw message payload size would
+    /// exceed `max_size` (always returning at least the first matching message so pagination
+    /// makes progress). Backends that do not override this fall back to [`read`](Self::read).
+    async fn read_bounded(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+        max_size: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        let _ = max_size;
+        self.read(sender, recipient, after, limit).await
+    }
+}
+
+/// `Send` variant of [`LocalIdempotentMailboxStore`].
+pub trait IdempotentMailboxStore: Send {
+    /// Append a message to the queue from `sender` to `recipient`, deduplicating retries.
+    #[allow(clippy::too_many_arguments)]
+    fn append_idempotent(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        header: Bytes,
+        content: Bytes,
+        initial_message: Option<Bytes>,
+        delivery_hash: Option<[u8; 32]>,
+        client_message_id: Option<[u8; 16]>,
+    ) -> impl std::future::Future<Output = Result<u64>> + Send;
+
+    /// Delete delivered messages whose delivery token SHA-256 hashes are in `hashes`.
+    fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> impl std::future::Future<Output = Result<()>> + Send;
+
+    /// Read up to `limit` messages after `after` from `sender` to `recipient`.
+    fn read(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+    ) -> impl std::future::Future<Output = Result<Vec<StoredMessage>>> + Send;
+
+    /// Like [`read`](Self::read), stopping once accumulated raw payload size exceeds `max_size`.
+    fn read_bounded(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+        max_size: usize,
+    ) -> impl std::future::Future<Output = Result<Vec<StoredMessage>>> + Send;
+}
+
+impl<T: IdempotentMailboxStore> LocalIdempotentMailboxStore for T {
+    async fn append_idempotent(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        header: Bytes,
+        content: Bytes,
+        initial_message: Option<Bytes>,
+        delivery_hash: Option<[u8; 32]>,
+        client_message_id: Option<[u8; 16]>,
+    ) -> Result<u64> {
+        IdempotentMailboxStore::append_idempotent(
+            self,
+            sender,
+            recipient,
+            header,
+            content,
+            initial_message,
+            delivery_hash,
+            client_message_id,
+        )
+        .await
+    }
+
+    async fn delete_delivered(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        hashes: &[[u8; 32]],
+    ) -> Result<()> {
+        IdempotentMailboxStore::delete_delivered(self, sender, recipient, hashes).await
+    }
+
+    async fn read(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredMessage>> {
+        IdempotentMailboxStore::read(self, sender, recipient, after, limit).await
+    }
+
+    async fn read_bounded(
+        &self,
+        sender: &PublicKey,
+        recipient: &PublicKey,
+        after: u64,
+        limit: u32,
+        max_size: usize,
+    ) -> Result<Vec<StoredMessage>> {
+        IdempotentMailboxStore::read_bounded(self, sender, recipient, after, limit, max_size).await
+    }
 }

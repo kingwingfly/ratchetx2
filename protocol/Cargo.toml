@@ -1,44 +1,42 @@
 [package]
 name = "protocol"
 version = "0.1.0"
-edition = "2024"
-license = "MIT"
-authors = ["Louis <836250617@qq.com>"]
-repository = "https://github.com/kingwingfly/ratchetx2"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "The E2EE chat's wire protocol: the handshake and mailbox services, their clients and servers."
 publish = false
 
 [dependencies]
-bon = { version = "3.10", optional = true }
-bytes = "1"
-getrandom = { version = "0.4", optional = true }
+bon = { workspace = true, optional = true }
+bytes.workspace = true
+getrandom = { workspace = true, optional = true }
 party = { path = "../party", default-features = false }
-prost = "0.14"
-rkyv = { version = "0.8", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-serde_json = { version = "1", optional = true }
-sha2 = { version = "0.11", optional = true }
+prost.workspace = true
+rkyv = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 storage = { path = "../storage", default-features = false, optional = true }
-subtle = { version = "2.6", optional = true }
-thiserror = "2.0"
-trait-variant = "0.1"
-url = { version = "2", default-features = false }
-web-time = { version = "1.1", optional = true }
+subtle = { workspace = true, optional = true }
+thiserror.workspace = true
+trait-variant.workspace = true
+url.workspace = true
+web-time = { workspace = true, optional = true }
 x3dh = { path = "../x3dh" }
 xeddsa = { path = "../xeddsa" }
+zeroize.workspace = true
 
 [build-dependencies]
-prost-build = "0.14"
-protox = { version = "0.10", optional = true }
+prost-build.workspace = true
+protox = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Reads the services in the .proto files, to check the Connect paths.
-protox = "0.10"
+protox.workspace = true
 storage = { path = "../storage" }
-tokio = { version = "1", default-features = false, features = [
-    "macros",
-    "rt-multi-thread",
-] }
+tokio.workspace = true
 
 [features]
 default = ["protox"]

@@ -1,19 +1,17 @@
+use std::{cell::Cell, rc::Rc};
+
 use leptos::{ev, prelude::*, task::spawn_local};
 use session::PqConfig;
 
 use crate::{
-    engine::{NAME_MAX, StartChatError, origin},
+    engine::{StartChatError, origin, same_server},
     state::{Dialog, SignInSuccessAction, UnavailableReason},
-    util::{day, sleep},
+    util::{NAME_MAX, day, sleep, validate_relay_url},
 };
 
 use super::{
-    common::{
-        ASKED_SHOWN, Progress, SecretInput, ToggleSwitch, cancel_active_chat_history_reservation,
-        cancel_chat_history, commit_chat_history, invited_server, is_chat_history_owned, lock,
-        reserve_chat_history, retain_active_chat_history_reservation, retain_chat_history,
-    },
-    engine,
+    common::{ConfirmGuard, Progress, SecretInput, ToggleSwitch, invited_server, lock},
+    engine, history,
 };
 
 /// Sign in to the server with its password, which storing files there takes, as they cost it
@@ -21,18 +19,17 @@ use super::{
 #[component]
 pub(super) fn SignInDialog() -> impl IntoView {
     let password_input = SecretInput::new();
-    let active_submit = StoredValue::new(None::<(u64, super::history::Reservation)>);
+    let active_submit = StoredValue::new(None::<(u64, history::Reservation)>);
     // Bind async sign-in completions strictly to this mounted form instance so dismissing a
     // password-only SignInDialog never allows its late completion to adopt a newer auto-start draft.
-    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-    let alive_cleanup = alive.clone();
+    let alive = StoredValue::new_local(Rc::new(Cell::new(true)));
     on_cleanup(move || {
-        alive_cleanup.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = alive.try_with_value(|flag| flag.set(false));
         password_input.clear();
         if let Some((auto_start_id, reservation)) =
             active_submit.try_update_value(Option::take).flatten()
         {
-            let _ = cancel_chat_history(Some(reservation));
+            let _ = history::cancel_reservation(Some(reservation));
             engine().cancel_startup_submission(auto_start_id);
         }
     });
@@ -59,11 +56,11 @@ pub(super) fn SignInDialog() -> impl IntoView {
         if let Some(id) = auto_start_id {
             engine.begin_sign_in_auto_start(id);
         }
-        let reservation = auto_start_id.map(|_| reserve_chat_history());
+        let reservation = auto_start_id.map(|_| history::reserve());
         if let (Some(id), Some(res)) = (auto_start_id, reservation) {
             active_submit.set_value(Some((id, res)));
         }
-        let alive = alive.clone();
+        let alive = alive.get_value();
         progress.start("Signing in…");
         spawn_local(async move {
             let result = engine.sign_in(&secret).await;
@@ -83,14 +80,14 @@ pub(super) fn SignInDialog() -> impl IntoView {
                     // If this SignInDialog instance was dismissed/unmounted or its auto-start
                     // draft was cancelled/superseded while signing in, do not start a cancelled
                     // chat or adopt a newer dialog's draft.
-                    if !alive.load(std::sync::atomic::Ordering::Relaxed)
+                    if !alive.get()
                         || auto_start_id.is_some_and(|id| {
                             engine.is_submission_cancelled(id)
-                                || !is_chat_history_owned(reservation)
+                                || !history::is_reservation_owned(reservation)
                         })
                     {
                         clear_active(auto_start_id);
-                        let _ = cancel_chat_history(reservation);
+                        let _ = history::cancel_reservation(reservation);
                         if let Some(id) = auto_start_id {
                             engine.finish_auto_start_chat(id, None);
                             engine.finish_submission(id);
@@ -104,7 +101,7 @@ pub(super) fn SignInDialog() -> impl IntoView {
                     match engine.complete_sign_in_flow() {
                         SignInSuccessAction::Close => {
                             clear_active(auto_start_id);
-                            let _ = cancel_chat_history(reservation);
+                            let _ = history::cancel_reservation(reservation);
                             if let Some(id) = auto_start_id {
                                 engine.finish_submission(id);
                             }
@@ -115,7 +112,7 @@ pub(super) fn SignInDialog() -> impl IntoView {
                         }
                         SignInSuccessAction::ReopenNewChat(dialog) => {
                             clear_active(auto_start_id);
-                            let _ = retain_chat_history(reservation);
+                            let _ = history::retain_reservation(reservation);
                             if let Some(id) = auto_start_id {
                                 engine.finish_submission(id);
                             }
@@ -125,11 +122,12 @@ pub(super) fn SignInDialog() -> impl IntoView {
                         SignInSuccessAction::AutoStartChat { id, pending } => {
                             if auto_start_id != Some(id) {
                                 clear_active(auto_start_id);
-                                let _ = cancel_chat_history(reservation);
+                                let _ = history::cancel_reservation(reservation);
                                 if let Some(prev_id) = auto_start_id {
                                     engine.finish_submission(prev_id);
                                 }
                                 progress.clear();
+                                engine.close_dialog_if_sign_in();
                                 engine.ui().notify(format!(
                                     "Signed in until {until}: waiting messages and files go now."
                                 ));
@@ -144,6 +142,7 @@ pub(super) fn SignInDialog() -> impl IntoView {
                                     id,
                                     &pending.key,
                                     pending.name.clone(),
+                                    pending.server.as_deref(),
                                     pending.pq_pinned,
                                     pending.allow_classical,
                                 )
@@ -153,14 +152,14 @@ pub(super) fn SignInDialog() -> impl IntoView {
                             engine.finish_submission(id);
                             match outcome {
                                 Ok(peer) => {
-                                    if cancelled || !is_chat_history_owned(reservation) {
+                                    if cancelled || !history::is_reservation_owned(reservation) {
                                         engine.finish_auto_start_chat(id, None);
                                         progress.clear();
                                         return;
                                     }
                                     engine.finish_auto_start_chat(id, None);
                                     engine.close_dialog_if_new_chat();
-                                    commit_chat_history(reservation, peer).await;
+                                    history::commit_reservation(reservation, peer).await;
                                     // If sending the initial greeting hit a secondary
                                     // `SignInRequired` after persisting the chat, `SignInDialog`
                                     // intentionally stayed open — reset `progress` so buttons are
@@ -180,14 +179,14 @@ pub(super) fn SignInDialog() -> impl IntoView {
                                     }
                                 }
                                 Err(StartChatError::Cancelled) => {
-                                    let _ = cancel_chat_history(reservation);
+                                    let _ = history::cancel_reservation(reservation);
                                     progress.clear();
                                 }
                                 Err(StartChatError::SignInRequired) => {
                                     // Retain the gesture-pushed reserved slot while `SignInDialog`
                                     // stays open for a retry.
                                     let still_owned =
-                                        !cancelled && retain_chat_history(reservation);
+                                        !cancelled && history::retain_reservation(reservation);
                                     if still_owned {
                                         engine.finish_auto_start_chat(
                                             id,
@@ -203,7 +202,7 @@ pub(super) fn SignInDialog() -> impl IntoView {
                                     // Retain the gesture-pushed reserved slot as `SignInDialog`
                                     // reopens `NewChat` for retry (e.g. "Allow classical").
                                     let still_owned =
-                                        !cancelled && retain_chat_history(reservation);
+                                        !cancelled && history::retain_reservation(reservation);
                                     progress.clear();
                                     if still_owned {
                                         engine.finish_auto_start_chat(id, Some(err));
@@ -216,15 +215,15 @@ pub(super) fn SignInDialog() -> impl IntoView {
                 }
                 Err(e) => {
                     clear_active(auto_start_id);
-                    if alive.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = retain_chat_history(reservation);
+                    if alive.get() {
+                        let _ = history::retain_reservation(reservation);
                         if let Some(id) = auto_start_id {
                             engine.finish_submission(id);
                         }
                         progress.try_fail(e);
                         password_input.focus();
                     } else {
-                        let _ = cancel_chat_history(reservation);
+                        let _ = history::cancel_reservation(reservation);
                         if let Some(id) = auto_start_id {
                             engine.finish_submission(id);
                         }
@@ -262,9 +261,9 @@ pub(super) fn SignInDialog() -> impl IntoView {
                     on:click=move |_| {
                         password_input.clear();
                         if engine().dismiss_sign_in() {
-                            retain_active_chat_history_reservation();
+                            history::retain_active_reservation();
                         } else {
-                            cancel_active_chat_history_reservation();
+                            history::cancel_active_reservation();
                         }
                     }
                 >
@@ -289,14 +288,25 @@ pub(super) fn CreateVault() -> impl IntoView {
     });
     let pq_compiled = !PqConfig::compiled_suites().is_empty();
     let pq_enabled = RwSignal::new(pq_compiled);
+    let page_origin = origin();
     let invited = invited_server();
-    let server = RwSignal::new(invited.clone().unwrap_or_else(origin));
+    let cross_origin_invited = invited
+        .as_ref()
+        .is_some_and(|inv| !same_server(inv, &page_origin));
+    let server = RwSignal::new(invited.unwrap_or_else(|| page_origin.clone()));
     let progress = Progress::new();
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         if progress.working.get_untracked() {
             return;
         }
+        let target_server = match validate_relay_url(&server.get_untracked()) {
+            Ok(valid) => valid,
+            Err(err) => {
+                progress.fail(err);
+                return;
+            }
+        };
         let secret = passphrase_input.take();
         let repeated = repeat_input.take();
         if secret.chars().count() < 8 {
@@ -312,7 +322,6 @@ pub(super) fn CreateVault() -> impl IntoView {
         drop(repeated);
         let enable_pq = pq_enabled.get_untracked();
         let display_name = name.get_untracked();
-        let target_server = server.get_untracked();
         progress.start("Deriving the key…");
         let engine = engine();
         spawn_local(async move {
@@ -325,6 +334,11 @@ pub(super) fn CreateVault() -> impl IntoView {
                 progress.try_fail(e);
             }
         });
+    };
+    let page_origin_for_check = page_origin.clone();
+    let is_third_party = move || {
+        let current = server.get();
+        !current.trim().is_empty() && !same_server(&current, &page_origin_for_check)
     };
     view! {
         <form on:submit=submit>
@@ -354,14 +368,27 @@ pub(super) fn CreateVault() -> impl IntoView {
             />
             <label for="server">"Server"</label>
             <input id="server" type="url" required bind:value=server />
-            {invited
-                .map(|_| {
-                    view! {
-                        <p class="hint">
-                            "The server of your invitation: a chat needs both of you on one."
-                        </p>
-                    }
-                })}
+            <Show when=is_third_party>
+                <p class="warning" role="alert">
+                    {if cross_origin_invited {
+                        "Warning: this invitation link pre-filled a third-party relay server ("
+                    } else {
+                        "Warning: this is a third-party relay server ("
+                    }}
+                    {move || server.get()}
+                    "). Creating your vault permanently binds your identity to that relay and cannot be changed later. "
+                    <button
+                        type="button"
+                        class="link"
+                        on:click={
+                            let page_origin = page_origin.clone();
+                            move |_| server.set(page_origin.clone())
+                        }
+                    >
+                        "Use this page's server instead"
+                    </button>
+                </p>
+            </Show>
             {pq_compiled.then(|| {
                 view! {
                     <div class="settings-card create-pq">
@@ -391,12 +418,13 @@ pub(super) fn UnlockVault() -> impl IntoView {
     let passphrase_input = SecretInput::new();
     on_cleanup(move || passphrase_input.clear());
     let progress = Progress::new();
-    let confirm_reset = RwSignal::new(false);
+    let confirm_reset = ConfirmGuard::new();
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         if progress.working.get_untracked() {
             return;
         }
+        confirm_reset.disarm();
         let secret = passphrase_input.take();
         progress.start("Deriving the key…");
         let engine = engine();
@@ -412,18 +440,7 @@ pub(super) fn UnlockVault() -> impl IntoView {
         if progress.working.get_untracked() {
             return;
         }
-        if !confirm_reset.get_untracked() {
-            confirm_reset.set(true);
-            set_timeout(
-                move || {
-                    if confirm_reset.try_get_untracked() == Some(true)
-                        && progress.working.try_get_untracked() == Some(false)
-                    {
-                        confirm_reset.set(false);
-                    }
-                },
-                ASKED_SHOWN,
-            );
+        if !confirm_reset.confirm_or_arm() {
             return;
         }
         passphrase_input.clear();
@@ -431,7 +448,7 @@ pub(super) fn UnlockVault() -> impl IntoView {
         spawn_local(async move {
             match crate::vault::Vault::destroy().await {
                 Ok(()) => lock(),
-                Err(e) => progress.fail(e.to_string()),
+                Err(e) => progress.try_fail(e.to_string()),
             }
         });
     };
@@ -457,7 +474,7 @@ pub(super) fn UnlockVault() -> impl IntoView {
                     on:click=reset
                 >
                     {move || {
-                        if confirm_reset.get() {
+                        if confirm_reset.is_armed() {
                             "Delete it all, for good?"
                         } else {
                             "Forgot it: start over"

@@ -1,55 +1,53 @@
 [package]
 name = "session"
 version = "0.1.0"
-edition = "2024"
-license = "MIT"
-authors = ["Louis <836250617@qq.com>"]
-repository = "https://github.com/kingwingfly/ratchetx2"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
 description = "The E2EE chat's client flow: publish prekeys, start or accept sessions, send and receive."
 publish = false
 
 [dependencies]
-aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc", "zeroize"] }
-bon = "3.10"
-bytes = "1"
-getrandom = "0.4"
-hkdf = "0.13"
-hmac = "0.13"
+aes-gcm.workspace = true
+bon.workspace = true
+bytes.workspace = true
+getrandom.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
 party = { path = "../party", default-features = false }
-prost = "0.14"
+prost.workspace = true
 protocol = { path = "../protocol", default-features = false, features = ["pq"] }
 ratchetx2 = { path = "../ratchetx2", version = "0.4" }
-rkyv = { version = "0.8", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
-sha2 = "0.11"
-thiserror = "2.0"
-web-time = "1.1"
+rkyv = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+sha2.workspace = true
+thiserror.workspace = true
+web-time.workspace = true
 x3dh = { path = "../x3dh" }
 xeddsa = { path = "../xeddsa" }
-zeroize = { version = "1.9", features = ["derive"] }
+zeroize.workspace = true
 
 [build-dependencies]
-prost-build = { version = "0.14", optional = true }
-protox = { version = "0.10", optional = true }
+prost-build = { workspace = true, optional = true }
+protox = { workspace = true, optional = true }
 
 [dev-dependencies]
 protocol = { path = "../protocol", features = ["server", "connect", "pq"] }
 storage = { path = "../storage", features = ["pq"] }
-tokio = { version = "1", default-features = false, features = [
-    "macros",
-    "rt-multi-thread",
-] }
+tokio.workspace = true
 
 [features]
 default = ["protox"]
 # Compile the .proto files with protox, so protoc is not needed.
-protox = ["dep:protox", "party/protox", "protocol/protox"]
+protox = ["party/protox", "protocol/protox"]
 # Serialize the client's and the sessions' states, to keep them between runs.
 serde = ["dep:serde", "party/serde", "x3dh/serde", "xeddsa/serde"]
 rkyv = ["dep:rkyv", "party/rkyv", "x3dh/rkyv", "xeddsa/rkyv"]
 # The states as protobuf messages too, from proto/session.proto.
 prost = [
     "dep:prost-build",
+    "dep:protox",
     "party/prost",
     "x3dh/prost",
 ]

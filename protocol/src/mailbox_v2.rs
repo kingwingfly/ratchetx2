@@ -4,17 +4,17 @@
 
 use bytes::Bytes;
 use prost::Message as _;
-use x3dh::PublicKey;
+use x3dh::{PQXDH_VERSION, PublicKey};
 use xeddsa::XEdDSAPrivateKey;
 
 use crate::{
-    check_safe_integer,
+    SigningBuf, check_canonical_key, check_safe_integer,
     error::{ErrorKind, Result},
     fixed,
     handshake::InitialMessage as InitialMessageV1,
-    handshake_v2::{InitialMessageV2, push_count, push_len_bytes},
-    mailbox::DELIVERY_TOKEN_LENGTH,
-    verify_recent,
+    handshake_v2::InitialMessageV2,
+    mailbox::{DELIVERY_TOKEN_LENGTH, MAX_DELIVERED},
+    verify_audience, verify_recent,
 };
 
 #[allow(missing_docs)]
@@ -50,22 +50,28 @@ pub trait LocalMailboxV2 {
 /// Encodes a carried [`InitialMessageV2`] for storage in the shared mailbox queue:
 /// - `version == 1`: raw [`InitialMessageV1`] protobuf bytes (readable by BOTH v1 and v2 clients).
 /// - `version == 2`: `b"\0IMV2" || InitialMessageV2` bytes (ignored by v1 clients, decoded by v2).
+///
+/// Fails with [`ErrorKind::Malformed`] for any other protocol version.
 pub fn encode_carried_initial(initial: &InitialMessageV2) -> Result<Bytes> {
-    if initial.version == 1 {
-        let v1 = InitialMessageV1::try_from(initial)?;
-        Ok(Bytes::from(v1.encode_to_vec()))
-    } else {
-        let encoded = if initial.id == 0 {
-            initial.encode_to_vec()
-        } else {
-            let mut carried = initial.clone();
-            carried.id = 0;
-            carried.encode_to_vec()
-        };
-        let mut out = Vec::with_capacity(V2_CARRIED_INITIAL_MAGIC.len() + encoded.len());
-        out.extend_from_slice(V2_CARRIED_INITIAL_MAGIC);
-        out.extend_from_slice(&encoded);
-        Ok(Bytes::from(out))
+    match initial.version {
+        1 => {
+            let v1 = InitialMessageV1::try_from(initial)?;
+            Ok(Bytes::from(v1.encode_to_vec()))
+        }
+        PQXDH_VERSION => {
+            let encoded = if initial.id == 0 {
+                initial.encode_to_vec()
+            } else {
+                let mut carried = initial.clone();
+                carried.id = 0;
+                carried.encode_to_vec()
+            };
+            let mut out = Vec::with_capacity(V2_CARRIED_INITIAL_MAGIC.len() + encoded.len());
+            out.extend_from_slice(V2_CARRIED_INITIAL_MAGIC);
+            out.extend_from_slice(&encoded);
+            Ok(Bytes::from(out))
+        }
+        _ => Err(ErrorKind::Malformed.into()),
     }
 }
 
@@ -89,34 +95,33 @@ pub fn decode_carried_initial(bytes: &[u8]) -> Option<InitialMessageV2> {
 /// `after(u64be) || limit(u32be) || max_size(u32be) || count_u32be(delivered) ||`
 /// `[token(16)]* || timestamp(u64be)`.
 pub fn fetch_signed_signing_input(request: &FetchSignedRequest) -> Result<Vec<u8>> {
+    if request.delivered.len() > MAX_DELIVERED {
+        return Err(ErrorKind::LimitExceeded.into());
+    }
     let sender: PublicKey = fixed(&request.sender)?;
     let recipient: PublicKey = fixed(&request.recipient)?;
-    let mut out = Vec::with_capacity(
-        FETCH_SIGNED_DOMAIN.len()
-            + 4
-            + request.audience.len()
-            + 64
-            + 8
-            + 4
-            + 4
-            + 4
-            + request.delivered.len() * DELIVERY_TOKEN_LENGTH
-            + 8,
-    );
-    out.extend_from_slice(FETCH_SIGNED_DOMAIN);
-    push_len_bytes(&mut out, request.audience.as_bytes())?;
-    out.extend_from_slice(&sender);
-    out.extend_from_slice(&recipient);
-    out.extend_from_slice(&request.after.to_be_bytes());
-    out.extend_from_slice(&request.limit.to_be_bytes());
-    out.extend_from_slice(&request.max_size.to_be_bytes());
-    push_count(&mut out, request.delivered.len())?;
+    let extra = 96usize
+        .saturating_add(request.audience.len())
+        .saturating_add(
+            request
+                .delivered
+                .len()
+                .saturating_mul(DELIVERY_TOKEN_LENGTH),
+        );
+    let mut out = SigningBuf::with_domain(FETCH_SIGNED_DOMAIN, extra);
+    out.push_audience_be(&request.audience)?;
+    out.push_bytes(&sender);
+    out.push_bytes(&recipient);
+    out.push_u64_be(request.after);
+    out.push_u32_be(request.limit);
+    out.push_u32_be(request.max_size);
+    out.push_count_be(request.delivered.len())?;
     for token in &request.delivered {
         let token: [u8; DELIVERY_TOKEN_LENGTH] = fixed(token)?;
-        out.extend_from_slice(&token);
+        out.push_bytes(&token);
     }
-    out.extend_from_slice(&request.timestamp.to_be_bytes());
-    Ok(out)
+    out.push_u64_be(request.timestamp);
+    Ok(out.into_vec())
 }
 
 impl FetchSignedRequest {
@@ -153,13 +158,12 @@ impl FetchSignedRequest {
     /// Verifies audience binding, recipient XEdDSA signature, and timestamp freshness against
     /// `now`. Returns `(sender, recipient)` on success.
     pub fn verify(&self, expected_audience: &str, now: u64) -> Result<(PublicKey, PublicKey)> {
-        if self.audience.is_empty() || expected_audience.is_empty() {
-            return Err(ErrorKind::Malformed.into());
+        if self.delivered.len() > MAX_DELIVERED {
+            return Err(ErrorKind::LimitExceeded.into());
         }
-        if self.audience != expected_audience {
-            return Err(ErrorKind::InvalidSignature.into());
-        }
+        verify_audience(&self.audience, expected_audience)?;
         let sender: PublicKey = fixed(&self.sender)?;
+        check_canonical_key(&sender)?;
         let recipient = verify_recent(
             &self.recipient,
             &self.signature,
@@ -175,7 +179,6 @@ impl FetchSignedRequest {
 mod server {
     use bon::Builder;
     use party::EncryptedMessage;
-    use sha2::{Digest, Sha256};
     use storage::LocalIdempotentMailboxStore;
     use x3dh::PqSuite;
 
@@ -183,7 +186,7 @@ mod server {
     use crate::{
         check_canonical_key,
         handshake_v2::validate_initial_message_v2,
-        mailbox::{MAX_DELIVERED, MailboxLimits},
+        mailbox::{MAX_DELIVERED, MailboxLimits, hash_delivery_tokens, page_envelopes},
         now_millis,
     };
 
@@ -239,18 +242,28 @@ mod server {
                     if validated.sender != sender {
                         return Err(ErrorKind::Malformed.into());
                     }
-                    let encoded = encode_carried_initial(init)?;
-                    if encoded.len() > self.limits.max_initial_message_size {
+                    // Check encoded size BEFORE allocating a carried-initial buffer.
+                    let encoded_len = match init.version {
+                        1 => InitialMessageV1::try_from(init)?.encoded_len(),
+                        PQXDH_VERSION => V2_CARRIED_INITIAL_MAGIC
+                            .len()
+                            .saturating_add(init.encoded_len()),
+                        _ => return Err(ErrorKind::Malformed.into()),
+                    };
+                    if encoded_len > self.limits.max_initial_message_size {
                         return Err(ErrorKind::LimitExceeded.into());
                     }
+                    let encoded = encode_carried_initial(init)?;
                     Some(encoded)
                 }
                 None => None,
             };
 
-            let size = message.header.len()
-                + message.content.len()
-                + initial_message.as_ref().map_or(0, Bytes::len);
+            let size = message
+                .header
+                .len()
+                .saturating_add(message.content.len())
+                .saturating_add(initial_message.as_ref().map_or(0, Bytes::len));
             if size > self.limits.max_message_size {
                 return Err(ErrorKind::LimitExceeded.into());
             }
@@ -288,14 +301,7 @@ mod server {
             let (sender, recipient) = request.verify(&self.server_id, now_millis())?;
 
             if !request.delivered.is_empty() {
-                let hashes = request
-                    .delivered
-                    .iter()
-                    .map(|token| {
-                        let token: [u8; DELIVERY_TOKEN_LENGTH] = fixed(token)?;
-                        Ok(Sha256::digest(token).into())
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let hashes = hash_delivery_tokens(&request.delivered)?;
                 self.store
                     .delete_delivered(&sender, &recipient, &hashes)
                     .await?;
@@ -311,29 +317,20 @@ mod server {
             };
             let stored = self
                 .store
-                .read(&sender, &recipient, request.after, limit)
+                .read_bounded(&sender, &recipient, request.after, limit, max_size)
                 .await?;
 
-            let mut messages = Vec::with_capacity(stored.len());
-            let mut size = 0;
-            for stored in stored {
-                let envelope = EnvelopeV2 {
-                    sequence: stored.sequence,
-                    message: stored.content.map(|content| EncryptedMessage {
-                        header: stored.header,
-                        content,
-                    }),
-                    initial_message: stored
-                        .initial_message
-                        .as_deref()
-                        .and_then(decode_carried_initial),
-                };
-                size += prost::encoding::message::encoded_len(1, &envelope);
-                if !messages.is_empty() && size > max_size {
-                    break;
-                }
-                messages.push(envelope);
-            }
+            let messages = page_envelopes(stored, max_size, |stored| EnvelopeV2 {
+                sequence: stored.sequence,
+                message: stored.content.map(|content| EncryptedMessage {
+                    header: stored.header,
+                    content,
+                }),
+                initial_message: stored
+                    .initial_message
+                    .as_deref()
+                    .and_then(decode_carried_initial),
+            });
             Ok(FetchSignedResponse { messages })
         }
     }
@@ -434,6 +431,19 @@ mod server {
             ) -> storage::Result<Vec<storage::StoredMessage>> {
                 IdempotentMailboxStore::read(&*self.0, sender, recipient, after, limit).await
             }
+            async fn read_bounded(
+                &self,
+                sender: &PublicKey,
+                recipient: &PublicKey,
+                after: u64,
+                limit: u32,
+                max_size: usize,
+            ) -> storage::Result<Vec<storage::StoredMessage>> {
+                IdempotentMailboxStore::read_bounded(
+                    &*self.0, sender, recipient, after, limit, max_size,
+                )
+                .await
+            }
         }
 
         #[tokio::test]
@@ -471,8 +481,8 @@ mod server {
                 id: 0,
                 version: PQXDH_VERSION,
                 identity_key: Bytes::copy_from_slice(&alice_pk),
-                ephemeral_key: Bytes::from_static(&[0x11; 32]),
-                signed_prekey: Bytes::from_static(&[0x22; 32]),
+                ephemeral_key: Bytes::copy_from_slice(&crate::test_public_key(0x11)),
+                signed_prekey: Bytes::copy_from_slice(&crate::test_public_key(0x22)),
                 one_time_prekey: None,
                 first_message: None,
                 pq_suite: u32::from(PqSuite::MlKem768.as_u8()),
@@ -598,8 +608,8 @@ mod server {
                 id: 0,
                 version: PQXDH_VERSION,
                 identity_key: Bytes::copy_from_slice(&alice_pk),
-                ephemeral_key: Bytes::from_static(&[0x11; 32]),
-                signed_prekey: Bytes::from_static(&[0x22; 32]),
+                ephemeral_key: Bytes::copy_from_slice(&crate::test_public_key(0x11)),
+                signed_prekey: Bytes::copy_from_slice(&crate::test_public_key(0x22)),
                 one_time_prekey: None,
                 first_message: None,
                 pq_suite: u32::from(PqSuite::MlKem1024.as_u8()),
@@ -660,6 +670,46 @@ mod server {
                     .await
                     .unwrap_err()
                     .kind(),
+                ErrorKind::Malformed
+            );
+        }
+
+        #[test]
+        fn encode_carried_initial_and_fetch_signed_verify_enforce_invariants() {
+            let mut bad_ver = InitialMessageV2 {
+                version: 0,
+                ..Default::default()
+            };
+            assert_eq!(
+                encode_carried_initial(&bad_ver).unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
+            bad_ver.version = 3;
+            assert_eq!(
+                encode_carried_initial(&bad_ver).unwrap_err().kind(),
+                ErrorKind::Malformed
+            );
+
+            let bob = XEdDSAPrivateKey::generate();
+            let alice_pk = crate::test_public_key(1);
+            let now = now_millis();
+
+            // FetchSignedRequest::verify rejects > MAX_DELIVERED outside MailboxV2Server.
+            let mut too_many =
+                FetchSignedRequest::sign(&bob, "relay.example", &alice_pk, 0, 10, 0, vec![], now)
+                    .unwrap();
+            too_many.delivered = vec![Bytes::from_static(&[1; 16]); MAX_DELIVERED + 1];
+            assert_eq!(
+                too_many.verify("relay.example", now).unwrap_err().kind(),
+                ErrorKind::LimitExceeded
+            );
+
+            // FetchSignedRequest::verify rejects non-prime-order / zero sender key.
+            let bad_sender =
+                FetchSignedRequest::sign(&bob, "relay.example", &[0u8; 32], 0, 10, 0, vec![], now)
+                    .unwrap();
+            assert_eq!(
+                bad_sender.verify("relay.example", now).unwrap_err().kind(),
                 ErrorKind::Malformed
             );
         }

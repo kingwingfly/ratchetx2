@@ -8,13 +8,13 @@ use crate::{
     icon::{Icon, icon},
     preview::Sort,
     state::{Body, FileView},
-    util::{day, month, size_u64},
+    util::{day, month, sanitize_filename, size_u64},
 };
 
 use super::{
-    common::{ASKED_SHOWN, close_dialog, extension},
+    common::{ConfirmGuard, close_dialog, extension},
     engine,
-    media::{MediaThumb, Source, inline_media},
+    media::{MediaThumb, Source, cancel_pending_previews, inline_media},
     ui,
 };
 
@@ -67,6 +67,8 @@ impl Shelf {
 /// the rest as a list. Each opens in the viewer.
 #[component]
 pub(super) fn FileBrowser(peer: PublicKey) -> impl IntoView {
+    // Closing Files invalidates any in-flight local-file or stream setup started from it.
+    on_cleanup(cancel_pending_previews);
     let ui = ui();
     let label = ui
         .contact(&peer)
@@ -226,7 +228,8 @@ fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -
             || deleted.with(|deleted| deleted.contains(&index))
             || ui.gone.with(|gone| gone.contains(&(peer, index)))
     };
-    let base_name = file.name.clone();
+    let base_name = sanitize_filename(&file.name);
+    let tile_name = base_name.clone();
     let title = move || match file_status_suffix(is_local, gone(), failed, deletable, outgoing) {
         Some(status) => format!("{base_name} ({status})"),
         None => base_name.clone(),
@@ -251,7 +254,7 @@ fn file_tile(peer: PublicKey, file: FileView, deleted: RwSignal<HashSet<u64>>) -
                 on:click=move |_| source.open()
             >
                 <MediaThumb source=shown sort=file.sort />
-                {(file.sort == Sort::Audio).then(|| view! { <span class="tile-name">{file.name}</span> })}
+                {(file.sort == Sort::Audio).then(|| view! { <span class="tile-name">{tile_name}</span> })}
             </button>
             {move || {
                 if gone() {
@@ -315,6 +318,7 @@ fn file_row(
         Some(status) => format!("{details} · {status}"),
         None => details.clone(),
     };
+    let display_name = sanitize_filename(&file.name);
     // Media shows its preview, the rest its extension.
     let mark = match file.sort {
         sort @ (Sort::Image | Sort::Video | Sort::Audio) => {
@@ -326,9 +330,9 @@ fn file_row(
             }
             .into_any()
         }
-        _ => view! { <span class="file-icon">{extension(&file.name)}</span> }.into_any(),
+        _ => view! { <span class="file-icon">{extension(&display_name)}</span> }.into_any(),
     };
-    let title = file.name.clone();
+    let title = display_name.clone();
     // An attachment on the server, sent or received, which either peer can delete, until it is.
     let delete = match &file.body {
         Body::Remote(remote) if file.deletable => {
@@ -346,7 +350,7 @@ fn file_row(
             <button class="file-row" title=title on:click=move |_| source.open()>
                 {mark}
                 <span>
-                    <strong>{file.name}</strong>
+                    <strong>{display_name}</strong>
                     <span>{details}</span>
                 </span>
             </button>
@@ -367,66 +371,57 @@ fn DeleteFromServer(
     pointer: content::AttachmentPointer,
     deleted: RwSignal<HashSet<u64>>,
 ) -> impl IntoView {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Step {
-        Offered,
-        Asked,
-        Deleting,
-    }
-    let step = RwSignal::new(Step::Offered);
+    let confirm = ConfirmGuard::new();
+    let deleting = RwSignal::new(false);
+    let safe_name = sanitize_filename(&pointer.name);
     let label = ui()
         .contact(&peer)
         .map(|contact| contact.label())
         .unwrap_or_default();
-    let what = move || match step.get() {
-        Step::Offered => "Delete from the server".to_string(),
-        Step::Asked => format!("Delete it from the server, for you and {label}?"),
-        Step::Deleting => "Deleting it from the server…".to_string(),
+    let what = move || {
+        if deleting.get() {
+            "Deleting it from the server…".to_string()
+        } else if confirm.is_armed() {
+            format!("Delete it from the server, for you and {label}?")
+        } else {
+            "Delete from the server".to_string()
+        }
     };
-    let click = move |_| match step.get_untracked() {
-        Step::Offered => {
-            step.set(Step::Asked);
+    let click = move |_| {
+        if deleting.get_untracked() {
+            return;
+        }
+        if !confirm.confirm_or_arm() {
             ui().notify(format!(
-                "Press again to delete {} from the server: neither of you can download it any \
-                 more; what you downloaded stays.",
-                pointer.name
+                "Press again to delete {safe_name} from the server: neither of you can download it \
+                 any more; what you downloaded stays."
             ));
-            // Not pressed again meanwhile, it asks no more.
-            set_timeout(
-                move || {
-                    if step.try_get_untracked() == Some(Step::Asked) {
-                        step.set(Step::Offered);
-                    }
-                },
-                ASKED_SHOWN,
-            );
+            return;
         }
-        Step::Asked => {
-            step.set(Step::Deleting);
-            let pointer = pointer.clone();
-            spawn_local(async move {
-                match engine().delete_attachment(peer, index, &pointer).await {
-                    Ok(()) => {
-                        deleted.try_update(|deleted| deleted.insert(index));
-                        ui().notify(format!("{} is deleted from the server", pointer.name));
-                    }
-                    Err(e) => {
-                        step.try_set(Step::Offered);
-                        ui().notify(e);
-                    }
+        deleting.set(true);
+        let pointer = pointer.clone();
+        let safe_name = safe_name.clone();
+        spawn_local(async move {
+            match engine().delete_attachment(peer, index, &pointer).await {
+                Ok(()) => {
+                    deleted.try_update(|deleted| deleted.insert(index));
+                    ui().notify(format!("{safe_name} is deleted from the server"));
                 }
-            });
-        }
-        Step::Deleting => {}
+                Err(e) => {
+                    deleting.try_set(false);
+                    ui().notify(e);
+                }
+            }
+        });
     };
     view! {
         <button
             type="button"
             class="btn icon small quiet delete-remote"
-            class:asked=move || step.get() == Step::Asked
+            class:asked=move || confirm.is_armed()
             title=what.clone()
             aria-label=what
-            disabled=move || step.get() == Step::Deleting
+            disabled=move || deleting.get()
             on:click=click
         >
             {icon(Icon::Delete)}

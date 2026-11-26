@@ -98,8 +98,11 @@ impl From<ErrorKind> for Error {
 impl From<xeddsa::Error> for Error {
     fn from(error: xeddsa::Error) -> Self {
         let kind = match error {
-            xeddsa::Error::InvalidPublicKey => ErrorKind::Malformed,
+            xeddsa::Error::InvalidPublicKey | xeddsa::Error::InvalidPrivateKey => {
+                ErrorKind::Malformed
+            }
             xeddsa::Error::Signature => ErrorKind::InvalidSignature,
+            xeddsa::Error::Rng => ErrorKind::Server,
         };
         Self::new(kind, error)
     }
@@ -121,6 +124,7 @@ impl From<storage::Error> for Error {
         let kind = match error.kind() {
             storage::ErrorKind::LimitExceeded => ErrorKind::LimitExceeded,
             storage::ErrorKind::InvalidArgument => ErrorKind::Malformed,
+            storage::ErrorKind::NotFound => ErrorKind::NotFound,
             _ => ErrorKind::Storage,
         };
         Self::new(kind, error)

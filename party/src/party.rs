@@ -47,6 +47,9 @@ pub const SKIP_MAX: u64 = 1024;
 /// kept; a message delayed longer cannot be decrypted.
 pub const MAX_SKIPPED_CHAINS: usize = 5;
 
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+const _: () = assert!(ratchetx2::pq::MAX_ENCAPSULATED_HISTORY > MAX_SKIPPED_CHAINS);
+
 /// The party who participates in the E2EE chat: encrypts and decrypts messages, without I/O.
 /// See the example in the [crate docs](crate).
 ///
@@ -91,6 +94,74 @@ pub struct Party {
     /// Optional post-quantum KEM ratchet state; `None` in classical sessions.
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
     kem_ratchet: Option<KemRatchet>,
+}
+
+/// Zero-copy read-only view of a [`Party`] or archived `ArchivedParty`, allowing callers such as
+/// `session` to inspect PQ state and associated data without deserializing secret keys onto the
+/// heap.
+pub trait PartyView {
+    /// Whether post-quantum KEM ratcheting is active on this party.
+    fn is_pq_ratchet_active(&self) -> bool;
+
+    /// Wire identifier (`1` = ML-KEM-1024, `2` = ML-KEM-768) of the active PQ KEM suite, if any.
+    fn pq_suite_id(&self) -> Option<u8>;
+
+    /// Associated data bound to every header and message in this session.
+    fn associated_data(&self) -> &[u8];
+}
+
+impl PartyView for Party {
+    fn is_pq_ratchet_active(&self) -> bool {
+        self.is_pq_ratchet_active()
+    }
+
+    fn pq_suite_id(&self) -> Option<u8> {
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            self.kem_ratchet.as_ref().map(|k| k.suite().id())
+        }
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        {
+            None
+        }
+    }
+
+    fn associated_data(&self) -> &[u8] {
+        self.associated_data()
+    }
+}
+
+#[cfg(feature = "rkyv")]
+impl PartyView for ArchivedParty {
+    fn is_pq_ratchet_active(&self) -> bool {
+        self.is_pq_ratchet_active()
+    }
+
+    fn pq_suite_id(&self) -> Option<u8> {
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            self.kem_ratchet.as_ref().map(|k| k.suite().id())
+        }
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        {
+            None
+        }
+    }
+
+    fn associated_data(&self) -> &[u8] {
+        self.associated_data()
+    }
+}
+
+/// Outcome of checking skipped chains during [`Party::decrypt`].
+enum SkippedOutcome {
+    /// Decrypted a delayed message from a skipped key.
+    Decrypted(Vec<u8>),
+    /// Header opened under the current receiving chain's header key (reused without decrypting
+    /// the header a second time).
+    CurrentChain(Header),
+    /// Header did not match any skipped chain.
+    NotMatched,
 }
 
 impl fmt::Debug for Party {
@@ -212,11 +283,9 @@ impl Party {
             .ok_or(ErrorKind::Crypto)?;
 
         let mut ratchet = self.ratchet.clone();
-        let header_key = Zeroizing::new(
-            ratchet
-                .header_key_sender()
-                .ok_or(ErrorKind::NoSendingChain)?,
-        );
+        let header_key = ratchet
+            .header_key_sender()
+            .ok_or(ErrorKind::NoSendingChain)?;
 
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         let (kem_ratchet, pq_suite, pq_public_key, pq_ciphertext, pq_key_id) = {
@@ -255,11 +324,9 @@ impl Party {
             &self.associated_data,
             &header_bytes,
         )?;
-        let message_key = Zeroizing::new(
-            ratchet
-                .step_message_ratchet_sender()
-                .ok_or(ErrorKind::NoSendingChain)?,
-        );
+        let message_key = ratchet
+            .step_message_ratchet_sender()
+            .ok_or(ErrorKind::NoSendingChain)?;
         let content = encrypt(
             &message_key,
             CONTENT_INFO,
@@ -282,16 +349,19 @@ impl Party {
 
     /// Decrypt a message. The state only changes if the content decrypts.
     pub fn decrypt(&mut self, message: &EncryptedMessage) -> Result<Vec<u8>> {
-        if let Some(content) = self.receive_skipped(message)? {
-            return Ok(content);
-        }
-        if let Some(header_key) = self.ratchet.header_key_receiver() {
-            let header_key = Zeroizing::new(header_key);
-            if let Some(header) = self.open_header(&header_key, message) {
-                return self.receive_current_chain(&header?, message);
+        match self.receive_skipped(message)? {
+            SkippedOutcome::Decrypted(content) => return Ok(content),
+            SkippedOutcome::CurrentChain(header) => {
+                return self.receive_current_chain(&header, message);
             }
+            SkippedOutcome::NotMatched => {}
         }
-        let next_header_key = Zeroizing::new(self.ratchet.next_header_key_receiver());
+        if let Some(header_key) = self.ratchet.header_key_receiver()
+            && let Some(header) = self.open_header(&header_key, message)
+        {
+            return self.receive_current_chain(&header?, message);
+        }
+        let next_header_key = self.ratchet.next_header_key_receiver();
         if let Some(header) = self.open_header(&next_header_key, message) {
             return self.receive_next_chain(&header?, message);
         }
@@ -299,17 +369,16 @@ impl Party {
     }
 
     /// A message whose key was skipped earlier, because it arrived out of order.
-    fn receive_skipped(&mut self, message: &EncryptedMessage) -> Result<Option<Vec<u8>>> {
+    fn receive_skipped(&mut self, message: &EncryptedMessage) -> Result<SkippedOutcome> {
         let Some((header_key, header)) =
             self.skipped_message_keys
                 .header_keys()
                 .find_map(|header_key| {
-                    let header_key = Zeroizing::new(header_key);
-                    let header = self.open_header(&header_key, message)?;
-                    Some((header_key, header))
+                    let header = self.open_header(header_key, message)?;
+                    Some((Zeroizing::new(*header_key), header))
                 })
         else {
-            return Ok(None);
+            return Ok(SkippedOutcome::NotMatched);
         };
         let header = header?;
         let Some(message_key) = self
@@ -322,16 +391,42 @@ impl Party {
             {
                 return Err(ErrorKind::EvictedMessage.into());
             }
-            return Ok(None);
+            // If this header key is the current receiving chain's key, hand the already-opened
+            // header straight to `receive_current_chain` (avoiding a second header trial-decrypt).
+            if self
+                .ratchet
+                .header_key_receiver()
+                .is_some_and(|cur| bool::from(cur.ct_eq(&*header_key)))
+            {
+                return Ok(SkippedOutcome::CurrentChain(header));
+            }
+            // Otherwise, this header belongs to a closed older chain still present in
+            // `skipped_message_keys` whose key was neither kept nor evicted: it was already
+            // received, so report `DuplicateMessage` rather than stalling as `Undecryptable`.
+            return Err(ErrorKind::DuplicateMessage.into());
         };
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        let mut kem_ratchet = self.kem_ratchet.clone();
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        match &mut kem_ratchet {
+            Some(kem) => {
+                let kem_header = kem_header_from_proto(&header)?;
+                kem.receive_skipped_header(&kem_header)
+                    .map_err(|e| Error::new(ErrorKind::InvalidHeader, e))?;
+            }
+            None => ensure_no_pq_header(&header)?,
+        }
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        ensure_no_pq_header(&header)?;
+
         let content = self.open_content(&message_key, message)?;
         self.skipped_message_keys
             .remove(&header_key, header.message_number);
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        if let Some(kem) = &mut self.kem_ratchet {
-            kem.note_skipped_received();
+        {
+            self.kem_ratchet = kem_ratchet;
         }
-        Ok(Some(content))
+        Ok(SkippedOutcome::Decrypted(content))
     }
 
     /// A message in the current receiving chain.
@@ -374,14 +469,12 @@ impl Party {
             self.message_number_receiver,
             header.message_number,
         )?;
-        let message_key = Zeroizing::new(
-            ratchet
-                .step_message_ratchet_receiver()
-                .ok_or(ErrorKind::InvalidHeader)?,
-        );
+        let message_key = ratchet
+            .step_message_ratchet_receiver()
+            .ok_or(ErrorKind::InvalidHeader)?;
         let content = self.open_content(&message_key, message)?;
 
-        let current_recv_hk = ratchet.header_key_receiver().map(Zeroizing::new);
+        let current_recv_hk = ratchet.header_key_receiver();
         self.ratchet = ratchet;
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         {
@@ -421,7 +514,7 @@ impl Party {
             .ok_or(ErrorKind::InvalidHeader)?;
 
         let mut ratchet = self.ratchet.clone();
-        let prev_recv_hk = ratchet.header_key_receiver().map(Zeroizing::new);
+        let prev_recv_hk = ratchet.header_key_receiver();
         let skipped_previous = skip_message_keys(
             &mut ratchet,
             self.message_number_receiver,
@@ -466,15 +559,13 @@ impl Party {
         }
 
         let skipped_next = skip_message_keys(&mut ratchet, 0, header.message_number)?;
-        let message_key = Zeroizing::new(
-            ratchet
-                .step_message_ratchet_receiver()
-                .ok_or(ErrorKind::InvalidHeader)?,
-        );
+        let message_key = ratchet
+            .step_message_ratchet_receiver()
+            .ok_or(ErrorKind::InvalidHeader)?;
         let content = self.open_content(&message_key, message)?;
 
         // Commit BOTH ratchets only after content AEAD succeeds.
-        let new_recv_hk = ratchet.header_key_receiver().map(Zeroizing::new);
+        let new_recv_hk = ratchet.header_key_receiver();
         self.ratchet = ratchet;
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         {
@@ -542,8 +633,8 @@ impl Party {
         PartyInvariants {
             dh_step_updates_sender: self.ratchet.dh_step_updates_sender(),
             has_sender_chain: self.ratchet.header_key_sender().is_some(),
-            receiver_header_key: self.ratchet.header_key_receiver().map(Zeroizing::new),
-            next_receiver_header_key: Zeroizing::new(self.ratchet.next_header_key_receiver()),
+            receiver_header_key: self.ratchet.header_key_receiver(),
+            next_receiver_header_key: self.ratchet.next_header_key_receiver(),
             previous_chain_length: self.previous_chain_length,
             message_number_sender: self.message_number_sender,
             message_number_receiver: self.message_number_receiver,
@@ -657,8 +748,8 @@ where
         PartyInvariants {
             dh_step_updates_sender: self.ratchet.dh_step_updates_sender(),
             has_sender_chain: self.ratchet.header_key_sender().is_some(),
-            receiver_header_key: self.ratchet.header_key_receiver().map(Zeroizing::new),
-            next_receiver_header_key: Zeroizing::new(self.ratchet.next_header_key_receiver()),
+            receiver_header_key: self.ratchet.header_key_receiver(),
+            next_receiver_header_key: self.ratchet.next_header_key_receiver(),
             previous_chain_length: self.previous_chain_length.to_native(),
             message_number_sender: self.message_number_sender.to_native(),
             message_number_receiver: self.message_number_receiver.to_native(),
@@ -758,19 +849,15 @@ fn skip_message_keys(ratchet: &mut Ratchet, from: u64, until: u64) -> Result<Opt
     if from >= until {
         return Ok(None);
     }
-    let header_key = Zeroizing::new(
-        ratchet
-            .header_key_receiver()
-            .ok_or(ErrorKind::InvalidHeader)?,
-    );
-    let mut skipped = SkippedChain::new(*header_key);
+    let header_key = ratchet
+        .header_key_receiver()
+        .ok_or(ErrorKind::InvalidHeader)?;
+    let mut skipped = SkippedChain::new(header_key);
     for message_number in from..until {
-        let message_key = Zeroizing::new(
-            ratchet
-                .step_message_ratchet_receiver()
-                .ok_or(ErrorKind::InvalidHeader)?,
-        );
-        skipped.insert(message_number, *message_key);
+        let message_key = ratchet
+            .step_message_ratchet_receiver()
+            .ok_or(ErrorKind::InvalidHeader)?;
+        skipped.insert(message_number, message_key);
     }
     Ok(Some(skipped))
 }
@@ -923,13 +1010,19 @@ mod test {
     /// the header key but not the message key.
     fn reencrypt_header(
         receiver: &Party,
-        header_key: HeaderKey,
+        header_key: &HeaderKey,
         message: &EncryptedMessage,
         alter: impl FnOnce(&mut Header),
     ) -> EncryptedMessage {
-        let mut header = receiver.open_header(&header_key, message).unwrap().unwrap();
+        let mut header = receiver.open_header(header_key, message).unwrap().unwrap();
         alter(&mut header);
-        let header = encrypt(&header_key, HEADER_INFO, b"AD", &header.encode_to_vec()).unwrap();
+        let header = encrypt(
+            header_key,
+            HEADER_INFO,
+            &receiver.associated_data,
+            &header.encode_to_vec(),
+        )
+        .unwrap();
         EncryptedMessage {
             header: header.into(),
             content: message.content.clone(),
@@ -1161,7 +1254,7 @@ mod test {
         // delayed message's key. It still opens with the header key and selects the same
         // message key.
         let header_key = bob.ratchet.next_header_key_receiver();
-        let forged = reencrypt_header(&bob, header_key, &next, |header| {
+        let forged = reencrypt_header(&bob, &header_key, &next, |header| {
             assert_eq!(header.previous_chain_length, 2);
             header.previous_chain_length = 1;
         });
@@ -1190,8 +1283,8 @@ mod test {
         // the current chain.
         let header_key = bob.ratchet.header_key_receiver().unwrap();
         let forged = [
-            reencrypt_header(&bob, header_key, &sent[0], |_| {}),
-            reencrypt_header(&bob, header_key, &sent[3], |header| {
+            reencrypt_header(&bob, &header_key, &sent[0], |_| {}),
+            reencrypt_header(&bob, &header_key, &sent[3], |header| {
                 header.previous_chain_length += 1;
             }),
         ];
@@ -1222,7 +1315,7 @@ mod test {
         assert_eq!(header.pq_key_id, None);
 
         // Injecting PQ fields into a classical header fails closed.
-        let forged = reencrypt_header(&bob, hk, &msg, |h| {
+        let forged = reencrypt_header(&bob, &hk, &msg, |h| {
             h.pq_suite = Some(1);
         });
         assert_eq!(
@@ -1627,10 +1720,11 @@ mod test {
                 // Delayed messages from earlier KEM epochs STILL decrypt cleanly!
                 assert_eq!(bob.decrypt(&a1_delayed).unwrap(), b"a1-delayed");
                 assert_eq!(alice.decrypt(&b1_delayed).unwrap(), b"b1-delayed");
-                // Replaying an earlier-epoch consumed message is rejected cleanly.
+                // Replaying an earlier-epoch consumed message while that chain still has another
+                // skipped key (`a0_lost`) MUST report DuplicateMessage (not Undecryptable).
                 assert_eq!(
                     bob.decrypt(&a1_delayed).unwrap_err().kind(),
-                    ErrorKind::Undecryptable
+                    ErrorKind::DuplicateMessage
                 );
                 // Replaying a current-epoch message is rejected as DuplicateMessage.
                 let a_cur = alice.encrypt(b"current-epoch").unwrap();
@@ -1639,6 +1733,85 @@ mod test {
                     bob.decrypt(&a_cur).unwrap_err().kind(),
                     ErrorKind::DuplicateMessage
                 );
+            }
+        }
+
+        #[test]
+        fn pq_delayed_evicted_offer_never_breaks_session_and_mid_chain_ct_mismatch_rejected() {
+            for suite in enabled_suites() {
+                // Case 1 (pending fresher offer present) and Case 2 (post-encapsulation `None`
+                // pending slot): peer creates E1 on a delayed message, calls `force_rekey` x4
+                // (evicting E1 from MAX_PENDING_OFFERS = 4), then delayed message carrying E1
+                // arrives out of order. Neither case may overwrite/adopt evicted E1, and replies
+                // MUST continue round-tripping cleanly.
+                for reply_before_delayed in [false, true] {
+                    let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::default());
+                    let a0 = alice.encrypt(b"a0").unwrap();
+                    assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
+                    let b0 = bob.encrypt(b"b0").unwrap();
+                    assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
+
+                    // Alice starts a new chain with E1 on a delayed message, then calls
+                    // `force_rekey` x4 so E1 is evicted from Alice's `pending_offers` ring!
+                    let a_lead = alice.encrypt(b"a-lead").unwrap();
+                    assert_eq!(bob.decrypt(&a_lead).unwrap(), b"a-lead");
+
+                    let evicted_id = alice.kem_ratchet.as_mut().unwrap().force_rekey().unwrap();
+                    let a_delayed_e1 = alice.encrypt(b"a-delayed-e1").unwrap();
+                    let mut latest_id = evicted_id;
+                    for _ in 0..ratchetx2::pq::MAX_PENDING_OFFERS {
+                        latest_id = alice.kem_ratchet.as_mut().unwrap().force_rekey().unwrap();
+                    }
+                    assert_ne!(evicted_id, latest_id);
+                    let a_latest = alice.encrypt(b"a-latest-e5").unwrap();
+                    // Bob receives `a_latest` (queuing `latest_id` via `receive_current_chain`).
+                    assert_eq!(bob.decrypt(&a_latest).unwrap(), b"a-latest-e5");
+
+                    if reply_before_delayed {
+                        // Advance through a turn so Bob consumes `latest_id` and `peer_pending_ek`
+                        // becomes `None` BEFORE `a_delayed_e1` arrives out of order!
+                        let b1 = bob.encrypt(b"b1").unwrap();
+                        assert_eq!(alice.decrypt(&b1).unwrap(), b"b1");
+                        let a_turn2 = alice.encrypt(b"a-turn2").unwrap();
+                        assert_eq!(bob.decrypt(&a_turn2).unwrap(), b"a-turn2");
+                        let b2 = bob.encrypt(b"b2").unwrap();
+                        assert_eq!(alice.decrypt(&b2).unwrap(), b"b2");
+                    }
+
+                    // Now delayed `a_delayed_e1` (carrying evicted E1) arrives out of order!
+                    assert_eq!(bob.decrypt(&a_delayed_e1).unwrap(), b"a-delayed-e1");
+
+                    // Round-trip replies MUST still succeed (never encapsulating evicted E1)!
+                    for turn in 0..2 {
+                        let a_msg = alice.encrypt(format!("after-a-{turn}").as_bytes()).unwrap();
+                        assert_eq!(
+                            bob.decrypt(&a_msg).unwrap(),
+                            format!("after-a-{turn}").as_bytes()
+                        );
+                        let b_msg = bob.encrypt(format!("after-b-{turn}").as_bytes()).unwrap();
+                        assert_eq!(
+                            alice.decrypt(&b_msg).unwrap(),
+                            format!("after-b-{turn}").as_bytes()
+                        );
+                    }
+                }
+
+                // Mid-chain ct/ek_id mismatch on current chain is rejected.
+                let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::every_turn());
+                let a0 = alice.encrypt(b"a0").unwrap();
+                assert_eq!(bob.decrypt(&a0).unwrap(), b"a0");
+                let b0 = bob.encrypt(b"b0").unwrap();
+                assert_eq!(alice.decrypt(&b0).unwrap(), b"b0");
+                let b_follow = bob.encrypt(b"b-follow").unwrap();
+                let alice_cur_hk = alice.ratchet.header_key_receiver().unwrap();
+                let forged = reencrypt_header(&alice, &alice_cur_hk, &b_follow, |h| {
+                    h.pq_key_id = Some(Bytes::from_static(&[0xEE; KEM_KEY_ID_LENGTH]));
+                });
+                assert_eq!(
+                    alice.decrypt(&forged).unwrap_err().kind(),
+                    ErrorKind::InvalidHeader
+                );
+                assert_eq!(alice.decrypt(&b_follow).unwrap(), b"b-follow");
             }
         }
 
