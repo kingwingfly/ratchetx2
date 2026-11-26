@@ -62,12 +62,19 @@ jobs:
       - name: Lint protobuf schemas
         run: buf lint
 
-  worker-build:
+  worker-build-and-workerd:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: e2ee_chat_worker/package-lock.json
 
       - name: Install wasm32 target
         run: rustup target add wasm32-unknown-unknown
@@ -109,9 +116,11 @@ jobs:
             exit 1
           fi
 
-      - name: Build Worker bundle
-        working-directory: e2ee_chat_worker
-        run: worker-build --release
+      - name: Install Worker test dependencies
+        run: npm --prefix e2ee_chat_worker ci
+
+      - name: Build Worker bundle and run workerd suite
+        run: ./.github/scripts/worker-test.sh
 
   web-bundle:
     runs-on: ubuntu-latest
