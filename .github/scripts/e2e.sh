@@ -32,7 +32,11 @@ fi
 run env CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
     cargo test --locked --target wasm32-unknown-unknown -p e2ee_chat_preview --features worker --test rpc_wire
 
-# 2. Build local Worker (`worker-build --dev`) and web client (`trunk build`).
+# 2. `e2ee_chat_web` in-module browser wasm32 tests (`vault.rs` & `workers.rs`).
+run env CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER=wasm-bindgen-test-runner \
+    cargo test --locked --target wasm32-unknown-unknown -p e2ee_chat_web --bin e2ee_chat_web
+
+# 3. Build local Worker (`worker-build --dev`) and web client (`trunk build`).
 cd "$REPO_ROOT/e2ee_chat_worker"
 run worker-build --dev
 if [ ! -x node_modules/.bin/wrangler ]; then
@@ -54,7 +58,7 @@ else
         trunk build
 fi
 
-# 3. Run Playwright Chromium + chromium-bfcache smoke suite against local `wrangler dev`.
+# 4. Run Playwright Chromium + chromium-bfcache smoke suite against local `wrangler dev`.
 cd "$REPO_ROOT/e2ee_chat_web/e2e"
 if [ ! -x node_modules/.bin/playwright ]; then
     run npm ci

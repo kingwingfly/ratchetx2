@@ -37,6 +37,10 @@ if (!fs.existsSync(wranglerBin)) {
 
 const port = process.env.E2E_PORT || '8788';
 const persistDir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2ee-chat-e2e-'));
+// Isolate the E2E server from any local developer `e2ee_chat_worker/.dev.vars` file so
+// `[vars]` from `wrangler.test.toml` are always deterministic.
+const emptyEnvFile = path.join(persistDir, 'empty.env');
+fs.writeFileSync(emptyEnvFile, '');
 
 const child = spawn(
   wranglerBin,
@@ -45,6 +49,14 @@ const child = spawn(
     '--local',
     '--config',
     wranglerConfig,
+    '--env-file',
+    emptyEnvFile,
+    '--var',
+    'PASSWORD:test-server-password',
+    '--var',
+    'AUTH_KEY:test-cookie-signing-key-for-workerd',
+    '--var',
+    'PQ_ENABLED:true',
     '--assets',
     webDistDir,
     '--ip',
