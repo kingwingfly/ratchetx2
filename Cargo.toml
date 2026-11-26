@@ -58,6 +58,12 @@ codegen-units = 1
 strip = "debuginfo"
 panic = "abort"
 
+# `arborium-tree-sitter`'s C `stack.c` keeps a dead `stderr` reference at `-O0` (its `fprintf`
+# macro expands to `0` in `arborium-sysroot/wasm-sysroot/stdio.h`), which fails `rust-lld` on
+# `wasm32-unknown-unknown` dev builds (`trunk build` / `trunk serve`). `-O1` eliminates it.
+[profile.dev.package.arborium-tree-sitter]
+opt-level = 1
+
 # The web client's Mermaid worker, the most Rust code it loads: built for size, it takes 40%
 # less, and still draws a diagram in milliseconds. The grammars' workers are mostly tables, which
 # this would not shrink.

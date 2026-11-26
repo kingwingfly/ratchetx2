@@ -121,7 +121,7 @@ message SessionState {
 // What was done last on a session.
 enum LastAction {
   // Nothing yet.
-  LAST_ACTION_NONE = 0;
+  LAST_ACTION_UNSPECIFIED = 0;
   // A message was encrypted on the active session.
   LAST_ACTION_SENT = 1;
   // A message decrypted on the active session.

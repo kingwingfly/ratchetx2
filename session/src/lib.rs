@@ -1749,7 +1749,7 @@ impl From<&SessionState> for proto::SessionState {
             peer: state.peer.to_vec(),
             cursor: state.cursor,
             last: match state.last {
-                LastAction::None => proto::LastAction::None,
+                LastAction::None => proto::LastAction::Unspecified,
                 LastAction::Sent => proto::LastAction::Sent,
                 LastAction::ReceivedActive => proto::LastAction::ReceivedActive,
                 LastAction::ReceivedEarlier => proto::LastAction::ReceivedEarlier,
@@ -1838,7 +1838,7 @@ impl TryFrom<&proto::SessionState> for SessionState {
             }
         };
         let last = match proto::LastAction::try_from(state.last) {
-            Ok(proto::LastAction::None) => LastAction::None,
+            Ok(proto::LastAction::Unspecified) => LastAction::None,
             Ok(proto::LastAction::Sent) => LastAction::Sent,
             Ok(proto::LastAction::ReceivedActive) => LastAction::ReceivedActive,
             Ok(proto::LastAction::ReceivedEarlier) => LastAction::ReceivedEarlier,

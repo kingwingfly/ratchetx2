@@ -18,7 +18,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  rust-check-and-test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -32,6 +32,8 @@ jobs:
 
       - name: Cache Cargo dependencies and build artifacts
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: rust
 
       # clang and llvm-ar compile the C grammars of the web client's code previews to WebAssembly.
       - name: Install protoc, clang, and LLVM
@@ -41,3 +43,157 @@ jobs:
 
       - name: Run tests
         run: .github/scripts/test.sh
+
+  proto-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Buf CLI
+        uses: bufbuild/buf-action@37ac33d8960807670a6e9719080e885197b09cc6 # v1.7.0
+        with:
+          version: 1.75.0
+          checksum: fad1e38d6909bbb583a4da81d8c02a01046e2cd663bde7e337dd24277393764b
+          setup_only: true
+          pr_comment: false
+
+      - name: Lint protobuf schemas
+        run: buf lint
+
+  worker-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: worker
+
+      - name: Install pinned wasm-bindgen-cli
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with:
+          tool: wasm-bindgen-cli@0.2.130
+
+      - name: Install pinned worker-build
+        run: cargo install --locked --version 0.9.0 worker-build
+
+      - name: Verify wasm-bindgen-cli and worker-build versions match Cargo.lock
+        run: |
+          set -euo pipefail
+          locked_wbg="$(awk '
+            $0 == "name = \"wasm-bindgen\"" { found = 1; next }
+            found && /^version = / { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.lock)"
+          installed_wbg="$(wasm-bindgen --version | awk '{print $2}')"
+          test -n "$locked_wbg"
+          if [ "$installed_wbg" != "$locked_wbg" ]; then
+            echo "wasm-bindgen version mismatch: installed=$installed_wbg Cargo.lock=$locked_wbg" >&2
+            exit 1
+          fi
+          locked_worker="$(awk '
+            $0 == "name = \"worker\"" { found = 1; next }
+            found && /^version = / { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.lock)"
+          installed_wb="$(worker-build --version | awk '{print $NF}')"
+          test -n "$locked_worker"
+          if [ "$installed_wb" != "$locked_worker" ]; then
+            echo "worker-build version mismatch: installed=$installed_wb Cargo.lock worker=$locked_worker" >&2
+            exit 1
+          fi
+
+      - name: Build Worker bundle
+        working-directory: e2ee_chat_worker
+        run: worker-build --release
+
+  web-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Determine whether release web bundle is required
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "${BASE_SHA}...HEAD")"
+          if printf '%s\n' "$changed" | grep -qE '^(e2ee_chat_web/|e2ee_chat_preview/|session/|protocol/|party/|x3dh/|xeddsa/|ratchetx2/|Cargo\.toml$|Cargo\.lock$)'; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Cache Cargo dependencies and build artifacts
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          prefix-key: web-bundle
+
+      # clang and llvm-ar compile the C grammars of the web client's code previews to WebAssembly.
+      - name: Install clang and LLVM
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm
+
+      - name: Install pinned trunk and wasm-bindgen-cli
+        uses: taiki-e/install-action@893d6ee8d714b6c7dfe2bcd94e5759e9a7958a7e # v2.90.10
+        with:
+          tool: trunk@0.22.2,wasm-bindgen-cli@0.2.130
+
+      - name: Install pinned wasm-opt (binaryen version_133)
+        run: |
+          set -euo pipefail
+          archive="binaryen-version_133-x86_64-linux.tar.gz"
+          url="https://github.com/WebAssembly/binaryen/releases/download/version_133/${archive}"
+          expected_sha256="2dc9c7813f5375db93d96ead4b78222fcc3e2677bbb832297af4797782a37489"
+          tmp="$(mktemp -d)"
+          curl -fsSL "$url" -o "${tmp}/${archive}"
+          echo "${expected_sha256}  ${tmp}/${archive}" | sha256sum -c -
+          sudo mkdir -p /usr/local/binaryen
+          sudo tar -xzf "${tmp}/${archive}" -C /usr/local/binaryen --strip-components=1
+          rm -rf "$tmp"
+          echo "/usr/local/binaryen/bin" >> "$GITHUB_PATH"
+
+      - name: Verify trunk, wasm-opt, and wasm-bindgen-cli versions
+        run: |
+          set -euo pipefail
+          trunk --version
+          wasm-opt --version
+          locked_wbg="$(awk '
+            $0 == "name = \"wasm-bindgen\"" { found = 1; next }
+            found && /^version = / { gsub(/"/, "", $3); print $3; exit }
+          ' Cargo.lock)"
+          installed_wbg="$(wasm-bindgen --version | awk '{print $2}')"
+          test -n "$locked_wbg"
+          if [ "$installed_wbg" != "$locked_wbg" ]; then
+            echo "wasm-bindgen version mismatch: installed=$installed_wbg Cargo.lock=$locked_wbg" >&2
+            exit 1
+          fi
+
+      - name: Build web bundle (dev)
+        if: steps.mode.outputs.release != 'true'
+        working-directory: e2ee_chat_web
+        run: trunk build
+
+      - name: Build web bundle (release)
+        if: steps.mode.outputs.release == 'true'
+        working-directory: e2ee_chat_web
+        run: trunk build --release

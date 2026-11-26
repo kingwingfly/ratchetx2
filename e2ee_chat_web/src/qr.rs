@@ -864,8 +864,269 @@ mod tests {
         assert!(!data_bits_fit(40, Ecc::High, 1274));
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn decode_png_qr(png_bytes: &[u8], expected_border_px: usize) -> (rqrr::MetaData, Vec<u8>) {
+        let decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+        let mut reader = decoder.read_info().expect("valid PNG header");
+        let buf_len = reader.output_buffer_size().expect("PNG output buffer size");
+        let mut raw = vec![0u8; buf_len];
+        let info = reader.next_frame(&mut raw).expect("decode PNG frame");
+        reader.finish().expect("valid PNG trailer");
+        assert_eq!(info.color_type, png::ColorType::Grayscale);
+        assert_eq!(info.bit_depth, png::BitDepth::One);
+        assert_eq!(info.width, info.height, "QR PNG must be square");
+
+        let dim = info.width as usize;
+        let stride = info.line_size;
+        let mut luma = Vec::with_capacity(dim * dim);
+        for y in 0..dim {
+            let row = &raw[y * stride..(y + 1) * stride];
+            for x in 0..dim {
+                let bit = (row[x >> 3] >> (7 - (x & 7))) & 1;
+                luma.push(if bit == 0 { 0u8 } else { 255u8 });
+            }
+        }
+
+        // Verify the entire quiet zone border is white on all four sides.
+        for y in 0..dim {
+            for x in 0..dim {
+                if y < expected_border_px
+                    || y >= dim - expected_border_px
+                    || x < expected_border_px
+                    || x >= dim - expected_border_px
+                {
+                    assert_eq!(
+                        luma[y * dim + x],
+                        255,
+                        "quiet zone pixel ({x}, {y}) must be white"
+                    );
+                }
+            }
+        }
+
+        let mut prepared =
+            rqrr::PreparedImage::prepare_from_greyscale(dim, dim, |x, y| luma[y * dim + x]);
+        let grids = prepared.detect_grids();
+        assert_eq!(
+            grids.len(),
+            1,
+            "expected exactly 1 QR grid in {dim}x{dim} PNG"
+        );
+        let mut out = Vec::new();
+        let meta = grids[0].decode_to(&mut out).expect("decode QR payload");
+        (meta, out)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn export_scale(qr: &QrCode) -> usize {
+        let total = qr.total_size(QUIET_ZONE) as u32;
+        (EXPORT_TARGET_PX / total).max(4) as usize
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn max_byte_payload(version: u8, ecc: Ecc) -> String {
+        let overhead_bits = 4 + byte_count_bits(version);
+        let max_bytes = (num_data_codewords(version, ecc) * 8 - overhead_bits) / 8;
+        let tag = format!("v{version:02}-{ecc:?}-");
+        let mut payload = String::with_capacity(max_bytes);
+        while payload.len() < max_bytes {
+            let rem = max_bytes - payload.len();
+            payload.push_str(&tag[..rem.min(tag.len())]);
+        }
+        payload
+    }
+
     #[test]
-    fn zbarimg_decodes_generated_pngs_across_all_versions_and_ecc_levels() {
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pure_rust_decodes_invitation_links_and_export_pngs() {
+        use session::PqConfig;
+
+        use crate::{
+            engine::{build_invitation_link, parse_invitation_hash},
+            state::{Dialog, Me, ServerPqStatus},
+            util::key_to_url,
+        };
+
+        // 1. Full end-to-end invitation links (default server, custom server, Unicode name, PQ on/off).
+        let key = [0x5Au8; 32];
+        let me_default = Me {
+            name: "Alice & 爱丽丝".to_string(),
+            key,
+            server: "https://chat.example.com".to_string(),
+            pq_config: PqConfig::default(),
+            server_pq: ServerPqStatus::Unknown,
+        };
+        let me_custom = Me {
+            name: "Bob".to_string(),
+            key,
+            server: "https://relay.example.org".to_string(),
+            pq_config: PqConfig::default(),
+            server_pq: ServerPqStatus::Disabled,
+        };
+        let invite_default = build_invitation_link("https://chat.example.com", &me_default);
+        let invite_custom = build_invitation_link("https://chat.example.com", &me_custom);
+
+        let qr_default = QrCode::encode_text(&invite_default).expect("encode default invite");
+        let (meta_default, raw_default) = decode_png_qr(
+            &qr_default.to_export_png(),
+            QUIET_ZONE * export_scale(&qr_default),
+        );
+        let decoded_default = String::from_utf8(raw_default).expect("valid utf-8 invite");
+        assert_eq!(decoded_default, invite_default);
+        assert_eq!(meta_default.version.0, usize::from(qr_default.version()));
+        assert_eq!(meta_default.ecc_level, Ecc::Medium.format_bits() as u16);
+
+        let (_, hash_default) = decoded_default.split_once('#').expect("fragment");
+        assert_eq!(
+            parse_invitation_hash(hash_default),
+            Some(Dialog::NewChat {
+                key: key_to_url(&key),
+                name: "Alice & 爱丽丝".to_string(),
+                server: None,
+                pq_pinned: me_default.pq_config.pq_enabled
+                    && !me_default.pq_config.offered_suites().is_empty(),
+            })
+        );
+
+        let qr_custom = QrCode::encode_text(&invite_custom).expect("encode custom invite");
+        let (meta_custom, raw_custom) = decode_png_qr(
+            &qr_custom.to_export_png(),
+            QUIET_ZONE * export_scale(&qr_custom),
+        );
+        let decoded_custom = String::from_utf8(raw_custom).expect("valid utf-8 invite");
+        assert_eq!(decoded_custom, invite_custom);
+        assert_eq!(meta_custom.version.0, usize::from(qr_custom.version()));
+        assert_eq!(meta_custom.ecc_level, Ecc::Medium.format_bits() as u16);
+
+        let (_, hash_custom) = decoded_custom.split_once('#').expect("fragment");
+        assert_eq!(
+            parse_invitation_hash(hash_custom),
+            Some(Dialog::NewChat {
+                key: key_to_url(&key),
+                name: "Bob".to_string(),
+                server: Some("https://relay.example.org".to_string()),
+                pq_pinned: false,
+            })
+        );
+
+        // 2. Oversized text exceeding V40 Medium (2,331 bytes) falls back to Low ECC.
+        let long_payload = "inv=".to_string() + &"x".repeat(2_496);
+        let qr_fallback = QrCode::encode_text(&long_payload).expect("fits at Low ECC");
+        let (meta_fallback, raw_fallback) = decode_png_qr(
+            &qr_fallback.to_export_png(),
+            QUIET_ZONE * export_scale(&qr_fallback),
+        );
+        assert_eq!(raw_fallback, long_payload.as_bytes());
+        assert_eq!(meta_fallback.version.0, usize::from(qr_fallback.version()));
+        assert_eq!(meta_fallback.ecc_level, Ecc::Low.format_bits() as u16);
+
+        // 3. Raw arbitrary binary payload (all 256 byte values) via `QrCode::encode`.
+        let all_bytes: Vec<u8> = (0u8..=255).collect();
+        let qr_binary = QrCode::encode(&all_bytes, Ecc::Medium).expect("encode binary");
+        let (meta_binary, raw_binary) = decode_png_qr(
+            &qr_binary.to_export_png(),
+            QUIET_ZONE * export_scale(&qr_binary),
+        );
+        assert_eq!(raw_binary, all_bytes);
+        assert_eq!(meta_binary.version.0, usize::from(qr_binary.version()));
+        assert_eq!(meta_binary.ecc_level, Ecc::Medium.format_bits() as u16);
+
+        // 4. Empty payload across all 4 ECC levels via `to_export_png()`.
+        for ecc in [Ecc::Low, Ecc::Medium, Ecc::Quartile, Ecc::High] {
+            let qr = QrCode::encode(b"", ecc).expect("encode empty");
+            assert_eq!(qr.version(), 1);
+            let (meta, raw) = decode_png_qr(&qr.to_export_png(), QUIET_ZONE * export_scale(&qr));
+            assert!(raw.is_empty(), "expected empty payload for {ecc:?}");
+            assert_eq!(meta.version.0, 1);
+            assert_eq!(meta.ecc_level, ecc.format_bits() as u16);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pure_rust_decodes_to_png_across_scale_factors() {
+        let payloads = [
+            (
+                "https://chat.example.com/#chat=OjpcOjo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo6Ojo&name=Alice&pq=1"
+                    .to_string(),
+                Ecc::Medium,
+            ),
+            (max_byte_payload(10, Ecc::Quartile), Ecc::Quartile),
+        ];
+
+        for (payload, ecc) in payloads {
+            let qr = QrCode::encode(payload.as_bytes(), ecc).expect("encode");
+            for module_px in [2u32, 3, 4, 6, 8] {
+                let png = qr.to_png(module_px, QUIET_ZONE);
+                let (meta, raw) = decode_png_qr(&png, QUIET_ZONE * module_px as usize);
+                assert_eq!(
+                    raw,
+                    payload.as_bytes(),
+                    "round-trip mismatch for v{} {ecc:?} at scale {module_px}",
+                    qr.version()
+                );
+                assert_eq!(meta.version.0, usize::from(qr.version()));
+                assert_eq!(meta.ecc_level, ecc.format_bits() as u16);
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn assert_all_versions_decode_for_ecc(ecc: Ecc) {
+        // Cover every ISO/IEC 18004 version 1..=40 at exact max byte capacity, using
+        // `to_export_png()` on key structural boundaries (V1, V7, V10, V32, V40) and
+        // `to_png(2, QUIET_ZONE)` across all other versions.
+        let export_boundaries = [1u8, 7, 10, 32, 40];
+        for version in 1u8..=40 {
+            let payload = max_byte_payload(version, ecc);
+            let qr = QrCode::encode(payload.as_bytes(), ecc).expect("encode");
+            assert_eq!(qr.version(), version);
+
+            let (png, border_px) = if export_boundaries.contains(&version) {
+                (qr.to_export_png(), QUIET_ZONE * export_scale(&qr))
+            } else {
+                (qr.to_png(2, QUIET_ZONE), QUIET_ZONE * 2)
+            };
+
+            let (meta, raw) = decode_png_qr(&png, border_px);
+            assert_eq!(
+                raw,
+                payload.as_bytes(),
+                "round-trip mismatch for v{version} {ecc:?}"
+            );
+            assert_eq!(meta.version.0, usize::from(version));
+            assert_eq!(meta.ecc_level, ecc.format_bits() as u16);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pure_rust_decodes_all_versions_ecc_low() {
+        assert_all_versions_decode_for_ecc(Ecc::Low);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pure_rust_decodes_all_versions_ecc_medium() {
+        assert_all_versions_decode_for_ecc(Ecc::Medium);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pure_rust_decodes_all_versions_ecc_quartile() {
+        assert_all_versions_decode_for_ecc(Ecc::Quartile);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn pure_rust_decodes_all_versions_ecc_high() {
+        assert_all_versions_decode_for_ecc(Ecc::High);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    #[ignore = "requires system zbarimg binary; pure-Rust decode tests run unconditionally"]
+    fn zbarimg_decodes_generated_pngs_interop() {
         use std::process::Command;
 
         use session::PqConfig;
@@ -876,10 +1137,6 @@ mod tests {
             util::key_to_url,
         };
 
-        if Command::new("zbarimg").arg("--version").output().is_err() {
-            return;
-        }
-
         let dir = std::env::temp_dir().join(format!("ratchetx2-qr-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
@@ -887,7 +1144,6 @@ mod tests {
         let mut expected: Vec<(String, u8, Ecc)> = Vec::new();
         let mut paths = Vec::new();
 
-        // 1. Full end-to-end invitation links (default server, custom server, Unicode name, PQ on/off).
         let key = [0x5Au8; 32];
         let me_default = Me {
             name: "Alice & 爱丽丝".to_string(),
@@ -913,41 +1169,24 @@ mod tests {
             paths.push(path);
         }
 
-        // 2. Every ISO/IEC 18004 version (1..=40) cycling across all 4 ECC levels, plus all 4 ECC
-        // levels at structural boundaries (V1, V7, V10, V32, V36, V40), at exact max byte capacity.
         let eccs = [Ecc::Low, Ecc::Medium, Ecc::Quartile, Ecc::High];
-        let mut matrix_cases: Vec<(u8, Ecc)> = (1u8..=40)
-            .map(|v| (v, eccs[usize::from(v - 1) % 4]))
-            .collect();
-        for v in [1u8, 7, 10, 32, 36, 40] {
+        for version in [1u8, 7, 10, 32, 36, 40] {
             for ecc in eccs {
-                if !matrix_cases.contains(&(v, ecc)) {
-                    matrix_cases.push((v, ecc));
-                }
+                let payload = max_byte_payload(version, ecc);
+                let qr = QrCode::encode(payload.as_bytes(), ecc).expect("encode");
+                assert_eq!(qr.version(), version);
+                let path = dir.join(format!("v{version:02}-{}.png", ecc as u8));
+                std::fs::write(&path, qr.to_png(3, QUIET_ZONE)).expect("write png");
+                expected.push((payload, version, ecc));
+                paths.push(path);
             }
-        }
-        for (version, ecc) in matrix_cases {
-            let overhead_bits = 4 + byte_count_bits(version);
-            let max_bytes = (num_data_codewords(version, ecc) * 8 - overhead_bits) / 8;
-            let tag = format!("v{version:02}-{ecc:?}-");
-            let mut payload = String::with_capacity(max_bytes);
-            while payload.len() < max_bytes {
-                let rem = max_bytes - payload.len();
-                payload.push_str(&tag[..rem.min(tag.len())]);
-            }
-            let qr = QrCode::encode(payload.as_bytes(), ecc).expect("encode");
-            assert_eq!(qr.version(), version);
-            let path = dir.join(format!("v{version:02}-{}.png", ecc as u8));
-            std::fs::write(&path, qr.to_png(3, QUIET_ZONE)).expect("write png");
-            expected.push((payload, version, ecc));
-            paths.push(path);
         }
 
         let out = Command::new("zbarimg")
             .args(["--quiet", "--raw", "-Sdisable", "-Sqrcode.enable"])
             .args(&paths)
             .output()
-            .expect("run zbarimg");
+            .expect("zbarimg must be installed to run this ignored interop test");
         let _ = std::fs::remove_dir_all(&dir);
 
         assert!(
@@ -962,7 +1201,6 @@ mod tests {
             assert_eq!(got, want, "round-trip mismatch for v{version} {ecc:?}");
         }
 
-        // Verify the decoded invitation URLs parse back into the exact NewChat dialogs.
         let (_, hash_default) = decoded[0].split_once('#').expect("fragment");
         assert_eq!(
             parse_invitation_hash(hash_default),
