@@ -58,7 +58,8 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
           workerNosniff: workerResp?.headers.get('x-content-type-options') ?? '',
         };
       });
-      for (const key of [
+      const expectedManifestKeys = [
+        'vault_kdf',
         'pdf',
         'audio',
         'search',
@@ -68,9 +69,12 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
         'code_systems',
         'code_apps',
         'code_scripts',
-      ]) {
+      ];
+      expect(Object.keys(assetMeta.manifest).sort()).toEqual([...expectedManifestKeys].sort());
+      for (const key of expectedManifestKeys) {
+        const prefix = key === 'vault_kdf' ? 'vault_kdf' : `preview_${key}`;
         expect(assetMeta.manifest[key], `manifest.${key}`).toMatch(
-          new RegExp(`^/assets/preview_${key}-[0-9a-f]+_loader\\.js$`),
+          new RegExp(`^/assets/${prefix}-[0-9a-f]+_loader\\.js$`),
         );
       }
       expect(assetMeta.scripts).toHaveLength(1);

@@ -17,6 +17,7 @@ function assertSecurityHeaders(headers: Record<string, string>): void {
 
 test.describe('media-worker.js service worker', () => {
   test('enforces method/destination guards, streams Range/suffix/200/416, and propagates AbortController aborts', async ({
+    browserName,
     context,
     page,
   }) => {
@@ -207,6 +208,10 @@ test.describe('media-worker.js service worker', () => {
     // 3. Exercise exact Range, suffix Range, invalid 416, non-Range multi-chunk 200, and
     //    AbortController.abort() cleanup directly inside the live `media-worker.js` Service Worker
     //    communicating with the real controlled page via `self.clients.get(clientId)`.
+    //    Playwright only exposes `BrowserContext.serviceWorkers()` on Chromium.
+    if (browserName !== 'chromium') {
+      return;
+    }
     const sw = context
       .serviceWorkers()
       .find((worker) => worker.url().endsWith('/media-worker.js'));

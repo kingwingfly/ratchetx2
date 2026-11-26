@@ -1,12 +1,76 @@
-import { expect, test } from '@playwright/test';
+import { expect, test, type Page } from '@playwright/test';
 import {
   LEGACY_ROLLBACK_ANCHOR_KEY,
   ROLLBACK_ANCHOR_KEY,
   TEST_PASSPHRASE,
   createVault,
+  establishChat,
+  fixturePath,
   lockVault,
+  sendFiles,
+  sendTextMessage,
   unlockVault,
 } from './helpers.ts';
+
+const EXPECTED_WORKER_MANIFEST_KEYS = [
+  'vault_kdf',
+  'pdf',
+  'audio',
+  'search',
+  'diagram',
+  'markdown',
+  'code_web',
+  'code_systems',
+  'code_apps',
+  'code_scripts',
+] as const;
+
+const LEGACY_IDB_PREFIXES = ['history:', 'file:', 'chunk:', 'outbox:', 'upload:', 'deferred'];
+
+async function inspectVaultIdb(page: Page): Promise<{ version: number; keys: string[] }> {
+  return page.evaluate(async () => {
+    return new Promise<{ version: number; keys: string[] }>((resolve, reject) => {
+      const req = indexedDB.open('e2ee-chat');
+      req.onerror = () => reject(req.error);
+      req.onsuccess = () => {
+        const db = req.result;
+        const version = db.version;
+        const tx = db.transaction('records', 'readonly');
+        const keysReq = tx.objectStore('records').getAllKeys();
+        keysReq.onerror = () => {
+          db.close();
+          reject(keysReq.error);
+        };
+        keysReq.onsuccess = () => {
+          const keys = keysReq.result.map(String);
+          db.close();
+          resolve({ version, keys });
+        };
+      };
+    });
+  });
+}
+
+function assertOpaqueV3IdbKeys(
+  idb: { version: number; keys: string[] },
+  opts: { requireOpaqueRecords?: boolean } = {},
+): void {
+  expect(idb.version).toBe(3);
+  expect(idb.keys).toContain('vault');
+  expect(idb.keys).toContain('state');
+  const opaqueKeys: string[] = [];
+  for (const key of idb.keys) {
+    if (key === 'vault' || key === 'state') continue;
+    for (const prefix of LEGACY_IDB_PREFIXES) {
+      expect(key, `cleartext legacy IDB key "${key}" leaked`).not.toContain(prefix);
+    }
+    expect(key, `raw IDB key "${key}" must be opaque 64-hex`).toMatch(/^[0-9a-f]{64}$/);
+    opaqueKeys.push(key);
+  }
+  if (opts.requireOpaqueRecords) {
+    expect(opaqueKeys.length).toBeGreaterThan(0);
+  }
+}
 
 test.describe('vault lifecycle', () => {
   test('first-boot create, opaque IDB keys, lock, wrong passphrase rejection, and unlock', async ({
@@ -17,34 +81,8 @@ test.describe('vault lifecycle', () => {
     const anchor = await page.evaluate((key) => localStorage.getItem(key), ROLLBACK_ANCHOR_KEY);
     expect(anchor).toMatch(/^v3:\d+:[0-9a-f]{32}$/);
 
-    // Verify all raw IndexedDB keys are either literal `"vault"`/`"state"` or 64-hex HMAC keys.
-    const rawKeys = await page.evaluate(async () => {
-      return new Promise<string[]>((resolve, reject) => {
-        const req = indexedDB.open('e2ee-chat');
-        req.onerror = () => reject(req.error);
-        req.onsuccess = () => {
-          const db = req.result;
-          const tx = db.transaction('records', 'readonly');
-          const keysReq = tx.objectStore('records').getAllKeys();
-          keysReq.onerror = () => {
-            db.close();
-            reject(keysReq.error);
-          };
-          keysReq.onsuccess = () => {
-            const keys = keysReq.result.map(String);
-            db.close();
-            resolve(keys);
-          };
-        };
-      });
-    });
-    expect(rawKeys).toContain('vault');
-    expect(rawKeys).toContain('state');
-    for (const k of rawKeys) {
-      if (k !== 'vault' && k !== 'state') {
-        expect(k, `raw IDB key "${k}" must be opaque 64-hex`).toMatch(/^[0-9a-f]{64}$/);
-      }
-    }
+    // Verify IndexedDB (`e2ee-chat` v3) keys are only `"vault"`, `"state"`, or 64-hex HMAC keys.
+    assertOpaqueV3IdbKeys(await inspectVaultIdb(page));
 
     await lockVault(page);
 
@@ -58,6 +96,33 @@ test.describe('vault lifecycle', () => {
     await expect(page.locator('.sidebar-foot .whoami strong')).toHaveText('Alice');
   });
 
+  test('real browser IndexedDB (v3) contains only "vault", "state", and 64-hex opaque keys after message and file exchange', async ({
+    browser,
+  }) => {
+    const aliceCtx = await browser.newContext();
+    const bobCtx = await browser.newContext();
+    const alicePage = await aliceCtx.newPage();
+    const bobPage = await bobCtx.newPage();
+    try {
+      await establishChat(alicePage, bobPage, 'Alice IDB', 'Bob IDB');
+
+      const messageText = 'Opaque IndexedDB v3 audit message';
+      await sendTextMessage(alicePage, messageText);
+      await expect(bobPage.locator('.messages .bubble', { hasText: messageText })).toBeVisible();
+
+      await sendFiles(alicePage, [fixturePath('sample.rs'), fixturePath('pixel.png')]);
+      await expect(alicePage.locator('.uploads .upload')).toHaveCount(0);
+      await expect(bobPage.locator('.messages .file-card', { hasText: 'sample.rs' })).toBeVisible();
+      await expect(bobPage.locator('.messages .inline-media button.thumb').first()).toBeVisible();
+
+      assertOpaqueV3IdbKeys(await inspectVaultIdb(alicePage), { requireOpaqueRecords: true });
+      assertOpaqueV3IdbKeys(await inspectVaultIdb(bobPage), { requireOpaqueRecords: true });
+    } finally {
+      await aliceCtx.close();
+      await bobCtx.close();
+    }
+  });
+
   test('vault_kdf worker manifest wiring, cancelable KDF UX during create & unlock, and real derivation', async ({
     page,
   }) => {
@@ -65,13 +130,19 @@ test.describe('vault lifecycle', () => {
     const dialog = page.locator('dialog.modal');
     await expect(dialog.getByRole('heading', { name: 'Create your vault' })).toBeVisible();
 
-    // 1. Verify `<meta name="e2ee-worker-manifest">` contains hashed `"vault_kdf"` loader entry.
+    // 1. Verify `<meta name="e2ee-worker-manifest">` contains all 10 expected hashed worker keys.
     const manifest = await page.evaluate(() => {
       const meta = document.querySelector('meta[name="e2ee-worker-manifest"]');
       return meta ? (JSON.parse(meta.getAttribute('content') || '{}') as Record<string, string>) : null;
     });
     expect(manifest).not.toBeNull();
-    expect(manifest!.vault_kdf).toMatch(/^\/assets\/vault_kdf-[0-9a-f]+_loader\.js$/);
+    expect(Object.keys(manifest!).sort()).toEqual([...EXPECTED_WORKER_MANIFEST_KEYS].sort());
+    for (const key of EXPECTED_WORKER_MANIFEST_KEYS) {
+      const prefix = key === 'vault_kdf' ? 'vault_kdf' : `preview_${key}`;
+      expect(manifest![key], `manifest.${key}`).toMatch(
+        new RegExp(`^/assets/${prefix}-[0-9a-f]+_loader\\.js$`),
+      );
+    }
 
     // 2. Cancel during Create: pause the `vault_kdf` worker script fetch deterministically so we
     //    can assert the accessible KDF spinner, status text, disabled inputs, and working Cancel

@@ -43,6 +43,24 @@ export default defineConfig({
         },
       },
     },
+    ...(process.env.E2E_CROSS_BROWSER === '1'
+      ? [
+          {
+            name: 'firefox',
+            testIgnore: /bfcache\.spec\.ts/,
+            use: {
+              ...devices['Desktop Firefox'],
+            },
+          },
+          {
+            name: 'webkit',
+            testIgnore: /bfcache\.spec\.ts/,
+            use: {
+              ...devices['Desktop Safari'],
+            },
+          },
+        ]
+      : []),
   ],
   webServer: {
     command: 'node ./scripts/start-server.mjs',

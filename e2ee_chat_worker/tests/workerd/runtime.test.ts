@@ -860,6 +860,50 @@ describe("workerd runtime twins", () => {
     const closed = await closePromise;
     expect(closed.code).toBe(1008);
     expect(closed.reason).toBe("unexpected message");
+
+    // Sign-in cookie `session_expires` survives hibernation and alarm closes expired socket with 1008.
+    const nonce3 = new Uint8Array(16).fill(0x33);
+    const sub3 = await signSubscribeRequestV2(bob, AUDIENCE, BigInt(Date.now()), nonce3);
+    const upgrade3 = await exports.default.fetch(wsUrl, {
+      headers: {
+        Upgrade: "websocket",
+        Origin: ORIGIN,
+        Cookie: cookie,
+        "Sec-WebSocket-Protocol": wsSubprotocolHeader(sub3),
+        "CF-Connecting-IP": "198.51.100.30",
+      },
+    });
+    expect(upgrade3.status).toBe(101);
+    const wsExp = upgrade3.webSocket!;
+    wsExp.accept();
+
+    await evictDurableObject(bobStub, { webSockets: "hibernate" });
+
+    const preservedExpires = await runInDurableObject(bobStub, async (_inst, state) => {
+      const sockets = state.getWebSockets();
+      expect(sockets.length).toBe(1);
+      const serverWs = sockets[0];
+      const att = serverWs.deserializeAttachment() as
+        | Map<string, unknown>
+        | Record<string, unknown>;
+      const prev = att instanceof Map ? att.get("session_expires") : att.session_expires;
+      const expiredAt = Date.now() - 1;
+      if (att instanceof Map) {
+        att.set("session_expires", expiredAt);
+        serverWs.serializeAttachment(att);
+      } else {
+        serverWs.serializeAttachment({ ...att, session_expires: expiredAt });
+      }
+      await state.storage.setAlarm(Date.now() + 60_000);
+      return Number(prev);
+    });
+    expect(preservedExpires).toBeGreaterThan(Date.now());
+
+    const expClosePromise = waitForClose(wsExp);
+    expect(await runDurableObjectAlarm(bobStub)).toBe(true);
+    const expClosed = await expClosePromise;
+    expect(expClosed.code).toBe(1008);
+    expect(expClosed.reason).toBe("session expired");
   });
 
   // -------------------------------------------------------------------------
