@@ -63,6 +63,7 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
         'audio',
         'search',
         'diagram',
+        'markdown',
         'code_web',
         'code_systems',
         'code_apps',
@@ -169,11 +170,12 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
       await expect(viewer.locator('pre.code')).not.toHaveAttribute('data-error');
       await closeViewer();
 
-      // (e) preview_diagram (Mermaid fenced block inside Markdown)
+      // (e) preview_markdown + preview_diagram + preview_code_systems (Markdown with Mermaid & Rust)
       const mdCard = bobPage.locator('.messages .file-card', { hasText: 'diagram.md' });
       await expect(mdCard).toBeVisible();
       await mdCard.click();
       await expect(viewer).toHaveAttribute('open', '');
+      await expect(viewer.locator('.markdown h1')).toHaveText('E2EE Preview Smoke Document');
       const diagramImg = viewer.locator('img.diagram');
       await expect(diagramImg).toBeVisible();
       const diagramSrc = await diagramImg.getAttribute('src');
@@ -183,6 +185,18 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
         'base64',
       ).toString('utf8');
       expect(decodedSvg).toContain('<svg');
+      // `<Enhanced>` also highlights fenced Rust inside the asynchronously rendered Markdown.
+      await expect(
+        viewer.locator('.markdown pre code[data-lang="rust"] span[class^="hl-"]').first(),
+      ).toBeVisible();
+
+      // Toggle Document -> Slides (lazily calls `preview_markdown` `slides` RPC) -> Document.
+      await viewer.getByRole('button', { name: 'View as slides', exact: true }).click();
+      await expect(viewer.locator('.slides .slide h1')).toHaveText('E2EE Preview Smoke Document');
+      await expect(viewer.locator('.slides .slides-bar span')).toHaveText('1 / 1');
+      await viewer.getByRole('button', { name: 'View as a document', exact: true }).click();
+      await expect(viewer.locator('.markdown h1')).toHaveText('E2EE Preview Smoke Document');
+      await expect(viewer.locator('img.diagram')).toBeVisible();
       await closeViewer();
 
       // (f) preview_pdf

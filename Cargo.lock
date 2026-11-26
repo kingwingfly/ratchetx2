@@ -82,6 +82,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57b212daf2e827b1ccdd778b7eb48ba433e58cb0e4f27b43cd6b7a608425a014"
 
 [[package]]
+name = "ammonia"
+version = "4.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b34ca49e407c06daac53f0c4debe8ff5df9cc2a4e9369d164a5d86ef8c219319"
+dependencies = [
+ "cssparser",
+ "html5ever",
+ "maplit",
+ "url",
+]
+
+[[package]]
 name = "any_spawner"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1347,6 +1359,7 @@ dependencies = [
 name = "e2ee_chat_preview"
 version = "0.3.0"
 dependencies = [
+ "ammonia",
  "arborium",
  "arborium-bash",
  "arborium-c",
@@ -1389,10 +1402,13 @@ dependencies = [
  "arborium-yaml",
  "arborium-zig",
  "console_error_panic_hook",
+ "data-url",
  "hayro",
  "js-sys",
  "lofty",
  "merman",
+ "pulldown-cmark",
+ "pulldown-latex",
  "regex",
  "serde_json",
  "wasm-bindgen",
@@ -1411,7 +1427,6 @@ dependencies = [
  "console_error_panic_hook",
  "crc32fast",
  "csv",
- "data-url",
  "e2ee_chat_preview",
  "flate2",
  "form_urlencoded",
@@ -1426,8 +1441,6 @@ dependencies = [
  "percent-encoding",
  "png",
  "prost",
- "pulldown-cmark",
- "pulldown-latex",
  "rqrr",
  "scopeguard",
  "serde_json",
@@ -2708,6 +2721,12 @@ dependencies = [
  "proc-macro2",
  "quote",
 ]
+
+[[package]]
+name = "maplit"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e2e65a1a2e43cfcb47a895c4c8b10d1f4a61097f9f254f183aee60cad9c651d"
 
 [[package]]
 name = "markup5ever"

@@ -441,6 +441,7 @@ pre.code { margin: 0; padding: 24px; font-family: var(--mono); font-size: 13px; 
 .hl-diff-add { color: #c3e88d; }
 .hl-diff-delete { color: #f07178; }
 .markdown { max-width: 860px; margin: 0 auto; padding: 24px 32px 48px; line-height: 1.7; overflow-wrap: anywhere; }
+.markdown-fallback .preview-note { margin: 0; padding: 12px 24px; border-bottom: 1px solid var(--line); }
 .markdown h1, .markdown h2, .markdown h3 { margin: 1.4em 0 .5em; }
 .markdown h1 { font-size: 26px; }
 .markdown h2 { font-size: 21px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }

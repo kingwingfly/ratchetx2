@@ -21,10 +21,9 @@ argon2 = { version = "0.6", default-features = false, features = ["alloc", "zero
 base64.workspace = true
 bytes.workspace = true
 console_error_panic_hook.workspace = true
-# File previews: CSV tables, tar.gz listings, Markdown, maths in it as MathML, and ZIP listings.
+# File previews: CSV tables, tar.gz listings, and ZIP listings.
 crc32fast = "1"
 csv = "1.4"
-data-url = "0.3"
 # Which of the previews' workers highlights what; the workers themselves are its binaries.
 e2ee_chat_preview = { path = "../e2ee_chat_preview", features = ["rpc"] }
 flate2 = "1.1"
@@ -38,8 +37,6 @@ leptos = { version = "0.8", features = ["csr"] }
 party = { path = "../party" }
 percent-encoding = "2"
 prost.workspace = true
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-pulldown-latex = "0.8"
 scopeguard = "1"
 # `prost`: the vault keeps the states as protobuf messages.
 session = { path = "../session", features = ["connect", "prost"] }

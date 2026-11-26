@@ -1,15 +1,10 @@
 //! What the viewer shows of a file. Its kind comes from its content first, as the sender's name
 //! and type are only hints, then from its name; for some kinds, Rust prepares what shows:
-//! Markdown as HTML, slides, tables, listings of archives, and cards of contacts and events.
-//!
-//! Every file comes from a peer: Markdown's raw HTML shows as written text, its links go only to
-//! the web or mail, and its images only come from raster `data:` URLs; the page's
-//! Content-Security-Policy stops the rest.
+//! tables, listings of archives, diffs, and cards of contacts and events on the page, while
+//! Markdown/MathML/slides, PDF pages, Mermaid diagrams, audio tags, and syntax highlighting run
+//! in dedicated web workers (`e2ee_chat_preview`).
 
 mod archive;
-mod markdown;
-mod mathml;
-mod sanitize;
 mod structured;
 #[cfg(test)]
 mod tests;
@@ -18,9 +13,6 @@ pub use archive::{Entry, Listing};
 pub use e2ee_chat_preview::audio::Tags;
 use e2ee_chat_preview::language::{self, Language};
 use flate2::read::MultiGzDecoder;
-pub use markdown::{markdown, slides};
-#[allow(unused_imports)] // Re-exported for syntax-highlight validation in `app::viewer`.
-pub use sanitize::validate_highlight_html;
 #[allow(unused_imports)] // `Card` is part of the public `Cards` preview API.
 pub use structured::{Card, Cards, Diff, DiffLine, Table};
 
@@ -288,9 +280,8 @@ pub enum Kind {
     Video(&'static str),
     Audio(&'static str),
     Pdf,
-    /// Markdown, as HTML, with its source, which can also show as slides.
+    /// Markdown source, rendered asynchronously in `preview_markdown` as HTML or reveal.js slides.
     Markdown {
-        html: String,
         source: String,
     },
     /// Text, highlighted as the language of this name in
@@ -327,7 +318,6 @@ pub fn kind(name: &str, mime: &str, data: &[u8]) -> Kind {
     }
     match extension {
         "md" | "markdown" | "mdown" | "mkd" => Kind::Markdown {
-            html: markdown(text),
             source: text.to_string(),
         },
         "csv" => Kind::Table(structured::table(text, b',')),

@@ -76,4 +76,5 @@ run cargo clippy --locked --target wasm32-unknown-unknown --features pdf,worker 
 run cargo clippy --locked --target wasm32-unknown-unknown --features audio,worker --bins -p e2ee_chat_preview -- -D warnings
 run cargo clippy --locked --target wasm32-unknown-unknown --features search,worker --bins -p e2ee_chat_preview -- -D warnings
 run cargo clippy --locked --target wasm32-unknown-unknown --features diagram,worker --bins -p e2ee_chat_preview -- -D warnings
+run cargo clippy --locked --target wasm32-unknown-unknown --no-default-features --features markdown,worker -p e2ee_chat_preview -- -D warnings
 run cargo clippy --locked --target wasm32-unknown-unknown --features code,worker --bins -p e2ee_chat_preview -- -D warnings

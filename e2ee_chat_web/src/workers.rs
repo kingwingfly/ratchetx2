@@ -1,8 +1,8 @@
 //! The previews' web workers, of [`e2ee_chat_preview`], each started when a preview first needs
-//! it: PDF pages, Mermaid diagrams, audio tags, search, and code highlighted by four workers, a
-//! group of languages each. Calls to each worker are queued FIFO client-side so only the active
-//! head-of-line call arms its [`TIMEOUT`] guard; a stalled or failed worker is terminated, failing
-//! its pending calls, and the next call starts a fresh one.
+//! it: PDF pages, Mermaid diagrams, Markdown/MathML/slides, audio tags, search, and code
+//! highlighted by four workers, a group of languages each. Calls to each worker are queued FIFO
+//! client-side so only the active head-of-line call arms its [`TIMEOUT`] guard; a stalled or
+//! failed worker is terminated, failing its pending calls, and the next call starts a fresh one.
 
 use std::{
     cell::{Cell, RefCell},
@@ -15,8 +15,9 @@ use e2ee_chat_preview::{
     audio::Tags,
     language::Language,
     rpc::{
-        AudioTagsCall, CodeHighlightCall, DiagramSvgCall, PdfCloseCall, PdfOpenCall, PdfRenderCall,
-        RpcCall, SearchFindCall, WirePayload, WorkerEvent, encode_request_frame,
+        AudioTagsCall, CodeHighlightCall, DiagramSvgCall, MarkdownCall, PdfCloseCall, PdfOpenCall,
+        PdfRenderCall, RpcCall, SearchFindCall, SlidesCall, WirePayload, WorkerEvent,
+        encode_request_frame,
     },
 };
 use futures_util::lock::Mutex;
@@ -458,6 +459,18 @@ pub async fn highlight(language: &Language, text: &str) -> Result<String, String
 pub async fn diagram(source: &str) -> Result<String, String> {
     let (svg, _) = call_typed(None, DiagramSvgCall(source)).await?;
     Ok(svg)
+}
+
+/// Markdown `source`, rendered as sanitized HTML (including MathML) in the Markdown worker.
+pub async fn markdown(source: &str) -> Result<String, String> {
+    let (html, _) = call_typed(None, MarkdownCall(source)).await?;
+    Ok(html)
+}
+
+/// reveal.js Markdown `source`, rendered as columns of sanitized HTML slides in the Markdown worker.
+pub async fn slides(source: &str) -> Result<Vec<Vec<String>>, String> {
+    let (deck, _) = call_typed(None, SlidesCall(source)).await?;
+    Ok(deck)
 }
 
 /// What the tags of the audio `data` say of it, if it has any.
@@ -1074,5 +1087,60 @@ mod wasm_tests {
             .await
             .expect_err("stopped pdf worker must reject existing handle");
         assert_eq!(stopped_err, "the preview restarted: open the file again");
+    }
+
+    #[wasm_bindgen_test]
+    async fn workers_markdown_and_slides_roundtrip_and_recover_from_crash() {
+        const CRASHING_MD_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id, method, source] = event.data;
+                if (source === "crash") {
+                    throw new Error("simulated markdown worker crash");
+                }
+                if (method === "markdown") {
+                    self.postMessage([id, true, "<h1>" + source + "</h1>"]);
+                } else if (method === "slides") {
+                    self.postMessage([id, true, [["<h1>" + source + "</h1>"], ["<p>two</p>"]]]);
+                } else {
+                    self.postMessage([id, false, "unknown method"]);
+                }
+            };
+            self.postMessage("ready");
+        "#;
+        const HEALTHY_MD_WORKER: &str = r#"
+            self.onmessage = (event) => {
+                const [id, method, source] = event.data;
+                if (method === "markdown") {
+                    self.postMessage([id, true, "<p>" + source + "</p>"]);
+                } else if (method === "slides") {
+                    self.postMessage([id, true, [["<p>" + source + "</p>"]]]);
+                } else {
+                    self.postMessage([id, false, "unknown method"]);
+                }
+            };
+            self.postMessage("ready");
+        "#;
+
+        let _harness = MockWorkerHarness::new(
+            Worker::Markdown,
+            &[CRASHING_MD_WORKER, HEALTHY_MD_WORKER],
+            Some(2_000),
+        );
+        assert_eq!(markdown("hi").await.as_deref(), Ok("<h1>hi</h1>"));
+        assert_eq!(
+            slides("deck").await,
+            Ok(vec![
+                vec!["<h1>deck</h1>".to_string()],
+                vec!["<p>two</p>".to_string()],
+            ])
+        );
+        assert_eq!(
+            markdown("crash").await,
+            Err("the preview failed".to_string())
+        );
+        assert_eq!(
+            markdown("recovered").await.as_deref(),
+            Ok("<p>recovered</p>")
+        );
     }
 }

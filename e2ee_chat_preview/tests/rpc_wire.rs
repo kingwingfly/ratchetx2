@@ -5,12 +5,14 @@ use e2ee_chat_preview::{
     audio::{COVER_MAX, MAX_AUDIO_BYTES, Tags},
     language::Group,
     rpc::{
-        AudioTagsCall, CodeHighlightCall, DIAGRAM_SVG_MAX, DiagramSvgCall, MATCHES_MAX, MAX_PAGES,
-        MAX_PDF_BYTES, MAX_PDF_PIXELS, MAX_PDF_SIDE, Method, PagePixels, PdfCloseCall, PdfOpenCall,
-        PdfOpened, PdfRenderCall, RenderedPage, Request, RequestFrame, Response, RpcCall,
-        SearchFindCall, SearchFound, WorkerEvent, decode_audio_tags, decode_code_highlight,
-        decode_diagram_svg, decode_pdf_close, decode_pdf_open, decode_pdf_render,
-        decode_search_find, encode_reply_frame, encode_request_frame,
+        AudioTagsCall, CodeHighlightCall, DIAGRAM_SVG_MAX, DiagramSvgCall, MARKDOWN_HTML_MAX,
+        MARKDOWN_SOURCE_MAX, MATCHES_MAX, MAX_PAGES, MAX_PDF_BYTES, MAX_PDF_PIXELS, MAX_PDF_SIDE,
+        MarkdownCall, Method, PagePixels, PdfCloseCall, PdfOpenCall, PdfOpened, PdfRenderCall,
+        RenderedPage, Request, RequestFrame, Response, RpcCall, SLIDES_HTML_MAX, SLIDES_MAX,
+        SearchFindCall, SearchFound, SlidesCall, WorkerEvent, decode_audio_tags,
+        decode_code_highlight, decode_diagram_svg, decode_markdown, decode_pdf_close,
+        decode_pdf_open, decode_pdf_render, decode_search_find, decode_slides, encode_reply_frame,
+        encode_request_frame,
     },
 };
 use js_sys::{
@@ -117,9 +119,45 @@ fn request_frame_roundtrips_all_methods_and_transfer_lists() {
         Request::Svg("flowchart LR\nA-->B".into())
     );
 
-    // 7. Highlight
+    // 7. Markdown
     let payload = encode_request_frame(
         7,
+        Request::Markdown {
+            source: "# Title\n\n$a^2$",
+        },
+    );
+    assert!(payload.transfer.is_none());
+    let frame = RequestFrame::decode(payload.value).unwrap();
+    assert_eq!(frame.id, 7);
+    assert_eq!(frame.method().unwrap(), Method::Markdown);
+    assert_eq!(
+        frame.request().unwrap(),
+        Request::Markdown {
+            source: "# Title\n\n$a^2$".into(),
+        }
+    );
+
+    // 8. Slides
+    let payload = encode_request_frame(
+        8,
+        Request::Slides {
+            source: "# One\n---\n# Two",
+        },
+    );
+    assert!(payload.transfer.is_none());
+    let frame = RequestFrame::decode(payload.value).unwrap();
+    assert_eq!(frame.id, 8);
+    assert_eq!(frame.method().unwrap(), Method::Slides);
+    assert_eq!(
+        frame.request().unwrap(),
+        Request::Slides {
+            source: "# One\n---\n# Two".into(),
+        }
+    );
+
+    // 9. Highlight
+    let payload = encode_request_frame(
+        9,
         Request::Highlight {
             language: "rust",
             text: "fn main() {}",
@@ -127,7 +165,7 @@ fn request_frame_roundtrips_all_methods_and_transfer_lists() {
     );
     assert!(payload.transfer.is_none());
     let frame = RequestFrame::decode(payload.value).unwrap();
-    assert_eq!(frame.id, 7);
+    assert_eq!(frame.id, 9);
     assert_eq!(frame.method().unwrap(), Method::Highlight);
     assert_eq!(
         frame.request().unwrap(),
@@ -188,6 +226,10 @@ fn request_frame_rejects_malformed_unknown_and_oversized_inputs() {
         Array::of3(&1u32.into(), &"open".into(), &"not-bytes".into()),
         Array::of3(&1u32.into(), &"tags".into(), &42u32.into()),
         Array::of3(&1u32.into(), &"svg".into(), &42u32.into()),
+        Array::of3(&1u32.into(), &"markdown".into(), &42u32.into()),
+        Array::of3(&1u32.into(), &"slides".into(), &42u32.into()),
+        Array::of2(&1u32.into(), &"markdown".into()),
+        Array::of2(&1u32.into(), &"slides".into()),
         Array::of3(&1u32.into(), &"highlight".into(), &"rust".into()),
     ];
     for frame_arr in bad_frames {
@@ -221,6 +263,14 @@ fn request_frame_rejects_malformed_unknown_and_oversized_inputs() {
     let frame = RequestFrame::decode(oversized_tags.into()).unwrap();
     let err = frame.request().unwrap_err();
     assert!(err.contains("exceeds limit"), "unexpected error: {err}");
+
+    // Oversized Markdown & Slides payloads (> MARKDOWN_SOURCE_MAX) rejected.
+    let huge_md = "x".repeat(MARKDOWN_SOURCE_MAX + 1);
+    for method in ["markdown", "slides"] {
+        let oversized_md = Array::of3(&13u32.into(), &method.into(), &huge_md.as_str().into());
+        let frame = RequestFrame::decode(oversized_md.into()).unwrap();
+        assert!(frame.request().is_err(), "expected rejection for {method}");
+    }
 }
 
 #[wasm_bindgen_test]
@@ -383,6 +433,40 @@ fn response_and_worker_event_roundtrip_all_variants_and_transfers() {
         other => panic!("unexpected event: {other:?}"),
     }
 
+    // Markdown (no transfer).
+    let md_html = "<h1>Hello</h1><p>World</p>".to_string();
+    let reply = encode_reply_frame(
+        &20u32.into(),
+        Ok(Response::Markdown(md_html.clone()).encode()),
+    );
+    assert!(reply.transfer.is_none());
+    match WorkerEvent::decode(reply.value).unwrap() {
+        WorkerEvent::Reply {
+            id: 20,
+            result: Ok(val),
+        } => {
+            assert_eq!(MarkdownCall::decode_reply(val).unwrap(), md_html);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
+    // Slides (no transfer).
+    let deck = vec![
+        vec!["<h1>One</h1>".to_string()],
+        vec!["<h1>Two</h1>".to_string(), "<p>Sub</p>".to_string()],
+    ];
+    let reply = encode_reply_frame(&21u32.into(), Ok(Response::Slides(deck.clone()).encode()));
+    assert!(reply.transfer.is_none());
+    match WorkerEvent::decode(reply.value).unwrap() {
+        WorkerEvent::Reply {
+            id: 21,
+            result: Ok(val),
+        } => {
+            assert_eq!(SlidesCall::decode_reply(val).unwrap(), deck);
+        }
+        other => panic!("unexpected event: {other:?}"),
+    }
+
     // Highlighted (no transfer).
     let html = "<a-k>fn</a-k> main() {}".to_string();
     let reply = encode_reply_frame(
@@ -522,10 +606,40 @@ fn reply_decoders_reject_malformed_and_oversized_frames() {
     let ok_matches = Uint32Array::from([0u32, 2].as_slice());
     assert!(decode_search_find(Array::of2(&ok_matches, &1u32.into()).into()).is_err());
 
-    // decode_diagram_svg & decode_code_highlight.
+    // decode_diagram_svg, decode_markdown, decode_slides & decode_code_highlight.
     let huge_svg = "x".repeat(DIAGRAM_SVG_MAX + 1);
     assert!(decode_diagram_svg(huge_svg.into()).is_err());
     assert!(decode_diagram_svg(JsValue::NULL).is_err());
+
+    let huge_md_html = "x".repeat(MARKDOWN_HTML_MAX + 1);
+    assert!(decode_markdown(huge_md_html.into()).is_err());
+    assert!(decode_markdown(JsValue::NULL).is_err());
+
+    // decode_slides: empty outer, empty column, non-string slide, > SLIDES_MAX, > MARKDOWN_HTML_MAX,
+    // and cumulative > SLIDES_HTML_MAX.
+    assert!(decode_slides(JsValue::NULL).is_err());
+    assert!(decode_slides(Array::new().into()).is_err());
+    assert!(decode_slides(Array::of1(&Array::new()).into()).is_err());
+    assert!(decode_slides(Array::of1(&Array::of1(&42u32.into())).into()).is_err());
+
+    let too_many_slides = Array::new();
+    for _ in 0..=SLIDES_MAX {
+        too_many_slides.push(&Array::of1(&"s".into()));
+    }
+    assert!(decode_slides(too_many_slides.into()).is_err());
+
+    let oversized_slide = "x".repeat(MARKDOWN_HTML_MAX + 1);
+    assert!(decode_slides(Array::of1(&Array::of1(&oversized_slide.into())).into()).is_err());
+
+    let large_slide = "x".repeat(MARKDOWN_HTML_MAX);
+    let too_big_deck = Array::new();
+    // 3 slides of 2 MiB each = 6 MiB > SLIDES_HTML_MAX (4 MiB).
+    for _ in 0..3 {
+        too_big_deck.push(&Array::of1(&large_slide.as_str().into()));
+    }
+    assert!(SLIDES_HTML_MAX < 3 * MARKDOWN_HTML_MAX);
+    assert!(decode_slides(too_big_deck.into()).is_err());
+
     assert!(decode_code_highlight(JsValue::from_f64(1.0)).is_err());
 }
 

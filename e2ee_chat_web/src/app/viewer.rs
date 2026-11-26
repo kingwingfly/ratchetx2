@@ -4,6 +4,7 @@ use base64::{Engine as _, prelude::BASE64_STANDARD};
 use e2ee_chat_preview::{
     language,
     rpc::{DIAGRAM_SOURCE_MAX, HIGHLIGHT_MAX},
+    validate_highlight_html,
 };
 use leptos::{ev, html, prelude::*, task::spawn_local};
 use session::PublicKey;
@@ -173,9 +174,7 @@ pub(super) fn Viewer() -> impl IntoView {
                 None => no_preview(),
             },
             Kind::Pdf => view! { <PdfView data=attachment.data.clone() /> }.into_any(),
-            Kind::Markdown { html, source } => {
-                view! { <MarkdownView html source slides_full /> }.into_any()
-            }
+            Kind::Markdown { source } => view! { <MarkdownView source slides_full /> }.into_any(),
             Kind::Code { text, language } => view! { <CodeView text language /> }.into_any(),
             Kind::Table(table) => table_view(table),
             Kind::Archive(listing) => archive_view(listing),
@@ -558,7 +557,7 @@ fn CodeView(text: String, language: Option<&'static str>) -> impl IntoView {
     let here = StoredValue::new(());
     spawn_local(async move {
         let result = match workers::highlight(lang, &text).await {
-            Ok(html) => match preview::validate_highlight_html(&html) {
+            Ok(html) => match validate_highlight_html(&html) {
                 Ok(()) => Ok(html),
                 Err(e) => Err(e),
             },
@@ -748,7 +747,7 @@ fn enhance(element: &web_sys::Element) {
                 }),
                 EnhancePlan::Highlight(language) => {
                     workers::highlight(language, &text).await.and_then(|html| {
-                        preview::validate_highlight_html(&html)?;
+                        validate_highlight_html(&html)?;
                         if code.is_connected() {
                             code.set_inner_html(&html);
                         }
@@ -765,10 +764,29 @@ fn enhance(element: &web_sys::Element) {
     });
 }
 
-/// A Markdown file, as a document, or as reveal.js slides.
+/// A Markdown file, rendered asynchronously in `preview_markdown` as a document or reveal.js slides.
 #[component]
-fn MarkdownView(html: String, source: String, slides_full: RwSignal<bool>) -> impl IntoView {
+fn MarkdownView(source: String, slides_full: RwSignal<bool>) -> impl IntoView {
+    let source = StoredValue::new(source);
     let as_slides = RwSignal::new(false);
+    // Cached across Document <-> Slides toggles so switching modes does not re-render.
+    let rendered = RwSignal::new(None::<Result<String, String>>);
+    let slides_deck = RwSignal::new(None::<Result<Vec<Vec<String>>, String>>);
+    let here = StoredValue::new(());
+    let generation = StoredValue::new(0u64);
+
+    {
+        let render_gen = generation.with_value(|g| g.wrapping_add(1).max(1));
+        generation.set_value(render_gen);
+        let raw = source.get_value();
+        spawn_local(async move {
+            let result = workers::markdown(&raw).await;
+            if here.try_get_value().is_some() && generation.try_get_value() == Some(render_gen) {
+                rendered.set(Some(result));
+            }
+        });
+    }
+
     view! {
         <div class="preview-bar">
             <button
@@ -782,15 +800,32 @@ fn MarkdownView(html: String, source: String, slides_full: RwSignal<bool>) -> im
         </div>
         {move || {
             if as_slides.get() {
-                view! { <Slides source=source.clone() full=slides_full /> }.into_any()
-            } else {
-                let html = html.clone();
-                view! {
-                    <Enhanced>
-                        <div class="markdown" inner_html=html></div>
-                    </Enhanced>
-                }
+                view! { <Slides source=source.get_value() deck=slides_deck full=slides_full /> }
                     .into_any()
+            } else {
+                match rendered.get() {
+                    None => view! {
+                        <div class="markdown">
+                            <p class="preview-note">"Rendering…"</p>
+                        </div>
+                    }
+                    .into_any(),
+                    Some(Ok(html)) => view! {
+                        <Enhanced>
+                            <div class="markdown" inner_html=html></div>
+                        </Enhanced>
+                    }
+                    .into_any(),
+                    Some(Err(err)) => view! {
+                        <div class="markdown-fallback">
+                            <p class="preview-note">
+                                {format!("Could not render Markdown ({err}). Showing raw source.")}
+                            </p>
+                            <pre class="code">{source.get_value()}</pre>
+                        </div>
+                    }
+                    .into_any(),
+                }
             }
         }}
     }
@@ -823,15 +858,37 @@ fn request_fullscreen_promise(
     }
 }
 
-/// reveal.js slides: the arrow keys go to the next column, left and right, and to the next slide
-/// in it, up and down. F shows them full screen, the browser's, or, where a page may not have it,
-/// as on iPhones, the window's, scaled as reveal.js scales them; F or Esc leaves it.
+/// reveal.js slides: lazily rendered in `preview_markdown` on toggle. The arrow keys go to the
+/// next column, left and right, and to the next slide in it, up and down. F shows them full
+/// screen, the browser's, or, where a page may not have it, as on iPhones, the window's, scaled
+/// as reveal.js scales them; F or Esc leaves it.
 #[component]
-fn Slides(source: String, full: RwSignal<bool>) -> impl IntoView {
-    let deck = StoredValue::new(preview::slides(&source));
+fn Slides(
+    source: String,
+    deck: RwSignal<Option<Result<Vec<Vec<String>>, String>>>,
+    full: RwSignal<bool>,
+) -> impl IntoView {
+    let raw_source = StoredValue::new(source);
     let position = RwSignal::new((0, 0));
     let node = NodeRef::<html::Div>::new();
     let here = StoredValue::new(());
+    let generation = StoredValue::new(0u64);
+
+    // Lazily render slides on first toggle (or retry if a prior worker attempt errored).
+    let needs_render = deck.with_untracked(|state| !matches!(state, Some(Ok(_))));
+    if needs_render {
+        deck.set(None);
+        let req_gen = generation.with_value(|g| g.wrapping_add(1).max(1));
+        generation.set_value(req_gen);
+        let raw = raw_source.get_value();
+        spawn_local(async move {
+            let result = workers::slides(&raw).await;
+            if here.try_get_value().is_some() && generation.try_get_value() == Some(req_gen) {
+                deck.set(Some(result));
+            }
+        });
+    }
+
     let toggle = move || {
         let document = document();
         if slides_full_screen() {
@@ -884,19 +941,25 @@ fn Slides(source: String, full: RwSignal<bool>) -> impl IntoView {
     });
     let resizes = window_event_listener(ev::resize, move |_| fit());
     let go = move |right: isize, down: isize| {
-        position.update(|(column, row)| {
-            deck.with_value(|deck| {
+        deck.with_untracked(|state| {
+            let Some(Ok(cols)) = state else {
+                return;
+            };
+            if cols.is_empty() {
+                return;
+            }
+            position.update(|(column, row)| {
                 let last = |len: usize| len.saturating_sub(1) as isize;
                 if right != 0 {
-                    let next = (*column as isize + right).clamp(0, last(deck.len())) as usize;
+                    let next = (*column as isize + right).clamp(0, last(cols.len())) as usize;
                     if next != *column {
                         (*column, *row) = (next, 0);
                     }
-                } else {
-                    *row = (*row as isize + down).clamp(0, last(deck[*column].len())) as usize;
+                } else if let Some(col) = cols.get(*column) {
+                    *row = (*row as isize + down).clamp(0, last(col.len())) as usize;
                 }
-            })
-        })
+            });
+        });
     };
     let keys = window_event_listener(ev::keydown, move |event| {
         // Typing, e.g. in the viewer's search box, is not for the slides.
@@ -929,6 +992,10 @@ fn Slides(source: String, full: RwSignal<bool>) -> impl IntoView {
             }
             _ => return,
         };
+        // Guard arrow-key navigation until the slide deck finishes loading.
+        if !deck.with_untracked(|state| matches!(state, Some(Ok(cols)) if !cols.is_empty())) {
+            return;
+        }
         event.prevent_default();
         go(right, down);
     });
@@ -944,22 +1011,35 @@ fn Slides(source: String, full: RwSignal<bool>) -> impl IntoView {
     // Whether `go(right, down)` goes anywhere.
     let can = move |right: isize, down: isize| {
         let (column, row) = position.get();
-        deck.with_value(|deck| match (right, down) {
-            (-1, _) => column > 0,
-            (1, _) => column + 1 < deck.len(),
-            (_, -1) => row > 0,
-            _ => row + 1 < deck[column].len(),
+        deck.with(|state| {
+            let Some(Ok(cols)) = state else {
+                return false;
+            };
+            let Some(col) = cols.get(column) else {
+                return false;
+            };
+            match (right, down) {
+                (-1, _) => column > 0,
+                (1, _) => column + 1 < cols.len(),
+                (_, -1) => row > 0,
+                _ => row + 1 < col.len(),
+            }
         })
-    };
-    let slide = move || {
-        let (column, row) = position.get();
-        deck.with_value(|deck| deck[column][row].clone())
     };
     let counter = move || {
         let (column, row) = position.get();
-        deck.with_value(|deck| match deck[column].len() {
-            1 => format!("{} / {}", column + 1, deck.len()),
-            rows => format!("{} / {} · {} / {rows}", column + 1, deck.len(), row + 1),
+        deck.with(|state| match state {
+            None => "…".to_string(),
+            Some(Err(_)) => String::new(),
+            Some(Ok(cols)) => {
+                let Some(col) = cols.get(column) else {
+                    return String::new();
+                };
+                match col.len() {
+                    1 => format!("{} / {}", column + 1, cols.len()),
+                    rows => format!("{} / {} · {} / {rows}", column + 1, cols.len(), row + 1),
+                }
+            }
         })
     };
     view! {
@@ -970,12 +1050,39 @@ fn Slides(source: String, full: RwSignal<bool>) -> impl IntoView {
             node_ref=node
         >
             {move || {
-                // Read here, where it is tracked: a component's children are built untracked.
-                let html = slide();
-                view! {
-                    <Enhanced>
-                        <div class="slide markdown" inner_html=html></div>
-                    </Enhanced>
+                // Read both `deck` and `position` here, where they are tracked.
+                let (column, row) = position.get();
+                match deck.get() {
+                    None => view! {
+                        <div class="enhanced">
+                            <div class="slide markdown">
+                                <p class="preview-note">"Rendering…"</p>
+                            </div>
+                        </div>
+                    }
+                    .into_any(),
+                    Some(Ok(cols)) => {
+                        let html = cols
+                            .get(column)
+                            .and_then(|col| col.get(row))
+                            .cloned()
+                            .unwrap_or_default();
+                        view! {
+                            <Enhanced>
+                                <div class="slide markdown" inner_html=html></div>
+                            </Enhanced>
+                        }
+                        .into_any()
+                    }
+                    Some(Err(err)) => view! {
+                        <div class="markdown-fallback">
+                            <p class="preview-note">
+                                {format!("Could not render slides ({err}). Showing raw source.")}
+                            </p>
+                            <pre class="code">{raw_source.get_value()}</pre>
+                        </div>
+                    }
+                    .into_any(),
                 }
             }}
             <div class="slides-bar">

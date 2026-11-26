@@ -1,9 +1,11 @@
-use e2ee_chat_preview::rpc::{DIAGRAM_SOURCE_MAX, HIGHLIGHT_MAX};
+use e2ee_chat_preview::{
+    rpc::{DIAGRAM_SOURCE_MAX, HIGHLIGHT_MAX},
+    validate_highlight_html,
+};
 use session::{PqSuite, PublicKey};
 
 use crate::{
     icon::Icon,
-    preview::validate_highlight_html,
     state::{
         ClassicalPrompt, LastMessage, LastMessageKind, SecurityAlert, SecurityView, ServerPqStatus,
     },
