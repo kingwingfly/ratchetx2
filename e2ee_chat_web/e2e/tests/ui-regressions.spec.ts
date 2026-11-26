@@ -127,8 +127,8 @@ test.describe('UI lifecycle regressions (PdfView, InlineMedia, FileBrowser)', ()
         .locator('audio');
       await expect(wavAudio).toBeVisible();
 
-      // 4. Close and reopen the chat on Bob so history reloads from IndexedDB with
-      //    `LocalFile { data: None }`, exercising true `when_shown` IntersectionObserver lazy load.
+      // 4. Close and reopen the chat on Bob so history reloads from IndexedDB, exercising true
+      //    `when_shown` IntersectionObserver lazy load for remote media.
       await bobPage.getByRole('button', { name: 'Close the chat', exact: true }).click();
       await expect(bobPage.locator('.messages')).toHaveCount(0);
 
@@ -141,7 +141,7 @@ test.describe('UI lifecycle regressions (PdfView, InlineMedia, FileBrowser)', ()
       await expect(pixelThumb).toHaveCount(1);
       await expect(pixelThumb.locator('img')).toHaveCount(0);
 
-      // Spy on `URL.revokeObjectURL` and capture the live `<audio>` element & src before unmounting.
+      // Spy on `URL.revokeObjectURL` and capture the live `<audio>` element & src before scrolling.
       const trackedAudioSrc = await bobPage.evaluate(() => {
         const revoked: string[] = [];
         const origRevoke = URL.revokeObjectURL.bind(URL);
@@ -154,9 +154,9 @@ test.describe('UI lifecycle regressions (PdfView, InlineMedia, FileBrowser)', ()
         (window as unknown as Record<string, unknown>).__mediaReleaseCheck = { revoked, audio };
         return src;
       });
-      expect(trackedAudioSrc).toMatch(/^blob:/);
+      expect(trackedAudioSrc).toMatch(/^(blob:|\/media\/)/);
 
-      // Scroll to top of `.messages` to bring `pixel.png` into view -> triggers lazy load.
+      // Scroll to top of `.messages` to bring `pixel.png` into view -> triggers lazy load & blob URL.
       await bobPage.locator('.messages').evaluate((el) => {
         el.scrollTop = 0;
       });
@@ -165,9 +165,11 @@ test.describe('UI lifecycle regressions (PdfView, InlineMedia, FileBrowser)', ()
       await expect
         .poll(() => pixelImg.evaluate((img: HTMLImageElement) => img.naturalWidth))
         .toBe(4);
+      const trackedImgSrc = (await pixelImg.getAttribute('src')) ?? '';
+      expect(trackedImgSrc).toMatch(/^blob:/);
 
-      // 5. Close chat (unmount `InlineMedia`): verify `stop_media` cleared `src` and `release`
-      //    revoked the audio blob URL.
+      // 5. Close chat (unmount `InlineMedia`): verify `stop_media` cleared `<audio src>` and
+      //    `release` revoked the image blob URL (and audio blob URL if non-streamed).
       await bobPage.getByRole('button', { name: 'Close the chat', exact: true }).click();
       await expect(bobPage.locator('.messages')).toHaveCount(0);
 
@@ -183,7 +185,10 @@ test.describe('UI lifecycle regressions (PdfView, InlineMedia, FileBrowser)', ()
         };
       });
       expect(releaseOutcome.audioHasSrc).toBe(false);
-      expect(releaseOutcome.revoked).toContain(trackedAudioSrc);
+      expect(releaseOutcome.revoked).toContain(trackedImgSrc);
+      if (trackedAudioSrc.startsWith('blob:')) {
+        expect(releaseOutcome.revoked).toContain(trackedAudioSrc);
+      }
     } finally {
       await aliceCtx.close();
       await bobCtx.close();

@@ -1,11 +1,11 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { signInCookie } from "./helpers";
 
 const CONFORMANCE_URL = "https://e2ee-chat.test/conformance";
 
 describe("POST /conformance", () => {
-
-  it("rejects missing and invalid conformance tokens with 403", async () => {
+  it("rejects missing, invalid tokens, and sign-in cookie alone with 403", async () => {
     const missing = await exports.default.fetch(CONFORMANCE_URL, {
       method: "POST",
     });
@@ -14,6 +14,17 @@ describe("POST /conformance", () => {
     expect(missing.headers.get("x-content-type-options")).toBe("nosniff");
     expect(missing.headers.get("cache-control")).toBe("no-store");
     expect(missing.headers.get("referrer-policy")).toBe("no-referrer");
+
+    // Sign-in cookie alone MUST NOT bypass CONFORMANCE_TOKEN.
+    const cookie = await signInCookie(env.PASSWORD, "198.51.100.90");
+    const cookieOnly = await exports.default.fetch(CONFORMANCE_URL, {
+      method: "POST",
+      headers: {
+        Cookie: cookie,
+      },
+    });
+    expect(cookieOnly.status).toBe(403);
+    expect(await cookieOnly.text()).toBe("unauthorized");
 
     const wrongBearer = await exports.default.fetch(CONFORMANCE_URL, {
       method: "POST",

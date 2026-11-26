@@ -6,7 +6,7 @@ package session.v1;
 import "party_state.proto";
 import "x3dh.proto";
 
-// A client's state: its identity, prekeys and the last signed request's timestamp.
+// A client's state: its identity, prekeys, signed-request timestamp, and unified mailbox cursors.
 message ClientState {
   // The identity's XEdDSA private key (32 bytes).
   bytes identity = 1;
@@ -23,7 +23,7 @@ message ClientState {
   uint32 preferred_pq_suite = 6;
   // Inverted so existing vaults default to PQ ratchet ON when PQ is enabled.
   bool pq_ratchet_disabled = 7;
-  // Strict / Require-PQ mode: refuse classical fallback and omit raw v1 SPK signature.
+  // Strict / Require-PQ mode: refuse classical fallback and omit raw SPK signature.
   bool strict_pq = 8;
   // Monotonic CapabilityManifest sequence number published via HandshakeV2.
   uint64 manifest_seq = 9;
@@ -32,6 +32,12 @@ message ClientState {
   // SHA-256 digests (32 bytes each) of recent CapabilityManifests signed by this client,
   // bounded so accept_initial_v2 can verify incoming manifest_digest values belong to this client.
   repeated bytes recent_manifest_digests = 11;
+  // Unified mailbox high-water sequence number last committed locally.
+  uint64 mailbox_cursor = 12;
+  // Unified mailbox sequence number committed locally and awaiting server prefix ACK (0 if none).
+  uint64 pending_mailbox_ack = 13;
+  // Identity-wide monotonic write-token grant version counter (starts at 1; 0 treated as 1).
+  uint64 next_grant_version = 14;
 }
 
 // Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
@@ -49,7 +55,7 @@ message PeerPqState {
   // Monotonic high-water mark of Hello.session_seq accepted from this peer.
   uint64 peer_session_seq = 6;
   // SHA-256 digest (32 bytes) of the verified CapabilityManifest at pinned_manifest_seq; empty
-  // if unset (e.g. restored from pre-digest state or before any manifest has been observed).
+  // if unset (e.g. before any manifest has been observed).
   bytes pinned_manifest_digest = 7;
 }
 
@@ -67,58 +73,63 @@ message SessionSecurity {
 message EarlierSession {
   // Its double-ratchet party.
   party.v1.Party party = 1;
-  // Its delivery key (32 bytes).
-  bytes delivery_key = 2;
+  // SHA-256 of the peer's deniable write token for this session (32 bytes, for O(1) routing).
+  bytes inbound_token_hash = 2;
+}
+
+// A write-token grant staged on a session until registered on the recipient's mailbox relay.
+message PendingGrant {
+  // SHA-256 of the peer's deniable write token (32 bytes).
+  bytes token_hash = 1;
+  // Strictly positive monotonic identity-wide grant version (1..=2^53 - 1).
+  uint64 grant_version = 2;
+  // Whether to pin this token as the peer's active grant on the relay.
+  bool pin_active = 3;
 }
 
 // A session's state.
 message SessionState {
+  // Legacy v1/per-peer cursor, stall, and delivery-token fields removed in v3 cutover.
+  reserved 4, 10, 11, 13, 14;
+
   // The double-ratchet party of the active session, which messages are sent on; none once it
   // was retired, until a new session starts.
   party.v1.Party party = 1;
-  // The active session's ID, the X3DH ephemeral key of the one who started it (32 bytes).
+  // The active session's ID, the X3DH/PQXDH ephemeral key of the one who started it (32 bytes).
   bytes id = 6;
   // Whether the peer is known to have the active session: it started it, or a message on it
   // decrypted.
   bool known_by_peer = 7;
-  // The initial message (`handshake.v1.InitialMessage`, encoded) that started the active
+  // The initial message (`handshake.v2.InitialMessageV2`, encoded) that started the active
   // session, which this client did, sent with each message until the peer is known to have
   // it; empty once it is.
   bytes initial_message = 12;
-  // The active session's delivery key (32 bytes), from X3DH's shared secret, which both peers
-  // have: each message's delivery token is HMAC-SHA256 of its header under it.
-  bytes delivery_key = 13;
   // Earlier sessions with the peer, latest first, which only decrypt: messages that `party`
   // cannot decrypt are tried on them.
   repeated EarlierSession others = 5;
-  // The delivery tokens of the messages received and not told to the server yet, which the
-  // next fetch tells it, so that it deletes them.
-  repeated bytes delivered = 14;
   // This client's identity key (32 bytes).
   bytes me = 2;
   // The peer's identity key (32 bytes).
   bytes peer = 3;
-  // Sequence number of the last message fetched from the peer's queue.
-  uint64 cursor = 4;
   // What was done last.
   LastAction last = 8;
   // How many times the peers turned between sending on the active session and receiving on an
   // earlier one; past a few, the active session is retired.
   uint32 direction_changes = 9;
-  // The last sequence number of the page in which receiving stopped at a message that did not
-  // decrypt, which may be on a session whose initial message is waiting.
-  uint64 stalled_through = 10;
-  // Up to this sequence number, messages that do not decrypt are skipped: the initial messages
-  // were taken since.
-  uint64 skip_through = 11;
   // Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
   PeerPqState peer_pq = 15;
   // Next outgoing monotonic Hello.session_seq for this peer (0 treated as 1).
   uint64 next_session_seq = 16;
   // Security level of the active session (absent/default for classical).
   SessionSecurity active_security = 17;
-  // Peer's Hello.session_seq that created the active session (0 if local or legacy).
+  // Peer's Hello.session_seq that created the active session (0 if local or unset).
   uint64 active_peer_session_seq = 18;
+  // Active session's secret outgoing write token `t_{me->peer}` (32 bytes; empty when retired).
+  bytes send_write_token = 19;
+  // SHA-256 of the active session's inbound write token `t_{peer->me}` (32 bytes; empty when retired).
+  bytes inbound_token_hash = 20;
+  // Pending write-token registrations queued for this peer (at most 4).
+  repeated PendingGrant pending_register_grants = 21;
 }
 
 // What was done last on a session.

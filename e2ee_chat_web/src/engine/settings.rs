@@ -9,10 +9,9 @@ use crate::state::{Delivery, ServerPqStatus};
 use crate::transport::Fetch;
 use crate::util::{describe, now, short};
 use crate::vault::{
-    CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, PendingPqRollback,
-    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
-    SECURITY_ALERT_PQ_REQUIRED,
+    CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
+    GREETING_DELIVERY_UNCERTAIN, HistoryEntry, PendingPqRollback, SECURITY_ALERT_DOWNGRADE,
+    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
 };
 use leptos::prelude::*;
 use session::{ErrorKind, PqConfig, PublicKey, Session, SessionState};
@@ -91,6 +90,7 @@ impl<V: VaultStore> Engine<V> {
             }
             let mut entries = vec![];
             let mut replaced_session = false;
+            let mut should_stage_grant = false;
             if contact.state.quarantined {
                 let was_new_quarantined = contact.is_new_quarantined();
                 let first_message = std::mem::take(&mut contact.state.quarantined_first_message);
@@ -198,6 +198,19 @@ impl<V: VaultStore> Engine<V> {
                         }
                     }
                 }
+                if !stale_discarded && !contact.state.request {
+                    should_stage_grant = true;
+                    contact.state.events.get_or_insert_default().accepted = true;
+                }
+            }
+            if should_stage_grant
+                && let Some(token_hash) = inner
+                    .contact(&peer)
+                    .and_then(|c| c.session.active_inbound_token_hash())
+                && let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true)
+            {
+                inner.roll_back(&peer, snapshot)?;
+                return Err(e);
             }
             let requeued = if replaced_session {
                 match inner.requeue_sealed(&peer).await {
@@ -248,6 +261,10 @@ impl<V: VaultStore> Engine<V> {
                 // receipts immediately.
                 self.reconcile_open_chat_read(inner, &peer, false).await;
             }
+            if should_stage_grant {
+                let _ = self.flush_pending_grants_for(inner, &peer).await;
+            }
+            let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
             self.ui.contacts.set(inner.views());
         }
         let _ = self.flush(&peer).await;
@@ -344,7 +361,7 @@ impl<V: VaultStore> Engine<V> {
                             contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                             contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
                         }
-                        ErrorKind::ClassicalApprovalRequired { peer_signed_off } => {
+                        ErrorKind::ClassicalApprovalRequired => {
                             if matches!(
                                 contact.state.security_alert,
                                 SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
@@ -352,11 +369,8 @@ impl<V: VaultStore> Engine<V> {
                                 contact.state.security_alert = SECURITY_ALERT_NONE;
                             }
                             if !contact.state.quarantined {
-                                contact.state.classical_approval_needed = if peer_signed_off {
-                                    CLASSICAL_APPROVAL_SIGNED_OFF
-                                } else {
-                                    CLASSICAL_APPROVAL_LEGACY
-                                };
+                                contact.state.classical_approval_needed =
+                                    CLASSICAL_APPROVAL_SIGNED_OFF;
                             }
                         }
                         _ => {}
@@ -443,6 +457,15 @@ impl<V: VaultStore> Engine<V> {
                 added_view = Some(contact.message(entry_index, entry));
             }
         }
+        if let Some(token_hash) = inner
+            .contact(&peer)
+            .and_then(|c| c.session.active_inbound_token_hash())
+            && let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true)
+        {
+            inner.state.next_session_seq = prev_next_session_seq;
+            inner.roll_back(&peer, snapshot)?;
+            return Err(e);
+        }
         // Requeue any outbox messages sealed on the previous session so they re-encrypt
         // on the new PQ session instead of pushing old-session ciphertexts with the PQ initial.
         let requeued = match inner.requeue_sealed(&peer).await {
@@ -468,6 +491,9 @@ impl<V: VaultStore> Engine<V> {
         if was_quarantined {
             self.reconcile_open_chat_read(inner, &peer, false).await;
         }
+        // Register our inbound write token on our DO before transmitting SendInitialV2 so the peer
+        // can reply immediately upon accepting the upgraded PQ session.
+        let _ = self.flush_pending_grants_for(inner, &peer).await;
         if let Ok(Err(e)) = inner
             .transmit_with_greeting_delivery(&peer, true, true, async |inner| {
                 inner.client.send_prepared_initiate_v2(&outgoing).await
@@ -481,6 +507,7 @@ impl<V: VaultStore> Engine<V> {
                 describe(&e)
             ));
         }
+        let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
         self.ui.contacts.set(inner.views());
         self.ui.log(format!(
             "upgraded chat with {} to post-quantum encryption",
@@ -590,16 +617,11 @@ pub(super) fn describe_upgrade_pq_error(
             .to_string();
     }
     match kind {
-        ErrorKind::ClassicalApprovalRequired {
-            peer_signed_off: true,
-        } => "Cannot upgrade to post-quantum encryption: this peer has post-quantum encryption \
-              turned off."
-            .to_string(),
-        ErrorKind::ClassicalApprovalRequired {
-            peer_signed_off: false,
-        } => "Cannot upgrade to post-quantum encryption: this peer has no post-quantum prekeys \
-              on the server."
-            .to_string(),
+        ErrorKind::ClassicalApprovalRequired => {
+            "Cannot upgrade to post-quantum encryption: this peer has post-quantum encryption \
+             turned off."
+                .to_string()
+        }
         ErrorKind::PeerManifestExpired => {
             "This peer's signed post-quantum capability manifest has expired. Try again after \
              they come online."

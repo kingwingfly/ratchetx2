@@ -316,14 +316,16 @@ export async function xeddsaSign(
 }
 
 // ---------------------------------------------------------------------------
-// Protocol message encoders / signers / decoders
+// Protocol message encoders / signers / decoders (clean v2 / 1A / 2A / 3A)
 // ---------------------------------------------------------------------------
 
 export async function signSubscribeRequestV2(
   identity: TestIdentity,
   audience: string,
   timestampMs: bigint,
+  nonce?: Uint8Array,
 ): Promise<Uint8Array> {
+  const subNonce = nonce ?? crypto.getRandomValues(new Uint8Array(16));
   const audBytes = utf8(audience);
   const transcript = concatBytes(
     utf8("notify.v2/subscribe"),
@@ -331,6 +333,7 @@ export async function signSubscribeRequestV2(
     audBytes,
     identity.publicKey,
     u64le(timestampMs),
+    subNonce,
   );
   const signature = await xeddsaSign(identity, transcript);
   return concatBytes(
@@ -338,24 +341,27 @@ export async function signSubscribeRequestV2(
     pbVarint(2, timestampMs),
     pbBytes(3, signature),
     pbString(4, audience),
+    pbBytes(5, subNonce),
   );
 }
 
+export function wsSubprotocolHeader(subscribeRequestBytes: Uint8Array): string {
+  return `e2ee-notify.v2, e2ee-sub.${base64UrlEncode(subscribeRequestBytes)}`;
+}
+
 export function encodePushV2Request(params: {
-  sender: Uint8Array;
   recipient: Uint8Array;
   header: Uint8Array;
   content: Uint8Array;
-  deliveryHash?: Uint8Array;
+  writeToken: Uint8Array;
   clientMessageId?: Uint8Array;
 }): Uint8Array {
   const encryptedMessage = concatBytes(pbBytes(1, params.header), pbBytes(2, params.content));
   return concatBytes(
-    pbBytes(1, params.sender),
-    pbBytes(2, params.recipient),
-    pbBytesAlways(3, encryptedMessage),
-    params.deliveryHash ? pbBytes(5, params.deliveryHash) : new Uint8Array(0),
-    params.clientMessageId ? pbBytes(6, params.clientMessageId) : new Uint8Array(0),
+    pbBytes(1, params.recipient),
+    pbBytesAlways(2, encryptedMessage),
+    params.clientMessageId ? pbBytes(4, params.clientMessageId) : new Uint8Array(0),
+    pbBytes(5, params.writeToken),
   );
 }
 
@@ -370,72 +376,213 @@ export function decodePushV2Response(bytes: Uint8Array): bigint {
 
 export async function signFetchSignedRequest(params: {
   recipient: TestIdentity;
-  sender: Uint8Array;
   audience: string;
-  after?: bigint;
+  afterSequence?: bigint;
   limit?: number;
   maxSize?: number;
-  delivered?: Uint8Array[];
+  ackUpToSequence?: bigint;
   timestampMs: bigint;
 }): Promise<Uint8Array> {
-  const after = params.after ?? 0n;
+  const afterSequence = params.afterSequence ?? 0n;
   const limit = params.limit ?? 10;
   const maxSize = params.maxSize ?? 0;
-  const delivered = params.delivered ?? [];
+  const ackUpToSequence = params.ackUpToSequence ?? 0n;
   const audBytes = utf8(params.audience);
   const transcript = concatBytes(
     utf8("ratchetx2.fetch.v2\0"),
     u32be(audBytes.length),
     audBytes,
-    params.sender,
     params.recipient.publicKey,
-    u64be(after),
+    u64be(afterSequence),
     u32be(limit),
     u32be(maxSize),
-    u32be(delivered.length),
-    ...delivered,
+    u64be(ackUpToSequence),
     u64be(params.timestampMs),
   );
   const signature = await xeddsaSign(params.recipient, transcript);
   return concatBytes(
     pbString(1, params.audience),
-    pbBytes(2, params.sender),
-    pbBytes(3, params.recipient.publicKey),
-    pbVarint(4, after),
-    pbVarint(5, limit),
-    pbVarint(6, maxSize),
-    ...delivered.map((token) => pbBytes(7, token)),
-    pbVarint(8, params.timestampMs),
-    pbBytes(9, signature),
+    pbBytes(2, params.recipient.publicKey),
+    pbVarint(3, afterSequence),
+    pbVarint(4, limit),
+    pbVarint(5, maxSize),
+    pbVarint(6, ackUpToSequence),
+    pbVarint(7, params.timestampMs),
+    pbBytes(8, signature),
   );
 }
 
 export interface DecodedEnvelopeV2 {
   sequence: bigint;
+  tokenHash: Uint8Array;
   header?: Uint8Array;
   content?: Uint8Array;
 }
 
-export function decodeFetchSignedResponse(bytes: Uint8Array): DecodedEnvelopeV2[] {
-  const out: DecodedEnvelopeV2[] = [];
+export function decodeFetchSignedResponse(bytes: Uint8Array): {
+  messages: DecodedEnvelopeV2[];
+  hasMore: boolean;
+} {
+  const messages: DecodedEnvelopeV2[] = [];
+  let hasMore = false;
   for (const field of decodePbFields(bytes)) {
     if (field.fieldNumber === 1 && field.bytes) {
       let sequence = 0n;
+      let tokenHash = new Uint8Array(0);
       let header: Uint8Array | undefined;
       let content: Uint8Array | undefined;
       for (const ef of decodePbFields(field.bytes)) {
         if (ef.fieldNumber === 1 && ef.varint !== undefined) sequence = ef.varint;
-        if (ef.fieldNumber === 2 && ef.bytes) {
+        if (ef.fieldNumber === 2 && ef.bytes) tokenHash = ef.bytes;
+        if (ef.fieldNumber === 3 && ef.bytes) {
           for (const mf of decodePbFields(ef.bytes)) {
             if (mf.fieldNumber === 1 && mf.bytes) header = mf.bytes;
             if (mf.fieldNumber === 2 && mf.bytes) content = mf.bytes;
           }
         }
       }
-      out.push({ sequence, header, content });
+      messages.push({ sequence, tokenHash, header, content });
+    } else if (field.fieldNumber === 2 && field.varint !== undefined) {
+      hasMore = field.varint !== 0n;
     }
   }
-  return out;
+  return { messages, hasMore };
+}
+
+export async function signAckMessagesRequest(params: {
+  recipient: TestIdentity;
+  audience: string;
+  upToSequence: bigint;
+  timestampMs: bigint;
+}): Promise<Uint8Array> {
+  const audBytes = utf8(params.audience);
+  const transcript = concatBytes(
+    utf8("ratchetx2.ack.v2\0"),
+    u32be(audBytes.length),
+    audBytes,
+    params.recipient.publicKey,
+    u64be(params.upToSequence),
+    u64be(params.timestampMs),
+  );
+  const signature = await xeddsaSign(params.recipient, transcript);
+  return concatBytes(
+    pbString(1, params.audience),
+    pbBytes(2, params.recipient.publicKey),
+    pbVarint(3, params.upToSequence),
+    pbVarint(4, params.timestampMs),
+    pbBytes(5, signature),
+  );
+}
+
+export function decodeAckMessagesResponse(bytes: Uint8Array): bigint {
+  for (const field of decodePbFields(bytes)) {
+    if (field.fieldNumber === 1 && field.varint !== undefined) return field.varint;
+  }
+  return 0n;
+}
+
+export async function signRegisterWriteTokenRequest(params: {
+  recipient: TestIdentity;
+  audience: string;
+  peerSlotId: Uint8Array;
+  tokenHash: Uint8Array;
+  grantVersion: bigint;
+  pinActive: boolean;
+  timestampMs: bigint;
+}): Promise<Uint8Array> {
+  const audBytes = utf8(params.audience);
+  const transcript = concatBytes(
+    utf8("ratchetx2.register-write-token.v2\0"),
+    u32be(audBytes.length),
+    audBytes,
+    params.recipient.publicKey,
+    params.peerSlotId,
+    params.tokenHash,
+    u64be(params.grantVersion),
+    new Uint8Array([params.pinActive ? 1 : 0]),
+    u64be(params.timestampMs),
+  );
+  const signature = await xeddsaSign(params.recipient, transcript);
+  return concatBytes(
+    pbString(1, params.audience),
+    pbBytes(2, params.recipient.publicKey),
+    pbBytes(3, params.peerSlotId),
+    pbBytes(4, params.tokenHash),
+    pbVarint(5, params.grantVersion),
+    pbVarint(6, params.pinActive),
+    pbVarint(7, params.timestampMs),
+    pbBytes(8, signature),
+  );
+}
+
+export async function signRevokeWriteTokenRequest(params: {
+  recipient: TestIdentity;
+  audience: string;
+  peerSlotId: Uint8Array;
+  tokenHash?: Uint8Array;
+  minGrantVersion: bigint;
+  timestampMs: bigint;
+}): Promise<Uint8Array> {
+  const audBytes = utf8(params.audience);
+  const tokenPart = params.tokenHash
+    ? concatBytes(new Uint8Array([1]), params.tokenHash)
+    : new Uint8Array([0]);
+  const transcript = concatBytes(
+    utf8("ratchetx2.revoke-write-token.v2\0"),
+    u32be(audBytes.length),
+    audBytes,
+    params.recipient.publicKey,
+    params.peerSlotId,
+    tokenPart,
+    u64be(params.minGrantVersion),
+    u64be(params.timestampMs),
+  );
+  const signature = await xeddsaSign(params.recipient, transcript);
+  return concatBytes(
+    pbString(1, params.audience),
+    pbBytes(2, params.recipient.publicKey),
+    pbBytes(3, params.peerSlotId),
+    params.tokenHash ? pbBytes(4, params.tokenHash) : new Uint8Array(0),
+    pbVarint(5, params.minGrantVersion),
+    pbVarint(6, params.timestampMs),
+    pbBytes(7, signature),
+  );
+}
+
+export function decodeRevokeWriteTokenResponse(bytes: Uint8Array): number {
+  for (const field of decodePbFields(bytes)) {
+    if (field.fieldNumber === 1 && field.varint !== undefined) return Number(field.varint);
+  }
+  return 0;
+}
+
+export function encodeClaimBundleRequest(
+  identityKey: Uint8Array,
+  preferredSuites: number[] = [],
+): Uint8Array {
+  return concatBytes(
+    pbBytes(1, identityKey),
+    ...preferredSuites.map((s) => pbVarint(2, s)),
+  );
+}
+
+export function encodeSendInitialV2ClassicalRequest(params: {
+  recipient: Uint8Array;
+  sender: Uint8Array;
+  ephemeralKey: Uint8Array;
+  signedPrekey: Uint8Array;
+  header: Uint8Array;
+  content: Uint8Array;
+}): Uint8Array {
+  const firstMessage = concatBytes(pbBytes(1, params.header), pbBytes(2, params.content));
+  const initialMsg = concatBytes(
+    pbVarint(2, 1),
+    pbBytes(3, params.sender),
+    pbBytes(4, params.ephemeralKey),
+    pbBytes(5, params.signedPrekey),
+    pbBytesAlways(7, firstMessage),
+  );
+  return concatBytes(pbBytes(1, params.recipient), pbBytesAlways(2, initialMsg));
 }
 
 export function encodeStartUploadRequest(chunks: number, deleteHash: Uint8Array): Uint8Array {
@@ -540,10 +687,10 @@ export async function signClassicalPublishV2Request(params: {
     u64be(params.generation),
     u64be(params.issuedAt),
     u64be(params.expiresAt),
-    new Uint8Array([0, 0, 0]), // pq_enabled=false, strict_pq=false, pq_ratchet_supported=false
-    u32be(0), // offered_suites count
+    new Uint8Array([0, 0, 0]),
+    u32be(0),
     params.signedPrekey,
-    u32be(0), // pq_last_resort count
+    u32be(0),
   );
   const manifestSig = await xeddsaSign(params.identity, manifestInput);
   const manifestDigest = await sha256(manifestInput);
@@ -556,8 +703,8 @@ export async function signClassicalPublishV2Request(params: {
     spkSig,
     u32be(params.oneTimePrekeys.length),
     ...params.oneTimePrekeys,
-    u32be(0), // pq_last_resort count
-    u32be(0), // pq_one_time_prekeys count
+    u32be(0),
+    u32be(0),
     u64be(params.timestampMs),
   );
   const publishSig = await xeddsaSign(params.identity, publishInput);
@@ -587,15 +734,11 @@ export function decodeGetServerInfoResponse(bytes: Uint8Array): {
   supportedSuites: number[];
   pqRatchetSupported: boolean;
   serverId: string;
-  legacyV1Enabled: boolean;
-  allowUnsignedFetch: boolean;
 } {
   let pqEnabled = false;
   const supportedSuites: number[] = [];
   let pqRatchetSupported = false;
   let serverId = "";
-  let legacyV1Enabled = false;
-  let allowUnsignedFetch = false;
   for (const field of decodePbFields(bytes)) {
     if (field.fieldNumber === 1 && field.varint !== undefined) pqEnabled = field.varint !== 0n;
     if (field.fieldNumber === 2) {
@@ -609,29 +752,23 @@ export function decodeGetServerInfoResponse(bytes: Uint8Array): {
       pqRatchetSupported = field.varint !== 0n;
     }
     if (field.fieldNumber === 4 && field.bytes) serverId = decodeUtf8(field.bytes);
-    if (field.fieldNumber === 5 && field.varint !== undefined) {
-      legacyV1Enabled = field.varint !== 0n;
-    }
-    if (field.fieldNumber === 6 && field.varint !== undefined) {
-      allowUnsignedFetch = field.varint !== 0n;
-    }
   }
   return {
     pqEnabled,
     supportedSuites,
     pqRatchetSupported,
     serverId,
-    legacyV1Enabled,
-    allowUnsignedFetch,
   };
 }
 
 export function decodeNotification(bytes: Uint8Array): {
-  messageFrom?: Uint8Array;
+  message?: boolean;
   initialMessage?: boolean;
 } {
   for (const field of decodePbFields(bytes)) {
-    if (field.fieldNumber === 1 && field.bytes) return { messageFrom: field.bytes };
+    if (field.fieldNumber === 1 && field.varint !== undefined) {
+      return { message: field.varint !== 0n };
+    }
     if (field.fieldNumber === 2 && field.varint !== undefined) {
       return { initialMessage: field.varint !== 0n };
     }
@@ -643,12 +780,15 @@ export function decodeNotification(bytes: Uint8Array): {
 // HTTP & Connect helpers against the Worker under test
 // ---------------------------------------------------------------------------
 
-export async function signInCookie(password = env.PASSWORD): Promise<string> {
+export async function signInCookie(
+  password = env.PASSWORD,
+  clientIp = "198.51.100.1",
+): Promise<string> {
   const res = await exports.default.fetch(`${ORIGIN}/auth/password`, {
     method: "POST",
     headers: {
       "Sec-Fetch-Site": "same-origin",
-      "CF-Connecting-IP": "198.51.100.1",
+      "CF-Connecting-IP": clientIp,
     },
     body: password,
   });
@@ -662,15 +802,19 @@ export async function signInCookie(password = env.PASSWORD): Promise<string> {
 
 export async function connectPost(
   path: string,
-  body: Uint8Array,
+  body: Uint8Array | ReadableStream<Uint8Array>,
   cookie?: string,
   fetcher: { fetch: typeof exports.default.fetch } = exports.default,
+  extraHeaders?: Record<string, string>,
 ): Promise<Response> {
   const headers = new Headers({
     "content-type": "application/proto",
     "connect-protocol-version": "1",
   });
   if (cookie) headers.set("cookie", cookie);
+  if (extraHeaders) {
+    for (const [k, v] of Object.entries(extraHeaders)) headers.set(k, v);
+  }
   return fetcher.fetch(`${ORIGIN}${path}`, {
     method: "POST",
     headers,

@@ -310,19 +310,23 @@ pub fn refill_prekeys_signing_input(request: &RefillPrekeysRequest) -> Result<Ve
     Ok(out.into_vec())
 }
 
-/// Builds the canonical signing input for a [`ListInitialMessagesRequest`].
+/// Builds the canonical signing input for a [`ListInitialMessagesRequest`]:
+///
+/// `b"ratchetx2.list-initial.v2\0" || len_u32be(audience) || audience || identity_key(32) ||`
+/// `limit(u32be) || timestamp(u64be) || after_id(u64be)`.
 pub fn list_initial_messages_signing_input(
     request: &ListInitialMessagesRequest,
 ) -> Result<Vec<u8>> {
     let identity_key: PublicKey = fixed(&request.identity_key)?;
     let mut out = SigningBuf::with_domain(
         LIST_INITIAL_DOMAIN,
-        48usize.saturating_add(request.audience.len()),
+        56usize.saturating_add(request.audience.len()),
     );
     out.push_audience_be(&request.audience)?;
     out.push_bytes(&identity_key);
     out.push_u32_be(request.limit);
     out.push_u64_be(request.timestamp);
+    out.push_u64_be(request.after_id);
     Ok(out.into_vec())
 }
 
@@ -438,9 +442,11 @@ impl ListInitialMessagesRequest {
     pub fn sign(
         identity: &XEdDSAPrivateKey,
         audience: impl Into<String>,
+        after_id: u64,
         limit: u32,
         timestamp: u64,
     ) -> Result<Self> {
+        check_safe_integer(after_id)?;
         check_safe_integer(timestamp)?;
         let identity_key = identity.compute_public_key().to_bytes();
         let mut request = Self {
@@ -449,15 +455,18 @@ impl ListInitialMessagesRequest {
             limit,
             timestamp,
             signature: Bytes::new(),
+            after_id,
         };
         let input = list_initial_messages_signing_input(&request)?;
         request.signature = Bytes::copy_from_slice(&identity.sign(input));
         Ok(request)
     }
 
-    /// Verifies the audience binding, signature, and timestamp freshness against `now`.
+    /// Verifies the audience binding, cursor bounds, signature, and timestamp freshness against
+    /// `now`.
     pub fn verify(&self, expected_audience: &str, now: u64) -> Result<PublicKey> {
         verify_audience(&self.audience, expected_audience)?;
+        check_safe_integer(self.after_id)?;
         verify_recent(
             &self.identity_key,
             &self.signature,
@@ -683,42 +692,6 @@ impl TryFrom<&InitialMessageV2> for x3dh::InitialMessage {
     }
 }
 
-impl From<&crate::handshake::InitialMessage> for InitialMessageV2 {
-    fn from(message: &crate::handshake::InitialMessage) -> Self {
-        Self {
-            id: 0,
-            version: 1,
-            identity_key: message.identity_key.clone(),
-            ephemeral_key: message.ephemeral_key.clone(),
-            signed_prekey: message.signed_prekey.clone(),
-            one_time_prekey: message.one_time_prekey.clone(),
-            first_message: message.first_message.clone(),
-            pq_suite: 0,
-            pq_last_resort: false,
-            pq_prekey_id: Bytes::new(),
-            pq_ciphertext: Bytes::new(),
-            manifest_digest: Bytes::new(),
-        }
-    }
-}
-
-impl TryFrom<&InitialMessageV2> for crate::handshake::InitialMessage {
-    type Error = Error;
-
-    fn try_from(message: &InitialMessageV2) -> Result<Self> {
-        if message.version != 1 || !message.manifest_digest.is_empty() {
-            return Err(ErrorKind::Malformed.into());
-        }
-        Ok(Self {
-            identity_key: message.identity_key.clone(),
-            ephemeral_key: message.ephemeral_key.clone(),
-            signed_prekey: message.signed_prekey.clone(),
-            one_time_prekey: message.one_time_prekey.clone(),
-            first_message: message.first_message.clone(),
-        })
-    }
-}
-
 /// Validated fields extracted from an [`InitialMessageV2`].
 #[cfg(feature = "server")]
 pub(crate) struct ValidatedInitialMessageV2 {
@@ -816,7 +789,7 @@ mod server {
 
     use super::*;
     use crate::{
-        check_canonical_key, check_monotonic_timestamp, mailbox::MAX_HEADER_SIZE, now_millis,
+        check_canonical_key, check_monotonic_timestamp, mailbox_v2::MAX_HEADER_SIZE, now_millis,
     };
 
     /// Runtime server capability configuration advertised via `GetServerInfo` and enforced by
@@ -831,17 +804,11 @@ mod server {
         pub pq_ratchet_supported: bool,
         /// Canonical server audience identifier bound into signed manifests and requests.
         pub server_id: String,
-        /// Deprecated compatibility flag kept at `false` in [`GetServerInfoResponse`] for wire
-        /// stability: whether legacy v1 handshake/mailbox routes remain enabled.
-        pub legacy_v1_enabled: bool,
-        /// Deprecated compatibility flag kept at `false` in [`GetServerInfoResponse`] for wire
-        /// stability: whether unsigned legacy v1 mailbox fetches remain allowed.
-        pub allow_unsigned_fetch: bool,
     }
 
     impl ServerInfoConfig {
         /// Default PQ-enabled configuration for `server_id` supporting both ML-KEM-1024 and
-        /// ML-KEM-768, with legacy v1 compatibility flags disabled (`false`).
+        /// ML-KEM-768.
         pub fn new(server_id: impl Into<String>) -> Self {
             Self {
                 pq_enabled: true,
@@ -851,8 +818,6 @@ mod server {
                 ],
                 pq_ratchet_supported: true,
                 server_id: server_id.into(),
-                legacy_v1_enabled: false,
-                allow_unsigned_fetch: false,
             }
         }
     }
@@ -983,8 +948,6 @@ mod server {
                 },
                 pq_ratchet_supported: self.info.pq_enabled && self.info.pq_ratchet_supported,
                 server_id: self.info.server_id.clone(),
-                legacy_v1_enabled: self.info.legacy_v1_enabled,
-                allow_unsigned_fetch: self.info.allow_unsigned_fetch,
             })
         }
 
@@ -1311,14 +1274,18 @@ mod server {
             request: ListInitialMessagesRequest,
         ) -> Result<ListInitialMessagesResponse> {
             let identity_key = request.verify(&self.info.server_id, now_millis())?;
+            let after_id = request.after_id;
             let limit = match request.limit {
                 0 => self.limits.max_list_limit,
                 n => (n as usize).min(self.limits.max_list_limit),
             };
-            let stored = self
+            drop(request);
+            let mut stored = self
                 .store
-                .list_initial_messages(&identity_key, limit)
+                .list_initial_messages(&identity_key, after_id, limit.saturating_add(1))
                 .await?;
+            let has_more = stored.len() > limit;
+            stored.truncate(limit);
             let messages = stored
                 .into_iter()
                 .map(|m| InitialMessageV2 {
@@ -1343,7 +1310,7 @@ mod server {
                         .map_or_else(Bytes::new, |d| Bytes::copy_from_slice(&d)),
                 })
                 .collect();
-            Ok(ListInitialMessagesResponse { messages })
+            Ok(ListInitialMessagesResponse { messages, has_more })
         }
 
         async fn ack_initial_messages(
@@ -1365,7 +1332,6 @@ mod server {
     }
 
     #[cfg(test)]
-    #[allow(deprecated)]
     mod test {
         use std::sync::Arc;
 
@@ -1373,44 +1339,10 @@ mod server {
         use x3dh::{sign_pq_opk, sign_pq_spk};
 
         use super::*;
-        use crate::handshake::{
-            FetchBundleRequest, HandshakeServer, LocalHandshake, PublishRequest,
-            SendInitialMessageRequest, TakeInitialMessagesRequest,
-        };
 
-        /// Wrapper sharing one `Arc<MemoryStore>` across v1 and v2 handshake servers.
+        /// Wrapper sharing one `Arc<MemoryStore>` across v2 handshake and mailbox servers.
         #[derive(Clone)]
         struct SharedStore(Arc<MemoryStore>);
-
-        impl storage::LocalHandshakeStore for SharedStore {
-            async fn publish(
-                &self,
-                bundle: storage::Bundle,
-                one_time_prekeys: Vec<PublicKey>,
-            ) -> storage::Result<bool> {
-                storage::HandshakeStore::publish(&*self.0, bundle, one_time_prekeys).await
-            }
-            async fn take_bundle(
-                &self,
-                identity_key: &PublicKey,
-            ) -> storage::Result<Option<(storage::Bundle, Option<PublicKey>)>> {
-                storage::HandshakeStore::take_bundle(&*self.0, identity_key).await
-            }
-            async fn add_initial_message(
-                &self,
-                initial_message: storage::StoredInitialMessage,
-                limit: usize,
-            ) -> storage::Result<bool> {
-                storage::HandshakeStore::add_initial_message(&*self.0, initial_message, limit).await
-            }
-            async fn take_initial_messages(
-                &self,
-                recipient: &PublicKey,
-                timestamp: u64,
-            ) -> storage::Result<Option<Vec<storage::StoredInitialMessage>>> {
-                storage::HandshakeStore::take_initial_messages(&*self.0, recipient, timestamp).await
-            }
-        }
 
         impl LocalPqHandshakeStore for SharedStore {
             async fn publish_v2(
@@ -1462,9 +1394,10 @@ mod server {
             async fn list_initial_messages(
                 &self,
                 recipient: &PublicKey,
+                after_id: u64,
                 limit: usize,
             ) -> storage::Result<Vec<StoredInitialMessageV2>> {
-                PqHandshakeStore::list_initial_messages(&*self.0, recipient, limit).await
+                PqHandshakeStore::list_initial_messages(&*self.0, recipient, after_id, limit).await
             }
             async fn ack_initial_messages(
                 &self,
@@ -1484,59 +1417,61 @@ mod server {
         impl storage::LocalIdempotentMailboxStore for SharedStore {
             async fn append_idempotent(
                 &self,
-                sender: &PublicKey,
                 recipient: &PublicKey,
+                token_hash: &[u8; 32],
                 header: Bytes,
                 content: Bytes,
                 initial_message: Option<Bytes>,
-                delivery_hash: Option<[u8; 32]>,
                 client_message_id: Option<[u8; 16]>,
             ) -> storage::Result<u64> {
                 storage::IdempotentMailboxStore::append_idempotent(
                     &*self.0,
-                    sender,
                     recipient,
+                    token_hash,
                     header,
                     content,
                     initial_message,
-                    delivery_hash,
                     client_message_id,
                 )
                 .await
             }
-            async fn delete_delivered(
+            async fn read_mailbox(
                 &self,
-                sender: &PublicKey,
                 recipient: &PublicKey,
-                hashes: &[[u8; 32]],
-            ) -> storage::Result<()> {
-                storage::IdempotentMailboxStore::delete_delivered(
-                    &*self.0, sender, recipient, hashes,
-                )
-                .await
-            }
-            async fn read(
-                &self,
-                sender: &PublicKey,
-                recipient: &PublicKey,
-                after: u64,
-                limit: u32,
-            ) -> storage::Result<Vec<storage::StoredMessage>> {
-                storage::IdempotentMailboxStore::read(&*self.0, sender, recipient, after, limit)
-                    .await
-            }
-            async fn read_bounded(
-                &self,
-                sender: &PublicKey,
-                recipient: &PublicKey,
-                after: u64,
+                after_sequence: u64,
                 limit: u32,
                 max_size: usize,
-            ) -> storage::Result<Vec<storage::StoredMessage>> {
-                storage::IdempotentMailboxStore::read_bounded(
-                    &*self.0, sender, recipient, after, limit, max_size,
+                ack_up_to_sequence: u64,
+            ) -> storage::Result<storage::MailboxPage> {
+                storage::IdempotentMailboxStore::read_mailbox(
+                    &*self.0,
+                    recipient,
+                    after_sequence,
+                    limit,
+                    max_size,
+                    ack_up_to_sequence,
                 )
                 .await
+            }
+            async fn ack_messages(
+                &self,
+                recipient: &PublicKey,
+                up_to_sequence: u64,
+            ) -> storage::Result<u64> {
+                storage::IdempotentMailboxStore::ack_messages(&*self.0, recipient, up_to_sequence)
+                    .await
+            }
+            async fn register_write_token(
+                &self,
+                record: storage::RegisterWriteTokenRecord,
+            ) -> storage::Result<()> {
+                storage::IdempotentMailboxStore::register_write_token(&*self.0, record).await
+            }
+            async fn revoke_write_token(
+                &self,
+                record: storage::RevokeWriteTokenRecord,
+            ) -> storage::Result<u32> {
+                storage::IdempotentMailboxStore::revoke_write_token(&*self.0, record).await
             }
         }
 
@@ -1601,7 +1536,6 @@ mod server {
         #[tokio::test]
         async fn manifest_publish_refill_claim_and_toggle_flow() {
             let shared = SharedStore(Arc::new(MemoryStore::default()));
-            let v1 = HandshakeServer::new(shared.clone());
             let v2 = HandshakeV2Server::new(shared.clone(), ServerInfoConfig::new("relay.example"));
             let now = now_millis();
 
@@ -1609,8 +1543,6 @@ mod server {
             assert!(info.pq_enabled);
             assert_eq!(info.supported_suites, vec![1, 2]);
             assert_eq!(info.server_id, "relay.example");
-            assert!(!info.legacy_v1_enabled);
-            assert!(!info.allow_unsigned_fetch);
 
             let bob = XEdDSAPrivateKey::generate();
             let bob_pk = bob.compute_public_key().to_bytes();
@@ -1623,10 +1555,6 @@ mod server {
             let opk6 = crate::test_public_key(0x46);
             let spk2 = crate::test_public_key(0x12);
             let spk3 = crate::test_public_key(0x13);
-            let v1_spk = crate::test_public_key(0x55);
-            let v1_opk = crate::test_public_key(0x56);
-            let carol_spk = crate::test_public_key(0x61);
-            let carol_opk = crate::test_public_key(0x62);
             let lr1024 = make_pq_prekey(&bob, PqSuite::MlKem1024, 0x21, true);
             let lr768 = make_pq_prekey(&bob, PqSuite::MlKem768, 0x22, true);
             let opk1024 = make_pq_prekey(&bob, PqSuite::MlKem1024, 0x31, false);
@@ -1682,12 +1610,12 @@ mod server {
                 })
                 .await
                 .unwrap();
-            assert_eq!(got.manifest, Some(m1.clone()));
+            assert_eq!(got.manifest, Some(m1));
 
             // Re-publishing with same manifest_seq fails as StaleTimestamp.
             let stale_req = PublishV2Request::sign(
                 &bob,
-                m1.clone(),
+                got.manifest.unwrap(),
                 Some(bob.sign(spk1)),
                 &[opk3],
                 vec![lr1024.clone(), lr768.clone()],
@@ -1708,7 +1636,7 @@ mod server {
                 })
                 .await
                 .unwrap();
-            assert_eq!(c1.pq_one_time_prekey, Some(opk1024.clone()));
+            assert_eq!(c1.pq_one_time_prekey, Some(opk1024));
             assert_eq!(c1.pq_last_resort, Some(lr1024.clone()));
             let bundle1 = PqPrekeyBundle::try_from(&c1).unwrap();
             assert!(!bundle1.pq_last_resort);
@@ -1721,8 +1649,8 @@ mod server {
                 })
                 .await
                 .unwrap();
-            assert_eq!(c2.pq_one_time_prekey, Some(opk768.clone()));
-            assert_eq!(c2.pq_last_resort, Some(lr768.clone()));
+            assert_eq!(c2.pq_one_time_prekey, Some(opk768));
+            assert_eq!(c2.pq_last_resort, Some(lr768));
 
             // Exhausted PQOPKs fall back to last-resort PQSPK.
             let c3 = v2
@@ -1770,33 +1698,7 @@ mod server {
                 ErrorKind::StaleTimestamp
             );
 
-            // Legacy v1 publish MUST be refused once a v2 manifest exists (neither wiping v2
-            // manifest/PQ prekeys nor corrupting the shared classical OPK pool).
-            let v1_prekeys = x3dh::PublishedPrekeys {
-                signed_prekey: v1_spk,
-                signed_prekey_signature: bob.sign(v1_spk),
-                one_time_prekeys: vec![v1_opk],
-            };
-            assert_eq!(
-                v1.publish(PublishRequest::sign(&bob, &v1_prekeys, now + 1).unwrap())
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::StaleTimestamp
-            );
-            assert_eq!(
-                v2.get_manifest(GetManifestRequest {
-                    identity_key: Bytes::copy_from_slice(&bob_pk),
-                })
-                .await
-                .unwrap()
-                .manifest,
-                Some(m1)
-            );
-
-            // Strict PQ publish clears legacy v1 bundle so v1 FetchBundle returns NotFound;
-            // replaying an old captured v1 PublishRequest MUST remain rejected and leave strict
-            // PQ bundle & OPKs intact.
+            // Strict PQ publish omits raw SPK signature and claims cleanly.
             let m2 = signed_manifest(
                 &bob,
                 "relay.example",
@@ -1811,22 +1713,15 @@ mod server {
             let strict_req =
                 PublishV2Request::sign(&bob, m2, None, &[opk5], vec![lr1024], vec![], now).unwrap();
             v2.publish_v2(strict_req).await.unwrap();
-            assert_eq!(
-                v1.publish(PublishRequest::sign(&bob, &v1_prekeys, 100).unwrap())
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::StaleTimestamp
-            );
-            assert_eq!(
-                v1.fetch_bundle(FetchBundleRequest {
+            let strict_claim = v2
+                .claim_bundle(ClaimBundleRequest {
                     identity_key: Bytes::copy_from_slice(&bob_pk),
+                    preferred_suites: vec![1],
                 })
                 .await
-                .unwrap_err()
-                .kind(),
-                ErrorKind::NotFound
-            );
+                .unwrap();
+            assert_eq!(strict_claim.signed_prekey_signature, None);
+            assert_eq!(strict_claim.one_time_prekey.as_deref(), Some(&opk5[..]));
 
             // Affirmative OFF without a raw SPK signature is rejected as Malformed (otherwise
             // classical peers cannot verify the SPK and the identity becomes unreachable).
@@ -1859,37 +1754,15 @@ mod server {
                 .await
                 .unwrap();
             assert_eq!(after_off.manifest, Some(m3));
+            assert!(after_off.signed_prekey_signature.is_some());
             assert_eq!(after_off.pq_last_resort, None);
             assert_eq!(after_off.pq_one_time_prekey, None);
-
-            // Classical-only v1 peer falls back gracefully in ClaimBundle with manifest = None.
-            let carol = XEdDSAPrivateKey::generate();
-            let carol_pk = carol.compute_public_key().to_bytes();
-            let carol_prekeys = x3dh::PublishedPrekeys {
-                signed_prekey: carol_spk,
-                signed_prekey_signature: carol.sign(carol_spk),
-                one_time_prekeys: vec![carol_opk],
-            };
-            v1.publish(PublishRequest::sign(&carol, &carol_prekeys, now).unwrap())
-                .await
-                .unwrap();
-            let carol_claim = v2
-                .claim_bundle(ClaimBundleRequest {
-                    identity_key: Bytes::copy_from_slice(&carol_pk),
-                    preferred_suites: vec![1, 2],
-                })
-                .await
-                .unwrap();
-            assert_eq!(carol_claim.manifest, None);
-            assert_eq!(carol_claim.signed_prekey.as_ref(), &carol_spk);
-            assert_eq!(carol_claim.one_time_prekey.as_deref(), Some(&carol_opk[..]));
         }
 
         #[tokio::test]
-        async fn two_phase_inbox_isolates_v1_take_from_v2_pq_initials() {
+        async fn two_phase_inbox_idempotency_and_cursor_pagination() {
             let shared = SharedStore(Arc::new(MemoryStore::default()));
-            let v1 = HandshakeServer::new(shared.clone());
-            let v2 = HandshakeV2Server::new(shared.clone(), ServerInfoConfig::new("relay.example"));
+            let v2 = HandshakeV2Server::new(shared, ServerInfoConfig::new("relay.example"));
             let now = now_millis();
 
             let alice = XEdDSAPrivateKey::generate();
@@ -1900,38 +1773,76 @@ mod server {
             let eph2 = crate::test_public_key(0x12);
             let spk = crate::test_public_key(0x22);
 
-            // Register Bob so Bob has an inbox.
-            v1.publish(
-                PublishRequest::sign(
-                    &bob,
-                    &x3dh::PublishedPrekeys {
-                        signed_prekey: spk,
-                        signed_prekey_signature: bob.sign(spk),
-                        one_time_prekeys: vec![],
-                    },
-                    now,
-                )
-                .unwrap(),
+            // Unregistered Bob rejects SendInitialV2 with NotFound.
+            let v1_msg = InitialMessageV2 {
+                id: 0,
+                version: 1,
+                identity_key: Bytes::copy_from_slice(&alice_pk),
+                ephemeral_key: Bytes::copy_from_slice(&eph1),
+                signed_prekey: Bytes::copy_from_slice(&spk),
+                one_time_prekey: None,
+                first_message: Some(EncryptedMessage {
+                    header: Bytes::from_static(b"v1-h"),
+                    content: Bytes::from_static(b"v1-c"),
+                }),
+                pq_suite: 0,
+                pq_last_resort: false,
+                pq_prekey_id: Bytes::new(),
+                pq_ciphertext: Bytes::new(),
+                manifest_digest: Bytes::new(),
+            };
+            assert_eq!(
+                v2.send_initial_v2(SendInitialV2Request {
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(v1_msg.clone()),
+                })
+                .await
+                .unwrap_err()
+                .kind(),
+                ErrorKind::NotFound
+            );
+
+            // Register Bob via PublishV2.
+            let m = signed_manifest(&bob, "relay.example", 1, 1, false, false, spk, &[], now);
+            v2.publish_v2(
+                PublishV2Request::sign(&bob, m, Some(bob.sign(spk)), &[], vec![], vec![], now)
+                    .unwrap(),
             )
             .await
             .unwrap();
 
-            // Send 1 classical v1 initial via v1 service.
-            v1.send_initial_message(SendInitialMessageRequest {
-                recipient: Bytes::copy_from_slice(&bob_pk),
-                message: Some(crate::handshake::InitialMessage {
-                    identity_key: Bytes::copy_from_slice(&alice_pk),
-                    ephemeral_key: Bytes::copy_from_slice(&eph1),
-                    signed_prekey: Bytes::copy_from_slice(&spk),
-                    one_time_prekey: None,
-                    first_message: Some(EncryptedMessage {
-                        header: Bytes::from_static(b"v1-h"),
-                        content: Bytes::from_static(b"v1-c"),
-                    }),
-                }),
-            })
-            .await
-            .unwrap();
+            // Send classical (version 1) initial; retrying with identical payload is idempotent;
+            // retrying with mismatched payload fails with Malformed.
+            let sent_v1 = v2
+                .send_initial_v2(SendInitialV2Request {
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(v1_msg.clone()),
+                })
+                .await
+                .unwrap();
+            assert!(sent_v1.id > 0);
+            assert_eq!(
+                v2.send_initial_v2(SendInitialV2Request {
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(v1_msg.clone()),
+                })
+                .await
+                .unwrap()
+                .id,
+                sent_v1.id
+            );
+            let mut mismatched = v1_msg;
+            mismatched.first_message.as_mut().unwrap().content = Bytes::from_static(b"tampered");
+            assert_eq!(
+                v2.send_initial_v2(SendInitialV2Request {
+                    recipient: Bytes::copy_from_slice(&bob_pk),
+                    message: Some(mismatched),
+                })
+                .await
+                .unwrap_err()
+                .kind(),
+                ErrorKind::Malformed
+            );
 
             let classical_with_digest = InitialMessageV2 {
                 version: 1,
@@ -1986,7 +1897,7 @@ mod server {
             );
 
             // Send valid PQXDH v2 initial (exact 1568 B ciphertext for ML-KEM-1024).
-            let sent = v2
+            let sent_pq = v2
                 .send_initial_v2(SendInitialV2Request {
                     recipient: Bytes::copy_from_slice(&bob_pk),
                     message: Some(InitialMessageV2 {
@@ -2009,55 +1920,64 @@ mod server {
                 })
                 .await
                 .unwrap();
-            assert!(sent.id > 0);
+            assert!(sent_pq.id > sent_v1.id);
 
-            // v2 ListInitialMessages returns BOTH v1 and v2 non-destructively.
-            let listed = v2
+            // Cursor pagination: page 1 with limit = 1 returns sent_v1 + has_more = true.
+            let page1 = v2
                 .list_initial_messages(
-                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, now).unwrap(),
+                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, 1, now).unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(listed.messages.len(), 2);
-            assert_eq!(listed.messages[0].version, 1);
-            assert_eq!(listed.messages[1].version, PQXDH_VERSION);
+            assert!(page1.has_more);
+            assert_eq!(page1.messages.len(), 1);
+            assert_eq!(page1.messages[0].id, sent_v1.id);
+            assert_eq!(page1.messages[0].version, 1);
 
-            // Legacy v1 TakeInitialMessages drains ONLY the v1 message; v2 PQ message stays!
-            let taken = v1
-                .take_initial_messages(TakeInitialMessagesRequest::sign(&bob, now))
-                .await
-                .unwrap();
-            assert_eq!(taken.messages.len(), 1);
+            // Tampering with after_id invalidates the ListInitialMessages signature.
+            let mut tampered =
+                ListInitialMessagesRequest::sign(&bob, "relay.example", 0, 1, now).unwrap();
+            tampered.after_id = sent_v1.id;
             assert_eq!(
-                taken.messages[0].first_message.as_ref().unwrap().header,
-                Bytes::from_static(b"v1-h")
+                v2.list_initial_messages(tampered).await.unwrap_err().kind(),
+                ErrorKind::InvalidSignature
             );
 
-            let still_there = v2
+            // Page 2 with after_id = sent_v1.id returns sent_pq + has_more = false.
+            let page2 = v2
                 .list_initial_messages(
-                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, now).unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(still_there.messages.len(), 1);
-            assert_eq!(still_there.messages[0].id, sent.id);
-
-            // Ack deletes only the acked ID.
-            let acked = v2
-                .ack_initial_messages(
-                    AckInitialMessagesRequest::sign(&bob, "relay.example", vec![sent.id], now)
+                    ListInitialMessagesRequest::sign(&bob, "relay.example", sent_v1.id, 1, now)
                         .unwrap(),
                 )
                 .await
                 .unwrap();
-            assert_eq!(acked.deleted, 1);
+            assert!(!page2.has_more);
+            assert_eq!(page2.messages.len(), 1);
+            assert_eq!(page2.messages[0].id, sent_pq.id);
+            assert_eq!(page2.messages[0].version, PQXDH_VERSION);
+
+            // Ack deletes only the acked IDs.
+            let acked = v2
+                .ack_initial_messages(
+                    AckInitialMessagesRequest::sign(
+                        &bob,
+                        "relay.example",
+                        vec![sent_v1.id, sent_pq.id],
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(acked.deleted, 2);
             let empty = v2
                 .list_initial_messages(
-                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, now).unwrap(),
+                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, 0, now).unwrap(),
                 )
                 .await
                 .unwrap();
             assert!(empty.messages.is_empty());
+            assert!(!empty.has_more);
         }
 
         #[tokio::test]
@@ -2092,12 +2012,31 @@ mod server {
             let future = now + crate::MAX_CLOCK_SKEW + 120_000;
 
             assert_eq!(
-                ListInitialMessagesRequest::sign(&bob, "r.test", 10, crate::MAX_SAFE_INTEGER + 1)
-                    .unwrap_err()
-                    .kind(),
+                ListInitialMessagesRequest::sign(
+                    &bob,
+                    "r.test",
+                    0,
+                    10,
+                    crate::MAX_SAFE_INTEGER + 1
+                )
+                .unwrap_err()
+                .kind(),
                 ErrorKind::Malformed
             );
-            let future_list = ListInitialMessagesRequest::sign(&bob, "r.test", 10, future).unwrap();
+            assert_eq!(
+                ListInitialMessagesRequest::sign(
+                    &bob,
+                    "r.test",
+                    crate::MAX_SAFE_INTEGER + 1,
+                    10,
+                    now
+                )
+                .unwrap_err()
+                .kind(),
+                ErrorKind::Malformed
+            );
+            let future_list =
+                ListInitialMessagesRequest::sign(&bob, "r.test", 0, 10, future).unwrap();
             assert_eq!(
                 v2.list_initial_messages(future_list)
                     .await
@@ -2126,25 +2065,22 @@ mod server {
         async fn pq_disabled_rollback_allows_drain_off_manifest_and_classical_fallback() {
             use crate::mailbox_v2::{
                 CLIENT_MESSAGE_ID_LENGTH, FetchSignedRequest, LocalMailboxV2, MailboxV2Server,
-                PushV2Request,
+                PEER_SLOT_ID_LENGTH, PushV2Request, RegisterWriteTokenRequest, WRITE_TOKEN_LENGTH,
             };
 
             let shared = SharedStore(Arc::new(MemoryStore::default()));
-            let v1 = HandshakeServer::new(shared.clone());
             let v2_on =
                 HandshakeV2Server::new(shared.clone(), ServerInfoConfig::new("relay.example"));
             let now = now_millis();
 
             let alice = XEdDSAPrivateKey::generate();
             let bob = XEdDSAPrivateKey::generate();
-            let carol = XEdDSAPrivateKey::generate();
             let dave = XEdDSAPrivateKey::generate();
             let alice_pk = alice.compute_public_key().to_bytes();
             let bob_pk = bob.compute_public_key().to_bytes();
-            let carol_pk = carol.compute_public_key().to_bytes();
             let dave_pk = dave.compute_public_key().to_bytes();
 
-            // Bob publishes a strict-PQ v2 manifest (which deletes his legacy v1 bundle).
+            // Bob publishes a strict-PQ v2 manifest.
             let bob_spk1 = crate::test_public_key(0x11);
             let bob_opk1 = crate::test_public_key(0x41);
             let bob_lr1024 = make_pq_prekey(&bob, PqSuite::MlKem1024, 0x21, true);
@@ -2207,24 +2143,6 @@ mod server {
                 )
                 .await
                 .unwrap();
-
-            // Carol is a classical v1-only user.
-            let carol_spk = crate::test_public_key(0x61);
-            let carol_opk = crate::test_public_key(0x62);
-            v1.publish(
-                PublishRequest::sign(
-                    &carol,
-                    &x3dh::PublishedPrekeys {
-                        signed_prekey: carol_spk,
-                        signed_prekey_signature: carol.sign(carol_spk),
-                        one_time_prekeys: vec![carol_opk],
-                    },
-                    now,
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
 
             // Alice sends Bob a PQXDH v2 initial while PQ is still ON.
             let pq_init = InitialMessageV2 {
@@ -2391,17 +2309,6 @@ mod server {
                 vec![(2, 1)]
             );
 
-            // ClaimBundle for v1-only Carol works seamlessly even with preferred_suites.
-            let carol_claim = v2_off
-                .claim_bundle(ClaimBundleRequest {
-                    identity_key: Bytes::copy_from_slice(&carol_pk),
-                    preferred_suites: vec![1, 2],
-                })
-                .await
-                .unwrap();
-            assert_eq!(carol_claim.manifest, None);
-            assert_eq!(carol_claim.signed_prekey.as_ref(), &carol_spk);
-
             // SendInitialV2 with classical version == 1 still succeeds when PQ_ENABLED="false".
             let classical_init = InitialMessageV2 {
                 id: 0,
@@ -2431,7 +2338,7 @@ mod server {
             // 1. Bob drains his v2 inbox (both queued PQXDH v2 initial and v1 initial) and acks them!
             let listed = v2_off
                 .list_initial_messages(
-                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, now).unwrap(),
+                    ListInitialMessagesRequest::sign(&bob, "relay.example", 0, 0, now).unwrap(),
                 )
                 .await
                 .unwrap();
@@ -2456,7 +2363,7 @@ mod server {
             assert!(
                 v2_off
                     .list_initial_messages(
-                        ListInitialMessagesRequest::sign(&bob, "relay.example", 0, now).unwrap(),
+                        ListInitialMessagesRequest::sign(&bob, "relay.example", 0, 0, now).unwrap(),
                     )
                     .await
                     .unwrap()
@@ -2466,38 +2373,44 @@ mod server {
 
             // 2. Alice flushes an in-flight carried PQ initial via PushV2 while PQ_ENABLED="false",
             //    and Bob reads it via FetchSigned without HTTP 400!
+            let token = [0x66; WRITE_TOKEN_LENGTH];
+            let token_hash: [u8; 32] = Sha256::digest(token).into();
+            mb_off
+                .register_write_token(
+                    RegisterWriteTokenRequest::sign(
+                        &bob,
+                        "relay.example",
+                        &[0x01; PEER_SLOT_ID_LENGTH],
+                        &token_hash,
+                        1,
+                        true,
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
             let carried_pq = InitialMessageV2 {
                 first_message: None,
                 ..pq_init.clone()
             };
             let pushed = mb_off
                 .push_v2(PushV2Request {
-                    sender: Bytes::copy_from_slice(&alice_pk),
                     recipient: Bytes::copy_from_slice(&bob_pk),
                     message: Some(EncryptedMessage {
                         header: Bytes::from_static(b"drain-h"),
                         content: Bytes::from_static(b"drain-c"),
                     }),
                     initial_message: Some(carried_pq.clone()),
-                    delivery_hash: Bytes::new(),
                     client_message_id: Bytes::from_static(&[0x88; CLIENT_MESSAGE_ID_LENGTH]),
+                    write_token: Bytes::copy_from_slice(&token),
                 })
                 .await
                 .unwrap();
             assert_eq!(pushed.sequence, 1);
             let fetched = mb_off
                 .fetch_signed(
-                    FetchSignedRequest::sign(
-                        &bob,
-                        "relay.example",
-                        &alice_pk,
-                        0,
-                        10,
-                        0,
-                        vec![],
-                        now,
-                    )
-                    .unwrap(),
+                    FetchSignedRequest::sign(&bob, "relay.example", 0, 10, 0, 0, now).unwrap(),
                 )
                 .await
                 .unwrap();
@@ -2505,8 +2418,7 @@ mod server {
             assert_eq!(fetched.messages[0].initial_message, Some(carried_pq));
 
             // 3. Previously strict-PQ Bob publishes a signed OFF manifest via PublishV2, which
-            //    clears his PQ prekeys, persists the OFF manifest, and restores his classical v1
-            //    bundle so he is never locked out or stranded!
+            //    clears his PQ prekeys, persists the OFF manifest, and preserves signed_prekey_signature!
             let bob_spk2 = crate::test_public_key(0x14);
             let bob_opk_71 = crate::test_public_key(0x71);
             let bob_opk_72 = crate::test_public_key(0x72);
@@ -2575,16 +2487,6 @@ mod server {
             );
             assert_eq!(claimed_off.pq_last_resort, None);
             assert_eq!(claimed_off.pq_one_time_prekey, None);
-
-            // Even legacy v1 FetchBundle now succeeds again for Bob!
-            let v1_bundle = v1
-                .fetch_bundle(FetchBundleRequest {
-                    identity_key: Bytes::copy_from_slice(&bob_pk),
-                })
-                .await
-                .unwrap();
-            assert_eq!(v1_bundle.signed_prekey.as_ref(), &bob_spk2);
-            assert_eq!(v1_bundle.one_time_prekey.as_deref(), Some(&bob_opk_72[..]));
         }
 
         #[test]

@@ -905,6 +905,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f079e83a288787bcd14a6aea84cee5c87a67c5a3e660c30f557a3d24761b3527"
 
 [[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures 0.3.1",
+ "zeroize",
+]
+
+[[package]]
+name = "chacha20poly1305"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
+dependencies = [
+ "aead",
+ "chacha20",
+ "cipher",
+ "poly1305",
+ "zeroize",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1420,10 +1445,10 @@ dependencies = [
 name = "e2ee_chat_web"
 version = "0.3.0"
 dependencies = [
- "aes-gcm",
  "argon2",
  "base64 0.23.1",
  "bytes",
+ "chacha20poly1305",
  "console_error_panic_hook",
  "crc32fast",
  "csv",
@@ -1434,6 +1459,8 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "getrandom",
+ "hkdf",
+ "hmac",
  "idb",
  "js-sys",
  "leptos",
@@ -1474,6 +1501,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.2",
  "storage",
+ "subtle",
  "wasm-bindgen",
  "worker",
  "xeddsa",
@@ -3421,6 +3449,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "poly1305"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
+dependencies = [
+ "cpufeatures 0.3.1",
+ "universal-hash",
+]
+
+[[package]]
 name = "polycool"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4319,6 +4357,11 @@ dependencies = [
  "bytes",
  "futures",
  "parking_lot 0.13.0",
+ "postcard",
+ "serde",
+ "serde-big-array",
+ "serde_json",
+ "subtle",
  "thiserror 2.0.21",
  "trait-variant",
  "web-time",

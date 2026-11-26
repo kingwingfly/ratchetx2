@@ -25,6 +25,9 @@ impl fmt::Debug for ClientState {
                 "recent_manifest_digests",
                 &self.recent_manifest_digests.len(),
             )
+            .field("mailbox_cursor", &self.mailbox_cursor)
+            .field("pending_mailbox_ack", &self.pending_mailbox_ack)
+            .field("next_grant_version", &self.next_grant_version)
             .finish_non_exhaustive()
     }
 }
@@ -53,8 +56,18 @@ impl fmt::Debug for SessionSecurity {
     }
 }
 
+impl fmt::Debug for PendingGrant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingGrant")
+            .field("token_hash_len", &self.token_hash.len())
+            .field("grant_version", &self.grant_version)
+            .field("pin_active", &self.pin_active)
+            .finish()
+    }
+}
+
 impl fmt::Debug for SessionState {
-    /// Shows no keys.
+    /// Shows no keys or write tokens.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SessionState")
             .field("party", &self.party)
@@ -64,16 +77,17 @@ impl fmt::Debug for SessionState {
             .field("others", &self.others)
             .field("me", &self.me)
             .field("peer", &self.peer)
-            .field("cursor", &self.cursor)
             .field("last", &self.last)
             .field("direction_changes", &self.direction_changes)
-            .field("stalled_through", &self.stalled_through)
-            .field("skip_through", &self.skip_through)
-            .field("delivered", &self.delivered.len())
             .field("peer_pq", &self.peer_pq)
             .field("next_session_seq", &self.next_session_seq)
             .field("active_security", &self.active_security)
             .field("active_peer_session_seq", &self.active_peer_session_seq)
+            .field("inbound_token_hash_len", &self.inbound_token_hash.len())
+            .field(
+                "pending_register_grants",
+                &self.pending_register_grants.len(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -83,6 +97,7 @@ impl fmt::Debug for EarlierSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EarlierSession")
             .field("party", &self.party)
+            .field("inbound_token_hash_len", &self.inbound_token_hash.len())
             .finish_non_exhaustive()
     }
 }

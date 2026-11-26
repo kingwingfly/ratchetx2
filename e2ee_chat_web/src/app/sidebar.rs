@@ -231,7 +231,7 @@ fn subtitle_tooltip(subtitle: &ChatItemSubtitle) -> String {
 pub(super) fn chat_item_meta(contact: &ContactView) -> ChatItemMeta {
     let has_downgrade = contact.has_downgrade();
     let is_quarantined = contact.is_quarantined();
-    let has_outbound_prompt = matches!(contact.classical_prompt, ClassicalPrompt::Outbound { .. });
+    let has_outbound_prompt = matches!(contact.classical_prompt, ClassicalPrompt::Outbound);
     let has_warn_alert = matches!(
         contact.alert,
         SecurityAlert::ManifestExpired | SecurityAlert::PqRequired

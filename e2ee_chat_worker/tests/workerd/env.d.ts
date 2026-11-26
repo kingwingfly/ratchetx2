@@ -5,6 +5,10 @@ declare namespace Cloudflare {
     BUCKET: R2Bucket;
     IDENTITIES: DurableObjectNamespace;
     ATTACHMENTS: DurableObjectNamespace;
+    AUTH_RATE_LIMITER: RateLimit;
+    WS_RATE_LIMITER: RateLimit;
+    HANDSHAKE_RATE_LIMITER: RateLimit;
+    UPLOAD_RATE_LIMITER: RateLimit;
     RETENTION_DAYS: string;
     FILE_RETENTION_DAYS: string;
     SESSION_DAYS: string;

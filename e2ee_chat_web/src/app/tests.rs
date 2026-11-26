@@ -167,9 +167,7 @@ fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
     );
 
     let mut outbound = make_contact(7, "Alice");
-    outbound.classical_prompt = ClassicalPrompt::Outbound {
-        peer_signed_off: true,
-    };
+    outbound.classical_prompt = ClassicalPrompt::Outbound;
     assert_eq!(
         chat_item_meta(&outbound),
         status(false, true, false, "classical approval needed")

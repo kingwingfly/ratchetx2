@@ -167,6 +167,7 @@ fn TopBar() -> impl IntoView {
         Phase::Loading => "loading".to_string(),
         Phase::Create => "no vault yet".to_string(),
         Phase::Locked => "locked".to_string(),
+        Phase::IncompatibleVault(_) => "incompatible vault".to_string(),
         Phase::Elsewhere => "open in another tab".to_string(),
         Phase::Unavailable(UnavailableReason::InsecureContext, _) => "HTTPS required".to_string(),
         Phase::Unavailable(UnavailableReason::LocksUnavailable, _) => {

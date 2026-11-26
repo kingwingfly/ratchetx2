@@ -216,9 +216,12 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
       await closeViewer();
 
       // (g) preview_audio (inline audio clip opens AudioView and displays worker-extracted tags)
-      const wavClipButton = bobPage.locator('.messages .inline-media .clip-name', {
-        hasText: 'sample.wav',
-      });
+      // All attachments are remote and lazy-load via IntersectionObserver (`when_shown`), so
+      // scroll `.inline-media` into view after earlier file-card clicks may have scrolled up.
+      const wavInline = bobPage.locator('.messages .inline-media', { hasText: 'sample.wav' });
+      await expect(wavInline).toBeAttached();
+      await wavInline.scrollIntoViewIfNeeded();
+      const wavClipButton = wavInline.locator('.clip-name');
       await expect(wavClipButton).toBeVisible();
       await wavClipButton.click();
       await expect(viewer).toHaveAttribute('open', '');

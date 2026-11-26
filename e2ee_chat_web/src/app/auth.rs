@@ -490,6 +490,61 @@ pub(super) fn UnlockVault() -> impl IntoView {
 }
 
 #[component]
+pub(super) fn IncompatibleVault(version: u32) -> impl IntoView {
+    let progress = Progress::new();
+    let confirm_reset = ConfirmGuard::new();
+    let reset = move |_| {
+        if progress.working.get_untracked() {
+            return;
+        }
+        if !confirm_reset.confirm_or_arm() {
+            return;
+        }
+        progress.start("Deleting incompatible vault…");
+        spawn_local(async move {
+            match crate::vault::Vault::destroy().await {
+                Ok(()) => lock(),
+                Err(e) => progress.try_fail(e.to_string()),
+            }
+        });
+    };
+    view! {
+        <div>
+            <h2>"Incompatible vault format"</h2>
+            <p>
+                {format!(
+                    "This browser holds a vault from format version {version}, which is \
+                     incompatible with the current vault format (v{}). Automatic migration is \
+                     not supported; reset the vault to create a new identity and start fresh.",
+                    crate::vault::VAULT_VERSION_V3
+                )}
+            </p>
+            <p class="warning" role="alert">
+                "Resetting permanently deletes the incompatible local vault, keys, and chat \
+                 history from this browser."
+            </p>
+            {progress.view()}
+            <div class="actions">
+                <button
+                    type="button"
+                    class="btn danger"
+                    disabled=move || progress.working.get()
+                    on:click=reset
+                >
+                    {move || {
+                        if confirm_reset.is_armed() {
+                            "Delete old vault, for good?"
+                        } else {
+                            "Reset vault and start over"
+                        }
+                    }}
+                </button>
+            </div>
+        </div>
+    }
+}
+
+#[component]
 pub(super) fn Elsewhere() -> impl IntoView {
     view! {
         <div>

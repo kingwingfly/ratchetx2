@@ -679,9 +679,7 @@ mod tests {
                 ClassicalPrompt::InboundQuarantined {
                     peer_was_pq_pinned: flag,
                 },
-                ClassicalPrompt::Outbound {
-                    peer_signed_off: flag,
-                },
+                ClassicalPrompt::Outbound,
             ] {
                 assert!(!can_allow_classical(prompt, true));
                 assert!(can_allow_classical(prompt, false));

@@ -30,6 +30,8 @@ pub enum Phase {
     /// No vault in this browser yet.
     Create,
     Locked,
+    /// Existing vault has an incompatible schema version (detected pre-KDF) and requires reset.
+    IncompatibleVault(u32),
     Unlocked,
     /// Another tab has the vault open.
     Elsewhere,
@@ -136,7 +138,7 @@ pub enum ClassicalPrompt {
     #[default]
     None,
     /// Outbound initiation or session renewal requires explicit classical approval.
-    Outbound { peer_signed_off: bool },
+    Outbound,
     /// Inbound classical initial message is held in quarantine pending explicit approval.
     InboundQuarantined { peer_was_pq_pinned: bool },
 }
@@ -945,8 +947,8 @@ pub struct Ui {
     pub log: RwSignal<Vec<(u64, String)>>,
     /// A message for the notice, and its number, so that a newer one is not hidden early.
     pub notice: RwSignal<Option<(u64, String)>>,
-    /// Set when the server rejects this client's protocol (e.g. WebSocket close `4010` or
-    /// `ErrorKind::Unimplemented`), prompting the user to refresh/reload the page.
+    /// Set when the server rejects this client's protocol (e.g. a confirmed
+    /// `ErrorKind::Unimplemented` server refusal), prompting the user to refresh/reload the page.
     pub update_required: RwSignal<Option<String>>,
     pub dialog: RwSignal<Option<Dialog>>,
     /// The file in the viewer, ...

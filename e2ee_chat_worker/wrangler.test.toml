@@ -12,15 +12,35 @@ bucket_name = "e2ee-chat-test"
 
 [[durable_objects.bindings]]
 name = "IDENTITIES"
-class_name = "Identity"
+class_name = "IdentityV2"
 
 [[durable_objects.bindings]]
 name = "ATTACHMENTS"
-class_name = "Attachment"
+class_name = "AttachmentV2"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["Identity", "Attachment"]
+new_sqlite_classes = ["IdentityV2", "AttachmentV2"]
+
+[[ratelimits]]
+name = "AUTH_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 20, period = 60 }
+
+[[ratelimits]]
+name = "WS_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "HANDSHAKE_RATE_LIMITER"
+namespace_id = "1003"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "UPLOAD_RATE_LIMITER"
+namespace_id = "1004"
+simple = { limit = 30, period = 60 }
 
 [vars]
 RETENTION_DAYS = "30"

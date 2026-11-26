@@ -4,232 +4,13 @@
 
 use bytes::Bytes;
 
-#[allow(deprecated)]
 use crate::{
-    Bundle, ErrorKind, LocalHandshakeStore, LocalMailboxStore, MAX_SAFE_INTEGER,
-    StoredInitialMessage,
+    ErrorKind, LocalAttachmentStore, LocalIdempotentMailboxStore, LocalPqHandshakeStore,
+    MAX_SAFE_INTEGER, MailboxPage, PqLastResortCommitment, PublishV2Record, PublishV2Status,
+    RefillPrekeysRecord, RefillStatus, RegisterWriteTokenRecord, RevokeWriteTokenRecord,
+    StoredAttachment, StoredCapabilityManifest, StoredInitialMessageV2, StoredMessage,
+    StoredPqPrekey,
 };
-use crate::{LocalAttachmentStore, StoredAttachment, StoredMessage};
-#[cfg(feature = "pq")]
-use crate::{
-    LocalIdempotentMailboxStore, LocalPqHandshakeStore, PqLastResortCommitment, PublishV2Record,
-    PublishV2Status, RefillPrekeysRecord, RefillStatus, StoredCapabilityManifest,
-    StoredInitialMessageV2, StoredPqPrekey,
-};
-
-/// Conformance suite for legacy v1 [`LocalHandshakeStore`].
-#[deprecated(
-    note = "legacy v1 handshake store conformance is deprecated; use pq_handshake_store (see git tag archive/legacy-v1)"
-)]
-#[allow(deprecated)]
-pub async fn handshake_store<S: LocalHandshakeStore>(store: &S) {
-    let (alice, bob) = ([1; 32], [2; 32]);
-    let bundle = |timestamp| Bundle {
-        identity_key: bob,
-        signed_prekey: [3; 32],
-        signed_prekey_signature: [4; 64],
-        timestamp,
-    };
-
-    assert_eq!(store.take_bundle(&bob).await.unwrap(), None);
-    assert!(
-        store
-            .publish(bundle(10), vec![[5; 32], [6; 32]])
-            .await
-            .unwrap()
-    );
-    // Publishing needs a newer timestamp.
-    assert!(!store.publish(bundle(10), vec![]).await.unwrap());
-    assert!(!store.publish(bundle(9), vec![]).await.unwrap());
-
-    // Each take consumes one one-time prekey; then the bundle comes without one.
-    let (taken, first) = store.take_bundle(&bob).await.unwrap().unwrap();
-    assert_eq!(taken, bundle(10));
-    let (_, second) = store.take_bundle(&bob).await.unwrap().unwrap();
-    let mut one_time_prekeys = [first.unwrap(), second.unwrap()];
-    one_time_prekeys.sort();
-    assert_eq!(one_time_prekeys, [[5; 32], [6; 32]]);
-    assert_eq!(
-        store.take_bundle(&bob).await.unwrap(),
-        Some((bundle(10), None))
-    );
-
-    // Publishing again replaces the one-time prekeys.
-    assert!(store.publish(bundle(11), vec![[7; 32]]).await.unwrap());
-    assert_eq!(
-        store.take_bundle(&bob).await.unwrap(),
-        Some((bundle(11), Some([7; 32])))
-    );
-    assert_eq!(store.take_bundle(&alice).await.unwrap(), None);
-
-    let initial_message = StoredInitialMessage {
-        sender: alice,
-        recipient: bob,
-        ephemeral_key: [8; 32],
-        signed_prekey: [3; 32],
-        one_time_prekey: Some([5; 32]),
-        header: Bytes::from_static(b"header"),
-        content: Bytes::from_static(b"content"),
-    };
-    let without_one_time_prekey = StoredInitialMessage {
-        one_time_prekey: None,
-        content: Bytes::new(),
-        ..initial_message.clone()
-    };
-    assert!(
-        store
-            .add_initial_message(initial_message.clone(), 2)
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .add_initial_message(without_one_time_prekey.clone(), 2)
-            .await
-            .unwrap()
-    );
-    // The inbox is full.
-    assert!(
-        !store
-            .add_initial_message(initial_message.clone(), 2)
-            .await
-            .unwrap()
-    );
-
-    assert_eq!(
-        store.take_initial_messages(&bob, 1).await.unwrap(),
-        Some(vec![initial_message, without_one_time_prekey])
-    );
-    // Taking needs a newer timestamp, and takes only what arrived since.
-    assert_eq!(store.take_initial_messages(&bob, 1).await.unwrap(), None);
-    assert_eq!(
-        store.take_initial_messages(&bob, 2).await.unwrap(),
-        Some(vec![])
-    );
-    assert_eq!(
-        store.take_initial_messages(&alice, 1).await.unwrap(),
-        Some(vec![])
-    );
-
-    // Timestamps above MAX_SAFE_INTEGER are rejected rather than silently clamped.
-    assert_eq!(
-        store
-            .publish(bundle(MAX_SAFE_INTEGER + 1), vec![])
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidArgument
-    );
-    assert_eq!(
-        store
-            .take_initial_messages(&bob, MAX_SAFE_INTEGER + 1)
-            .await
-            .unwrap_err()
-            .kind(),
-        ErrorKind::InvalidArgument
-    );
-}
-
-/// Conformance suite for legacy v1 [`LocalMailboxStore`].
-#[deprecated(
-    note = "legacy v1 mailbox store conformance is deprecated; use idempotent_mailbox_store (see git tag archive/legacy-v1)"
-)]
-#[allow(deprecated)]
-pub async fn mailbox_store<S: LocalMailboxStore>(store: &S) {
-    let (alice, bob) = ([1; 32], [2; 32]);
-
-    assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
-    for i in 1..=3 {
-        let initial_message = (i == 2).then(|| Bytes::from_static(b"initial"));
-        let sequence = store
-            .append(
-                &alice,
-                &bob,
-                Bytes::from(vec![i]),
-                Bytes::from(vec![i, i]),
-                initial_message,
-                Some([i; 32]),
-            )
-            .await
-            .unwrap();
-        assert_eq!(sequence, u64::from(i));
-    }
-    // The other direction is a separate queue.
-    let sequence = store
-        .append(
-            &bob,
-            &alice,
-            Bytes::from_static(b"h"),
-            Bytes::from_static(b"c"),
-            None,
-            Some([1; 32]),
-        )
-        .await
-        .unwrap();
-    assert_eq!(sequence, 1);
-
-    let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
-    let sequences: Vec<_> = messages.iter().map(|m| m.sequence).collect();
-    assert_eq!(sequences, [1, 2, 3]);
-    assert_eq!(
-        messages[1],
-        StoredMessage {
-            sender: alice,
-            recipient: bob,
-            sequence: 2,
-            header: Bytes::from(vec![2]),
-            content: Some(Bytes::from(vec![2, 2])),
-            initial_message: Some(Bytes::from_static(b"initial")),
-        }
-    );
-    let page = store.read(&alice, &bob, 1, 1).await.unwrap();
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].sequence, 2);
-    assert!(store.read(&alice, &bob, 3, 10).await.unwrap().is_empty());
-    assert!(
-        store
-            .read(&alice, &bob, u64::MAX, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
-    assert_eq!(store.read(&bob, &alice, 0, 10).await.unwrap().len(), 1);
-
-    // Delivered, the first two go, of their queue only; a hash naming none changes nothing.
-    store
-        .delete_delivered(&alice, &bob, &[[1; 32], [2; 32], [9; 32]])
-        .await
-        .unwrap();
-    let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
-    let sequences: Vec<_> = messages.iter().map(|m| m.sequence).collect();
-    assert_eq!(sequences, [3]);
-    assert_eq!(store.read(&bob, &alice, 0, 10).await.unwrap().len(), 1);
-    // Numbers go on, and a page reads past the gap.
-    for i in 4..=6 {
-        let sequence = store
-            .append(
-                &alice,
-                &bob,
-                Bytes::from(vec![i]),
-                Bytes::from(vec![i]),
-                None,
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(sequence, u64::from(i));
-    }
-    store
-        .delete_delivered(&alice, &bob, &[[3; 32]])
-        .await
-        .unwrap();
-    let page = store.read(&alice, &bob, 0, 2).await.unwrap();
-    let sequences: Vec<_> = page.iter().map(|m| m.sequence).collect();
-    assert_eq!(sequences, [4, 5]);
-    // A message without a delivery hash stays.
-    store.delete_delivered(&alice, &bob, &[]).await.unwrap();
-    assert_eq!(store.read(&alice, &bob, 3, 10).await.unwrap().len(), 3);
-}
 
 /// Conformance suite for [`LocalAttachmentStore`].
 pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
@@ -286,10 +67,18 @@ pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
     assert_eq!(store.attachment(&attachment.id).await.unwrap(), None);
     assert_eq!(store.chunk(&attachment.id, 0).await.unwrap(), None);
     store.delete_attachment(&attachment.id).await.unwrap();
+    // Putting a chunk on a missing/deleted attachment returns NotFound.
+    assert_eq!(
+        store
+            .put_chunk(&attachment.id, 0, Bytes::from_static(b"after-delete"))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
 }
 
 /// Conformance suite for [`LocalPqHandshakeStore`].
-#[cfg(feature = "pq")]
 pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
     let (alice, bob) = ([11; 32], [12; 32]);
     let pq_key = |suite: u8, tag: u8| StoredPqPrekey {
@@ -328,17 +117,43 @@ pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
             signature: [0x55; 64],
         };
 
-    // Unknown identity returns None / empty without allocating.
+    // Unknown identity returns None / empty without allocating, and rejects inbox writes.
     assert_eq!(store.get_manifest(&bob).await.unwrap(), None);
     assert_eq!(store.claim_bundle(&bob, &[1, 2]).await.unwrap(), None);
     assert!(
         store
-            .list_initial_messages(&bob, 10)
+            .list_initial_messages(&bob, 0, 10)
             .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(store.ack_initial_messages(&bob, &[1]).await.unwrap(), 0);
+    assert_eq!(
+        store
+            .add_initial_message_v2(
+                StoredInitialMessageV2 {
+                    id: 0,
+                    version: 1,
+                    sender: alice,
+                    recipient: bob,
+                    ephemeral_key: [79; 32],
+                    signed_prekey: [21; 32],
+                    one_time_prekey: None,
+                    header: Bytes::from_static(b"unreg"),
+                    content: Bytes::new(),
+                    pq_suite: None,
+                    pq_last_resort: false,
+                    pq_prekey_id: None,
+                    pq_ciphertext: None,
+                    manifest_digest: None,
+                },
+                10,
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
 
     // Duplicate OPK or PQOPK is rejected.
     let dup = PublishV2Record {
@@ -400,9 +215,11 @@ pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
         PublishV2Status::StaleSequence
     );
 
-    // Classical claim (empty preferred_suites) pops a classical OPK and NEVER consumes PQOPKs.
+    // Classical claim (empty preferred_suites) pops a classical OPK and preserves
+    // signed_prekey_signature while NEVER consuming PQOPKs.
     let classical_claim = store.claim_bundle(&bob, &[]).await.unwrap().unwrap();
     assert_eq!(classical_claim.signed_prekey, [21; 32]);
+    assert_eq!(classical_claim.signed_prekey_signature, Some([0x44; 64]));
     assert_eq!(classical_claim.one_time_prekey, Some([40; 32]));
     assert_eq!(classical_claim.pq_last_resort, None);
     assert_eq!(classical_claim.pq_one_time_prekey, None);
@@ -507,7 +324,8 @@ pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
     assert_eq!(strict_claim.signed_prekey_signature, None);
     assert_eq!(strict_claim.pq_one_time_prekey, Some(pq_key(1, 0xB4)));
 
-    // Affirmative PQ OFF clears stored PQ prekeys while persisting the signed OFF manifest.
+    // Affirmative PQ OFF clears stored PQ prekeys while persisting the signed OFF manifest and
+    // preserving signed_prekey_signature for intentional classical X3DH.
     assert_eq!(
         store
             .publish_v2(PublishV2Record {
@@ -526,57 +344,82 @@ pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
     assert!(!off_snap.manifest.as_ref().unwrap().pq_enabled);
     assert!(off_snap.pq_last_resort_suites.is_empty());
     assert!(off_snap.pq_one_time_counts.is_empty());
+    let off_claim = store.claim_bundle(&bob, &[1, 2]).await.unwrap().unwrap();
+    assert_eq!(off_claim.signed_prekey_signature, Some([0x77; 64]));
+    assert_eq!(off_claim.one_time_prekey, Some([70; 32]));
 
-    // Two-phase inbox: add 1 classical (version 1) initial and 1 PQXDH (version 2) initial.
+    // Two-phase inbox with idempotency on (sender, ephemeral_key) + payload match, and cursor
+    // pagination via after_id.
+    let v1_msg = StoredInitialMessageV2 {
+        id: 0,
+        version: 1,
+        sender: alice,
+        recipient: bob,
+        ephemeral_key: [80; 32],
+        signed_prekey: [23; 32],
+        one_time_prekey: None,
+        header: Bytes::from_static(b"v1-h"),
+        content: Bytes::from_static(b"v1-c"),
+        pq_suite: None,
+        pq_last_resort: false,
+        pq_prekey_id: None,
+        pq_ciphertext: None,
+        manifest_digest: None,
+    };
     let v1_id = store
-        .add_initial_message_v2(
-            StoredInitialMessageV2 {
-                id: 0,
-                version: 1,
-                sender: alice,
-                recipient: bob,
-                ephemeral_key: [80; 32],
-                signed_prekey: [23; 32],
-                one_time_prekey: None,
-                header: Bytes::from_static(b"v1-h"),
-                content: Bytes::from_static(b"v1-c"),
-                pq_suite: None,
-                pq_last_resort: false,
-                pq_prekey_id: None,
-                pq_ciphertext: None,
-                manifest_digest: None,
-            },
-            2,
-        )
+        .add_initial_message_v2(v1_msg.clone(), 2)
         .await
         .unwrap()
         .unwrap();
     assert!(v1_id > 0);
+    // Retrying the exact same (sender, ephemeral_key) payload is idempotent and consumes 1 slot.
+    assert_eq!(
+        store
+            .add_initial_message_v2(v1_msg.clone(), 2)
+            .await
+            .unwrap(),
+        Some(v1_id)
+    );
+    // Mismatched payload for the same (sender, ephemeral_key) fails with InvalidArgument.
+    let mut bad_retry = v1_msg.clone();
+    bad_retry.content = Bytes::from_static(b"tampered");
+    assert_eq!(
+        store
+            .add_initial_message_v2(bad_retry, 2)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+
+    let pq_msg = StoredInitialMessageV2 {
+        id: 0,
+        version: 2,
+        sender: alice,
+        recipient: bob,
+        ephemeral_key: [81; 32],
+        signed_prekey: [23; 32],
+        one_time_prekey: Some([70; 32]),
+        header: Bytes::from_static(b"v2-h"),
+        content: Bytes::from_static(b"v2-c"),
+        pq_suite: Some(1),
+        pq_last_resort: false,
+        pq_prekey_id: Some([0xB4; 32]),
+        pq_ciphertext: Some(Bytes::from(vec![0xCC; 1568])),
+        manifest_digest: Some([0xDD; 32]),
+    };
     let pq_id = store
-        .add_initial_message_v2(
-            StoredInitialMessageV2 {
-                id: 0,
-                version: 2,
-                sender: alice,
-                recipient: bob,
-                ephemeral_key: [81; 32],
-                signed_prekey: [23; 32],
-                one_time_prekey: Some([70; 32]),
-                header: Bytes::from_static(b"v2-h"),
-                content: Bytes::from_static(b"v2-c"),
-                pq_suite: Some(1),
-                pq_last_resort: false,
-                pq_prekey_id: Some([0xB4; 32]),
-                pq_ciphertext: Some(Bytes::from(vec![0xCC; 1568])),
-                manifest_digest: Some([0xDD; 32]),
-            },
-            2,
-        )
+        .add_initial_message_v2(pq_msg.clone(), 2)
         .await
         .unwrap()
         .unwrap();
     assert!(pq_id > v1_id);
-    // Inbox limit is enforced.
+    // Idempotent retry STILL succeeds even when inbox is full at limit=2.
+    assert_eq!(
+        store.add_initial_message_v2(pq_msg, 2).await.unwrap(),
+        Some(pq_id)
+    );
+    // A distinct 3rd initial hits the inbox limit.
     assert_eq!(
         store
             .add_initial_message_v2(
@@ -603,165 +446,402 @@ pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
         None
     );
 
-    // Non-destructive list returns BOTH v1 and v2 oldest-first.
-    let listed = store.list_initial_messages(&bob, 10).await.unwrap();
-    assert_eq!(listed.len(), 2);
-    assert_eq!(listed[0].id, v1_id);
-    assert_eq!(listed[0].version, 1);
-    assert_eq!(listed[1].id, pq_id);
-    assert_eq!(listed[1].version, 2);
+    // Cursor pagination via after_id.
+    let page1 = store.list_initial_messages(&bob, 0, 1).await.unwrap();
+    assert_eq!(page1.len(), 1);
+    assert_eq!(page1[0].id, v1_id);
+    let page2 = store.list_initial_messages(&bob, v1_id, 10).await.unwrap();
+    assert_eq!(page2.len(), 1);
+    assert_eq!(page2[0].id, pq_id);
+    assert!(
+        store
+            .list_initial_messages(&bob, pq_id, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .list_initial_messages(&bob, MAX_SAFE_INTEGER + 1, 10)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
 
     // Ack deletes only the acknowledged IDs.
     assert_eq!(store.ack_initial_messages(&bob, &[v1_id]).await.unwrap(), 1);
-    let remaining = store.list_initial_messages(&bob, 10).await.unwrap();
+    let remaining = store.list_initial_messages(&bob, 0, 10).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].id, pq_id);
-    assert_eq!(remaining[0].version, 2);
 
     assert_eq!(store.ack_initial_messages(&bob, &[pq_id]).await.unwrap(), 1);
     assert!(
         store
-            .list_initial_messages(&bob, 10)
+            .list_initial_messages(&bob, 0, 10)
             .await
             .unwrap()
             .is_empty()
     );
 }
 
-/// Conformance suite for [`LocalIdempotentMailboxStore`].
-#[cfg(feature = "pq")]
-pub async fn idempotent_mailbox_store<S: LocalIdempotentMailboxStore>(store: &S) {
-    let (alice, bob) = ([21; 32], [22; 32]);
-    let cid = [0x42; 16];
+/// Conformance suite for [`LocalIdempotentMailboxStore`] (paired with [`LocalPqHandshakeStore`]
+/// so recipients can register manifests before registering write tokens).
+pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotentMailboxStore>(
+    store: &S,
+) {
+    let bob = [22; 32];
+    let peer_a = [0xA0; 32];
+    let peer_b = [0xB0; 32];
+    let tok_a1 = [0xA1; 32];
+    let tok_a2 = [0xA2; 32];
+    let tok_a3 = [0xA3; 32];
+    let tok_a4 = [0xA4; 32];
+    let tok_a5 = [0xA5; 32];
+    let tok_b1 = [0xB1; 32];
+    let cid1 = [0x42; 16];
 
-    assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
+    // 1. Unregistered recipient fails closed on grants, writes, and non-zero ACK without alloc.
+    assert_eq!(
+        store
+            .register_write_token(RegisterWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: tok_a1,
+                grant_version: 1,
+                pin_active: true,
+            })
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    assert_eq!(
+        store
+            .append_idempotent(
+                &bob,
+                &tok_a1,
+                Bytes::from_static(b"h"),
+                Bytes::from_static(b"c"),
+                None,
+                Some(cid1),
+            )
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::WriteTokenRejected
+    );
+    assert_eq!(
+        store.read_mailbox(&bob, 0, 10, 1024, 0).await.unwrap(),
+        MailboxPage::default()
+    );
+    assert_eq!(
+        store.ack_messages(&bob, 1).await.unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
 
+    // Register Bob's manifest.
+    let manifest = StoredCapabilityManifest {
+        audience: "chat.example".to_string(),
+        identity_key: bob,
+        manifest_seq: 1,
+        generation: 1,
+        issued_at: 1000,
+        expires_at: 100_000,
+        pq_enabled: false,
+        strict_pq: false,
+        pq_ratchet_supported: false,
+        offered_suites: vec![],
+        signed_prekey: [0x20; 32],
+        pq_last_resort: vec![],
+        signature: [0x55; 64],
+    };
+    assert_eq!(
+        store
+            .publish_v2(PublishV2Record {
+                manifest,
+                signed_prekey_signature: Some([0x44; 64]),
+                one_time_prekeys: vec![],
+                pq_last_resort: vec![],
+                pq_one_time_prekeys: vec![],
+                timestamp: 1001,
+            })
+            .await
+            .unwrap(),
+        PublishV2Status::Stored
+    );
+
+    // 2. Grant registration invariants: pinned active preserved across 5th grant eviction,
+    //    duplicate token never refreshes eviction priority, cross-peer token_hash rejected.
+    store
+        .register_write_token(RegisterWriteTokenRecord {
+            recipient: bob,
+            peer_slot_id: peer_a,
+            token_hash: tok_a1,
+            grant_version: 1,
+            pin_active: true,
+        })
+        .await
+        .unwrap();
+    // Cross-peer token_hash collision -> InvalidArgument.
+    assert_eq!(
+        store
+            .register_write_token(RegisterWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_b,
+                token_hash: tok_a1,
+                grant_version: 1,
+                pin_active: true,
+            })
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+    // Register grants 2, 3, 4 (not pinning active) so tok_a1 (v=1) stays pinned active.
+    for (tok, ver) in [(tok_a2, 2), (tok_a3, 3), (tok_a4, 4)] {
+        store
+            .register_write_token(RegisterWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: tok,
+                grant_version: ver,
+                pin_active: false,
+            })
+            .await
+            .unwrap();
+    }
+    // Duplicate registration of tok_a2 with higher version must NOT refresh its eviction priority.
+    store
+        .register_write_token(RegisterWriteTokenRecord {
+            recipient: bob,
+            peer_slot_id: peer_a,
+            token_hash: tok_a2,
+            grant_version: 99,
+            pin_active: false,
+        })
+        .await
+        .unwrap();
+    // Register 5th grant tok_a5 (v=5): must evict tok_a2 (v=2), strictly preserving pinned tok_a1!
+    store
+        .register_write_token(RegisterWriteTokenRecord {
+            recipient: bob,
+            peer_slot_id: peer_a,
+            token_hash: tok_a5,
+            grant_version: 5,
+            pin_active: false,
+        })
+        .await
+        .unwrap();
+    // tok_a2 was evicted -> WriteTokenRejected.
+    assert_eq!(
+        store
+            .append_idempotent(&bob, &tok_a2, Bytes::new(), Bytes::new(), None, None)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::WriteTokenRejected
+    );
+    // Pinned tok_a1 still works!
     let seq1 = store
         .append_idempotent(
-            &alice,
             &bob,
+            &tok_a1,
             Bytes::from_static(b"h1"),
             Bytes::from_static(b"c1"),
             Some(Bytes::from_static(b"initial")),
-            Some([1; 32]),
-            Some(cid),
+            Some(cid1),
         )
         .await
         .unwrap();
     assert_eq!(seq1, 1);
-    // Retrying with the same client_message_id returns the original sequence without duplicating.
-    let seq1_retry = store
-        .append_idempotent(
-            &alice,
-            &bob,
-            Bytes::from_static(b"h1"),
-            Bytes::from_static(b"c1"),
-            Some(Bytes::from_static(b"initial")),
-            Some([1; 32]),
-            Some(cid),
-        )
-        .await
-        .unwrap();
-    assert_eq!(seq1_retry, 1);
 
-    // The opposite direction is an independent queue.
-    let reverse = store
-        .append_idempotent(
-            &bob,
-            &alice,
-            Bytes::from_static(b"rh"),
-            Bytes::from_static(b"rc"),
-            None,
-            Some([1; 32]),
-            Some(cid),
-        )
-        .await
-        .unwrap();
-    assert_eq!(reverse, 1);
-
-    let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
+    // 3. Idempotent retry returns original sequence.
     assert_eq!(
-        messages,
-        vec![StoredMessage {
-            sender: alice,
-            recipient: bob,
-            sequence: 1,
-            header: Bytes::from_static(b"h1"),
-            content: Some(Bytes::from_static(b"c1")),
-            initial_message: Some(Bytes::from_static(b"initial")),
-        }]
+        store
+            .append_idempotent(
+                &bob,
+                &tok_a1,
+                Bytes::from_static(b"h1"),
+                Bytes::from_static(b"c1"),
+                Some(Bytes::from_static(b"initial")),
+                Some(cid1),
+            )
+            .await
+            .unwrap(),
+        1
     );
 
-    // Tombstone survives delete_delivered, and deleting only affects the matching direction.
+    // 4. Unified monotonic sequence across multiple peers.
     store
-        .delete_delivered(&alice, &bob, &[[1; 32], [9; 32]])
+        .register_write_token(RegisterWriteTokenRecord {
+            recipient: bob,
+            peer_slot_id: peer_b,
+            token_hash: tok_b1,
+            grant_version: 1,
+            pin_active: true,
+        })
         .await
         .unwrap();
-    assert_eq!(store.read(&bob, &alice, 0, 10).await.unwrap().len(), 1);
-    let retry = store
+    let seq2 = store
         .append_idempotent(
-            &alice,
             &bob,
-            Bytes::new(),
-            Bytes::new(),
-            None,
-            Some([1; 32]),
-            Some(cid),
-        )
-        .await
-        .unwrap();
-    assert_eq!(retry, seq1);
-    assert!(store.read(&alice, &bob, 0, 10).await.unwrap().is_empty());
-
-    let next = store
-        .append_idempotent(
-            &alice,
-            &bob,
+            &tok_b1,
             Bytes::from_static(b"h2"),
             Bytes::from_static(b"c2"),
             None,
-            Some([2; 32]),
-            Some([0x43; 16]),
+            Some(cid1), // Same client_message_id under a DIFFERENT token_hash is independent!
         )
         .await
         .unwrap();
-    assert_eq!(next, seq1 + 1);
+    assert_eq!(seq2, 2);
 
-    // Appending without a client_message_id allocates the next sequence cleanly.
+    // 5. Read pagination with has_more (limit & byte cap) and token_hash metadata.
+    let page1 = store.read_mailbox(&bob, 0, 1, 1024, 0).await.unwrap();
+    assert!(page1.has_more);
+    assert_eq!(
+        page1.messages,
+        vec![StoredMessage {
+            sequence: 1,
+            token_hash: tok_a1,
+            header: Bytes::from_static(b"h1"),
+            content: Bytes::from_static(b"c1"),
+            initial_message: Some(Bytes::from_static(b"initial")),
+        }]
+    );
+    // Piggybacked ACK of seq 1 while reading after seq 1 returns seq 2 with has_more = false.
+    let page2 = store.read_mailbox(&bob, 1, 10, 1024, 1).await.unwrap();
+    assert!(!page2.has_more);
+    assert_eq!(page2.messages.len(), 1);
+    assert_eq!(page2.messages[0].sequence, 2);
+    assert_eq!(page2.messages[0].token_hash, tok_b1);
+
+    // Seq 1 was deleted, yet retrying cid1 under still-valid tok_a1 returns seq 1 without duplicating.
+    assert_eq!(
+        store
+            .append_idempotent(&bob, &tok_a1, Bytes::new(), Bytes::new(), None, Some(cid1))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .read_mailbox(&bob, 0, 10, 1024, 0)
+            .await
+            .unwrap()
+            .messages
+            .len(),
+        1
+    );
+
+    // 6. AckMessages bounds: rejects 0, rejects > last_sequence, idempotent on <= last_sequence,
+    //    and preserves monotonic last_sequence.
+    assert_eq!(
+        store.ack_messages(&bob, 0).await.unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        store.ack_messages(&bob, 3).await.unwrap_err().kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(
+        store
+            .read_mailbox(&bob, 0, 10, 1024, 3)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidArgument
+    );
+    assert_eq!(store.ack_messages(&bob, 2).await.unwrap(), 1);
+    assert_eq!(store.ack_messages(&bob, 2).await.unwrap(), 0);
+    assert!(
+        store
+            .read_mailbox(&bob, 0, 10, 1024, 0)
+            .await
+            .unwrap()
+            .messages
+            .is_empty()
+    );
     let seq3 = store
         .append_idempotent(
-            &alice,
             &bob,
+            &tok_b1,
             Bytes::from_static(b"h3"),
             Bytes::from_static(b"c3"),
             None,
             None,
-            None,
         )
         .await
         .unwrap();
-    assert_eq!(seq3, next + 1);
+    assert_eq!(seq3, 3);
 
-    let messages = store.read(&alice, &bob, 0, 10).await.unwrap();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].sequence, next);
-    assert_eq!(messages[1].sequence, seq3);
-
-    // Pagination and bounds.
-    let page = store.read(&alice, &bob, 0, 1).await.unwrap();
-    assert_eq!(page.len(), 1);
-    assert_eq!(page[0].sequence, next);
-    let page2 = store.read(&alice, &bob, next, 10).await.unwrap();
-    assert_eq!(page2.len(), 1);
-    assert_eq!(page2[0].sequence, seq3);
-    assert!(
+    // 7. Auth-before-dedup on revocation & StaleVersion floor enforcement.
+    assert_eq!(
         store
-            .read(&alice, &bob, u64::MAX, 10)
+            .revoke_write_token(RevokeWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: Some(tok_a1),
+                min_grant_version: 10,
+            })
             .await
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        1
     );
-    // Empty hashes list leaves remaining messages untouched.
-    store.delete_delivered(&alice, &bob, &[]).await.unwrap();
-    assert_eq!(store.read(&alice, &bob, 0, 10).await.unwrap().len(), 2);
+    // Retrying cid1 with the REVOKED tok_a1 MUST return WriteTokenRejected (NOT Ok(1))!
+    assert_eq!(
+        store
+            .append_idempotent(&bob, &tok_a1, Bytes::new(), Bytes::new(), None, Some(cid1))
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::WriteTokenRejected
+    );
+    // Registering a grant <= min_grant_version (10) fails with StaleVersion.
+    assert_eq!(
+        store
+            .register_write_token(RegisterWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: [0xA9; 32],
+                grant_version: 10,
+                pin_active: true,
+            })
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleVersion
+    );
+    // Registering with grant_version = 11 (> 10) succeeds!
+    store
+        .register_write_token(RegisterWriteTokenRecord {
+            recipient: bob,
+            peer_slot_id: peer_a,
+            token_hash: [0xA9; 32],
+            grant_version: 11,
+            pin_active: true,
+        })
+        .await
+        .unwrap();
+    // Revoking all grants for peer_a clears tok_a3, tok_a4, tok_a5, and [0xA9; 32] (4 tokens).
+    assert_eq!(
+        store
+            .revoke_write_token(RevokeWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: None,
+                min_grant_version: 12,
+            })
+            .await
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        store
+            .append_idempotent(&bob, &[0xA9; 32], Bytes::new(), Bytes::new(), None, None)
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::WriteTokenRejected
+    );
 }

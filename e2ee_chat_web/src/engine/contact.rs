@@ -2,18 +2,19 @@
 
 use super::EVENTS_KEPT;
 use crate::content::{Content, Events, Kind};
+#[cfg(test)]
+use crate::state::message_order_key;
 use crate::state::{
     Attachment, Body, ClassicalPrompt, ContactView, Delivery, IsolatedContactView, LastMessageKind,
-    LocalFile, MessageView, RemoteFile, SecurityAlert, SecurityView, Step, message_order_key,
+    LocalFile, MessageView, RemoteFile, SecurityAlert, SecurityView, Step,
 };
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, now, sanitize_filename, sanitize_preview_text, short};
 use crate::vault::{
-    Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_LEGACY_UNKNOWN,
-    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, IndexRange,
-    LastMessageRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
-    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
+    Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
+    GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
+    HistoryEntry, IndexRange, LastMessageRecord, SECURITY_ALERT_DOWNGRADE,
+    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
 };
 use crate::{content, preview};
 use session::{ErrorKind, PublicKey, Session, SessionState, proto};
@@ -104,6 +105,7 @@ pub(super) fn preview_for_entry(entry: &HistoryEntry) -> LastMessageRecord {
 }
 
 /// Pick the bottom-most message in display order from `entries` and return its sidebar preview.
+#[cfg(test)]
 pub(super) fn latest_entry_preview(
     entries: &[(u64, HistoryEntry)],
     me: &PublicKey,
@@ -399,12 +401,7 @@ impl Contact {
             }
         } else {
             match self.state.classical_approval_needed {
-                CLASSICAL_APPROVAL_LEGACY => ClassicalPrompt::Outbound {
-                    peer_signed_off: false,
-                },
-                CLASSICAL_APPROVAL_SIGNED_OFF => ClassicalPrompt::Outbound {
-                    peer_signed_off: true,
-                },
+                CLASSICAL_APPROVAL_SIGNED_OFF => ClassicalPrompt::Outbound,
                 _ => ClassicalPrompt::None,
             }
         };
@@ -544,13 +541,6 @@ impl Contact {
         changed
     }
 
-    /// Whether the active local session still carries an unacknowledged initial message.
-    pub(super) fn has_carried_initial(&self) -> bool {
-        !proto::SessionState::from(self.session.state())
-            .initial_message
-            .is_empty()
-    }
-
     /// How deleting this contact should handle farewell transmission.
     pub(super) fn farewell_mode(&self) -> FarewellMode {
         if self.state.request
@@ -558,10 +548,7 @@ impl Contact {
             || self.state.greeting_delivery == GREETING_DELIVERY_UNSENT
         {
             FarewellMode::Suppress
-        } else if self.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
-            || (self.state.greeting_delivery == GREETING_DELIVERY_LEGACY_UNKNOWN
-                && self.has_carried_initial())
-        {
+        } else if self.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
             FarewellMode::WithoutInitial
         } else {
             FarewellMode::Normal
@@ -813,6 +800,9 @@ pub(super) fn forget_told(events: &mut Events, told: &Events) {
     events
         .downloaded
         .retain(|clock| !told.downloaded.contains(clock));
+    if told.accepted {
+        events.accepted = false;
+    }
 }
 
 fn validate_history(state: &ContactState) -> Result<(), &'static str> {
@@ -871,10 +861,7 @@ pub(super) fn is_pq_incompatible_isolated(state: &ContactState, me: &PublicKey) 
     let Some(raw) = state.session.as_ref() else {
         return false;
     };
-    if raw.me != me.as_slice()
-        || raw.peer != state.peer
-        || raw.cursor > session::protocol::MAX_SAFE_INTEGER
-    {
+    if raw.me != me.as_slice() || raw.peer != state.peer {
         return false;
     }
     let active_kem = raw

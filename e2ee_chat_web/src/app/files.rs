@@ -166,9 +166,9 @@ pub(super) fn FileBrowser(peer: PublicKey) -> impl IntoView {
                 )}
             </p>
             <p class="hint">
-                "Small files (up to 1 MB) are stored locally in your vault and removed from the \
-                 server upon delivery. Larger attachments stay on the server temporarily and can \
-                 be deleted from the server by either peer."
+                "All files are sent as end-to-end encrypted attachments stored temporarily on the \
+                 server, cached locally once downloaded, and deletable from the server by either \
+                 peer."
             </p>
             <div class="shelves">{shelves}</div>
             <div class="file-months">

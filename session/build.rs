@@ -36,6 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
             )
             .message_attribute(
+                ".session.v1.PendingGrant",
+                "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
+            )
+            .message_attribute(
                 ".session.v1.PeerPqState",
                 "#[derive(::zeroize::Zeroize, ::zeroize::ZeroizeOnDrop)]",
             )

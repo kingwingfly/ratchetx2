@@ -1,15 +1,16 @@
 //! The object of an attachment: how many chunks it has, the hashes of its two tokens, and which
-//! chunks were put, while its chunks are R2 objects named `attachments/<id>/<index>`. An alarm
+//! chunks were put, while its chunks are R2 objects named `v2/attachments/<id>/<index>`. An alarm
 //! deletes it, chunks first, once `FILE_RETENTION_DAYS` old, as deleting it does.
 
 use serde::Deserialize;
+use storage::StoredAttachment;
 use worker::{
-    Date, DurableObject, Env, Method, Request, Response, Result, State, console_error,
+    Date, DurableObject, Env, Error, Method, Request, Response, Result, State, console_error,
     durable_object,
 };
 
 use super::{
-    AttachmentCall, AttachmentRow, RETRY_ALARM, alarm_at, answer_rpc, decode, has_table, rpc,
+    AttachmentCall, RETRY_ALARM, alarm_at, answer_rpc, decode, has_table, rpc,
     sql::{Blob, SqlExec, WorkerSql, params},
 };
 
@@ -29,13 +30,13 @@ CREATE TABLE IF NOT EXISTS attachment (
     -- The chunks put so far, chunk i as bit i: one put and gone from R2 since, as the bucket's
     -- lifecycle rules deleted it, expired, rather than is still to come.
     uploaded INTEGER NOT NULL DEFAULT 0,
-    -- Being deleted: gone for every call, while its chunks go, see `Attachment::delete`.
+    -- Being deleted: gone for every call, while its chunks go, see `AttachmentV2::delete`.
     deleting INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL
 );
 ";
 
-/// SQL-backed core of [`Attachment`], parameterized over [`SqlExec`] and timestamps so native
+/// SQL-backed core of [`AttachmentV2`], parameterized over [`SqlExec`] and timestamps so native
 /// SQLite tests can drive every query, constraint, bitmask, expiry, and deletion transition.
 pub(crate) struct AttachmentStore<'a, S: SqlExec> {
     sql: &'a S,
@@ -82,25 +83,26 @@ impl<'a, S: SqlExec> AttachmentStore<'a, S> {
     }
 
     /// Inserts the single attachment row (`only = 0`) using `ON CONFLICT (only) DO NOTHING`.
-    pub(crate) fn insert_row(
-        &self,
-        id: &[u8],
-        chunks: u32,
-        token_hash: &[u8],
-        delete_hash: &[u8],
-        now_ms: u64,
-    ) -> Result<bool> {
+    pub(crate) fn insert_row(&self, attachment: &StoredAttachment, now_ms: u64) -> Result<bool> {
         let inserted: Option<OnlyRow> = self.sql.query_opt(
             "INSERT INTO attachment (only, id, chunks, token_hash, delete_hash, created_at) \
              VALUES (0, ?, ?, ?, ?, ?) ON CONFLICT (only) DO NOTHING RETURNING only",
-            params![id, chunks, token_hash, delete_hash, now_ms]?,
+            params![
+                attachment.id.as_slice(),
+                attachment.chunks,
+                attachment.token_hash.as_slice(),
+                attachment.delete_hash.as_slice(),
+                now_ms
+            ]?,
         )?;
         Ok(inserted.is_some())
     }
 
     /// The attachment, unless gone, being deleted, or expired.
-    pub(crate) fn get(&self, now_ms: u64) -> Result<Option<AttachmentRow>> {
-        Ok(self.load_row(true, now_ms)?.map(AttachmentRow::from))
+    pub(crate) fn get(&self, now_ms: u64) -> Result<Option<StoredAttachment>> {
+        self.load_row(true, now_ms)?
+            .map(StoredAttachment::try_from)
+            .transpose()
     }
 
     /// Note chunk `index` as put, in one statement, which also tells whether the attachment is
@@ -131,12 +133,12 @@ impl<'a, S: SqlExec> AttachmentStore<'a, S> {
 }
 
 #[durable_object]
-pub struct Attachment {
+pub struct AttachmentV2 {
     state: State,
     env: Env,
 }
 
-impl DurableObject for Attachment {
+impl DurableObject for AttachmentV2 {
     fn new(state: State, env: Env) -> Self {
         Self { state, env }
     }
@@ -150,10 +152,9 @@ impl DurableObject for Attachment {
             Err(_) => return Response::error("malformed internal request", 400),
         };
         match call {
-            AttachmentCall::Add(req) => answer_rpc::<rpc::AddAttachment>(
-                self.add(&req.id, req.chunks, &req.token_hash, &req.delete_hash)
-                    .await,
-            ),
+            AttachmentCall::Add(req) => {
+                answer_rpc::<rpc::AddAttachment>(self.add(&req.attachment).await)
+            }
             AttachmentCall::Get(_) => answer_rpc::<rpc::GetAttachment>(self.get()),
             AttachmentCall::Note(req) => answer_rpc::<rpc::NoteChunk>(self.note(req.index)),
             AttachmentCall::Delete(_) => answer_rpc::<rpc::DeleteAttachment>(self.delete().await),
@@ -166,7 +167,7 @@ impl DurableObject for Attachment {
     }
 }
 
-impl Attachment {
+impl AttachmentV2 {
     fn retention(&self) -> u64 {
         crate::millis(crate::period(
             &self.env,
@@ -187,26 +188,18 @@ impl Attachment {
     /// Keep the attachment, unless kept already, and set its alarm: first, so that failing to
     /// set it keeps nothing, rather than an attachment that never expires. Its table is created
     /// here, and only here, see `has_table`.
-    async fn add(
-        &self,
-        id: &[u8],
-        chunks: u32,
-        token_hash: &[u8],
-        delete_hash: &[u8],
-    ) -> Result<bool> {
+    async fn add(&self, attachment: &StoredAttachment) -> Result<bool> {
         if !self.with_store(|store| store.prepare_add())? {
             return Ok(false);
         }
         let now = Date::now().as_millis();
         let at = now.saturating_add(self.retention());
         self.state.storage().set_alarm(alarm_at(at)).await?;
-        self.with_store(|store| {
-            store.insert_row(id, chunks, token_hash, delete_hash, Date::now().as_millis())
-        })
+        self.with_store(|store| store.insert_row(attachment, Date::now().as_millis()))
     }
 
     /// The attachment, unless gone, being deleted, or expired.
-    fn get(&self) -> Result<Option<AttachmentRow>> {
+    fn get(&self) -> Result<Option<StoredAttachment>> {
         self.with_store(|store| store.get(Date::now().as_millis()))
     }
 
@@ -267,15 +260,23 @@ struct AttachmentDbRow {
     uploaded: i64,
 }
 
-impl From<AttachmentDbRow> for AttachmentRow {
-    fn from(row: AttachmentDbRow) -> Self {
-        Self {
-            id: row.id.into_vec(),
+fn fixed_blob<const N: usize>(blob: Blob, name: &str) -> Result<[u8; N]> {
+    blob.into_vec()
+        .try_into()
+        .map_err(|_| Error::RustError(format!("corrupt stored attachment {name} length")))
+}
+
+impl TryFrom<AttachmentDbRow> for StoredAttachment {
+    type Error = Error;
+
+    fn try_from(row: AttachmentDbRow) -> Result<Self> {
+        Ok(Self {
+            id: fixed_blob(row.id, "id")?,
             chunks: row.chunks,
-            token_hash: row.token_hash.into_vec(),
-            delete_hash: row.delete_hash.into_vec(),
+            token_hash: fixed_blob(row.token_hash, "token_hash")?,
+            delete_hash: fixed_blob(row.delete_hash, "delete_hash")?,
             uploaded: row.uploaded as u64,
-        }
+        })
     }
 }
 
@@ -285,6 +286,16 @@ mod tests {
     use crate::objects::sql::TestSql;
 
     const RETENTION_MS: u64 = 10_000;
+
+    fn sample_attachment(id_byte: u8, chunks: u32) -> StoredAttachment {
+        StoredAttachment {
+            id: [id_byte; 16],
+            chunks,
+            token_hash: [id_byte.wrapping_add(1); 32],
+            delete_hash: [id_byte.wrapping_add(2); 32],
+            uploaded: 0,
+        }
+    }
 
     #[test]
     fn reads_and_notes_leave_unallocated_storage_untouched() {
@@ -302,43 +313,39 @@ mod tests {
     fn single_row_constraint_and_on_conflict_do_nothing() {
         let sql = TestSql::in_memory();
         let store = AttachmentStore::new(&sql, RETENTION_MS);
+        let first = sample_attachment(0x11, 4);
+        let second = sample_attachment(0x22, 9);
 
         assert!(store.prepare_add().unwrap());
-        assert!(
-            store
-                .insert_row(b"id-1", 4, b"tok-1", b"del-1", 5_000)
-                .unwrap()
-        );
+        assert!(store.insert_row(&first, 5_000).unwrap());
         // `prepare_add` sees the existing row before setting an alarm.
         assert!(!store.prepare_add().unwrap());
         // Direct concurrent `insert_row` hits `ON CONFLICT (only) DO NOTHING` without overwriting.
-        assert!(
-            !store
-                .insert_row(b"id-2", 9, b"tok-2", b"del-2", 6_000)
-                .unwrap()
-        );
+        assert!(!store.insert_row(&second, 6_000).unwrap());
         // CHECK (only = 0) rejects any second slot.
         let check_err = sql.exec(
             "INSERT INTO attachment (only, id, chunks, token_hash, delete_hash, created_at) \
              VALUES (1, ?, 1, ?, ?, 5000)",
-            params![b"id-x".as_slice(), b"t".as_slice(), b"d".as_slice()].unwrap(),
+            params![
+                second.id.as_slice(),
+                second.token_hash.as_slice(),
+                second.delete_hash.as_slice()
+            ]
+            .unwrap(),
         );
         assert!(check_err.is_err());
 
         let row = store.get(5_000).unwrap().expect("stored attachment");
-        assert_eq!(row.id, b"id-1");
-        assert_eq!(row.chunks, 4);
-        assert_eq!(row.token_hash, b"tok-1");
-        assert_eq!(row.delete_hash, b"del-1");
-        assert_eq!(row.uploaded, 0);
+        assert_eq!(row, first);
     }
 
     #[test]
     fn note_updates_uploaded_bitmask_across_chunks() {
         let sql = TestSql::in_memory();
         let store = AttachmentStore::new(&sql, RETENTION_MS);
+        let att = sample_attachment(0x33, 60);
         assert!(store.prepare_add().unwrap());
-        assert!(store.insert_row(b"att", 60, b"tok", b"del", 1_000).unwrap());
+        assert!(store.insert_row(&att, 1_000).unwrap());
 
         assert!(store.note(0, 1_500).unwrap());
         assert!(store.note(3, 1_500).unwrap());
@@ -358,8 +365,9 @@ mod tests {
     fn load_row_live_vs_all_handles_expiry_and_deleting_retry_lifecycle() {
         let sql = TestSql::in_memory();
         let store = AttachmentStore::new(&sql, RETENTION_MS);
+        let att = sample_attachment(0x44, 3);
         assert!(store.prepare_add().unwrap());
-        assert!(store.insert_row(b"att", 3, b"tok", b"del", 10_000).unwrap());
+        assert!(store.insert_row(&att, 10_000).unwrap());
 
         // Exactly at retention boundary (created_at == now - retention): still live.
         assert!(
@@ -380,7 +388,7 @@ mod tests {
             .load_row(false, expired_now)
             .unwrap()
             .expect("expired row retained for cleanup");
-        assert_eq!(raw_expired.id.as_ref(), b"att");
+        assert_eq!(raw_expired.id.as_ref(), &att.id);
         assert_eq!(raw_expired.uploaded as u64, storage::uploaded_bit(0));
 
         // Transition to `deleting = 1` (e.g. while R2 deletion is in flight or retrying).
@@ -401,7 +409,7 @@ mod tests {
             .load_row(false, 10_000)
             .unwrap()
             .expect("deleting row retained for R2 retry");
-        assert_eq!(retry.id.as_ref(), b"att");
+        assert_eq!(retry.id.as_ref(), &att.id);
         assert!(store.begin_delete().unwrap().is_some());
 
         // After storage wipe (simulated `delete_all`), row is gone for all callers.

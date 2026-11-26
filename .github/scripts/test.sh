@@ -24,7 +24,7 @@ run cargo clippy --locked --all-features --all-targets -- -D warnings
 
 # Each optional feature must build on its own too. Without protox, protoc compiles the protos.
 run cargo clippy --locked --all-targets --no-default-features "${LIBS[@]}" -- -D warnings
-run cargo clippy --locked --all-targets --features serde -p ratchetx2 -p xeddsa -p x3dh -p party -p protocol -p session -- -D warnings
+run cargo clippy --locked --all-targets --features serde -p ratchetx2 -p xeddsa -p x3dh -p party -p storage -p protocol -p session -- -D warnings
 run cargo clippy --locked --all-targets --features prost -p ratchetx2 -p x3dh -p party -p session -- -D warnings
 run cargo clippy --locked --all-targets --features server -p protocol -- -D warnings
 run cargo clippy --locked --all-targets --features connect -p protocol -p session -- -D warnings
@@ -37,7 +37,7 @@ run cargo clippy --locked --all-targets --features ml-kem-768,prost -p session -
 run cargo clippy --locked --all-targets --features ml-kem-1024 -p ratchetx2 -p x3dh -p party -- -D warnings
 run cargo clippy --locked --lib --features ml-kem-1024 -p session -- -D warnings
 run cargo clippy --locked --all-targets --features ml-kem-1024,prost -p session -- -D warnings
-run cargo clippy --locked --all-targets --features pq -p ratchetx2 -p x3dh -p party -p storage -p protocol -- -D warnings
+run cargo clippy --locked --all-targets --features pq -p ratchetx2 -p x3dh -p party -- -D warnings
 run cargo clippy --locked --lib --features pq -p session -- -D warnings
 
 # Preview library feature isolation on host.

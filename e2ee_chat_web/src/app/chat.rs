@@ -279,21 +279,15 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                             .into_any(),
                         )
                     }
-                    ClassicalPrompt::Outbound { peer_signed_off } => Some(
+                    ClassicalPrompt::Outbound => Some(
                         view! {
                             <div class="banner warn" role="alert">
                                 <span>
-                                    {if peer_signed_off {
-                                        "Sending paused: this peer published a signed manifest disabling post-quantum encryption. "
-                                    } else {
-                                        "Sending paused: this peer has no post-quantum prekeys on the server. "
-                                    }}
+                                    "Sending paused: this peer published a signed manifest disabling post-quantum encryption. "
                                     {if strict_pq {
                                         "Require post-quantum (strict mode) blocks classical fallback. Retry PQ when available or disable strict mode in Settings."
-                                    } else if peer_signed_off {
-                                        "Allow classical fallback to send?"
                                     } else {
-                                        "Allow classical encryption for this chat?"
+                                        "Allow classical fallback to send?"
                                     }}
                                 </span>
                                 {move || {

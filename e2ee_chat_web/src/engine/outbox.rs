@@ -10,12 +10,14 @@ use crate::content::{Content, Events, Kind, stamp};
 use crate::state::{Delivery, MessageView, Step, Ui};
 use crate::util::{describe, now, short};
 use crate::vault::{
-    Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, Outgoing, OutgoingRecord,
-    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
+    Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
+    GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, HistoryEntry, Outgoing,
+    OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
     SECURITY_ALERT_PQ_REQUIRED, SealedEvents,
 };
+use bytes::Bytes;
 use leptos::prelude::*;
+use session::protocol::handshake_v2::SendInitialV2Request;
 use session::{ErrorKind, PublicKey};
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
@@ -23,7 +25,7 @@ impl<V: VaultStore> Engine<V> {
     /// Push the messages waiting for `peer`, in order, each encrypted as its turn comes, then
     /// the events to tell the peer. Returns whether any went.
     pub(super) async fn flush(&self, peer: &PublicKey) -> Result<bool, String> {
-        if self.waits_sign_in.borrow().contains(peer) {
+        if self.waits_sign_in.borrow().contains(peer) || self.is_approval_backed_off(peer) {
             return Ok(false);
         }
         // With messages waiting and no session to send on, the peer may have started one, e.g.
@@ -195,6 +197,58 @@ impl<V: VaultStore> Engine<V> {
                     break;
                 }
             };
+            // If this sealed record belongs to an older session than `active_id`, requeue sealed
+            // outbox items on the current active session before transmitting.
+            let stale_session = !record.session_id.is_empty()
+                && inner.contact(peer).is_some_and(|c| {
+                    c.session
+                        .active_id()
+                        .is_some_and(|id| id.as_slice() != record.session_id.as_slice())
+                });
+            if stale_session {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.needs_requeue_sealed = true;
+                }
+                if let Some(outcome) = inner.requeue_before_push(peer).await? {
+                    outcome.log_missing(&self.ui, peer);
+                    self.show_changes(inner, peer, &outcome.history);
+                }
+                continue;
+            }
+            let Some(sealed_msg) = record.to_sealed() else {
+                match inner
+                    .recover_corrupt_outbox(peer, outgoing.history_index)
+                    .await
+                {
+                    Ok(CorruptOutboxRecovery::Rebuilt(_)) => {
+                        self.ui.log(format!(
+                            "Rebuilt incomplete sealed outbox record #{} for {}",
+                            outgoing.history_index,
+                            short(peer)
+                        ));
+                        changed = true;
+                        continue;
+                    }
+                    Ok(CorruptOutboxRecovery::Dropped { history }) => {
+                        self.release(peer, outgoing.history_index);
+                        server_deletes.extend(
+                            self.prepare_cancel_uploads_for_failed(
+                                inner,
+                                peer,
+                                &[outgoing.history_index],
+                            )
+                            .await,
+                        );
+                        self.show_changes(inner, peer, &history);
+                        changed = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            };
             // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE transmitting a message that can carry a
             // previously unsent initial greeting so a lost response still notifies an established
             // peer on deletion without carrying the unconfirmed greeting.
@@ -203,7 +257,7 @@ impl<V: VaultStore> Engine<V> {
                     let Some(contact) = inner.contact(peer) else {
                         return Err(session::Error::from(ErrorKind::NotFound));
                     };
-                    contact.session.push_v2(record.to_push()).await.map(|_| ())
+                    contact.session.push_v2(&sealed_msg).await.map(|_| ())
                 })
                 .await
             {
@@ -218,8 +272,63 @@ impl<V: VaultStore> Engine<V> {
             }
             let step = match push_res {
                 Ok(()) => {
+                    self.clear_approval_backoff(peer);
                     self.release(peer, outgoing.history_index);
                     (Step::Pushed, outgoing.clock)
+                }
+                Err(e) if e.kind() == ErrorKind::WriteTokenRejected => {
+                    let known = inner
+                        .contact(peer)
+                        .is_some_and(|c| c.session.is_known_by_peer());
+                    if known {
+                        // Peer previously accepted us and has since revoked/deleted the chat:
+                        // retire active session and requeue so the next sync starts fresh.
+                        if let Some(contact) = inner.contact(peer) {
+                            contact.state.needs_requeue_sealed = true;
+                            contact.session.retire();
+                        }
+                        let _ = inner.save_state().await;
+                        self.ui.contacts.set(inner.views());
+                        break;
+                    }
+                    // Peer has not yet accepted our chat request: retry idempotent `SendInitialV2`
+                    // at most once if greeting delivery wasn't confirmed, then back off without
+                    // dropping the outbox or setting an offline error.
+                    let greeting_unconfirmed = inner
+                        .contact(peer)
+                        .is_some_and(|c| c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED);
+                    if greeting_unconfirmed
+                        && !record.carried_initial.is_empty()
+                        && let Some(wire_initial) =
+                            session::protocol::mailbox_v2::decode_carried_initial(
+                                &record.carried_initial,
+                            )
+                    {
+                        let retry_req = SendInitialV2Request {
+                            recipient: Bytes::copy_from_slice(peer),
+                            message: Some(wire_initial),
+                        };
+                        if inner
+                            .client
+                            .send_prepared_initiate_v2(&retry_req)
+                            .await
+                            .is_ok()
+                        {
+                            if let Some(contact) = inner.contact(peer) {
+                                contact.mark_greeting_confirmed();
+                            }
+                            let _ = inner.save_state().await;
+                        }
+                    }
+                    let delay_ms = self.record_approval_backoff(peer);
+                    let label = inner
+                        .contact(peer)
+                        .map_or_else(|| short(peer), |c| c.view().label());
+                    self.ui.log(format!(
+                        "Waiting for {label} to accept your chat request (retrying in {}s)…",
+                        delay_ms / 1000
+                    ));
+                    break;
                 }
                 // Large enough to cost the server storage, which it keeps only for those signed
                 // in to it: it waits, with those after it, until this browser is.
@@ -388,9 +497,10 @@ impl<V: VaultStore> Engine<V> {
                             .session
                             .encrypt(&events.to_bytes())
                             .map_err(|e| describe(&e))?;
+                        let session_id = active.clone().unwrap_or_default();
                         let sealed = SealedEvents {
-                            record: Some(OutgoingRecord::sealed(message)),
-                            session: active.unwrap_or_default(),
+                            record: Some(OutgoingRecord::sealed(message, &session_id)),
+                            session: session_id,
                             events: Some(events),
                         };
                         contact.state.sealed_events = Some(sealed.clone());
@@ -400,15 +510,39 @@ impl<V: VaultStore> Engine<V> {
                     .await?
             }
         };
-        let message = sealed.record.unwrap_or_default().to_push();
+        let Some(message) = sealed.record.as_ref().and_then(OutgoingRecord::to_sealed) else {
+            if let Some(contact) = inner.contact(peer) {
+                contact.state.sealed_events = None;
+            }
+            let _ = inner.save_state().await;
+            return Ok(false);
+        };
         let push_res = inner
             .transmit_with_greeting_delivery(peer, false, false, async |inner| {
                 let contact = inner.contact(peer).ok_or(ErrorKind::NotFound)?;
-                contact.session.push_v2(message).await
+                contact.session.push_v2(&message).await
             })
             .await?;
         match push_res {
-            Ok(_) => {}
+            Ok(_) => {
+                self.clear_approval_backoff(peer);
+            }
+            Err(e) if e.kind() == ErrorKind::WriteTokenRejected => {
+                let known = inner
+                    .contact(peer)
+                    .is_some_and(|c| c.session.is_known_by_peer());
+                if known {
+                    if let Some(contact) = inner.contact(peer) {
+                        contact.state.sealed_events = None;
+                        contact.state.needs_requeue_sealed = true;
+                        contact.session.retire();
+                    }
+                    let _ = inner.save_state().await;
+                } else {
+                    self.record_approval_backoff(peer);
+                }
+                return Ok(false);
+            }
             // The chat waits for the sign-in, as a message refused for it does, rather than
             // tries every round, and goes once signed in.
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
@@ -510,6 +644,14 @@ impl<V: VaultStore> Inner<V> {
         content: Kind,
         awaits_upload: bool,
     ) -> Result<MessageView, String> {
+        if let Kind::Text(ref text) = content
+            && text.len() > super::MAX_TEXT_BYTES
+        {
+            return Err(format!(
+                "Message is too long (maximum {} KiB).",
+                super::MAX_TEXT_BYTES / 1024
+            ));
+        }
         let contact = self.contact(peer).ok_or("no such chat")?;
         if contact.state.request {
             return Err("accept the request first".into());
@@ -525,11 +667,7 @@ impl<V: VaultStore> Inner<V> {
             let index = contact.next_history_index().map_err(str::to_string)?;
             contact.mark_index_acked(index);
             // Encrypted as it goes, once its place in the chat is known, see `flush`.
-            let record = OutgoingRecord {
-                message: None,
-                content: content.to_bytes(),
-                delivery_hash: vec![],
-            };
+            let record = OutgoingRecord::unsealed(content.to_bytes());
             contact.state.last_activity = now();
             contact.state.outbox.push(Outgoing {
                 history_index: index,
@@ -589,17 +727,27 @@ impl<V: VaultStore> Inner<V> {
             };
             match prepared {
                 Ok(outgoing) => {
-                    if let Some(contact) = self.contact(peer) {
+                    let token_hash = self.contact(peer).and_then(|contact| {
                         contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                         contact.state.security_alert = SECURITY_ALERT_NONE;
                         contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                        contact.session.active_inbound_token_hash()
+                    });
+                    if let Some(token_hash) = token_hash
+                        && let Err(e) = self.stage_write_token_grant(peer, token_hash, true)
+                    {
+                        self.state.next_session_seq = prev_next_session_seq;
+                        self.roll_back(peer, snapshot)?;
+                        return Err(e);
                     }
-                    // H-2: Persist new session and uncertain delivery marker BEFORE transmitting!
+                    // H-2: Persist new session, grant, and uncertain delivery marker BEFORE transmitting!
                     if let Err(e) = self.save(&[]).await {
                         self.state.next_session_seq = prev_next_session_seq;
                         self.roll_back(peer, snapshot)?;
                         return Err(describe(&e));
                     }
+                    // Register our new inbound write token BEFORE sending the re-initiation.
+                    let _ = self.flush_pending_grants_for(peer).await;
                     if let Ok(Err(e)) = self
                         .transmit_with_greeting_delivery(peer, true, true, async |inner| {
                             inner.client.send_prepared_initiate_v2(&outgoing).await
@@ -626,7 +774,7 @@ impl<V: VaultStore> Inner<V> {
                         return Ok(SealOutcome::UpdateRequired(describe(&e)));
                     }
                     let paused = match kind {
-                        ErrorKind::ClassicalApprovalRequired { peer_signed_off } => {
+                        ErrorKind::ClassicalApprovalRequired => {
                             if let Some(contact) = self.contact(peer) {
                                 if matches!(
                                     contact.state.security_alert,
@@ -634,11 +782,8 @@ impl<V: VaultStore> Inner<V> {
                                 ) {
                                     contact.state.security_alert = SECURITY_ALERT_NONE;
                                 }
-                                contact.state.classical_approval_needed = if peer_signed_off {
-                                    CLASSICAL_APPROVAL_SIGNED_OFF
-                                } else {
-                                    CLASSICAL_APPROVAL_LEGACY
-                                };
+                                contact.state.classical_approval_needed =
+                                    CLASSICAL_APPROVAL_SIGNED_OFF;
                             }
                             true
                         }
@@ -685,7 +830,7 @@ impl<V: VaultStore> Inner<V> {
         };
         let index = contact.state.outbox[next].history_index;
         let mut content = match self.vault.outgoing(peer, index).await {
-            Ok(record) => record.content,
+            Ok(mut record) => std::mem::take(&mut record.content),
             Err(crate::vault::Error::Corrupt(_)) => {
                 match self.recover_corrupt_outbox(peer, index).await? {
                     CorruptOutboxRecovery::Rebuilt(bytes) => bytes,
@@ -710,6 +855,11 @@ impl<V: VaultStore> Inner<V> {
             };
             let clock = contact.state.clock.saturating_add(1);
             stamp(&mut content, clock);
+            let session_id = contact
+                .session
+                .active_id()
+                .map(|id| id.to_vec())
+                .unwrap_or_default();
             let sealed = contact
                 .session
                 .encrypt(&content)
@@ -717,7 +867,7 @@ impl<V: VaultStore> Inner<V> {
             contact.state.clock = clock;
             let outgoing = &mut contact.state.outbox[next];
             (outgoing.sealed, outgoing.clock) = (true, clock);
-            let record = OutgoingRecord::sealed(sealed);
+            let record = OutgoingRecord::sealed(sealed, &session_id);
             inner
                 .save_with(&[], &[(*peer, index, Some(record))])
                 .await
@@ -752,11 +902,7 @@ impl<V: VaultStore> Inner<V> {
         match (entry, content) {
             (Some(_), Some(kind)) => {
                 let bytes = kind.to_bytes();
-                let rebuilt = OutgoingRecord {
-                    message: None,
-                    content: bytes.clone(),
-                    delivery_hash: vec![],
-                };
+                let rebuilt = OutgoingRecord::unsealed(bytes.clone());
                 self.with_contact_tx(peer, async |inner| {
                     let contact = inner
                         .contact(peer)
@@ -999,10 +1145,7 @@ impl RequeueOutcome {
                     }
                     self.history.push((index, entry));
                 }
-                Some(OutgoingRecord {
-                    content: kind.to_bytes(),
-                    ..Default::default()
-                })
+                Some(OutgoingRecord::unsealed(kind.to_bytes()))
             }
             (entry, _) => {
                 if let Some(mut entry) = entry {

@@ -73,6 +73,7 @@ impl Error {
                     | ErrorKind::Malformed
                     | ErrorKind::InvalidSignature
                     | ErrorKind::StaleTimestamp
+                    | ErrorKind::WriteTokenRejected
             )
     }
 
@@ -125,6 +126,8 @@ impl From<storage::Error> for Error {
             storage::ErrorKind::LimitExceeded => ErrorKind::LimitExceeded,
             storage::ErrorKind::InvalidArgument => ErrorKind::Malformed,
             storage::ErrorKind::NotFound => ErrorKind::NotFound,
+            storage::ErrorKind::WriteTokenRejected => ErrorKind::WriteTokenRejected,
+            storage::ErrorKind::StaleVersion => ErrorKind::StaleTimestamp,
             _ => ErrorKind::Storage,
         };
         Self::new(kind, error)
@@ -147,10 +150,13 @@ pub enum ErrorKind {
     /// A request's or a prekey's signature, or an upload token, does not verify.
     #[error("invalid signature")]
     InvalidSignature,
-    /// A signed request's timestamp is not greater than the previous request's, or a
-    /// subscription's is too far from the server's clock.
+    /// A signed request's timestamp is not greater than the previous request's, a subscription's
+    /// is too far from the server's clock, or a write-token grant version is stale.
     #[error("stale timestamp")]
     StaleTimestamp,
+    /// The mailbox write token is unknown or has been revoked by the recipient.
+    #[error("write token rejected")]
+    WriteTokenRejected,
     /// Nobody published keys for this identity, or there is no such attachment or chunk.
     #[error("not found")]
     NotFound,

@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     ActivityList, Toast,
-    auth::{CreateVault, Elsewhere, SignInDialog, Unavailable, UnlockVault},
+    auth::{CreateVault, Elsewhere, IncompatibleVault, SignInDialog, Unavailable, UnlockVault},
     chat::{contact_can_upgrade_to_pq, security_badge},
     common::{
         AllowClassical, ConfirmGuard, ContactKey, CopyButton, CopyFeedbackButton, Copyable,
@@ -36,7 +36,11 @@ pub(super) fn VaultDialog() -> impl IntoView {
     let ui = ui();
     let dialog = NodeRef::<html::Dialog>::new();
     let shown = move || match ui.phase.get() {
-        Phase::Create | Phase::Locked | Phase::Elsewhere | Phase::Unavailable(_, _) => true,
+        Phase::Create
+        | Phase::Locked
+        | Phase::IncompatibleVault(_)
+        | Phase::Elsewhere
+        | Phase::Unavailable(_, _) => true,
         Phase::Unlocked => ui.dialog.get().is_some(),
         Phase::Loading => false,
     };
@@ -98,7 +102,11 @@ pub(super) fn VaultDialog() -> impl IntoView {
             // restored `NewChat` draft so the modal cannot permanently vanish.
             if matches!(
                 ui.phase.get_untracked(),
-                Phase::Create | Phase::Locked | Phase::Elsewhere | Phase::Unavailable(_, _)
+                Phase::Create
+                    | Phase::Locked
+                    | Phase::IncompatibleVault(_)
+                    | Phase::Elsewhere
+                    | Phase::Unavailable(_, _)
             ) {
                 let _ = d.show_modal();
                 return;
@@ -141,6 +149,9 @@ pub(super) fn VaultDialog() -> impl IntoView {
             {move || match (ui.phase.get(), ui.dialog.get()) {
                 (Phase::Create, _) => view! { <CreateVault /> }.into_any(),
                 (Phase::Locked, _) => view! { <UnlockVault /> }.into_any(),
+                (Phase::IncompatibleVault(version), _) => {
+                    view! { <IncompatibleVault version /> }.into_any()
+                }
                 (Phase::Elsewhere, _) => view! { <Elsewhere /> }.into_any(),
                 (Phase::Unavailable(reason, error), _) => {
                     view! { <Unavailable reason error /> }.into_any()
@@ -181,18 +192,16 @@ pub(super) fn VaultDialog() -> impl IntoView {
 
 fn apply_start_chat_error(
     err: StartChatError,
-    classical_needed: RwSignal<Option<bool>>,
+    classical_needed: RwSignal<bool>,
     progress: Progress,
 ) {
     match err {
         StartChatError::SignInRequired | StartChatError::Cancelled => progress.clear(),
-        StartChatError::ClassicalApprovalRequired { peer_signed_off } => {
-            let _ = classical_needed.try_set(Some(peer_signed_off));
-            progress.try_fail(if peer_signed_off {
-                "This peer signed a manifest disabling post-quantum encryption."
-            } else {
-                "This peer has no post-quantum prekeys on the server."
-            });
+        StartChatError::ClassicalApprovalRequired => {
+            let _ = classical_needed.try_set(true);
+            progress.try_fail(
+                "This peer published a signed manifest disabling post-quantum encryption.",
+            );
         }
         StartChatError::DowngradeDetected => {
             progress.try_fail(
@@ -266,7 +275,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
     let key = RwSignal::new(key);
     let name = RwSignal::new(initial_name);
     let progress = Progress::new();
-    let classical_needed = RwSignal::new(None::<bool>);
+    let classical_needed = RwSignal::new(false);
     if let Some(feedback) = engine().take_new_chat_feedback() {
         apply_start_chat_error(feedback, classical_needed, progress);
     }
@@ -292,7 +301,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
         let key_changed = last_key.with_value(|prev| *prev != current_key);
         if key_changed {
             last_key.set_value(current_key.clone());
-            classical_needed.set(None);
+            classical_needed.set(false);
             if !progress.working.get_untracked() {
                 progress.clear();
             }
@@ -324,7 +333,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
             ));
             return;
         }
-        classical_needed.set(None);
+        classical_needed.set(false);
         let raw_key = key.get_untracked();
         // Validate locally before reserving browser history so mistyped keys never push a history
         // entry or discard browser Forward history.
@@ -475,17 +484,15 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 })
             }}
             {move || {
-                classical_needed.get().map(|peer_signed_off| {
+                classical_needed.get().then(|| {
                     let strict_pq = strict_pq_enabled(ui);
                     view! {
                         <div class="classical-box" role="alert">
                             <p>
                                 {if strict_pq {
                                     "Require post-quantum (strict mode) blocks classical exceptions. To allow a classical chat, disable strict mode in Settings first."
-                                } else if peer_signed_off {
-                                    "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
                                 } else {
-                                    "No post-quantum prekeys were returned for this peer. Allow a classical (non-PQ) chat?"
+                                    "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
                                 }}
                             </p>
                             {(!strict_pq).then(|| view! {

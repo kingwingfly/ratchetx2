@@ -693,11 +693,7 @@ impl<V: VaultStore> Engine<V> {
             sealed_chunk_hash: Vec::new(),
         };
         let content = Kind::Attachment(pointer);
-        let record = OutgoingRecord {
-            message: None,
-            content: content.to_bytes(),
-            delivery_hash: vec![],
-        };
+        let record = OutgoingRecord::unsealed(content.to_bytes());
         entry.content = Some(Content {
             kind: Some(content),
             ..entry.content.unwrap_or_default()

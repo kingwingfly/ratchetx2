@@ -1,32 +1,30 @@
-//! The vault: everything the client keeps, in IndexedDB (schema v2), encrypted with a key derived
-//! from the passphrase.
+//! The vault: everything the client keeps, in IndexedDB (schema v3), encrypted with
+//! XChaCha20-Poly1305 under HKDF-SHA256 subkeys derived from a random 32-byte `root_key` wrapped
+//! by the passphrase-derived Argon2id KEK.
 //!
-//! The database `e2ee-chat` (IndexedDB version 2) has one object store of records by name:
-//! - `vault`: the [`VaultHeader`], in the clear: the salt, Argon2id parameters, schema version,
-//!   and monotonic CAS revision.
-//! - `state`: the [`AppState`]: the identity, the prekeys, the contacts and their sessions, plus
-//!   authenticated checkpoints for `upload/*`, per-revision tags for `outbox/*`, a vault-instance
-//!   `record_epoch`, and the SHA-256 digest of `deferred_initials`.
-//!   In v2, its AES-256-GCM AAD is `b"state/v2\0" || encoded(VaultHeader)` so any tampering with
-//!   header parameters, version, or revision fails decryption.
-//! - `deferred_initials`: optional [`DeferredInitialsRecord`] holding encrypted inbox initials
-//!   retained for a build with their suite (or restored contact), encrypted under AAD
-//!   `b"deferred_initials"` and committed atomically in the same CAS transaction as `state`. Its
-//!   SHA-256 digest is bound into `AppState` so swapping an old sidecar against a newer `STATE`
-//!   fails unlock while remaining tolerant of older bundles that do not populate tag 16.
-//! - `history/<peer in hex>/<index>`: one [`HistoryEntry`] of a chat, without the bytes of its
-//!   file, if any, which are in `file/<peer in hex>/<index>`, a [`FileRecord`], read when shown.
-//! - `outbox/<peer in hex>/<index>`: a message of a chat, the history entry `index`, waiting to
-//!   be pushed: an [`OutgoingRecord`], bound via AAD to its commit revision in `STATE`.
-//! - `attachment/<peer in hex>/<id in hex>/<index>`: a chunk of an attachment in a chat, as the
-//!   server has it: encrypted under the attachment's key, which only the history holds.
-//! - `upload/<peer in hex>/<id in hex>`: a [`PendingUpload`], an attachment this client uploads,
-//!   with its upload token and checkpoint bound into `STATE`, forgotten once the upload is done.
+//! The database `e2ee-chat` (IndexedDB version 3) has one object store of records:
+//! - `vault`: the [`VaultHeader`] (v3), in the clear: Argon2id parameters & salt, schema version
+//!   (`3`), monotonic CAS `revision`, static 16-byte `vault_id`, and 72-byte `wrapped_root_key`.
+//! - `state`: the [`AppState`], encrypted under `state_key` with AAD
+//!   `b"state/v3\0" || encoded(VaultHeader)`, holding identity, prekeys, contacts, upload
+//!   checkpoints (with commit revisions), structured outbox revisions, compact `peer_storage`
+//!   indices, pending write-token revokes, random non-zero `record_epoch`, and the SHA-256 digest
+//!   of the deferred sidecar.
+//! - All other IndexedDB keys are flat 64-hex opaque `HMAC-SHA256(idb_mac_key, len_prefixed(domain, parts...))`
+//!   tags with zero cleartext prefixes, peer keys, or counters leaked in IDB metadata:
+//!   - `("deferred",)` — [`DeferredRecord`] (deferred initials, carried timestamps, and buffered
+//!     `DeferredEnvelope`s), encrypted under `record_key` with AAD `b"deferred/v3\0" || epoch_be`
+//!     and bound via SHA-256 digest in `STATE`.
+//!   - `("history", peer, index_be)` — [`HistoryEntry`] under `record_key` with static AAD.
+//!   - `("file", peer, index_be)` — [`FileRecord`] under `record_key` with static AAD.
+//!   - `("outbox", peer, index_be)` — [`OutgoingRecord`] under `record_key` with revision-bound AAD.
+//!   - `("upload", peer, id)` — [`PendingUpload`] under `record_key` with revision-bound AAD.
+//!   - `("chunk", peer, id, index_be)` — server-side encrypted attachment chunk tracked via bitmap
+//!     in `AppState.peer_storage`.
 //!
 //! Every `ReadWrite` transaction enforces monotonic `revision` compare-and-swap (CAS) against the
-//! persisted `VaultHeader` inside the transaction and updates a monotonic `localStorage` rollback
-//! anchor (`migrated_v2`, `max_revision`, `salt_hash`) so neither concurrent tabs nor offline
-//! storage rollback / v1 replay can rewind Double Ratchet or prekey state.
+//! persisted `VaultHeader` inside the transaction and updates the external `localStorage` rollback
+//! anchor (`e2ee-chat.vault.anchor.v3`, format `v3:{max_revision}:{vault_id_hex}`).
 
 use std::{
     cell::RefCell,
@@ -34,51 +32,78 @@ use std::{
     fmt,
 };
 
-use aes_gcm::{
-    AeadCore, Aes256Gcm, KeyInit,
+use argon2::{Algorithm, Argon2, Params, Version};
+use bytes::Bytes;
+use chacha20poly1305::{
+    AeadCore, KeyInit, XChaCha20Poly1305,
     aead::{Aead, Payload, array::typenum::Unsigned},
 };
-use argon2::{Algorithm, Argon2, Params, Version};
-use idb::{Database, DatabaseEvent, Factory, KeyRange, ObjectStoreParams, TransactionMode};
+use hkdf::Hkdf;
+use hmac::{Hmac, Mac};
+use idb::{Database, DatabaseEvent, Factory, ObjectStoreParams, TransactionMode};
 use js_sys::Uint8Array;
 use prost::Message;
-use session::{PublicKey, Sealed, protocol::mailbox::PushRequest};
+use session::{PublicKey, Sealed, protocol::mailbox_v2::PushV2Request};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     content::{Content, Events, Kind},
     preview::{self, Sort},
     state::{Delivery, LastMessage, LastMessageKind},
-    util::{from_hex, hex},
+    util::hex,
 };
 
+type HmacSha256 = Hmac<Sha256>;
+
 const DATABASE: &str = "e2ee-chat";
-/// IndexedDB schema version 2 fence: older v1 clients fail closed with `VersionError` instead of
-/// stripping unknown prost PQ fields or offering to wipe via `create()`.
-const DATABASE_VERSION: u32 = 2;
+/// IndexedDB schema version 3 fence.
+const DATABASE_VERSION: u32 = 3;
 const STORE: &str = "records";
 const HEADER: &str = "vault";
 const STATE: &str = "state";
-const DEFERRED_INITIALS: &str = "deferred_initials";
-/// `localStorage` key storing the monotonic v2 rollback / v1-downgrade anchor.
-const ROLLBACK_ANCHOR_KEY: &str = "e2ee-chat.vault.anchor.v1";
+/// `localStorage` key storing the monotonic v3 rollback anchor (`v3:{max_revision}:{vault_id_hex}`).
+const ROLLBACK_ANCHOR_KEY: &str = "e2ee-chat.vault.anchor.v3";
+/// Legacy v1/v2 `localStorage` anchor key cleared on [`Vault::destroy`].
+const LEGACY_ROLLBACK_ANCHOR_KEY: &str = "e2ee-chat.vault.anchor.v1";
 
-/// Legacy v1 vault schema version (v1 headers omitted field 5, so protobuf decodes `0`).
-pub const VAULT_VERSION_V1: u32 = 1;
-/// Hardened v2 vault schema version (header-bound `STATE` AAD + monotonic CAS revision).
-pub const VAULT_VERSION_V2: u32 = 2;
+/// Vault v3 schema version (XChaCha20-Poly1305, KEK-wrapped root key, HKDF subkeys, opaque HMAC keys).
+pub const VAULT_VERSION_V3: u32 = 3;
 
-/// Prefix for v2 `STATE` associated data: `b"state/v2\0" || header_bytes`.
-const STATE_V2_AAD_PREFIX: &[u8] = b"state/v2\0";
-/// Domain prefix for the `DEFERRED_INITIALS` digest stored in `AppState`.
-const DEFERRED_DIGEST_PREFIX: &[u8] = b"deferred_initials/v1\0";
+const VAULT_ID_LEN: usize = 16;
+const NONCE_LEN: usize = <XChaCha20Poly1305 as AeadCore>::NonceSize::USIZE;
+const TAG_LEN: usize = <XChaCha20Poly1305 as AeadCore>::TagSize::USIZE;
+/// 24B nonce || 32B root key ciphertext || 16B Poly1305 tag.
+const WRAPPED_ROOT_KEY_LEN: usize = NONCE_LEN + 32 + TAG_LEN;
+
+/// Domain prefix for the static KEK root-key wrap AAD (deliberately omits `revision`).
+const ROOT_KEY_WRAP_AAD_PREFIX: &[u8] = b"root-key/v3\0";
+/// Prefix for v3 `STATE` associated data: `b"state/v3\0" || header_bytes`.
+const STATE_V3_AAD_PREFIX: &[u8] = b"state/v3\0";
+/// Prefix for `history` per-record AAD.
+const HISTORY_V3_AAD_PREFIX: &[u8] = b"history/v3\0";
+/// Prefix for `file` per-record AAD.
+const FILE_V3_AAD_PREFIX: &[u8] = b"file/v3\0";
+/// Prefix for `outbox` per-record AAD.
+const OUTBOX_V3_AAD_PREFIX: &[u8] = b"outbox/v3\0";
+/// Prefix for `upload` per-record AAD.
+const UPLOAD_V3_AAD_PREFIX: &[u8] = b"upload/v3\0";
+/// Prefix for `deferred` per-record AAD and SHA-256 digest.
+const DEFERRED_V3_PREFIX: &[u8] = b"deferred/v3\0";
+
+/// HKDF-SHA256 info strings for the three Vault v3 subkeys.
+const HKDF_INFO_STATE: &[u8] = b"ratchetx2/vault/v3/state";
+const HKDF_INFO_RECORD: &[u8] = b"ratchetx2/vault/v3/record";
+const HKDF_INFO_IDB_KEY: &[u8] = b"ratchetx2/vault/v3/idb-key";
+
+/// Maximum chunk bitmap byte length accepted (supports >500k chunks; `MAX_FILE_SIZE` is ~1024 chunks).
+const MAX_CHUNK_BITMAP_BYTES: usize = 65_536;
 
 /// Allowed Argon2id parameter bounds (enforced on untrusted headers BEFORE key derivation).
 pub const ARGON2_MEMORY_MIN: u32 = 16 * 1024;
 pub const ARGON2_MEMORY_MAX: u32 = 256 * 1024;
-/// Default Argon2id memory for NEW and upgraded vaults: 64 MiB.
+/// Default Argon2id memory for new vaults: 64 MiB.
 pub const ARGON2_DEFAULT_MEMORY: u32 = 64 * 1024;
 pub const ARGON2_ITERATIONS_MIN: u32 = 1;
 pub const ARGON2_ITERATIONS_MAX: u32 = 10;
@@ -91,7 +116,6 @@ pub const ARGON2_SALT_MAX: usize = 64;
 
 /// Pending outbound classical approval state stored in [`ContactState::classical_approval_needed`].
 pub const CLASSICAL_APPROVAL_NONE: u32 = 0;
-pub const CLASSICAL_APPROVAL_LEGACY: u32 = 1;
 pub const CLASSICAL_APPROVAL_SIGNED_OFF: u32 = 2;
 
 /// Per-contact security alert state stored in [`ContactState::security_alert`].
@@ -101,14 +125,11 @@ pub const SECURITY_ALERT_MANIFEST_EXPIRED: u32 = 2;
 pub const SECURITY_ALERT_PQ_REQUIRED: u32 = 3;
 
 /// Initial-greeting delivery state stored in [`ContactState::greeting_delivery`].
-pub const GREETING_DELIVERY_LEGACY_UNKNOWN: u32 = 0;
 pub const GREETING_DELIVERY_UNSENT: u32 = 1;
 pub const GREETING_DELIVERY_UNCERTAIN: u32 = 2;
 pub const GREETING_DELIVERY_CONFIRMED: u32 = 3;
 
 /// Explicit upload lifecycle state stored in [`PendingUpload::upload_state`].
-#[allow(dead_code)] // Legacy sentinel (`0` from older prost messages).
-pub const UPLOAD_STATE_LEGACY: u32 = 0;
 /// Waiting for server sign-in under a client-generated placeholder ID.
 pub const UPLOAD_STATE_WAITING: u32 = 1;
 /// Started on the server, awaiting chat announcement.
@@ -116,132 +137,219 @@ pub const UPLOAD_STATE_STARTED: u32 = 2;
 /// Started on the server and durably announced in chat history/outbox.
 pub const UPLOAD_STATE_ANNOUNCED: u32 = 3;
 
-/// AES-GCM nonce length.
-const NONCE_LEN: usize = <Aes256Gcm as AeadCore>::NonceSize::USIZE;
+/// Three HKDF-SHA256 subkeys derived from `(vault_id, root_key)` (96 bytes in RAM, zeroized on drop).
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct VaultKeys {
+    pub state_key: [u8; 32],
+    pub record_key: [u8; 32],
+    pub idb_mac_key: [u8; 32],
+}
 
-/// Build the v2 `STATE` associated data binding `header_bytes`: `b"state/v2\0" || header_bytes`.
-pub fn state_v2_aad(header_bytes: &[u8]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(STATE_V2_AAD_PREFIX.len() + header_bytes.len());
-    aad.extend_from_slice(STATE_V2_AAD_PREFIX);
+impl VaultKeys {
+    /// Derive `(state_key, record_key, idb_mac_key)` via HKDF-SHA256 salted by static `vault_id`.
+    pub fn derive(vault_id: &[u8], root_key: &[u8; 32]) -> Self {
+        let hk = Hkdf::<Sha256>::new(Some(vault_id), root_key.as_slice());
+        let mut state_key = [0u8; 32];
+        let mut record_key = [0u8; 32];
+        let mut idb_mac_key = [0u8; 32];
+        hk.expand(HKDF_INFO_STATE, &mut state_key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        hk.expand(HKDF_INFO_RECORD, &mut record_key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        hk.expand(HKDF_INFO_IDB_KEY, &mut idb_mac_key)
+            .expect("32 bytes is a valid HKDF-SHA256 output length");
+        Self {
+            state_key,
+            record_key,
+            idb_mac_key,
+        }
+    }
+}
+
+/// Compute a flat 64-hex opaque IndexedDB key via length-prefixed `HMAC-SHA256(idb_mac_key, ...)`.
+pub fn opaque_idb_key(idb_mac_key: &[u8; 32], domain: &[u8], parts: &[&[u8]]) -> String {
+    let mut mac = <HmacSha256 as KeyInit>::new_from_slice(idb_mac_key)
+        .expect("HMAC-SHA256 accepts any 32-byte key");
+    mac.update(&(domain.len() as u32).to_be_bytes());
+    mac.update(domain);
+    for part in parts {
+        mac.update(&(part.len() as u32).to_be_bytes());
+        mac.update(part);
+    }
+    hex(&mac.finalize().into_bytes())
+}
+
+pub fn opaque_deferred_key(idb_mac_key: &[u8; 32]) -> String {
+    opaque_idb_key(idb_mac_key, b"deferred", &[])
+}
+
+pub fn opaque_history_key(idb_mac_key: &[u8; 32], peer: &PublicKey, index: u64) -> String {
+    opaque_idb_key(idb_mac_key, b"history", &[peer, &index.to_be_bytes()])
+}
+
+pub fn opaque_file_key(idb_mac_key: &[u8; 32], peer: &PublicKey, index: u64) -> String {
+    opaque_idb_key(idb_mac_key, b"file", &[peer, &index.to_be_bytes()])
+}
+
+pub fn opaque_outbox_key(idb_mac_key: &[u8; 32], peer: &PublicKey, index: u64) -> String {
+    opaque_idb_key(idb_mac_key, b"outbox", &[peer, &index.to_be_bytes()])
+}
+
+pub fn opaque_upload_key(idb_mac_key: &[u8; 32], peer: &PublicKey, id: &[u8]) -> String {
+    opaque_idb_key(idb_mac_key, b"upload", &[peer, id])
+}
+
+pub fn opaque_chunk_key(idb_mac_key: &[u8; 32], peer: &PublicKey, id: &[u8], index: u32) -> String {
+    opaque_idb_key(idb_mac_key, b"chunk", &[peer, id, &index.to_be_bytes()])
+}
+
+/// Static KEK wrap AAD for `VaultHeader.wrapped_root_key` (deliberately omits `revision` so
+/// normal CAS revision increments never require re-wrapping the root key or retaining the KEK).
+pub fn root_key_wrap_aad(header: &VaultHeader) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(
+        ROOT_KEY_WRAP_AAD_PREFIX.len() + header.vault_id.len() + 20 + header.salt.len(),
+    );
+    aad.extend_from_slice(ROOT_KEY_WRAP_AAD_PREFIX);
+    aad.extend_from_slice(&header.vault_id);
+    aad.extend_from_slice(&header.version.to_be_bytes());
+    aad.extend_from_slice(&header.memory.to_be_bytes());
+    aad.extend_from_slice(&header.iterations.to_be_bytes());
+    aad.extend_from_slice(&header.parallelism.to_be_bytes());
+    aad.extend_from_slice(&(header.salt.len() as u32).to_be_bytes());
+    aad.extend_from_slice(&header.salt);
+    aad
+}
+
+/// Build the v3 `STATE` associated data binding `header_bytes`: `b"state/v3\0" || header_bytes`.
+pub fn state_v3_aad(header_bytes: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(STATE_V3_AAD_PREFIX.len() + header_bytes.len());
+    aad.extend_from_slice(STATE_V3_AAD_PREFIX);
     aad.extend_from_slice(header_bytes);
     aad
 }
 
-/// Build per-record associated data binding `name` and vault instance `epoch`.
-/// When `epoch == 0` (legacy pre-epoch records), returns `name.as_bytes()` for backwards
-/// compatibility.
-pub fn record_aad(name: &str, epoch: u64) -> Vec<u8> {
-    if epoch == 0 {
-        return name.as_bytes().to_vec();
-    }
-    let mut aad = Vec::with_capacity(name.len() + 15);
-    aad.extend_from_slice(name.as_bytes());
-    aad.extend_from_slice(b"\0epoch/");
+/// Static per-record AAD for `history` records: `b"history/v3\0" || peer || index_be || epoch_be`.
+pub fn history_aad(peer: &PublicKey, index: u64, epoch: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(HISTORY_V3_AAD_PREFIX.len() + 32 + 16);
+    aad.extend_from_slice(HISTORY_V3_AAD_PREFIX);
+    aad.extend_from_slice(peer);
+    aad.extend_from_slice(&index.to_be_bytes());
     aad.extend_from_slice(&epoch.to_be_bytes());
     aad
 }
 
-/// Build per-revision associated data for `outbox/*` records so an attacker with storage write
-/// access cannot substitute an older `OutgoingRecord` next to a newer `STATE`.
-pub fn outbox_aad(name: &str, epoch: u64, revision: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(name.len() + 27);
-    aad.extend_from_slice(name.as_bytes());
-    aad.extend_from_slice(b"\0epoch/");
+/// Static per-record AAD for `file` records: `b"file/v3\0" || peer || index_be || epoch_be`.
+pub fn file_aad(peer: &PublicKey, index: u64, epoch: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(FILE_V3_AAD_PREFIX.len() + 32 + 16);
+    aad.extend_from_slice(FILE_V3_AAD_PREFIX);
+    aad.extend_from_slice(peer);
+    aad.extend_from_slice(&index.to_be_bytes());
     aad.extend_from_slice(&epoch.to_be_bytes());
-    aad.extend_from_slice(b"/rev/");
+    aad
+}
+
+/// Revision-bound AAD for `outbox` records: `b"outbox/v3\0" || peer || index_be || epoch_be || rev_be`.
+pub fn outbox_aad(peer: &PublicKey, index: u64, epoch: u64, revision: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(OUTBOX_V3_AAD_PREFIX.len() + 32 + 24);
+    aad.extend_from_slice(OUTBOX_V3_AAD_PREFIX);
+    aad.extend_from_slice(peer);
+    aad.extend_from_slice(&index.to_be_bytes());
+    aad.extend_from_slice(&epoch.to_be_bytes());
     aad.extend_from_slice(&revision.to_be_bytes());
     aad
 }
 
-/// SHA-256 digest of a [`DeferredInitialsRecord`] bound into `AppState`.
-pub fn deferred_initials_digest(record: &DeferredInitialsRecord) -> Vec<u8> {
+/// Revision-bound AAD for `upload` records: `b"upload/v3\0" || peer || id || epoch_be || rev_be`.
+pub fn upload_aad(peer: &PublicKey, id: &[u8], epoch: u64, revision: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(UPLOAD_V3_AAD_PREFIX.len() + 32 + id.len() + 16);
+    aad.extend_from_slice(UPLOAD_V3_AAD_PREFIX);
+    aad.extend_from_slice(peer);
+    aad.extend_from_slice(id);
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad.extend_from_slice(&revision.to_be_bytes());
+    aad
+}
+
+/// Per-record AAD for the `deferred` sidecar: `b"deferred/v3\0" || epoch_be`.
+pub fn deferred_aad(epoch: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(DEFERRED_V3_PREFIX.len() + 8);
+    aad.extend_from_slice(DEFERRED_V3_PREFIX);
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad
+}
+
+/// SHA-256 digest of a [`DeferredRecord`] bound into `AppState`.
+pub fn deferred_record_digest(record: &DeferredRecord) -> Vec<u8> {
     let encoded = Zeroizing::new(record.encode_to_vec());
     let mut hasher = Sha256::new();
-    hasher.update(DEFERRED_DIGEST_PREFIX);
+    hasher.update(DEFERRED_V3_PREFIX);
     hasher.update(encoded.as_slice());
     hasher.finalize().to_vec()
 }
 
-/// Verify `record` against the expected digest stored in `AppState` (when populated by a build
-/// supporting tag 16).
-pub fn verify_deferred_initials_digest(
-    expected: &[u8],
-    record: &DeferredInitialsRecord,
-) -> Result<()> {
-    if expected.is_empty() {
-        return Ok(());
+/// Strictly verify `record` against the 32-byte SHA-256 digest stored in `AppState`.
+pub fn verify_deferred_record_digest(expected: &[u8], record: &DeferredRecord) -> Result<()> {
+    if expected.len() != 32 {
+        return Err(Error::Corrupt(
+            "missing or invalid deferred record digest in vault state".into(),
+        ));
     }
-    let actual = deferred_initials_digest(record);
+    let actual = deferred_record_digest(record);
     if expected != actual.as_slice() {
         return Err(Error::Corrupt(
-            "deferred_initials record does not match authenticated state digest".into(),
+            "deferred record does not match authenticated state digest".into(),
         ));
     }
     Ok(())
 }
 
-/// Monotonic rollback & v1-downgrade anchor persisted outside IndexedDB in `localStorage`.
+/// Monotonic v3 rollback anchor persisted outside IndexedDB in `localStorage`.
+/// Keyed by static `vault_id_hex` (32 lowercase hex chars) so future passphrase/salt rotation
+/// does not false-positive as a vault swap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackAnchor {
-    pub migrated_v2: bool,
     pub max_revision: u64,
-    /// Hex-encoded SHA-256 of the v2 vault's `VaultHeader.salt`.
-    pub salt_hash: String,
+    /// 32-char lowercase hex encoding of `VaultHeader.vault_id`.
+    pub vault_id_hex: String,
 }
 
 impl RollbackAnchor {
-    pub fn for_v2_header(header: &VaultHeader) -> Self {
+    pub fn for_v3_header(header: &VaultHeader) -> Self {
         Self {
-            migrated_v2: true,
             max_revision: header.revision,
-            salt_hash: salt_fingerprint(&header.salt),
+            vault_id_hex: hex(&header.vault_id),
         }
     }
 
     #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
     pub fn encode(&self) -> String {
-        format!(
-            "v1:{}:{}:{}",
-            u8::from(self.migrated_v2),
-            self.max_revision,
-            self.salt_hash
-        )
+        format!("v3:{}:{}", self.max_revision, self.vault_id_hex)
     }
 
     #[cfg_attr(not(any(target_arch = "wasm32", test)), allow(dead_code))]
     pub fn parse(raw: &str) -> Option<Self> {
         let mut parts = raw.trim().split(':');
-        if parts.next()? != "v1" {
+        if parts.next()? != "v3" {
             return None;
         }
-        let migrated_v2 = match parts.next()? {
-            "1" => true,
-            "0" => false,
-            _ => return None,
-        };
         let max_revision: u64 = parts.next()?.parse().ok()?;
-        let salt_hash = parts.next()?.to_string();
+        let vault_id_hex = parts.next()?.to_ascii_lowercase();
         if parts.next().is_some() {
             return None;
         }
-        if !salt_hash.is_empty()
-            && (salt_hash.len() != 64 || !salt_hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        if vault_id_hex.len() != VAULT_ID_LEN * 2
+            || !vault_id_hex.bytes().all(|b| b.is_ascii_hexdigit())
         {
             return None;
         }
         Some(Self {
-            migrated_v2,
             max_revision,
-            salt_hash,
+            vault_id_hex,
         })
     }
 }
 
-fn salt_fingerprint(salt: &[u8]) -> String {
-    hex(&Sha256::digest(salt))
-}
-
-/// Reject legacy v1 replay or v2 revision/salt rollback against an external [`RollbackAnchor`].
+/// Reject revision rollback or vault replacement against an external [`RollbackAnchor`].
 pub fn check_unlock_against_anchor(
     anchor: Option<&RollbackAnchor>,
     header: &VaultHeader,
@@ -249,38 +357,30 @@ pub fn check_unlock_against_anchor(
     let Some(anchor) = anchor else {
         return Ok(());
     };
-    if anchor.migrated_v2 && header.is_legacy_v1() {
+    let current_id = hex(&header.vault_id);
+    if anchor.vault_id_hex != current_id {
         return Err(Error::Corrupt(
-            "legacy v1 vault replay rejected after v2 migration".into(),
+            "vault rollback or replacement detected (vault_id does not match anchor)".into(),
         ));
     }
-    if header.version == VAULT_VERSION_V2 {
-        let current_salt = salt_fingerprint(&header.salt);
-        if anchor.migrated_v2 && !anchor.salt_hash.is_empty() && anchor.salt_hash != current_salt {
-            return Err(Error::Corrupt(
-                "vault rollback or replacement detected (header salt does not match anchor)".into(),
-            ));
-        }
-        if header.revision < anchor.max_revision {
-            return Err(Error::Corrupt(format!(
-                "vault rollback detected (revision {} is behind anchor {})",
-                header.revision, anchor.max_revision
-            )));
-        }
+    if header.revision < anchor.max_revision {
+        return Err(Error::Corrupt(format!(
+            "vault rollback detected (revision {} is behind anchor {})",
+            header.revision, anchor.max_revision
+        )));
     }
     Ok(())
 }
 
-/// Advance an existing anchor monotonically for a committed v2 header.
+/// Advance an existing anchor monotonically for a committed v3 header.
 fn advance_anchor(existing: Option<&RollbackAnchor>, header: &VaultHeader) -> RollbackAnchor {
-    let current_salt = salt_fingerprint(&header.salt);
+    let current_id = hex(&header.vault_id);
     let prev_rev = existing
-        .filter(|a| a.salt_hash == current_salt)
+        .filter(|a| a.vault_id_hex == current_id)
         .map_or(0, |a| a.max_revision);
     RollbackAnchor {
-        migrated_v2: true,
         max_revision: prev_rev.max(header.revision),
-        salt_hash: current_salt,
+        vault_id_hex: current_id,
     }
 }
 
@@ -313,11 +413,16 @@ fn clear_rollback_anchor() {
     #[cfg(target_arch = "wasm32")]
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item(ROLLBACK_ANCHOR_KEY);
+        let _ = storage.remove_item(LEGACY_ROLLBACK_ANCHOR_KEY);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (ROLLBACK_ANCHOR_KEY, LEGACY_ROLLBACK_ANCHOR_KEY);
     }
 }
 
-/// The KDF's salt, parameters, schema version, and monotonic CAS revision, in the clear.
-/// Bound into `STATE` AAD in v2 vaults so tampering is detected upon unlock.
+/// The v3 vault header stored in the clear under key `"vault"`.
+/// Bound into `STATE` AAD (`state/v3\0 || encoded(VaultHeader)`) so tampering fails unlock.
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct VaultHeader {
     #[prost(bytes = "vec", tag = "1")]
@@ -329,23 +434,29 @@ pub struct VaultHeader {
     pub iterations: u32,
     #[prost(uint32, tag = "4")]
     pub parallelism: u32,
-    /// Schema version: `0` or `1` for legacy v1 vaults, `2` for hardened v2 vaults.
+    /// Schema version (must equal [`VAULT_VERSION_V3`]).
     #[prost(uint32, tag = "5")]
     pub version: u32,
     /// Monotonic state revision enforced with compare-and-swap inside every RW transaction.
     #[prost(uint64, tag = "6")]
     pub revision: u64,
+    /// Static random 16-byte vault identifier (salts HKDF subkeys & rollback anchor).
+    #[prost(bytes = "vec", tag = "7")]
+    pub vault_id: Vec<u8>,
+    /// XChaCha20-Poly1305 wrapped 32-byte random root key (72B: 24B nonce || 32B ct || 16B tag).
+    #[prost(bytes = "vec", tag = "8")]
+    pub wrapped_root_key: Vec<u8>,
 }
 
 fn verify_checked_header(expected: &VaultHeader, raw: &[u8]) -> Result<VaultHeader> {
     let decoded = VaultHeader::decode(raw).map_err(|e| Error::Corrupt(e.to_string()))?;
-    if decoded.version != VAULT_VERSION_V2 || decoded.revision != expected.revision {
+    if decoded.version != VAULT_VERSION_V3 || decoded.revision != expected.revision {
         return Err(Error::Conflict {
             expected: expected.revision,
             actual: decoded.revision,
         });
     }
-    if expected.version != VAULT_VERSION_V2
+    if expected.version != VAULT_VERSION_V3
         || decoded != *expected
         || raw != expected.encode_to_vec()
     {
@@ -358,15 +469,19 @@ fn verify_checked_header(expected: &VaultHeader, raw: &[u8]) -> Result<VaultHead
 
 #[cfg(test)]
 fn reseal_state_for_next_revision(
-    key: &[u8; 32],
+    state_key: &[u8; 32],
     current: &VaultHeader,
     sealed_state: &[u8],
 ) -> Result<(VaultHeader, Vec<u8>, Vec<u8>)> {
-    let plain = open_bytes(key, &state_v2_aad(&current.encode_to_vec()), sealed_state)
-        .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
+    let plain = open_bytes(
+        state_key,
+        &state_v3_aad(&current.encode_to_vec()),
+        sealed_state,
+    )
+    .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
     let next = current.next_revision()?;
     let header = next.encode_to_vec();
-    let sealed = try_seal_bytes(key, &state_v2_aad(&header), plain.as_slice())?;
+    let sealed = try_seal_bytes(state_key, &state_v3_aad(&header), plain.as_slice())?;
     Ok((next, header, sealed))
 }
 
@@ -382,47 +497,65 @@ impl VaultHeader {
         })
     }
 
-    /// A new v2 header with a random 16-byte salt and hardened Argon2id parameters (64 MiB),
-    /// returning an error instead of panicking if browser CSPRNG fails.
-    pub fn try_new() -> Result<Self> {
-        let mut salt = vec![0; 16];
+    /// Create a fresh v3 header with random salt, random 16B `vault_id`, and a random 32B
+    /// `root_key` wrapped under the Argon2id KEK derived from `passphrase`. Immediately drops
+    /// both `kek` and `root_key`, returning `(header, VaultKeys)`.
+    pub fn create_with_passphrase(passphrase: &[u8]) -> Result<(Self, VaultKeys)> {
+        Self::create_with_params(
+            passphrase,
+            ARGON2_DEFAULT_MEMORY,
+            ARGON2_DEFAULT_ITERATIONS,
+            ARGON2_DEFAULT_PARALLELISM,
+        )
+    }
+
+    fn create_with_params(
+        passphrase: &[u8],
+        memory: u32,
+        iterations: u32,
+        parallelism: u32,
+    ) -> Result<(Self, VaultKeys)> {
+        let mut salt = vec![0u8; 16];
         getrandom::fill(&mut salt)
             .map_err(|e| Error::Storage(format!("random salt generation failed: {e}")))?;
-        Ok(Self {
+        let mut vault_id = vec![0u8; VAULT_ID_LEN];
+        getrandom::fill(&mut vault_id)
+            .map_err(|e| Error::Storage(format!("random vault_id generation failed: {e}")))?;
+        let mut root_key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(root_key.as_mut_slice())
+            .map_err(|e| Error::Storage(format!("random root key generation failed: {e}")))?;
+
+        let mut header = Self {
             salt,
-            memory: ARGON2_DEFAULT_MEMORY,
-            iterations: ARGON2_DEFAULT_ITERATIONS,
-            parallelism: ARGON2_DEFAULT_PARALLELISM,
-            version: VAULT_VERSION_V2,
+            memory,
+            iterations,
+            parallelism,
+            version: VAULT_VERSION_V3,
             revision: 1,
-        })
+            vault_id,
+            wrapped_root_key: vec![0u8; WRAPPED_ROOT_KEY_LEN],
+        };
+        header.validate()?;
+        let kek = header.derive_kek(passphrase)?;
+        let wrap_aad = root_key_wrap_aad(&header);
+        header.wrapped_root_key = try_seal_bytes(&kek, &wrap_aad, root_key.as_slice())?;
+        drop(kek);
+        header.validate()?;
+        let keys = VaultKeys::derive(&header.vault_id, &root_key);
+        drop(root_key);
+        Ok((header, keys))
     }
 
-    #[cfg(test)]
-    fn new() -> Self {
-        Self::try_new().expect("crypto.getRandomValues")
-    }
-
-    /// Whether this header represents a legacy v1 vault awaiting atomic v1 -> v2 upgrade.
-    pub fn is_legacy_v1(&self) -> bool {
-        self.version == 0 || self.version == VAULT_VERSION_V1
-    }
-
-    /// Validate untrusted header version, salt length, and Argon2id parameters BEFORE deriving
-    /// any key (prevents DoS via huge memory/iterations or downgrade via tiny parameters).
+    /// Validate untrusted header version, revision, salt length, Argon2id bounds, `vault_id`
+    /// length, and `wrapped_root_key` length BEFORE running Argon2id KDF.
     pub fn validate(&self) -> Result<()> {
-        match self.version {
-            0 | VAULT_VERSION_V1 => {}
-            VAULT_VERSION_V2 => {
-                if self.revision == 0 {
-                    return Err(Error::Corrupt(
-                        "v2 vault header has invalid revision 0".into(),
-                    ));
-                }
-            }
-            v => {
-                return Err(Error::Corrupt(format!("unsupported vault version {v}")));
-            }
+        if self.version != VAULT_VERSION_V3 {
+            return Err(Error::IncompatibleVersion(self.version));
+        }
+        if self.revision == 0 {
+            return Err(Error::Corrupt(
+                "v3 vault header has invalid revision 0".into(),
+            ));
         }
         if !(ARGON2_SALT_MIN..=ARGON2_SALT_MAX).contains(&self.salt.len()) {
             return Err(Error::Corrupt(format!(
@@ -448,28 +581,61 @@ impl VaultHeader {
                 self.parallelism, ARGON2_PARALLELISM_MIN, ARGON2_PARALLELISM_MAX
             )));
         }
+        if self.vault_id.len() != VAULT_ID_LEN {
+            return Err(Error::Corrupt(format!(
+                "invalid vault_id length {}",
+                self.vault_id.len()
+            )));
+        }
+        if self.wrapped_root_key.len() != WRAPPED_ROOT_KEY_LEN {
+            return Err(Error::Corrupt(format!(
+                "invalid wrapped_root_key length {}",
+                self.wrapped_root_key.len()
+            )));
+        }
         Ok(())
     }
 
-    /// Derive the 32-byte vault key from `passphrase` after validating parameters.
-    pub fn derive_key(&self, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    /// Derive the temporary 32-byte Argon2id KEK from `passphrase` after validating parameters.
+    pub fn derive_kek(&self, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
         self.validate()?;
         let params = Params::new(self.memory, self.iterations, self.parallelism, Some(32))
             .map_err(|e| Error::Corrupt(e.to_string()))?;
-        let mut key = Zeroizing::new([0; 32]);
+        let mut kek = Zeroizing::new([0; 32]);
         Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into(passphrase, &self.salt, key.as_mut_slice())
+            .hash_password_into(passphrase, &self.salt, kek.as_mut_slice())
             .map_err(|e| Error::Corrupt(e.to_string()))?;
-        Ok(key)
+        Ok(kek)
+    }
+
+    /// Unwrap `wrapped_root_key` with `passphrase`, immediately drop the KEK and `root_key`, and
+    /// return the three HKDF-SHA256 subkeys.
+    pub fn unwrap_keys(&self, passphrase: &[u8]) -> Result<VaultKeys> {
+        let kek = self.derive_kek(passphrase)?;
+        let wrap_aad = root_key_wrap_aad(self);
+        let unwrapped =
+            open_bytes(&kek, &wrap_aad, &self.wrapped_root_key).ok_or(Error::WrongPassphrase)?;
+        drop(kek);
+        let mut root_key = Zeroizing::new([0u8; 32]);
+        if unwrapped.len() != 32 {
+            return Err(Error::Corrupt(
+                "unwrapped root key has unexpected length".into(),
+            ));
+        }
+        root_key.copy_from_slice(unwrapped.as_slice());
+        drop(unwrapped);
+        let keys = VaultKeys::derive(&self.vault_id, &root_key);
+        drop(root_key);
+        Ok(keys)
     }
 }
 
-/// Fallibly encrypt `plaintext` under `key` with associated data `aad` (never panics on RNG error).
+/// Fallibly encrypt `plaintext` under `key` with XChaCha20-Poly1305 and associated data `aad`.
 pub fn try_seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
     let mut nonce = [0; NONCE_LEN];
     getrandom::fill(&mut nonce)
         .map_err(|e| Error::Storage(format!("random nonce generation failed: {e}")))?;
-    let ciphertext = Aes256Gcm::new(key.into())
+    let ciphertext = XChaCha20Poly1305::new(key.into())
         .encrypt(
             &nonce.into(),
             Payload {
@@ -477,23 +643,23 @@ pub fn try_seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Ve
                 aad,
             },
         )
-        .map_err(|_| Error::Corrupt("AES-GCM encryption failed".into()))?;
+        .map_err(|_| Error::Corrupt("XChaCha20-Poly1305 encryption failed".into()))?;
     let mut sealed = Vec::with_capacity(NONCE_LEN + ciphertext.len());
     sealed.extend_from_slice(&nonce);
     sealed.extend_from_slice(&ciphertext);
     Ok(sealed)
 }
 
-/// Encrypt `plaintext` under `key` with associated data `aad`.
+/// Encrypt `plaintext` under `key` with XChaCha20-Poly1305 and associated data `aad`.
 #[cfg(test)]
 pub fn seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    try_seal_bytes(key, aad, plaintext).expect("AES-GCM sealing in tests")
+    try_seal_bytes(key, aad, plaintext).expect("XChaCha20-Poly1305 sealing in tests")
 }
 
-/// Decrypt `sealed` under `key` with associated data `aad`; zeroized on drop.
+/// Decrypt `sealed` under `key` with XChaCha20-Poly1305 and associated data `aad`; zeroized on drop.
 pub fn open_bytes(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     let (nonce, ciphertext) = sealed.split_at_checked(NONCE_LEN)?;
-    Aes256Gcm::new(key.into())
+    XChaCha20Poly1305::new(key.into())
         .decrypt(
             &<[u8; NONCE_LEN]>::try_from(nonce).ok()?.into(),
             Payload {
@@ -503,6 +669,18 @@ pub fn open_bytes(key: &[u8; 32], aad: &[u8], sealed: &[u8]) -> Option<Zeroizing
         )
         .ok()
         .map(Zeroizing::new)
+}
+
+fn generate_record_epoch() -> Result<u64> {
+    let mut buf = [0u8; 8];
+    loop {
+        getrandom::fill(&mut buf)
+            .map_err(|e| Error::Storage(format!("random epoch generation failed: {e}")))?;
+        let epoch = u64::from_be_bytes(buf);
+        if epoch != 0 {
+            return Ok(epoch);
+        }
+    }
 }
 
 /// Everything but the chats' histories.
@@ -539,27 +717,30 @@ pub struct AppState {
     /// Preferences to restore if the relay refuses a pending settings change.
     #[prost(message, optional, tag = "11")]
     pub pending_pq_rollback: Option<PendingPqRollback>,
-    /// Legacy migration field for deferred inbox initials; always left empty on writes because
-    /// deferred initials are stored in the separate [`DEFERRED_INITIALS`] record.
-    #[prost(message, repeated, tag = "12")]
-    pub deferred_initials: Vec<session::protocol::handshake_v2::InitialMessageV2>,
+    // Tag 12 reserved (removed legacy inline deferred_initials).
     /// Monotonic floor for newly started chat `Hello.session_seq` values so recreating a deleted
     /// chat never reuses `session_seq = 1` against a peer who kept the old history.
     #[prost(uint64, tag = "13")]
     pub next_session_seq: u64,
-    /// Authenticated per-upload watermarks and hashes bound inside `STATE`, detecting partial
-    /// rollback of standalone `upload/<peer>/<id>` records.
+    /// Authenticated per-upload watermarks, hashes, and commit revisions bound inside `STATE`.
     #[prost(message, repeated, tag = "14")]
     pub upload_checkpoints: Vec<UploadCheckpoint>,
-    /// Vault-instance epoch bound into per-record AAD for records written by this build.
+    /// Random non-zero vault-instance epoch bound into per-record AADs.
     #[prost(uint64, tag = "15")]
     pub record_epoch: u64,
-    /// SHA-256 digest of the committed `DEFERRED_INITIALS` record (empty only in legacy vaults).
+    /// SHA-256 digest of the committed `DeferredRecord` sidecar.
     #[prost(bytes = "vec", tag = "16")]
     pub deferred_initials_digest: Vec<u8>,
-    /// Per-outbox-record commit revisions bound into `outbox/*` AADs.
+    /// Structured per-outbox-record commit revisions bound into `outbox` AADs.
     #[prost(message, repeated, tag = "17")]
     pub outbox_revisions: Vec<OutboxRevision>,
+    /// Compact per-peer storage indices (history length, file indices, kept chunk bitmaps)
+    /// authenticated inside `STATE`, replacing all IndexedDB prefix scans.
+    #[prost(message, repeated, tag = "18")]
+    pub peer_storage: Vec<PeerStorageIndex>,
+    /// Durable pending write-token revocations staged on chat deletion and flushed on sync.
+    #[prost(message, repeated, tag = "19")]
+    pub pending_revokes: Vec<PendingRevoke>,
 }
 
 impl AppState {
@@ -570,6 +751,8 @@ impl AppState {
         for contact in &mut self.contacts {
             contact.zeroize_secrets();
         }
+        // `Farewell` implements `Drop` + `ZeroizeOnDrop`.
+        self.farewells.clear();
         for cp in &mut self.upload_checkpoints {
             cp.prefix_hash.zeroize();
             cp.sealed_chunk_hash.zeroize();
@@ -578,8 +761,7 @@ impl AppState {
     }
 }
 
-/// Compact upload watermark authenticated inside `STATE` so partial rollback of an
-/// `upload/<peer>/<id>` record cannot supply stale `encrypted` / `prefix_hash` values on resume.
+/// Compact upload watermark and commit revision authenticated inside `STATE`.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct UploadCheckpoint {
     #[prost(bytes = "vec", tag = "1")]
@@ -596,10 +778,12 @@ pub struct UploadCheckpoint {
     pub sealed_chunk_hash: Vec<u8>,
     #[prost(uint32, tag = "7")]
     pub upload_state: u32,
+    #[prost(uint64, tag = "8")]
+    pub revision: u64,
 }
 
 impl UploadCheckpoint {
-    fn from_upload(peer: &PublicKey, upload: &PendingUpload) -> Self {
+    fn from_upload(peer: &PublicKey, upload: &PendingUpload, revision: u64) -> Self {
         Self {
             peer: peer.to_vec(),
             id: upload.id.clone(),
@@ -608,6 +792,7 @@ impl UploadCheckpoint {
             prefix_hash: upload.prefix_hash.clone(),
             sealed_chunk_hash: upload.sealed_chunk_hash.clone(),
             upload_state: upload.upload_state,
+            revision,
         }
     }
 
@@ -622,13 +807,92 @@ impl UploadCheckpoint {
     }
 }
 
-/// Authenticated revision binding for an active `outbox/<peer>/<index>` record.
+/// Structured authenticated revision binding for an active outbox record `(peer, index)`.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
 pub struct OutboxRevision {
-    #[prost(string, tag = "1")]
-    pub key: String,
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer: Vec<u8>,
     #[prost(uint64, tag = "2")]
+    pub index: u64,
+    #[prost(uint64, tag = "3")]
     pub revision: u64,
+}
+
+/// Compact per-peer storage index authenticated inside `STATE`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct PeerStorageIndex {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer: Vec<u8>,
+    /// Exclusive upper bound on history indices written for `peer`.
+    #[prost(uint64, tag = "2")]
+    pub max_history_len: u64,
+    /// Sorted deduplicated history indices that have a separate `file` record.
+    #[prost(uint64, repeated, tag = "3")]
+    pub file_indices: Vec<u64>,
+    /// Kept attachment chunk bitmaps for `peer`.
+    #[prost(message, repeated, tag = "4")]
+    pub kept_chunks: Vec<AttachmentChunks>,
+}
+
+/// Bitmap tracking which chunk indices of attachment `id` are cached locally in IndexedDB.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct AttachmentChunks {
+    #[prost(bytes = "vec", tag = "1")]
+    pub id: Vec<u8>,
+    /// Bit `i` (byte `i / 8`, mask `1 << (i % 8)`) is set iff chunk `i` is kept in IndexedDB.
+    #[prost(bytes = "vec", tag = "2")]
+    pub chunks_bitmap: Vec<u8>,
+}
+
+impl AttachmentChunks {
+    pub fn has_bit(&self, index: u32) -> bool {
+        let byte_idx = (index / 8) as usize;
+        let mask = 1u8 << (index % 8);
+        self.chunks_bitmap
+            .get(byte_idx)
+            .is_some_and(|b| b & mask != 0)
+    }
+
+    /// Set bit `index`, returning `true` if newly set or `false` if already set.
+    pub fn set_bit(&mut self, index: u32) -> Result<bool> {
+        let byte_idx = (index / 8) as usize;
+        if byte_idx >= MAX_CHUNK_BITMAP_BYTES {
+            return Err(Error::Corrupt(format!(
+                "attachment chunk index {index} exceeds bitmap bound"
+            )));
+        }
+        let mask = 1u8 << (index % 8);
+        if self.chunks_bitmap.len() <= byte_idx {
+            self.chunks_bitmap.resize(byte_idx + 1, 0);
+        }
+        let prev = self.chunks_bitmap[byte_idx];
+        self.chunks_bitmap[byte_idx] |= mask;
+        Ok((prev & mask) == 0)
+    }
+
+    pub fn count(&self) -> u32 {
+        self.chunks_bitmap.iter().map(|b| b.count_ones()).sum()
+    }
+
+    pub fn indices(&self) -> impl Iterator<Item = u32> + '_ {
+        self.chunks_bitmap
+            .iter()
+            .enumerate()
+            .flat_map(|(byte_idx, &byte)| {
+                (0u32..8).filter_map(move |bit| {
+                    ((byte & (1u8 << bit)) != 0).then_some((byte_idx as u32) * 8 + bit)
+                })
+            })
+    }
+}
+
+/// Pending mailbox write-token revocation staged on chat deletion and flushed on sync.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct PendingRevoke {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer_slot_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub min_grant_version: u64,
 }
 
 /// One encrypted inbox initial retained until a build with its suite (or restored contact) can
@@ -651,42 +915,54 @@ pub struct CarriedDeferredTimestamp {
     pub deferred_at: u64,
 }
 
-/// Separate encrypted sidecar record committed atomically with `STATE` so rolling back to an
-/// older bundle that rewrites `STATE` cannot strip already-acknowledged greetings.
+/// Raw mailbox envelope buffered locally for a stalled/quarantined/rekeying peer so the server
+/// mailbox cursor advances immediately for all active peers (cross-peer stall isolation).
 #[derive(Clone, PartialEq, prost::Message)]
-pub struct DeferredInitialsRecord {
+pub struct DeferredEnvelope {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(message, optional, tag = "3")]
+    pub message: Option<party::EncryptedMessage>,
+    #[prost(message, optional, tag = "4")]
+    pub initial_message: Option<session::protocol::handshake_v2::InitialMessageV2>,
+    #[prost(uint64, tag = "5")]
+    pub deferred_at: u64,
+}
+
+/// Separate encrypted sidecar record committed atomically with `STATE` under opaque key `("deferred",)`.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct DeferredRecord {
     #[prost(message, repeated, tag = "1")]
     pub entries: Vec<DeferredInitial>,
     #[prost(message, repeated, tag = "2")]
     pub carried_timestamps: Vec<CarriedDeferredTimestamp>,
+    #[prost(message, repeated, tag = "3")]
+    pub envelopes: Vec<DeferredEnvelope>,
 }
 
-impl DeferredInitialsRecord {
+impl DeferredRecord {
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty() && self.carried_timestamps.is_empty()
+        self.entries.is_empty() && self.carried_timestamps.is_empty() && self.envelopes.is_empty()
     }
 }
 
-/// Fallibly seal a [`DeferredInitialsRecord`] under `key` with the `deferred_initials` record AAD.
-pub fn try_seal_deferred_initials(
-    key: &[u8; 32],
-    record: &DeferredInitialsRecord,
+/// Fallibly seal a [`DeferredRecord`] under `record_key` with `deferred_aad(epoch)`.
+pub fn try_seal_deferred(
+    record_key: &[u8; 32],
+    epoch: u64,
+    record: &DeferredRecord,
 ) -> Result<Vec<u8>> {
     let plaintext = Zeroizing::new(record.encode_to_vec());
-    try_seal_bytes(key, DEFERRED_INITIALS.as_bytes(), &plaintext)
+    try_seal_bytes(record_key, &deferred_aad(epoch), &plaintext)
 }
 
-/// Seal a [`DeferredInitialsRecord`] under `key` with the `deferred_initials` record AAD.
-#[cfg(test)]
-pub fn seal_deferred_initials(key: &[u8; 32], record: &DeferredInitialsRecord) -> Vec<u8> {
-    try_seal_deferred_initials(key, record).expect("deferred_initials sealing in tests")
-}
-
-/// Open a sealed [`DeferredInitialsRecord`] under `key` with the `deferred_initials` record AAD.
-pub fn open_deferred_initials(key: &[u8; 32], sealed: &[u8]) -> Result<DeferredInitialsRecord> {
-    let plain = open_bytes(key, DEFERRED_INITIALS.as_bytes(), sealed)
-        .ok_or_else(|| Error::Corrupt("deferred_initials does not decrypt".into()))?;
-    DeferredInitialsRecord::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))
+/// Open a sealed [`DeferredRecord`] under `record_key` with `deferred_aad(epoch)`.
+pub fn open_deferred(record_key: &[u8; 32], epoch: u64, sealed: &[u8]) -> Result<DeferredRecord> {
+    let plain = open_bytes(record_key, &deferred_aad(epoch), sealed)
+        .ok_or_else(|| Error::Corrupt("deferred sidecar does not decrypt".into()))?;
+    DeferredRecord::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -862,6 +1138,7 @@ impl ContactState {
         for buf in &mut self.pending_carried_initials {
             buf.zeroize();
         }
+        self.fallback_farewells.clear();
         if let Some(sealed) = &mut self.sealed_events
             && let Some(rec) = &mut sealed.record
         {
@@ -957,20 +1234,15 @@ pub struct PendingUpload {
 impl PendingUpload {
     /// Whether its upload started, so that the server has it, under its ID.
     pub fn started(&self) -> bool {
-        match self.upload_state {
-            UPLOAD_STATE_WAITING => false,
-            UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED => !self.token.is_empty(),
-            _ => !self.token.is_empty(),
-        }
+        matches!(
+            self.upload_state,
+            UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED
+        ) && !self.token.is_empty()
     }
 
     /// Whether the server-assigned attachment pointer has been durably announced in chat history.
     pub fn is_announced(&self) -> bool {
-        match self.upload_state {
-            UPLOAD_STATE_WAITING | UPLOAD_STATE_STARTED => false,
-            UPLOAD_STATE_ANNOUNCED => true,
-            _ => self.announced && !self.token.is_empty(),
-        }
+        self.upload_state == UPLOAD_STATE_ANNOUNCED && !self.token.is_empty()
     }
 
     fn clear_secrets(&mut self) {
@@ -987,7 +1259,7 @@ impl Drop for PendingUpload {
     }
 }
 
-impl zeroize::ZeroizeOnDrop for PendingUpload {}
+impl ZeroizeOnDrop for PendingUpload {}
 
 impl fmt::Debug for PendingUpload {
     /// Shows no key, token or hash.
@@ -1019,6 +1291,7 @@ pub struct Outgoing {
 
 /// What a message not pushed yet is: its content, encrypted just before it goes.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct OutgoingRecord {
     /// The message, once encrypted.
     #[prost(message, optional, tag = "1")]
@@ -1026,34 +1299,108 @@ pub struct OutgoingRecord {
     /// Its content, until it is encrypted.
     #[prost(bytes = "vec", tag = "3")]
     pub content: Vec<u8>,
-    /// SHA-256 of its delivery token, once encrypted, under the key of the session it was
-    /// encrypted on, see `session::Sealed`.
+    /// Raw 32-byte mailbox write token for this sealed message (`PushV2Request.write_token`).
     #[prost(bytes = "vec", tag = "4")]
-    pub delivery_hash: Vec<u8>,
+    pub write_token: Vec<u8>,
+    /// Optional encoded `InitialMessageV2` carried alongside this sealed message.
+    #[prost(bytes = "vec", tag = "5")]
+    pub carried_initial: Vec<u8>,
+    /// Session ID that produced `message`, `write_token`, and `carried_initial`.
+    #[prost(bytes = "vec", tag = "6")]
+    pub session_id: Vec<u8>,
 }
 
 impl OutgoingRecord {
-    /// The record of `sealed`, encrypted.
-    pub fn sealed(sealed: Sealed) -> Self {
+    /// Build an unsealed [`OutgoingRecord`] carrying plaintext `content` bytes waiting to be
+    /// encrypted once its position in the chat is fixed.
+    pub fn unsealed(content: Vec<u8>) -> Self {
         Self {
-            message: Some(sealed.message),
+            message: None,
+            content,
+            write_token: Vec::new(),
+            carried_initial: Vec::new(),
+            session_id: Vec::new(),
+        }
+    }
+
+    /// Build a sealed [`OutgoingRecord`] bound to `session_id`.
+    pub fn sealed(sealed: Sealed, session_id: &[u8]) -> Self {
+        Self {
+            message: Some(sealed.message.clone()),
             content: vec![],
-            delivery_hash: sealed.delivery_hash.map(Vec::from).unwrap_or_default(),
+            write_token: sealed.write_token.to_vec(),
+            carried_initial: sealed
+                .initial_message
+                .as_ref()
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default(),
+            session_id: session_id.to_vec(),
         }
     }
 
-    /// The message to push, once encrypted.
-    pub fn to_push(&self) -> Sealed {
-        Sealed {
-            message: self.message.clone().unwrap_or_default(),
-            delivery_hash: self.delivery_hash.as_slice().try_into().ok(),
-        }
+    /// Reconstruct a [`Sealed`] payload if this record has a valid message and 32-byte `write_token`.
+    pub fn to_sealed(&self) -> Option<Sealed> {
+        let message = self.message.clone()?;
+        let write_token: [u8; 32] = self.write_token.as_slice().try_into().ok()?;
+        let initial_message = (!self.carried_initial.is_empty())
+            .then(|| Bytes::copy_from_slice(&self.carried_initial));
+        Some(Sealed {
+            message,
+            write_token: Zeroizing::new(write_token),
+            initial_message,
+        })
     }
 
-    /// Wipe plaintext content and delivery hash buffers.
+    /// Build a wire [`PushV2Request`] for `recipient` if this record holds a valid sealed message
+    /// and 32-byte `write_token`.
+    #[cfg(test)]
+    pub fn to_push_v2_request(&self, recipient: &PublicKey) -> Option<PushV2Request> {
+        let message = self.message.clone()?;
+        let write_token: [u8; 32] = self.write_token.as_slice().try_into().ok()?;
+        let initial_message = if self.carried_initial.is_empty() {
+            None
+        } else {
+            Some(session::protocol::mailbox_v2::decode_carried_initial(
+                &self.carried_initial,
+            )?)
+        };
+        let client_message_id = Bytes::copy_from_slice(&Sealed::client_message_id_for(&message));
+        Some(PushV2Request {
+            recipient: Bytes::copy_from_slice(recipient),
+            message: Some(message),
+            initial_message,
+            client_message_id,
+            write_token: Bytes::copy_from_slice(&write_token),
+        })
+    }
+
+    /// Wipe plaintext content, write token, carried initial, and session binding.
     pub fn zeroize_secrets(&mut self) {
         self.content.zeroize();
-        self.delivery_hash.zeroize();
+        self.write_token.zeroize();
+        self.carried_initial.zeroize();
+        self.session_id.zeroize();
+    }
+}
+
+impl Drop for OutgoingRecord {
+    fn drop(&mut self) {
+        self.zeroize_secrets();
+    }
+}
+
+impl ZeroizeOnDrop for OutgoingRecord {}
+
+impl fmt::Debug for OutgoingRecord {
+    /// Shows no plaintext content, write token, or ciphertext bytes.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutgoingRecord")
+            .field("has_message", &self.message.is_some())
+            .field("content_len", &self.content.len())
+            .field("has_write_token", &(self.write_token.len() == 32))
+            .field("has_carried_initial", &!self.carried_initial.is_empty())
+            .field("session_id_len", &self.session_id.len())
+            .finish()
     }
 }
 
@@ -1064,25 +1411,12 @@ pub struct FileRecord {
     pub data: Vec<u8>,
 }
 
-/// The name of the [`OutgoingRecord`] of the history entry `index` of the chat with `peer`.
-pub fn outbox_key(peer: &PublicKey, index: u64) -> String {
-    format!("outbox/{}/{index:020}", hex(peer))
-}
-
-/// The name of the [`FileRecord`] of the history entry `index` of the chat with `peer`.
-fn file_key(peer: &PublicKey, index: u64) -> String {
-    format!("file/{}/{index:020}", hex(peer))
-}
-
 /// A message telling a peer that this client deleted the chat, not pushed yet.
 #[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
 pub struct Farewell {
-    #[prost(message, optional, tag = "1")]
-    pub push: Option<PushRequest>,
-    /// Optional deterministic 16-byte `client_message_id` for v2 idempotent `PushV2`.
-    #[prost(bytes = "vec", tag = "2")]
-    pub client_message_id: Vec<u8>,
-    /// Encoded `protocol::mailbox_v2::PushV2Request` preserving v2/PQXDH carried initial messages.
+    /// Encoded `protocol::mailbox_v2::PushV2Request` preserving v2/PQXDH carried initial messages
+    /// and the 32-byte `write_token`.
     #[prost(bytes = "vec", tag = "3")]
     pub push_v2: Vec<u8>,
 }
@@ -1090,13 +1424,29 @@ pub struct Farewell {
 impl Farewell {
     /// Recipient identity key of this farewell.
     pub fn recipient(&self) -> Option<Vec<u8>> {
-        if !self.push_v2.is_empty()
-            && let Ok(v2) =
-                session::protocol::mailbox_v2::PushV2Request::decode(self.push_v2.as_slice())
-        {
-            return Some(v2.recipient.to_vec());
+        if self.push_v2.is_empty() {
+            return None;
         }
-        self.push.as_ref().map(|p| p.recipient.to_vec())
+        PushV2Request::decode(self.push_v2.as_slice())
+            .ok()
+            .map(|v2| v2.recipient.to_vec())
+    }
+}
+
+impl Drop for Farewell {
+    fn drop(&mut self) {
+        self.push_v2.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for Farewell {}
+
+impl fmt::Debug for Farewell {
+    /// Shows no encoded `PushV2Request` / `write_token` bytes.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Farewell")
+            .field("push_v2_len", &self.push_v2.len())
+            .finish()
     }
 }
 
@@ -1177,14 +1527,7 @@ impl HistoryEntry {
     }
 }
 
-/// The name of a history entry's record.
-pub fn history_key(peer: &PublicKey, index: u64) -> String {
-    format!("history/{}/{index:020}", hex(peer))
-}
-
 /// Compute the inclusive `[first, last]` history index bounds for `(history_len, limit)`.
-/// Returns `None` when `history_len == 0` or `limit == 0` so `KeyRange::bound` is never called
-/// with `lower > upper`.
 fn history_bounds(history_len: u64, limit: u64) -> Option<(u64, u64)> {
     if limit == 0 {
         return None;
@@ -1194,49 +1537,13 @@ fn history_bounds(history_len: u64, limit: u64) -> Option<(u64, u64)> {
     Some((first, last))
 }
 
-/// Every name that starts with `prefix`, which ends with `/`: `0` sorts right after `/`.
-fn prefix_range(prefix: &str) -> Result<KeyRange> {
-    Ok(KeyRange::bound(
-        &prefix.into(),
-        &format!("{}0", prefix.trim_end_matches('/')).into(),
-        None,
-        Some(true),
-    )?)
-}
-
-/// The name of the upload `id`, in the chat with `peer`.
-fn upload_key(peer: &PublicKey, id: &[u8]) -> String {
-    format!("upload/{}/{}", hex(peer), hex(id))
-}
-
-/// The name of chunk `index` of the attachment `id`, in the chat with `peer`.
-fn chunk_key(peer: &PublicKey, id: &[u8], index: u32) -> String {
-    format!("attachment/{}/{}/{index:010}", hex(peer), hex(id))
-}
-
-/// The history entries of the chat with `peer`, from index `first` to `last`.
-fn history_range(peer: &PublicKey, first: u64, last: u64) -> Result<KeyRange> {
-    Ok(KeyRange::bound(
-        &history_key(peer, first).into(),
-        &history_key(peer, last).into(),
-        None,
-        None,
-    )?)
-}
-
-fn parse_upload_peer(key: &str) -> Option<PublicKey> {
-    key.split('/')
-        .nth(1)
-        .and_then(from_hex)
-        .and_then(|peer| PublicKey::try_from(peer).ok())
-}
-
 fn upsert_upload_checkpoint(
     checkpoints: &mut Vec<UploadCheckpoint>,
     peer: &PublicKey,
     upload: &PendingUpload,
+    revision: u64,
 ) {
-    let cp = UploadCheckpoint::from_upload(peer, upload);
+    let cp = UploadCheckpoint::from_upload(peer, upload, revision);
     if let Some(existing) = checkpoints
         .iter_mut()
         .find(|c| c.peer.as_slice() == peer.as_slice() && c.id == upload.id)
@@ -1251,141 +1558,38 @@ fn remove_upload_checkpoint(checkpoints: &mut Vec<UploadCheckpoint>, peer: &Publ
     checkpoints.retain(|c| !(c.peer.as_slice() == peer.as_slice() && c.id.as_slice() == id));
 }
 
-fn verify_upload_checkpoint(
-    checkpoints: &[UploadCheckpoint],
-    enforced: bool,
+fn find_upload_checkpoint<'a>(
+    checkpoints: &'a [UploadCheckpoint],
     peer: &PublicKey,
-    upload: &PendingUpload,
-) -> bool {
-    match checkpoints
+    id: &[u8],
+) -> Option<&'a UploadCheckpoint> {
+    checkpoints
         .iter()
-        .find(|c| c.peer.as_slice() == peer.as_slice() && c.id == upload.id)
-    {
-        Some(cp) => cp.matches(peer, upload),
-        None => !enforced,
-    }
+        .find(|c| c.peer.as_slice() == peer.as_slice() && c.id.as_slice() == id)
 }
 
-/// Decode a batch of `(key, sealed_bytes)` upload records, skipping individual corrupt or
-/// checkpoint-mismatched records so one damaged upload never breaks `uploads()` or `delete()`.
-fn decode_uploads_tolerant(
-    key: &[u8; 32],
+fn decode_upload_with_checkpoint(
+    record_key: &[u8; 32],
     record_epoch: u64,
-    checkpoints: &[UploadCheckpoint],
-    records: impl IntoIterator<Item = (String, Vec<u8>)>,
-) -> Vec<(PublicKey, PendingUpload)> {
-    let enforced = record_epoch > 0;
-    let mut out = Vec::new();
-    for (name, sealed) in records {
-        let Some(peer) = parse_upload_peer(&name) else {
-            continue;
-        };
-        let Some(plain) = open_record_bytes(key, &name, record_epoch, &sealed) else {
-            continue;
-        };
-        let Ok(upload) = PendingUpload::decode(plain.as_slice()) else {
-            continue;
-        };
-        if !verify_upload_checkpoint(checkpoints, enforced, &peer, &upload) {
-            continue;
-        }
-        out.push((peer, upload));
-    }
-    out
-}
-
-fn open_record_bytes(
-    key: &[u8; 32],
-    name: &str,
-    record_epoch: u64,
+    cp: &UploadCheckpoint,
+    peer: &PublicKey,
     sealed: &[u8],
-) -> Option<Zeroizing<Vec<u8>>> {
-    let aad = record_aad(name, record_epoch);
-    open_bytes(key, &aad, sealed)
+) -> Option<PendingUpload> {
+    let aad = upload_aad(peer, &cp.id, record_epoch, cp.revision);
+    let plain = open_bytes(record_key, &aad, sealed)?;
+    let upload = PendingUpload::decode(plain.as_slice()).ok()?;
+    cp.matches(peer, &upload).then_some(upload)
 }
 
-/// Re-encrypted record set produced during an atomic v1 -> v2 KDF upgrade.
-struct UpgradedV1Records {
-    updated: Vec<(String, Vec<u8>)>,
-    deleted: Vec<String>,
-    deferred: DeferredInitialsRecord,
-    checkpoints: Vec<UploadCheckpoint>,
-    outbox_revs: BTreeMap<String, u64>,
-}
-
-/// Re-encrypt all non-header, non-state, non-attachment vault records during an atomic v1 -> v2
-/// KDF upgrade (`old_key` -> `new_key`, binding `record_epoch = 1` and `outbox_revisions` /
-/// `upload_checkpoints`).
-fn upgrade_v1_records(
-    old_key: &[u8; 32],
-    new_key: &[u8; 32],
-    record_epoch: u64,
-    v2_revision: u64,
-    records: Vec<(String, Vec<u8>)>,
-) -> Result<UpgradedV1Records> {
-    let mut updated = Vec::new();
-    let mut deleted = Vec::new();
-    let mut deferred = DeferredInitialsRecord::default();
-    let mut checkpoints = Vec::new();
-    let mut outbox_revs = BTreeMap::new();
-
-    for (name, sealed) in records {
-        if name == HEADER || name == STATE || name.starts_with("attachment/") {
-            continue;
-        }
-        if name == DEFERRED_INITIALS {
-            deferred = open_deferred_initials(old_key, &sealed)?;
-            if !deferred.is_empty() {
-                updated.push((name, try_seal_deferred_initials(new_key, &deferred)?));
-            } else {
-                deleted.push(name);
-            }
-            continue;
-        }
-        if name.starts_with("upload/") {
-            let Some(peer) = parse_upload_peer(&name) else {
-                deleted.push(name);
-                continue;
-            };
-            let Some(plain) = open_bytes(old_key, name.as_bytes(), &sealed) else {
-                deleted.push(name);
-                continue;
-            };
-            let Ok(upload) = PendingUpload::decode(plain.as_slice()) else {
-                deleted.push(name);
-                continue;
-            };
-            upsert_upload_checkpoint(&mut checkpoints, &peer, &upload);
-            let resealed = try_seal_bytes(new_key, &record_aad(&name, record_epoch), &plain)?;
-            updated.push((name, resealed));
-            continue;
-        }
-        if name.starts_with("outbox/") {
-            let plain = open_bytes(old_key, name.as_bytes(), &sealed)
-                .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt during upgrade")))?;
-            let resealed = try_seal_bytes(
-                new_key,
-                &outbox_aad(&name, record_epoch, v2_revision),
-                &plain,
-            )?;
-            outbox_revs.insert(name.clone(), v2_revision);
-            updated.push((name, resealed));
-            continue;
-        }
-        if name.starts_with("history/") || name.starts_with("file/") {
-            let plain = open_bytes(old_key, name.as_bytes(), &sealed)
-                .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt during upgrade")))?;
-            let resealed = try_seal_bytes(new_key, &record_aad(&name, record_epoch), &plain)?;
-            updated.push((name, resealed));
-        }
-    }
-    Ok(UpgradedV1Records {
-        updated,
-        deleted,
-        deferred,
-        checkpoints,
-        outbox_revs,
-    })
+/// Pre-KDF inspection result for the browser vault header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VaultPresence {
+    /// No vault exists in IndexedDB.
+    None,
+    /// A compatible v3 vault exists and can be unlocked with a passphrase.
+    Compatible,
+    /// A vault with an incompatible schema version exists (detected pre-KDF) and requires reset.
+    IncompatibleVersion(u32),
 }
 
 #[derive(Debug)]
@@ -1394,6 +1598,8 @@ pub enum Error {
     Storage(String),
     /// The passphrase does not open the vault.
     WrongPassphrase,
+    /// Existing vault has an unsupported/legacy schema version (detected pre-KDF).
+    IncompatibleVersion(u32),
     /// A record does not decode, failed parameter validation, or failed rollback/integrity check.
     Corrupt(String),
     /// The vault revision changed underneath this tab (concurrent writer detected via CAS).
@@ -1405,6 +1611,10 @@ impl fmt::Display for Error {
         match self {
             Self::Storage(e) => write!(f, "the browser's storage failed: {e}"),
             Self::WrongPassphrase => write!(f, "wrong passphrase"),
+            Self::IncompatibleVersion(v) => write!(
+                f,
+                "incompatible vault format version {v} (expected v{VAULT_VERSION_V3})"
+            ),
             Self::Corrupt(e) => write!(f, "the vault is corrupt: {e}"),
             Self::Conflict { expected, actual } => write!(
                 f,
@@ -1424,17 +1634,19 @@ impl From<idb::Error> for Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
-/// The open vault.
+/// The open v3 vault.
 pub struct Vault {
     database: Database,
-    key: Zeroizing<[u8; 32]>,
+    keys: VaultKeys,
     header: RefCell<VaultHeader>,
-    /// Vault-instance epoch bound into per-record AADs (`0` only for pre-epoch legacy v2 vaults).
+    /// Random non-zero vault-instance epoch bound into per-record AADs.
     record_epoch: u64,
     /// Authoritative upload checkpoints persisted inside `STATE`.
     upload_checkpoints: RefCell<Vec<UploadCheckpoint>>,
     /// Authoritative per-outbox-record revisions persisted inside `STATE`.
-    outbox_revisions: RefCell<BTreeMap<String, u64>>,
+    outbox_revisions: RefCell<BTreeMap<(PublicKey, u64), u64>>,
+    /// Authoritative compact per-peer storage indices persisted inside `STATE`.
+    peer_storage: RefCell<BTreeMap<PublicKey, PeerStorageIndex>>,
 }
 
 /// Fail closed before opening or mutating any IndexedDB transaction once `pagehide` has released
@@ -1446,50 +1658,126 @@ fn ensure_vault_lock_owned() -> Result<()> {
     Ok(())
 }
 
-fn outbox_revisions_to_proto(map: &BTreeMap<String, u64>) -> Vec<OutboxRevision> {
+fn outbox_revisions_to_proto(map: &BTreeMap<(PublicKey, u64), u64>) -> Vec<OutboxRevision> {
     map.iter()
-        .map(|(key, &revision)| OutboxRevision {
-            key: key.clone(),
+        .map(|((peer, index), &revision)| OutboxRevision {
+            peer: peer.to_vec(),
+            index: *index,
             revision,
         })
         .collect()
 }
 
-fn outbox_revisions_from_proto(list: &[OutboxRevision]) -> BTreeMap<String, u64> {
-    list.iter()
-        .map(|entry| (entry.key.clone(), entry.revision))
-        .collect()
+fn outbox_revisions_from_proto(list: &[OutboxRevision]) -> BTreeMap<(PublicKey, u64), u64> {
+    let mut map = BTreeMap::new();
+    for entry in list {
+        if let Ok(peer) = PublicKey::try_from(entry.peer.as_slice()) {
+            map.insert((peer, entry.index), entry.revision);
+        }
+    }
+    map
 }
 
+fn peer_storage_to_proto(map: &BTreeMap<PublicKey, PeerStorageIndex>) -> Vec<PeerStorageIndex> {
+    map.values().cloned().collect()
+}
+
+fn peer_storage_from_proto(list: &[PeerStorageIndex]) -> BTreeMap<PublicKey, PeerStorageIndex> {
+    let mut map = BTreeMap::new();
+    for item in list {
+        if let Ok(peer) = PublicKey::try_from(item.peer.as_slice()) {
+            map.insert(peer, item.clone());
+        }
+    }
+    map
+}
+
+fn record_peer_entry(
+    storage: &mut BTreeMap<PublicKey, PeerStorageIndex>,
+    peer: PublicKey,
+    index: u64,
+    has_file: bool,
+) {
+    let ps = storage.entry(peer).or_insert_with(|| PeerStorageIndex {
+        peer: peer.to_vec(),
+        max_history_len: 0,
+        file_indices: Vec::new(),
+        kept_chunks: Vec::new(),
+    });
+    ps.max_history_len = ps.max_history_len.max(index.saturating_add(1));
+    if has_file && let Err(pos) = ps.file_indices.binary_search(&index) {
+        ps.file_indices.insert(pos, index);
+    }
+}
+
+fn set_peer_chunk_bit(
+    storage: &mut BTreeMap<PublicKey, PeerStorageIndex>,
+    peer: PublicKey,
+    id: &[u8],
+    index: u32,
+) -> Result<bool> {
+    let ps = storage.entry(peer).or_insert_with(|| PeerStorageIndex {
+        peer: peer.to_vec(),
+        max_history_len: 0,
+        file_indices: Vec::new(),
+        kept_chunks: Vec::new(),
+    });
+    if let Some(existing) = ps.kept_chunks.iter_mut().find(|a| a.id.as_slice() == id) {
+        existing.set_bit(index)
+    } else {
+        let mut chunks = AttachmentChunks {
+            id: id.to_vec(),
+            chunks_bitmap: Vec::new(),
+        };
+        let added = chunks.set_bit(index)?;
+        ps.kept_chunks.push(chunks);
+        Ok(added)
+    }
+}
+
+type PreparedEntry = (PublicKey, u64, HistoryEntry, Option<Zeroizing<Vec<u8>>>);
+
 impl Vault {
-    /// Whether this browser has a vault.
-    pub async fn exists() -> Result<bool> {
-        Ok(get(&open().await?, HEADER).await?.is_some())
+    /// Inspect the stored vault header pre-KDF to distinguish absent, compatible (v3), and
+    /// incompatible/legacy vaults.
+    pub async fn inspect() -> Result<VaultPresence> {
+        let database = open().await?;
+        let raw = get(&database, HEADER).await;
+        database.close();
+        let Some(raw) = raw? else {
+            return Ok(VaultPresence::None);
+        };
+        let header =
+            VaultHeader::decode(raw.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
+        if header.version != VAULT_VERSION_V3 {
+            return Ok(VaultPresence::IncompatibleVersion(header.version));
+        }
+        Ok(VaultPresence::Compatible)
     }
 
-    /// A new v2 vault holding `state`, under `passphrase`, replacing any other.
+    /// A new v3 vault holding `state`, under `passphrase`, replacing any other.
     pub async fn create(passphrase: &[u8], state: &AppState) -> Result<Self> {
         ensure_vault_lock_owned()?;
         let database = open().await?;
-        let header = VaultHeader::try_new()?;
-        let key = header.derive_key(passphrase)?;
+        let (header, keys) = VaultHeader::create_with_passphrase(passphrase)?;
         let header_bytes = header.encode_to_vec();
-        let record_epoch = 1u64;
+        let record_epoch = generate_record_epoch()?;
         let mut state_to_save = state.clone();
         state_to_save.record_epoch = record_epoch;
         state_to_save.upload_checkpoints.clear();
         state_to_save.outbox_revisions.clear();
-        state_to_save.deferred_initials_digest =
-            deferred_initials_digest(&DeferredInitialsRecord::default());
+        state_to_save.peer_storage.clear();
+        state_to_save.deferred_initials_digest = deferred_record_digest(&DeferredRecord::default());
         let vault = Self {
             database,
-            key,
+            keys,
             header: RefCell::new(header.clone()),
             record_epoch,
             upload_checkpoints: RefCell::new(Vec::new()),
             outbox_revisions: RefCell::new(BTreeMap::new()),
+            peer_storage: RefCell::new(BTreeMap::new()),
         };
-        let sealed_state = vault.seal_with_aad(&state_v2_aad(&header_bytes), &state_to_save)?;
+        let sealed_state = vault.seal_state(&state_v3_aad(&header_bytes), &state_to_save)?;
         state_to_save.zeroize_secrets();
         ensure_vault_lock_owned()?;
         let transaction = vault
@@ -1507,18 +1795,18 @@ impl Vault {
             return Err(e);
         }
         commit(transaction).await?;
-        write_rollback_anchor(&RollbackAnchor::for_v2_header(&header));
+        write_rollback_anchor(&RollbackAnchor::for_v3_header(&header));
         Ok(vault)
     }
 
-    /// Open the vault with `passphrase`, enforcing lock ownership, single-transaction snapshot
-    /// reads, rollback-anchor verification, and atomic v1 -> v2 KDF + record upgrade.
-    pub async fn unlock(passphrase: &[u8]) -> Result<(Self, AppState, DeferredInitialsRecord)> {
+    /// Open the v3 vault with `passphrase`, enforcing pre-KDF header/version/anchor validation,
+    /// KEK unwrapping, HKDF subkey derivation, and strict deferred sidecar digest verification.
+    pub async fn unlock(passphrase: &[u8]) -> Result<(Self, AppState, DeferredRecord)> {
         ensure_vault_lock_owned()?;
         let database = open().await?;
         ensure_vault_lock_owned()?;
-        // Read HEADER, STATE, and DEFERRED_INITIALS in one consistent ReadOnly snapshot.
-        let (header_bytes, sealed_state, sealed_deferred) = {
+        // Read HEADER and STATE in one consistent ReadOnly snapshot.
+        let (header_bytes, sealed_state) = {
             let tx = database.transaction(&[STORE], TransactionMode::ReadOnly)?;
             let store = tx.object_store(STORE)?;
             let header = store
@@ -1531,153 +1819,49 @@ impl Vault {
                 .await?
                 .map(|v| Uint8Array::new(&v).to_vec())
                 .ok_or_else(|| Error::Corrupt("no state".into()))?;
-            let deferred = store
-                .get(JsValue::from_str(DEFERRED_INITIALS))?
-                .await?
-                .map(|v| Uint8Array::new(&v).to_vec());
-            (header, state, deferred)
+            (header, state)
         };
         let header = VaultHeader::decode(header_bytes.as_slice())
             .map_err(|e| Error::Corrupt(e.to_string()))?;
-        // Validate version, salt, Argon2 parameters, and rollback anchor BEFORE deriving key.
+        // Validate version, revision, salt, Argon2 bounds, vault_id, wrapped_root_key, and
+        // rollback anchor BEFORE deriving the Argon2id KEK.
         header.validate()?;
         let anchor = read_rollback_anchor();
         check_unlock_against_anchor(anchor.as_ref(), &header)?;
-        let key = header.derive_key(passphrase)?;
 
-        if header.is_legacy_v1() {
-            // Unlock legacy v1 vault with `"state"` AAD, then atomically re-key with default
-            // 64 MiB Argon2id params + fresh salt and re-encrypt all vault records in one RW tx.
-            let plain =
-                open_bytes(&key, STATE.as_bytes(), &sealed_state).ok_or(Error::WrongPassphrase)?;
-            let mut state =
-                AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
-
-            let v2_header = VaultHeader::try_new()?;
-            let new_key = v2_header.derive_key(passphrase)?;
-            let v2_header_bytes = v2_header.encode_to_vec();
-            let record_epoch = 1u64;
-
-            ensure_vault_lock_owned()?;
-            let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
-            let store = transaction.object_store(STORE)?;
-            let current = match store.get(JsValue::from_str(HEADER))?.await? {
-                Some(v) => Uint8Array::new(&v).to_vec(),
-                None => {
-                    let _ = transaction.abort();
-                    return Err(Error::Corrupt("no vault".into()));
-                }
-            };
-            if let Err(e) = ensure_vault_lock_owned() {
-                let _ = transaction.abort();
-                return Err(e);
-            }
-            if current != header_bytes {
-                let actual = VaultHeader::decode(current.as_slice())
-                    .map(|h| h.revision)
-                    .unwrap_or(0);
-                let _ = transaction.abort();
-                return Err(Error::Conflict {
-                    expected: 0,
-                    actual,
-                });
-            }
-            let keys = store.get_all_keys(None, None)?.await?;
-            let values = store.get_all(None, None)?.await?;
-            let all_records: Vec<(String, Vec<u8>)> = keys
-                .into_iter()
-                .zip(values)
-                .map(|(k, v)| {
-                    (
-                        k.as_string().unwrap_or_default(),
-                        Uint8Array::new(&v).to_vec(),
-                    )
-                })
-                .collect();
-            let UpgradedV1Records {
-                updated,
-                deleted,
-                deferred,
-                checkpoints,
-                outbox_revs,
-            } = match upgrade_v1_records(
-                &key,
-                &new_key,
-                record_epoch,
-                v2_header.revision,
-                all_records,
-            ) {
-                Ok(res) => res,
-                Err(e) => {
-                    let _ = transaction.abort();
-                    return Err(e);
-                }
-            };
-            state.record_epoch = record_epoch;
-            state.upload_checkpoints = checkpoints.clone();
-            state.outbox_revisions = outbox_revisions_to_proto(&outbox_revs);
-            state.deferred_initials_digest = deferred_initials_digest(&deferred);
-            let encoded_state = Zeroizing::new(state.encode_to_vec());
-            let v2_sealed_state =
-                match try_seal_bytes(&new_key, &state_v2_aad(&v2_header_bytes), &encoded_state) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let _ = transaction.abort();
-                        return Err(e);
-                    }
-                };
-            let write_res: Result<()> = (|| {
-                for (name, sealed) in &updated {
-                    store.put(&bytes(sealed), Some(&name.as_str().into()))?;
-                }
-                for name in &deleted {
-                    store.delete(JsValue::from_str(name))?;
-                }
-                store.put(&bytes(&v2_sealed_state), Some(&STATE.into()))?;
-                store.put(&bytes(&v2_header_bytes), Some(&HEADER.into()))?;
-                Ok(())
-            })();
-            if let Err(e) = write_res {
-                let _ = transaction.abort();
-                return Err(e);
-            }
-            commit(transaction).await?;
-            write_rollback_anchor(&RollbackAnchor::for_v2_header(&v2_header));
-
-            let vault = Self {
-                database,
-                key: new_key,
-                header: RefCell::new(v2_header),
-                record_epoch,
-                upload_checkpoints: RefCell::new(checkpoints),
-                outbox_revisions: RefCell::new(outbox_revs),
-            };
-            Ok((vault, state, deferred))
-        } else {
-            let plain = open_bytes(&key, &state_v2_aad(&header_bytes), &sealed_state)
-                .ok_or(Error::WrongPassphrase)?;
-            let state =
-                AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
-            let deferred = match sealed_deferred {
-                Some(sealed) => open_deferred_initials(&key, &sealed)?,
-                None => DeferredInitialsRecord::default(),
-            };
-            verify_deferred_initials_digest(&state.deferred_initials_digest, &deferred)?;
-            let next_anchor = advance_anchor(anchor.as_ref(), &header);
-            write_rollback_anchor(&next_anchor);
-            let record_epoch = state.record_epoch;
-            let checkpoints = state.upload_checkpoints.clone();
-            let outbox_revs = outbox_revisions_from_proto(&state.outbox_revisions);
-            let vault = Self {
-                database,
-                key,
-                header: RefCell::new(header),
-                record_epoch,
-                upload_checkpoints: RefCell::new(checkpoints),
-                outbox_revisions: RefCell::new(outbox_revs),
-            };
-            Ok((vault, state, deferred))
+        let keys = header.unwrap_keys(passphrase)?;
+        let plain = open_bytes(&keys.state_key, &state_v3_aad(&header_bytes), &sealed_state)
+            .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
+        let state =
+            AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
+        if state.record_epoch == 0 {
+            return Err(Error::Corrupt("vault state missing record_epoch".into()));
         }
+
+        let deferred_key = opaque_deferred_key(&keys.idb_mac_key);
+        let sealed_deferred = get(&database, &deferred_key).await?;
+        let deferred = match sealed_deferred {
+            Some(sealed) => open_deferred(&keys.record_key, state.record_epoch, &sealed)?,
+            None => DeferredRecord::default(),
+        };
+        verify_deferred_record_digest(&state.deferred_initials_digest, &deferred)?;
+
+        let next_anchor = advance_anchor(anchor.as_ref(), &header);
+        write_rollback_anchor(&next_anchor);
+        let record_epoch = state.record_epoch;
+        let checkpoints = state.upload_checkpoints.clone();
+        let outbox_revs = outbox_revisions_from_proto(&state.outbox_revisions);
+        let peer_storage = peer_storage_from_proto(&state.peer_storage);
+        let vault = Self {
+            database,
+            keys,
+            header: RefCell::new(header),
+            record_epoch,
+            upload_checkpoints: RefCell::new(checkpoints),
+            outbox_revisions: RefCell::new(outbox_revs),
+            peer_storage: RefCell::new(peer_storage),
+        };
+        Ok((vault, state, deferred))
     }
 
     /// Open an IndexedDB RW transaction and enforce lock ownership plus monotonic CAS revision
@@ -1713,17 +1897,19 @@ impl Vault {
     fn prepare_state_for_commit(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         checkpoints: &[UploadCheckpoint],
-        outbox_revs: &BTreeMap<String, u64>,
+        outbox_revs: &BTreeMap<(PublicKey, u64), u64>,
+        peer_storage: &BTreeMap<PublicKey, PeerStorageIndex>,
         next_header_bytes: &[u8],
     ) -> Result<Vec<u8>> {
         let mut stamped = state.clone();
         stamped.record_epoch = self.record_epoch;
         stamped.upload_checkpoints = checkpoints.to_vec();
         stamped.outbox_revisions = outbox_revisions_to_proto(outbox_revs);
-        stamped.deferred_initials_digest = deferred_initials_digest(deferred);
-        let sealed = self.seal_with_aad(&state_v2_aad(next_header_bytes), &stamped);
+        stamped.peer_storage = peer_storage_to_proto(peer_storage);
+        stamped.deferred_initials_digest = deferred_record_digest(deferred);
+        let sealed = self.seal_state(&state_v3_aad(next_header_bytes), &stamped);
         stamped.zeroize_secrets();
         sealed
     }
@@ -1741,24 +1927,35 @@ impl Vault {
     pub async fn save<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> Result<()> {
         let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
         let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
-        let outgoing_vec: Vec<(String, Option<&OutgoingRecord>)> = outgoing
+        let outgoing_vec: Vec<(PublicKey, u64, Option<&OutgoingRecord>)> = outgoing
             .into_iter()
-            .map(|(peer, index, record)| (outbox_key(peer, *index), record.as_ref()))
+            .map(|(peer, index, record)| (*peer, *index, record.as_ref()))
             .collect();
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
-        for (key, record) in &outgoing_vec {
+        for &(peer, index, record) in &outgoing_vec {
             if record.is_some() {
-                next_outbox_revs.insert(key.clone(), next_header.revision);
+                next_outbox_revs.insert((peer, index), next_header.revision);
             } else {
-                next_outbox_revs.remove(key);
+                next_outbox_revs.remove(&(peer, index));
             }
+        }
+        let prepared_entries: Vec<PreparedEntry> = entries
+            .into_iter()
+            .map(|(peer, index, entry)| {
+                let (stripped, file_data) = entry.without_file();
+                (*peer, *index, stripped, file_data)
+            })
+            .collect();
+        let mut next_peer_storage = self.peer_storage.borrow().clone();
+        for (peer, index, _, file_data) in &prepared_entries {
+            record_peer_entry(&mut next_peer_storage, *peer, *index, file_data.is_some());
         }
         let checkpoints = self.upload_checkpoints.borrow().clone();
         let sealed_state = match self.prepare_state_for_commit(
@@ -1766,6 +1963,7 @@ impl Vault {
             deferred,
             &checkpoints,
             &next_outbox_revs,
+            &next_peer_storage,
             &next_header_bytes,
         ) {
             Ok(s) => s,
@@ -1775,9 +1973,9 @@ impl Vault {
             }
         };
         let write_res: Result<()> = (|| {
-            self.put_entries(&store, entries)?;
+            self.put_prepared_entries(&store, prepared_entries)?;
             self.put_outgoing(&store, &outgoing_vec, next_header.revision)?;
-            self.put_deferred_initials(&store, deferred)?;
+            self.put_deferred(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
             Ok(())
@@ -1788,21 +1986,19 @@ impl Vault {
         }
         commit(transaction).await?;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
+        *self.peer_storage.borrow_mut() = next_peer_storage;
         self.commit_header_and_anchor(next_header);
         Ok(())
     }
 
-    /// Put or delete the separate encrypted [`DEFERRED_INITIALS`] record in `store`.
-    fn put_deferred_initials(
-        &self,
-        store: &idb::ObjectStore,
-        deferred: &DeferredInitialsRecord,
-    ) -> Result<()> {
+    /// Put or delete the separate encrypted [`DeferredRecord`] under its opaque HMAC key.
+    fn put_deferred(&self, store: &idb::ObjectStore, deferred: &DeferredRecord) -> Result<()> {
+        let key = opaque_deferred_key(&self.keys.idb_mac_key);
         if deferred.is_empty() {
-            store.delete(JsValue::from_str(DEFERRED_INITIALS))?;
+            store.delete(JsValue::from_str(&key))?;
         } else {
-            let sealed = try_seal_deferred_initials(&self.key, deferred)?;
-            store.put(&bytes(&sealed), Some(&DEFERRED_INITIALS.into()))?;
+            let sealed = try_seal_deferred(&self.keys.record_key, self.record_epoch, deferred)?;
+            store.put(&bytes(&sealed), Some(&key.as_str().into()))?;
         }
         Ok(())
     }
@@ -1811,64 +2007,69 @@ impl Vault {
     fn put_outgoing(
         &self,
         store: &idb::ObjectStore,
-        outgoing: &[(String, Option<&OutgoingRecord>)],
+        outgoing: &[(PublicKey, u64, Option<&OutgoingRecord>)],
         revision: u64,
     ) -> Result<()> {
-        for (key, record) in outgoing {
+        for &(peer, index, record) in outgoing {
+            let key = opaque_outbox_key(&self.keys.idb_mac_key, &peer, index);
             match record {
                 Some(record) => {
-                    let aad = outbox_aad(key, self.record_epoch, revision);
-                    let sealed = self.seal_with_aad(&aad, *record)?;
+                    let aad = outbox_aad(&peer, index, self.record_epoch, revision);
+                    let sealed = self.seal_record(&aad, record)?;
                     store.put(&bytes(&sealed), Some(&key.as_str().into()))?;
                 }
                 None => {
-                    store.delete(JsValue::from_str(key))?;
+                    store.delete(JsValue::from_str(&key))?;
                 }
             }
         }
         Ok(())
     }
 
-    /// Put `entries` in `store`, each file of theirs in a record of its own.
-    fn put_entries<'a>(
+    /// Put pre-stripped `entries` and optional separate `FileRecord`s into `store` under opaque keys.
+    fn put_prepared_entries(
         &self,
         store: &idb::ObjectStore,
-        entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
+        entries: Vec<PreparedEntry>,
     ) -> Result<()> {
-        for (peer, index, entry) in entries {
-            let key = history_key(peer, *index);
-            let (mut entry, data) = entry.without_file();
+        for (peer, index, mut entry, data) in entries {
             if let Some(data) = data {
-                let name = file_key(peer, *index);
+                let fkey = opaque_file_key(&self.keys.idb_mac_key, &peer, index);
                 let mut record = FileRecord {
                     data: data.to_vec(),
                 };
-                let sealed = self.seal_record(&name, &record)?;
+                let sealed =
+                    self.seal_record(&file_aad(&peer, index, self.record_epoch), &record)?;
                 record.data.zeroize();
-                store.put(&bytes(&sealed), Some(&name.as_str().into()))?;
+                store.put(&bytes(&sealed), Some(&fkey.as_str().into()))?;
             }
-            let sealed_entry = self.seal_record(&key, &entry)?;
+            let hkey = opaque_history_key(&self.keys.idb_mac_key, &peer, index);
+            let sealed_entry =
+                self.seal_record(&history_aad(&peer, index, self.record_epoch), &entry)?;
             entry.zeroize_secrets();
-            store.put(&bytes(&sealed_entry), Some(&key.as_str().into()))?;
+            store.put(&bytes(&sealed_entry), Some(&hkey.as_str().into()))?;
         }
         Ok(())
     }
 
     /// The bytes of the file of the history entry `index` of the chat with `peer`.
     pub async fn file(&self, peer: &PublicKey, index: u64) -> Result<Vec<u8>> {
-        let name = file_key(peer, index);
-        self.file_data(&name)
+        self.file_data(peer, index)
             .await?
-            .ok_or_else(|| Error::Corrupt(format!("{name} is missing")))
+            .ok_or_else(|| Error::Corrupt(format!("file record {index} is missing")))
     }
 
-    async fn file_data(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        let Some(sealed) = get(&self.database, name).await? else {
+    async fn file_data(&self, peer: &PublicKey, index: u64) -> Result<Option<Vec<u8>>> {
+        let key = opaque_file_key(&self.keys.idb_mac_key, peer, index);
+        let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
         };
-        let record = self
-            .open_record(name, &sealed)
-            .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
+        let record = open_bytes(
+            &self.keys.record_key,
+            &file_aad(peer, index, self.record_epoch),
+            &sealed,
+        )
+        .ok_or_else(|| Error::Corrupt(format!("file record {index} does not decrypt")))?;
         FileRecord::decode(record.as_slice())
             .map(|record| Some(record.data))
             .map_err(|e| Error::Corrupt(e.to_string()))
@@ -1886,7 +2087,7 @@ impl Vault {
             .as_ref()
             .and_then(|content| content.kind.clone());
         if entry.file > 0 {
-            let Some(data) = self.file_data(&file_key(peer, index)).await? else {
+            let Some(data) = self.file_data(peer, index).await? else {
                 return Ok(None);
             };
             match kind.as_mut() {
@@ -1900,13 +2101,16 @@ impl Vault {
 
     /// The history entry `index` of the chat with `peer`, without its file, if any.
     pub async fn entry(&self, peer: &PublicKey, index: u64) -> Result<Option<HistoryEntry>> {
-        let name = history_key(peer, index);
-        let Some(sealed) = get(&self.database, &name).await? else {
+        let key = opaque_history_key(&self.keys.idb_mac_key, peer, index);
+        let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
         };
-        let entry = self
-            .open_record(&name, &sealed)
-            .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
+        let entry = open_bytes(
+            &self.keys.record_key,
+            &history_aad(peer, index, self.record_epoch),
+            &sealed,
+        )
+        .ok_or_else(|| Error::Corrupt(format!("history entry {index} does not decrypt")))?;
         HistoryEntry::decode(entry.as_slice())
             .map(Some)
             .map_err(|e| Error::Corrupt(e.to_string()))
@@ -1915,25 +2119,27 @@ impl Vault {
     /// The record of the message waiting to be pushed that is the history entry `index` of the
     /// chat with `peer`.
     pub async fn outgoing(&self, peer: &PublicKey, index: u64) -> Result<OutgoingRecord> {
-        let name = outbox_key(peer, index);
-        let sealed = get(&self.database, &name)
+        let key = opaque_outbox_key(&self.keys.idb_mac_key, peer, index);
+        let sealed = get(&self.database, &key)
             .await?
-            .ok_or_else(|| Error::Corrupt(format!("{name} is missing")))?;
-        let expected_rev = self.outbox_revisions.borrow().get(&name).copied();
-        let record = match expected_rev {
-            Some(rev) => open_bytes(
-                &self.key,
-                &outbox_aad(&name, self.record_epoch, rev),
-                &sealed,
-            ),
-            None if self.record_epoch == 0 => open_bytes(&self.key, name.as_bytes(), &sealed),
-            None => None,
-        }
-        .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
+            .ok_or_else(|| Error::Corrupt(format!("outbox record {index} is missing")))?;
+        let expected_rev = self
+            .outbox_revisions
+            .borrow()
+            .get(&(*peer, index))
+            .copied()
+            .ok_or_else(|| Error::Corrupt(format!("outbox record {index} missing revision")))?;
+        let record = open_bytes(
+            &self.keys.record_key,
+            &outbox_aad(peer, index, self.record_epoch, expected_rev),
+            &sealed,
+        )
+        .ok_or_else(|| Error::Corrupt(format!("outbox record {index} does not decrypt")))?;
         OutgoingRecord::decode(record.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))
     }
 
-    /// The history of the chat with `peer`, oldest first, at most the last `limit` entries.
+    /// The history of the chat with `peer`, oldest first, at most the last `limit` entries,
+    /// pipelined as point gets inside a single `ReadOnly` transaction.
     pub async fn history(
         &self,
         peer: &PublicKey,
@@ -1943,35 +2149,36 @@ impl Vault {
         let Some((first, last)) = history_bounds(history_len, limit) else {
             return Ok(vec![]);
         };
-        let range = history_range(peer, first, last)?;
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadOnly)?;
         let store = transaction.object_store(STORE)?;
-        let keys = store
-            .get_all_keys(Some(range.clone().into()), None)?
-            .await?;
-        let values = store.get_all(Some(range.into()), None)?.await?;
-        keys.into_iter()
-            .zip(values)
-            .map(|(key, value)| {
-                let key = key.as_string().unwrap_or_default();
-                let index = key
-                    .rsplit('/')
-                    .next()
-                    .and_then(|index| index.parse().ok())
-                    .ok_or_else(|| Error::Corrupt(format!("{key} is not a history entry")))?;
-                let entry = self
-                    .open_record(&key, &Uint8Array::new(&value).to_vec())
-                    .ok_or_else(|| Error::Corrupt(format!("{key} does not decrypt")))?;
-                let entry = HistoryEntry::decode(entry.as_slice())
-                    .map_err(|e| Error::Corrupt(e.to_string()))?;
-                Ok((index, entry))
-            })
-            .collect()
+        let mut requests = Vec::with_capacity((last - first + 1) as usize);
+        for index in first..=last {
+            let key = opaque_history_key(&self.keys.idb_mac_key, peer, index);
+            requests.push((index, store.get(JsValue::from_str(&key))?));
+        }
+        let mut entries = Vec::with_capacity(requests.len());
+        for (index, req) in requests {
+            let Some(value) = req.await? else {
+                continue;
+            };
+            let sealed = Uint8Array::new(&value).to_vec();
+            let plain = open_bytes(
+                &self.keys.record_key,
+                &history_aad(peer, index, self.record_epoch),
+                &sealed,
+            )
+            .ok_or_else(|| Error::Corrupt(format!("history entry {index} does not decrypt")))?;
+            let entry = HistoryEntry::decode(plain.as_slice())
+                .map_err(|e| Error::Corrupt(e.to_string()))?;
+            entries.push((index, entry));
+        }
+        Ok(entries)
     }
 
     /// Keep chunk `index` of the attachment `id`, in the chat with `peer`, as the server has it.
+    /// Short-circuits `STATE` rewrite when chunk `index` is already recorded in `peer_storage`.
     pub async fn put_chunk(
         &self,
         peer: &PublicKey,
@@ -1979,49 +2186,102 @@ impl Vault {
         index: u32,
         chunk: &[u8],
     ) -> Result<()> {
-        let (transaction, store, _) = self.begin_checked_rw_tx().await?;
-        if let Err(e) = store.put(&bytes(chunk), Some(&chunk_key(peer, id, index).into())) {
-            let _ = transaction.abort();
-            return Err(e.into());
+        let key = opaque_chunk_key(&self.keys.idb_mac_key, peer, id, index);
+        let already_tracked = self
+            .peer_storage
+            .borrow()
+            .get(peer)
+            .and_then(|ps| ps.kept_chunks.iter().find(|a| a.id.as_slice() == id))
+            .is_some_and(|a| a.has_bit(index));
+
+        if already_tracked {
+            let (transaction, store, _) = self.begin_checked_rw_tx().await?;
+            if let Err(e) = store.put(&bytes(chunk), Some(&key.as_str().into())) {
+                let _ = transaction.abort();
+                return Err(e.into());
+            }
+            return commit(transaction).await;
         }
-        commit(transaction).await
+
+        let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
+        let write = async {
+            let state_raw = store
+                .get(JsValue::from_str(STATE))?
+                .await?
+                .ok_or_else(|| Error::Corrupt("no state".into()))?;
+            ensure_vault_lock_owned()?;
+            let state_bytes = Uint8Array::new(&state_raw).to_vec();
+            let plain = open_bytes(
+                &self.keys.state_key,
+                &state_v3_aad(&trusted.encode_to_vec()),
+                &state_bytes,
+            )
+            .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
+            let mut app_state =
+                AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
+
+            let mut next_peer_storage = self.peer_storage.borrow().clone();
+            set_peer_chunk_bit(&mut next_peer_storage, *peer, id, index)?;
+            app_state.record_epoch = self.record_epoch;
+            app_state.upload_checkpoints = self.upload_checkpoints.borrow().clone();
+            app_state.outbox_revisions = outbox_revisions_to_proto(&self.outbox_revisions.borrow());
+            app_state.peer_storage = peer_storage_to_proto(&next_peer_storage);
+
+            let next = trusted.next_revision()?;
+            let header = next.encode_to_vec();
+            let sealed = self.seal_state(&state_v3_aad(&header), &app_state);
+            app_state.zeroize_secrets();
+            let sealed = sealed?;
+
+            store.put(&bytes(chunk), Some(&key.as_str().into()))?;
+            store.put(&bytes(&sealed), Some(&STATE.into()))?;
+            store.put(&bytes(&header), Some(&HEADER.into()))?;
+            Ok((next, next_peer_storage))
+        }
+        .await;
+        let (next, next_peer_storage) = match write {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = transaction.abort();
+                return Err(e);
+            }
+        };
+        commit(transaction).await?;
+        *self.peer_storage.borrow_mut() = next_peer_storage;
+        self.commit_header_and_anchor(next);
+        Ok(())
     }
 
     /// Chunk `index` of the attachment `id`, in the chat with `peer`, if kept.
     pub async fn chunk(&self, peer: &PublicKey, id: &[u8], index: u32) -> Result<Option<Vec<u8>>> {
-        get(&self.database, &chunk_key(peer, id, index)).await
+        let key = opaque_chunk_key(&self.keys.idb_mac_key, peer, id, index);
+        get(&self.database, &key).await
     }
 
-    /// How many chunks of the attachment `id`, in the chat with `peer`, are kept.
+    /// How many chunks of the attachment `id`, in the chat with `peer`, are kept (O(1) bitmap count).
     pub async fn chunks_kept(&self, peer: &PublicKey, id: &[u8]) -> Result<u32> {
-        let range = prefix_range(&format!("attachment/{}/{}/", hex(peer), hex(id)))?;
-        let transaction = self
-            .database
-            .transaction(&[STORE], TransactionMode::ReadOnly)?;
-        let count = transaction
-            .object_store(STORE)?
-            .count(Some(range.into()))?
-            .await?;
-        Ok(count)
+        Ok(self
+            .peer_storage
+            .borrow()
+            .get(peer)
+            .and_then(|ps| ps.kept_chunks.iter().find(|a| a.id.as_slice() == id))
+            .map_or(0, AttachmentChunks::count))
     }
 
     /// Keep `upload` in the chat with `peer`, replacing any previous copy, and bind its
-    /// checkpoint into `STATE` in the same transaction.
+    /// checkpoint and commit revision into `STATE` in the same transaction.
     pub async fn save_upload(&self, peer: &PublicKey, upload: &PendingUpload) -> Result<()> {
-        let name = upload_key(peer, &upload.id);
-        let sealed = self.seal_record(&name, upload)?;
-        self.write_upload(peer, &upload.id, &name, Some((upload, &sealed)))
-            .await
+        self.write_upload(peer, &upload.id, Some(upload)).await
     }
 
     /// Atomically promote a waiting sign-in upload (`old_id`) into a server-started `new_upload`
     /// together with the updated `state`, `deferred`, `entries`, and `outgoing` in a single
-    /// IndexedDB RW transaction (preventing orphaned uploads or stale placeholder pointers on crash).
+    /// IndexedDB RW transaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn promote_upload<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         peer: &PublicKey,
         old_id: &[u8],
         new_upload: &PendingUpload,
@@ -2031,27 +2291,44 @@ impl Vault {
         let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
         let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
-        let outgoing_vec: Vec<(String, Option<&OutgoingRecord>)> = outgoing
+        let outgoing_vec: Vec<(PublicKey, u64, Option<&OutgoingRecord>)> = outgoing
             .into_iter()
-            .map(|(p, index, record)| (outbox_key(p, *index), record.as_ref()))
+            .map(|(p, index, record)| (*p, *index, record.as_ref()))
             .collect();
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
-        for (key, record) in &outgoing_vec {
+        for &(p, index, record) in &outgoing_vec {
             if record.is_some() {
-                next_outbox_revs.insert(key.clone(), next_header.revision);
+                next_outbox_revs.insert((p, index), next_header.revision);
             } else {
-                next_outbox_revs.remove(key);
+                next_outbox_revs.remove(&(p, index));
             }
+        }
+        let prepared_entries: Vec<PreparedEntry> = entries
+            .into_iter()
+            .map(|(p, index, entry)| {
+                let (stripped, file_data) = entry.without_file();
+                (*p, *index, stripped, file_data)
+            })
+            .collect();
+        let mut next_peer_storage = self.peer_storage.borrow().clone();
+        for (p, index, _, file_data) in &prepared_entries {
+            record_peer_entry(&mut next_peer_storage, *p, *index, file_data.is_some());
         }
         let mut next_checkpoints = self.upload_checkpoints.borrow().clone();
         remove_upload_checkpoint(&mut next_checkpoints, peer, old_id);
-        upsert_upload_checkpoint(&mut next_checkpoints, peer, new_upload);
+        upsert_upload_checkpoint(
+            &mut next_checkpoints,
+            peer,
+            new_upload,
+            next_header.revision,
+        );
 
         let sealed_state = match self.prepare_state_for_commit(
             state,
             deferred,
             &next_checkpoints,
             &next_outbox_revs,
+            &next_peer_storage,
             &next_header_bytes,
         ) {
             Ok(s) => s,
@@ -2060,23 +2337,31 @@ impl Vault {
                 return Err(e);
             }
         };
-        let new_name = upload_key(peer, &new_upload.id);
-        let sealed_upload = match self.seal_record(&new_name, new_upload) {
+        let sealed_upload = match self.seal_record(
+            &upload_aad(
+                peer,
+                &new_upload.id,
+                self.record_epoch,
+                next_header.revision,
+            ),
+            new_upload,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 let _ = transaction.abort();
                 return Err(e);
             }
         };
-        let old_name = upload_key(peer, old_id);
+        let new_key = opaque_upload_key(&self.keys.idb_mac_key, peer, &new_upload.id);
+        let old_key = opaque_upload_key(&self.keys.idb_mac_key, peer, old_id);
         let write_res: Result<()> = (|| {
-            store.put(&bytes(&sealed_upload), Some(&new_name.as_str().into()))?;
-            if old_name != new_name {
-                store.delete(JsValue::from_str(&old_name))?;
+            store.put(&bytes(&sealed_upload), Some(&new_key.as_str().into()))?;
+            if old_key != new_key {
+                store.delete(JsValue::from_str(&old_key))?;
             }
-            self.put_entries(&store, entries)?;
+            self.put_prepared_entries(&store, prepared_entries)?;
             self.put_outgoing(&store, &outgoing_vec, next_header.revision)?;
-            self.put_deferred_initials(&store, deferred)?;
+            self.put_deferred(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
             Ok(())
@@ -2088,6 +2373,7 @@ impl Vault {
         commit(transaction).await?;
         *self.upload_checkpoints.borrow_mut() = next_checkpoints;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
+        *self.peer_storage.borrow_mut() = next_peer_storage;
         self.commit_header_and_anchor(next_header);
         Ok(())
     }
@@ -2095,19 +2381,18 @@ impl Vault {
     /// Forget the upload once cancelled or deleted from the server, removing its checkpoint from
     /// `STATE` in the same transaction.
     pub async fn forget_upload(&self, peer: &PublicKey, id: &[u8]) -> Result<()> {
-        let name = upload_key(peer, id);
-        self.write_upload(peer, id, &name, None).await
+        self.write_upload(peer, id, None).await
     }
 
-    /// Advance the revision, update `AppState.upload_checkpoints`, and rebind `STATE` to the new
-    /// header in the same transaction as the upload record mutation.
+    /// Advance the revision, seal `upload` under `next.revision` (if `Some`), update
+    /// `AppState.upload_checkpoints`, and rebind `STATE` to the new header in one atomic RW tx.
     async fn write_upload(
         &self,
         peer: &PublicKey,
         id: &[u8],
-        name: &str,
-        upload: Option<(&PendingUpload, &[u8])>,
+        upload: Option<&PendingUpload>,
     ) -> Result<()> {
+        let key = opaque_upload_key(&self.keys.idb_mac_key, peer, id);
         let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
         let write = async {
             let state_raw = store
@@ -2117,40 +2402,49 @@ impl Vault {
             ensure_vault_lock_owned()?;
             let state_bytes = Uint8Array::new(&state_raw).to_vec();
             let plain = open_bytes(
-                &self.key,
-                &state_v2_aad(&trusted.encode_to_vec()),
+                &self.keys.state_key,
+                &state_v3_aad(&trusted.encode_to_vec()),
                 &state_bytes,
             )
             .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
             let mut app_state =
                 AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
 
-            let mut next_checkpoints = self.upload_checkpoints.borrow().clone();
-            match upload {
-                Some((pending, _)) => {
-                    upsert_upload_checkpoint(&mut next_checkpoints, peer, pending)
-                }
-                None => remove_upload_checkpoint(&mut next_checkpoints, peer, id),
-            }
-            app_state.record_epoch = self.record_epoch;
-            app_state.upload_checkpoints = next_checkpoints.clone();
-
             let next = trusted.next_revision()?;
-            let header = next.encode_to_vec();
-            let sealed = self.seal_with_aad(&state_v2_aad(&header), &app_state);
-            app_state.zeroize_secrets();
-            let sealed = sealed?;
-
-            let name = JsValue::from_str(name);
-            match upload {
-                Some((_, sealed_upload)) => {
-                    store.put(&bytes(sealed_upload), Some(&name))?;
+            let mut next_checkpoints = self.upload_checkpoints.borrow().clone();
+            let sealed_upload = match upload {
+                Some(pending) => {
+                    upsert_upload_checkpoint(&mut next_checkpoints, peer, pending, next.revision);
+                    Some(self.seal_record(
+                        &upload_aad(peer, &pending.id, self.record_epoch, next.revision),
+                        pending,
+                    )?)
                 }
                 None => {
-                    store.delete(name)?;
+                    remove_upload_checkpoint(&mut next_checkpoints, peer, id);
+                    None
+                }
+            };
+            app_state.record_epoch = self.record_epoch;
+            app_state.upload_checkpoints = next_checkpoints.clone();
+            app_state.outbox_revisions = outbox_revisions_to_proto(&self.outbox_revisions.borrow());
+            app_state.peer_storage = peer_storage_to_proto(&self.peer_storage.borrow());
+
+            let header = next.encode_to_vec();
+            let sealed_state = self.seal_state(&state_v3_aad(&header), &app_state);
+            app_state.zeroize_secrets();
+            let sealed_state = sealed_state?;
+
+            let key_js = JsValue::from_str(&key);
+            match sealed_upload {
+                Some(sealed_upload) => {
+                    store.put(&bytes(&sealed_upload), Some(&key_js))?;
+                }
+                None => {
+                    store.delete(key_js)?;
                 }
             }
-            store.put(&bytes(&sealed), Some(&STATE.into()))?;
+            store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&header), Some(&HEADER.into()))?;
             Ok((next, next_checkpoints))
         }
@@ -2170,64 +2464,85 @@ impl Vault {
 
     /// The upload `id`, in the chat with `peer`, if kept and matching its `STATE` checkpoint.
     pub async fn upload(&self, peer: &PublicKey, id: &[u8]) -> Result<Option<PendingUpload>> {
-        let name = upload_key(peer, id);
-        let Some(sealed) = get(&self.database, &name).await? else {
+        let key = opaque_upload_key(&self.keys.idb_mac_key, peer, id);
+        let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
         };
-        let upload = self
-            .open_record(&name, &sealed)
-            .ok_or_else(|| Error::Corrupt(format!("{name} does not decrypt")))?;
-        let upload =
-            PendingUpload::decode(upload.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
-        let enforced = self.record_epoch > 0;
-        if !verify_upload_checkpoint(&self.upload_checkpoints.borrow(), enforced, peer, &upload) {
-            return Err(Error::Corrupt(format!(
-                "{name} does not match authenticated upload checkpoint"
-            )));
-        }
+        let checkpoints = self.upload_checkpoints.borrow();
+        let cp = find_upload_checkpoint(&checkpoints, peer, id).ok_or_else(|| {
+            Error::Corrupt("upload record missing authenticated upload checkpoint".into())
+        })?;
+        let upload = decode_upload_with_checkpoint(
+            &self.keys.record_key,
+            self.record_epoch,
+            cp,
+            peer,
+            &sealed,
+        )
+        .ok_or_else(|| {
+            Error::Corrupt("upload record failed decryption or checkpoint check".into())
+        })?;
         Ok(Some(upload))
     }
 
     /// The uploads kept, those not done, with the peers of their chats: those of the chat with
-    /// `peer` only, if given. Tolerates individual corrupt or stale upload records so one damaged
-    /// entry cannot block vault unlock or chat deletion.
+    /// `peer` only, if given. Point-gets each tracked checkpoint without prefix scanning,
+    /// tolerating individual corrupt records.
     pub async fn uploads(
         &self,
         peer: Option<&PublicKey>,
     ) -> Result<Vec<(PublicKey, PendingUpload)>> {
-        let range = match peer {
-            Some(peer) => prefix_range(&format!("upload/{}/", hex(peer)))?,
-            None => prefix_range("upload/")?,
-        };
+        let matching: Vec<(PublicKey, UploadCheckpoint)> = self
+            .upload_checkpoints
+            .borrow()
+            .iter()
+            .filter_map(|cp| {
+                let p = PublicKey::try_from(cp.peer.as_slice()).ok()?;
+                if peer.is_none_or(|wanted| wanted == &p) {
+                    Some((p, cp.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if matching.is_empty() {
+            return Ok(Vec::new());
+        }
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadOnly)?;
         let store = transaction.object_store(STORE)?;
-        let keys = store
-            .get_all_keys(Some(range.clone().into()), None)?
-            .await?;
-        let values = store.get_all(Some(range.into()), None)?.await?;
-        let raw_records = keys.into_iter().zip(values).map(|(k, v)| {
-            (
-                k.as_string().unwrap_or_default(),
-                Uint8Array::new(&v).to_vec(),
-            )
-        });
-        Ok(decode_uploads_tolerant(
-            &self.key,
-            self.record_epoch,
-            &self.upload_checkpoints.borrow(),
-            raw_records,
-        ))
+        let mut requests = Vec::with_capacity(matching.len());
+        for (p, cp) in matching {
+            let key = opaque_upload_key(&self.keys.idb_mac_key, &p, &cp.id);
+            requests.push((p, cp, store.get(JsValue::from_str(&key))?));
+        }
+        let mut out = Vec::with_capacity(requests.len());
+        for (p, cp, req) in requests {
+            let Some(val) = req.await? else {
+                continue;
+            };
+            let sealed = Uint8Array::new(&val).to_vec();
+            if let Some(upload) = decode_upload_with_checkpoint(
+                &self.keys.record_key,
+                self.record_epoch,
+                &cp,
+                &p,
+                &sealed,
+            ) {
+                out.push((p, upload));
+            }
+        }
+        Ok(out)
     }
 
-    /// Save `state` and `deferred`, without the history, files, outbox, attachments and uploads
-    /// of the chat with `peer`, and `entries` / `outgoing` of other chats with it, enforcing
-    /// monotonic `revision` CAS.
+    /// Save `state` and `deferred`, point-deleting all history, files, outbox, kept chunks, and
+    /// uploads tracked for `peer`, plus `entries` / `outgoing` of other chats, enforcing monotonic
+    /// `revision` CAS.
     pub async fn forget<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         peer: &PublicKey,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
@@ -2235,28 +2550,75 @@ impl Vault {
         let (transaction, store, trusted) = self.begin_checked_rw_tx().await?;
         let next_header = trusted.next_revision()?;
         let next_header_bytes = next_header.encode_to_vec();
-        let outgoing_vec: Vec<(String, Option<&OutgoingRecord>)> = outgoing
+        let outgoing_vec: Vec<(PublicKey, u64, Option<&OutgoingRecord>)> = outgoing
             .into_iter()
-            .map(|(p, index, record)| (outbox_key(p, *index), record.as_ref()))
+            .map(|(p, index, record)| (*p, *index, record.as_ref()))
             .collect();
-        let peer_outbox_prefix = format!("outbox/{}/", hex(peer));
+
+        // Collect all opaque keys to delete for `peer` from authenticated STATE indices.
+        let mut keys_to_delete: Vec<String> = Vec::new();
+        let mut next_peer_storage = self.peer_storage.borrow().clone();
+        if let Some(old_ps) = next_peer_storage.remove(peer) {
+            for idx in 0..old_ps.max_history_len {
+                keys_to_delete.push(opaque_history_key(&self.keys.idb_mac_key, peer, idx));
+            }
+            for idx in old_ps.file_indices {
+                keys_to_delete.push(opaque_file_key(&self.keys.idb_mac_key, peer, idx));
+            }
+            for ac in old_ps.kept_chunks {
+                for chunk_idx in ac.indices() {
+                    keys_to_delete.push(opaque_chunk_key(
+                        &self.keys.idb_mac_key,
+                        peer,
+                        &ac.id,
+                        chunk_idx,
+                    ));
+                }
+            }
+        }
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
-        next_outbox_revs.retain(|k, _| !k.starts_with(&peer_outbox_prefix));
-        for (key, record) in &outgoing_vec {
-            if record.is_some() {
-                next_outbox_revs.insert(key.clone(), next_header.revision);
+        next_outbox_revs.retain(|&(p, idx), _| {
+            if p == *peer {
+                keys_to_delete.push(opaque_outbox_key(&self.keys.idb_mac_key, peer, idx));
+                false
             } else {
-                next_outbox_revs.remove(key);
+                true
+            }
+        });
+        for &(p, index, record) in &outgoing_vec {
+            if record.is_some() {
+                next_outbox_revs.insert((p, index), next_header.revision);
+            } else {
+                next_outbox_revs.remove(&(p, index));
             }
         }
         let mut next_checkpoints = self.upload_checkpoints.borrow().clone();
-        next_checkpoints.retain(|cp| cp.peer.as_slice() != peer.as_slice());
+        next_checkpoints.retain(|cp| {
+            if cp.peer.as_slice() == peer.as_slice() {
+                keys_to_delete.push(opaque_upload_key(&self.keys.idb_mac_key, peer, &cp.id));
+                false
+            } else {
+                true
+            }
+        });
+
+        let prepared_entries: Vec<PreparedEntry> = entries
+            .into_iter()
+            .map(|(p, index, entry)| {
+                let (stripped, file_data) = entry.without_file();
+                (*p, *index, stripped, file_data)
+            })
+            .collect();
+        for (p, index, _, file_data) in &prepared_entries {
+            record_peer_entry(&mut next_peer_storage, *p, *index, file_data.is_some());
+        }
 
         let sealed_state = match self.prepare_state_for_commit(
             state,
             deferred,
             &next_checkpoints,
             &next_outbox_revs,
+            &next_peer_storage,
             &next_header_bytes,
         ) {
             Ok(s) => s,
@@ -2266,13 +2628,12 @@ impl Vault {
             }
         };
         let write_res: Result<()> = (|| {
-            store.delete(history_range(peer, 0, u64::MAX)?)?;
-            for prefix in ["file", "outbox", "attachment", "upload"] {
-                store.delete(prefix_range(&format!("{prefix}/{}/", hex(peer)))?)?;
+            for key in &keys_to_delete {
+                store.delete(JsValue::from_str(key))?;
             }
-            self.put_entries(&store, entries)?;
+            self.put_prepared_entries(&store, prepared_entries)?;
             self.put_outgoing(&store, &outgoing_vec, next_header.revision)?;
-            self.put_deferred_initials(&store, deferred)?;
+            self.put_deferred(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&next_header_bytes), Some(&HEADER.into()))?;
             Ok(())
@@ -2284,36 +2645,39 @@ impl Vault {
         commit(transaction).await?;
         *self.upload_checkpoints.borrow_mut() = next_checkpoints;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
+        *self.peer_storage.borrow_mut() = next_peer_storage;
         self.commit_header_and_anchor(next_header);
         Ok(())
     }
 
-    /// Delete the vault for good and clear its external rollback anchor.
+    /// Delete the vault for good and clear both v1 and v3 external rollback anchors.
     pub async fn destroy() -> Result<()> {
         ensure_vault_lock_owned()?;
         let database = open().await?;
-        ensure_vault_lock_owned()?;
-        let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
-        transaction.object_store(STORE)?.clear()?;
-        commit(transaction).await?;
+        let result: Result<()> = async {
+            ensure_vault_lock_owned()?;
+            let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
+            transaction.object_store(STORE)?.clear()?;
+            commit(transaction).await?;
+            Ok(())
+        }
+        .await;
+        database.close();
+        result?;
         clear_rollback_anchor();
         Ok(())
     }
 
-    /// `record`, encrypted under explicit `aad`. Its plaintext, which holds keys, is zeroized.
-    fn seal_with_aad(&self, aad: &[u8], record: &impl Message) -> Result<Vec<u8>> {
+    /// Seal `AppState` under `state_key` with `aad`, zeroizing the encoded plaintext buffer.
+    fn seal_state(&self, aad: &[u8], record: &impl Message) -> Result<Vec<u8>> {
         let plaintext = Zeroizing::new(record.encode_to_vec());
-        try_seal_bytes(&self.key, aad, &plaintext)
+        try_seal_bytes(&self.keys.state_key, aad, &plaintext)
     }
 
-    /// `record`, encrypted under `record_aad(name, self.record_epoch)`.
-    fn seal_record(&self, name: &str, record: &impl Message) -> Result<Vec<u8>> {
-        self.seal_with_aad(&record_aad(name, self.record_epoch), record)
-    }
-
-    /// The plaintext of the record `name`, zeroized once dropped; `None` if it does not decrypt.
-    fn open_record(&self, name: &str, sealed: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-        open_record_bytes(&self.key, name, self.record_epoch, sealed)
+    /// Seal a non-state record under `record_key` with `aad`, zeroizing the encoded plaintext buffer.
+    fn seal_record(&self, aad: &[u8], record: &impl Message) -> Result<Vec<u8>> {
+        let plaintext = Zeroizing::new(record.encode_to_vec());
+        try_seal_bytes(&self.keys.record_key, aad, &plaintext)
     }
 }
 
@@ -2367,202 +2731,247 @@ fn bytes(bytes: &[u8]) -> JsValue {
 mod tests {
     use super::*;
 
+    fn test_header_and_keys(passphrase: &[u8]) -> (VaultHeader, VaultKeys) {
+        VaultHeader::create_with_params(passphrase, ARGON2_MEMORY_MIN, 1, 1)
+            .expect("create v3 test header")
+    }
+
     #[test]
-    fn vault_header_argon2_parameter_bounds_and_defaults() {
-        let new_header = VaultHeader::new();
-        assert_eq!(new_header.version, VAULT_VERSION_V2);
-        assert_eq!(new_header.revision, 1);
-        assert_eq!(new_header.memory, ARGON2_DEFAULT_MEMORY);
-        assert_eq!(new_header.memory, 64 * 1024);
-        assert!(new_header.validate().is_ok());
+    fn vault_header_v3_bounds_and_pre_kdf_incompatible_version() {
+        let (header, keys) = test_header_and_keys(b"test-passphrase");
+        assert_eq!(header.version, VAULT_VERSION_V3);
+        assert_eq!(header.revision, 1);
+        assert_eq!(header.vault_id.len(), VAULT_ID_LEN);
+        assert_eq!(header.wrapped_root_key.len(), WRAPPED_ROOT_KEY_LEN);
+        assert!(header.validate().is_ok());
 
-        // Legacy v1 vault header (19 MiB, version = 0, revision = 0) validates cleanly.
-        let legacy_v1 = VaultHeader {
-            salt: vec![0x42; 16],
-            memory: 19 * 1024,
-            iterations: 2,
-            parallelism: 1,
-            version: 0,
-            revision: 0,
-        };
-        assert!(legacy_v1.is_legacy_v1());
-        assert!(legacy_v1.validate().is_ok());
+        // Correct passphrase unwraps identical subkeys; wrong passphrase fails cleanly.
+        let unwrapped = header.unwrap_keys(b"test-passphrase").unwrap();
+        assert_eq!(unwrapped.state_key, keys.state_key);
+        assert_eq!(unwrapped.record_key, keys.record_key);
+        assert_eq!(unwrapped.idb_mac_key, keys.idb_mac_key);
+        assert!(matches!(
+            header.unwrap_keys(b"wrong-passphrase"),
+            Err(Error::WrongPassphrase)
+        ));
 
-        // Reject out-of-range Argon2 parameters BEFORE running KDF.
+        // Legacy/future versions return IncompatibleVersion PRE-KDF even with absurd Argon2 memory.
+        for bad_ver in [0u32, 1, 2, 4, 99] {
+            let incompat = VaultHeader {
+                version: bad_ver,
+                memory: u32::MAX,
+                ..header.clone()
+            };
+            assert!(matches!(
+                incompat.validate(),
+                Err(Error::IncompatibleVersion(v)) if v == bad_ver
+            ));
+            assert!(matches!(
+                incompat.unwrap_keys(b"any"),
+                Err(Error::IncompatibleVersion(v)) if v == bad_ver
+            ));
+        }
+
+        // Out-of-range KDF params, revision 0, bad vault_id/wrapped_root_key fail with Corrupt pre-KDF.
         for bad in [
             VaultHeader {
                 memory: ARGON2_MEMORY_MIN - 1,
-                ..new_header.clone()
+                ..header.clone()
             },
             VaultHeader {
                 memory: ARGON2_MEMORY_MAX + 1,
-                ..new_header.clone()
+                ..header.clone()
             },
             VaultHeader {
                 iterations: 0,
-                ..new_header.clone()
+                ..header.clone()
             },
             VaultHeader {
                 iterations: ARGON2_ITERATIONS_MAX + 1,
-                ..new_header.clone()
+                ..header.clone()
             },
             VaultHeader {
                 parallelism: 0,
-                ..new_header.clone()
+                ..header.clone()
             },
             VaultHeader {
                 parallelism: ARGON2_PARALLELISM_MAX + 1,
-                ..new_header.clone()
+                ..header.clone()
             },
             VaultHeader {
                 salt: vec![0u8; 8],
-                ..new_header.clone()
+                ..header.clone()
             },
             VaultHeader {
-                version: 3,
-                ..new_header.clone()
-            },
-            VaultHeader {
-                version: VAULT_VERSION_V2,
                 revision: 0,
-                ..new_header.clone()
+                ..header.clone()
+            },
+            VaultHeader {
+                vault_id: vec![0u8; 15],
+                ..header.clone()
+            },
+            VaultHeader {
+                wrapped_root_key: vec![0u8; 71],
+                ..header.clone()
             },
         ] {
             assert!(
                 matches!(bad.validate(), Err(Error::Corrupt(_))),
                 "expected Corrupt for {bad:?}"
             );
-            assert!(matches!(
-                bad.derive_key(b"passphrase"),
-                Err(Error::Corrupt(_))
-            ));
+            assert!(matches!(bad.unwrap_keys(b"pass"), Err(Error::Corrupt(_))));
         }
     }
 
     #[test]
-    fn vault_v1_to_v2_header_bound_aad_detects_tampering() {
-        let legacy_header = VaultHeader {
-            salt: vec![0x11; 16],
-            memory: ARGON2_MEMORY_MIN,
-            iterations: 1,
-            parallelism: 1,
-            version: 0,
-            revision: 0,
+    fn kek_wrap_survives_revision_bumps_and_salt_rotation_preserves_subkeys_and_anchor() {
+        let (header, keys) = test_header_and_keys(b"old-passphrase");
+        // Bumping revision keeps wrapped_root_key valid because root_key_wrap_aad omits revision.
+        let bumped = VaultHeader {
+            revision: 42,
+            ..header.clone()
         };
-        let key = legacy_header
-            .derive_key(b"correct horse battery staple")
-            .unwrap();
+        let unwrapped_bumped = bumped.unwrap_keys(b"old-passphrase").unwrap();
+        assert_eq!(unwrapped_bumped.state_key, keys.state_key);
+        assert_eq!(unwrapped_bumped.record_key, keys.record_key);
+        assert_eq!(unwrapped_bumped.idb_mac_key, keys.idb_mac_key);
 
-        let state = AppState {
-            name: "Alice".to_string(),
-            server: "https://chat.example.com".to_string(),
-            ..AppState::default()
-        };
-        let plain = state.encode_to_vec();
+        // Tampering KDF params or vault_id invalidates KEK wrap AAD.
+        let mut tampered_id = header.clone();
+        tampered_id.vault_id[0] ^= 0xFF;
+        assert!(matches!(
+            tampered_id.unwrap_keys(b"old-passphrase"),
+            Err(Error::WrongPassphrase)
+        ));
+        let mut tampered_mem = header.clone();
+        tampered_mem.memory = ARGON2_MEMORY_MIN + 1;
+        assert!(matches!(
+            tampered_mem.unwrap_keys(b"old-passphrase"),
+            Err(Error::WrongPassphrase)
+        ));
 
-        // Legacy v1 STATE sealed under `"state"` AAD opens cleanly.
-        let v1_sealed = seal_bytes(&key, STATE.as_bytes(), &plain);
-        let opened_v1 = open_bytes(&key, STATE.as_bytes(), &v1_sealed).unwrap();
-        assert_eq!(opened_v1.as_slice(), plain.as_slice());
+        // Simulate passphrase + salt rotation keeping static vault_id and root_key:
+        // VaultKeys remain identical and RollbackAnchor still accepts the rotated header!
+        let old_kek = header.derive_kek(b"old-passphrase").unwrap();
+        let root_key_bytes = open_bytes(
+            &old_kek,
+            &root_key_wrap_aad(&header),
+            &header.wrapped_root_key,
+        )
+        .unwrap();
+        let mut rotated = header.clone();
+        rotated.salt = vec![0x99; 16];
+        rotated.revision = 2;
+        let new_kek = rotated.derive_kek(b"new-passphrase").unwrap();
+        rotated.wrapped_root_key = try_seal_bytes(
+            &new_kek,
+            &root_key_wrap_aad(&rotated),
+            root_key_bytes.as_slice(),
+        )
+        .unwrap();
 
-        // Upgrade to v2: bind encoded v2 VaultHeader bytes into STATE AAD.
-        let mut v2_header = legacy_header;
-        v2_header.version = VAULT_VERSION_V2;
-        v2_header.revision = 1;
-        let v2_header_bytes = v2_header.encode_to_vec();
-        let v2_aad = state_v2_aad(&v2_header_bytes);
-        assert!(v2_aad.starts_with(b"state/v2\0"));
-        let v2_sealed = seal_bytes(&key, &v2_aad, &opened_v1);
+        let rotated_keys = rotated.unwrap_keys(b"new-passphrase").unwrap();
+        assert_eq!(rotated_keys.state_key, keys.state_key);
+        assert_eq!(rotated_keys.record_key, keys.record_key);
+        assert_eq!(rotated_keys.idb_mac_key, keys.idb_mac_key);
 
-        // Opens with matching v2 header bytes, fails with legacy `"state"` AAD.
-        assert!(open_bytes(&key, STATE.as_bytes(), &v2_sealed).is_none());
-        let opened_v2 = open_bytes(&key, &v2_aad, &v2_sealed).unwrap();
-        assert_eq!(AppState::decode(opened_v2.as_slice()).unwrap(), state);
-
-        // Any tampering with VaultHeader (e.g. revision rollback or memory change) fails AAD check!
-        let mut tampered_rev = v2_header.clone();
-        tampered_rev.revision = 2;
-        assert!(
-            open_bytes(
-                &key,
-                &state_v2_aad(&tampered_rev.encode_to_vec()),
-                &v2_sealed
-            )
-            .is_none()
-        );
-
-        let mut tampered_mem = v2_header;
-        tampered_mem.memory = ARGON2_DEFAULT_MEMORY;
-        assert!(
-            open_bytes(
-                &key,
-                &state_v2_aad(&tampered_mem.encode_to_vec()),
-                &v2_sealed
-            )
-            .is_none()
-        );
+        let anchor = RollbackAnchor::for_v3_header(&header);
+        assert!(check_unlock_against_anchor(Some(&anchor), &rotated).is_ok());
     }
 
     #[test]
-    fn checked_header_requires_the_authenticated_encoding() {
-        let trusted = VaultHeader::new();
-        assert_eq!(
-            verify_checked_header(&trusted, &trusted.encode_to_vec()).unwrap(),
-            trusted
+    fn state_v3_aad_and_checked_header_detect_tampering() {
+        let (header, keys) = test_header_and_keys(b"passphrase");
+        let state = AppState {
+            name: "Alice".to_string(),
+            server: "https://chat.example.com".to_string(),
+            record_epoch: 7,
+            ..AppState::default()
+        };
+        let header_bytes = header.encode_to_vec();
+        let aad = state_v3_aad(&header_bytes);
+        assert!(aad.starts_with(b"state/v3\0"));
+        let sealed = seal_bytes(&keys.state_key, &aad, &state.encode_to_vec());
+
+        // Opens with exact header; fails on any header mutation or wrong subkey.
+        let opened = open_bytes(&keys.state_key, &aad, &sealed).unwrap();
+        assert_eq!(AppState::decode(opened.as_slice()).unwrap(), state);
+        assert!(open_bytes(&keys.record_key, &aad, &sealed).is_none());
+
+        let mut rev_changed = header.clone();
+        rev_changed.revision = 2;
+        assert!(
+            open_bytes(
+                &keys.state_key,
+                &state_v3_aad(&rev_changed.encode_to_vec()),
+                &sealed
+            )
+            .is_none()
         );
-        for field in 0..6 {
-            let mut changed = trusted.clone();
+
+        assert_eq!(
+            verify_checked_header(&header, &header.encode_to_vec()).unwrap(),
+            header
+        );
+        for field in 0..8 {
+            let mut changed = header.clone();
             match field {
                 0 => changed.salt[0] ^= 1,
                 1 => changed.memory += 1,
                 2 => changed.iterations += 1,
                 3 => changed.parallelism += 1,
-                4 => changed.revision += 1,
-                _ => changed.version = 1,
+                4 => changed.vault_id[0] ^= 1,
+                5 => changed.wrapped_root_key[0] ^= 1,
+                6 => changed.revision += 1,
+                _ => changed.version = 2,
             }
-            let error = verify_checked_header(&trusted, &changed.encode_to_vec()).unwrap_err();
-            if field < 4 {
+            let error = verify_checked_header(&header, &changed.encode_to_vec()).unwrap_err();
+            if field < 6 {
                 assert!(matches!(error, Error::Corrupt(_)));
             } else {
                 assert!(matches!(error, Error::Conflict { .. }));
             }
         }
-        let mut extra = trusted.encode_to_vec();
-        extra.extend([0x38, 1]);
-        assert!(matches!(
-            verify_checked_header(&trusted, &extra),
-            Err(Error::Corrupt(_))
-        ));
     }
 
     #[test]
     fn upload_revisions_authenticate_state_at_each_commit() {
-        let key = [42; 32];
-        let mut current = VaultHeader::new();
-        let mut sealed = seal_bytes(&key, &state_v2_aad(&current.encode_to_vec()), b"state");
+        let (mut current, keys) = test_header_and_keys(b"passphrase");
+        let mut sealed = seal_bytes(
+            &keys.state_key,
+            &state_v3_aad(&current.encode_to_vec()),
+            b"state",
+        );
         for _ in 0..2 {
             let (next, header, updated) =
-                reseal_state_for_next_revision(&key, &current, &sealed).unwrap();
+                reseal_state_for_next_revision(&keys.state_key, &current, &sealed).unwrap();
             assert_eq!(next.revision, current.revision + 1);
             assert_eq!(next.encode_to_vec(), header);
             assert_eq!(
-                &**open_bytes(&key, &state_v2_aad(&header), &updated).unwrap(),
+                &**open_bytes(&keys.state_key, &state_v3_aad(&header), &updated).unwrap(),
                 b"state"
             );
-            assert!(open_bytes(&key, &state_v2_aad(&current.encode_to_vec()), &updated).is_none());
+            assert!(
+                open_bytes(
+                    &keys.state_key,
+                    &state_v3_aad(&current.encode_to_vec()),
+                    &updated
+                )
+                .is_none()
+            );
             current = next;
             sealed = updated;
         }
         sealed[0] ^= 1;
         assert!(matches!(
-            reseal_state_for_next_revision(&key, &current, &sealed),
+            reseal_state_for_next_revision(&keys.state_key, &current, &sealed),
             Err(Error::Corrupt(_))
         ));
     }
 
     #[test]
-    fn pending_upload_wipes_both_secrets() {
-        fn requires_wipe_on_drop<T: zeroize::ZeroizeOnDrop>(_: &T) {}
+    fn sensitive_records_implement_zeroize_on_drop_and_redacted_debug() {
+        fn requires_wipe_on_drop<T: ZeroizeOnDrop>(_: &T) {}
         let mut upload = PendingUpload::default();
         upload.token.extend([1; 16]);
         upload.key.extend([2; 32]);
@@ -2571,84 +2980,62 @@ mod tests {
         requires_wipe_on_drop(&upload);
         upload.clear_secrets();
         assert!(upload.token.is_empty() && upload.key.is_empty());
-        assert!(upload.prefix_hash.is_empty() && upload.sealed_chunk_hash.is_empty());
+
+        let outgoing = OutgoingRecord {
+            message: None,
+            content: b"super-secret-plaintext".to_vec(),
+            write_token: vec![0xAA; 32],
+            carried_initial: vec![0xBB; 16],
+            session_id: vec![0xCC; 16],
+        };
+        requires_wipe_on_drop(&outgoing);
+        let dbg = format!("{outgoing:?}");
+        assert!(!dbg.contains("super-secret"));
+        assert!(!dbg.contains("170")); // 0xAA
+        assert!(outgoing.to_sealed().is_none());
+        assert!(outgoing.to_push_v2_request(&[0x55; 32]).is_none());
+
+        let sealed_rec = OutgoingRecord {
+            message: Some(party::EncryptedMessage {
+                header: Bytes::from_static(b"hdr"),
+                content: Bytes::from_static(b"ct"),
+            }),
+            content: vec![],
+            write_token: vec![0xAA; 32],
+            carried_initial: vec![],
+            session_id: vec![0xCC; 16],
+        };
+        let req = sealed_rec
+            .to_push_v2_request(&[0x55; 32])
+            .expect("valid sealed OutgoingRecord builds PushV2Request");
+        assert_eq!(req.recipient.as_ref(), &[0x55; 32]);
+        assert_eq!(req.write_token.as_ref(), &[0xAA; 32]);
+        assert_eq!(req.client_message_id.len(), 16);
+        assert!(sealed_rec.to_sealed().is_some());
+
+        let farewell = Farewell {
+            push_v2: vec![0xDD; 48],
+        };
+        requires_wipe_on_drop(&farewell);
+        let fdbg = format!("{farewell:?}");
+        assert!(!fdbg.contains("221")); // 0xDD
     }
 
     #[test]
-    fn deferred_initials_separate_record_survives_older_state_overwrite() {
-        let key = [0x5Au8; 32];
-        let header_v1 = VaultHeader::new();
-        let state_v1 = AppState {
-            name: "Alice".to_string(),
-            pending_inbox_acks: vec![42],
-            ..AppState::default()
-        };
-        assert!(state_v1.deferred_initials.is_empty());
-        let deferred = DeferredInitialsRecord {
-            entries: vec![DeferredInitial {
-                initial: Some(session::protocol::handshake_v2::InitialMessageV2 {
-                    version: 2,
-                    identity_key: vec![0x11; 32].into(),
-                    ephemeral_key: vec![0x22; 32].into(),
-                    signed_prekey: vec![0x33; 32].into(),
-                    pq_suite: 1,
-                    pq_last_resort: true,
-                    pq_prekey_id: vec![0x44; 32].into(),
-                    pq_ciphertext: vec![0x55; 1568].into(),
-                    ..Default::default()
-                }),
-                deferred_at: 1_700_000_000_000,
-            }],
-            carried_timestamps: vec![CarriedDeferredTimestamp {
-                signed_prekey: vec![0x33; 32],
-                deferred_at: 1_700_000_000_123,
-            }],
-        };
-
-        let sealed_state_1 = seal_bytes(
-            &key,
-            &state_v2_aad(&header_v1.encode_to_vec()),
-            &state_v1.encode_to_vec(),
-        );
-        let sealed_deferred = seal_deferred_initials(&key, &deferred);
-
-        // Simulate rolling back to an older `dev` bundle that unlocks `STATE`, advances
-        // `VaultHeader.revision`, and overwrites `STATE` without knowing about `DEFERRED_INITIALS`.
-        let (header_v2, header_v2_bytes, sealed_state_2) =
-            reseal_state_for_next_revision(&key, &header_v1, &sealed_state_1).unwrap();
-        assert_eq!(header_v2.revision, header_v1.revision + 1);
-        assert!(open_bytes(&key, &state_v2_aad(&header_v2_bytes), &sealed_state_2).is_some());
-
-        // The separate `DEFERRED_INITIALS` record still decrypts cleanly after the `STATE` overwrite!
-        let restored = open_deferred_initials(&key, &sealed_deferred).unwrap();
-        assert_eq!(restored, deferred);
-
-        // Wrong key or wrong AAD fails authentication.
-        let wrong_key = [0xA5u8; 32];
-        assert!(matches!(
-            open_deferred_initials(&wrong_key, &sealed_deferred),
-            Err(Error::Corrupt(_))
-        ));
-        assert!(open_bytes(&key, STATE.as_bytes(), &sealed_deferred).is_none());
-    }
-
-    #[test]
-    fn rollback_anchor_rejects_v1_replay_and_v2_revision_or_salt_rollback() {
-        let mut h = VaultHeader::new();
+    fn rollback_anchor_v3_rejects_stale_revision_and_vault_id_swap() {
+        let (mut h, _) = test_header_and_keys(b"passphrase");
         h.revision = 5;
-        let anchor = RollbackAnchor::for_v2_header(&h);
-        assert_eq!(
-            RollbackAnchor::parse(&anchor.encode()),
-            Some(anchor.clone())
-        );
+        let anchor = RollbackAnchor::for_v3_header(&h);
+        let encoded = anchor.encode();
+        assert!(encoded.starts_with("v3:5:"));
+        assert_eq!(RollbackAnchor::parse(&encoded), Some(anchor.clone()));
+        assert_eq!(RollbackAnchor::parse("v1:1:5:00"), None);
 
-        // Same or higher revision with matching salt succeeds.
         assert!(check_unlock_against_anchor(Some(&anchor), &h).is_ok());
         let mut newer = h.clone();
         newer.revision = 6;
         assert!(check_unlock_against_anchor(Some(&anchor), &newer).is_ok());
 
-        // Lower revision with same salt is rejected.
         let mut older = h.clone();
         older.revision = 4;
         assert!(matches!(
@@ -2656,137 +3043,89 @@ mod tests {
             Err(Error::Corrupt(_))
         ));
 
-        // Legacy v1 replay is rejected once `migrated_v2` is set.
-        let v1 = VaultHeader {
-            salt: vec![0x22; 16],
-            memory: ARGON2_MEMORY_MIN,
-            iterations: 1,
-            parallelism: 1,
-            version: 0,
-            revision: 0,
-        };
+        let mut swapped_id = h.clone();
+        swapped_id.vault_id[0] ^= 0xFF;
+        swapped_id.revision = 10;
         assert!(matches!(
-            check_unlock_against_anchor(Some(&anchor), &v1),
-            Err(Error::Corrupt(_))
-        ));
-
-        // Different salt on v2 is rejected as possible vault replacement/rollback.
-        let mut swapped_salt = h.clone();
-        swapped_salt.salt[0] ^= 0xFF;
-        swapped_salt.revision = 10;
-        assert!(matches!(
-            check_unlock_against_anchor(Some(&anchor), &swapped_salt),
+            check_unlock_against_anchor(Some(&anchor), &swapped_id),
             Err(Error::Corrupt(_))
         ));
     }
 
     #[test]
-    fn per_record_aad_and_deferred_digest_detect_record_swaps() {
-        let key = [0x33u8; 32];
+    fn opaque_keys_and_per_record_aads_isolate_domains_and_revisions() {
+        let (_, keys) = test_header_and_keys(b"passphrase");
         let peer = [0x11u8; 32];
-        let out_name = outbox_key(&peer, 7);
+        let id = [0x22u8; 16];
+        let all_keys = [
+            opaque_deferred_key(&keys.idb_mac_key),
+            opaque_history_key(&keys.idb_mac_key, &peer, 0),
+            opaque_file_key(&keys.idb_mac_key, &peer, 0),
+            opaque_outbox_key(&keys.idb_mac_key, &peer, 0),
+            opaque_upload_key(&keys.idb_mac_key, &peer, &id),
+            opaque_chunk_key(&keys.idb_mac_key, &peer, &id, 0),
+        ];
+        for k in &all_keys {
+            assert_eq!(k.len(), 64);
+            assert!(k.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(!k.contains('/'));
+            assert!(!k.contains(&hex(&peer)));
+        }
+        let unique: std::collections::HashSet<&String> = all_keys.iter().collect();
+        assert_eq!(unique.len(), all_keys.len());
 
-        // Outbox record bound to revision 5 cannot be replayed at revision 6 or legacy AAD.
-        let sealed_rev5 = try_seal_bytes(&key, &outbox_aad(&out_name, 1, 5), b"msg-v5").unwrap();
-        assert!(open_bytes(&key, &outbox_aad(&out_name, 1, 5), &sealed_rev5).is_some());
-        assert!(open_bytes(&key, &outbox_aad(&out_name, 1, 6), &sealed_rev5).is_none());
-        assert!(open_bytes(&key, out_name.as_bytes(), &sealed_rev5).is_none());
+        // Revision-bound outbox and upload AADs detect rollback.
+        let sealed_out =
+            try_seal_bytes(&keys.record_key, &outbox_aad(&peer, 7, 9, 5), b"msg-v5").unwrap();
+        assert!(open_bytes(&keys.record_key, &outbox_aad(&peer, 7, 9, 5), &sealed_out).is_some());
+        assert!(open_bytes(&keys.record_key, &outbox_aad(&peer, 7, 9, 6), &sealed_out).is_none());
+        assert!(open_bytes(&keys.record_key, &outbox_aad(&peer, 7, 10, 5), &sealed_out).is_none());
 
-        // Deferred initials digest detects swapping an old non-empty record when state expects empty.
-        let empty = DeferredInitialsRecord::default();
-        let non_empty = DeferredInitialsRecord {
+        let sealed_up =
+            try_seal_bytes(&keys.record_key, &upload_aad(&peer, &id, 9, 5), b"up-v5").unwrap();
+        assert!(open_bytes(&keys.record_key, &upload_aad(&peer, &id, 9, 5), &sealed_up).is_some());
+        assert!(open_bytes(&keys.record_key, &upload_aad(&peer, &id, 9, 6), &sealed_up).is_none());
+
+        // Strict deferred digest rejects empty expected digest and mismatched records.
+        let empty = DeferredRecord::default();
+        let non_empty = DeferredRecord {
             entries: vec![DeferredInitial {
                 initial: None,
                 deferred_at: 123,
             }],
             carried_timestamps: vec![],
+            envelopes: vec![],
         };
-        let empty_digest = deferred_initials_digest(&empty);
-        assert_eq!(empty_digest.len(), 32);
-        assert!(verify_deferred_initials_digest(&empty_digest, &empty).is_ok());
+        let empty_digest = deferred_record_digest(&empty);
+        assert!(verify_deferred_record_digest(&empty_digest, &empty).is_ok());
         assert!(matches!(
-            verify_deferred_initials_digest(&empty_digest, &non_empty),
+            verify_deferred_record_digest(&empty_digest, &non_empty),
             Err(Error::Corrupt(_))
         ));
-        // Empty expected digest remains backwards-compatible with legacy bundles.
-        assert!(verify_deferred_initials_digest(&[], &non_empty).is_ok());
+        assert!(matches!(
+            verify_deferred_record_digest(&[], &empty),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     #[test]
-    fn v1_to_v2_upgrade_rekeys_all_records_and_populates_checkpoints() {
-        let old_key = [0x12u8; 32];
-        let new_key = [0x34u8; 32];
-        let peer = [0xABu8; 32];
-        let hist_k = history_key(&peer, 0);
-        let out_k = outbox_key(&peer, 1);
-        let up_id = [0x77u8; 16];
-        let up_k = upload_key(&peer, &up_id);
-        let upload = PendingUpload {
-            id: up_id.to_vec(),
-            token: vec![1; 16],
-            key: vec![2; 32],
-            name: "photo.jpg".into(),
-            mime: "image/jpeg".into(),
-            size: 100,
-            uploaded: 0,
-            encrypted: 1,
-            prefix_hash: vec![9; 32],
-            announced: true,
-            history_index: 0,
-            expires: 0,
-            upload_state: UPLOAD_STATE_ANNOUNCED,
-            sealed_chunk_hash: vec![8; 32],
+    fn attachment_chunks_bitmap_tracks_bits_and_counts() {
+        let mut chunks = AttachmentChunks {
+            id: vec![1; 16],
+            chunks_bitmap: Vec::new(),
         };
-        let records = vec![
-            (
-                hist_k.clone(),
-                seal_bytes(&old_key, hist_k.as_bytes(), b"hist"),
-            ),
-            (
-                out_k.clone(),
-                seal_bytes(&old_key, out_k.as_bytes(), b"out"),
-            ),
-            (
-                up_k.clone(),
-                seal_bytes(&old_key, up_k.as_bytes(), &upload.encode_to_vec()),
-            ),
-            ("attachment/aa/bb/0000000000".into(), b"raw-chunk".to_vec()),
-        ];
-
-        let UpgradedV1Records {
-            updated,
-            deleted,
-            deferred,
-            checkpoints,
-            outbox_revs,
-        } = upgrade_v1_records(&old_key, &new_key, 1, 1, records).unwrap();
-        assert!(deleted.is_empty());
-        assert!(deferred.is_empty());
-        assert_eq!(checkpoints.len(), 1);
-        assert_eq!(outbox_revs.get(&out_k), Some(&1));
-
-        let by_name: HashMap<String, Vec<u8>> = updated.into_iter().collect();
-        // Attachments are left untouched.
-        assert!(!by_name.contains_key("attachment/aa/bb/0000000000"));
-        // History and upload decrypt under `new_key` with epoch 1 AAD, not `old_key`.
-        assert_eq!(
-            &**open_record_bytes(&new_key, &hist_k, 1, &by_name[&hist_k]).unwrap(),
-            b"hist"
-        );
-        assert!(open_bytes(&old_key, hist_k.as_bytes(), &by_name[&hist_k]).is_none());
-        assert_eq!(
-            &**open_bytes(&new_key, &outbox_aad(&out_k, 1, 1), &by_name[&out_k]).unwrap(),
-            b"out"
-        );
-        // Valid upload passes checkpoint verification; rolled-back upload is rejected.
-        let decoded = decode_uploads_tolerant(
-            &new_key,
-            1,
-            &checkpoints,
-            vec![(up_k.clone(), by_name[&up_k].clone())],
-        );
-        assert_eq!(decoded.len(), 1);
-        assert_eq!(decoded[0].1.name, "photo.jpg");
+        assert_eq!(chunks.count(), 0);
+        assert!(!chunks.has_bit(0));
+        assert!(chunks.set_bit(0).unwrap());
+        assert!(!chunks.set_bit(0).unwrap()); // idempotent
+        assert!(chunks.set_bit(7).unwrap());
+        assert!(chunks.set_bit(8).unwrap());
+        assert!(chunks.set_bit(100).unwrap());
+        assert_eq!(chunks.count(), 4);
+        assert!(chunks.has_bit(100));
+        assert!(!chunks.has_bit(99));
+        let indices: Vec<u32> = chunks.indices().collect();
+        assert_eq!(indices, vec![0, 7, 8, 100]);
     }
 
     #[test]
@@ -2797,59 +3136,6 @@ mod tests {
         assert_eq!(history_bounds(10, 1), Some((9, 9)));
         assert_eq!(history_bounds(10, 5), Some((5, 9)));
         assert_eq!(history_bounds(10, 500), Some((0, 9)));
-    }
-
-    #[test]
-    fn decode_uploads_tolerant_skips_corrupt_and_stale_records() {
-        let key = [0x55u8; 32];
-        let peer = [0x22u8; 32];
-        let good_id = [0x01u8; 16];
-        let stale_id = [0x02u8; 16];
-        let bad_id = [0x03u8; 16];
-
-        let mut good = PendingUpload::default();
-        good.id = good_id.to_vec();
-        good.name = "good.bin".into();
-        good.uploaded = 2;
-        good.encrypted = 2;
-        good.prefix_hash = vec![1; 32];
-        good.upload_state = UPLOAD_STATE_ANNOUNCED;
-
-        let mut stale_old = PendingUpload::default();
-        stale_old.id = stale_id.to_vec();
-        stale_old.name = "stale.bin".into();
-        stale_old.uploaded = 0;
-        stale_old.encrypted = 1;
-        stale_old.prefix_hash = vec![2; 32];
-        stale_old.upload_state = UPLOAD_STATE_ANNOUNCED;
-
-        let mut stale_expected = stale_old.clone();
-        stale_expected.uploaded = 1;
-        stale_expected.encrypted = 2;
-
-        let mut checkpoints = Vec::new();
-        upsert_upload_checkpoint(&mut checkpoints, &peer, &good);
-        upsert_upload_checkpoint(&mut checkpoints, &peer, &stale_expected);
-
-        let good_k = upload_key(&peer, &good_id);
-        let stale_k = upload_key(&peer, &stale_id);
-        let bad_k = upload_key(&peer, &bad_id);
-        let records = vec![
-            (
-                good_k.clone(),
-                try_seal_bytes(&key, &record_aad(&good_k, 1), &good.encode_to_vec()).unwrap(),
-            ),
-            (
-                stale_k.clone(),
-                try_seal_bytes(&key, &record_aad(&stale_k, 1), &stale_old.encode_to_vec()).unwrap(),
-            ),
-            (bad_k, b"corrupt-ciphertext".to_vec()),
-        ];
-
-        let listed = decode_uploads_tolerant(&key, 1, &checkpoints, records);
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].0, peer);
-        assert_eq!(listed[0].1.id, good_id);
     }
 }
 
@@ -2900,9 +3186,24 @@ mod wasm_tests {
             .expect("localStorage get_item")
     }
 
-    async fn raw_idb_get(name: &str) -> Option<Vec<u8>> {
-        let db = open().await.expect("open IndexedDB");
-        get(&db, name).await.expect("get record from IndexedDB")
+    fn set_raw_local_storage(key: &str, value: &str) {
+        web_sys::window()
+            .expect("browser window")
+            .local_storage()
+            .expect("localStorage access")
+            .expect("localStorage available")
+            .set_item(key, value)
+            .expect("localStorage set_item");
+    }
+
+    fn get_raw_local_storage(key: &str) -> Option<String> {
+        web_sys::window()
+            .expect("browser window")
+            .local_storage()
+            .expect("localStorage access")
+            .expect("localStorage available")
+            .get_item(key)
+            .expect("localStorage get_item")
     }
 
     async fn raw_idb_put(records: &[(&str, &[u8])]) {
@@ -2938,13 +3239,17 @@ mod wasm_tests {
     async fn clean_browser_vault() {
         ensure_real_web_lock().await;
         Vault::destroy().await.expect("Vault::destroy");
-        assert!(!Vault::exists().await.expect("Vault::exists"));
+        assert_eq!(
+            Vault::inspect().await.expect("Vault::inspect"),
+            VaultPresence::None
+        );
         assert!(raw_local_storage_anchor().is_none());
+        assert!(get_raw_local_storage(LEGACY_ROLLBACK_ANCHOR_KEY).is_none());
         assert!(raw_idb_keys().await.is_empty());
     }
 
     #[wasm_bindgen_test]
-    async fn vault_create_save_reopen_wrong_passphrase_and_web_locks() {
+    async fn vault_v3_create_save_opaque_keys_chunks_uploads_forget_and_destroy() {
         clean_browser_vault().await;
 
         // Real browser Web Lock exclusivity: a second acquisition attempt while held fails closed.
@@ -2968,7 +3273,6 @@ mod wasm_tests {
         }
         assert!(crate::glue::owns_lock());
 
-        // First-boot Vault::create writes IDB records and the localStorage rollback anchor.
         let initial_state = AppState {
             name: "Alice".to_string(),
             server: "https://chat.example.com".to_string(),
@@ -2977,35 +3281,49 @@ mod wasm_tests {
         let vault = Vault::create(b"correct-horse-battery", &initial_state)
             .await
             .expect("Vault::create");
-        assert!(Vault::exists().await.expect("Vault::exists"));
+        assert_eq!(
+            Vault::inspect().await.expect("Vault::inspect"),
+            VaultPresence::Compatible
+        );
 
-        let created_salt_hash = salt_fingerprint(&vault.header.borrow().salt);
+        let created_vault_id_hex = hex(&vault.header.borrow().vault_id);
         let anchor_after_create = RollbackAnchor::parse(
-            &raw_local_storage_anchor().expect("rollback anchor written on create"),
+            &raw_local_storage_anchor().expect("v3 rollback anchor written on create"),
         )
-        .expect("parse rollback anchor");
+        .expect("parse v3 rollback anchor");
         assert_eq!(
             anchor_after_create,
             RollbackAnchor {
-                migrated_v2: true,
                 max_revision: 1,
-                salt_hash: created_salt_hash.clone(),
+                vault_id_hex: created_vault_id_hex.clone(),
             }
         );
 
-        // Save updated state, deferred sidecar, history (text + file), and an outgoing record.
+        // Save state, deferred sidecar (including DeferredEnvelope), history (text + file), outbox.
         let peer: PublicKey = [0x42u8; 32];
+        let peer_hex = hex(&peer);
         let updated_state = AppState {
             name: "Alice Updated".to_string(),
             server: "https://relay.example.com".to_string(),
             pending_inbox_acks: vec![7, 11],
+            pending_revokes: vec![PendingRevoke {
+                peer_slot_id: vec![0x99; 32],
+                min_grant_version: 5,
+            }],
             ..initial_state
         };
-        let deferred = DeferredInitialsRecord {
+        let deferred = DeferredRecord {
             entries: vec![],
             carried_timestamps: vec![CarriedDeferredTimestamp {
                 signed_prekey: vec![0x33; 32],
                 deferred_at: 1_700_000_000_555,
+            }],
+            envelopes: vec![DeferredEnvelope {
+                peer: peer.to_vec(),
+                sequence: 42,
+                message: None,
+                initial_message: None,
+                deferred_at: 1_700_000_000_600,
             }],
         };
         let text_entry = HistoryEntry {
@@ -3013,7 +3331,7 @@ mod wasm_tests {
             at: 1_700_000_001_000,
             content: Some(Content {
                 clock: 1,
-                kind: Some(Kind::Text("hello real indexeddb".to_string())),
+                kind: Some(Kind::Text("hello real indexeddb v3".to_string())),
                 ..Content::default()
             }),
             delivery: Delivery::Pending.into(),
@@ -3041,20 +3359,83 @@ mod wasm_tests {
         let outgoing_rec = OutgoingRecord {
             message: None,
             content: b"pending outbox bytes".to_vec(),
-            delivery_hash: vec![0xAB; 32],
+            write_token: vec![0xAB; 32],
+            carried_initial: vec![],
+            session_id: vec![0xCD; 16],
         };
         let outgoing = [(peer, 0u64, Some(outgoing_rec.clone()))];
-
         vault
             .save(&updated_state, &deferred, &entries, &outgoing)
             .await
             .expect("vault.save");
-        let anchor_after_save = RollbackAnchor::parse(
-            &raw_local_storage_anchor().expect("rollback anchor updated on save"),
-        )
-        .expect("parse rollback anchor after save");
-        assert_eq!(anchor_after_save.max_revision, 2);
-        assert_eq!(anchor_after_save.salt_hash, created_salt_hash);
+
+        // Save an upload and chunks (verifying chunk bitmap + short-circuit on duplicate chunk).
+        let upload_id = [0x77u8; 16];
+        let upload = PendingUpload {
+            id: upload_id.to_vec(),
+            token: vec![1; 16],
+            key: vec![2; 32],
+            name: "clip.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: 32,
+            uploaded: 1,
+            encrypted: 1,
+            prefix_hash: vec![3; 32],
+            announced: true,
+            history_index: 0,
+            expires: 0,
+            upload_state: UPLOAD_STATE_ANNOUNCED,
+            sealed_chunk_hash: vec![],
+        };
+        vault
+            .save_upload(&peer, &upload)
+            .await
+            .expect("vault.save_upload");
+        let rev_before_chunk = vault.header.borrow().revision;
+        vault
+            .put_chunk(&peer, &upload_id, 0, b"chunk-0-ciphertext")
+            .await
+            .expect("put_chunk 0");
+        assert_eq!(vault.header.borrow().revision, rev_before_chunk + 1);
+        assert_eq!(vault.chunks_kept(&peer, &upload_id).await.unwrap(), 1);
+        // Re-writing the same chunk index short-circuits STATE rewrite (revision unchanged!).
+        vault
+            .put_chunk(&peer, &upload_id, 0, b"chunk-0-ciphertext-repaired")
+            .await
+            .expect("put_chunk 0 repair");
+        assert_eq!(vault.header.borrow().revision, rev_before_chunk + 1);
+        assert_eq!(
+            vault.chunk(&peer, &upload_id, 0).await.unwrap().as_deref(),
+            Some(b"chunk-0-ciphertext-repaired".as_slice())
+        );
+
+        // Verify raw IndexedDB keys contain ONLY "vault", "state", and 64-hex opaque keys!
+        let keys = raw_idb_keys().await;
+        assert!(keys.len() >= 8);
+        for k in &keys {
+            if k == HEADER || k == STATE {
+                continue;
+            }
+            assert_eq!(k.len(), 64, "expected 64-hex opaque IDB key, got {k:?}");
+            assert!(
+                k.bytes().all(|b| b.is_ascii_hexdigit()),
+                "non-hex IDB key {k:?}"
+            );
+            assert!(!k.contains(&peer_hex), "peer hex leaked in key {k:?}");
+            for forbidden in [
+                "history/",
+                "file/",
+                "outbox/",
+                "upload/",
+                "attachment/",
+                "deferred_initials",
+            ] {
+                assert!(
+                    !k.contains(forbidden),
+                    "forbidden cleartext prefix {forbidden} in key {k:?}"
+                );
+            }
+        }
         drop(vault);
 
         // Wrong passphrase fails cleanly without disturbing stored records.
@@ -3063,276 +3444,102 @@ mod wasm_tests {
             Err(Error::WrongPassphrase)
         ));
 
-        // Correct passphrase reopens the vault and decrypts state, sidecar, history, file, outbox.
+        // Reopen with correct passphrase and verify every record round-trips.
         let (reopened, restored_state, restored_deferred) = Vault::unlock(b"correct-horse-battery")
             .await
-            .expect("Vault::unlock with correct passphrase");
+            .expect("Vault::unlock");
         assert_eq!(restored_state.name, "Alice Updated");
-        assert_eq!(restored_state.server, "https://relay.example.com");
-        assert_eq!(restored_state.pending_inbox_acks, vec![7, 11]);
-        assert_eq!(restored_state.record_epoch, 1);
+        assert_eq!(restored_state.pending_revokes.len(), 1);
+        assert_ne!(restored_state.record_epoch, 0);
         assert_eq!(restored_deferred, deferred);
-
-        let history = reopened
-            .history(&peer, 2, 10)
-            .await
-            .expect("read history from IDB");
+        let history = reopened.history(&peer, 2, 10).await.unwrap();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[0].0, 0);
-        assert_eq!(history[1].0, 1);
-        assert_eq!(
-            history[0].1.content.as_ref().and_then(|c| c.kind.as_ref()),
-            Some(&Kind::Text("hello real indexeddb".to_string()))
-        );
-        assert_eq!(history[1].1.file, file_bytes.len() as u64);
-        assert_eq!(
-            reopened.file(&peer, 1).await.expect("read file record"),
-            file_bytes
-        );
-        let restored_kind = reopened
-            .content(&peer, 1, &history[1].1)
-            .await
-            .expect("read content with file bytes");
-        assert_eq!(
-            restored_kind,
-            Some(Kind::File(File {
-                name: "note.txt".to_string(),
-                mime: "text/plain".to_string(),
-                data: file_bytes,
-            }))
-        );
+        assert_eq!(reopened.file(&peer, 1).await.unwrap(), file_bytes);
+        assert_eq!(reopened.outgoing(&peer, 0).await.unwrap(), outgoing_rec);
         assert_eq!(
             reopened
-                .outgoing(&peer, 0)
+                .upload(&peer, &upload_id)
                 .await
-                .expect("read outgoing record"),
-            outgoing_rec
+                .unwrap()
+                .unwrap()
+                .name,
+            "clip.bin"
         );
+        assert_eq!(reopened.uploads(Some(&peer)).await.unwrap().len(), 1);
+        assert_eq!(reopened.chunks_kept(&peer, &upload_id).await.unwrap(), 1);
 
+        // Forget peer: leaves ZERO orphan keys for peer in IndexedDB!
+        let empty_deferred = DeferredRecord::default();
+        reopened
+            .forget(&restored_state, &empty_deferred, &peer, &[], &[])
+            .await
+            .expect("vault.forget");
+        let keys_after_forget = raw_idb_keys().await;
+        assert_eq!(
+            keys_after_forget.len(),
+            2,
+            "expected only vault & state after forget, got {keys_after_forget:?}"
+        );
+        assert!(keys_after_forget.contains(&HEADER.to_string()));
+        assert!(keys_after_forget.contains(&STATE.to_string()));
+        assert_eq!(reopened.chunks_kept(&peer, &upload_id).await.unwrap(), 0);
+        assert!(reopened.uploads(None).await.unwrap().is_empty());
+
+        // Destroy clears BOTH v1 and v3 rollback anchors.
+        set_raw_local_storage(LEGACY_ROLLBACK_ANCHOR_KEY, "v1:1:1:00");
         drop(reopened);
         clean_browser_vault().await;
     }
 
     #[wasm_bindgen_test]
-    async fn vault_rejects_incompatible_header_version_pre_kdf() {
+    async fn vault_v3_rejects_incompatible_version_pre_kdf_and_rollback_anchor() {
         clean_browser_vault().await;
 
-        // Unrecognized future header version with absurd Argon2 memory must fail pre-KDF.
-        let future_v3 = VaultHeader {
+        // Legacy v2 header with absurd Argon2 memory fails pre-KDF with IncompatibleVersion(2).
+        let legacy_v2 = VaultHeader {
             salt: vec![0x11; 16],
             memory: u32::MAX,
             iterations: ARGON2_DEFAULT_ITERATIONS,
             parallelism: ARGON2_DEFAULT_PARALLELISM,
-            version: 3,
+            version: 2,
             revision: 1,
+            vault_id: vec![],
+            wrapped_root_key: vec![],
         };
         raw_idb_put(&[
-            (HEADER, &future_v3.encode_to_vec()),
+            (HEADER, &legacy_v2.encode_to_vec()),
             (STATE, b"unauthenticated-placeholder"),
         ])
         .await;
-        match Vault::unlock(b"any-passphrase").await {
-            Err(Error::Corrupt(msg)) => {
-                assert!(
-                    msg.contains("unsupported vault version 3"),
-                    "unexpected error message: {msg}"
-                );
-            }
-            Err(err) => panic!("expected Corrupt for unsupported version 3, got Err({err:?})"),
-            Ok(_) => panic!("expected Corrupt for unsupported version 3, got Ok"),
-        }
-
-        // Unrecognized arbitrary version with otherwise valid KDF params also fails pre-KDF.
-        let unknown_v99 = VaultHeader {
-            salt: vec![0x22; 16],
-            memory: ARGON2_DEFAULT_MEMORY,
-            iterations: ARGON2_DEFAULT_ITERATIONS,
-            parallelism: ARGON2_DEFAULT_PARALLELISM,
-            version: 99,
-            revision: 1,
-        };
-        raw_idb_put(&[
-            (HEADER, &unknown_v99.encode_to_vec()),
-            (STATE, b"unauthenticated-placeholder"),
-        ])
-        .await;
-        match Vault::unlock(b"any-passphrase").await {
-            Err(Error::Corrupt(msg)) => {
-                assert!(
-                    msg.contains("unsupported vault version 99"),
-                    "unexpected error message: {msg}"
-                );
-            }
-            Err(err) => panic!("expected Corrupt for unsupported version 99, got Err({err:?})"),
-            Ok(_) => panic!("expected Corrupt for unsupported version 99, got Ok"),
-        }
-
-        // Current version with invalid revision 0 also fails pre-KDF.
-        let zero_rev_v2 = VaultHeader {
-            salt: vec![0x33; 16],
-            memory: ARGON2_DEFAULT_MEMORY,
-            iterations: ARGON2_DEFAULT_ITERATIONS,
-            parallelism: ARGON2_DEFAULT_PARALLELISM,
-            version: VAULT_VERSION_V2,
-            revision: 0,
-        };
-        raw_idb_put(&[
-            (HEADER, &zero_rev_v2.encode_to_vec()),
-            (STATE, b"unauthenticated-placeholder"),
-        ])
-        .await;
-        match Vault::unlock(b"any-passphrase").await {
-            Err(Error::Corrupt(msg)) => {
-                assert!(
-                    msg.contains("invalid revision 0"),
-                    "unexpected error message: {msg}"
-                );
-            }
-            Err(err) => panic!("expected Corrupt for v2 revision 0, got Err({err:?})"),
-            Ok(_) => panic!("expected Corrupt for v2 revision 0, got Ok"),
-        }
-
-        clean_browser_vault().await;
-    }
-
-    #[wasm_bindgen_test]
-    async fn vault_rollback_anchor_rejects_stale_revision_and_salt_swap() {
-        clean_browser_vault().await;
-
-        let state_v1 = AppState {
-            name: "Rev 1".to_string(),
-            ..AppState::default()
-        };
-        let vault = Vault::create(b"rollback-passphrase", &state_v1)
-            .await
-            .expect("Vault::create");
-        let rev1_header_bytes = raw_idb_get(HEADER).await.expect("rev1 header in IDB");
-        let rev1_state_bytes = raw_idb_get(STATE).await.expect("rev1 state in IDB");
-
-        let state_v2 = AppState {
-            name: "Rev 2".to_string(),
-            ..state_v1
-        };
-        vault
-            .save(&state_v2, &DeferredInitialsRecord::default(), [], [])
-            .await
-            .expect("advance vault to revision 2");
-        let rev2_header = vault.header.borrow().clone();
-        assert_eq!(rev2_header.revision, 2);
-        drop(vault);
-
-        let anchor = RollbackAnchor::parse(
-            &raw_local_storage_anchor().expect("rollback anchor present after save"),
-        )
-        .expect("valid anchor");
-        assert_eq!(anchor.max_revision, 2);
-
-        // 1. Offline IDB rollback to the authentic rev-1 snapshot must fail against anchor rev 2.
-        raw_idb_put(&[(HEADER, &rev1_header_bytes), (STATE, &rev1_state_bytes)]).await;
-        match Vault::unlock(b"rollback-passphrase").await {
-            Err(Error::Corrupt(msg)) => {
-                assert!(
-                    msg.contains("vault rollback detected"),
-                    "unexpected rollback error: {msg}"
-                );
-            }
-            Err(err) => panic!("expected Corrupt on stale revision rollback, got Err({err:?})"),
-            Ok(_) => panic!("expected Corrupt on stale revision rollback, got Ok"),
-        }
-
-        // 2. Same-version salt swap with a higher revision must also fail against the anchor.
-        let mut swapped_header = rev2_header;
-        swapped_header.salt[0] ^= 0xFF;
-        swapped_header.revision = 10;
-        raw_idb_put(&[(HEADER, &swapped_header.encode_to_vec())]).await;
-        match Vault::unlock(b"rollback-passphrase").await {
-            Err(Error::Corrupt(msg)) => {
-                assert!(
-                    msg.contains("salt does not match anchor"),
-                    "unexpected salt-swap error: {msg}"
-                );
-            }
-            Err(err) => panic!("expected Corrupt on salt swap, got Err({err:?})"),
-            Ok(_) => panic!("expected Corrupt on salt swap, got Ok"),
-        }
-
-        clean_browser_vault().await;
-    }
-
-    #[wasm_bindgen_test]
-    async fn vault_destroy_clears_idb_and_rollback_anchor_for_fresh_create() {
-        clean_browser_vault().await;
-
-        let peer: PublicKey = [0x99u8; 32];
-        let initial = AppState {
-            name: "Old Vault".to_string(),
-            ..AppState::default()
-        };
-        let vault = Vault::create(b"old-passphrase", &initial)
-            .await
-            .expect("create initial vault");
-        let entry = HistoryEntry {
-            outgoing: true,
-            at: 100,
-            content: Some(Content {
-                clock: 1,
-                kind: Some(Kind::Text("to be wiped".to_string())),
-                ..Content::default()
-            }),
-            delivery: Delivery::Sent.into(),
-            place: 1,
-            ..HistoryEntry::default()
-        };
-        vault
-            .save(
-                &initial,
-                &DeferredInitialsRecord::default(),
-                &[(peer, 0u64, entry)],
-                [],
-            )
-            .await
-            .expect("save entry before destroy");
-        let old_anchor =
-            RollbackAnchor::parse(&raw_local_storage_anchor().expect("old anchor present"))
-                .expect("parse old anchor");
-        assert_eq!(old_anchor.max_revision, 2);
-        drop(vault);
-
-        // Destroy must wipe both IndexedDB records and localStorage ROLLBACK_ANCHOR_KEY.
-        Vault::destroy().await.expect("Vault::destroy");
-        assert!(!Vault::exists().await.expect("Vault::exists after destroy"));
-        assert!(raw_idb_keys().await.is_empty());
-        assert!(raw_local_storage_anchor().is_none());
-
-        // A fresh Vault::create at revision 1 with a new random salt succeeds cleanly.
-        let fresh_state = AppState {
-            name: "Fresh Vault".to_string(),
-            ..AppState::default()
-        };
-        let fresh_vault = Vault::create(b"fresh-passphrase", &fresh_state)
-            .await
-            .expect("fresh Vault::create after destroy");
-        drop(fresh_vault);
-
-        let (reopened, restored_state, _) = Vault::unlock(b"fresh-passphrase")
-            .await
-            .expect("unlock fresh vault after destroy");
-        assert_eq!(restored_state.name, "Fresh Vault");
-        let new_anchor = RollbackAnchor::parse(
-            &raw_local_storage_anchor().expect("new anchor present after recreate"),
-        )
-        .expect("parse new anchor");
-        assert_eq!(new_anchor.max_revision, 1);
-        assert_ne!(new_anchor.salt_hash, old_anchor.salt_hash);
-        assert!(
-            reopened
-                .entry(&peer, 0)
-                .await
-                .expect("old history entry lookup")
-                .is_none()
+        assert_eq!(
+            Vault::inspect().await.expect("inspect v2"),
+            VaultPresence::IncompatibleVersion(2)
         );
+        assert!(matches!(
+            Vault::unlock(b"any").await,
+            Err(Error::IncompatibleVersion(2))
+        ));
 
-        drop(reopened);
+        // Create a real v3 vault, advance revision to 2, then tamper anchor to test rejection.
+        clean_browser_vault().await;
+        let vault = Vault::create(b"passphrase-rollback", &AppState::default())
+            .await
+            .expect("create");
+        let vault_id_hex = hex(&vault.header.borrow().vault_id);
+        drop(vault);
+
+        set_raw_local_storage(ROLLBACK_ANCHOR_KEY, &format!("v3:9:{vault_id_hex}"));
+        assert!(matches!(
+            Vault::unlock(b"passphrase-rollback").await,
+            Err(Error::Corrupt(msg)) if msg.contains("behind anchor 9")
+        ));
+
+        set_raw_local_storage(ROLLBACK_ANCHOR_KEY, &format!("v3:1:{}", "ff".repeat(16)));
+        assert!(matches!(
+            Vault::unlock(b"passphrase-rollback").await,
+            Err(Error::Corrupt(msg)) if msg.contains("vault_id does not match")
+        ));
+
         clean_browser_vault().await;
     }
 }

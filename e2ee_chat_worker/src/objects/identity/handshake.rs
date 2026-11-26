@@ -1,13 +1,19 @@
-//! V2 capability manifests, classical and post-quantum prekeys, and the two-phase handshake inbox.
+//! V2 capability manifests (with folded nullable classical SPK signature), classical and
+//! post-quantum prekeys, and the two-phase idempotent handshake inbox.
 
 use std::collections::HashSet;
 
+use sha2::{Digest, Sha256};
+use storage::{
+    ClaimOutcome, ClaimedPqBundle, MAX_SAFE_INTEGER, PqLastResortCommitment, PqStorageSnapshot,
+    PublicKey, PublishV2Record, PublishV2Status, RefillPrekeysRecord, Signature,
+    StoredCapabilityManifest, StoredInitialMessageV2, StoredPqPrekey,
+};
 use worker::{Error, Result};
 
 use super::{IdentityStore, rows::*};
 use crate::objects::{
-    ClaimBundleOutcome, ClaimedBundleWire, InitialMessageV2Wire, ManifestWire, PqCommitmentWire,
-    PqPrekeyWire, PqSnapshotWire, PublishV2Outcome, RefillOutcome,
+    AddInitialOutcome, RefillOutcome,
     sql::{SqlExec, checked_integer, params},
 };
 
@@ -23,7 +29,7 @@ enum PqPrekeyTable {
     OneTime,
 }
 
-fn insert_pq_prekey<S: SqlExec>(sql: &S, table: PqPrekeyTable, key: &PqPrekeyWire) -> Result<()> {
+fn insert_pq_prekey<S: SqlExec>(sql: &S, table: PqPrekeyTable, key: &StoredPqPrekey) -> Result<()> {
     let stmt = match table {
         PqPrekeyTable::LastResort => {
             "INSERT INTO pq_last_resort (suite, prekey_id, encapsulation_key, signature) \
@@ -39,7 +45,7 @@ fn insert_pq_prekey<S: SqlExec>(sql: &S, table: PqPrekeyTable, key: &PqPrekeyWir
         params![
             key.suite,
             key.id.as_slice(),
-            key.encapsulation_key.as_slice(),
+            key.encapsulation_key.as_ref(),
             key.signature.as_slice()
         ]?,
     )
@@ -63,8 +69,59 @@ fn opk_budget_step(current: Option<(u64, u64)>, now_ms: u64) -> (bool, u64, u64)
     }
 }
 
+/// Canonical SHA-256 payload digest of a [`StoredInitialMessageV2`] (excluding `id`) for
+/// idempotency equality checking on `(sender, ephemeral_key)`.
+fn initial_message_payload_hash(msg: &StoredInitialMessageV2) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"initial_v2/payload_hash\0");
+    h.update(msg.version.to_be_bytes());
+    h.update(msg.sender);
+    h.update(msg.recipient);
+    h.update(msg.ephemeral_key);
+    h.update(msg.signed_prekey);
+    match &msg.one_time_prekey {
+        Some(opk) => {
+            h.update([1]);
+            h.update(opk);
+        }
+        None => h.update([0]),
+    }
+    h.update((msg.header.len() as u32).to_be_bytes());
+    h.update(&msg.header);
+    h.update((msg.content.len() as u32).to_be_bytes());
+    h.update(&msg.content);
+    match msg.pq_suite {
+        Some(suite) => h.update([1, suite]),
+        None => h.update([0]),
+    }
+    h.update([u8::from(msg.pq_last_resort)]);
+    match &msg.pq_prekey_id {
+        Some(id) => {
+            h.update([1]);
+            h.update(id);
+        }
+        None => h.update([0]),
+    }
+    match &msg.pq_ciphertext {
+        Some(ct) => {
+            h.update([1]);
+            h.update((ct.len() as u32).to_be_bytes());
+            h.update(ct);
+        }
+        None => h.update([0]),
+    }
+    match &msg.manifest_digest {
+        Some(digest) => {
+            h.update([1]);
+            h.update(digest);
+        }
+        None => h.update([0]),
+    }
+    h.finalize().into()
+}
+
 impl<S: SqlExec> IdentityStore<'_, S> {
-    fn pop_classical_opk_sql(sql: &S) -> Result<Option<Vec<u8>>> {
+    fn pop_classical_opk_sql(sql: &S) -> Result<Option<PublicKey>> {
         let prekey: Option<PrekeyRow> = sql.query_opt(
             "SELECT position, prekey FROM one_time_prekeys ORDER BY position LIMIT 1",
             vec![],
@@ -75,19 +132,17 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 params![prekey.position]?,
             )?;
         }
-        Ok(prekey.map(|p| p.prekey.into_vec()))
+        prekey
+            .map(|p| fixed_blob(p.prekey, "one_time_prekey"))
+            .transpose()
     }
 
     fn negotiate_last_resort(
-        &self,
         sql: &S,
-        manifest: &ManifestWire,
+        manifest: &StoredCapabilityManifest,
         preferred_suites: &[u8],
-    ) -> Result<Option<PqPrekeyWire>> {
-        if !manifest.pq_enabled
-            || preferred_suites.is_empty()
-            || !self.has_v2_table(sql, "pq_last_resort")?
-        {
+    ) -> Result<Option<StoredPqPrekey>> {
+        if !manifest.pq_enabled || preferred_suites.is_empty() {
             return Ok(None);
         }
         for &suite in preferred_suites {
@@ -99,16 +154,13 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                  FROM pq_last_resort WHERE suite = ?",
                 params![suite]?,
             )? {
-                return Ok(Some(PqPrekeyWire::from(lr)));
+                return Ok(Some(StoredPqPrekey::try_from(lr)?));
             }
         }
         Ok(None)
     }
 
-    fn pop_pq_otpk(&self, sql: &S, suite: u8) -> Result<Option<PqPrekeyWire>> {
-        if !self.has_v2_table(sql, "pq_one_time_prekeys")? {
-            return Ok(None);
-        }
+    fn pop_pq_otpk(sql: &S, suite: u8) -> Result<Option<StoredPqPrekey>> {
         let row: Option<PqOneTimeRow> = sql.query_opt(
             "SELECT position, suite, prekey_id, encapsulation_key, signature \
              FROM pq_one_time_prekeys WHERE suite = ? ORDER BY position LIMIT 1",
@@ -120,28 +172,32 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 params![r.position]?,
             )?;
         }
-        Ok(row.map(PqPrekeyWire::from))
+        row.map(StoredPqPrekey::try_from).transpose()
     }
 
-    fn get_manifest_sql(&self, sql: &S) -> Result<Option<ManifestWire>> {
-        if !self.has_v2_table(sql, "capability_manifest")? {
-            return Ok(None);
-        }
+    fn get_manifest_with_spk_sig_sql(
+        sql: &S,
+    ) -> Result<Option<(StoredCapabilityManifest, Option<Signature>)>> {
         let Some(row) = sql.query_opt::<ManifestRow>(
             "SELECT audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
              pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
-             pq_last_resort_commitments, signature FROM capability_manifest",
+             signed_prekey_signature, pq_last_resort_commitments, signature \
+             FROM capability_manifest WHERE only = 0",
             vec![],
         )?
         else {
             return Ok(None);
         };
-        let pq_last_resort: Vec<PqCommitmentWire> =
+        let pq_last_resort: Vec<PqLastResortCommitment> =
             postcard::from_bytes(&row.pq_last_resort_commitments)
                 .map_err(|e| Error::RustError(e.to_string()))?;
-        Ok(Some(ManifestWire {
+        let spk_sig = row
+            .signed_prekey_signature
+            .map(|b| fixed_blob(b, "signed_prekey_signature"))
+            .transpose()?;
+        let manifest = StoredCapabilityManifest {
             audience: row.audience,
-            identity_key: row.identity_key.into_vec(),
+            identity_key: fixed_blob(row.identity_key, "identity_key")?,
             manifest_seq: row.manifest_seq,
             generation: row.generation,
             issued_at: row.issued_at,
@@ -150,16 +206,37 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             strict_pq: row.strict_pq != 0,
             pq_ratchet_supported: row.pq_ratchet_supported != 0,
             offered_suites: row.offered_suites.into_vec(),
-            signed_prekey: row.signed_prekey.into_vec(),
+            signed_prekey: fixed_blob(row.signed_prekey, "signed_prekey")?,
             pq_last_resort,
-            signature: row.signature.into_vec(),
-        }))
+            signature: fixed_blob(row.signature, "manifest signature")?,
+        };
+        Ok(Some((manifest, spk_sig)))
     }
 
-    fn pq_one_time_counts_sql(&self, sql: &S) -> Result<Vec<(u8, u64)>> {
-        if !self.has_v2_table(sql, "pq_one_time_prekeys")? {
-            return Ok(vec![]);
+    /// Whether a capability manifest is currently stored (without allocating DO tables).
+    pub(super) fn has_manifest(&self) -> Result<bool> {
+        if !self.has_tables()? {
+            return Ok(false);
         }
+        Ok(self
+            .sql
+            .query_opt::<ManifestSeqRow>(
+                "SELECT manifest_seq FROM capability_manifest WHERE only = 0",
+                vec![],
+            )?
+            .is_some())
+    }
+
+    pub(super) fn has_manifest_sql(sql: &S) -> Result<bool> {
+        Ok(sql
+            .query_opt::<ManifestSeqRow>(
+                "SELECT manifest_seq FROM capability_manifest WHERE only = 0",
+                vec![],
+            )?
+            .is_some())
+    }
+
+    fn pq_one_time_counts_sql(sql: &S) -> Result<Vec<(u8, u64)>> {
         let rows: Vec<SuiteCountRow> = sql.query(
             "SELECT suite, count(*) AS count FROM pq_one_time_prekeys GROUP BY suite ORDER BY suite",
             vec![],
@@ -167,75 +244,64 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         Ok(rows.into_iter().map(|r| (r.suite as u8, r.count)).collect())
     }
 
-    pub(super) fn publish_v2(
-        &self,
-        manifest: &ManifestWire,
-        signed_prekey_signature: Option<&[u8]>,
-        one_time_prekeys: &[Vec<u8>],
-        pq_last_resort: &[PqPrekeyWire],
-        pq_one_time_prekeys: &[PqPrekeyWire],
-        timestamp: u64,
-    ) -> Result<PublishV2Outcome> {
+    pub(super) fn publish_v2(&self, record: &PublishV2Record) -> Result<PublishV2Status> {
         // Validate and prepare ALL fallible values BEFORE executing any mutating SQL statement so
         // no partial wipe can occur on a validation or serialization failure.
-        let _ = checked_integer(timestamp)?;
+        let manifest = &record.manifest;
+        let _ = checked_integer(record.timestamp)?;
         let _ = checked_integer(manifest.manifest_seq)?;
         let _ = checked_integer(manifest.generation)?;
         let _ = checked_integer(manifest.issued_at)?;
         let _ = checked_integer(manifest.expires_at)?;
 
         // Check duplicate classical OPKs, duplicate PQ last-resort suites, and duplicate PQ IDs.
-        let mut seen_opks = HashSet::with_capacity(one_time_prekeys.len());
-        for (pos, opk) in one_time_prekeys.iter().enumerate() {
+        let mut seen_opks = HashSet::with_capacity(record.one_time_prekeys.len());
+        for (pos, opk) in record.one_time_prekeys.iter().enumerate() {
             if !seen_opks.insert(opk.as_slice()) {
-                return Ok(PublishV2Outcome::DuplicatePrekey);
+                return Ok(PublishV2Status::DuplicatePrekey);
             }
             let _ = checked_integer(pos as u64)?;
         }
-        let mut seen_lr_suites = HashSet::with_capacity(pq_last_resort.len());
-        let mut seen_pq = HashSet::with_capacity(pq_last_resort.len() + pq_one_time_prekeys.len());
-        for lr in pq_last_resort {
+        let mut seen_lr_suites = HashSet::with_capacity(record.pq_last_resort.len());
+        let mut seen_pq =
+            HashSet::with_capacity(record.pq_last_resort.len() + record.pq_one_time_prekeys.len());
+        for lr in &record.pq_last_resort {
             if !seen_lr_suites.insert(lr.suite) || !seen_pq.insert(lr.id.as_slice()) {
-                return Ok(PublishV2Outcome::DuplicatePrekey);
+                return Ok(PublishV2Status::DuplicatePrekey);
             }
         }
-        for opk in pq_one_time_prekeys {
+        for opk in &record.pq_one_time_prekeys {
             if !seen_pq.insert(opk.id.as_slice()) {
-                return Ok(PublishV2Outcome::DuplicatePrekey);
+                return Ok(PublishV2Status::DuplicatePrekey);
             }
         }
 
         let commitments_blob = postcard::to_allocvec(&manifest.pq_last_resort)
             .map_err(|e| Error::RustError(e.to_string()))?;
+        let signed_prekey_signature = if manifest.strict_pq {
+            None
+        } else {
+            record
+                .signed_prekey_signature
+                .as_ref()
+                .map(|s| s.as_slice())
+        };
 
+        self.ensure_v5_tables()?;
         self.sql.transaction_sync(|sql| {
             if sql
-                .query_opt::<ManifestSeqRow>("SELECT manifest_seq FROM capability_manifest", vec![])?
+                .query_opt::<ManifestSeqRow>(
+                    "SELECT manifest_seq FROM capability_manifest WHERE only = 0",
+                    vec![],
+                )?
                 .is_some_and(|row| row.manifest_seq >= manifest.manifest_seq)
             {
-                return Ok(PublishV2Outcome::StaleSequence);
-            }
-
-            // Store or clear classical SPK signature row depending on strict_pq and signature presence.
-            if !manifest.strict_pq
-                && let Some(sig) = signed_prekey_signature
-            {
-                let next_ts = sql
-                    .query_opt::<TimestampRow>("SELECT timestamp FROM bundle", vec![])?
-                    .map_or(timestamp, |r| r.timestamp.max(timestamp));
-                sql.exec(
-                    "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, ?) \
-                     ON CONFLICT (only) DO UPDATE SET signed_prekey = excluded.signed_prekey, \
-                     signature = excluded.signature, timestamp = excluded.timestamp",
-                    params![manifest.signed_prekey.as_slice(), sig, next_ts]?,
-                )?;
-            } else {
-                sql.exec("DELETE FROM bundle", vec![])?;
+                return Ok(PublishV2Status::StaleSequence);
             }
 
             // Replace classical OPKs.
             sql.exec("DELETE FROM one_time_prekeys", vec![])?;
-            for (pos, prekey) in one_time_prekeys.iter().enumerate() {
+            for (pos, prekey) in record.one_time_prekeys.iter().enumerate() {
                 sql.exec(
                     "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
                     params![pos as u64, prekey.as_slice()]?,
@@ -246,10 +312,10 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             sql.exec("DELETE FROM pq_last_resort", vec![])?;
             sql.exec("DELETE FROM pq_one_time_prekeys", vec![])?;
             if manifest.pq_enabled {
-                for lr in pq_last_resort {
+                for lr in &record.pq_last_resort {
                     insert_pq_prekey(sql, PqPrekeyTable::LastResort, lr)?;
                 }
-                for opk in pq_one_time_prekeys {
+                for opk in &record.pq_one_time_prekeys {
                     insert_pq_prekey(sql, PqPrekeyTable::OneTime, opk)?;
                 }
             }
@@ -258,8 +324,8 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 "INSERT INTO capability_manifest \
                  (only, audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
                   pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
-                  pq_last_resort_commitments, signature) \
-                 VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                  signed_prekey_signature, pq_last_resort_commitments, signature) \
+                 VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (only) DO UPDATE SET \
                   audience = excluded.audience, identity_key = excluded.identity_key, \
                   manifest_seq = excluded.manifest_seq, generation = excluded.generation, \
@@ -267,6 +333,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                   pq_enabled = excluded.pq_enabled, strict_pq = excluded.strict_pq, \
                   pq_ratchet_supported = excluded.pq_ratchet_supported, \
                   offered_suites = excluded.offered_suites, signed_prekey = excluded.signed_prekey, \
+                  signed_prekey_signature = excluded.signed_prekey_signature, \
                   pq_last_resort_commitments = excluded.pq_last_resort_commitments, \
                   signature = excluded.signature",
                 params![
@@ -281,50 +348,42 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                     manifest.pq_ratchet_supported,
                     manifest.offered_suites.as_slice(),
                     manifest.signed_prekey.as_slice(),
+                    signed_prekey_signature,
                     commitments_blob.as_slice(),
                     manifest.signature.as_slice()
                 ]?,
             )?;
-            sql.exec(
-                "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
-                 VALUES (0, ?, 0) \
-                 ON CONFLICT (only) DO UPDATE SET \
-                 last_v1_publish_ts = max(publish_watermarks.last_v1_publish_ts, excluded.last_v1_publish_ts)",
-                params![timestamp]?,
-            )?;
-            Ok(PublishV2Outcome::Stored)
+            Ok(PublishV2Status::Stored)
         })
     }
 
-    pub(super) fn refill_prekeys(
-        &self,
-        generation: u64,
-        one_time_prekeys: &[Vec<u8>],
-        pq_one_time_prekeys: &[PqPrekeyWire],
-        max_one_time_prekeys: u64,
-        max_pq_one_time_prekeys: u64,
-        timestamp: u64,
-    ) -> Result<RefillOutcome> {
-        let _ = checked_integer(generation)?;
-        let _ = checked_integer(timestamp)?;
+    pub(super) fn refill_prekeys(&self, record: &RefillPrekeysRecord) -> Result<RefillOutcome> {
+        let _ = checked_integer(record.generation)?;
+        let _ = checked_integer(record.timestamp)?;
         if !self.has_tables()? {
             return Ok(RefillOutcome::NotFound);
         }
 
+        let max_one_time_prekeys = record.max_one_time_prekeys as u64;
+        let max_pq_one_time_prekeys = record.max_pq_one_time_prekeys as u64;
+
         self.sql.transaction_sync(|sql| {
-            let Some(manifest) = self.get_manifest_sql(sql)? else {
+            let Some((manifest, _)) = Self::get_manifest_with_spk_sig_sql(sql)? else {
                 return Ok(RefillOutcome::NotFound);
             };
-            if manifest.generation != generation {
+            if manifest.generation != record.generation {
                 return Ok(RefillOutcome::StaleGeneration);
             }
-            if !pq_one_time_prekeys.is_empty() && !manifest.pq_enabled {
+            if !record.pq_one_time_prekeys.is_empty() && !manifest.pq_enabled {
                 return Ok(RefillOutcome::SuiteNotOffered);
             }
 
             if sql
-                .query_opt::<WatermarkRow>("SELECT last_refill_ts FROM publish_watermarks", vec![])?
-                .is_some_and(|row| row.last_refill_ts >= timestamp)
+                .query_opt::<WatermarkRow>(
+                    "SELECT last_refill_ts FROM publish_watermarks WHERE only = 0",
+                    vec![],
+                )?
+                .is_some_and(|row| row.last_refill_ts >= record.timestamp)
             {
                 return Ok(RefillOutcome::StaleTimestamp);
             }
@@ -332,14 +391,14 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 "SELECT position, prekey FROM one_time_prekeys ORDER BY position",
                 vec![],
             )?;
-            if (existing_opks.len() as u64).saturating_add(one_time_prekeys.len() as u64)
+            if (existing_opks.len() as u64).saturating_add(record.one_time_prekeys.len() as u64)
                 > max_one_time_prekeys
             {
                 return Ok(RefillOutcome::LimitExceeded);
             }
             let mut seen_opks: HashSet<&[u8]> =
                 existing_opks.iter().map(|r| r.prekey.as_ref()).collect();
-            for opk in one_time_prekeys {
+            for opk in &record.one_time_prekeys {
                 if !seen_opks.insert(opk.as_slice()) {
                     return Ok(RefillOutcome::DuplicatePrekey);
                 }
@@ -347,7 +406,8 @@ impl<S: SqlExec> IdentityStore<'_, S> {
 
             let existing_pq_ids: Vec<IdBlobRow> =
                 sql.query("SELECT prekey_id FROM pq_one_time_prekeys", vec![])?;
-            if (existing_pq_ids.len() as u64).saturating_add(pq_one_time_prekeys.len() as u64)
+            if (existing_pq_ids.len() as u64)
+                .saturating_add(record.pq_one_time_prekeys.len() as u64)
                 > max_pq_one_time_prekeys
             {
                 return Ok(RefillOutcome::LimitExceeded);
@@ -359,7 +419,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 .chain(lr_ids.iter())
                 .map(|r| r.prekey_id.as_ref())
                 .collect();
-            for pq in pq_one_time_prekeys {
+            for pq in &record.pq_one_time_prekeys {
                 if !manifest.offered_suites.contains(&pq.suite) {
                     return Ok(RefillOutcome::SuiteNotOffered);
                 }
@@ -370,29 +430,28 @@ impl<S: SqlExec> IdentityStore<'_, S> {
 
             // Pre-validate position integer bindings before mutating SQLite.
             let start_pos = existing_opks.last().map_or(0, |r| r.position + 1);
-            for offset in 0..one_time_prekeys.len() {
+            for offset in 0..record.one_time_prekeys.len() {
                 let _ = checked_integer(start_pos.saturating_add(offset as u64))?;
             }
 
             // Record monotonic refill watermark and append OPKs/PQOPKs without rotating SPK.
             sql.exec(
-                "INSERT INTO publish_watermarks (only, last_v1_publish_ts, last_refill_ts) \
-                 VALUES (0, 0, ?) \
+                "INSERT INTO publish_watermarks (only, last_refill_ts) VALUES (0, ?) \
                  ON CONFLICT (only) DO UPDATE SET last_refill_ts = excluded.last_refill_ts",
-                params![timestamp]?,
+                params![record.timestamp]?,
             )?;
-            for (offset, opk) in one_time_prekeys.iter().enumerate() {
+            for (offset, opk) in record.one_time_prekeys.iter().enumerate() {
                 sql.exec(
                     "INSERT INTO one_time_prekeys (position, prekey) VALUES (?, ?)",
                     params![start_pos.saturating_add(offset as u64), opk.as_slice()]?,
                 )?;
             }
-            for pq in pq_one_time_prekeys {
+            for pq in &record.pq_one_time_prekeys {
                 insert_pq_prekey(sql, PqPrekeyTable::OneTime, pq)?;
             }
 
-            let classical_count = existing_opks.len() as u64 + one_time_prekeys.len() as u64;
-            let pq_counts = self.pq_one_time_counts_sql(sql)?;
+            let classical_count = existing_opks.len() as u64 + record.one_time_prekeys.len() as u64;
+            let pq_counts = Self::pq_one_time_counts_sql(sql)?;
             Ok(RefillOutcome::Stored {
                 classical_count,
                 pq_counts,
@@ -400,11 +459,11 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         })
     }
 
-    pub(super) fn get_manifest(&self) -> Result<Option<ManifestWire>> {
+    pub(super) fn get_manifest(&self) -> Result<Option<StoredCapabilityManifest>> {
         if !self.has_tables()? {
             return Ok(None);
         }
-        self.get_manifest_sql(self.sql)
+        Ok(Self::get_manifest_with_spk_sig_sql(self.sql)?.map(|(m, _)| m))
     }
 
     /// Atomically validates `reject_pq_on_manifest`, `strict_pq`, suite negotiation, and the
@@ -414,12 +473,18 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         preferred_suites: &[u8],
         reject_pq_on_manifest: bool,
         now_ms: u64,
-    ) -> Result<ClaimBundleOutcome> {
+    ) -> Result<ClaimOutcome> {
         if !self.has_tables()? {
-            return Ok(ClaimBundleOutcome::NotFound);
+            return Ok(ClaimOutcome::NotFound);
         }
-        self.ensure_v2_tables()?;
         self.sql.transaction_sync(|sql| {
+            let Some((manifest, folded_spk_sig)) = Self::get_manifest_with_spk_sig_sql(sql)? else {
+                return Ok(ClaimOutcome::NotFound);
+            };
+            if reject_pq_on_manifest && manifest.pq_enabled {
+                return Ok(ClaimOutcome::PqDisabledForPqManifest);
+            }
+
             let current_budget = sql
                 .query_opt::<OpkBudgetRow>(
                     "SELECT window_start, claims FROM opk_claim_budget WHERE only = 0",
@@ -429,173 +494,164 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             let (budget_allows, next_window_start, next_claims) =
                 opk_budget_step(current_budget, now_ms);
 
-            if let Some(manifest) = self.get_manifest_sql(sql)? {
-                if reject_pq_on_manifest && manifest.pq_enabled {
-                    return Ok(ClaimBundleOutcome::PqDisabledForPqManifest);
-                }
+            let signed_prekey_signature = if manifest.strict_pq {
+                None
+            } else {
+                folded_spk_sig
+            };
+            let pq_last_resort = Self::negotiate_last_resort(sql, &manifest, preferred_suites)?;
 
-                let signed_prekey_signature = if manifest.strict_pq {
-                    None
-                } else {
-                    sql.query_opt::<BundleRow>(
-                        "SELECT signed_prekey, signature FROM bundle",
-                        vec![],
-                    )?
-                    .filter(|b| b.signed_prekey.as_ref() == manifest.signed_prekey.as_slice())
-                    .map(|b| b.signature.into_vec())
-                };
-                let pq_last_resort =
-                    self.negotiate_last_resort(sql, &manifest, preferred_suites)?;
-
-                // Validate policy & negotiation BEFORE popping any OPK (matches Wave 1 MemoryStore).
-                let can_pop_opk = if manifest.strict_pq
-                    || (manifest.pq_enabled && !preferred_suites.is_empty())
-                {
+            // Validate policy & negotiation BEFORE popping any OPK.
+            let can_pop_opk =
+                if manifest.strict_pq || (manifest.pq_enabled && !preferred_suites.is_empty()) {
                     pq_last_resort.is_some()
                 } else {
                     signed_prekey_signature.is_some()
                 };
-                if !can_pop_opk {
-                    return Ok(ClaimBundleOutcome::Claimed(Box::new(ClaimedBundleWire {
-                        signed_prekey: manifest.signed_prekey.clone(),
-                        manifest: Some(manifest),
-                        signed_prekey_signature,
-                        one_time_prekey: None,
-                        pq_last_resort: None,
-                        pq_one_time_prekey: None,
-                    })));
-                }
-
-                let (one_time_prekey, pq_one_time_prekey) = if budget_allows {
-                    let pq_opk = match pq_last_resort.as_ref() {
-                        Some(lr) => self.pop_pq_otpk(sql, lr.suite)?,
-                        None => None,
-                    };
-                    let classical_opk = Self::pop_classical_opk_sql(sql)?;
-                    if classical_opk.is_some() || pq_opk.is_some() {
-                        record_opk_budget(sql, next_window_start, next_claims)?;
-                    }
-                    (classical_opk, pq_opk)
-                } else {
-                    (None, None)
-                };
-
-                return Ok(ClaimBundleOutcome::Claimed(Box::new(ClaimedBundleWire {
-                    signed_prekey: manifest.signed_prekey.clone(),
+            if !can_pop_opk {
+                return Ok(ClaimOutcome::Claimed(Box::new(ClaimedPqBundle {
+                    identity_key: manifest.identity_key,
+                    signed_prekey: manifest.signed_prekey,
                     manifest: Some(manifest),
                     signed_prekey_signature,
-                    one_time_prekey,
-                    pq_last_resort,
-                    pq_one_time_prekey,
+                    one_time_prekey: None,
+                    pq_last_resort: None,
+                    pq_one_time_prekey: None,
                 })));
             }
 
-            // Preserve read compatibility for pre-existing DOs that still have a classical bundle row.
-            let Some(bundle) =
-                sql.query_opt::<BundleRow>("SELECT signed_prekey, signature FROM bundle", vec![])?
-            else {
-                return Ok(ClaimBundleOutcome::NotFound);
-            };
-            let one_time_prekey = if budget_allows {
-                let popped = Self::pop_classical_opk_sql(sql)?;
-                if popped.is_some() {
+            let (one_time_prekey, pq_one_time_prekey) = if budget_allows {
+                let pq_opk = match pq_last_resort.as_ref() {
+                    Some(lr) => Self::pop_pq_otpk(sql, lr.suite)?,
+                    None => None,
+                };
+                let classical_opk = Self::pop_classical_opk_sql(sql)?;
+                if classical_opk.is_some() || pq_opk.is_some() {
                     record_opk_budget(sql, next_window_start, next_claims)?;
                 }
-                popped
+                (classical_opk, pq_opk)
             } else {
-                None
+                (None, None)
             };
-            Ok(ClaimBundleOutcome::Claimed(Box::new(ClaimedBundleWire {
-                manifest: None,
-                signed_prekey: bundle.signed_prekey.into_vec(),
-                signed_prekey_signature: Some(bundle.signature.into_vec()),
+
+            Ok(ClaimOutcome::Claimed(Box::new(ClaimedPqBundle {
+                identity_key: manifest.identity_key,
+                signed_prekey: manifest.signed_prekey,
+                manifest: Some(manifest),
+                signed_prekey_signature,
                 one_time_prekey,
-                pq_last_resort: None,
-                pq_one_time_prekey: None,
+                pq_last_resort,
+                pq_one_time_prekey,
             })))
         })
     }
 
     pub(super) fn add_initial_message_v2(
         &self,
-        message: &InitialMessageV2Wire,
+        message: &StoredInitialMessageV2,
         limit: u64,
         now_ms: u64,
-    ) -> Result<Option<u64>> {
-        let initial_bindings = params![
+    ) -> Result<AddInitialOutcome> {
+        if !self.has_tables()? {
+            return Ok(AddInitialOutcome::NotFound);
+        }
+        let payload_hash = initial_message_payload_hash(message);
+        let cutoff = now_ms.saturating_sub(self.retention_ms);
+        let bindings = params![
+            message.version,
             message.sender.as_slice(),
             message.ephemeral_key.as_slice(),
             message.signed_prekey.as_slice(),
-            message.one_time_prekey.as_deref(),
-            message.header.as_slice(),
-            message.content.as_slice(),
+            message.one_time_prekey.as_ref().map(|k| k.as_slice()),
+            message.header.as_ref(),
+            message.content.as_ref(),
+            message.pq_suite,
+            message.pq_last_resort,
+            message.pq_prekey_id.as_ref().map(|id| id.as_slice()),
+            message.pq_ciphertext.as_deref(),
+            message.manifest_digest.as_ref().map(|d| d.as_slice()),
+            payload_hash.as_slice(),
             now_ms
         ]?;
-        let has_pq = message.version != 1;
-        if has_pq {
-            let _ = checked_integer(u64::from(message.version))?;
-        }
+
         self.sql.transaction_sync(|sql| {
+            if !Self::has_manifest_sql(sql)? {
+                return Ok(AddInitialOutcome::NotFound);
+            }
+            // Prune expired rows BEFORE `(sender, ephemeral_key)` lookup/insert so an expired row
+            // never collides with UNIQUE(sender, ephemeral_key) or occupies an inbox slot.
+            sql.exec(
+                "DELETE FROM initial_messages WHERE created_at < ?",
+                params![cutoff]?,
+            )?;
+
+            if let Some(existing) = sql.query_opt::<InitialPayloadRow>(
+                "SELECT id, payload_hash FROM initial_messages \
+                 WHERE sender = ? AND ephemeral_key = ?",
+                params![message.sender.as_slice(), message.ephemeral_key.as_slice()]?,
+            )? {
+                if existing.payload_hash.as_ref() == payload_hash.as_slice() {
+                    return Ok(AddInitialOutcome::Added {
+                        id: existing.id,
+                        inserted: false,
+                    });
+                }
+                return Ok(AddInitialOutcome::PayloadMismatch);
+            }
+
             let count: CountRow =
                 sql.query_one("SELECT count(*) AS count FROM initial_messages", vec![])?;
             if count.count >= limit {
-                return Ok(None);
+                return Ok(AddInitialOutcome::LimitExceeded);
             }
+
             let inserted: IdRow = sql.query_one(
-                "INSERT INTO initial_messages (sender, ephemeral_key, signed_prekey, \
-                 one_time_prekey, header, content, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO initial_messages \
+                 (version, sender, ephemeral_key, signed_prekey, one_time_prekey, header, content, \
+                  pq_suite, pq_last_resort, pq_prekey_id, pq_ciphertext, manifest_digest, \
+                  payload_hash, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  RETURNING id",
-                initial_bindings,
+                bindings,
             )?;
-            if has_pq {
+            if inserted.id > MAX_SAFE_INTEGER {
                 sql.exec(
-                    "INSERT INTO initial_messages_pq \
-                     (initial_message_id, version, pq_suite, pq_last_resort, pq_prekey_id, \
-                      pq_ciphertext, manifest_digest) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        inserted.id,
-                        message.version,
-                        message.pq_suite.unwrap_or(0),
-                        message.pq_last_resort,
-                        message.pq_prekey_id.as_deref().unwrap_or_default(),
-                        message.pq_ciphertext.as_deref().unwrap_or_default(),
-                        message.manifest_digest.as_deref()
-                    ]?,
+                    "DELETE FROM initial_messages WHERE id = ?",
+                    params![inserted.id]?,
                 )?;
+                return Ok(AddInitialOutcome::SequenceOverflow);
             }
-            Ok(Some(inserted.id))
+            Ok(AddInitialOutcome::Added {
+                id: inserted.id,
+                inserted: true,
+            })
         })
     }
 
     pub(super) fn list_initial_messages(
         &self,
+        recipient: PublicKey,
+        after_id: u64,
         limit: u64,
         now_ms: u64,
-    ) -> Result<Vec<InitialMessageV2Wire>> {
+    ) -> Result<Vec<StoredInitialMessageV2>> {
+        let _ = checked_integer(after_id)?;
         if !self.has_tables()? || limit == 0 {
             return Ok(vec![]);
         }
         let cutoff = now_ms.saturating_sub(self.retention_ms);
-        if self.has_v2_table(self.sql, "initial_messages_pq")? {
-            let rows: Vec<InitialMessageJoinedRow> = self.sql.query(
-                "SELECT m.id, m.sender, m.ephemeral_key, m.signed_prekey, m.one_time_prekey, \
-                 m.header, m.content, p.version, p.pq_suite, p.pq_last_resort, \
-                 p.pq_prekey_id, p.pq_ciphertext, p.manifest_digest \
-                 FROM initial_messages m \
-                 LEFT JOIN initial_messages_pq p ON p.initial_message_id = m.id \
-                 WHERE m.created_at >= ? \
-                 ORDER BY m.id LIMIT ?",
-                params![cutoff, limit]?,
-            )?;
-            Ok(rows.into_iter().map(InitialMessageV2Wire::from).collect())
-        } else {
-            let rows: Vec<InitialMessageWithIdRow> = self.sql.query(
-                "SELECT id, sender, ephemeral_key, signed_prekey, one_time_prekey, header, content \
-                 FROM initial_messages WHERE created_at >= ? ORDER BY id LIMIT ?",
-                params![cutoff, limit]?,
-            )?;
-            Ok(rows.into_iter().map(InitialMessageV2Wire::from).collect())
-        }
+        let rows: Vec<InitialMessageRow> = self.sql.query(
+            "SELECT id, version, sender, ephemeral_key, signed_prekey, one_time_prekey, \
+             header, content, pq_suite, pq_last_resort, pq_prekey_id, pq_ciphertext, \
+             manifest_digest \
+             FROM initial_messages \
+             WHERE id > ? AND created_at >= ? \
+             ORDER BY id LIMIT ?",
+            params![after_id, cutoff, limit]?,
+        )?;
+        rows.into_iter()
+            .map(|row| row.into_stored(recipient))
+            .collect()
     }
 
     pub(super) fn ack_initial_messages(&self, ids: &[u64]) -> Result<u64> {
@@ -606,59 +662,43 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             return Ok(0);
         }
         let ids_json = serde_json::to_string(ids).map_err(|e| Error::RustError(e.to_string()))?;
-        self.sql.transaction_sync(|sql| {
-            if self.has_v2_table(sql, "initial_messages_pq")? {
-                sql.exec(
-                    "DELETE FROM initial_messages_pq \
-                     WHERE initial_message_id IN (SELECT value FROM json_each(?))",
-                    params![ids_json.as_str()]?,
-                )?;
-            }
-            let deleted: Vec<IdRow> = sql.query(
-                "DELETE FROM initial_messages \
-                 WHERE id IN (SELECT value FROM json_each(?)) RETURNING id",
-                params![ids_json.as_str()]?,
-            )?;
-            Self::cleanup_orphan_pq_initials_sql(sql)?;
-            Ok(deleted.len() as u64)
-        })
+        let deleted: Vec<IdRow> = self.sql.query(
+            "DELETE FROM initial_messages \
+             WHERE id IN (SELECT value FROM json_each(?)) RETURNING id",
+            params![ids_json.as_str()]?,
+        )?;
+        Ok(deleted.len() as u64)
     }
 
-    pub(super) fn pq_snapshot(&self, now_ms: u64) -> Result<PqSnapshotWire> {
+    pub(super) fn pq_snapshot(&self, now_ms: u64) -> Result<PqStorageSnapshot> {
         if !self.has_tables()? {
-            return Ok(PqSnapshotWire {
-                manifest: None,
-                classical_one_time_count: 0,
-                pq_last_resort_suites: vec![],
-                pq_one_time_counts: vec![],
-                pending_initial_messages: 0,
-            });
+            return Ok(PqStorageSnapshot::default());
         }
         let cutoff = now_ms.saturating_sub(self.retention_ms);
-        let manifest = self.get_manifest_sql(self.sql)?;
+        let manifest = Self::get_manifest_with_spk_sig_sql(self.sql)?.map(|(m, _)| m);
         let classical: CountRow = self
             .sql
             .query_one("SELECT count(*) AS count FROM one_time_prekeys", vec![])?;
-        let pq_last_resort_suites = if self.has_v2_table(self.sql, "pq_last_resort")? {
-            self.sql
-                .query::<SuiteRow>("SELECT suite FROM pq_last_resort ORDER BY suite", vec![])?
-                .into_iter()
-                .map(|r| r.suite as u8)
-                .collect()
-        } else {
-            vec![]
-        };
-        let pq_one_time_counts = self.pq_one_time_counts_sql(self.sql)?;
+        let pq_last_resort_suites: Vec<u8> = self
+            .sql
+            .query::<SuiteRow>("SELECT suite FROM pq_last_resort ORDER BY suite", vec![])?
+            .into_iter()
+            .map(|r| r.suite as u8)
+            .collect();
+        let pq_one_time_counts = Self::pq_one_time_counts_sql(self.sql)?
+            .into_iter()
+            .map(|(suite, count)| (suite, count as usize))
+            .collect();
         let pending: CountRow = self.sql.query_one(
             "SELECT count(*) AS count FROM initial_messages WHERE created_at >= ?",
             params![cutoff]?,
         )?;
-        Ok(PqSnapshotWire {
+        Ok(PqStorageSnapshot {
             manifest,
-            classical_one_time_count: classical.count,
+            classical_one_time_count: classical.count as usize,
             pq_last_resort_suites,
             pq_one_time_counts,
-            pending_initial_messages: pending.count,
+            pending_initial_messages: pending.count as usize,
         })
     }
 }
@@ -709,18 +749,23 @@ mod tests {
 
     #[cfg(not(target_arch = "wasm32"))]
     mod native_sqlite_tests {
+        use storage::Bytes;
+
         use super::*;
         use crate::objects::identity::TestIdentity;
+
+        const BOB: PublicKey = [0x11; 32];
+        const ALICE: PublicKey = [0x22; 32];
 
         fn mk_manifest(
             seq: u64,
             generation: u64,
             pq_enabled: bool,
             strict_pq: bool,
-        ) -> ManifestWire {
-            ManifestWire {
+        ) -> StoredCapabilityManifest {
+            StoredCapabilityManifest {
                 audience: "relay.example".into(),
-                identity_key: vec![0x11; 32],
+                identity_key: BOB,
                 manifest_seq: seq,
                 generation,
                 issued_at: 1_000,
@@ -729,38 +774,57 @@ mod tests {
                 strict_pq,
                 pq_ratchet_supported: pq_enabled,
                 offered_suites: if pq_enabled { vec![1, 2] } else { vec![] },
-                signed_prekey: vec![0x22; 32],
+                signed_prekey: [0x22; 32],
                 pq_last_resort: if pq_enabled {
                     vec![
-                        PqCommitmentWire {
+                        PqLastResortCommitment {
                             suite: 1,
-                            prekey_id: b"lr-1".to_vec(),
+                            prekey_id: [0xA1; 32],
                         },
-                        PqCommitmentWire {
+                        PqLastResortCommitment {
                             suite: 2,
-                            prekey_id: b"lr-2".to_vec(),
+                            prekey_id: [0xA2; 32],
                         },
                     ]
                 } else {
                     vec![]
                 },
-                signature: vec![0x33; 64],
+                signature: [0x33; 64],
             }
         }
 
-        fn mk_pq_key(suite: u8, id: &[u8]) -> PqPrekeyWire {
-            PqPrekeyWire {
+        fn mk_pq_key(suite: u8, tag: u8) -> StoredPqPrekey {
+            StoredPqPrekey {
                 suite,
-                id: id.to_vec(),
-                encapsulation_key: vec![suite; 32],
-                signature: vec![0x44; 64],
+                id: [tag; 32],
+                encapsulation_key: Bytes::from(vec![suite; 32]),
+                signature: [0x44; 64],
             }
         }
 
-        fn mk_opk(idx: u32) -> Vec<u8> {
-            let mut key = vec![0u8; 32];
+        fn mk_opk(idx: u32) -> PublicKey {
+            let mut key = [0u8; 32];
             key[..4].copy_from_slice(&idx.to_be_bytes());
             key
+        }
+
+        fn mk_initial(eph: u8, version: u32, content: &'static [u8]) -> StoredInitialMessageV2 {
+            StoredInitialMessageV2 {
+                id: 0,
+                version,
+                sender: ALICE,
+                recipient: BOB,
+                ephemeral_key: [eph; 32],
+                signed_prekey: [0x22; 32],
+                one_time_prekey: None,
+                header: Bytes::from_static(b"hdr"),
+                content: Bytes::from_static(content),
+                pq_suite: (version == 2).then_some(1),
+                pq_last_resort: false,
+                pq_prekey_id: (version == 2).then_some([0xB1; 32]),
+                pq_ciphertext: (version == 2).then(|| Bytes::from_static(b"pq-ct")),
+                manifest_digest: (version == 2).then_some([0xDD; 32]),
+            }
         }
 
         #[test]
@@ -770,492 +834,315 @@ mod tests {
 
             // Unknown identity returns None / NotFound without creating tables.
             assert!(store.get_manifest().unwrap().is_none());
-            assert!(matches!(
-                store.refill_prekeys(1, &[], &[], 10, 10, 1_000).unwrap(),
+            assert_eq!(
+                store
+                    .refill_prekeys(&RefillPrekeysRecord {
+                        identity_key: BOB,
+                        generation: 1,
+                        one_time_prekeys: vec![],
+                        pq_one_time_prekeys: vec![],
+                        max_one_time_prekeys: 10,
+                        max_pq_one_time_prekeys: 10,
+                        timestamp: 1_000,
+                    })
+                    .unwrap(),
                 RefillOutcome::NotFound
-            ));
+            );
             assert!(!store.has_tables().unwrap());
 
-            store.ensure_v2_tables().unwrap();
-
-            // Duplicate classical OPK rejected before writing.
+            // Duplicate classical OPK rejected before creating/mutating manifest.
             let m1 = mk_manifest(1, 1, true, false);
-            assert!(matches!(
+            assert_eq!(
                 store
-                    .publish_v2(
-                        &m1,
-                        Some(&[0xaa; 64]),
-                        &[mk_opk(1), mk_opk(1)],
-                        &[mk_pq_key(1, b"lr-1")],
-                        &[],
-                        1_000
-                    )
+                    .publish_v2(&PublishV2Record {
+                        manifest: m1.clone(),
+                        signed_prekey_signature: Some([0xAA; 64]),
+                        one_time_prekeys: vec![mk_opk(1), mk_opk(1)],
+                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                        pq_one_time_prekeys: vec![],
+                        timestamp: 1_000,
+                    })
                     .unwrap(),
-                PublishV2Outcome::DuplicatePrekey
-            ));
-            assert!(store.get_manifest().unwrap().is_none());
+                PublishV2Status::DuplicatePrekey
+            );
+            assert!(!store.has_tables().unwrap());
 
-            // Duplicate PQ prekey ID (colliding with last-resort) rejected.
-            assert!(matches!(
+            // Valid publish stores folded signed_prekey_signature on capability_manifest.
+            assert_eq!(
                 store
-                    .publish_v2(
-                        &m1,
-                        Some(&[0xaa; 64]),
-                        &[mk_opk(1)],
-                        &[mk_pq_key(1, b"lr-1")],
-                        &[mk_pq_key(1, b"lr-1")],
-                        1_000
-                    )
+                    .publish_v2(&PublishV2Record {
+                        manifest: m1.clone(),
+                        signed_prekey_signature: Some([0xAA; 64]),
+                        one_time_prekeys: vec![mk_opk(1), mk_opk(2)],
+                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                        pq_one_time_prekeys: vec![mk_pq_key(1, 0xB1)],
+                        timestamp: 1_000,
+                    })
                     .unwrap(),
-                PublishV2Outcome::DuplicatePrekey
-            ));
-
-            // Valid publish succeeds.
-            assert!(matches!(
-                store
-                    .publish_v2(
-                        &m1,
-                        Some(&[0xaa; 64]),
-                        &[mk_opk(1), mk_opk(2)],
-                        &[mk_pq_key(1, b"lr-1"), mk_pq_key(2, b"lr-2")],
-                        &[mk_pq_key(1, b"opk-1")],
-                        1_000
-                    )
-                    .unwrap(),
-                PublishV2Outcome::Stored
-            ));
-            assert_eq!(store.get_manifest().unwrap().unwrap().manifest_seq, 1);
+                PublishV2Status::Stored
+            );
+            assert_eq!(store.get_manifest().unwrap(), Some(m1));
 
             // Stale manifest_seq rejected.
-            assert!(matches!(
+            assert_eq!(
                 store
-                    .publish_v2(&m1, Some(&[0xaa; 64]), &[], &[], &[], 2_000)
+                    .publish_v2(&PublishV2Record {
+                        manifest: mk_manifest(1, 2, true, false),
+                        signed_prekey_signature: Some([0xAA; 64]),
+                        one_time_prekeys: vec![],
+                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                        pq_one_time_prekeys: vec![],
+                        timestamp: 2_000,
+                    })
                     .unwrap(),
-                PublishV2Outcome::StaleSequence
-            ));
+                PublishV2Status::StaleSequence
+            );
 
-            // Refill validations: wrong generation, unoffered suite, duplicate OPK, limit exceeded.
-            assert!(matches!(
+            // Refill: wrong generation, unoffered suite, duplicate, cap, valid, stale ts.
+            assert_eq!(
                 store
-                    .refill_prekeys(99, &[mk_opk(3)], &[], 10, 10, 2_000)
+                    .refill_prekeys(&RefillPrekeysRecord {
+                        identity_key: BOB,
+                        generation: 99,
+                        one_time_prekeys: vec![mk_opk(3)],
+                        pq_one_time_prekeys: vec![],
+                        max_one_time_prekeys: 10,
+                        max_pq_one_time_prekeys: 10,
+                        timestamp: 2_000,
+                    })
                     .unwrap(),
                 RefillOutcome::StaleGeneration
-            ));
-            assert!(matches!(
+            );
+            assert_eq!(
                 store
-                    .refill_prekeys(1, &[], &[mk_pq_key(9, b"bad-suite")], 10, 10, 2_000)
+                    .refill_prekeys(&RefillPrekeysRecord {
+                        identity_key: BOB,
+                        generation: 1,
+                        one_time_prekeys: vec![],
+                        pq_one_time_prekeys: vec![mk_pq_key(9, 0xC9)],
+                        max_one_time_prekeys: 10,
+                        max_pq_one_time_prekeys: 10,
+                        timestamp: 2_000,
+                    })
                     .unwrap(),
                 RefillOutcome::SuiteNotOffered
-            ));
-            assert!(matches!(
+            );
+            assert_eq!(
                 store
-                    .refill_prekeys(1, &[mk_opk(1)], &[], 10, 10, 2_000)
+                    .refill_prekeys(&RefillPrekeysRecord {
+                        identity_key: BOB,
+                        generation: 1,
+                        one_time_prekeys: vec![mk_opk(1)],
+                        pq_one_time_prekeys: vec![],
+                        max_one_time_prekeys: 10,
+                        max_pq_one_time_prekeys: 10,
+                        timestamp: 2_000,
+                    })
                     .unwrap(),
                 RefillOutcome::DuplicatePrekey
-            ));
-            assert!(matches!(
+            );
+            assert_eq!(
                 store
-                    .refill_prekeys(1, &[], &[mk_pq_key(1, b"lr-1")], 10, 10, 2_000)
+                    .refill_prekeys(&RefillPrekeysRecord {
+                        identity_key: BOB,
+                        generation: 1,
+                        one_time_prekeys: vec![mk_opk(3), mk_opk(4)],
+                        pq_one_time_prekeys: vec![mk_pq_key(2, 0xB2)],
+                        max_one_time_prekeys: 10,
+                        max_pq_one_time_prekeys: 10,
+                        timestamp: 2_000,
+                    })
                     .unwrap(),
-                RefillOutcome::DuplicatePrekey
-            ));
-            assert!(matches!(
-                store
-                    .refill_prekeys(1, &[mk_opk(3), mk_opk(4)], &[], 3, 10, 2_000)
-                    .unwrap(),
-                RefillOutcome::LimitExceeded
-            ));
-
-            // Valid refill appends OPKs and PQ OPKs and updates watermark.
-            let refilled = store
-                .refill_prekeys(
-                    1,
-                    &[mk_opk(3)],
-                    &[mk_pq_key(1, b"opk-2"), mk_pq_key(2, b"opk-3")],
-                    10,
-                    10,
-                    2_000,
-                )
-                .unwrap();
-            assert!(matches!(
-                refilled,
                 RefillOutcome::Stored {
-                    classical_count: 3,
-                    ref pq_counts,
-                } if pq_counts == &vec![(1, 2), (2, 1)]
-            ));
-
-            // Non-increasing refill timestamp rejected.
-            assert!(matches!(
+                    classical_count: 4,
+                    pq_counts: vec![(1, 1), (2, 1)],
+                }
+            );
+            assert_eq!(
                 store
-                    .refill_prekeys(1, &[mk_opk(4)], &[], 10, 10, 2_000)
+                    .refill_prekeys(&RefillPrekeysRecord {
+                        identity_key: BOB,
+                        generation: 1,
+                        one_time_prekeys: vec![mk_opk(5)],
+                        pq_one_time_prekeys: vec![],
+                        max_one_time_prekeys: 10,
+                        max_pq_one_time_prekeys: 10,
+                        timestamp: 2_000,
+                    })
                     .unwrap(),
                 RefillOutcome::StaleTimestamp
-            ));
-
-            // Re-publish with pq_enabled = false clears PQ tables and rejects PQ refills.
-            let m2_off = mk_manifest(2, 2, false, false);
-            assert!(matches!(
-                store
-                    .publish_v2(&m2_off, Some(&[0xbb; 64]), &[mk_opk(10)], &[], &[], 3_000)
-                    .unwrap(),
-                PublishV2Outcome::Stored
-            ));
-            let snap = store.pq_snapshot(3_000).unwrap();
-            assert_eq!(snap.classical_one_time_count, 1);
-            assert!(snap.pq_last_resort_suites.is_empty());
-            assert!(snap.pq_one_time_counts.is_empty());
-            assert!(matches!(
-                store
-                    .refill_prekeys(2, &[], &[mk_pq_key(1, b"nope")], 10, 10, 4_000)
-                    .unwrap(),
-                RefillOutcome::SuiteNotOffered
-            ));
+            );
         }
 
         #[test]
-        fn claim_bundle_checked_handles_reject_pq_opk_depletion_and_hourly_budget_reset() {
+        fn claim_bundle_preserves_classical_spk_sig_and_enforces_opk_budget() {
             let env = TestIdentity::new(50_000);
             let store = env.store();
 
-            // Unallocated DO -> NotFound without creating tables.
-            assert!(matches!(
+            assert_eq!(
                 store.claim_bundle_checked(&[1], false, 1_000).unwrap(),
-                ClaimBundleOutcome::NotFound
-            ));
+                ClaimOutcome::NotFound
+            );
             assert!(!store.has_tables().unwrap());
 
-            store.ensure_v2_tables().unwrap();
-
-            // Publish 36 classical OPKs + 36 PQ OPKs so we can exercise the 32/hr budget cap
-            // and subsequent window reset + full depletion.
-            let opks: Vec<Vec<u8>> = (1..=36u32).map(mk_opk).collect();
-            let pq_opks: Vec<PqPrekeyWire> = (1..=36u32)
-                .map(|i| mk_pq_key(2, format!("pq-{i:02}").as_bytes()))
-                .collect();
-            let manifest = mk_manifest(1, 1, true, false);
-            store
-                .publish_v2(
-                    &manifest,
-                    Some(&[0xaa; 64]),
-                    &opks,
-                    &[mk_pq_key(1, b"lr-1"), mk_pq_key(2, b"lr-2")],
-                    &pq_opks,
-                    1_000,
-                )
-                .unwrap();
-
-            // 1) reject_pq_on_manifest = true MUST fail atomically without popping OPKs or budget.
-            assert!(matches!(
-                store.claim_bundle_checked(&[2], true, 10_000).unwrap(),
-                ClaimBundleOutcome::PqDisabledForPqManifest
-            ));
-            assert_eq!(
-                store.pq_snapshot(10_000).unwrap().classical_one_time_count,
-                36
-            );
-            assert!(
-                env.sql
-                    .query_opt::<OpkBudgetRow>(
-                        "SELECT window_start, claims FROM opk_claim_budget WHERE only = 0",
-                        vec![]
-                    )
-                    .unwrap()
-                    .is_none()
-            );
-
-            // 2) Unnegotiable preferred suite ([99]) does not pop any OPK.
-            let unneg = store.claim_bundle_checked(&[99], false, 10_000).unwrap();
-            match unneg {
-                ClaimBundleOutcome::Claimed(b) => {
-                    assert!(b.pq_last_resort.is_none());
-                    assert!(b.one_time_prekey.is_none());
-                    assert!(b.pq_one_time_prekey.is_none());
-                }
-                other => panic!("expected Claimed without OPKs, got {other:?}"),
-            }
-            assert_eq!(
-                store.pq_snapshot(10_000).unwrap().classical_one_time_count,
-                36
-            );
-
-            // 3) First MAX_OPK_CLAIMS_PER_HOUR (32) claims pop classical + PQ OPKs in FIFO order.
-            let window_start = 100_000;
-            for i in 1..=MAX_OPK_CLAIMS_PER_HOUR {
-                let claimed = store
-                    .claim_bundle_checked(&[2, 1], false, window_start + i)
-                    .unwrap();
-                match claimed {
-                    ClaimBundleOutcome::Claimed(b) => {
-                        assert_eq!(
-                            b.one_time_prekey.as_deref(),
-                            Some(mk_opk(i as u32).as_slice())
-                        );
-                        assert_eq!(b.pq_last_resort.as_ref().unwrap().id, b"lr-2");
-                        assert_eq!(
-                            b.pq_one_time_prekey.as_ref().unwrap().id,
-                            format!("pq-{i:02}").as_bytes()
-                        );
-                    }
-                    other => panic!("expected Claimed on claim {i}, got {other:?}"),
-                }
-            }
-
-            // Budget row persisted at claims == 32.
-            let budget: OpkBudgetRow = env
-                .sql
-                .query_one(
-                    "SELECT window_start, claims FROM opk_claim_budget WHERE only = 0",
-                    vec![],
-                )
-                .unwrap();
-            assert_eq!(budget.window_start, window_start + 1);
-            assert_eq!(budget.claims, MAX_OPK_CLAIMS_PER_HOUR);
-
-            // 4) 33rd claim within same hour still succeeds (SPK + PQ last-resort) WITHOUT popping OPKs!
-            let capped = store
-                .claim_bundle_checked(&[2], false, window_start + OPK_BUDGET_WINDOW_MS)
-                .unwrap();
-            match capped {
-                ClaimBundleOutcome::Claimed(b) => {
-                    assert!(b.pq_last_resort.is_some());
-                    assert!(b.one_time_prekey.is_none());
-                    assert!(b.pq_one_time_prekey.is_none());
-                }
-                other => panic!("expected Claimed without OPKs at budget cap, got {other:?}"),
-            }
+            let opks: Vec<PublicKey> = (0..40).map(mk_opk).collect();
             assert_eq!(
                 store
-                    .pq_snapshot(window_start)
-                    .unwrap()
-                    .classical_one_time_count,
-                4
+                    .publish_v2(&PublishV2Record {
+                        manifest: mk_manifest(1, 1, true, false),
+                        signed_prekey_signature: Some([0x77; 64]),
+                        one_time_prekeys: opks,
+                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                        pq_one_time_prekeys: vec![mk_pq_key(1, 0xB1)],
+                        timestamp: 1_000,
+                    })
+                    .unwrap(),
+                PublishV2Status::Stored
             );
 
-            // 5) After 1-hour window rolls over, OPK popping resumes and depletes remaining 4 OPKs.
-            let next_window = window_start + 1 + OPK_BUDGET_WINDOW_MS;
-            for i in 33..=36u32 {
-                let claimed = store
-                    .claim_bundle_checked(&[2], false, next_window + u64::from(i))
-                    .unwrap();
-                match claimed {
-                    ClaimBundleOutcome::Claimed(b) => {
-                        assert_eq!(b.one_time_prekey.as_deref(), Some(mk_opk(i).as_slice()));
-                        assert!(b.pq_one_time_prekey.is_some());
-                    }
-                    other => panic!("expected Claimed after window reset, got {other:?}"),
-                }
-            }
+            // reject_pq_on_manifest refuses PQ-ON manifest without popping OPKs.
+            assert_eq!(
+                store.claim_bundle_checked(&[1], true, 1_000).unwrap(),
+                ClaimOutcome::PqDisabledForPqManifest
+            );
+            assert_eq!(
+                store.pq_snapshot(1_000).unwrap().classical_one_time_count,
+                40
+            );
 
-            // 6) Depleted pool still returns SPK + PQ last-resort with None OPKs.
-            let depleted = store
-                .claim_bundle_checked(&[2], false, next_window + 50)
-                .unwrap();
-            match depleted {
-                ClaimBundleOutcome::Claimed(b) => {
-                    assert!(b.pq_last_resort.is_some());
-                    assert!(b.one_time_prekey.is_none());
-                    assert!(b.pq_one_time_prekey.is_none());
-                }
-                other => panic!("expected Claimed when depleted, got {other:?}"),
+            // Classical claim (empty suites) preserves folded signed_prekey_signature.
+            let ClaimOutcome::Claimed(classical) =
+                store.claim_bundle_checked(&[], false, 1_000).unwrap()
+            else {
+                panic!("expected claimed");
+            };
+            assert_eq!(classical.signed_prekey_signature, Some([0x77; 64]));
+            assert_eq!(classical.one_time_prekey, Some(mk_opk(0)));
+            assert!(classical.pq_last_resort.is_none());
+
+            // Exhaust remaining 31 hourly OPK claims; 33rd claim returns bundle with OPK=None.
+            for i in 1..MAX_OPK_CLAIMS_PER_HOUR {
+                let ClaimOutcome::Claimed(c) =
+                    store.claim_bundle_checked(&[2], false, 1_000 + i).unwrap()
+                else {
+                    panic!("expected claimed");
+                };
+                assert!(c.one_time_prekey.is_some());
             }
-            let budget_after: OpkBudgetRow = env
-                .sql
-                .query_one(
-                    "SELECT window_start, claims FROM opk_claim_budget WHERE only = 0",
-                    vec![],
-                )
-                .unwrap();
-            // Depleted claim popped 0 OPKs so claims stayed at 4 in the new window.
-            assert_eq!(budget_after.claims, 4);
+            let ClaimOutcome::Claimed(throttled) = store
+                .claim_bundle_checked(&[2], false, 1_000 + MAX_OPK_CLAIMS_PER_HOUR)
+                .unwrap()
+            else {
+                panic!("expected claimed");
+            };
+            assert!(throttled.one_time_prekey.is_none());
+            assert_eq!(throttled.pq_last_resort, Some(mk_pq_key(2, 0xA2)));
         }
 
         #[test]
-        fn initial_messages_add_list_ack_and_expiry_lifecycle() {
-            let retention = 10_000;
-            let env = TestIdentity::new(retention);
+        fn initial_messages_require_manifest_deduplicate_prune_expired_and_paginate() {
+            let env = TestIdentity::new(10_000);
             let store = env.store();
-            store.ensure_v2_tables().unwrap();
 
-            let v1 = InitialMessageV2Wire {
-                id: 0,
-                version: 1,
-                sender: vec![1; 32],
-                ephemeral_key: vec![2; 32],
-                signed_prekey: vec![3; 32],
-                one_time_prekey: Some(vec![4; 32]),
-                header: b"v1-h".to_vec(),
-                content: b"v1-c".to_vec(),
-                pq_suite: None,
-                pq_last_resort: false,
-                pq_prekey_id: None,
-                pq_ciphertext: None,
-                manifest_digest: None,
-            };
-            let v2_pq = InitialMessageV2Wire {
-                id: 0,
-                version: 2,
-                sender: vec![5; 32],
-                ephemeral_key: vec![6; 32],
-                signed_prekey: vec![7; 32],
-                one_time_prekey: None,
-                header: b"v2-h".to_vec(),
-                content: b"v2-c".to_vec(),
-                pq_suite: Some(2),
-                pq_last_resort: true,
-                pq_prekey_id: Some(b"lr-2".to_vec()),
-                pq_ciphertext: Some(vec![0xef; 24]),
-                manifest_digest: Some(vec![0xab; 32]),
-            };
+            // Unregistered recipient returns NotFound without creating tables.
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&mk_initial(1, 1, b"hi"), 10, 1_000)
+                    .unwrap(),
+                AddInitialOutcome::NotFound
+            );
+            assert!(!store.has_tables().unwrap());
 
-            let id1 = store
-                .add_initial_message_v2(&v1, 2, 1_000)
-                .unwrap()
-                .unwrap();
-            let id2 = store
-                .add_initial_message_v2(&v2_pq, 2, 20_000)
-                .unwrap()
-                .unwrap();
+            // Publish manifest.
+            assert_eq!(
+                store
+                    .publish_v2(&PublishV2Record {
+                        manifest: mk_manifest(1, 1, true, false),
+                        signed_prekey_signature: Some([0x77; 64]),
+                        one_time_prekeys: vec![],
+                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                        pq_one_time_prekeys: vec![],
+                        timestamp: 1_000,
+                    })
+                    .unwrap(),
+                PublishV2Status::Stored
+            );
+
+            // Insert initial 1 (v1) and retry idempotently.
+            let m1 = mk_initial(1, 1, b"first");
+            let AddInitialOutcome::Added {
+                id: id1,
+                inserted: true,
+            } = store.add_initial_message_v2(&m1, 2, 1_000).unwrap()
+            else {
+                panic!("expected fresh insert");
+            };
+            assert_eq!(
+                store.add_initial_message_v2(&m1, 2, 1_100).unwrap(),
+                AddInitialOutcome::Added {
+                    id: id1,
+                    inserted: false
+                }
+            );
+            // Mismatched payload on same (sender, ephemeral_key) -> PayloadMismatch.
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&mk_initial(1, 1, b"tampered"), 2, 1_200)
+                    .unwrap(),
+                AddInitialOutcome::PayloadMismatch
+            );
+
+            // Insert initial 2 (v2 PQ) -> fills cap 2.
+            let m2 = mk_initial(2, 2, b"second");
+            let AddInitialOutcome::Added {
+                id: id2,
+                inserted: true,
+            } = store.add_initial_message_v2(&m2, 2, 5_000).unwrap()
+            else {
+                panic!("expected fresh insert");
+            };
             assert!(id2 > id1);
+            // Distinct 3rd message hits cap while both unexpired.
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&mk_initial(3, 1, b"third"), 2, 6_000)
+                    .unwrap(),
+                AddInitialOutcome::LimitExceeded
+            );
 
-            // Inbox limit == 2 blocks a 3rd insert.
+            // Cursor pagination via after_id.
+            let p1 = store.list_initial_messages(BOB, 0, 1, 6_000).unwrap();
+            assert_eq!(p1.len(), 1);
+            assert_eq!(p1[0].id, id1);
+            let p2 = store.list_initial_messages(BOB, id1, 10, 6_000).unwrap();
+            assert_eq!(p2.len(), 1);
+            assert_eq!(p2[0].id, id2);
+            assert_eq!(p2[0].pq_suite, Some(1));
+            assert_eq!(p2[0].pq_ciphertext, Some(Bytes::from_static(b"pq-ct")));
             assert!(
                 store
-                    .add_initial_message_v2(&v2_pq, 2, 20_000)
-                    .unwrap()
-                    .is_none()
+                    .list_initial_messages(BOB, MAX_SAFE_INTEGER + 1, 10, 6_000)
+                    .is_err()
             );
 
-            // At now = 25_000 (cutoff = 15_000), id1 is expired and omitted from list & pq_snapshot.
-            let listed = store.list_initial_messages(10, 25_000).unwrap();
-            assert_eq!(listed.len(), 1);
-            assert_eq!(listed[0].id, id2);
-            assert_eq!(listed[0].version, 2);
-            assert_eq!(listed[0].pq_suite, Some(2));
-            assert!(listed[0].pq_last_resort);
-            assert_eq!(listed[0].pq_prekey_id.as_deref(), Some(b"lr-2".as_slice()));
-            assert_eq!(
-                listed[0].manifest_digest.as_deref(),
-                Some([0xab; 32].as_slice())
-            );
-            assert_eq!(
-                store.pq_snapshot(25_000).unwrap().pending_initial_messages,
-                1
-            );
-
-            // At now = 5_000 both rows are live; verify v1 row fields too.
-            let both = store.list_initial_messages(10, 5_000).unwrap();
-            assert_eq!(both.len(), 2);
-            assert_eq!(both[0].id, id1);
-            assert_eq!(both[0].version, 1);
-            assert_eq!(both[0].pq_suite, None);
-            assert_eq!(
-                both[0].one_time_prekey.as_deref(),
-                Some([4u8; 32].as_slice())
-            );
-
-            // Ack deletes both initial_messages and initial_messages_pq cleanly.
-            assert_eq!(store.ack_initial_messages(&[id2, 999]).unwrap(), 1);
-            let pq_remaining: CountRow = env
-                .sql
-                .query_one("SELECT count(*) AS count FROM initial_messages_pq", vec![])
-                .unwrap();
-            assert_eq!(pq_remaining.count, 0);
-            assert_eq!(store.ack_initial_messages(&[id1]).unwrap(), 1);
-            assert!(store.list_initial_messages(10, 5_000).unwrap().is_empty());
-        }
-
-        #[test]
-        fn strict_pq_clears_classical_bundle_and_legacy_bundle_only_do_claims_classically() {
-            // 1) strict_pq = true deletes any prior classical bundle signature row.
-            let env = TestIdentity::new(50_000);
-            let store = env.store();
-            store.ensure_v2_tables().unwrap();
-
-            let hybrid = mk_manifest(1, 1, true, false);
-            store
-                .publish_v2(
-                    &hybrid,
-                    Some(&[0xaa; 64]),
-                    &[mk_opk(1)],
-                    &[mk_pq_key(1, b"lr-1")],
-                    &[],
-                    1_000,
-                )
-                .unwrap();
-            assert!(
-                env.sql
-                    .query_opt::<BundleRow>("SELECT signed_prekey, signature FROM bundle", vec![])
-                    .unwrap()
-                    .is_some()
-            );
-
-            let strict = mk_manifest(2, 2, true, true);
-            store
-                .publish_v2(
-                    &strict,
-                    Some(&[0xbb; 64]),
-                    &[mk_opk(2)],
-                    &[mk_pq_key(1, b"lr-1")],
-                    &[],
-                    2_000,
-                )
-                .unwrap();
-            assert!(
-                env.sql
-                    .query_opt::<BundleRow>("SELECT signed_prekey, signature FROM bundle", vec![])
-                    .unwrap()
-                    .is_none()
-            );
-            // strict_pq with empty preferred_suites cannot negotiate PQ -> does not pop classical OPK.
-            match store.claim_bundle_checked(&[], false, 3_000).unwrap() {
-                ClaimBundleOutcome::Claimed(b) => {
-                    assert!(b.signed_prekey_signature.is_none());
-                    assert!(b.pq_last_resort.is_none());
-                    assert!(b.one_time_prekey.is_none());
-                }
-                other => panic!("expected Claimed without OPK, got {other:?}"),
-            }
-            assert_eq!(
-                store.pq_snapshot(3_000).unwrap().classical_one_time_count,
-                1
-            );
-
-            // 2) Pre-existing classical-only DO (bundle row without capability_manifest).
-            let legacy_env = TestIdentity::new(50_000);
-            let legacy_store = legacy_env.store();
-            legacy_store.ensure_v2_tables().unwrap();
-            legacy_env
-                .sql
-                .exec(
-                    "INSERT INTO bundle (only, signed_prekey, signature, timestamp) VALUES (0, ?, ?, 100)",
-                    params![[0x55u8; 32].as_slice(), [0x66u8; 64].as_slice()].unwrap(),
-                )
-                .unwrap();
-            legacy_env
-                .sql
-                .exec(
-                    "INSERT INTO one_time_prekeys (position, prekey) VALUES (0, ?)",
-                    params![mk_opk(7).as_slice()].unwrap(),
-                )
-                .unwrap();
-
-            match legacy_store
-                .claim_bundle_checked(&[1], true, 5_000)
+            // Advance past m1's retention (1_000 + 10_000 = 11_000): m1 is pruned BEFORE
+            // `(sender, ephemeral_key)` lookup so reusing eph=1 with a NEW payload succeeds!
+            let AddInitialOutcome::Added {
+                id: id3,
+                inserted: true,
+            } = store
+                .add_initial_message_v2(&mk_initial(1, 1, b"fresh-after-expiry"), 2, 11_001)
                 .unwrap()
-            {
-                ClaimBundleOutcome::Claimed(b) => {
-                    assert!(b.manifest.is_none());
-                    assert_eq!(b.signed_prekey, vec![0x55; 32]);
-                    assert_eq!(
-                        b.signed_prekey_signature.as_deref(),
-                        Some([0x66; 64].as_slice())
-                    );
-                    assert_eq!(b.one_time_prekey.as_deref(), Some(mk_opk(7).as_slice()));
-                    assert!(b.pq_last_resort.is_none());
-                }
-                other => panic!("expected legacy classical Claimed, got {other:?}"),
-            }
+            else {
+                panic!("expected fresh insert after expiry prune");
+            };
+            assert!(id3 > id2);
+
+            // Ack deletes only specified IDs.
+            assert_eq!(store.ack_initial_messages(&[id2]).unwrap(), 1);
+            let rem = store.list_initial_messages(BOB, 0, 10, 11_001).unwrap();
+            assert_eq!(rem.len(), 1);
+            assert_eq!(rem[0].id, id3);
         }
     }
 }

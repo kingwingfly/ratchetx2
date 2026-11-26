@@ -10,15 +10,18 @@ pub mod attachment;
 pub mod connect;
 pub mod content;
 pub mod error;
-pub mod handshake;
-#[cfg(feature = "pq")]
 pub mod handshake_v2;
-pub mod mailbox;
-#[cfg(feature = "pq")]
 pub mod mailbox_v2;
 pub mod notify;
 
 pub use error::{Error, ErrorKind, Result};
+
+/// Prost's generated `mailbox.v2` code references `super::super::handshake::v2::InitialMessageV2`.
+mod handshake {
+    pub(crate) mod v2 {
+        pub use crate::handshake_v2::proto::*;
+    }
+}
 
 /// How far, in milliseconds, the timestamp of a signed request or subscription may be from the
 /// server's clock, as a signature would otherwise stay good forever or lock out an identity.
@@ -157,8 +160,24 @@ pub fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
     bytes.try_into().map_err(|_| ErrorKind::Malformed.into())
 }
 
+/// Zeroizes the backing buffer of `bytes` in place when uniquely owned (including prost-decoded
+/// and [`bytes::Bytes::copy_from_slice`] allocations). Static or still-shared handles are detached
+/// without panicking.
+pub(crate) fn zeroize_bytes(bytes: &mut bytes::Bytes) {
+    let owned = core::mem::take(bytes);
+    if let Ok(mut buf) = owned.try_into_mut() {
+        zeroize::Zeroize::zeroize(buf.as_mut());
+    }
+}
+
+/// `N` cryptographically random bytes, failing with [`ErrorKind::Server`] if the OS RNG fails.
+pub(crate) fn try_random<const N: usize>() -> Result<[u8; N]> {
+    let mut bytes = [0; N];
+    getrandom::fill(&mut bytes).map_err(|_| ErrorKind::Server)?;
+    Ok(bytes)
+}
+
 /// Validates that a 32-byte key is a canonical, prime-order Curve25519 public key.
-#[cfg(any(feature = "server", feature = "pq"))]
 pub(crate) fn check_canonical_key(key: &x3dh::PublicKey) -> Result<()> {
     if !xeddsa::is_canonical_public_key(key) {
         return Err(ErrorKind::Malformed.into());
@@ -169,7 +188,6 @@ pub(crate) fn check_canonical_key(key: &x3dh::PublicKey) -> Result<()> {
 
 /// Verifies that an incoming `actual` audience string is non-empty, within
 /// [`MAX_AUDIENCE_LENGTH`], and matches the canonicalized `expected_audience`.
-#[cfg(feature = "pq")]
 pub(crate) fn verify_audience(actual: &str, expected_audience: &str) -> Result<()> {
     let expected = NormalizedAudience::parse(expected_audience)?;
     if actual.is_empty() || actual.len() > MAX_AUDIENCE_LENGTH {
@@ -192,17 +210,14 @@ impl SigningBuf {
         Self(buf)
     }
 
-    #[cfg(feature = "pq")]
     pub(crate) fn push_u8(&mut self, value: u8) {
         self.0.push(value);
     }
 
-    #[cfg(feature = "pq")]
     pub(crate) fn push_u32_be(&mut self, value: u32) {
         self.0.extend_from_slice(&value.to_be_bytes());
     }
 
-    #[cfg(feature = "pq")]
     pub(crate) fn push_u64_be(&mut self, value: u64) {
         self.0.extend_from_slice(&value.to_be_bytes());
     }
@@ -215,7 +230,6 @@ impl SigningBuf {
         self.0.extend_from_slice(bytes);
     }
 
-    #[cfg(feature = "pq")]
     pub(crate) fn push_len_bytes_be(&mut self, bytes: &[u8]) -> Result<()> {
         let len = u32::try_from(bytes.len()).map_err(|_| ErrorKind::Malformed)?;
         self.0.extend_from_slice(&len.to_be_bytes());
@@ -230,7 +244,6 @@ impl SigningBuf {
         Ok(())
     }
 
-    #[cfg(feature = "pq")]
     pub(crate) fn push_audience_be(&mut self, audience: &str) -> Result<()> {
         if audience.is_empty() || audience.len() > MAX_AUDIENCE_LENGTH {
             return Err(ErrorKind::Malformed.into());
@@ -245,7 +258,6 @@ impl SigningBuf {
         self.push_len_bytes_le(audience.as_bytes())
     }
 
-    #[cfg(feature = "pq")]
     pub(crate) fn push_count_be(&mut self, count: usize) -> Result<()> {
         let count = u32::try_from(count).map_err(|_| ErrorKind::Malformed)?;
         self.0.extend_from_slice(&count.to_be_bytes());
@@ -257,7 +269,7 @@ impl SigningBuf {
     }
 }
 
-/// Validates that `timestamp` does not exceed [`MAX_SAFE_INTEGER`].
+/// Validates that `value` does not exceed [`MAX_SAFE_INTEGER`].
 pub(crate) fn check_safe_integer(value: u64) -> Result<()> {
     if value > MAX_SAFE_INTEGER {
         return Err(ErrorKind::Malformed.into());

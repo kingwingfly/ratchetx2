@@ -10,12 +10,11 @@
 //!
 //! This module does no I/O: [`ConnectClient`] runs on any HTTP client that implements
 //! [`LocalPost`], [`handle_attachments`] answers attachment calls with [`LocalAttachments`], and
-//! (with the `pq` feature) `handle_v2` answers `handshake.v2` and `mailbox.v2` calls.
-//! [`is_legacy_v1_path`] identifies legacy `/handshake.v1.*` and `/mailbox.v1.*` routes so servers
-//! can reject them cleanly without instantiating deprecated v1 servers.
+//! [`handle_v2`] answers `handshake.v2` and `mailbox.v2` calls.
 
 use std::fmt;
 
+use bytes::Buf;
 use prost::Message;
 
 use crate::{
@@ -25,17 +24,6 @@ use crate::{
         StartUploadResponse,
     },
     error::{Error, ErrorKind, Result},
-    handshake::{
-        FetchBundleRequest, FetchBundleResponse, PublishRequest, PublishResponse,
-        SendInitialMessageRequest, SendInitialMessageResponse, TakeInitialMessagesRequest,
-        TakeInitialMessagesResponse,
-    },
-    mailbox::{FetchRequest, FetchResponse, PushRequest, PushResponse},
-};
-#[allow(deprecated)]
-use crate::{handshake::LocalHandshake, mailbox::LocalMailbox};
-#[cfg(feature = "pq")]
-use crate::{
     handshake_v2::{
         AckInitialMessagesRequest, AckInitialMessagesResponse, ClaimBundleRequest,
         ClaimBundleResponse, GetManifestRequest, GetManifestResponse, GetServerInfoRequest,
@@ -44,7 +32,9 @@ use crate::{
         RefillPrekeysResponse, SendInitialV2Request, SendInitialV2Response,
     },
     mailbox_v2::{
-        FetchSignedRequest, FetchSignedResponse, LocalMailboxV2, PushV2Request, PushV2Response,
+        AckMessagesRequest, AckMessagesResponse, FetchSignedRequest, FetchSignedResponse,
+        LocalMailboxV2, PushV2Request, PushV2Response, RegisterWriteTokenRequest,
+        RegisterWriteTokenResponse, RevokeWriteTokenRequest, RevokeWriteTokenResponse,
     },
 };
 
@@ -81,7 +71,6 @@ macro_rules! define_procedures {
             )*
         }
 
-        #[allow(deprecated)]
         impl $name {
             /// Every procedure in this service set.
             pub const ALL: [Self; [$($path),*].len()] = [
@@ -104,7 +93,6 @@ macro_rules! define_procedures {
             }
         }
 
-        #[allow(deprecated)]
         impl ConnectProcedure for $name {
             fn path(self) -> &'static str {
                 Self::path(self)
@@ -127,65 +115,6 @@ define_procedures! {
     }
 }
 
-/// Returns `true` if `path` targets a legacy v1 handshake or mailbox Connect route
-/// (`/handshake.v1.*` or `/mailbox.v1.*`).
-///
-/// Servers can use this to return an upgrade-required / unimplemented error without importing
-/// deprecated v1 handshake or mailbox servers. Attachment routes (`/attachment.v1.*`) return
-/// `false`.
-pub fn is_legacy_v1_path(path: &str) -> bool {
-    path.starts_with("/handshake.v1.") || path.starts_with("/mailbox.v1.")
-}
-
-define_procedures! {
-    /// A combined legacy v1 + attachment procedure: a method of the legacy handshake, legacy mailbox,
-    /// or attachment service.
-    ///
-    /// New servers should route [`AttachmentProcedure`] with [`handle_attachments`] and (with the `pq`
-    /// feature) `ProcedureV2` with `handle_v2`, using [`is_legacy_v1_path`] to reject legacy v1 paths.
-    pub enum Procedure {
-        /// Legacy v1 [`LocalHandshake::publish`].
-        #[deprecated(
-            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-        )]
-        Publish => "/handshake.v1.HandshakeService/Publish",
-        /// Legacy v1 [`LocalHandshake::fetch_bundle`].
-        #[deprecated(
-            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-        )]
-        FetchBundle => "/handshake.v1.HandshakeService/FetchBundle",
-        /// Legacy v1 [`LocalHandshake::send_initial_message`].
-        #[deprecated(
-            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-        )]
-        SendInitialMessage => "/handshake.v1.HandshakeService/SendInitialMessage",
-        /// Legacy v1 [`LocalHandshake::take_initial_messages`].
-        #[deprecated(
-            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-        )]
-        TakeInitialMessages => "/handshake.v1.HandshakeService/TakeInitialMessages",
-        /// Legacy v1 [`LocalMailbox::push`].
-        #[deprecated(
-            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-        )]
-        Push => "/mailbox.v1.MailboxService/Push",
-        /// Legacy v1 [`LocalMailbox::fetch`].
-        #[deprecated(
-            note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-        )]
-        Fetch => "/mailbox.v1.MailboxService/Fetch",
-        /// [`LocalAttachments::start_upload`].
-        StartUpload => "/attachment.v1.AttachmentService/StartUpload",
-        /// [`LocalAttachments::put_chunk`].
-        PutChunk => "/attachment.v1.AttachmentService/PutChunk",
-        /// [`LocalAttachments::get_chunk`].
-        GetChunk => "/attachment.v1.AttachmentService/GetChunk",
-        /// [`LocalAttachments::delete_attachment`].
-        DeleteAttachment => "/attachment.v1.AttachmentService/DeleteAttachment",
-    }
-}
-
-#[cfg(feature = "pq")]
 define_procedures! {
     /// A v2 procedure: a method of `handshake.v2.HandshakeService` or `mailbox.v2.MailboxService`.
     pub enum ProcedureV2 {
@@ -209,6 +138,12 @@ define_procedures! {
         PushV2 => "/mailbox.v2.MailboxService/PushV2",
         /// [`LocalMailboxV2::fetch_signed`].
         FetchSigned => "/mailbox.v2.MailboxService/FetchSigned",
+        /// [`LocalMailboxV2::ack_messages`].
+        AckMessages => "/mailbox.v2.MailboxService/AckMessages",
+        /// [`LocalMailboxV2::register_write_token`].
+        RegisterWriteToken => "/mailbox.v2.MailboxService/RegisterWriteToken",
+        /// [`LocalMailboxV2::revoke_write_token`].
+        RevokeWriteToken => "/mailbox.v2.MailboxService/RevokeWriteToken",
     }
 }
 
@@ -249,8 +184,10 @@ fn finish_reply(reply: Result<Vec<u8>>) -> Response {
 }
 
 /// Answer a call to an attachment `procedure`, whose request has `content_type` and `body`, with
-/// `attachments` (`/attachment.v1.AttachmentService/*` only, without requiring legacy v1 handshake
-/// or mailbox servers).
+/// `attachments` (`/attachment.v1.AttachmentService/*`).
+///
+/// Accepting `impl Buf` allows callers with an owned [`bytes::Bytes`] buffer to slice fields
+/// zero-copy and drop the raw outer buffer as soon as prost finishes decoding.
 ///
 /// Routing and the method are up to the HTTP server: find the procedure with
 /// [`AttachmentProcedure::from_path`], and only take `POST`. A body of another content type is
@@ -259,7 +196,7 @@ pub async fn handle_attachments(
     attachments: &impl LocalAttachments,
     procedure: AttachmentProcedure,
     content_type: Option<&str>,
-    body: &[u8],
+    body: impl Buf,
 ) -> Response {
     if let Some(response) = check_content_type(content_type) {
         return response;
@@ -281,57 +218,17 @@ pub async fn handle_attachments(
     finish_reply(reply)
 }
 
-/// Answer a call to `procedure`, whose request has `content_type` and `body`, with `handshake`,
-/// `mailbox` and `attachments`.
-///
-/// Routing and the method are up to the HTTP server: find the procedure with
-/// [`Procedure::from_path`], and only take `POST`. A body of another content type is answered
-/// with `415 Unsupported Media Type`.
-#[deprecated(
-    note = "legacy v1 protocol is deprecated; use handshake.v2, mailbox.v2, and audience-bound SubscribeRequest v2 (see git tag archive/legacy-v1)"
-)]
-#[allow(deprecated)]
-pub async fn handle(
-    handshake: &impl LocalHandshake,
-    mailbox: &impl LocalMailbox,
-    attachments: &impl LocalAttachments,
-    procedure: Procedure,
-    content_type: Option<&str>,
-    body: &[u8],
-) -> Response {
-    if let Some(response) = check_content_type(content_type) {
-        return response;
-    }
-    let reply = match procedure {
-        Procedure::Publish => reply(decode(body).map(|r| handshake.publish(r))).await,
-        Procedure::FetchBundle => reply(decode(body).map(|r| handshake.fetch_bundle(r))).await,
-        Procedure::SendInitialMessage => {
-            reply(decode(body).map(|r| handshake.send_initial_message(r))).await
-        }
-        Procedure::TakeInitialMessages => {
-            reply(decode(body).map(|r| handshake.take_initial_messages(r))).await
-        }
-        Procedure::Push => reply(decode(body).map(|r| mailbox.push(r))).await,
-        Procedure::Fetch => reply(decode(body).map(|r| mailbox.fetch(r))).await,
-        Procedure::StartUpload => reply(decode(body).map(|r| attachments.start_upload(r))).await,
-        Procedure::PutChunk => reply(decode(body).map(|r| attachments.put_chunk(r))).await,
-        Procedure::GetChunk => reply(decode(body).map(|r| attachments.get_chunk(r))).await,
-        Procedure::DeleteAttachment => {
-            reply(decode(body).map(|r| attachments.delete_attachment(r))).await
-        }
-    };
-    finish_reply(reply)
-}
-
 /// Answer a call to a v2 `procedure`, whose request has `content_type` and `body`, with
 /// `handshake` and `mailbox`.
-#[cfg(feature = "pq")]
+///
+/// Accepting `impl Buf` allows callers with an owned [`bytes::Bytes`] buffer to slice fields
+/// zero-copy and drop the raw outer buffer as soon as prost finishes decoding.
 pub async fn handle_v2(
     handshake: &impl LocalHandshakeV2,
     mailbox: &impl LocalMailboxV2,
     procedure: ProcedureV2,
     content_type: Option<&str>,
-    body: &[u8],
+    body: impl Buf,
 ) -> Response {
     if let Some(response) = check_content_type(content_type) {
         return response;
@@ -357,12 +254,19 @@ pub async fn handle_v2(
         }
         ProcedureV2::PushV2 => reply(decode(body).map(|r| mailbox.push_v2(r))).await,
         ProcedureV2::FetchSigned => reply(decode(body).map(|r| mailbox.fetch_signed(r))).await,
+        ProcedureV2::AckMessages => reply(decode(body).map(|r| mailbox.ack_messages(r))).await,
+        ProcedureV2::RegisterWriteToken => {
+            reply(decode(body).map(|r| mailbox.register_write_token(r))).await
+        }
+        ProcedureV2::RevokeWriteToken => {
+            reply(decode(body).map(|r| mailbox.revoke_write_token(r))).await
+        }
     };
     finish_reply(reply)
 }
 
-/// The response to a call that fails with `kind` before [`handle`] could answer it, e.g. as its
-/// body is too large to read.
+/// The response to a call that fails with `kind` before [`handle_v2`] or [`handle_attachments`]
+/// could answer it, e.g. as its body is too large to read.
 pub fn error(kind: ErrorKind, message: &str) -> Response {
     let code = Code::from(kind);
     Response {
@@ -373,7 +277,7 @@ pub fn error(kind: ErrorKind, message: &str) -> Response {
 }
 
 /// A request's body, decoded.
-fn decode<T: Message + Default>(body: &[u8]) -> Result<T> {
+fn decode<T: Message + Default>(body: impl Buf) -> Result<T> {
     T::decode(body).map_err(|e| Error::new(ErrorKind::Malformed, e))
 }
 
@@ -438,7 +342,8 @@ impl<P: LocalPost> ConnectClient<P> {
             let kind = Code::from_name(&error.code).map_or(ErrorKind::Server, ErrorKind::from);
             return Err(Error::new(kind, error));
         }
-        // A proxy can generate this status. Only the server's own 403 asks for sign-in.
+        // A proxy can generate 403 or 409 without a Connect JSON body. Only decoded Connect
+        // JSON error bodies produce SignInRequired or WriteTokenRejected.
         let code = match Code::from_status(status) {
             Code::PermissionDenied => Code::Unknown,
             code => code,
@@ -450,42 +355,6 @@ impl<P: LocalPost> ConnectClient<P> {
                 message: format!("HTTP status {status}"),
             },
         ))
-    }
-}
-
-#[allow(deprecated)]
-impl<P: LocalPost> LocalHandshake for ConnectClient<P> {
-    async fn publish(&self, request: PublishRequest) -> Result<PublishResponse> {
-        self.call(Procedure::Publish, request).await
-    }
-
-    async fn fetch_bundle(&self, request: FetchBundleRequest) -> Result<FetchBundleResponse> {
-        self.call(Procedure::FetchBundle, request).await
-    }
-
-    async fn send_initial_message(
-        &self,
-        request: SendInitialMessageRequest,
-    ) -> Result<SendInitialMessageResponse> {
-        self.call(Procedure::SendInitialMessage, request).await
-    }
-
-    async fn take_initial_messages(
-        &self,
-        request: TakeInitialMessagesRequest,
-    ) -> Result<TakeInitialMessagesResponse> {
-        self.call(Procedure::TakeInitialMessages, request).await
-    }
-}
-
-#[allow(deprecated)]
-impl<P: LocalPost> LocalMailbox for ConnectClient<P> {
-    async fn push(&self, request: PushRequest) -> Result<PushResponse> {
-        self.call(Procedure::Push, request).await
-    }
-
-    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse> {
-        self.call(Procedure::Fetch, request).await
     }
 }
 
@@ -511,7 +380,6 @@ impl<P: LocalPost> LocalAttachments for ConnectClient<P> {
     }
 }
 
-#[cfg(feature = "pq")]
 impl<P: LocalPost> LocalHandshakeV2 for ConnectClient<P> {
     async fn get_server_info(
         &self,
@@ -558,7 +426,6 @@ impl<P: LocalPost> LocalHandshakeV2 for ConnectClient<P> {
     }
 }
 
-#[cfg(feature = "pq")]
 impl<P: LocalPost> LocalMailboxV2 for ConnectClient<P> {
     async fn push_v2(&self, request: PushV2Request) -> Result<PushV2Response> {
         self.call(ProcedureV2::PushV2, request).await
@@ -566,6 +433,24 @@ impl<P: LocalPost> LocalMailboxV2 for ConnectClient<P> {
 
     async fn fetch_signed(&self, request: FetchSignedRequest) -> Result<FetchSignedResponse> {
         self.call(ProcedureV2::FetchSigned, request).await
+    }
+
+    async fn ack_messages(&self, request: AckMessagesRequest) -> Result<AckMessagesResponse> {
+        self.call(ProcedureV2::AckMessages, request).await
+    }
+
+    async fn register_write_token(
+        &self,
+        request: RegisterWriteTokenRequest,
+    ) -> Result<RegisterWriteTokenResponse> {
+        self.call(ProcedureV2::RegisterWriteToken, request).await
+    }
+
+    async fn revoke_write_token(
+        &self,
+        request: RevokeWriteTokenRequest,
+    ) -> Result<RevokeWriteTokenResponse> {
+        self.call(ProcedureV2::RevokeWriteToken, request).await
     }
 }
 
@@ -591,6 +476,7 @@ enum Code {
     InvalidArgument,
     Unauthenticated,
     FailedPrecondition,
+    Aborted,
     NotFound,
     ResourceExhausted,
     Unavailable,
@@ -602,10 +488,11 @@ enum Code {
 
 impl Code {
     #[cfg(all(test, feature = "server"))]
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
         Self::InvalidArgument,
         Self::Unauthenticated,
         Self::FailedPrecondition,
+        Self::Aborted,
         Self::NotFound,
         Self::ResourceExhausted,
         Self::Unavailable,
@@ -620,6 +507,7 @@ impl Code {
             Self::InvalidArgument => "invalid_argument",
             Self::Unauthenticated => "unauthenticated",
             Self::FailedPrecondition => "failed_precondition",
+            Self::Aborted => "aborted",
             Self::NotFound => "not_found",
             Self::ResourceExhausted => "resource_exhausted",
             Self::Unavailable => "unavailable",
@@ -630,13 +518,14 @@ impl Code {
         }
     }
 
-    /// The code named `name`, if it is one of these. Other codes, such as `aborted`, are
-    /// [`ErrorKind::Server`] errors to the clients.
+    /// The code named `name`, if it is one of these. Other codes are [`ErrorKind::Server`] errors
+    /// to the clients.
     fn from_name(name: &str) -> Option<Self> {
         match name {
             "invalid_argument" => Some(Self::InvalidArgument),
             "unauthenticated" => Some(Self::Unauthenticated),
             "failed_precondition" => Some(Self::FailedPrecondition),
+            "aborted" => Some(Self::Aborted),
             "not_found" => Some(Self::NotFound),
             "resource_exhausted" => Some(Self::ResourceExhausted),
             "unavailable" => Some(Self::Unavailable),
@@ -655,6 +544,7 @@ impl Code {
             Self::Unauthenticated => 401,
             Self::PermissionDenied => 403,
             Self::NotFound => 404,
+            Self::Aborted => 409,
             Self::ResourceExhausted => 429,
             Self::Unimplemented => 501,
             Self::Unavailable => 503,
@@ -663,6 +553,9 @@ impl Code {
     }
 
     /// The code a client infers from the status of a response without a valid error body.
+    ///
+    /// Bare HTTP `409` intentionally maps to `Code::Unknown` (so only a decoded Connect JSON
+    /// `"aborted"` body produces [`ErrorKind::WriteTokenRejected`]).
     fn from_status(status: u16) -> Self {
         match status {
             400 => Self::Internal,
@@ -682,6 +575,7 @@ impl From<ErrorKind> for Code {
             ErrorKind::Malformed => Self::InvalidArgument,
             ErrorKind::InvalidSignature => Self::Unauthenticated,
             ErrorKind::StaleTimestamp => Self::FailedPrecondition,
+            ErrorKind::WriteTokenRejected => Self::Aborted,
             ErrorKind::NotFound => Self::NotFound,
             ErrorKind::LimitExceeded => Self::ResourceExhausted,
             ErrorKind::SignInRequired => Self::PermissionDenied,
@@ -698,6 +592,7 @@ impl From<Code> for ErrorKind {
             Code::InvalidArgument => Self::Malformed,
             Code::Unauthenticated => Self::InvalidSignature,
             Code::FailedPrecondition => Self::StaleTimestamp,
+            Code::Aborted => Self::WriteTokenRejected,
             Code::NotFound => Self::NotFound,
             Code::ResourceExhausted => Self::LimitExceeded,
             Code::PermissionDenied => Self::SignInRequired,
@@ -708,85 +603,25 @@ impl From<Code> for ErrorKind {
 }
 
 #[cfg(all(test, feature = "server"))]
-#[allow(deprecated)]
 mod test {
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use party::EncryptedMessage;
+    use sha2::{Digest, Sha256};
     use storage::MemoryStore;
+    use x3dh::{PqSuite, pq_prekey_id, sign_pq_spk};
+    use xeddsa::XEdDSAPrivateKey;
 
     use super::*;
-    use crate::{attachment::AttachmentServer, handshake::HandshakeServer, mailbox::MailboxServer};
-
-    /// Posts to the servers in-process, through `handle`.
-    struct InProcess {
-        handshake: HandshakeServer<MemoryStore>,
-        mailbox: MailboxServer<MemoryStore>,
-        attachments: AttachmentServer<MemoryStore>,
-    }
-
-    impl LocalPost for InProcess {
-        async fn post(&self, path: &str, body: Vec<u8>) -> Result<(u16, Vec<u8>)> {
-            let Some(procedure) = Procedure::from_path(path) else {
-                return Ok((404, b"no such page".to_vec()));
-            };
-            let response = handle(
-                &self.handshake,
-                &self.mailbox,
-                &self.attachments,
-                procedure,
-                Some(CONTENT_TYPE),
-                &body,
-            )
-            .await;
-            Ok((response.status, response.body))
-        }
-    }
-
-    #[tokio::test]
-    async fn over_connect() {
-        let client = ConnectClient::new(InProcess {
-            handshake: HandshakeServer::new(MemoryStore::default()),
-            mailbox: MailboxServer::new(MemoryStore::default()),
-            attachments: AttachmentServer::new(MemoryStore::default()),
-        });
-
-        // Error kinds survive the trip through Connect's error codes.
-        let alice_pk = crate::test_public_key(1);
-        let bob_pk = crate::test_public_key(2);
-        let request = FetchBundleRequest {
-            identity_key: Bytes::copy_from_slice(&alice_pk),
-        };
-        let error = client.fetch_bundle(request).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::NotFound);
-        let request = FetchBundleRequest {
-            identity_key: Bytes::from_static(&[1; 31]),
-        };
-        let error = client.fetch_bundle(request).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Malformed);
-
-        let message = EncryptedMessage {
-            header: Bytes::from_static(b"header"),
-            content: Bytes::from_static(b"content"),
-        };
-        let request = PushRequest {
-            sender: Bytes::copy_from_slice(&alice_pk),
-            recipient: Bytes::copy_from_slice(&bob_pk),
-            message: Some(message.clone()),
-            initial_message: None,
-            delivery_hash: Bytes::new(),
-        };
-        assert_eq!(client.push(request).await.unwrap().sequence, 1);
-        let request = FetchRequest {
-            sender: Bytes::copy_from_slice(&alice_pk),
-            recipient: Bytes::copy_from_slice(&bob_pk),
-            after: 0,
-            limit: 0,
-            delivered: vec![],
-        };
-        let messages = client.fetch(request).await.unwrap().messages;
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].message, Some(message));
-    }
+    use crate::{
+        attachment::AttachmentServer,
+        handshake_v2::{
+            CapabilityManifest, HandshakeV2Server, PqLastResortCommitment, PqPrekey,
+            ServerInfoConfig, sign_manifest,
+        },
+        mailbox_v2::{MailboxV2Server, PEER_SLOT_ID_LENGTH, WRITE_TOKEN_LENGTH},
+    };
 
     /// Answers every call with `status` and `body`, as something in front of a server may.
     struct Answering(u16, &'static [u8]);
@@ -797,7 +632,6 @@ mod test {
         }
     }
 
-    #[cfg(feature = "pq")]
     #[tokio::test]
     async fn unimplemented_distinguishes_connect_errors_from_proxy_statuses() {
         for (body, is_connect) in [
@@ -820,19 +654,34 @@ mod test {
     }
 
     #[tokio::test]
-    async fn only_the_servers_own_refusal_asks_to_sign_in() {
-        let request = || PushRequest::default();
-        let refused = br#"{"code":"permission_denied","message":"sign in"}"#;
-        for (status, body, kind) in [
-            (403, &refused[..], ErrorKind::SignInRequired),
+    async fn only_the_servers_own_refusal_asks_to_sign_in_or_rejects_write_token() {
+        let request = || PushV2Request::default();
+        let sign_in = br#"{"code":"permission_denied","message":"sign in"}"#;
+        let aborted = br#"{"code":"aborted","message":"write token rejected"}"#;
+        for (status, body, kind, is_refusal) in [
+            (403, &sign_in[..], ErrorKind::SignInRequired, true),
             // A firewall's page, or none.
-            (403, b"<html>blocked</html>", ErrorKind::Server),
-            (403, b"", ErrorKind::Server),
-            (429, b"", ErrorKind::Server),
+            (403, b"<html>blocked</html>", ErrorKind::Server, false),
+            (403, b"", ErrorKind::Server, false),
+            (429, b"", ErrorKind::Server, false),
+            // Decoded Connect 409 aborted -> WriteTokenRejected (server refusal).
+            (409, &aborted[..], ErrorKind::WriteTokenRejected, true),
+            // Bare HTTP 409 without Connect JSON body -> Server (NOT a refusal).
+            (409, b"<html>conflict</html>", ErrorKind::Server, false),
+            (409, b"", ErrorKind::Server, false),
         ] {
             let client = ConnectClient::new(Answering(status, body));
-            assert_eq!(client.push(request()).await.unwrap_err().kind(), kind);
+            let err = client.push_v2(request()).await.unwrap_err();
+            assert_eq!(err.kind(), kind, "status={status}");
+            assert_eq!(err.is_server_refusal(), is_refusal, "status={status}");
+            assert_eq!(err.is_connect_error(), is_refusal, "status={status}");
         }
+        // Server-side `connect::error` emits HTTP 409 JSON for WriteTokenRejected.
+        let resp = error(ErrorKind::WriteTokenRejected, "write token rejected");
+        assert_eq!(resp.status, 409);
+        assert_eq!(resp.content_type, ERROR_CONTENT_TYPE);
+        let parsed: CallError = serde_json::from_slice(&resp.body).unwrap();
+        assert_eq!(parsed.code, "aborted");
     }
 
     #[tokio::test]
@@ -851,7 +700,7 @@ mod test {
         }
         for code in Code::ALL {
             let error = ConnectClient::new(Reply(code))
-                .push(PushRequest::default())
+                .push_v2(PushV2Request::default())
                 .await
                 .unwrap_err();
             assert_eq!(error.kind(), ErrorKind::from(code));
@@ -866,7 +715,7 @@ mod test {
             ErrorKind::Connect,
         ] {
             let error = ConnectClient::new(ResponseError(kind))
-                .push(PushRequest::default())
+                .push_v2(PushV2Request::default())
                 .await
                 .unwrap_err();
             assert_eq!(
@@ -882,7 +731,7 @@ mod test {
             assert!(!Error::ambiguous_response(kind, "response read failed").is_server_refusal());
         }
         let error = ConnectClient::new(Answering(200, &[0xff]))
-            .push(PushRequest::default())
+            .push_v2(PushV2Request::default())
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::InvalidResponse);
@@ -891,66 +740,34 @@ mod test {
 
     #[tokio::test]
     async fn rejects_other_content_types() {
-        let (handshake, mailbox, attachments) = (
-            HandshakeServer::new(MemoryStore::default()),
-            MailboxServer::new(MemoryStore::default()),
-            AttachmentServer::new(MemoryStore::default()),
+        let handshake = HandshakeV2Server::new(
+            MemoryStore::default(),
+            ServerInfoConfig::new("connect.test"),
         );
-        let response = handle(
+        let mailbox = MailboxV2Server::new(MemoryStore::default(), "connect.test");
+        let response = handle_v2(
             &handshake,
             &mailbox,
-            &attachments,
-            Procedure::Fetch,
+            ProcedureV2::FetchSigned,
             Some("application/json"),
-            b"{}",
+            &b"{}"[..],
         )
         .await;
         assert_eq!(response.status, 415);
-        let response = handle(
+        let response = handle_v2(
             &handshake,
             &mailbox,
-            &attachments,
-            Procedure::Fetch,
+            ProcedureV2::FetchSigned,
             Some("Application/Proto; charset=binary"),
-            &[],
+            Bytes::new(),
         )
         .await;
         assert_eq!(response.status, 400);
     }
 
-    /// The paths are those of the services in the `.proto` files, which Connect clients in other
-    /// languages are generated from.
-    #[test]
-    fn paths_follow_the_services() {
-        let files = protox::compile(
-            [
-                "proto/attachment.proto",
-                "proto/handshake.proto",
-                "proto/mailbox.proto",
-            ],
-            ["proto", "../party/proto"],
-        )
-        .unwrap();
-        let mut services: Vec<_> = files
-            .file
-            .iter()
-            .flat_map(|file| {
-                file.service.iter().flat_map(move |service| {
-                    service.method.iter().map(move |method| {
-                        format!("/{}.{}/{}", file.package(), service.name(), method.name())
-                    })
-                })
-            })
-            .collect();
-        let mut paths = Procedure::ALL.map(|procedure| procedure.path().to_string());
-        services.sort();
-        paths.sort();
-        assert_eq!(services, paths);
-    }
-
-    #[cfg(feature = "pq")]
     #[test]
     fn v2_paths_follow_the_services() {
+        assert_eq!(ProcedureV2::ALL.len(), 13);
         let files = protox::compile(
             ["proto/handshake_v2.proto", "proto/mailbox_v2.proto"],
             ["proto", "../party/proto"],
@@ -973,22 +790,39 @@ mod test {
         assert_eq!(services, paths);
     }
 
-    #[cfg(feature = "pq")]
+    #[test]
+    fn attachment_paths_follow_the_service() {
+        let files =
+            protox::compile(["proto/attachment.proto"], ["proto", "../party/proto"]).unwrap();
+        let mut services: Vec<_> = files
+            .file
+            .iter()
+            .flat_map(|file| {
+                file.service.iter().flat_map(move |service| {
+                    service.method.iter().map(move |method| {
+                        format!("/{}.{}/{}", file.package(), service.name(), method.name())
+                    })
+                })
+            })
+            .collect();
+        let mut paths = AttachmentProcedure::ALL.map(|procedure| procedure.path().to_string());
+        services.sort();
+        paths.sort();
+        assert_eq!(services, paths);
+        for procedure in AttachmentProcedure::ALL {
+            assert_eq!(
+                AttachmentProcedure::from_path(procedure.path()),
+                Some(procedure)
+            );
+        }
+        assert_eq!(
+            AttachmentProcedure::from_path("/handshake.v2.HandshakeService/PublishV2"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn v2_over_connect_roundtrip() {
-        use std::sync::Arc;
-
-        use x3dh::{PqSuite, pq_prekey_id, sign_pq_spk};
-        use xeddsa::XEdDSAPrivateKey;
-
-        use crate::{
-            handshake_v2::{
-                CapabilityManifest, HandshakeV2Server, PqLastResortCommitment, PqPrekey,
-                ServerInfoConfig, sign_manifest,
-            },
-            mailbox_v2::MailboxV2Server,
-        };
-
         #[derive(Clone)]
         struct Shared(Arc<MemoryStore>);
 
@@ -1042,9 +876,11 @@ mod test {
             async fn list_initial_messages(
                 &self,
                 id: &x3dh::PublicKey,
+                after_id: u64,
                 limit: usize,
             ) -> storage::Result<Vec<storage::StoredInitialMessageV2>> {
-                storage::PqHandshakeStore::list_initial_messages(&*self.0, id, limit).await
+                storage::PqHandshakeStore::list_initial_messages(&*self.0, id, after_id, limit)
+                    .await
             }
             async fn ack_initial_messages(
                 &self,
@@ -1064,43 +900,54 @@ mod test {
         impl storage::LocalIdempotentMailboxStore for Shared {
             async fn append_idempotent(
                 &self,
-                s: &x3dh::PublicKey,
                 r: &x3dh::PublicKey,
+                token_hash: &[u8; 32],
                 h: Bytes,
                 c: Bytes,
                 i: Option<Bytes>,
-                d: Option<[u8; 32]>,
                 cid: Option<[u8; 16]>,
             ) -> storage::Result<u64> {
-                storage::IdempotentMailboxStore::append_idempotent(&*self.0, s, r, h, c, i, d, cid)
-                    .await
+                storage::IdempotentMailboxStore::append_idempotent(
+                    &*self.0, r, token_hash, h, c, i, cid,
+                )
+                .await
             }
-            async fn delete_delivered(
+            async fn read_mailbox(
                 &self,
-                s: &x3dh::PublicKey,
                 r: &x3dh::PublicKey,
-                h: &[[u8; 32]],
-            ) -> storage::Result<()> {
-                storage::IdempotentMailboxStore::delete_delivered(&*self.0, s, r, h).await
-            }
-            async fn read(
-                &self,
-                s: &x3dh::PublicKey,
-                r: &x3dh::PublicKey,
-                a: u64,
-                l: u32,
-            ) -> storage::Result<Vec<storage::StoredMessage>> {
-                storage::IdempotentMailboxStore::read(&*self.0, s, r, a, l).await
-            }
-            async fn read_bounded(
-                &self,
-                s: &x3dh::PublicKey,
-                r: &x3dh::PublicKey,
-                a: u64,
-                l: u32,
+                after_sequence: u64,
+                limit: u32,
                 max_size: usize,
-            ) -> storage::Result<Vec<storage::StoredMessage>> {
-                storage::IdempotentMailboxStore::read_bounded(&*self.0, s, r, a, l, max_size).await
+                ack_up_to_sequence: u64,
+            ) -> storage::Result<storage::MailboxPage> {
+                storage::IdempotentMailboxStore::read_mailbox(
+                    &*self.0,
+                    r,
+                    after_sequence,
+                    limit,
+                    max_size,
+                    ack_up_to_sequence,
+                )
+                .await
+            }
+            async fn ack_messages(
+                &self,
+                r: &x3dh::PublicKey,
+                up_to_sequence: u64,
+            ) -> storage::Result<u64> {
+                storage::IdempotentMailboxStore::ack_messages(&*self.0, r, up_to_sequence).await
+            }
+            async fn register_write_token(
+                &self,
+                record: storage::RegisterWriteTokenRecord,
+            ) -> storage::Result<()> {
+                storage::IdempotentMailboxStore::register_write_token(&*self.0, record).await
+            }
+            async fn revoke_write_token(
+                &self,
+                record: storage::RevokeWriteTokenRecord,
+            ) -> storage::Result<u32> {
+                storage::IdempotentMailboxStore::revoke_write_token(&*self.0, record).await
             }
         }
 
@@ -1114,12 +961,13 @@ mod test {
                 let Some(proc_v2) = ProcedureV2::from_path(path) else {
                     return Ok((404, b"no such procedure".to_vec()));
                 };
+                // Pass owned `Bytes` directly to exercise zero-copy `impl Buf` handling.
                 let resp = handle_v2(
                     &self.handshake,
                     &self.mailbox,
                     proc_v2,
                     Some(CONTENT_TYPE),
-                    &body,
+                    Bytes::from(body),
                 )
                 .await;
                 Ok((resp.status, resp.body))
@@ -1141,8 +989,6 @@ mod test {
 
         let bob = XEdDSAPrivateKey::generate();
         let bob_pk = bob.compute_public_key().to_bytes();
-        let alice = XEdDSAPrivateKey::generate();
-        let alice_pk = alice.compute_public_key().to_bytes();
         let now = crate::now_millis();
 
         let ek = vec![0x99; PqSuite::MlKem1024.ek_len()];
@@ -1206,90 +1052,84 @@ mod test {
             .unwrap();
         assert!(claimed.pq_last_resort.is_some());
 
-        let pushed = client
+        // Unauthorized PushV2 surfaces WriteTokenRejected over Connect Code::Aborted (409 JSON).
+        let token = [0x42; WRITE_TOKEN_LENGTH];
+        let token_hash: [u8; 32] = Sha256::digest(token).into();
+        let peer_slot = [0x99; PEER_SLOT_ID_LENGTH];
+        let err = client
             .push_v2(PushV2Request {
-                sender: Bytes::copy_from_slice(&alice_pk),
                 recipient: Bytes::copy_from_slice(&bob_pk),
                 message: Some(EncryptedMessage {
                     header: Bytes::from_static(b"hdr"),
                     content: Bytes::from_static(b"body"),
                 }),
                 initial_message: None,
-                delivery_hash: Bytes::new(),
                 client_message_id: Bytes::from_static(&[7; 16]),
+                write_token: Bytes::copy_from_slice(&token),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WriteTokenRejected);
+        assert!(err.is_server_refusal());
+
+        // RegisterWriteToken -> PushV2 -> FetchSigned -> AckMessages -> RevokeWriteToken.
+        client
+            .register_write_token(
+                RegisterWriteTokenRequest::sign(
+                    &bob,
+                    "connect.test",
+                    &peer_slot,
+                    &token_hash,
+                    1,
+                    true,
+                    now,
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let pushed = client
+            .push_v2(PushV2Request {
+                recipient: Bytes::copy_from_slice(&bob_pk),
+                message: Some(EncryptedMessage {
+                    header: Bytes::from_static(b"hdr"),
+                    content: Bytes::from_static(b"body"),
+                }),
+                initial_message: None,
+                client_message_id: Bytes::from_static(&[7; 16]),
+                write_token: Bytes::copy_from_slice(&token),
             })
             .await
             .unwrap();
         assert_eq!(pushed.sequence, 1);
 
         let fetched = client
-            .fetch_signed(
-                FetchSignedRequest::sign(&bob, "connect.test", &alice_pk, 0, 10, 0, vec![], now)
+            .fetch_signed(FetchSignedRequest::sign(&bob, "connect.test", 0, 10, 0, 0, now).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fetched.messages.len(), 1);
+        assert!(!fetched.has_more);
+        assert_eq!(fetched.messages[0].token_hash.as_ref(), &token_hash);
+
+        let acked = client
+            .ack_messages(AckMessagesRequest::sign(&bob, "connect.test", 1, now).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(acked.deleted, 1);
+
+        let revoked = client
+            .revoke_write_token(
+                RevokeWriteTokenRequest::sign(&bob, "connect.test", &peer_slot, None, 2, now)
                     .unwrap(),
             )
             .await
             .unwrap();
-        assert_eq!(fetched.messages.len(), 1);
-    }
-
-    #[test]
-    fn attachment_paths_follow_the_service_and_legacy_v1_path_detection() {
-        let files =
-            protox::compile(["proto/attachment.proto"], ["proto", "../party/proto"]).unwrap();
-        let mut services: Vec<_> = files
-            .file
-            .iter()
-            .flat_map(|file| {
-                file.service.iter().flat_map(move |service| {
-                    service.method.iter().map(move |method| {
-                        format!("/{}.{}/{}", file.package(), service.name(), method.name())
-                    })
-                })
-            })
-            .collect();
-        let mut paths = AttachmentProcedure::ALL.map(|procedure| procedure.path().to_string());
-        services.sort();
-        paths.sort();
-        assert_eq!(services, paths);
-        for procedure in AttachmentProcedure::ALL {
-            assert_eq!(
-                AttachmentProcedure::from_path(procedure.path()),
-                Some(procedure)
-            );
-            assert!(!is_legacy_v1_path(procedure.path()));
-        }
-        assert_eq!(
-            AttachmentProcedure::from_path("/handshake.v1.HandshakeService/Publish"),
-            None
-        );
-
-        for legacy in [
-            "/handshake.v1.HandshakeService/Publish",
-            "/handshake.v1.HandshakeService/FetchBundle",
-            "/handshake.v1.HandshakeService/SendInitialMessage",
-            "/handshake.v1.HandshakeService/TakeInitialMessages",
-            "/mailbox.v1.MailboxService/Push",
-            "/mailbox.v1.MailboxService/Fetch",
-        ] {
-            assert!(is_legacy_v1_path(legacy), "expected legacy: {legacy}");
-        }
-        for modern in [
-            "/handshake.v2.HandshakeService/GetServerInfo",
-            "/handshake.v2.HandshakeService/PublishV2",
-            "/mailbox.v2.MailboxService/PushV2",
-            "/mailbox.v2.MailboxService/FetchSigned",
-            "/attachment.v1.AttachmentService/StartUpload",
-            "/notifications",
-            "/auth",
-        ] {
-            assert!(!is_legacy_v1_path(modern), "expected non-legacy: {modern}");
-        }
+        assert_eq!(revoked.revoked, 1);
     }
 
     #[tokio::test]
     async fn attachments_over_connect_roundtrip() {
-        use sha2::{Digest, Sha256};
-
         struct AttachmentsOnly(AttachmentServer<MemoryStore>);
 
         impl LocalPost for AttachmentsOnly {
@@ -1298,7 +1138,8 @@ mod test {
                     return Ok((404, b"no such procedure".to_vec()));
                 };
                 let response =
-                    handle_attachments(&self.0, procedure, Some(CONTENT_TYPE), &body).await;
+                    handle_attachments(&self.0, procedure, Some(CONTENT_TYPE), Bytes::from(body))
+                        .await;
                 Ok((response.status, response.body))
             }
         }
@@ -1308,7 +1149,7 @@ mod test {
             &server,
             AttachmentProcedure::StartUpload,
             Some("application/json"),
-            b"{}",
+            &b"{}"[..],
         )
         .await;
         assert_eq!(bad_ct.status, 415);

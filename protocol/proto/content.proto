@@ -43,6 +43,8 @@ message Events {
   repeated uint64 read = 1;
   // Attachments downloaded whole.
   repeated uint64 downloaded = 2;
+  // The recipient explicitly accepted the chat and registered a write token for the sender.
+  bool accepted = 3;
 }
 
 // A file.

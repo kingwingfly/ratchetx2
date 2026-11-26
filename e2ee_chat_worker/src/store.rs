@@ -1,43 +1,35 @@
-//! The v2 handshake, idempotent mailbox, and attachment stores over the Worker's Durable Objects,
-//! with large message contents and attachments' chunks in R2.
+//! The v2 handshake, unified sealed-sender-lite mailbox, and attachment stores over the Worker's
+//! Durable Objects, with R2 used exclusively for attachment chunks (`v2/attachments/{hex}/{idx}`).
 //!
-//! Each store method is one typed call of one object, which serves it whole, so it is atomic, as
-//! the storage traits require. Large contents go to R2 before the DO append call; on an ambiguous
-//! DO RPC error the R2 object is intentionally NOT deleted (relying on R2 lifecycle/GC) so a
-//! committed message row can never be left pointing at a deleted blob. Only a definitive
-//! pre-commit rejection (`AppendOutcome::LimitExceeded`) deletes the staged R2 object.
+//! `IdentityV2` has zero R2 dependency: all `PushV2` envelopes (capped at 64 KiB) live inline in
+//! the recipient's Durable Object SQLite database. Each store method is one typed call of one
+//! object, served atomically.
 
-use futures_util::{StreamExt, TryStreamExt, stream};
 use storage::{
     AttachmentId, Bytes, ClaimOutcome, ClaimedPqBundle, Error, ErrorKind, LocalAttachmentStore,
-    LocalIdempotentMailboxStore, LocalPqHandshakeStore, MAX_SAFE_INTEGER, PqLastResortCommitment,
+    LocalIdempotentMailboxStore, LocalPqHandshakeStore, MAX_SAFE_INTEGER, MailboxPage,
     PqStorageSnapshot, PublicKey, PublishV2Record, PublishV2Status, RefillPrekeysRecord,
-    RefillStatus, Result, StoredAttachment, StoredCapabilityManifest, StoredInitialMessageV2,
-    StoredMessage, StoredPqPrekey,
+    RefillStatus, RegisterWriteTokenRecord, Result, RevokeWriteTokenRecord, StoredAttachment,
+    StoredCapabilityManifest, StoredInitialMessageV2, WriteTokenHash,
 };
 use worker::{Bucket, Conditional, Env, console_error};
 
 use crate::objects::{
-    self, AppendOutcome, AttachmentRpc, ClaimBundleOutcome, ClaimedBundleWire, Content,
-    IdentityRpc, InitialMessageV2Wire, ManifestWire, PqCommitmentWire, PqPrekeyWire,
-    PublishV2Outcome, RefillOutcome, rpc,
+    self, AckMessagesOutcome, AddInitialOutcome, AppendOutcome, AttachmentRpc, IdentityRpc,
+    ReadMailboxOutcome, RefillOutcome, RegisterWriteTokenOutcome, RevokeWriteTokenOutcome, rpc,
 };
 
-/// Contents larger than this go to R2; smaller ones stay in their object's row.
-pub const INLINE_CONTENT_MAX: usize = 64 << 10;
-
-/// The stores over `env`'s objects and its R2 bucket.
+/// The stores over `env`'s objects and its R2 bucket (attachments only).
 #[derive(Clone)]
 pub struct Store {
     env: Env,
     bucket: Bucket,
-    /// Most bytes, headers and contents, one read returns, unless its first message alone is
-    /// larger.
+    /// Most bytes one mailbox read returns, unless its first message alone is larger.
     max_read_size: usize,
 }
 
 impl Store {
-    /// The stores over `env`'s bindings, whose reads return at most `max_read_size` bytes,
+    /// The stores over `env`'s bindings, whose mailbox reads return at most `max_read_size` bytes,
     /// unless the first message alone is larger.
     pub fn new(env: &Env, max_read_size: usize) -> worker::Result<Self> {
         Ok(Self {
@@ -47,28 +39,13 @@ impl Store {
         })
     }
 
-    /// Make typed `call` of the object of `identity_key`.
+    /// Make typed `call` of the `IdentityV2` object of `identity_key`.
     async fn identity<R: IdentityRpc>(&self, identity_key: &[u8], call: R) -> Result<R::Reply> {
         let stub = objects::identity(&self.env, identity_key).map_err(unavailable)?;
         objects::call(&stub, call).await.map_err(unavailable)
     }
 
-    /// Make typed `call` of the object of `identity_key`, returning `Ok(None)` if an older
-    /// Durable Object rejected the newly introduced wire tag during a rolling deploy.
-    async fn identity_or_unsupported<R: IdentityRpc>(
-        &self,
-        identity_key: &[u8],
-        call: R,
-    ) -> Result<Option<R::Reply>> {
-        let stub = objects::identity(&self.env, identity_key).map_err(unavailable)?;
-        match objects::call_raw(&stub, call).await {
-            Ok(reply) => Ok(Some(reply)),
-            Err(err) if err.is_unsupported_call() => Ok(None),
-            Err(err) => Err(unavailable(err.into_worker_error())),
-        }
-    }
-
-    /// Make typed `call` of the object of the attachment `id`.
+    /// Make typed `call` of the `AttachmentV2` object of `id`.
     async fn attachment_call<R: AttachmentRpc>(
         &self,
         id: &AttachmentId,
@@ -78,8 +55,7 @@ impl Store {
         objects::call(&stub, call).await.map_err(unavailable)
     }
 
-    /// The content in R2 under `object`; none if it expired, as the bucket's lifecycle rules
-    /// deleted it before its message was read, which the recipient goes past.
+    /// Read an attachment chunk from R2 under `object`; `None` if not uploaded or expired.
     async fn object(&self, object: &str) -> Result<Option<Bytes>> {
         let Some(object) = self
             .bucket
@@ -95,96 +71,6 @@ impl Store {
             .ok_or_else(|| Error::new(ErrorKind::Corrupt, "an R2 object without a body"))?;
         Ok(Some(Bytes::from(body.bytes().await.map_err(unavailable)?)))
     }
-
-    async fn stage_content(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        content: Bytes,
-    ) -> Result<(Content, u64)> {
-        let size = content.len() as u64;
-        if content.len() > INLINE_CONTENT_MAX {
-            let object = format!(
-                "messages/{}/{}/{}",
-                hex(sender),
-                hex(recipient),
-                random_id()?
-            );
-            self.bucket
-                .put(&object, content.to_vec())
-                .execute()
-                .await
-                .map_err(unavailable)?;
-            Ok((Content::Object(object), size))
-        } else {
-            Ok((Content::Inline(content.to_vec()), size))
-        }
-    }
-
-    async fn finish_append(&self, outcome: Result<AppendOutcome>, staged: &Content) -> Result<u64> {
-        match outcome {
-            Ok(AppendOutcome::Appended(seq)) => Ok(seq),
-            Ok(AppendOutcome::Deduplicated(seq)) => {
-                // Retry hit existing dedup row; newly staged R2 object is not referenced.
-                if let Content::Object(object) = staged
-                    && let Err(e) = self.bucket.delete(object).await
-                {
-                    console_error!("cannot delete unused duplicate R2 object: {e}");
-                }
-                Ok(seq)
-            }
-            Ok(AppendOutcome::LimitExceeded) => {
-                // Definitive pre-commit rejection: safe to clean up the staged R2 object.
-                if let Content::Object(object) = staged
-                    && let Err(e) = self.bucket.delete(object).await
-                {
-                    console_error!("cannot delete R2 object after definitive rejection: {e}");
-                }
-                Err(ErrorKind::LimitExceeded.into())
-            }
-            // Ambiguous DO RPC failure: DO NOT delete the R2 object, because the DO may have
-            // committed the row before the response failed. R2 lifecycle rules GC true orphans.
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn read_with_cap(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        after: u64,
-        limit: u32,
-        max_size: usize,
-    ) -> Result<Vec<StoredMessage>> {
-        let rows = self
-            .identity(
-                recipient,
-                rpc::Read {
-                    sender: sender.to_vec(),
-                    after,
-                    limit,
-                    max_size: max_size as u64,
-                },
-            )
-            .await?;
-        stream::iter(rows.into_iter().map(|row| async move {
-            let content = match row.content {
-                Content::Inline(content) => Some(Bytes::from(content)),
-                Content::Object(object) => self.object(&object).await?,
-            };
-            Ok(StoredMessage {
-                sender: *sender,
-                recipient: *recipient,
-                sequence: row.sequence,
-                header: Bytes::from(row.header),
-                content,
-                initial_message: row.initial_message.map(Bytes::from),
-            })
-        }))
-        .buffered(6)
-        .try_collect()
-        .await
-    }
 }
 
 fn check_safe(value: u64) -> Result<()> {
@@ -194,97 +80,11 @@ fn check_safe(value: u64) -> Result<()> {
     Ok(())
 }
 
-fn manifest_to_wire(manifest: &StoredCapabilityManifest) -> ManifestWire {
-    ManifestWire {
-        audience: manifest.audience.clone(),
-        identity_key: manifest.identity_key.to_vec(),
-        manifest_seq: manifest.manifest_seq,
-        generation: manifest.generation,
-        issued_at: manifest.issued_at,
-        expires_at: manifest.expires_at,
-        pq_enabled: manifest.pq_enabled,
-        strict_pq: manifest.strict_pq,
-        pq_ratchet_supported: manifest.pq_ratchet_supported,
-        offered_suites: manifest.offered_suites.clone(),
-        signed_prekey: manifest.signed_prekey.to_vec(),
-        pq_last_resort: manifest
-            .pq_last_resort
-            .iter()
-            .map(|c| PqCommitmentWire {
-                suite: c.suite,
-                prekey_id: c.prekey_id.to_vec(),
-            })
-            .collect(),
-        signature: manifest.signature.to_vec(),
+fn check_positive_safe(value: u64) -> Result<()> {
+    if value == 0 || value > MAX_SAFE_INTEGER {
+        return Err(ErrorKind::InvalidArgument.into());
     }
-}
-
-fn manifest_from_wire(wire: ManifestWire) -> Result<StoredCapabilityManifest> {
-    let pq_last_resort = wire
-        .pq_last_resort
-        .into_iter()
-        .map(|c| {
-            Ok(PqLastResortCommitment {
-                suite: c.suite,
-                prekey_id: fixed(&c.prekey_id)?,
-            })
-        })
-        .collect::<Result<_>>()?;
-    Ok(StoredCapabilityManifest {
-        audience: wire.audience,
-        identity_key: fixed(&wire.identity_key)?,
-        manifest_seq: wire.manifest_seq,
-        generation: wire.generation,
-        issued_at: wire.issued_at,
-        expires_at: wire.expires_at,
-        pq_enabled: wire.pq_enabled,
-        strict_pq: wire.strict_pq,
-        pq_ratchet_supported: wire.pq_ratchet_supported,
-        offered_suites: wire.offered_suites,
-        signed_prekey: fixed(&wire.signed_prekey)?,
-        pq_last_resort,
-        signature: fixed(&wire.signature)?,
-    })
-}
-
-fn pq_prekey_to_wire(key: &StoredPqPrekey) -> PqPrekeyWire {
-    PqPrekeyWire {
-        suite: key.suite,
-        id: key.id.to_vec(),
-        encapsulation_key: key.encapsulation_key.to_vec(),
-        signature: key.signature.to_vec(),
-    }
-}
-
-fn pq_prekey_from_wire(wire: PqPrekeyWire) -> Result<StoredPqPrekey> {
-    Ok(StoredPqPrekey {
-        suite: wire.suite,
-        id: fixed(&wire.id)?,
-        encapsulation_key: Bytes::from(wire.encapsulation_key),
-        signature: fixed(&wire.signature)?,
-    })
-}
-
-fn claimed_bundle_from_wire(
-    identity_key: &PublicKey,
-    wire: ClaimedBundleWire,
-) -> Result<ClaimedPqBundle> {
-    Ok(ClaimedPqBundle {
-        identity_key: *identity_key,
-        manifest: wire.manifest.map(manifest_from_wire).transpose()?,
-        signed_prekey: fixed(&wire.signed_prekey)?,
-        signed_prekey_signature: wire
-            .signed_prekey_signature
-            .as_deref()
-            .map(fixed)
-            .transpose()?,
-        one_time_prekey: wire.one_time_prekey.as_deref().map(fixed).transpose()?,
-        pq_last_resort: wire.pq_last_resort.map(pq_prekey_from_wire).transpose()?,
-        pq_one_time_prekey: wire
-            .pq_one_time_prekey
-            .map(pq_prekey_from_wire)
-            .transpose()?,
-    })
+    Ok(())
 }
 
 impl LocalPqHandshakeStore for Store {
@@ -294,53 +94,17 @@ impl LocalPqHandshakeStore for Store {
         check_safe(record.manifest.generation)?;
         check_safe(record.manifest.issued_at)?;
         check_safe(record.manifest.expires_at)?;
-        let outcome = self
-            .identity(
-                &record.manifest.identity_key,
-                rpc::PublishV2 {
-                    manifest: manifest_to_wire(&record.manifest),
-                    signed_prekey_signature: record.signed_prekey_signature.map(|s| s.to_vec()),
-                    one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
-                    pq_last_resort: record
-                        .pq_last_resort
-                        .iter()
-                        .map(pq_prekey_to_wire)
-                        .collect(),
-                    pq_one_time_prekeys: record
-                        .pq_one_time_prekeys
-                        .iter()
-                        .map(pq_prekey_to_wire)
-                        .collect(),
-                    timestamp: record.timestamp,
-                },
-            )
-            .await?;
-        Ok(match outcome {
-            PublishV2Outcome::Stored => PublishV2Status::Stored,
-            PublishV2Outcome::StaleSequence => PublishV2Status::StaleSequence,
-            PublishV2Outcome::DuplicatePrekey => PublishV2Status::DuplicatePrekey,
-        })
+        let identity_key = record.manifest.identity_key;
+        self.identity(&identity_key, rpc::PublishV2 { record })
+            .await
     }
 
     async fn refill_prekeys(&self, record: RefillPrekeysRecord) -> Result<RefillStatus> {
         check_safe(record.generation)?;
         check_safe(record.timestamp)?;
+        let identity_key = record.identity_key;
         let outcome = self
-            .identity(
-                &record.identity_key,
-                rpc::RefillPrekeys {
-                    generation: record.generation,
-                    one_time_prekeys: record.one_time_prekeys.iter().map(|k| k.to_vec()).collect(),
-                    pq_one_time_prekeys: record
-                        .pq_one_time_prekeys
-                        .iter()
-                        .map(pq_prekey_to_wire)
-                        .collect(),
-                    max_one_time_prekeys: record.max_one_time_prekeys as u64,
-                    max_pq_one_time_prekeys: record.max_pq_one_time_prekeys as u64,
-                    timestamp: record.timestamp,
-                },
-            )
+            .identity(&identity_key, rpc::RefillPrekeys { record })
             .await?;
         match outcome {
             RefillOutcome::Stored {
@@ -369,8 +133,7 @@ impl LocalPqHandshakeStore for Store {
         &self,
         identity_key: &PublicKey,
     ) -> Result<Option<StoredCapabilityManifest>> {
-        let wire = self.identity(identity_key, rpc::GetManifest).await?;
-        wire.map(manifest_from_wire).transpose()
+        self.identity(identity_key, rpc::GetManifest).await
     }
 
     async fn claim_bundle(
@@ -393,52 +156,14 @@ impl LocalPqHandshakeStore for Store {
         preferred_suites: &[u8],
         reject_pq_on_manifest: bool,
     ) -> Result<ClaimOutcome> {
-        if let Some(outcome) = self
-            .identity_or_unsupported(
-                identity_key,
-                rpc::ClaimBundleChecked {
-                    preferred_suites: preferred_suites.to_vec(),
-                    reject_pq_on_manifest,
-                },
-            )
-            .await?
-        {
-            return match outcome {
-                ClaimBundleOutcome::NotFound => Ok(ClaimOutcome::NotFound),
-                ClaimBundleOutcome::PqDisabledForPqManifest => {
-                    Ok(ClaimOutcome::PqDisabledForPqManifest)
-                }
-                ClaimBundleOutcome::Claimed(wire) => Ok(ClaimOutcome::Claimed(Box::new(
-                    claimed_bundle_from_wire(identity_key, *wire)?,
-                ))),
-            };
-        }
-        // Rolling-deploy fallback for older DO instances that do not recognize tag 17 yet:
-        // pre-check `get_manifest` when `reject_pq_on_manifest` is set, then call tag 11.
-        if reject_pq_on_manifest
-            && self
-                .get_manifest(identity_key)
-                .await?
-                .is_some_and(|manifest| manifest.pq_enabled)
-        {
-            return Ok(ClaimOutcome::PqDisabledForPqManifest);
-        }
-        let wire = self
-            .identity(
-                identity_key,
-                rpc::ClaimBundle {
-                    preferred_suites: preferred_suites.to_vec(),
-                },
-            )
-            .await?;
-        let Some(wire) = wire else {
-            return Ok(ClaimOutcome::NotFound);
-        };
-        let claimed = claimed_bundle_from_wire(identity_key, wire)?;
-        if reject_pq_on_manifest && claimed.manifest.as_ref().is_some_and(|m| m.pq_enabled) {
-            return Ok(ClaimOutcome::PqDisabledForPqManifest);
-        }
-        Ok(ClaimOutcome::Claimed(Box::new(claimed)))
+        self.identity(
+            identity_key,
+            rpc::ClaimBundleChecked {
+                preferred_suites: preferred_suites.to_vec(),
+                reject_pq_on_manifest,
+            },
+        )
+        .await
     }
 
     async fn add_initial_message_v2(
@@ -446,64 +171,41 @@ impl LocalPqHandshakeStore for Store {
         initial_message: StoredInitialMessageV2,
         limit: usize,
     ) -> Result<Option<u64>> {
-        self.identity(
-            &initial_message.recipient,
-            rpc::AddInitialMessageV2 {
-                message: InitialMessageV2Wire {
-                    id: 0,
-                    version: initial_message.version,
-                    sender: initial_message.sender.to_vec(),
-                    ephemeral_key: initial_message.ephemeral_key.to_vec(),
-                    signed_prekey: initial_message.signed_prekey.to_vec(),
-                    one_time_prekey: initial_message.one_time_prekey.map(|k| k.to_vec()),
-                    header: initial_message.header.to_vec(),
-                    content: initial_message.content.to_vec(),
-                    pq_suite: initial_message.pq_suite,
-                    pq_last_resort: initial_message.pq_last_resort,
-                    pq_prekey_id: initial_message.pq_prekey_id.map(|id| id.to_vec()),
-                    pq_ciphertext: initial_message.pq_ciphertext.map(|ct| ct.to_vec()),
-                    manifest_digest: initial_message.manifest_digest.map(|d| d.to_vec()),
+        let recipient = initial_message.recipient;
+        match self
+            .identity(
+                &recipient,
+                rpc::AddInitialMessageV2 {
+                    message: initial_message,
+                    limit: limit as u64,
                 },
-                limit: limit as u64,
-            },
-        )
-        .await
+            )
+            .await?
+        {
+            AddInitialOutcome::Added { id, .. } => Ok(Some(id)),
+            AddInitialOutcome::LimitExceeded => Ok(None),
+            AddInitialOutcome::NotFound => Err(ErrorKind::NotFound.into()),
+            AddInitialOutcome::PayloadMismatch => Err(ErrorKind::InvalidArgument.into()),
+            AddInitialOutcome::SequenceOverflow => Err(ErrorKind::LimitExceeded.into()),
+        }
     }
 
     async fn list_initial_messages(
         &self,
         recipient: &PublicKey,
+        after_id: u64,
         limit: usize,
     ) -> Result<Vec<StoredInitialMessageV2>> {
-        let wires = self
-            .identity(
-                recipient,
-                rpc::ListInitialMessages {
-                    limit: limit as u64,
-                },
-            )
-            .await?;
-        wires
-            .into_iter()
-            .map(|w| {
-                Ok(StoredInitialMessageV2 {
-                    id: w.id,
-                    version: w.version,
-                    sender: fixed(&w.sender)?,
-                    recipient: *recipient,
-                    ephemeral_key: fixed(&w.ephemeral_key)?,
-                    signed_prekey: fixed(&w.signed_prekey)?,
-                    one_time_prekey: w.one_time_prekey.as_deref().map(fixed).transpose()?,
-                    header: Bytes::from(w.header),
-                    content: Bytes::from(w.content),
-                    pq_suite: w.pq_suite,
-                    pq_last_resort: w.pq_last_resort,
-                    pq_prekey_id: w.pq_prekey_id.as_deref().map(fixed).transpose()?,
-                    pq_ciphertext: w.pq_ciphertext.map(Bytes::from),
-                    manifest_digest: w.manifest_digest.as_deref().map(fixed).transpose()?,
-                })
-            })
-            .collect()
+        check_safe(after_id)?;
+        self.identity(
+            recipient,
+            rpc::ListInitialMessages {
+                recipient: *recipient,
+                after_id,
+                limit: limit as u64,
+            },
+        )
+        .await
     }
 
     async fn ack_initial_messages(&self, recipient: &PublicKey, ids: &[u64]) -> Result<usize> {
@@ -517,157 +219,116 @@ impl LocalPqHandshakeStore for Store {
     }
 
     async fn pq_snapshot(&self, identity_key: &PublicKey) -> Result<PqStorageSnapshot> {
-        let wire = self.identity(identity_key, rpc::PqSnapshot).await?;
-        Ok(PqStorageSnapshot {
-            manifest: wire.manifest.map(manifest_from_wire).transpose()?,
-            classical_one_time_count: wire.classical_one_time_count as usize,
-            pq_last_resort_suites: wire.pq_last_resort_suites,
-            pq_one_time_counts: wire
-                .pq_one_time_counts
-                .into_iter()
-                .map(|(s, c)| (s, c as usize))
-                .collect(),
-            pending_initial_messages: wire.pending_initial_messages as usize,
-        })
+        self.identity(identity_key, rpc::PqSnapshot).await
     }
 }
 
 impl LocalIdempotentMailboxStore for Store {
     async fn append_idempotent(
         &self,
-        sender: &PublicKey,
         recipient: &PublicKey,
+        token_hash: &WriteTokenHash,
         header: Bytes,
         content: Bytes,
         initial_message: Option<Bytes>,
-        delivery_hash: Option<[u8; 32]>,
         client_message_id: Option<[u8; 16]>,
     ) -> Result<u64> {
-        let (staged, size) = self.stage_content(sender, recipient, content).await?;
-        let outcome = self
+        match self
             .identity(
                 recipient,
                 rpc::AppendIdempotent {
-                    sender: sender.to_vec(),
-                    header: header.to_vec(),
-                    content: staged.clone(),
-                    size,
-                    initial_message: initial_message.map(|bytes| bytes.to_vec()),
-                    delivery_hash: delivery_hash.map(Vec::from),
-                    client_message_id: client_message_id.map(Vec::from),
-                },
-            )
-            .await;
-        self.finish_append(outcome, &staged).await
-    }
-
-    async fn delete_delivered(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        hashes: &[[u8; 32]],
-    ) -> Result<()> {
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        let hashes: Vec<Vec<u8>> = hashes.iter().map(|hash| hash.to_vec()).collect();
-        if self
-            .identity_or_unsupported(
-                recipient,
-                rpc::DeleteDeliveredAtomic {
-                    sender: sender.to_vec(),
-                    hashes: hashes.clone(),
+                    token_hash: *token_hash,
+                    header,
+                    content,
+                    initial_message,
+                    client_message_id,
                 },
             )
             .await?
-            .is_some()
         {
-            return Ok(());
+            AppendOutcome::Appended(seq) | AppendOutcome::Deduplicated(seq) => Ok(seq),
+            AppendOutcome::WriteTokenRejected => Err(ErrorKind::WriteTokenRejected.into()),
+            AppendOutcome::LimitExceeded => Err(ErrorKind::LimitExceeded.into()),
         }
-        // Rolling-deploy fallback for older DO instances that do not recognize tag 18 yet:
-        // call tags 6 + 7, propagating any R2 deletion failure BEFORE SQL deletion so client
-        // receipts are never silently dropped.
-        let objects = self
-            .identity(
-                recipient,
-                rpc::DeliveredObjects {
-                    sender: sender.to_vec(),
-                    hashes: hashes.clone(),
-                },
-            )
-            .await?;
-        if !objects.is_empty() {
-            delete_objects(&self.bucket, objects.clone())
-                .await
-                .map_err(unavailable)?;
-        }
-        self.identity(
-            recipient,
-            rpc::DeleteDelivered {
-                sender: sender.to_vec(),
-                hashes,
-                objects,
-            },
-        )
-        .await
     }
 
-    async fn read(
+    async fn read_mailbox(
         &self,
-        sender: &PublicKey,
         recipient: &PublicKey,
-        after: u64,
-        limit: u32,
-    ) -> Result<Vec<StoredMessage>> {
-        self.read_with_cap(sender, recipient, after, limit, self.max_read_size)
-            .await
-    }
-
-    async fn read_bounded(
-        &self,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-        after: u64,
+        after_sequence: u64,
         limit: u32,
         max_size: usize,
-    ) -> Result<Vec<StoredMessage>> {
-        self.read_with_cap(
-            sender,
-            recipient,
-            after,
-            limit,
-            max_size.min(self.max_read_size),
-        )
-        .await
+        ack_up_to_sequence: u64,
+    ) -> Result<MailboxPage> {
+        check_safe(after_sequence)?;
+        check_safe(ack_up_to_sequence)?;
+        let capped_size = max_size.min(self.max_read_size) as u64;
+        match self
+            .identity(
+                recipient,
+                rpc::ReadMailbox {
+                    after_sequence,
+                    limit,
+                    max_size: capped_size,
+                    ack_up_to_sequence,
+                },
+            )
+            .await?
+        {
+            ReadMailboxOutcome::Page(page) => Ok(page),
+            ReadMailboxOutcome::InvalidAckSequence => Err(ErrorKind::InvalidArgument.into()),
+        }
+    }
+
+    async fn ack_messages(&self, recipient: &PublicKey, up_to_sequence: u64) -> Result<u64> {
+        check_positive_safe(up_to_sequence)?;
+        match self
+            .identity(recipient, rpc::AckMessages { up_to_sequence })
+            .await?
+        {
+            AckMessagesOutcome::Acked(deleted) => Ok(deleted),
+            AckMessagesOutcome::InvalidSequence => Err(ErrorKind::InvalidArgument.into()),
+        }
+    }
+
+    async fn register_write_token(&self, record: RegisterWriteTokenRecord) -> Result<()> {
+        check_positive_safe(record.grant_version)?;
+        let recipient = record.recipient;
+        match self
+            .identity(&recipient, rpc::RegisterWriteToken { record })
+            .await?
+        {
+            RegisterWriteTokenOutcome::Registered => Ok(()),
+            RegisterWriteTokenOutcome::NotFound => Err(ErrorKind::NotFound.into()),
+            RegisterWriteTokenOutcome::StaleVersion => Err(ErrorKind::StaleVersion.into()),
+            RegisterWriteTokenOutcome::InvalidArgument => Err(ErrorKind::InvalidArgument.into()),
+            RegisterWriteTokenOutcome::LimitExceeded => Err(ErrorKind::LimitExceeded.into()),
+        }
+    }
+
+    async fn revoke_write_token(&self, record: RevokeWriteTokenRecord) -> Result<u32> {
+        check_positive_safe(record.min_grant_version)?;
+        let recipient = record.recipient;
+        match self
+            .identity(&recipient, rpc::RevokeWriteToken { record })
+            .await?
+        {
+            RevokeWriteTokenOutcome::Revoked(revoked) => Ok(revoked),
+            RevokeWriteTokenOutcome::NotFound => Err(ErrorKind::NotFound.into()),
+            RevokeWriteTokenOutcome::InvalidArgument => Err(ErrorKind::InvalidArgument.into()),
+        }
     }
 }
 
 impl LocalAttachmentStore for Store {
     async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool> {
-        self.attachment_call(
-            &attachment.id,
-            rpc::AddAttachment {
-                id: attachment.id.to_vec(),
-                chunks: attachment.chunks,
-                token_hash: attachment.token_hash.to_vec(),
-                delete_hash: attachment.delete_hash.to_vec(),
-            },
-        )
-        .await
+        let id = attachment.id;
+        self.attachment_call(&id, rpc::AddAttachment { attachment })
+            .await
     }
 
     async fn attachment(&self, id: &AttachmentId) -> Result<Option<StoredAttachment>> {
-        let row = self.attachment_call(id, rpc::GetAttachment).await?;
-        row.map(|row| {
-            Ok(StoredAttachment {
-                id: fixed(&row.id)?,
-                chunks: row.chunks,
-                token_hash: fixed(&row.token_hash)?,
-                delete_hash: fixed(&row.delete_hash)?,
-                uploaded: row.uploaded,
-            })
-        })
-        .transpose()
+        self.attachment_call(id, rpc::GetAttachment).await
     }
 
     async fn put_chunk(&self, id: &AttachmentId, index: u32, data: Bytes) -> Result<()> {
@@ -676,8 +337,11 @@ impl LocalAttachmentStore for Store {
             etag_does_not_match: Some("*".to_string()),
             ..Conditional::default()
         };
+        // `Vec::from(data)` reuses the allocation zero-copy when `data` is uniquely owned, and
+        // `PutOptionsBuilder::execute` copies into a JS `Uint8Array` and drops the Rust `Vec`
+        // BEFORE awaiting the R2 put promise.
         self.bucket
-            .put(&object, data.to_vec())
+            .put(&object, Vec::from(data))
             .only_if(absent)
             .execute()
             .await
@@ -685,7 +349,10 @@ impl LocalAttachmentStore for Store {
         let noted = self.attachment_call(id, rpc::NoteChunk { index }).await?;
         if !noted {
             self.bucket.delete(&object).await.map_err(unavailable)?;
-            return Err(Error::new(ErrorKind::Other, "the attachment was deleted"));
+            return Err(Error::new(
+                ErrorKind::NotFound,
+                "the attachment was deleted",
+            ));
         }
         Ok(())
     }
@@ -699,9 +366,9 @@ impl LocalAttachmentStore for Store {
     }
 }
 
-/// The R2 object of chunk `index` of the attachment `id`.
+/// The opaque R2 object key of chunk `index` of attachment `id` (zero identity keys in R2).
 pub(crate) fn chunk_object(id: &[u8], index: u32) -> String {
-    format!("attachments/{}/{index}", hex(id))
+    format!("v2/attachments/{}/{index}", hex(id))
 }
 
 /// Delete the R2 `objects`, 1000 at once, as R2 takes them.
@@ -737,27 +404,6 @@ pub(crate) fn decode_hex_fixed<const N: usize>(hex: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
-/// A random 128-bit hex identifier for an R2 object.
-fn random_id() -> Result<String> {
-    let mut bytes = [0; 16];
-    getrandom::fill(&mut bytes).map_err(|e| {
-        console_error!("RNG failed generating R2 object ID: {e}");
-        Error::new(ErrorKind::Unavailable, "storage temporarily unavailable")
-    })?;
-    Ok(hex(&bytes))
-}
-
-/// A stored key or signature of `N` bytes.
-fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
-    bytes.try_into().map_err(|_| {
-        console_error!(
-            "corrupt stored key length: {} bytes, expected {N}",
-            bytes.len()
-        );
-        Error::new(ErrorKind::Corrupt, "corrupt stored record")
-    })
-}
-
 /// A failed object or R2 call, logged internally while returning a generic message to clients.
 fn unavailable(error: worker::Error) -> Error {
     console_error!("storage failed: {error}");
@@ -766,7 +412,16 @@ fn unavailable(error: worker::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex_fixed, hex};
+    use super::{chunk_object, decode_hex_fixed, hex};
+
+    #[test]
+    fn chunk_object_uses_opaque_v2_attachments_prefix() {
+        let id = [0xab; 16];
+        assert_eq!(
+            chunk_object(&id, 7),
+            "v2/attachments/abababababababababababababababab/7"
+        );
+    }
 
     #[test]
     fn hex_encodes_all_byte_values_and_round_trips() {

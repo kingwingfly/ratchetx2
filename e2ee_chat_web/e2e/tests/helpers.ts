@@ -6,7 +6,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const FIXTURES_DIR = path.resolve(__dirname, '../fixtures');
 export const TEST_SERVER_PASSWORD = 'test-server-password';
 export const TEST_PASSPHRASE = 'correct horse battery staple';
-export const ROLLBACK_ANCHOR_KEY = 'e2ee-chat.vault.anchor.v1';
+export const ROLLBACK_ANCHOR_KEY = 'e2ee-chat.vault.anchor.v3';
+export const LEGACY_ROLLBACK_ANCHOR_KEY = 'e2ee-chat.vault.anchor.v1';
 
 export function fixturePath(name: string): string {
   return path.join(FIXTURES_DIR, name);

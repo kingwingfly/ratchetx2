@@ -16,10 +16,10 @@ ml-kem-768 = ["session/ml-kem-768", "party/ml-kem-768"]
 pq = ["ml-kem-1024", "ml-kem-768", "session/pq", "party/pq"]
 
 [dependencies]
-aes-gcm.workspace = true
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 base64.workspace = true
 bytes.workspace = true
+chacha20poly1305.workspace = true
 console_error_panic_hook.workspace = true
 # File previews: CSV tables, tar.gz listings, and ZIP listings.
 crc32fast = "1"
@@ -31,6 +31,8 @@ form_urlencoded = "1"
 futures-channel = "0.3"
 futures-util = { workspace = true, features = ["std"] }
 getrandom = { workspace = true, features = ["wasm_js"] }
+hkdf.workspace = true
+hmac.workspace = true
 idb = "0.6"
 js-sys.workspace = true
 leptos = { version = "0.8", features = ["csr"] }

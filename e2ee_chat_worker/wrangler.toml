@@ -1,8 +1,14 @@
 name = "e2ee-chat"
 main = "build/worker/shim.mjs"
 compatibility_date = "2026-10-01"
-workers_dev = true
+workers_dev = false
 preview_urls = false
+
+# Attach a custom domain before deploying (`workers_dev` is disabled so `__Host-` cookies and
+# `SERVER_ID` stay bound to your own origin):
+# routes = [
+#   { pattern = "chat.example.com", custom_domain = true }
+# ]
 
 # Builds the web client into ../e2ee_chat_web/dist, then the Worker.
 # Never splice ambient env vars here so `--features conformance` cannot leak into a deploy.
@@ -15,48 +21,73 @@ watch_dir = ["src", "../e2ee_chat_web/src", "../e2ee_chat_web/index.html", "../e
 [assets]
 directory = "../e2ee_chat_web/dist"
 
-# Message contents over 64 KiB and attachments' chunks. Create it with
-# `npx wrangler r2 bucket create e2ee-chat`.
+# Encrypted attachment chunks under opaque `v2/attachments/<id>/<index>` keys (zero mailbox data
+# or identity keys in R2). Create it with `npx wrangler r2 bucket create e2ee-chat`.
 [[r2_buckets]]
 binding = "BUCKET"
 bucket_name = "e2ee-chat"
 
-# The server's state, in SQLite-backed Durable Objects, as the Free plan requires: an object per
-# identity key, keeping its prekeys, its inbox, the messages to it and its client's WebSockets;
-# and an object per attachment. Each deletes what expires with an alarm.
+# The server's state, in SQLite-backed Durable Objects, as the Free plan requires: an `IdentityV2`
+# per identity key (manifest, prekeys, inbox, write-token grants, inline unified mailbox, and
+# pre-authenticated WebSockets; zero R2 dependency), and an `AttachmentV2` per attachment. Each
+# deletes what expires with an alarm.
 [[durable_objects.bindings]]
 name = "IDENTITIES"
-class_name = "Identity"
+class_name = "IdentityV2"
 
 [[durable_objects.bindings]]
 name = "ATTACHMENTS"
-class_name = "Attachment"
+class_name = "AttachmentV2"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["Identity", "Attachment"]
+new_sqlite_classes = ["IdentityV2", "AttachmentV2"]
 
-# How long, in days, the messages never delivered and the initial messages never taken are kept,
-# and attachments: the objects' alarms delete them then.
+# GA per-colo, eventually consistent rate limiters (Free-plan eligible).
+# Because counters are per-colo, operators MUST configure a high-entropy random PASSWORD
+# (>= 128 bits, e.g. `openssl rand -base64 24`) and pair with Cloudflare WAF Rate Limiting rules
+# for global cross-colo enforcement.
+[[ratelimits]]
+name = "AUTH_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 20, period = 60 }
+
+[[ratelimits]]
+name = "WS_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "HANDSHAKE_RATE_LIMITER"
+namespace_id = "1003"
+simple = { limit = 30, period = 60 }
+
+[[ratelimits]]
+name = "UPLOAD_RATE_LIMITER"
+namespace_id = "1004"
+simple = { limit = 30, period = 60 }
+
+# How long, in days, unread messages and initial messages are kept, and attachments: the objects'
+# alarms delete them then.
 [vars]
 RETENTION_DAYS = "30"
 FILE_RETENTION_DAYS = "90"
 # How long a sign-in lasts.
 SESSION_DAYS = "30"
+# Canonical audience (`host[:port]`) matching your custom domain in `routes` above. Defaults to
+# the request URL origin if omitted; set explicitly in production:
+# SERVER_ID = "chat.example.com"
 # Runtime post-quantum toggle:
 # - PQ_ENABLED = "false" disables GetManifest and advertises pq_enabled: false, x-e2ee-pq: 0,
 #   and empty supported_suites. PublishV2 accepts signed OFF manifests and ClaimBundle offers
-#   classical fallback. ListInitialMessages, AckInitialMessages, PushV2, and FetchSigned stay
-#   active so clients can drain in-flight handshakes and messages and continue signed reads.
-# Legacy v1 (`handshake.v1`, `mailbox.v1`, unsigned `Fetch`, and query-param / unbound
-# `/notifications`) has been deprecated and removed; the last legacy-v1-compatible version is
-# tagged `archive/legacy-v1`.
-# Optional SERVER_ID sets the canonical audience string as host[:port] (defaults to the request URL host[:port]).
+#   classical fallback. ListInitialMessages, AckInitialMessages, PushV2, FetchSigned, AckMessages,
+#   RegisterWriteToken, and RevokeWriteToken stay active so clients can drain in-flight handshakes
+#   and messages and continue signed reads.
 PQ_ENABLED = "true"
 
-# The secrets PASSWORD, which clients sign in with, as every write takes it, and AUTH_KEY, which
-# signs their sign-ins' cookies: set with `npx wrangler secret put`, or in .dev.vars for
-# `wrangler dev`, which warns if one is missing; see the README. Without both, nobody can use the
+# The secrets PASSWORD, which clients sign in with (use >= 128 bits of entropy, e.g.
+# `openssl rand -base64 24`), and AUTH_KEY, which signs their sign-ins' cookies: set with
+# `npx wrangler secret put`, or in .dev.vars for `wrangler dev`. Without both, nobody can use the
 # server.
 [secrets]
 required = ["PASSWORD", "AUTH_KEY"]

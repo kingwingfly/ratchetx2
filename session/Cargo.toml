@@ -17,7 +17,7 @@ hkdf.workspace = true
 hmac.workspace = true
 party = { path = "../party", default-features = false }
 prost.workspace = true
-protocol = { path = "../protocol", default-features = false, features = ["pq"] }
+protocol = { path = "../protocol", default-features = false }
 ratchetx2 = { path = "../ratchetx2", version = "0.5" }
 serde = { workspace = true, optional = true }
 sha2.workspace = true
@@ -32,8 +32,8 @@ prost-build = { workspace = true, optional = true }
 protox = { workspace = true, optional = true }
 
 [dev-dependencies]
-protocol = { path = "../protocol", features = ["server", "connect", "pq"] }
-storage = { path = "../storage", features = ["pq"] }
+protocol = { path = "../protocol", features = ["server", "connect"] }
+storage = { path = "../storage" }
 tokio.workspace = true
 
 [features]
@@ -52,8 +52,8 @@ prost = [
 # Connect clients over any HTTP client, see `protocol::connect`.
 connect = ["protocol/connect"]
 # Optional ML-KEM-1024 post-quantum handshake (PQXDH) and KEM ratchet suite.
-ml-kem-1024 = ["x3dh/ml-kem-1024", "party/ml-kem-1024", "protocol/pq"]
+ml-kem-1024 = ["x3dh/ml-kem-1024", "party/ml-kem-1024"]
 # Optional ML-KEM-768 post-quantum handshake (PQXDH) and KEM ratchet suite.
-ml-kem-768 = ["x3dh/ml-kem-768", "party/ml-kem-768", "protocol/pq"]
+ml-kem-768 = ["x3dh/ml-kem-768", "party/ml-kem-768"]
 # All optional post-quantum suites (ML-KEM-1024 and ML-KEM-768).
-pq = ["ml-kem-1024", "ml-kem-768", "x3dh/pq", "party/pq", "protocol/pq"]
+pq = ["ml-kem-1024", "ml-kem-768", "x3dh/pq", "party/pq"]

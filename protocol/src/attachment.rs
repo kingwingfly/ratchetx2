@@ -45,19 +45,9 @@ pub const ID_LENGTH: usize = 16;
 /// Length of an upload or delete token.
 pub const TOKEN_LENGTH: usize = 16;
 
-/// Zeroizes the backing buffer of `bytes` in place when uniquely owned (including prost-decoded
-/// and [`bytes::Bytes::copy_from_slice`] allocations). Static or still-shared handles are detached
-/// without panicking.
-fn zeroize_bytes(bytes: &mut bytes::Bytes) {
-    let owned = core::mem::take(bytes);
-    if let Ok(mut buf) = owned.try_into_mut() {
-        zeroize::Zeroize::zeroize(buf.as_mut());
-    }
-}
-
 impl Drop for StartUploadResponse {
     fn drop(&mut self) {
-        zeroize_bytes(&mut self.upload_token);
+        crate::zeroize_bytes(&mut self.upload_token);
     }
 }
 
@@ -65,7 +55,7 @@ impl zeroize::ZeroizeOnDrop for StartUploadResponse {}
 
 impl Drop for PutChunkRequest {
     fn drop(&mut self) {
-        zeroize_bytes(&mut self.upload_token);
+        crate::zeroize_bytes(&mut self.upload_token);
     }
 }
 
@@ -73,7 +63,7 @@ impl zeroize::ZeroizeOnDrop for PutChunkRequest {}
 
 impl Drop for DeleteAttachmentRequest {
     fn drop(&mut self) {
-        zeroize_bytes(&mut self.token);
+        crate::zeroize_bytes(&mut self.token);
     }
 }
 
@@ -134,7 +124,7 @@ mod server {
     use zeroize::Zeroizing;
 
     use super::*;
-    use crate::{error::ErrorKind, fixed};
+    use crate::{error::ErrorKind, fixed, try_random};
 
     /// Limits of an [`AttachmentServer`].
     #[derive(Debug, Clone, Copy)]
@@ -216,34 +206,12 @@ mod server {
 
     impl<S: LocalAttachmentStore> AttachmentServer<S> {
         /// The attachment `id`, which must exist.
-        async fn attachment(&self, id: &[u8]) -> Result<StoredAttachment> {
-            let id = fixed(id)?;
+        async fn attachment(&self, id: &[u8; ID_LENGTH]) -> Result<StoredAttachment> {
             Ok(self
                 .store
-                .attachment(&id)
+                .attachment(id)
                 .await?
                 .ok_or(ErrorKind::NotFound)?)
-        }
-
-        /// The attachment `id`, if `upload_token` is its upload token.
-        async fn uploading(&self, id: &[u8], upload_token: &[u8]) -> Result<StoredAttachment> {
-            let attachment = self.attachment(id).await?;
-            let hash = <[u8; 32]>::from(Sha256::digest(upload_token));
-            if !bool::from(hash.ct_eq(&attachment.token_hash)) {
-                return Err(ErrorKind::InvalidSignature.into());
-            }
-            Ok(attachment)
-        }
-
-        /// The attachment `id`, if `token` is its upload or delete token.
-        async fn deletable(&self, id: &[u8], token: &[u8]) -> Result<StoredAttachment> {
-            let attachment = self.attachment(id).await?;
-            let hash = <[u8; 32]>::from(Sha256::digest(token));
-            let matches = hash.ct_eq(&attachment.token_hash) | hash.ct_eq(&attachment.delete_hash);
-            if !bool::from(matches) {
-                return Err(ErrorKind::InvalidSignature.into());
-            }
-            Ok(attachment)
         }
     }
 
@@ -253,16 +221,18 @@ mod server {
         async fn start_upload(&self, request: StartUploadRequest) -> Result<StartUploadResponse> {
             let now = crate::now_millis();
             let delete_hash = fixed(&request.delete_hash)?;
-            if request.chunks == 0 {
+            let chunks = request.chunks;
+            drop(request);
+            if chunks == 0 {
                 return Err(ErrorKind::Malformed.into());
             }
-            if request.chunks > self.limits.max_chunks.min(UPLOADED_NOTED) {
+            if chunks > self.limits.max_chunks.min(UPLOADED_NOTED) {
                 return Err(ErrorKind::LimitExceeded.into());
             }
             let token = Zeroizing::new(try_random::<TOKEN_LENGTH>()?);
             let attachment = StoredAttachment {
                 id: try_random()?,
-                chunks: request.chunks,
+                chunks,
                 token_hash: Sha256::digest(token.as_slice()).into(),
                 delete_hash,
                 uploaded: 0,
@@ -286,38 +256,57 @@ mod server {
         /// Store a chunk, if the upload token is the attachment's and the chunk is not stored
         /// already: one uploaded again keeps its first copy.
         async fn put_chunk(&self, mut request: PutChunkRequest) -> Result<PutChunkResponse> {
-            if request.data.len() > MAX_CHUNK_SIZE {
+            // Destructure and drop sibling `Bytes` handles BEFORE any `.await` so `data` does not
+            // share the underlying decoded request buffer across async calls.
+            let data = core::mem::take(&mut request.data);
+            let id_bytes = core::mem::take(&mut request.id);
+            let mut upload_token = core::mem::take(&mut request.upload_token);
+            let index = request.index;
+            drop(request);
+
+            if data.len() > MAX_CHUNK_SIZE {
+                crate::zeroize_bytes(&mut upload_token);
                 return Err(ErrorKind::LimitExceeded.into());
             }
-            let attachment = self.uploading(&request.id, &request.upload_token).await?;
-            if request.index >= attachment.chunks || request.data.len() < MIN_CHUNK_SIZE {
+            let id_res: Result<[u8; ID_LENGTH]> = fixed(&id_bytes);
+            drop(id_bytes);
+            let token_hash = <[u8; 32]>::from(Sha256::digest(&upload_token));
+            crate::zeroize_bytes(&mut upload_token);
+            drop(upload_token);
+            let id = id_res?;
+
+            let attachment = self.attachment(&id).await?;
+            if !bool::from(token_hash.ct_eq(&attachment.token_hash)) {
+                return Err(ErrorKind::InvalidSignature.into());
+            }
+            if index >= attachment.chunks || data.len() < MIN_CHUNK_SIZE {
                 return Err(ErrorKind::Malformed.into());
             }
             // Noted as uploaded, it stays as it is, though it expired since; the store keeps the
             // first copy of the others, beyond what is noted.
-            if attachment.was_uploaded(request.index) {
+            if attachment.was_uploaded(index) {
                 return Ok(PutChunkResponse {});
             }
-            let data = core::mem::take(&mut request.data);
-            self.store
-                .put_chunk(&attachment.id, request.index, data)
-                .await?;
+            self.store.put_chunk(&attachment.id, index, data).await?;
             Ok(PutChunkResponse {})
         }
 
         /// A chunk, as uploaded, or that it is not uploaded yet. One uploaded and gone since,
         /// as the store's lifecycle rules deleted it, is not found: it expired.
         async fn get_chunk(&self, request: GetChunkRequest) -> Result<GetChunkResponse> {
-            let attachment = self.attachment(&request.id).await?;
-            if request.index >= attachment.chunks {
+            let id: [u8; ID_LENGTH] = fixed(&request.id)?;
+            let index = request.index;
+            drop(request);
+            let attachment = self.attachment(&id).await?;
+            if index >= attachment.chunks {
                 return Err(ErrorKind::Malformed.into());
             }
-            match self.store.chunk(&attachment.id, request.index).await? {
+            match self.store.chunk(&attachment.id, index).await? {
                 Some(data) => Ok(GetChunkResponse {
                     data,
                     uploaded: true,
                 }),
-                None if attachment.was_uploaded(request.index) => Err(ErrorKind::NotFound.into()),
+                None if attachment.was_uploaded(index) => Err(ErrorKind::NotFound.into()),
                 None => {
                     // Re-check existence in case the attachment was concurrently deleted between
                     // `attachment()` and `chunk()` so callers see `NotFound` instead of spinning
@@ -333,19 +322,26 @@ mod server {
         /// Delete the attachment, if the token is its upload or delete token.
         async fn delete_attachment(
             &self,
-            request: DeleteAttachmentRequest,
+            mut request: DeleteAttachmentRequest,
         ) -> Result<DeleteAttachmentResponse> {
-            let attachment = self.deletable(&request.id, &request.token).await?;
+            let id_bytes = core::mem::take(&mut request.id);
+            let mut token = core::mem::take(&mut request.token);
+            drop(request);
+            let id_res: Result<[u8; ID_LENGTH]> = fixed(&id_bytes);
+            drop(id_bytes);
+            let hash = <[u8; 32]>::from(Sha256::digest(&token));
+            crate::zeroize_bytes(&mut token);
+            drop(token);
+            let id = id_res?;
+
+            let attachment = self.attachment(&id).await?;
+            let matches = hash.ct_eq(&attachment.token_hash) | hash.ct_eq(&attachment.delete_hash);
+            if !bool::from(matches) {
+                return Err(ErrorKind::InvalidSignature.into());
+            }
             self.store.delete_attachment(&attachment.id).await?;
             Ok(DeleteAttachmentResponse {})
         }
-    }
-
-    /// `N` random bytes, failing with [`ErrorKind::Server`] if the OS RNG fails.
-    fn try_random<const N: usize>() -> Result<[u8; N]> {
-        let mut bytes = [0; N];
-        getrandom::fill(&mut bytes).map_err(|_| ErrorKind::Server)?;
-        Ok(bytes)
     }
 
     #[cfg(test)]
@@ -712,7 +708,7 @@ mod token_zeroize_tests {
 
         // Static buffers detach cleanly without panicking.
         let mut static_bytes = Bytes::from_static(&[0xCC; TOKEN_LENGTH]);
-        zeroize_bytes(&mut static_bytes);
+        crate::zeroize_bytes(&mut static_bytes);
         assert!(static_bytes.is_empty());
     }
 }

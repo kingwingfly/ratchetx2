@@ -22,13 +22,13 @@ use crate::state::{
     UnavailableReason, UploadState, order, order_rows,
 };
 use crate::transport::{Connect, Fetch};
-use crate::util::{describe, js_error, key_to_url, short, size_u64, sleep};
+use crate::util::{describe, key_to_url, monotonic_now_ms, short, size_u64, sleep};
 use crate::vault::{
-    AppState, CarriedDeferredTimestamp, ContactState, DeferredInitial, DeferredInitialsRecord,
-    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, OutgoingRecord,
-    PendingUpload, Vault,
+    AppState, CarriedDeferredTimestamp, ContactState, DeferredEnvelope, DeferredInitial,
+    DeferredRecord, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry,
+    OutgoingRecord, PendingRevoke, PendingUpload, Vault, VaultPresence,
 };
-use crate::{content, glue, transport};
+use crate::{glue, transport};
 use attachments::{ChunkSource, upload_of};
 use contact::{
     Contact, DisplayedEntry, FarewellMode, isolated_contact_views, restore_contacts,
@@ -43,15 +43,14 @@ use leptos::task::spawn_local;
 use session::attachment::{CHUNK_SIZE, Upload};
 use session::protocol::attachment::DEFAULT_MAX_CHUNKS;
 use session::{
-    Client, ClientState, ErrorKind, PqConfig, PublicKey, Session, SessionState, attachment,
-    expected_audience_from_url, proto,
+    Client, ClientState, ErrorKind, PendingGrant, PqConfig, PublicKey, Session, SessionState,
+    attachment, expected_audience_from_url, proto,
 };
 use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use streaming::Stream;
-use wasm_bindgen_futures::JsFuture;
 use zeroize::Zeroizing;
 
 /// Why an attachment's upload has not started.
@@ -81,9 +80,7 @@ const REPUBLISH_AGE: u64 = 7 * 24 * 60 * 60 * 1000;
 pub enum StartChatError {
     /// The server requires sign-in on this page's origin before fetching prekeys / starting a chat.
     SignInRequired,
-    ClassicalApprovalRequired {
-        peer_signed_off: bool,
-    },
+    ClassicalApprovalRequired,
     DowngradeDetected,
     PeerManifestExpired,
     PqRequired,
@@ -93,8 +90,9 @@ pub enum StartChatError {
 }
 /// Maximum milliseconds to wait for a proactive `/auth` check when unlocking via an invitation link.
 const AUTH_CHECK_TIMEOUT: i32 = 1_500;
-/// Files up to this many bytes go in their message; larger ones go as attachments.
-pub const INLINE_FILE_MAX: usize = 1 << 20;
+/// Maximum UTF-8 byte length for an outgoing text message (32 KiB; fits well under the 64 KiB
+/// `PushV2` inline envelope cap alongside ratchet/PQ headers and optional carried initial).
+pub const MAX_TEXT_BYTES: usize = 32 << 10;
 /// Attachments up to this many bytes that are images, videos or audio show in the chat, fetched
 /// as they are about to show; larger ones show as files, fetched once opened.
 pub const MEDIA_INLINE_MAX: u64 = 8 << 20;
@@ -226,6 +224,9 @@ pub struct Engine<V = Vault> {
     deleted_peer_seq: Cell<u64>,
     /// Whether a clock-skew warning has already been surfaced during the current drift episode.
     clock_skew_warned: Cell<bool>,
+    /// Per-peer exponential backoff after `WriteTokenRejected` while awaiting peer approval:
+    /// maps `peer -> (next_try_monotonic_ms, current_delay_ms)`.
+    approval_backoff: RefCell<HashMap<PublicKey, (u64, u64)>>,
 }
 
 /// Per-row reactive signal handles owned by the currently rendered chat.
@@ -417,11 +418,14 @@ struct Inner<V = Vault> {
     last_server_pq_opks: Option<u32>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
-    /// Encrypted inbox initials retained in the separate `deferred_initials` vault record.
+    /// Encrypted inbox initials retained in the separate `deferred` vault sidecar record.
     deferred_initials: Vec<DeferredInitial>,
     /// Earliest timestamps (Unix ms) at which unsupported carried initials referencing an SPK
     /// were retained, bounding signed-prekey preservation across rotations.
     carried_deferred_timestamps: Vec<CarriedDeferredTimestamp>,
+    /// Raw mailbox envelopes buffered for stalled/quarantined/rekeying peers so the unified
+    /// mailbox cursor advances immediately for all active peers.
+    deferred_envelopes: Vec<DeferredEnvelope>,
     client: Client<Connect>,
     contacts: Vec<Contact>,
     /// Unreadable records retained verbatim until explicitly deleted.
@@ -464,9 +468,7 @@ pub(super) enum ProtocolRpcScope {
 /// Whether `error` on an RPC in `scope` should trip the global `Ui::update_required` banner
 /// (and slow foreground polling to `POLL_LIVE`).
 ///
-/// The core v2 handler must report `Unimplemented`, either directly or in a Connect error body.
-/// The transport handles explicit `x-e2ee-deprecated` headers and sync handles WebSocket close
-/// code `4010` independently.
+/// The core v2 handler must report a confirmed Connect `Unimplemented` server refusal.
 pub(super) fn should_require_update_for_rpc(
     scope: ProtocolRpcScope,
     error: &session::Error,
@@ -530,6 +532,7 @@ impl<V: VaultStore> Engine<V> {
             displayed_rows: RefCell::default(),
             deleted_peer_seq: Cell::new(0),
             clock_skew_warned: Cell::new(false),
+            approval_backoff: RefCell::default(),
         });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
         let weak = Rc::downgrade(&engine);
@@ -539,18 +542,40 @@ impl<V: VaultStore> Engine<V> {
             }
         });
         let weak = Rc::downgrade(&engine);
-        transport::on_update_required(move |reason| {
-            if let Some(engine) = weak.upgrade() {
-                engine.require_update(reason);
-            }
-        });
-        let weak = Rc::downgrade(&engine);
         transport::on_clock_skew(move |offset_ms| {
             if let Some(engine) = weak.upgrade() {
                 engine.warn_clock_skew(offset_ms);
             }
         });
         engine
+    }
+
+    pub(super) fn clear_approval_backoff(&self, peer: &PublicKey) {
+        self.approval_backoff.borrow_mut().remove(peer);
+    }
+
+    pub(super) fn clear_all_approval_backoffs(&self) {
+        self.approval_backoff.borrow_mut().clear();
+    }
+
+    pub(super) fn is_approval_backed_off(&self, peer: &PublicKey) -> bool {
+        self.approval_backoff
+            .borrow()
+            .get(peer)
+            .is_some_and(|&(next_try, _)| monotonic_now_ms() < next_try)
+    }
+
+    /// Record or advance per-peer approval backoff (`15s -> 30s -> 60s -> 5m`).
+    pub(super) fn record_approval_backoff(&self, peer: &PublicKey) -> u64 {
+        let mut map = self.approval_backoff.borrow_mut();
+        let delay = match map.get(peer).map(|&(_, prev)| prev) {
+            None => 15_000,
+            Some(15_000) => 30_000,
+            Some(30_000) => 60_000,
+            Some(_) => 300_000,
+        };
+        map.insert(*peer, (monotonic_now_ms().saturating_add(delay), delay));
+        delay
     }
 
     /// Log and notify the user once per drift episode when the device clock disagrees with the
@@ -566,7 +591,7 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Surface a persistent upgrade/refresh banner when the server rejects this client's protocol
-    /// (e.g. WebSocket close `4010`, `x-e2ee-deprecated`, or `ErrorKind::Unimplemented`).
+    /// (e.g. a confirmed `ErrorKind::Unimplemented` server refusal on core v2 RPCs).
     pub(super) fn require_update(&self, reason: impl Into<String>) {
         let message = normalize_update_reason(&reason.into());
         let already_shown = self.ui.update_required.with_untracked(Option::is_some);
@@ -615,7 +640,8 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    /// Send `file` to `peer`: a small one in its message, a larger one as an attachment.
+    /// Send `file` to `peer`: all files (including 0-byte files) route unconditionally through
+    /// the chunked encrypted attachment path (`attachment.v1`) so mailbox envelopes stay bounded.
     async fn send_file(
         self: &Rc<Self>,
         peer: PublicKey,
@@ -630,16 +656,7 @@ impl<V: VaultStore> Engine<V> {
                 size_u64(MAX_FILE_SIZE as u64)
             ));
         }
-        // An upload shows how far it got above the composer.
-        if bytes > INLINE_FILE_MAX as u64 {
-            return self.send_attachment(peer, ChunkSource::File(file)).await;
-        }
-        let buffer = JsFuture::from(file.array_buffer())
-            .await
-            .map_err(|e| format!("Cannot read {name}: {}", js_error(e)))?;
-        let data = js_sys::Uint8Array::new(&buffer).to_vec();
-        self.send(peer, content::from_file(name, file.type_(), data))
-            .await
+        self.send_attachment(peer, ChunkSource::File(file)).await
     }
 
     /// The signals it keeps up to date.
@@ -698,6 +715,9 @@ impl<V: VaultStore> Engine<V> {
         match status {
             200 => {}
             403 => return Err("Wrong password.".to_string()),
+            429 => {
+                return Err("Too many sign-in attempts. Wait a minute and try again.".to_string());
+            }
             503 => return Err("This server takes no sign-ins: it has no password set.".to_string()),
             status => return Err(format!("The server answered {status}.")),
         }
@@ -1048,10 +1068,13 @@ impl Engine<Vault> {
         if crate::glue::lock_released() {
             return;
         }
-        match Vault::exists().await {
+        match Vault::inspect().await {
             Ok(_) if crate::glue::lock_released() => {}
-            Ok(true) => self.ui.phase.set(Phase::Locked),
-            Ok(false) => self.ui.phase.set(Phase::Create),
+            Ok(VaultPresence::Compatible) => self.ui.phase.set(Phase::Locked),
+            Ok(VaultPresence::None) => self.ui.phase.set(Phase::Create),
+            Ok(VaultPresence::IncompatibleVersion(version)) => {
+                self.ui.phase.set(Phase::IncompatibleVault(version));
+            }
             // Offering to create one could replace a vault that is there.
             Err(e) => self.ui.phase.set(Phase::Unavailable(
                 UnavailableReason::StorageUnavailable,
@@ -1123,7 +1146,7 @@ impl Engine<Vault> {
             client,
             vec![],
             vec![],
-            DeferredInitialsRecord::default(),
+            DeferredRecord::default(),
         ))
         .await;
         Ok(())
@@ -1151,46 +1174,21 @@ impl Engine<Vault> {
             ClientState::try_from(&client).map_err(|e| describe(&e))?,
         )
         .with_clock(transport::clock(&address));
-        let (mut contacts, isolated_contacts, warnings) = restore_contacts(
+        let (contacts, isolated_contacts, warnings) = restore_contacts(
             std::mem::take(&mut state.contacts),
             &client.identity_key(),
             &address,
         );
-        let me = client.identity_key();
-        let mut backfilled_last_messages = false;
-        for contact in &mut contacts {
-            if contact.state.history_len > 0
-                && contact.state.last_message.is_none()
-                && let Ok(mut entries) = vault
-                    .history(&contact.peer, contact.state.history_len, 16)
-                    .await
-            {
-                if let Some(preview) = contact::latest_entry_preview(&entries, &me, &contact.peer) {
-                    contact.state.last_message = Some(preview);
-                    backfilled_last_messages = true;
-                }
-                for (_, entry) in &mut entries {
-                    entry.zeroize_secrets();
-                }
-            }
-        }
         let now_ms = crate::util::now();
         let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
-        let migrated_deferred = handshake::merge_legacy_deferred_initials(
-            &mut deferred.entries,
-            std::mem::take(&mut state.deferred_initials),
-        );
         let (pruned_deferred, modified_deferred) =
             handshake::sanitize_deferred_initials(&mut deferred.entries, now_ms);
-        let backfilled_carried_ts = handshake::backfill_carried_timestamps_for_contacts(
-            &mut deferred.carried_timestamps,
-            contacts.iter(),
-            now_ms,
-        );
         let pruned_carried_ts = handshake::prune_carried_timestamps_for_contacts(
             &mut deferred.carried_timestamps,
             contacts.iter(),
         );
+        let pruned_envelopes =
+            sync::prune_deferred_envelopes(&mut deferred.envelopes, &contacts, now_ms);
         let mut inner = Inner::new(
             vault,
             address,
@@ -1214,10 +1212,8 @@ impl Engine<Vault> {
         if pruned > 0
             || pruned_deferred > 0
             || modified_deferred
-            || migrated_deferred
-            || backfilled_carried_ts
             || pruned_carried_ts > 0
-            || backfilled_last_messages
+            || pruned_envelopes > 0
         {
             inner.unsaved_state = true;
         }
@@ -1896,24 +1892,38 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    /// Accept the request of `peer`, naming the peer `name`. Refuses while the contact is
-    /// quarantined pending explicit classical approval or post-quantum upgrade.
+    /// Accept the request of `peer`, naming the peer `name`, registering the peer's write token
+    /// grant, replaying any buffered envelopes, and sending `Events { accepted: true }` to wake
+    /// the peer immediately. Refuses while the contact is quarantined pending explicit classical
+    /// approval or post-quantum upgrade.
     pub async fn accept(&self, peer: PublicKey, name: String) -> Result<(), String> {
         {
             let mut guard = self.inner.lock().await;
             let inner = guard.as_mut().ok_or("locked")?;
             inner
                 .with_contact_tx(&peer, async |inner| {
-                    let contact = inner
-                        .contact(&peer)
-                        .ok_or_else(|| "no such chat".to_string())?;
-                    contact.accept_request(&name)?;
+                    let token_hash = {
+                        let contact = inner
+                            .contact(&peer)
+                            .ok_or_else(|| "no such chat".to_string())?;
+                        contact.accept_request(&name)?;
+                        contact.state.events.get_or_insert_default().accepted = true;
+                        contact.session.active_inbound_token_hash()
+                    };
+                    if let Some(token_hash) = token_hash {
+                        inner.stage_write_token_grant(&peer, token_hash, true)?;
+                    }
                     inner.save(&[]).await.map_err(|e| describe(&e))
                 })
                 .await?;
+            // Register write token BEFORE pushing `Events { accepted: true }` so the peer's
+            // follow-up messages are immediately accepted on our DO.
+            let _ = self.flush_pending_grants_for(inner, &peer).await;
+            let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
             self.ui.contacts.set(inner.views());
         }
-        // The peer learns what was read of the request.
+        // Wake the peer immediately with `Events { accepted: true }` + any read receipts.
+        let _ = self.flush(&peer).await;
         self.wake();
         Ok(())
     }
@@ -2038,11 +2048,26 @@ impl<V: VaultStore> Engine<V> {
                 ));
             }
         }
-        // Forgotten in the vault first, so that if that fails, the chat stays whole; with the
-        // records of other chats left unsaved, as with each save. Preserve this contact's
-        // outgoing `next_session_seq` floor in `AppState` so recreating the chat later never
-        // reuses a stale `session_seq` against a peer who kept the old history.
+        // Stage a durable write-token revocation before snapshotting `AppState` so `client.next_grant_version`
+        // persists above `min_grant_version` and any recreated chat gets a strictly higher grant version.
+        let peer_slot_id = inner.client.peer_slot_id(&peer);
+        let min_grant_version = inner
+            .client
+            .allocate_grant_version()
+            .map_err(|e| describe(&e))?;
         let mut state = inner.app_state();
+        if let Some(existing) = state
+            .pending_revokes
+            .iter_mut()
+            .find(|r| r.peer_slot_id.as_slice() == peer_slot_id.as_slice())
+        {
+            existing.min_grant_version = existing.min_grant_version.max(min_grant_version);
+        } else {
+            state.pending_revokes.push(PendingRevoke {
+                peer_slot_id: peer_slot_id.to_vec(),
+                min_grant_version,
+            });
+        }
         if let Some(contact) = inner.contact(&peer) {
             state.next_session_seq = state
                 .next_session_seq
@@ -2058,6 +2083,7 @@ impl<V: VaultStore> Engine<V> {
             }
             return Err(describe(&e));
         }
+        self.clear_approval_backoff(&peer);
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
         // chat, which `may_keep` now tells them is gone.
         upload_ids.extend(self.ui.uploads.with_untracked(|uploads| {
@@ -2204,7 +2230,7 @@ pub(crate) trait VaultStore: 'static {
     async fn save<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()>;
@@ -2239,7 +2265,7 @@ pub(crate) trait VaultStore: 'static {
     async fn promote_upload<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         peer: &PublicKey,
         old_id: &[u8],
         new_upload: &PendingUpload,
@@ -2259,7 +2285,7 @@ pub(crate) trait VaultStore: 'static {
     async fn forget<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         peer: &PublicKey,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
@@ -2285,7 +2311,7 @@ impl VaultStore for Vault {
     async fn save<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()> {
@@ -2336,7 +2362,7 @@ impl VaultStore for Vault {
     async fn promote_upload<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         peer: &PublicKey,
         old_id: &[u8],
         new_upload: &PendingUpload,
@@ -2367,7 +2393,7 @@ impl VaultStore for Vault {
     async fn forget<'a>(
         &self,
         state: &AppState,
-        deferred: &DeferredInitialsRecord,
+        deferred: &DeferredRecord,
         peer: &PublicKey,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
@@ -2419,7 +2445,7 @@ impl<V: VaultStore> Inner<V> {
         &mut self,
         peer: &PublicKey,
         state: AppState,
-        deferred: DeferredInitialsRecord,
+        deferred: DeferredRecord,
     ) -> crate::vault::Result<()> {
         let unsaved = self
             .unsaved
@@ -2434,11 +2460,13 @@ impl<V: VaultStore> Inner<V> {
             .await?;
         self.state.next_session_seq = state.next_session_seq;
         self.state.farewells = state.farewells;
+        self.state.pending_revokes = state.pending_revokes;
         self.contacts.retain(|contact| contact.peer != *peer);
         self.forget_isolated_peer(peer);
         self.pending_pq_contact_flags.remove(peer);
         self.deferred_initials = deferred.entries;
         self.carried_deferred_timestamps = deferred.carried_timestamps;
+        self.deferred_envelopes = deferred.envelopes;
         self.finish_state_save(state.pending_inbox_acks);
         self.saved_late.extend(
             self.unsaved
@@ -2489,13 +2517,12 @@ impl<V: VaultStore> Inner<V> {
         vault: V,
         server: String,
         audience: String,
-        mut state: AppState,
+        state: AppState,
         client: Client<Connect>,
         contacts: Vec<Contact>,
         mut isolated_contacts: Vec<ContactState>,
-        deferred: DeferredInitialsRecord,
+        deferred: DeferredRecord,
     ) -> Self {
-        state.deferred_initials.clear();
         let active_peers: HashSet<_> = contacts.iter().map(|c| c.peer).collect();
         isolated_contacts.retain(|c| {
             PublicKey::try_from(c.peer.as_slice())
@@ -2512,6 +2539,7 @@ impl<V: VaultStore> Inner<V> {
             state,
             deferred_initials: deferred.entries,
             carried_deferred_timestamps: deferred.carried_timestamps,
+            deferred_envelopes: deferred.envelopes,
             client,
             contacts,
             isolated_contacts,
@@ -2527,6 +2555,31 @@ impl<V: VaultStore> Inner<V> {
             unsaved_outbox: vec![],
             saved_late: vec![],
         }
+    }
+
+    /// Stage a durable `RegisterWriteToken` grant on `peer`'s session using the next monotonic
+    /// identity-wide `grant_version`.
+    pub(super) fn stage_write_token_grant(
+        &mut self,
+        peer: &PublicKey,
+        token_hash: [u8; 32],
+        pin_active: bool,
+    ) -> Result<(), String> {
+        let grant_version = self
+            .client
+            .allocate_grant_version()
+            .map_err(|e| describe(&e))?;
+        if let Some(contact) = self.contact(peer) {
+            contact
+                .session
+                .queue_pending_grant(PendingGrant {
+                    token_hash,
+                    grant_version,
+                    pin_active,
+                })
+                .map_err(|e| describe(&e))?;
+        }
+        Ok(())
     }
 
     /// Monotonic outgoing `Hello.session_seq` for a newly initiated chat, strictly above any
@@ -2546,13 +2599,11 @@ impl<V: VaultStore> Inner<V> {
             .clamp(1, session::protocol::MAX_SAFE_INTEGER)
     }
 
-    /// What the vault keeps in `STATE` (never writes tag 12 `deferred_initials`, which live in
-    /// the separate `deferred_initials` record).
+    /// What the vault keeps in `STATE`.
     fn app_state(&self) -> AppState {
         let mut state = AppState {
             client: Some(self.client.state().into()),
             contacts: stored_contacts(&self.contacts, &self.isolated_contacts),
-            deferred_initials: vec![],
             ..self.state.clone()
         };
         for &id in &self.deferred_acks_after_save {
@@ -2561,14 +2612,15 @@ impl<V: VaultStore> Inner<V> {
         state
     }
 
-    fn deferred_record(&self) -> DeferredInitialsRecord {
-        DeferredInitialsRecord {
+    fn deferred_record(&self) -> DeferredRecord {
+        DeferredRecord {
             entries: self.deferred_initials.clone(),
             carried_timestamps: self.carried_deferred_timestamps.clone(),
+            envelopes: self.deferred_envelopes.clone(),
         }
     }
 
-    pub(super) fn deferred_record_without_peer(&self, peer: &PublicKey) -> DeferredInitialsRecord {
+    pub(super) fn deferred_record_without_peer(&self, peer: &PublicKey) -> DeferredRecord {
         let entries = self
             .deferred_initials
             .iter()
@@ -2585,9 +2637,16 @@ impl<V: VaultStore> Inner<V> {
             &mut carried_timestamps,
             self.contacts.iter().filter(|c| c.peer != *peer),
         );
-        DeferredInitialsRecord {
+        let envelopes = self
+            .deferred_envelopes
+            .iter()
+            .filter(|env| env.peer.as_slice() != peer.as_slice())
+            .cloned()
+            .collect();
+        DeferredRecord {
             entries,
             carried_timestamps,
+            envelopes,
         }
     }
 

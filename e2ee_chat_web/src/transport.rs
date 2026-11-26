@@ -48,9 +48,6 @@ const MAX_CALL_RESPONSE_BYTES: usize = 64 << 10;
 /// Told how far the body of a request got: bytes sent, of how many.
 pub type Progress = Rc<dyn Fn(u64, u64)>;
 
-/// Told when a server indicates this client's protocol is deprecated (`x-e2ee-deprecated`).
-type UpdateHook = Rc<dyn Fn(String)>;
-
 /// Told when a server response `Date` reveals clock drift exceeding the trusted threshold.
 type ClockSkewHook = Rc<dyn Fn(i64)>;
 
@@ -59,8 +56,6 @@ thread_local! {
     static CLOCKS: RefCell<HashMap<String, ServerClock>> = RefCell::default();
     /// Told when a server refuses a call for the sign-in, whichever call it was.
     static REFUSED: RefCell<Option<Rc<dyn Fn()>>> = RefCell::default();
-    /// Told when a server indicates the client's protocol is deprecated (`x-e2ee-deprecated`).
-    static UPDATE_REQUIRED: RefCell<Option<UpdateHook>> = RefCell::default();
     /// Told when the observed server clock differs from local time past the trusted drift cap.
     static CLOCK_SKEW: RefCell<Option<ClockSkewHook>> = RefCell::default();
 }
@@ -70,37 +65,10 @@ pub fn on_sign_in_required(refused: impl Fn() + 'static) {
     REFUSED.with_borrow_mut(|hook| *hook = Some(Rc::new(refused)));
 }
 
-/// Tell `handler` whenever a server returns an `x-e2ee-deprecated` header on a Connect response.
-pub fn on_update_required(handler: impl Fn(String) + 'static) {
-    UPDATE_REQUIRED.with_borrow_mut(|hook| *hook = Some(Rc::new(handler)));
-}
-
 /// Tell `handler` whenever a server response `Date` reveals clock drift exceeding the trusted
 /// threshold ([`session::DEFAULT_MAX_TRUSTED_DRIFT_MS`]).
 pub fn on_clock_skew(handler: impl Fn(i64) + 'static) {
     CLOCK_SKEW.with_borrow_mut(|hook| *hook = Some(Rc::new(handler)));
-}
-
-/// Extract a refresh/upgrade notice when the server explicitly flags a deprecated protocol via
-/// `x-e2ee-deprecated`.
-fn deprecated_notice(header: Option<&str>, body: &[u8]) -> Option<String> {
-    if !header.is_some_and(|value| !value.trim().is_empty()) {
-        return None;
-    }
-    let message = serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("message")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|msg| !msg.is_empty())
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| {
-            "This app version is deprecated. Refresh the page to continue.".to_string()
-        });
-    Some(message)
 }
 
 /// Whether `status` and `body` are the server's own refusal of a call for the sign-in.
@@ -374,15 +342,6 @@ impl LocalPost for Fetch {
                     })?;
             check_response_size(u64::from(body.byte_length()))?;
             let body = Uint8Array::new(&body).to_vec();
-            let deprecated_header = request
-                .get_response_header("x-e2ee-deprecated")
-                .ok()
-                .flatten();
-            if let Some(reason) = deprecated_notice(deprecated_header.as_deref(), &body)
-                && let Some(handler) = UPDATE_REQUIRED.with_borrow(Clone::clone)
-            {
-                handler(reason);
-            }
             if asks_sign_in(status, &body)
                 && let Some(refused) = REFUSED.with_borrow(Clone::clone)
             {
@@ -521,20 +480,5 @@ mod tests {
         assert!(check_call_response_size(0).is_ok());
         assert!(check_call_response_size(MAX_CALL_RESPONSE_BYTES as u64).is_ok());
         assert!(check_call_response_size(MAX_CALL_RESPONSE_BYTES as u64 + 1).is_err());
-    }
-
-    #[test]
-    fn deprecated_header_extracts_server_message_or_fallback() {
-        assert_eq!(deprecated_notice(None, b"{}"), None);
-        assert_eq!(deprecated_notice(Some("   "), b"{}"), None);
-        assert_eq!(
-            deprecated_notice(
-                Some("v1"),
-                br#"{"code":"unimplemented","message":"Legacy v1 protocol is deprecated. Please refresh."}"#,
-            ),
-            Some("Legacy v1 protocol is deprecated. Please refresh.".to_string())
-        );
-        let fallback = deprecated_notice(Some("v1"), b"not-json").unwrap();
-        assert!(fallback.contains("Refresh"));
     }
 }

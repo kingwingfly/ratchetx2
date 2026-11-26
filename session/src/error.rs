@@ -40,6 +40,16 @@ impl Error {
         self.connect_error
     }
 
+    /// Whether this error originated from [`x3dh::ErrorKind::Replayed`] (the initial message's
+    /// ephemeral key was already confirmed in a retained local prekey generation, e.g. on
+    /// post-persist/pre-ack crash replay).
+    pub fn is_replayed(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|src| src.downcast_ref::<x3dh::Error>())
+            .is_some_and(|err| err.kind() == x3dh::ErrorKind::Replayed)
+    }
+
     pub(crate) fn from_protocol_with_kind(kind: ErrorKind, error: protocol::Error) -> Self {
         Self {
             server_refusal: error.is_server_refusal(),
@@ -68,6 +78,7 @@ impl From<protocol::Error> for Error {
             Kind::NotFound => ErrorKind::NotFound,
             Kind::LimitExceeded => ErrorKind::LimitExceeded,
             Kind::SignInRequired => ErrorKind::SignInRequired,
+            Kind::WriteTokenRejected => ErrorKind::WriteTokenRejected,
             Kind::Unimplemented => ErrorKind::Unimplemented,
             Kind::Malformed | Kind::InvalidSignature | Kind::StaleTimestamp => ErrorKind::Protocol,
             _ => ErrorKind::Server,
@@ -127,10 +138,13 @@ pub enum ErrorKind {
     /// The peer's inbox is full, or a message or an attachment is too large.
     #[error("limit exceeded")]
     LimitExceeded,
-    /// The server stores this only for clients signed in to it, e.g. with its password: a large
+    /// The server stores this only for clients signed in to it, e.g. with its password: a pushed
     /// message, or an attachment.
     #[error("sign-in required")]
     SignInRequired,
+    /// The recipient's mailbox rejected the write token (not yet approved or revoked).
+    #[error("write token rejected")]
+    WriteTokenRejected,
     /// The server rejected a request, or sent a malformed reply.
     #[error("protocol error")]
     Protocol,
@@ -155,22 +169,13 @@ pub enum ErrorKind {
     /// A received message cannot be decrypted.
     #[error("cannot decrypt the message")]
     Undecryptable,
-    /// Receiving stopped at a message that does not decrypt, which may be on a session whose
-    /// initial message is waiting: take the initial messages, then receive again, see
-    /// [`Session::receive`](crate::Session::receive).
-    #[error("receiving stopped at a message that does not decrypt yet")]
-    Stalled,
     /// A received message was received already.
     #[error("duplicate message")]
     DuplicateMessage,
     /// A received message's skipped decryption key was evicted before it arrived; the message is
-    /// permanently lost, though its delivery token has been queued for server acknowledgement.
+    /// permanently lost.
     #[error("message skipped key was evicted")]
     EvictedMessage,
-    /// A message's content expired on the server before it was fetched, leaving only carried
-    /// initial message(s) to surface.
-    #[error("message content expired on the server")]
-    Expired,
     /// A received message is malformed.
     #[error("invalid message")]
     InvalidMessage,
@@ -188,14 +193,14 @@ pub enum ErrorKind {
     #[error("attachment chunk nonce reuse refused")]
     NonceReuse,
     /// An argument to a local operation was out of range or malformed (e.g. out-of-range chunk
-    /// index or short non-last attachment chunk).
+    /// index, short non-last attachment chunk, or invalid cursor/grant version).
     #[error("invalid argument")]
     InvalidArgument,
     /// Local policy requires post-quantum security (strict PQ mode), refusing classical fallback.
     #[error("post-quantum security is required")]
     PqRequired,
-    /// A post-quantum downgrade, manifest replay, audience mismatch, or prekey stripping attack
-    /// was detected.
+    /// A post-quantum downgrade, manifest replay, audience mismatch, missing manifest, or prekey
+    /// stripping attack was detected.
     #[error("post-quantum downgrade detected")]
     DowngradeDetected,
     /// A peer's signed capability manifest is cryptographically valid and not rolled back, but
@@ -203,16 +208,10 @@ pub enum ErrorKind {
     /// offline past its manifest TTL.
     #[error("peer capability manifest has expired")]
     PeerManifestExpired,
-    /// Peer lacks PQ (or published a signed `OFF` manifest) while local PQ is enabled, and no
-    /// classical exception has been approved yet.
-    #[error(
-        "classical fallback requires explicit user approval (peer_signed_off={peer_signed_off})"
-    )]
-    ClassicalApprovalRequired {
-        /// `true` if the peer published a valid signed `CapabilityManifest` with
-        /// `pq_enabled == false`; `false` if the peer has no manifest (legacy v1 user).
-        peer_signed_off: bool,
-    },
+    /// Peer published a signed `OFF` manifest (or relay rolled back PQ while peer is unpinned)
+    /// while local PQ is enabled, and no classical exception has been approved yet.
+    #[error("classical fallback requires explicit user approval")]
+    ClassicalApprovalRequired,
     /// No mutually supported post-quantum suite is available.
     #[error("unsupported post-quantum suite")]
     UnsupportedSuite,
