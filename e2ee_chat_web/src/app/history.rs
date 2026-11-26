@@ -1584,7 +1584,14 @@ thread_local! {
     ));
 }
 
+fn is_closing() -> bool {
+    crate::glue::lock_released() || super::is_shutting_down()
+}
+
 fn apply_history_op(op: &HistoryOp, current_hash: &str) -> bool {
+    if is_closing() {
+        return false;
+    }
     let Ok(history) = window().history() else {
         return false;
     };
@@ -1677,6 +1684,9 @@ fn execute_history_op(
     current_hash: &str,
     ui: Ui,
 ) -> Option<UiAction> {
+    if is_closing() {
+        return None;
+    }
     let op = op?;
     if apply_history_op(op, current_hash) {
         if let HistoryOp::Back(attempt) = *op {
@@ -1700,6 +1710,9 @@ fn execute_history_op(
 fn schedule_back_recovery(attempt: u64, ui: Ui) {
     set_timeout(
         move || {
+            if is_closing() {
+                return;
+            }
             if let Some(action) = recover_aborted_back(attempt, ui) {
                 execute_ui_action(action, false, ui);
             }
@@ -1783,6 +1796,9 @@ pub(super) fn install(ui: Ui) {
     tag_current_list_entry(ui, &initial_hash);
 
     let _ = window_event_listener(ev::popstate, move |event: ev::PopStateEvent| {
+        if is_closing() {
+            return;
+        }
         let raw = event.state().as_string();
         let hash = current_location_hash();
         if ui.phase.get_untracked() != Phase::Unlocked {
@@ -1816,6 +1832,9 @@ pub(super) fn install(ui: Ui) {
 
     Effect::new(move |prev_open: Option<Option<PublicKey>>| {
         let current = ui.open.get();
+        if is_closing() {
+            return current;
+        }
         if let Some(Some(prev_peer)) = prev_open
             && current != Some(prev_peer)
         {
@@ -1837,6 +1856,9 @@ pub(super) fn install(ui: Ui) {
         let is_startup = ui
             .dialog
             .with(|dialog| matches!(dialog, Some(Dialog::NewChat { .. } | Dialog::SignIn)));
+        if is_closing() {
+            return is_startup;
+        }
         if prev_startup == Some(true) && !is_startup {
             // A startup modal closed without committing a chat: unwind any retained
             // (`EntryKind::Reserved(None)`) history slot back to the chat list.

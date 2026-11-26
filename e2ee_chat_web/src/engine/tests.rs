@@ -440,6 +440,7 @@ struct MemoryVault {
     fail_promote_upload: Cell<bool>,
     fail_forget: Cell<bool>,
     saved_manifest_seqs: std::rc::Rc<RefCell<Vec<u64>>>,
+    on_save: RefCell<Option<Box<dyn FnMut()>>>,
 }
 
 impl MemoryVault {
@@ -524,6 +525,10 @@ impl VaultStore for MemoryVault {
         self.deferred.replace(deferred.clone());
         self.apply_entries(entries);
         self.apply_outgoing(outgoing);
+        let callback = self.on_save.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback();
+        }
         Ok(())
     }
 
@@ -644,6 +649,10 @@ impl VaultStore for MemoryVault {
         self.deferred.replace(deferred.clone());
         self.apply_entries(entries);
         self.apply_outgoing(outgoing);
+        let callback = self.on_save.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback();
+        }
         Ok(())
     }
 
@@ -696,6 +705,10 @@ impl VaultStore for MemoryVault {
         self.deferred.replace(deferred.clone());
         self.apply_entries(entries);
         self.apply_outgoing(outgoing);
+        let callback = self.on_save.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback();
+        }
         Ok(())
     }
 }
@@ -7153,5 +7166,239 @@ fn deferred_envelopes_survive_cross_peer_and_multipage_inbox_replay() {
                 "{texts:?}"
             );
         }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn teardown_on_pagehide_revokes_generation_while_inner_is_held_and_blocks_post_pagehide_writes() {
+    use crate::kdf_worker::{KdfCancelToken, derive_kek_async};
+    use crate::notify::{CloseHandle, Event};
+    use crate::state::{Link, Phase};
+    use leptos::prelude::Set;
+
+    futures::executor::block_on(async {
+        let (mut inner, peer) = unlocked_client();
+        inner.state.name = "Alice Secret".into();
+        inner.contacts[0].state.name = "Bob Secret".into();
+        inner.contacts[0].state.history_len = 1;
+        inner.vault.entries.borrow_mut().insert(
+            (peer, 0),
+            HistoryEntry {
+                outgoing: false,
+                at: 100,
+                place: 1,
+                content: Some(Content {
+                    clock: 1,
+                    kind: Some(Kind::Text("classified payload".into())),
+                    events: None,
+                }),
+                ..HistoryEntry::default()
+            },
+        );
+        let ui = Ui::new();
+        let engine = Engine::with_inner(ui, inner);
+        assert_eq!(engine.open(Some(peer)).await, OpenOutcome::Opened);
+        ui.dialog.set(Some(Dialog::Settings));
+        ui.notify("sensitive notice");
+        ui.log("sensitive log line");
+        ui.live.set(true);
+        ui.syncing.set(true);
+        ui.link.set(Link::Synced(123));
+
+        // Attach a live WebSocket CloseHandle and a tracked blob URL.
+        let (handle, mut ws_events) = CloseHandle::test_pair();
+        *engine.ws_close.borrow_mut() = Some(handle.clone());
+        crate::app::register_blob_url("blob:https://example.test/pagehide-leak-check");
+        assert!(crate::app::live_blob_url_count() >= 1);
+
+        let before_gen = engine.vault_gen();
+        let before_lock_gen = crate::glue::lock_generation();
+        assert!(engine.is_live(before_gen));
+
+        // Hold `self.inner` across an `.await` boundary via `lock_inner()` (simulating an
+        // in-flight sync/flush/send task) while synchronous `pagehide` teardown fires.
+        {
+            let mut held_guard = engine.lock_inner().await;
+            assert!(held_guard.is_some());
+
+            engine.teardown_on_pagehide();
+
+            // 1. Both Engine and glue generations bumped synchronously.
+            assert!(!engine.is_live(before_gen));
+            assert_ne!(engine.vault_gen(), before_gen);
+            assert_ne!(crate::glue::lock_generation(), before_lock_gen);
+
+            // 2. Notification WebSocket closed synchronously via CloseHandle without awaiting inner.
+            assert!(handle.is_closed());
+            assert!(matches!(ws_events.try_recv(), Ok(Event::Closed)));
+            assert!(engine.ws_close.borrow().is_none());
+
+            // 3. All tracked blob URLs drained synchronously.
+            assert_eq!(crate::app::live_blob_url_count(), 0);
+            assert_eq!(crate::glue::active_media_port_count(), 0);
+
+            // 4. ALL sensitive UI signals scrubbed synchronously.
+            assert_eq!(ui.phase.get_untracked(), Phase::Locked);
+            assert!(ui.me.get_untracked().is_none());
+            assert!(ui.contacts.get_untracked().is_empty());
+            assert!(ui.isolated_contacts.get_untracked().is_empty());
+            assert!(ui.open.get_untracked().is_none());
+            assert!(ui.messages.get_untracked().is_empty());
+            assert!(ui.uploads.get_untracked().is_empty());
+            assert!(ui.dialog.get_untracked().is_none());
+            assert!(ui.viewer.get_untracked().is_none());
+            assert!(ui.opening.get_untracked().is_none());
+            assert!(ui.streaming.get_untracked().is_none());
+            assert!(ui.log.get_untracked().is_empty());
+            assert!(ui.notice.get_untracked().is_none());
+            assert!(!ui.live.get_untracked());
+            assert!(!ui.syncing.get_untracked());
+
+            // 5. While the suspended task still holds `held_guard`, every persistence write MUST
+            //    fail closed without modifying `MemoryVault`!
+            let inner = held_guard.as_mut().expect("still held until guard drops");
+            let entries_before = inner.vault.entries.borrow().len();
+            inner.state.name = "Post-Pagehide Mutation".into();
+            let err = inner
+                .save(&[(
+                    peer,
+                    1,
+                    HistoryEntry {
+                        outgoing: true,
+                        at: 200,
+                        place: 2,
+                        content: Some(Content {
+                            clock: 2,
+                            kind: Some(Kind::Text("must not persist".into())),
+                            events: None,
+                        }),
+                        ..HistoryEntry::default()
+                    },
+                )])
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("page is closing"),
+                "unexpected error: {err}"
+            );
+            assert_eq!(inner.vault.entries.borrow().len(), entries_before);
+            assert_ne!(
+                inner.vault.state.borrow().name,
+                "Post-Pagehide Mutation",
+                "vault state must not be overwritten after pagehide"
+            );
+
+            // Forget also fails closed.
+            let state = inner.app_state();
+            let deferred = inner.deferred_record();
+            assert!(inner.forget_peer(&peer, state, deferred).await.is_err());
+        }
+
+        // 6. As soon as `InnerGuard` drops, `Inner` is automatically wiped.
+        assert!(
+            engine.inner.try_lock().expect("uncontended").is_none(),
+            "InnerGuard::drop must take and drop Inner once teardown fired"
+        );
+
+        // 7. Subsequent async engine calls must fail/no-op cleanly with zero UI repaints.
+        assert_eq!(engine.open(Some(peer)).await, OpenOutcome::Ignored);
+        assert!(
+            engine
+                .send_returning_index(peer, Kind::Text("late".into()))
+                .await
+                .is_err()
+        );
+        assert_eq!(ui.phase.get_untracked(), Phase::Locked);
+        assert!(ui.contacts.get_untracked().is_empty());
+        assert!(ui.messages.get_untracked().is_empty());
+        assert!(ui.open.get_untracked().is_none());
+
+        // 8. Cancelled KdfCancelToken aborts host KDF derivation immediately (before running Argon2id).
+        let token = KdfCancelToken::new();
+        token.cancel();
+        let res = derive_kek_async(
+            b"passphrase",
+            &[0x55u8; 16],
+            crate::vault::ARGON2_MEMORY_MIN,
+            1,
+            1,
+            &token,
+        )
+        .await;
+        assert_eq!(res, Err(crate::kdf_worker::KdfError::Cancelled));
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn start_chat_aborts_without_ui_repaint_when_teardown_fires_during_save() {
+    use crate::state::{PendingNewChat, Phase};
+    use crate::util::key_to_text;
+
+    futures::executor::block_on(async {
+        let prev_released = crate::glue::set_lock_released_for_test(false);
+        let _restore_lock = scopeguard::guard(prev_released, |prev| {
+            crate::glue::set_lock_released_for_test(prev);
+        });
+
+        let (mut inner, peer) = unlocked_client();
+        inner.contacts[0].state.name = "Bob Before".into();
+        let ui = Ui::new();
+        let engine = Engine::with_inner(ui, inner);
+
+        // Register a live startup submission so `teardown_on_pagehide()` cancels it just like a
+        // real browser `pagehide` / manual Lock during an in-flight `start_chat`.
+        let key_text = key_to_text(&peer);
+        let submission_id = engine.begin_new_chat_submit(PendingNewChat {
+            key: key_text.clone(),
+            name: "Bob Renamed".into(),
+            server: None,
+            pq_pinned: false,
+            allow_classical: false,
+            auto_start: true,
+        });
+
+        // Fire `glue::teardown_and_release_lock()` right as `inner.save(&[]).await` finishes
+        // inside `start_chat`'s existing-contact branch.
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            *inner.vault.on_save.borrow_mut() = Some(Box::new(|| {
+                crate::glue::teardown_and_release_lock();
+            }));
+        }
+
+        let res = engine
+            .start_chat(
+                submission_id,
+                &key_text,
+                "Bob Renamed".into(),
+                None,
+                false,
+                false,
+            )
+            .await;
+
+        assert_eq!(res, Err(StartChatError::Cancelled));
+        assert!(crate::glue::lock_released());
+        assert!(engine.is_shutting_down());
+        assert_eq!(ui.phase.get_untracked(), Phase::Locked);
+        assert!(
+            ui.contacts.get_untracked().is_empty(),
+            "post-teardown start_chat must not repopulate ui.contacts"
+        );
+        assert!(
+            ui.log.get_untracked().is_empty(),
+            "post-teardown start_chat must not append ui.log"
+        );
+        assert!(
+            ui.notice.get_untracked().is_none(),
+            "post-teardown start_chat must not set ui.notice"
+        );
+        assert!(
+            engine.inner.try_lock().expect("uncontended").is_none(),
+            "InnerGuard::drop must clear Inner on exit"
+        );
     });
 }

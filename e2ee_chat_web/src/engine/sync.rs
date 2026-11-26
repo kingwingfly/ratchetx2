@@ -194,7 +194,11 @@ impl<V: VaultStore> Engine<V> {
 
     /// Flush staged `RegisterWriteToken` grants across all contacts.
     pub(super) async fn flush_pending_grants(&self) -> Result<(), String> {
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
@@ -206,6 +210,9 @@ impl<V: VaultStore> Engine<V> {
             .collect();
         let mut first_err: Option<String> = None;
         for peer in peers {
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
             if let Err(e) = self.flush_pending_grants_for(inner, &peer).await {
                 first_err.get_or_insert(e);
             }
@@ -218,12 +225,19 @@ impl<V: VaultStore> Engine<V> {
 
     /// Flush durably staged `RevokeWriteToken` entries from `AppState.pending_revokes`.
     pub(super) async fn flush_pending_revokes(&self) -> Result<(), String> {
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
         let mailbox = Fetch::client(&inner.server);
         while let Some(revoke) = inner.state.pending_revokes.first().cloned() {
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
             let Ok(slot_id) = <[u8; 32]>::try_from(revoke.peer_slot_id.as_slice()) else {
                 inner.state.pending_revokes.remove(0);
                 let _ = inner.save_state().await;
@@ -243,9 +257,14 @@ impl<V: VaultStore> Engine<V> {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(e) => {
-                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                    if self.is_live(vgen) {
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                    }
                     return Err(describe(&e));
                 }
+            }
+            if !self.is_live(vgen) {
+                return Ok(());
             }
             inner.state.pending_revokes.remove(0);
             inner.save_state().await.map_err(|e| describe(&e))?;
@@ -257,6 +276,9 @@ impl<V: VaultStore> Engine<V> {
     /// [`HIDDEN_GRACE`], or out of focus for less than [`UNFOCUSED_GRACE`]. Notifications are
     /// for then only, as a WebSocket open is held on the server.
     pub(super) fn present(&self) -> bool {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return false;
+        }
         let document = document();
         let grace = if document.hidden() {
             Some(HIDDEN_GRACE)
@@ -284,12 +306,18 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Sync until the page goes.
-    pub(super) fn run(self: Rc<Self>) {
+    pub(super) fn run(self: Rc<Self>, vgen: u64) {
         spawn_local(async move {
             let mut delay = POLL_FAST;
             loop {
+                if !self.is_live(vgen) {
+                    return;
+                }
                 let asked = self.ui.syncing.get_untracked();
                 let active = self.sync().await;
+                if !self.is_live(vgen) {
+                    return;
+                }
                 if asked {
                     self.ui.syncing.set(false);
                 }
@@ -305,6 +333,9 @@ impl<V: VaultStore> Engine<V> {
                 let mut waited = 0;
                 let mut was_present = self.present();
                 loop {
+                    if !self.is_live(vgen) {
+                        return;
+                    }
                     if self.wake.replace(false) {
                         delay = POLL_FAST;
                         break;
@@ -329,23 +360,35 @@ impl<V: VaultStore> Engine<V> {
     /// Subscribe to this client's notifications while the user is here, until the page goes,
     /// subscribing again whenever the socket closes, and act on each. Away, the socket closes,
     /// which tells the server, and opens again on coming back.
-    pub(super) fn listen(self: Rc<Self>) {
+    pub(super) fn listen(self: Rc<Self>, vgen: u64) {
         spawn_local(async move {
             let mut retry = RESUBSCRIBE_MIN;
             loop {
+                if !self.is_live(vgen) {
+                    return;
+                }
                 if self.ui.update_required.with_untracked(Option::is_some) {
                     self.ui.live.set(false);
                     return;
                 }
                 while !self.present() {
+                    if !self.is_live(vgen) {
+                        return;
+                    }
                     if self.ui.update_required.with_untracked(Option::is_some) {
                         self.ui.live.set(false);
                         return;
                     }
                     sleep(AWAY_CHECK).await;
                 }
+                if !self.is_live(vgen) {
+                    return;
+                }
                 let subscribed = {
-                    let mut guard = self.inner.lock().await;
+                    let mut guard = self.lock_inner().await;
+                    if !self.is_live(vgen) {
+                        return;
+                    }
                     let Some(inner) = guard.as_mut() else {
                         return;
                     };
@@ -355,40 +398,60 @@ impl<V: VaultStore> Engine<V> {
                         .map_err(|e| describe(&e))
                         .and_then(|request| Subscription::open(&inner.server, &request))
                 };
+                if !self.is_live(vgen) {
+                    return;
+                }
                 let mut left = false;
                 match subscribed {
-                    Ok(mut subscription) => loop {
-                        let next =
-                            select(Box::pin(subscription.next()), Box::pin(sleep(AWAY_CHECK)));
-                        match next.await {
-                            Either::Left((Event::Open, _)) => {
-                                self.ui.live.set(true);
-                                retry = RESUBSCRIBE_MIN;
-                                // What came while it was closed has no notification.
-                                self.wake();
-                            }
-                            Either::Left((Event::Notification(notification), _)) => {
-                                self.notified(notification).await
-                            }
-                            Either::Left((Event::Resync, _)) => self.wake(),
-                            Either::Left((Event::Closed, _)) => break,
-                            Either::Right(_)
-                                if self.ui.update_required.with_untracked(Option::is_some) =>
-                            {
-                                self.ui.live.set(false);
+                    Ok(mut subscription) => {
+                        *self.ws_close.borrow_mut() = Some(subscription.close_handle());
+                        let _clear_ws = scopeguard::guard((), |()| {
+                            *self.ws_close.borrow_mut() = None;
+                        });
+                        if !self.is_live(vgen) {
+                            return;
+                        }
+                        loop {
+                            if !self.is_live(vgen) {
                                 return;
                             }
-                            // Away: dropped, the subscription closes its socket.
-                            Either::Right(_) if !self.present() => {
-                                left = true;
-                                break;
+                            let next =
+                                select(Box::pin(subscription.next()), Box::pin(sleep(AWAY_CHECK)));
+                            match next.await {
+                                _ if !self.is_live(vgen) => return,
+                                Either::Left((Event::Open, _)) => {
+                                    self.ui.live.set(true);
+                                    retry = RESUBSCRIBE_MIN;
+                                    // What came while it was closed has no notification.
+                                    self.wake();
+                                }
+                                Either::Left((Event::Notification(notification), _)) => {
+                                    self.notified(notification).await
+                                }
+                                Either::Left((Event::Resync, _)) => self.wake(),
+                                Either::Left((Event::Closed, _)) => break,
+                                Either::Right(_)
+                                    if self.ui.update_required.with_untracked(Option::is_some) =>
+                                {
+                                    self.ui.live.set(false);
+                                    return;
+                                }
+                                // Away: dropped, the subscription closes its socket.
+                                Either::Right(_) if !self.present() => {
+                                    left = true;
+                                    break;
+                                }
+                                Either::Right(_) => {}
                             }
-                            Either::Right(_) => {}
                         }
-                    },
-                    Err(e) => self
+                    }
+                    Err(e) if self.is_live(vgen) => self
                         .ui
                         .log(format!("cannot subscribe to notifications: {e}")),
+                    Err(_) => return,
+                }
+                if !self.is_live(vgen) {
+                    return;
                 }
                 self.ui.live.set(false);
                 if self.ui.update_required.with_untracked(Option::is_some) {
@@ -399,6 +462,9 @@ impl<V: VaultStore> Engine<V> {
                     continue;
                 }
                 sleep(retry).await;
+                if !self.is_live(vgen) {
+                    return;
+                }
                 retry = (retry * 2).min(RESUBSCRIBE_MAX);
             }
         });
@@ -406,10 +472,17 @@ impl<V: VaultStore> Engine<V> {
 
     /// Fetch what sender-blind `notification` says arrived; if that fails, sync soon.
     async fn notified(&self, notification: Notification) {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return;
+        }
         let fetched = match notification.event {
             Some(notify::Event::Message(true)) => match self.receive_mailbox().await {
                 Ok(affected_peers) => {
                     for peer in affected_peers {
+                        if !self.is_live(vgen) {
+                            return;
+                        }
                         self.clear_approval_backoff(&peer);
                         let _ = self.flush(&peer).await;
                     }
@@ -419,7 +492,9 @@ impl<V: VaultStore> Engine<V> {
             },
             Some(notify::Event::InitialMessage(true)) => match self.take_initial_messages().await {
                 Ok(true) => {
-                    self.wake();
+                    if self.is_live(vgen) {
+                        self.wake();
+                    }
                     Ok(())
                 }
                 Ok(false) => Ok(()),
@@ -427,18 +502,23 @@ impl<V: VaultStore> Engine<V> {
             },
             _ => return,
         };
-        if fetched.is_err() {
+        if fetched.is_err() && self.is_live(vgen) {
             self.wake();
         }
     }
 
     /// Sync soon.
     pub fn wake(&self) {
-        self.wake.set(true);
+        if !self.shutting_down.get() && !crate::glue::lock_released() {
+            self.wake.set(true);
+        }
     }
 
     /// Sync now, as asked on the page, clearing per-peer approval backoff and showing it until done.
     pub fn sync_now(&self) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         self.clear_all_approval_backoffs();
         self.ui.syncing.set(true);
         self.wake();
@@ -447,7 +527,11 @@ impl<V: VaultStore> Engine<V> {
     /// Query `GetServerInfo` verifying `server_id` against the client's locally derived expected
     /// audience (never blindly trusting server-supplied audience strings).
     pub(super) async fn refresh_server_info(&self, force: bool) {
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return;
+        }
         let Some(inner) = guard.as_mut() else {
             return;
         };
@@ -455,6 +539,7 @@ impl<V: VaultStore> Engine<V> {
             return;
         }
         let status = match inner.client.check_server_info(&inner.audience).await {
+            _ if !self.is_live(vgen) => return,
             Ok(info) if info.pq_enabled => {
                 if !inner.client.clock().is_drift_exceeded() {
                     self.clock_skew_warned.set(false);
@@ -489,7 +574,9 @@ impl<V: VaultStore> Engine<V> {
         };
         if inner.server_pq != status {
             inner.server_pq = status;
-            self.ui.me.set(Some(inner.me()));
+            if self.is_live(vgen) {
+                self.ui.me.set(Some(inner.me()));
+            }
         }
     }
 
@@ -497,16 +584,32 @@ impl<V: VaultStore> Engine<V> {
     /// take initial messages, publish/refill prekeys, flush write-token grants, receive the
     /// unified mailbox, and flush per-peer outboxes. Returns whether anything happened.
     pub(super) async fn sync(&self) -> bool {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return false;
+        }
         let (mut active, mut failure) = match self.recover_local_changes().await {
             Ok(recovered) => (recovered, None),
             Err(e) => (false, Some(e)),
         };
+        if !self.is_live(vgen) {
+            return false;
+        }
         self.refresh_server_info(false).await;
+        if !self.is_live(vgen) {
+            return false;
+        }
         if let Err(e) = self.say_farewells().await {
             failure.get_or_insert(e);
         }
+        if !self.is_live(vgen) {
+            return false;
+        }
         if let Err(e) = self.flush_pending_revokes().await {
             failure.get_or_insert(e);
+        }
+        if !self.is_live(vgen) {
+            return false;
         }
         let reached = match self.take_initial_messages().await {
             Ok(taken) => {
@@ -518,11 +621,20 @@ impl<V: VaultStore> Engine<V> {
                 false
             }
         };
+        if !self.is_live(vgen) {
+            return false;
+        }
         if reached && let Err(e) = self.publish(false).await {
             failure.get_or_insert(e);
         }
+        if !self.is_live(vgen) {
+            return false;
+        }
         if let Err(e) = self.flush_pending_grants().await {
             failure.get_or_insert(e);
+        }
+        if !self.is_live(vgen) {
+            return false;
         }
         match self.receive_mailbox().await {
             Ok(affected) => {
@@ -537,13 +649,22 @@ impl<V: VaultStore> Engine<V> {
                 failure.get_or_insert(e);
             }
         }
+        if !self.is_live(vgen) {
+            return false;
+        }
         for peer in self.peers().await {
+            if !self.is_live(vgen) {
+                return false;
+            }
             match self.flush(&peer).await {
                 Ok(pushed) => active |= pushed,
                 Err(e) => {
                     failure.get_or_insert(e);
                 }
             }
+        }
+        if !self.is_live(vgen) {
+            return false;
         }
         match failure {
             None => self.ui.link.set(Link::Synced(now())),
@@ -554,12 +675,19 @@ impl<V: VaultStore> Engine<V> {
 
     /// Retry failed writes, join initials left on disk, and replay eligible deferred envelopes.
     async fn recover_local_changes(&self) -> Result<bool, String> {
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
         let Some(inner) = guard.as_mut() else {
             return Ok(false);
         };
         if inner.needs_save() {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
+        if !self.is_live(vgen) {
+            return Ok(false);
         }
         let late = std::mem::take(&mut inner.saved_late);
         if std::mem::take(&mut inner.contacts_dirty_late) || !late.is_empty() {
@@ -569,9 +697,15 @@ impl<V: VaultStore> Engine<V> {
             {
                 self.reconcile_open_chat_read(inner, &open, true).await;
             }
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
             self.ui.contacts.set(inner.views());
         }
         let replayed = self.replay_deferred_initials(inner).await?;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
         let pending: Vec<_> = inner
             .contacts
             .iter()
@@ -583,15 +717,24 @@ impl<V: VaultStore> Engine<V> {
             .collect();
         let mut upgrades = replayed.unwrap_or_default();
         for peer in &pending {
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
             if self.join_carried(inner, peer).await?.recommend_upgrade {
                 upgrades.insert(*peer);
             }
+        }
+        if !self.is_live(vgen) {
+            return Ok(false);
         }
         let (replayed_peers, replay_upgrades) = self.replay_deferred_envelopes(inner, None).await?;
         upgrades.extend(replay_upgrades);
         let recovered = !pending.is_empty() || !replayed_peers.is_empty();
         drop(guard);
         for peer in upgrades {
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
             let _ = self.upgrade_to_pq(peer).await;
         }
         Ok(recovered)
@@ -600,12 +743,19 @@ impl<V: VaultStore> Engine<V> {
     /// Push the messages telling peers that their chats were deleted here, see
     /// [`delete`](Self::delete).
     pub(super) async fn say_farewells(&self) -> Result<(), String> {
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         let Some(inner) = guard.as_mut() else {
             return Ok(());
         };
         let signs_in_here = same_server(&inner.server, &origin());
         while let Some(farewell) = inner.state.farewells.first().cloned() {
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
             let Some(v2_req) = farewell_push_v2_request(&farewell) else {
                 inner.state.farewells.remove(0);
                 inner.save_state().await.map_err(|e| describe(&e))?;
@@ -616,6 +766,9 @@ impl<V: VaultStore> Engine<V> {
                 .await
                 .map(|_| ())
                 .map_err(session::Error::from);
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
             match pushed {
                 Ok(()) => {}
                 // Pushing takes a sign-in: they wait for it, without failing the round.
@@ -648,7 +801,7 @@ impl<V: VaultStore> Engine<V> {
     }
 
     pub(super) async fn peers(&self) -> Vec<PublicKey> {
-        let inner = self.inner.lock().await;
+        let inner = self.lock_inner().await;
         inner
             .iter()
             .flat_map(|inner| inner.contacts.iter().map(|contact| contact.peer))
@@ -666,12 +819,19 @@ impl<V: VaultStore> Engine<V> {
     /// - After draining, joins carried/inbox initials and locally replays buffered envelopes with
     ///   zero server re-fetch.
     pub(super) async fn receive_mailbox(&self) -> Result<Vec<PublicKey>, String> {
+        let vgen = self.vault_gen();
         let mut affected_peers: BTreeSet<PublicKey> = BTreeSet::new();
         let mut upgrades: BTreeSet<PublicKey> = BTreeSet::new();
         let mut peers_needing_replay: BTreeSet<PublicKey> = BTreeSet::new();
 
         for _ in 0..MAX_MAILBOX_PAGES {
-            let mut guard = self.inner.lock().await;
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
             let Some(inner) = guard.as_mut() else {
                 break;
             };
@@ -689,6 +849,7 @@ impl<V: VaultStore> Engine<V> {
                 .fetch_mailbox_v2(&mailbox, &inner.audience, 100)
                 .await
             {
+                _ if !self.is_live(vgen) => return Ok(Vec::new()),
                 Ok(page) => page,
                 Err(e) => {
                     self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
@@ -1016,6 +1177,9 @@ impl<V: VaultStore> Engine<V> {
                 )?;
                 return Err(describe(&e));
             }
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
 
             // Durable commit succeeded: log evicted counts, update open chat UI & contact views.
             for (peer, evicted_count) in peer_evicted_counts {
@@ -1061,12 +1225,16 @@ impl<V: VaultStore> Engine<V> {
                     }
                 }
             }
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
             self.ui.contacts.set(inner.views());
 
             // Unconditionally ACK server mailbox prefix on the final page (earlier pages piggyback).
             if !has_more {
                 if inner.client.pending_mailbox_ack() > 0 {
                     match inner.client.ack_mailbox_v2(&mailbox, &inner.audience).await {
+                        _ if !self.is_live(vgen) => return Ok(Vec::new()),
                         Ok(_) => {
                             let _ = inner.save_state().await;
                         }
@@ -1082,18 +1250,33 @@ impl<V: VaultStore> Engine<V> {
         // If any carried initials or buffered envelopes arrived, pull inbox initials, join carried
         // initials, and locally replay buffered envelopes with zero server re-fetch.
         if !peers_needing_replay.is_empty() {
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
             if let Ok((_, replayed_during_inbox)) = self.take_initial_messages_with_replayed().await
             {
                 affected_peers.extend(replayed_during_inbox);
             }
-            let mut guard = self.inner.lock().await;
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
             if let Some(inner) = guard.as_mut() {
                 for peer in &peers_needing_replay {
+                    if !self.is_live(vgen) {
+                        return Ok(Vec::new());
+                    }
                     if let Ok(join) = self.join_carried(inner, peer).await
                         && join.recommend_upgrade
                     {
                         upgrades.insert(*peer);
                     }
+                }
+                if !self.is_live(vgen) {
+                    return Ok(Vec::new());
                 }
                 if let Ok((replayed, replay_upgrades)) =
                     self.replay_deferred_envelopes(inner, None).await
@@ -1105,6 +1288,9 @@ impl<V: VaultStore> Engine<V> {
         }
 
         for peer in upgrades {
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
             let _ = self.upgrade_to_pq(peer).await;
         }
         Ok(affected_peers.into_iter().collect())
@@ -1455,6 +1641,9 @@ impl<V: VaultStore> Engine<V> {
             )?;
             return Err(describe(&e));
         }
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return Ok((BTreeSet::new(), BTreeSet::new()));
+        }
 
         for (peer, count) in skipped_counts {
             let label = inner
@@ -1498,7 +1687,9 @@ impl<V: VaultStore> Engine<V> {
                 }
             }
         }
-        self.ui.contacts.set(inner.views());
+        if !self.shutting_down.get() && !crate::glue::lock_released() {
+            self.ui.contacts.set(inner.views());
+        }
         Ok((replayed_peers, upgrades))
     }
 }

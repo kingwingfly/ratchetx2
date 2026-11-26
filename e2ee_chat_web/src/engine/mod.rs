@@ -16,6 +16,8 @@ mod tests;
 
 use crate::content::Kind;
 use crate::glue::LockStatus;
+use crate::kdf_worker::KdfCancelToken;
+use crate::notify::CloseHandle;
 use crate::state::{
     Body, ContactView, Delivery, Dialog, IsolatedContactView, Link, Me, MessageRow, MessageView,
     PendingNewChat, Phase, ServerPqStatus, SignIn, SignInFlow, SignInSuccessAction, Ui,
@@ -75,6 +77,15 @@ const SERVER_MAX_PQ_ONE_TIME_PREKEYS: usize = 100;
 const REFILL_USED: u32 = 10;
 /// ... and rotate the signed prekey once it is this old, in milliseconds.
 const REPUBLISH_AGE: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Structured error returned by [`Engine::create`] and [`Engine::unlock`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaultOpenError {
+    /// Key derivation was cancelled explicitly by the user or aborted on `pagehide`.
+    Cancelled,
+    /// Creation or unlock failed for a user-visible reason.
+    Failed(String),
+}
+
 /// Structured error returned by [`Engine::start_chat`] so the UI can offer actionable prompts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartChatError {
@@ -151,6 +162,17 @@ const EVENTS_KEPT: usize = 1_000;
 pub struct Engine<V = Vault> {
     ui: Ui,
     inner: Mutex<Option<Inner<V>>>,
+    /// Monotonic vault lifecycle generation bumped on every create/unlock and synchronously inside
+    /// [`Engine::teardown_on_pagehide`] so any in-flight async continuation aborts cleanly without
+    /// mutating IndexedDB or repopulating `Ui` signals.
+    vault_generation: Cell<u64>,
+    /// Set synchronously inside [`Engine::teardown_on_pagehide`]: if `self.inner` was held by an
+    /// in-flight async task during `pagehide`, [`InnerGuard::drop`] immediately takes and drops
+    /// `Inner` as soon as that task exits the mutex.
+    shutting_down: Cell<bool>,
+    /// Synchronous close handle for the active notification WebSocket, invoked directly on
+    /// `pagehide` without awaiting `self.inner`.
+    ws_close: RefCell<Option<CloseHandle>>,
     /// Single-unlock / single-create re-entrancy guard preventing overlapping unlocks or
     /// duplicate sync/notification/service-worker loops.
     unlocking: Cell<bool>,
@@ -403,9 +425,40 @@ impl Sending {
     }
 }
 
+/// RAII mutex guard over `Engine::inner` that automatically wipes `Inner` on exit if synchronous
+/// `pagehide` teardown fired while this guard was held across an `.await`.
+pub(super) struct InnerGuard<'a, V> {
+    engine: &'a Engine<V>,
+    guard: futures_util::lock::MutexGuard<'a, Option<Inner<V>>>,
+}
+
+impl<V> std::ops::Deref for InnerGuard<'_, V> {
+    type Target = Option<Inner<V>>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<V> std::ops::DerefMut for InnerGuard<'_, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl<V> Drop for InnerGuard<'_, V> {
+    fn drop(&mut self) {
+        if self.engine.shutting_down.get() {
+            let _ = self.guard.take();
+        }
+    }
+}
+
 /// The unlocked client.
-struct Inner<V = Vault> {
+pub(super) struct Inner<V = Vault> {
     vault: V,
+    /// Monotonic `glue::lock_generation()` captured when this `Inner` was constructed so any
+    /// persistence attempt that outlives `pagehide` fails closed even before touching `V`.
+    lock_generation: u64,
     /// The server's address.
     server: String,
     /// Canonical expected server audience derived from `server` via `expected_audience_from_url`.
@@ -490,6 +543,7 @@ impl<V: VaultStore> Engine<V> {
     /// Construct an already-unlocked engine backed by `inner` for deterministic native async tests.
     fn with_inner(ui: Ui, inner: Inner<V>) -> Rc<Self> {
         let engine = Self::empty(ui);
+        engine.bump_vault_generation();
         engine
             .can_sign_in_here
             .set(same_server(&inner.server, &origin()));
@@ -507,6 +561,9 @@ impl<V: VaultStore> Engine<V> {
         let engine = Rc::new(Self {
             ui,
             inner: Mutex::new(None),
+            vault_generation: Cell::new(0),
+            shutting_down: Cell::new(false),
+            ws_close: RefCell::new(None),
             unlocking: Cell::new(false),
             wake: Cell::new(false),
             files: RefCell::default(),
@@ -534,6 +591,13 @@ impl<V: VaultStore> Engine<V> {
             clock_skew_warned: Cell::new(false),
             approval_backoff: RefCell::default(),
         });
+        // Register synchronous `pagehide` teardown BEFORE releasing the exclusive Web Lock.
+        let weak = Rc::downgrade(&engine);
+        glue::on_pagehide(move || {
+            if let Some(engine) = weak.upgrade() {
+                engine.teardown_on_pagehide();
+            }
+        });
         // Whatever the server refuses for the sign-in, the user is asked to sign in.
         let weak = Rc::downgrade(&engine);
         transport::on_sign_in_required(move || {
@@ -548,6 +612,126 @@ impl<V: VaultStore> Engine<V> {
             }
         });
         engine
+    }
+
+    pub(super) fn bump_vault_generation(&self) -> u64 {
+        let next = self.vault_generation.get().wrapping_add(1).max(1);
+        self.vault_generation.set(next);
+        next
+    }
+
+    pub(super) fn vault_gen(&self) -> u64 {
+        self.vault_generation.get()
+    }
+
+    /// Whether synchronous `pagehide` / manual-lock teardown has started.
+    pub fn is_shutting_down(&self) -> bool {
+        self.shutting_down.get()
+    }
+
+    /// Whether `vgen` still matches the active vault lifecycle generation and `pagehide` has not
+    /// revoked this page.
+    pub(super) fn is_live(&self, vgen: u64) -> bool {
+        !self.shutting_down.get()
+            && self.vault_generation.get() == vgen
+            && !crate::glue::lock_released()
+    }
+
+    /// Acquire `self.inner` through [`InnerGuard`], clearing `Inner` immediately if teardown has
+    /// started (and on drop if teardown fires while this guard is held across an `.await`).
+    pub(super) async fn lock_inner(&self) -> InnerGuard<'_, V> {
+        let mut guard = self.inner.lock().await;
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            let _ = guard.take();
+        }
+        InnerGuard {
+            engine: self,
+            guard,
+        }
+    }
+
+    /// Synchronously revoke the active vault generation and scrub all sensitive in-memory,
+    /// worker, WebSocket, media-port, blob-URL, DOM, and title state. Invoked directly inside
+    /// `glue.rs`'s `pagehide` handler BEFORE releasing the exclusive Web Lock (and before manual
+    /// vault lock reloads). Idempotent.
+    pub fn teardown_on_pagehide(&self) {
+        // 1. Bump both Engine and glue generations synchronously before anything else.
+        self.shutting_down.set(true);
+        self.bump_vault_generation();
+        crate::glue::bump_lock_generation();
+
+        // 2. Synchronously cancel and terminate any in-flight KDF worker.
+        crate::kdf_worker::cancel_active();
+
+        // 3. Synchronously close the live notification WebSocket without awaiting `self.inner`.
+        if let Some(handle) = self.ws_close.borrow_mut().take() {
+            handle.close();
+        }
+
+        // 4. Synchronously abort and close all active service-worker media ports.
+        crate::glue::close_all_media_ports();
+
+        // 5. Synchronously cancel pending previews and revoke all live `blob:` URLs.
+        crate::app::cancel_pending_previews();
+        crate::app::revoke_all_blob_urls();
+
+        // 6. Synchronously terminate all live preview workers and reject pending calls.
+        crate::workers::terminate_all();
+
+        // 7. Clear transient engine caches and invalidate in-flight navigation/submissions.
+        self.unlocking.set(false);
+        self.wake.set(false);
+        self.files.borrow_mut().clear();
+        self.running.borrow_mut().clear();
+        self.cancelled.borrow_mut().clear();
+        self.sending.borrow_mut().clear();
+        self.streams.borrow_mut().clear();
+        self.decrypted.borrow_mut().clear();
+        self.loading.borrow_mut().clear();
+        self.waits_sign_in.borrow_mut().clear();
+        self.approval_backoff.borrow_mut().clear();
+        *self.new_chat_feedback.borrow_mut() = None;
+        self.cancel_active_startup_submission();
+        *self.displayed_history.borrow_mut() = None;
+        let mut tracker = self.open_tracker.get();
+        tracker.close();
+        self.open_tracker.set(tracker);
+
+        // 8. Synchronously clear displayed messages, scrub ALL sensitive `Ui` signals, and reset
+        //    `document.title` to generic `"E2EE Chat"` (no unread counts or peer names).
+        self.clear_displayed_messages();
+        let _ = self.ui.me.try_set(None);
+        let _ = self.ui.contacts.try_set(vec![]);
+        let _ = self.ui.isolated_contacts.try_set(vec![]);
+        let _ = self.ui.open.try_set(None);
+        let _ = self.ui.has_older_messages.try_set(false);
+        let _ = self.ui.deleted_peer.try_set(None);
+        let _ = self.ui.uploads.try_set(vec![]);
+        let _ = self.ui.held.try_set(HashSet::new());
+        let _ = self.ui.gone.try_set(HashSet::new());
+        let _ = self.ui.dialog.try_set(None);
+        let _ = self.ui.viewer.try_set(None);
+        let _ = self.ui.opening.try_set(None);
+        let _ = self.ui.streaming.try_set(None);
+        let _ = self.ui.log.try_set(vec![]);
+        let _ = self.ui.notice.try_set(None);
+        let _ = self.ui.update_required.try_set(None);
+        let _ = self.ui.live.try_set(false);
+        let _ = self.ui.syncing.try_set(false);
+        let _ = self.ui.away.try_set(false);
+        let _ = self.ui.link.try_set(Link::Connecting);
+        let _ = self.ui.phase.try_set(Phase::Locked);
+        #[cfg(target_arch = "wasm32")]
+        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+            doc.set_title("E2EE Chat");
+        }
+
+        // 9. Take and drop `Inner` synchronously if uncontended; if held across an `.await`,
+        //    `InnerGuard::drop` takes/drops `Inner` immediately on lock exit while `is_live(vgen)`
+        //    and `ensure_vault_lock_owned()` prevent any post-`pagehide` IDB or `Ui` writes.
+        if let Some(mut guard) = self.inner.try_lock() {
+            let _ = guard.take();
+        }
     }
 
     pub(super) fn clear_approval_backoff(&self, peer: &PublicKey) {
@@ -581,6 +765,9 @@ impl<V: VaultStore> Engine<V> {
     /// Log and notify the user once per drift episode when the device clock disagrees with the
     /// server beyond [`session::DEFAULT_MAX_TRUSTED_DRIFT_MS`].
     pub(super) fn warn_clock_skew(&self, offset_ms: i64) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         if !self.clock_skew_warned.replace(true) {
             let hours = offset_ms.unsigned_abs() / (60 * 60 * 1000);
             self.ui.log(format!(
@@ -593,6 +780,9 @@ impl<V: VaultStore> Engine<V> {
     /// Surface a persistent upgrade/refresh banner when the server rejects this client's protocol
     /// (e.g. a confirmed `ErrorKind::Unimplemented` server refusal on core v2 RPCs).
     pub(super) fn require_update(&self, reason: impl Into<String>) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         let message = normalize_update_reason(&reason.into());
         let already_shown = self.ui.update_required.with_untracked(Option::is_some);
         if !already_shown {
@@ -625,8 +815,12 @@ impl<V: VaultStore> Engine<V> {
 
     /// Send what was sent, a message at a time, until none is left.
     async fn drain(self: Rc<Self>) {
+        let vgen = self.vault_gen();
         let _guard = scopeguard::guard((), |()| self.draining.set(false));
         loop {
+            if !self.is_live(vgen) {
+                break;
+            }
             let Some(next) = self.sending.borrow_mut().pop_front() else {
                 break;
             };
@@ -634,6 +828,9 @@ impl<V: VaultStore> Engine<V> {
                 Sending::Content(peer, content) => self.send(peer, content).await,
                 Sending::File(peer, file) => self.send_file(peer, file).await,
             };
+            if !self.is_live(vgen) {
+                break;
+            }
             if let Err(e) = sent {
                 self.ui.notify(e);
             }
@@ -688,7 +885,11 @@ impl<V: VaultStore> Engine<V> {
     /// takes. If an external sign-in is observed (e.g. on another of the server's pages), resumes
     /// held peers, prekey publishing, and waiting uploads.
     pub async fn signed_in(self: &Rc<Self>) -> Result<Option<SignIn>, String> {
+        let vgen = self.vault_gen();
         let signed_in = self.check_signed_in().await?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         if signed_in.is_some() {
             self.resume_after_sign_in();
             let engine = self.clone();
@@ -701,7 +902,11 @@ impl<V: VaultStore> Engine<V> {
 
     /// Sign in to the server with its `password`: what waited for it goes then.
     pub async fn sign_in(self: &Rc<Self>, password: &str) -> Result<SignIn, String> {
+        let vgen = self.vault_gen();
         let server = self.server().await?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         // Its cookie is the server's, which only the server's own page keeps and sends; another
         // origin's calls to it cannot even read its answer.
         if !same_server(&server, &origin()) {
@@ -712,6 +917,9 @@ impl<V: VaultStore> Engine<V> {
         }
         let (status, _) =
             transport::call(&server, "POST", "/auth/password", Some(password)).await?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         match status {
             200 => {}
             403 => return Err("Wrong password.".to_string()),
@@ -725,9 +933,14 @@ impl<V: VaultStore> Engine<V> {
         let signed_in = self.check_signed_in().await?.ok_or(
             "This browser kept no sign-in for the server: it may block the server's cookies.",
         )?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.resume_after_sign_in();
         self.start_waiting_uploads().await;
-        self.wake();
+        if self.is_live(vgen) {
+            self.wake();
+        }
         Ok(signed_in)
     }
 
@@ -745,6 +958,9 @@ impl<V: VaultStore> Engine<V> {
     /// unmounting and rebuilding an active `SignInDialog` (which would cancel its live submission
     /// and history reservation).
     pub(super) fn show_dialog_if_changed(&self, dialog: Dialog) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         if self
             .ui
             .dialog
@@ -757,6 +973,9 @@ impl<V: VaultStore> Engine<V> {
     /// Ask the user to sign in to the server, as what was sent waits for it. If `NewChat` is
     /// currently open, preserves its invitation/draft so it can resume seamlessly after sign-in.
     fn ask_sign_in(&self) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         let next = self.ui.dialog.with_untracked(|current| {
             self.sign_in_flow.borrow_mut().on_ask_sign_in(
                 current.as_ref(),
@@ -772,6 +991,9 @@ impl<V: VaultStore> Engine<V> {
     /// The server refused a call, whichever, as this browser is not signed in to it, which every
     /// write takes: ask, unless the user put it off or cancelled the in-flight startup submission.
     fn refused_for_sign_in(&self) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         if let Some((id, greeting_only)) = self.in_flight_start_chat.get() {
             if self.is_submission_cancelled(id) {
                 return;
@@ -1019,7 +1241,7 @@ impl<V: VaultStore> Engine<V> {
 
     /// The server's address.
     async fn server(&self) -> Result<String, String> {
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
         Ok(guard.as_ref().ok_or("locked")?.server.clone())
     }
 }
@@ -1032,9 +1254,15 @@ impl Engine<Vault> {
         // display `Elsewhere` immediately while waiting ONLY when this tab is visible and focused,
         // so refreshing or locking a foreground tab never hands the vault to a background waiter.
         let mut lock = crate::glue::take_lock("e2ee-chat").await;
-        if lock == LockStatus::HeldElsewhere && !crate::glue::lock_released() {
+        if lock == LockStatus::HeldElsewhere
+            && !crate::glue::lock_released()
+            && !self.shutting_down.get()
+        {
             self.ui.phase.set(Phase::Elsewhere);
             lock = crate::glue::wait_for_lock_when_active("e2ee-chat").await;
+        }
+        if crate::glue::lock_released() || self.shutting_down.get() {
+            return;
         }
         match lock {
             LockStatus::Acquired => {}
@@ -1065,21 +1293,24 @@ impl Engine<Vault> {
                 return;
             }
         }
-        if crate::glue::lock_released() {
+        if crate::glue::lock_released() || self.shutting_down.get() {
             return;
         }
         match Vault::inspect().await {
-            Ok(_) if crate::glue::lock_released() => {}
+            Ok(_) if crate::glue::lock_released() || self.shutting_down.get() => {}
             Ok(VaultPresence::Compatible) => self.ui.phase.set(Phase::Locked),
             Ok(VaultPresence::None) => self.ui.phase.set(Phase::Create),
             Ok(VaultPresence::IncompatibleVersion(version)) => {
                 self.ui.phase.set(Phase::IncompatibleVault(version));
             }
             // Offering to create one could replace a vault that is there.
-            Err(e) => self.ui.phase.set(Phase::Unavailable(
-                UnavailableReason::StorageUnavailable,
-                describe(&e),
-            )),
+            Err(e) if !crate::glue::lock_released() && !self.shutting_down.get() => {
+                self.ui.phase.set(Phase::Unavailable(
+                    UnavailableReason::StorageUnavailable,
+                    describe(&e),
+                ));
+            }
+            Err(_) => {}
         }
     }
 
@@ -1090,21 +1321,35 @@ impl Engine<Vault> {
         passphrase: Zeroizing<String>,
         server: String,
         pq_enabled: bool,
-    ) -> Result<(), String> {
+        cancel: KdfCancelToken,
+    ) -> Result<(), VaultOpenError> {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return Err(VaultOpenError::Cancelled);
+        }
         if self.unlocking.replace(true) {
-            return Err("The vault is already being opened.".to_string());
+            return Err(VaultOpenError::Failed(
+                "The vault is already being opened.".to_string(),
+            ));
         }
         let _unlock_guard = scopeguard::guard((), |()| self.unlocking.set(false));
-        if self.inner.lock().await.is_some() {
-            return Err("The vault is already unlocked.".to_string());
+        let vgen = self.bump_vault_generation();
+        if self.lock_inner().await.is_some() {
+            return Err(VaultOpenError::Failed(
+                "The vault is already unlocked.".to_string(),
+            ));
+        }
+        if !self.is_live(vgen) {
+            return Err(VaultOpenError::Cancelled);
         }
         let raw_server = server.trim();
         let current_origin = origin();
         let (server, address) = if raw_server.is_empty() {
-            let canonical = crate::util::validate_relay_url(&current_origin)?;
+            let canonical =
+                crate::util::validate_relay_url(&current_origin).map_err(VaultOpenError::Failed)?;
             (String::new(), canonical)
         } else {
-            let canonical = crate::util::validate_relay_url(raw_server)?;
+            let canonical =
+                crate::util::validate_relay_url(raw_server).map_err(VaultOpenError::Failed)?;
             // The page's own server is saved as empty, so the vault follows the page.
             let stored = if same_server(&canonical, &current_origin) {
                 String::new()
@@ -1114,7 +1359,9 @@ impl Engine<Vault> {
             (stored, canonical)
         };
         let audience = expected_audience_from_url(&address).map_err(|_| {
-            "Enter a valid https:// (or http://localhost) server address.".to_string()
+            VaultOpenError::Failed(
+                "Enter a valid https:// (or http://localhost) server address.".to_string(),
+            )
         })?;
         let mut client =
             Client::new(Fetch::client(&address)).with_clock(transport::clock(&address));
@@ -1123,55 +1370,91 @@ impl Engine<Vault> {
             pq_config.pq_enabled = false;
             pq_config.strict_pq = false;
         }
-        client.set_pq_config(pq_config).map_err(|e| describe(&e))?;
+        client
+            .set_pq_config(pq_config)
+            .map_err(|e| VaultOpenError::Failed(describe(&e)))?;
         let state = AppState {
             client: Some(client.state().into()),
             server,
-            name: checked_name(&name)?,
+            name: checked_name(&name).map_err(VaultOpenError::Failed)?,
             ..AppState::default()
         };
-        let vault = Vault::create(passphrase.as_bytes(), &state)
+        let vault = Vault::create(passphrase.as_bytes(), &state, &cancel)
             .await
-            .map_err(|e| describe(&e))?;
+            .map_err(|e| match e {
+                crate::vault::Error::Cancelled => VaultOpenError::Cancelled,
+                other => VaultOpenError::Failed(describe(&other)),
+            })?;
         drop(passphrase);
+        if !self.is_live(vgen) || cancel.is_cancelled() {
+            return Err(VaultOpenError::Cancelled);
+        }
         let state = AppState {
             client: None,
             ..state
         };
-        self.unlocked(Inner::new(
-            vault,
-            address,
-            audience,
-            state,
-            client,
-            vec![],
-            vec![],
-            DeferredRecord::default(),
-        ))
+        self.unlocked(
+            vgen,
+            Inner::new(
+                vault,
+                address,
+                audience,
+                state,
+                client,
+                vec![],
+                vec![],
+                DeferredRecord::default(),
+            ),
+        )
         .await;
         Ok(())
     }
 
     /// Unlock the vault with `passphrase`.
-    pub async fn unlock(self: &Rc<Self>, passphrase: Zeroizing<String>) -> Result<(), String> {
+    pub async fn unlock(
+        self: &Rc<Self>,
+        passphrase: Zeroizing<String>,
+        cancel: KdfCancelToken,
+    ) -> Result<(), VaultOpenError> {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return Err(VaultOpenError::Cancelled);
+        }
         if self.unlocking.replace(true) {
-            return Err("The vault is already being opened.".to_string());
+            return Err(VaultOpenError::Failed(
+                "The vault is already being opened.".to_string(),
+            ));
         }
         let _unlock_guard = scopeguard::guard((), |()| self.unlocking.set(false));
-        if self.inner.lock().await.is_some() {
-            return Err("The vault is already unlocked.".to_string());
+        let vgen = self.bump_vault_generation();
+        if self.lock_inner().await.is_some() {
+            return Err(VaultOpenError::Failed(
+                "The vault is already unlocked.".to_string(),
+            ));
         }
-        let (vault, mut state, mut deferred) = Vault::unlock(passphrase.as_bytes())
+        if !self.is_live(vgen) {
+            return Err(VaultOpenError::Cancelled);
+        }
+        let (vault, mut state, mut deferred) = Vault::unlock(passphrase.as_bytes(), &cancel)
             .await
-            .map_err(|e| describe(&e))?;
+            .map_err(|e| match e {
+                crate::vault::Error::Cancelled => VaultOpenError::Cancelled,
+                other => VaultOpenError::Failed(describe(&other)),
+            })?;
         drop(passphrase);
+        if !self.is_live(vgen) || cancel.is_cancelled() {
+            return Err(VaultOpenError::Cancelled);
+        }
         let address = address(&state.server);
-        let audience = expected_audience_from_url(&address)
-            .map_err(|_| "the server address saved in the vault is invalid".to_string())?;
-        let client = state.client.take().ok_or("the vault has no identity")?;
+        let audience = expected_audience_from_url(&address).map_err(|_| {
+            VaultOpenError::Failed("the server address saved in the vault is invalid".to_string())
+        })?;
+        let client = state
+            .client
+            .take()
+            .ok_or_else(|| VaultOpenError::Failed("the vault has no identity".to_string()))?;
         let client = Client::restore(
             Fetch::client(&address),
-            ClientState::try_from(&client).map_err(|e| describe(&e))?,
+            ClientState::try_from(&client).map_err(|e| VaultOpenError::Failed(describe(&e)))?,
         )
         .with_clock(transport::clock(&address));
         let (contacts, isolated_contacts, warnings) = restore_contacts(
@@ -1199,6 +1482,18 @@ impl Engine<Vault> {
             isolated_contacts,
             deferred,
         );
+        if pruned > 0
+            || pruned_deferred > 0
+            || modified_deferred
+            || pruned_carried_ts > 0
+            || pruned_envelopes > 0
+        {
+            inner.unsaved_state = true;
+        }
+        self.unlocked(vgen, inner).await;
+        if !self.is_live(vgen) {
+            return Err(VaultOpenError::Cancelled);
+        }
         if pruned > 0 {
             self.ui.log(format!(
                 "Removed {pruned} invalid or duplicate inbox acknowledgement ID(s) from the vault."
@@ -1209,15 +1504,6 @@ impl Engine<Vault> {
                 "Removed {pruned_deferred} invalid, duplicate, or excess deferred initial message(s) from the vault."
             ));
         }
-        if pruned > 0
-            || pruned_deferred > 0
-            || modified_deferred
-            || pruned_carried_ts > 0
-            || pruned_envelopes > 0
-        {
-            inner.unsaved_state = true;
-        }
-        self.unlocked(inner).await;
         let warning_count = warnings.len();
         for warning in warnings {
             self.ui.log(warning);
@@ -1235,7 +1521,10 @@ impl Engine<Vault> {
         Ok(())
     }
 
-    async fn unlocked(self: &Rc<Self>, inner: Inner) {
+    async fn unlocked(self: &Rc<Self>, vgen: u64, inner: Inner) {
+        if !self.is_live(vgen) {
+            return;
+        }
         let can_sign_in_here = same_server(&inner.server, &origin());
         self.can_sign_in_here.set(can_sign_in_here);
         self.ui.me.set(Some(inner.me()));
@@ -1245,6 +1534,9 @@ impl Engine<Vault> {
         match inner.vault.uploads(None).await {
             Ok(uploads) => {
                 for (peer, pending) in uploads {
+                    if !self.is_live(vgen) {
+                        return;
+                    }
                     // Done, but left behind, as forgetting it failed (or tab closed after
                     // keeping the final chunk before `forget_upload` committed).
                     let chunks = attachment::chunk_count(pending.size);
@@ -1258,6 +1550,9 @@ impl Engine<Vault> {
                                     .unwrap_or(0),
                             ) >= chunks)
                     {
+                        if !self.is_live(vgen) {
+                            return;
+                        }
                         let _ = inner.vault.forget_upload(&peer, &pending.id).await;
                         continue;
                     }
@@ -1271,8 +1566,14 @@ impl Engine<Vault> {
                                 })
                         })
                     {
+                        if !self.is_live(vgen) {
+                            return;
+                        }
                         let _ = inner.vault.forget_upload(&peer, &pending.id).await;
                         continue;
+                    }
+                    if !self.is_live(vgen) {
+                        return;
                     }
                     let reason = if pending.started() {
                         "choose the file again to go on"
@@ -1283,11 +1584,15 @@ impl Engine<Vault> {
                     self.show_upload(&peer, &pending, UploadState::Paused(reason.to_string()));
                 }
             }
-            Err(e) => self.ui.notify(describe(&e)),
+            Err(e) if self.is_live(vgen) => self.ui.notify(describe(&e)),
+            Err(_) => return,
+        }
+        if !self.is_live(vgen) {
+            return;
         }
         {
-            let mut slot = self.inner.lock().await;
-            if slot.is_some() {
+            let mut slot = self.lock_inner().await;
+            if !self.is_live(vgen) || slot.is_some() {
                 return;
             }
             *slot = Some(inner);
@@ -1311,6 +1616,9 @@ impl Engine<Vault> {
             } else {
                 None
             };
+            if !self.is_live(vgen) {
+                return;
+            }
             let initial = self.sign_in_flow.borrow_mut().on_unlock_with_invitation(
                 dialog,
                 can_sign_in_here,
@@ -1318,14 +1626,17 @@ impl Engine<Vault> {
             );
             self.ui.dialog.set(Some(initial));
         }
+        if !self.is_live(vgen) {
+            return;
+        }
         self.ui.phase.set(Phase::Unlocked);
         self.ui.log("vault unlocked");
-        self.clone().run();
-        self.clone().listen();
+        self.clone().run(vgen);
+        self.clone().listen(vgen);
         let engine = self.clone();
         glue::serve_media(move |request| {
             let engine = engine.clone();
-            spawn_local(async move { engine.serve_media(request).await });
+            spawn_local(async move { engine.serve_media(request, vgen).await });
         });
     }
 }
@@ -1338,20 +1649,34 @@ impl<V: VaultStore> Engine<V> {
     }
 
     async fn send_returning_index(&self, peer: PublicKey, content: Kind) -> Result<u64, String> {
+        let vgen = self.vault_gen();
         let index = {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             let view = inner.add(&peer, content, false).await?;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let index = view.index;
             self.show_new(inner, &peer, vec![view]);
             self.ui.contacts.set(inner.views());
             index
         };
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         // Saved, so it goes in a later sync if not now.
-        if let Err(e) = self.flush(&peer).await {
+        if let Err(e) = self.flush(&peer).await
+            && self.is_live(vgen)
+        {
             self.ui.link.set(Link::Offline(e));
         }
-        self.wake();
+        if self.is_live(vgen) {
+            self.wake();
+        }
         Ok(index)
     }
 
@@ -1375,7 +1700,7 @@ impl<V: VaultStore> Engine<V> {
 
     /// Clear `ui.messages` and dispose every per-row reactive signal owned by the previous chat.
     fn clear_displayed_messages(&self) {
-        self.ui.messages.set(vec![]);
+        let _ = self.ui.messages.try_set(vec![]);
         let old = {
             let mut displayed = self.displayed_rows.borrow_mut();
             displayed.peer = None;
@@ -1390,6 +1715,9 @@ impl<V: VaultStore> Engine<V> {
     /// when refreshing the same chat (so `<For>` children stay wired to live signals) and
     /// disposing removed/old signals cleanly.
     fn set_displayed_messages(&self, peer: PublicKey, views: Vec<MessageView>, open_peer: bool) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         let mut displayed = self.displayed_rows.borrow_mut();
         let same_peer = displayed.peer == Some(peer);
         let mut old_rows = std::mem::take(&mut displayed.rows);
@@ -1544,10 +1872,17 @@ impl<V: VaultStore> Engine<V> {
             self.close_chat();
             return OpenOutcome::Opened;
         };
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return OpenOutcome::Ignored;
+        }
         let mut tracker = self.open_tracker.get();
         let generation = tracker.begin_open(peer);
         self.open_tracker.set(tracker);
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return OpenOutcome::Ignored;
+        }
         let current = self.open_tracker.get();
         if current.was_deleted(generation) {
             return OpenOutcome::Ignored;
@@ -1566,10 +1901,16 @@ impl<V: VaultStore> Engine<V> {
             LoadedHistory::Missing => return OpenOutcome::Ignored,
             LoadedHistory::Loaded(page) => Some(page),
             LoadedHistory::Failed(e) => {
+                if !self.is_live(vgen) {
+                    return OpenOutcome::Ignored;
+                }
                 self.ui.notify(e);
                 None
             }
         };
+        if !self.is_live(vgen) {
+            return OpenOutcome::Ignored;
+        }
         let current = self.open_tracker.get();
         if current.was_deleted(generation) {
             return OpenOutcome::Ignored;
@@ -1607,13 +1948,25 @@ impl<V: VaultStore> Engine<V> {
         // load or the tab became hidden before display (`visibilitychange` calls `mark_read` on return).
         let read = self.acknowledge_displayed_window(inner, &peer);
         if read && let Err(e) = inner.save_state().await {
+            if !self.is_live(vgen) {
+                return OpenOutcome::Ignored;
+            }
             self.ui.notify(describe(&e));
+        }
+        if !self.is_live(vgen) {
+            return OpenOutcome::Ignored;
         }
         self.ui.contacts.set(inner.views());
         drop(guard);
         // The peer learns what was read.
-        if read && let Err(e) = self.flush(&peer).await {
+        if read
+            && let Err(e) = self.flush(&peer).await
+            && self.is_live(vgen)
+        {
             self.ui.link.set(Link::Offline(e));
+        }
+        if !self.is_live(vgen) {
+            return OpenOutcome::Ignored;
         }
         let current = self.open_tracker.get();
         if current.was_deleted(generation) {
@@ -1704,11 +2057,14 @@ impl<V: VaultStore> Engine<V> {
             Some(start) => history_len.saturating_sub(start).max(HISTORY_SHOWN),
             None => HISTORY_SHOWN,
         };
+        let vgen = self.vault_gen();
         match self
             .load_history_window(inner, peer, history_len, limit)
             .await
         {
-            LoadedHistory::Loaded(page) if self.ui.open.get_untracked() == Some(*peer) => {
+            LoadedHistory::Loaded(page)
+                if self.is_live(vgen) && self.ui.open.get_untracked() == Some(*peer) =>
+            {
                 let has_older = page.loaded_start > 0;
                 *self.displayed_history.borrow_mut() = Some(DisplayedHistory {
                     peer: *peer,
@@ -1720,11 +2076,11 @@ impl<V: VaultStore> Engine<V> {
                 self.set_displayed_messages(*peer, page.messages, false);
                 true
             }
-            LoadedHistory::Failed(e) => {
+            LoadedHistory::Failed(e) if self.is_live(vgen) => {
                 self.ui.notify(e);
                 false
             }
-            LoadedHistory::Missing | LoadedHistory::Loaded(_) => false,
+            LoadedHistory::Failed(_) | LoadedHistory::Missing | LoadedHistory::Loaded(_) => false,
         }
     }
 
@@ -1732,8 +2088,9 @@ impl<V: VaultStore> Engine<V> {
     /// chat so unread messages before the tail page are reachable and acknowledged once displayed.
     /// Returns `Ok(true)` when at least one older row was prepended to `ui.messages`.
     pub async fn load_earlier(&self, peer: PublicKey) -> Result<bool, String> {
-        let mut guard = self.inner.lock().await;
-        if self.ui.open.get_untracked() != Some(peer) {
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) || self.ui.open.get_untracked() != Some(peer) {
             return Ok(false);
         }
         let Some(inner) = guard.as_mut() else {
@@ -1759,7 +2116,7 @@ impl<V: VaultStore> Engine<V> {
             LoadedHistory::Missing => return Ok(false),
             LoadedHistory::Failed(e) => return Err(e),
         };
-        if self.ui.open.get_untracked() != Some(peer) {
+        if !self.is_live(vgen) || self.ui.open.get_untracked() != Some(peer) {
             return Ok(false);
         }
         let still_at_boundary = self
@@ -1813,13 +2170,19 @@ impl<V: VaultStore> Engine<V> {
         self.ui.has_older_messages.set(has_older);
         let read = self.acknowledge_displayed_window(inner, &peer);
         if read && let Err(e) = inner.save_state().await {
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
             self.ui.notify(describe(&e));
+        }
+        if !self.is_live(vgen) {
+            return Ok(false);
         }
         self.ui.contacts.set(inner.views());
         drop(guard);
         // Schedule receipt delivery asynchronously via the sync loop so local history paging never
         // blocks on a slow or stalled relay.
-        if read {
+        if read && self.is_live(vgen) {
             self.wake();
         }
         Ok(prepended)
@@ -1835,7 +2198,8 @@ impl<V: VaultStore> Engine<V> {
         peer: &PublicKey,
         force_reload: bool,
     ) -> bool {
-        if self.ui.open.get_untracked() != Some(*peer) {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) || self.ui.open.get_untracked() != Some(*peer) {
             return false;
         }
         if !force_reload && !is_page_visible() {
@@ -1849,6 +2213,7 @@ impl<V: VaultStore> Engine<V> {
             if self.show_history(inner, peer).await {
                 inner.saved_late.retain(|saved| saved != peer);
             } else if force_reload
+                && self.is_live(vgen)
                 && self.ui.open.get_untracked() == Some(*peer)
                 && inner.contact(peer).is_some()
             {
@@ -1856,16 +2221,19 @@ impl<V: VaultStore> Engine<V> {
                 return false;
             }
         }
-        if self.ui.open.get_untracked() != Some(*peer) || !is_page_visible() {
+        if !self.is_live(vgen) || self.ui.open.get_untracked() != Some(*peer) || !is_page_visible()
+        {
             return false;
         }
         if !self.acknowledge_displayed_window(inner, peer) {
             return false;
         }
-        if let Err(e) = inner.save_state().await {
+        if let Err(e) = inner.save_state().await
+            && self.is_live(vgen)
+        {
             self.ui.notify(describe(&e));
         }
-        true
+        self.is_live(vgen)
     }
 
     /// Count the displayed messages of the chat with `peer` as read, e.g. back on the page with
@@ -1873,21 +2241,24 @@ impl<V: VaultStore> Engine<V> {
     /// pending `saved_late` / staged `unsaved` entries), reload history first and acknowledge only
     /// what is actually displayed.
     pub async fn mark_read(&self, peer: PublicKey) {
-        let mut guard = self.inner.lock().await;
-        // Re-check after acquiring the mutex: `close_chat` can clear `ui.open` (or the tab can
-        // hide again) while a prior `receive` held `inner`.
-        if self.ui.open.get_untracked() != Some(peer) || !is_page_visible() {
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        // Re-check after acquiring the mutex: `close_chat` or `pagehide` can clear `ui.open` (or
+        // the tab can hide again) while a prior `receive` held `inner`.
+        if !self.is_live(vgen) || self.ui.open.get_untracked() != Some(peer) || !is_page_visible() {
             return;
         }
         let Some(inner) = guard.as_mut() else {
             return;
         };
-        if !self.reconcile_open_chat_read(inner, &peer, false).await {
+        if !self.reconcile_open_chat_read(inner, &peer, false).await || !self.is_live(vgen) {
             return;
         }
         self.ui.contacts.set(inner.views());
         drop(guard);
-        if let Err(e) = self.flush(&peer).await {
+        if let Err(e) = self.flush(&peer).await
+            && self.is_live(vgen)
+        {
             self.ui.link.set(Link::Offline(e));
         }
     }
@@ -1897,8 +2268,12 @@ impl<V: VaultStore> Engine<V> {
     /// the peer immediately. Refuses while the contact is quarantined pending explicit classical
     /// approval or post-quantum upgrade.
     pub async fn accept(&self, peer: PublicKey, name: String) -> Result<(), String> {
+        let vgen = self.vault_gen();
         {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             inner
                 .with_contact_tx(&peer, async |inner| {
@@ -1916,15 +2291,29 @@ impl<V: VaultStore> Engine<V> {
                     inner.save(&[]).await.map_err(|e| describe(&e))
                 })
                 .await?;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             // Register write token BEFORE pushing `Events { accepted: true }` so the peer's
             // follow-up messages are immediately accepted on our DO.
             let _ = self.flush_pending_grants_for(inner, &peer).await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             self.ui.contacts.set(inner.views());
+        }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
         }
         // Wake the peer immediately with `Events { accepted: true }` + any read receipts.
         let _ = self.flush(&peer).await;
-        self.wake();
+        if self.is_live(vgen) {
+            self.wake();
+        }
         Ok(())
     }
 
@@ -1938,7 +2327,11 @@ impl<V: VaultStore> Engine<V> {
         peer: PublicKey,
         change: impl FnOnce(&mut Contact),
     ) -> Result<(), String> {
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         inner
             .with_contact_tx(&peer, async |inner| {
@@ -1949,6 +2342,9 @@ impl<V: VaultStore> Engine<V> {
                 inner.save(&[]).await.map_err(|e| describe(&e))
             })
             .await?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.ui.contacts.set(inner.views());
         Ok(())
     }
@@ -1975,10 +2371,14 @@ impl<V: VaultStore> Engine<V> {
     }
 
     async fn delete_inner(&self, peer: PublicKey, require_isolated: bool) -> Result<(), String> {
-        if !crate::glue::owns_lock() {
+        let vgen = self.vault_gen();
+        if !crate::glue::owns_lock() || !self.is_live(vgen) {
             return Err("page is closing; tab lock released".into());
         }
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         if require_isolated && !inner.is_isolated_peer(&peer) {
             return Err("That contact is no longer isolated.".to_string());
@@ -2083,6 +2483,9 @@ impl<V: VaultStore> Engine<V> {
             }
             return Err(describe(&e));
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.clear_approval_backoff(&peer);
         // Its uploads stop, as cancelled, and keep nothing more: the vault forgot them with the
         // chat, which `may_keep` now tells them is gone.
@@ -2186,10 +2589,17 @@ impl<V: VaultStore> Engine<V> {
         if let Ok(peer) = PublicKey::try_from(raw_peer.as_slice()) {
             return self.delete_inner(peer, true).await;
         }
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         if !inner.delete_isolated_raw(&raw_peer).await? {
             return Err("That isolated contact record was already removed.".to_string());
+        }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
         }
         self.ui.isolated_contacts.set(inner.isolated_views());
         self.ui
@@ -2200,12 +2610,19 @@ impl<V: VaultStore> Engine<V> {
     /// Go by `name` in the greetings of new chats.
     pub async fn set_name(&self, name: String) -> Result<(), String> {
         let name = checked_name(&name)?;
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         let prev_name = std::mem::replace(&mut inner.state.name, name);
         if let Err(e) = inner.save(&[]).await {
             inner.state.name = prev_name;
             return Err(describe(&e));
+        }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
         }
         self.ui.me.set(Some(inner.me()));
         Ok(())
@@ -2416,7 +2833,7 @@ impl<V: VaultStore> Inner<V> {
     ) -> crate::vault::Result<()> {
         let state = self.app_state();
         let deferred = self.deferred_record();
-        if !crate::glue::owns_lock() {
+        if !crate::glue::owns_lock() || crate::glue::lock_generation() != self.lock_generation {
             return Err(crate::vault::Error::Storage(
                 "page is closing; tab lock released".into(),
             ));
@@ -2447,6 +2864,11 @@ impl<V: VaultStore> Inner<V> {
         state: AppState,
         deferred: DeferredRecord,
     ) -> crate::vault::Result<()> {
+        if !crate::glue::owns_lock() || crate::glue::lock_generation() != self.lock_generation {
+            return Err(crate::vault::Error::Storage(
+                "page is closing; tab lock released".into(),
+            ));
+        }
         let unsaved = self
             .unsaved
             .iter()
@@ -2534,6 +2956,7 @@ impl<V: VaultStore> Inner<V> {
             .collect();
         Self {
             vault,
+            lock_generation: crate::glue::lock_generation(),
             server,
             audience,
             state,
@@ -2695,7 +3118,7 @@ impl<V: VaultStore> Inner<V> {
     ) -> crate::vault::Result<()> {
         let state = self.app_state();
         let deferred = self.deferred_record();
-        if !crate::glue::owns_lock() {
+        if !crate::glue::owns_lock() || crate::glue::lock_generation() != self.lock_generation {
             return Err(crate::vault::Error::Storage(
                 "page is closing; tab lock released".into(),
             ));
@@ -2886,7 +3309,11 @@ impl<V: VaultStore> Inner<V> {
 impl<V: VaultStore> Engine<V> {
     /// Show `views`, new in the chat with `peer`, if it is on screen, in its order.
     fn show_new(&self, inner: &Inner<impl VaultStore>, peer: &PublicKey, views: Vec<MessageView>) {
-        if self.ui.open.get_untracked() != Some(*peer) || views.is_empty() {
+        if self.shutting_down.get()
+            || crate::glue::lock_released()
+            || self.ui.open.get_untracked() != Some(*peer)
+            || views.is_empty()
+        {
             return;
         }
         let me = inner.client.identity_key();
@@ -2939,7 +3366,11 @@ impl<V: VaultStore> Engine<V> {
         peer: &PublicKey,
         entries: &[(u64, HistoryEntry)],
     ) {
-        if self.ui.open.get_untracked() != Some(*peer) || entries.is_empty() {
+        if self.shutting_down.get()
+            || crate::glue::lock_released()
+            || self.ui.open.get_untracked() != Some(*peer)
+            || entries.is_empty()
+        {
             return;
         }
         let me = inner.client.identity_key();

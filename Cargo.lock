@@ -1400,6 +1400,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "e2ee_chat_kdf"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "console_error_panic_hook",
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
+ "zeroize",
+]
+
+[[package]]
 name = "e2ee_chat_preview"
 version = "0.3.0"
 dependencies = [
@@ -1466,7 +1478,6 @@ dependencies = [
 name = "e2ee_chat_web"
 version = "0.3.0"
 dependencies = [
- "argon2",
  "base64 0.23.1",
  "bytes",
  "chacha20poly1305",
@@ -1474,6 +1485,7 @@ dependencies = [
  "const-hex",
  "crc32fast",
  "csv",
+ "e2ee_chat_kdf",
  "e2ee_chat_preview",
  "flate2",
  "form_urlencoded",

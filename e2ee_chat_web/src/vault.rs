@@ -32,7 +32,6 @@ use std::{
     fmt,
 };
 
-use argon2::{Algorithm, Argon2, Params, Version};
 use bytes::Bytes;
 use chacha20poly1305::{
     AeadCore, KeyInit, XChaCha20Poly1305,
@@ -50,6 +49,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     content::{Content, Events, Kind},
+    kdf_worker::{KdfCancelToken, KdfError, derive_kek_async},
     preview::{self, Sort},
     state::{Delivery, LastMessage, LastMessageKind},
     util::hex,
@@ -467,7 +467,7 @@ fn verify_checked_header(expected: &VaultHeader, raw: &[u8]) -> Result<VaultHead
     Ok(expected.clone())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 fn reseal_state_for_next_revision(
     state_key: &[u8; 32],
     current: &VaultHeader,
@@ -498,17 +498,69 @@ impl VaultHeader {
     }
 
     /// Create a fresh v3 header with random salt, random 16B `vault_id`, and a random 32B
-    /// `root_key` wrapped under the Argon2id KEK derived from `passphrase`. Immediately drops
-    /// both `kek` and `root_key`, returning `(header, VaultKeys)`.
-    pub fn create_with_passphrase(passphrase: &[u8]) -> Result<(Self, VaultKeys)> {
-        Self::create_with_params(
+    /// `root_key` wrapped under the Argon2id KEK derived via the ephemeral `vault_kdf` worker (on
+    /// `wasm32`) or `e2ee_chat_kdf` (on host). Immediately drops both `kek` and `root_key`.
+    pub async fn create_with_passphrase_async(
+        passphrase: &[u8],
+        cancel: &KdfCancelToken,
+    ) -> Result<(Self, VaultKeys)> {
+        Self::create_with_params_async(
             passphrase,
             ARGON2_DEFAULT_MEMORY,
             ARGON2_DEFAULT_ITERATIONS,
             ARGON2_DEFAULT_PARALLELISM,
+            cancel,
         )
+        .await
     }
 
+    async fn create_with_params_async(
+        passphrase: &[u8],
+        memory: u32,
+        iterations: u32,
+        parallelism: u32,
+        cancel: &KdfCancelToken,
+    ) -> Result<(Self, VaultKeys)> {
+        let mut salt = vec![0u8; 16];
+        getrandom::fill(&mut salt)
+            .map_err(|e| Error::Storage(format!("random salt generation failed: {e}")))?;
+        let mut vault_id = vec![0u8; VAULT_ID_LEN];
+        getrandom::fill(&mut vault_id)
+            .map_err(|e| Error::Storage(format!("random vault_id generation failed: {e}")))?;
+        let mut root_key = Zeroizing::new([0u8; 32]);
+        getrandom::fill(root_key.as_mut_slice())
+            .map_err(|e| Error::Storage(format!("random root key generation failed: {e}")))?;
+
+        let mut header = Self {
+            salt,
+            memory,
+            iterations,
+            parallelism,
+            version: VAULT_VERSION_V3,
+            revision: 1,
+            vault_id,
+            wrapped_root_key: vec![0u8; WRAPPED_ROOT_KEY_LEN],
+        };
+        header.validate()?;
+        let kek = derive_kek_async(
+            passphrase,
+            &header.salt,
+            header.memory,
+            header.iterations,
+            header.parallelism,
+            cancel,
+        )
+        .await?;
+        let wrap_aad = root_key_wrap_aad(&header);
+        header.wrapped_root_key = try_seal_bytes(&kek, &wrap_aad, root_key.as_slice())?;
+        drop(kek);
+        header.validate()?;
+        let keys = VaultKeys::derive(&header.vault_id, &root_key);
+        drop(root_key);
+        Ok((header, keys))
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     fn create_with_params(
         passphrase: &[u8],
         memory: u32,
@@ -596,22 +648,23 @@ impl VaultHeader {
         Ok(())
     }
 
-    /// Derive the temporary 32-byte Argon2id KEK from `passphrase` after validating parameters.
+    /// Derive the temporary 32-byte Argon2id KEK synchronously on host targets.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn derive_kek(&self, passphrase: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
         self.validate()?;
-        let params = Params::new(self.memory, self.iterations, self.parallelism, Some(32))
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
-        let mut kek = Zeroizing::new([0; 32]);
-        Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
-            .hash_password_into(passphrase, &self.salt, kek.as_mut_slice())
-            .map_err(|e| Error::Corrupt(e.to_string()))?;
-        Ok(kek)
+        e2ee_chat_kdf::derive_kek(
+            passphrase,
+            &self.salt,
+            self.memory,
+            self.iterations,
+            self.parallelism,
+        )
+        .map_err(Error::Corrupt)
     }
 
-    /// Unwrap `wrapped_root_key` with `passphrase`, immediately drop the KEK and `root_key`, and
-    /// return the three HKDF-SHA256 subkeys.
-    pub fn unwrap_keys(&self, passphrase: &[u8]) -> Result<VaultKeys> {
-        let kek = self.derive_kek(passphrase)?;
+    /// Unwrap `wrapped_root_key` with `kek`, drop `kek` and `root_key`, and return the three
+    /// HKDF-SHA256 subkeys.
+    fn unwrap_keys_with_kek(&self, kek: Zeroizing<[u8; 32]>) -> Result<VaultKeys> {
         let wrap_aad = root_key_wrap_aad(self);
         let unwrapped =
             open_bytes(&kek, &wrap_aad, &self.wrapped_root_key).ok_or(Error::WrongPassphrase)?;
@@ -627,6 +680,34 @@ impl VaultHeader {
         let keys = VaultKeys::derive(&self.vault_id, &root_key);
         drop(root_key);
         Ok(keys)
+    }
+
+    /// Unwrap `wrapped_root_key` asynchronously via the ephemeral `vault_kdf` worker (on `wasm32`)
+    /// or `e2ee_chat_kdf` (on host), validating header bounds BEFORE spawning the worker.
+    pub async fn unwrap_keys_async(
+        &self,
+        passphrase: &[u8],
+        cancel: &KdfCancelToken,
+    ) -> Result<VaultKeys> {
+        self.validate()?;
+        let kek = derive_kek_async(
+            passphrase,
+            &self.salt,
+            self.memory,
+            self.iterations,
+            self.parallelism,
+            cancel,
+        )
+        .await?;
+        self.unwrap_keys_with_kek(kek)
+    }
+
+    /// Synchronous host-only unwrap for unit tests.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn unwrap_keys(&self, passphrase: &[u8]) -> Result<VaultKeys> {
+        let kek = self.derive_kek(passphrase)?;
+        self.unwrap_keys_with_kek(kek)
     }
 }
 
@@ -651,7 +732,7 @@ pub fn try_seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Result<Ve
 }
 
 /// Encrypt `plaintext` under `key` with XChaCha20-Poly1305 and associated data `aad`.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub fn seal_bytes(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     try_seal_bytes(key, aad, plaintext).expect("XChaCha20-Poly1305 sealing in tests")
 }
@@ -1353,7 +1434,7 @@ impl OutgoingRecord {
 
     /// Build a wire [`PushV2Request`] for `recipient` if this record holds a valid sealed message
     /// and 32-byte `write_token`.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub fn to_push_v2_request(&self, recipient: &PublicKey) -> Option<PushV2Request> {
         let message = self.message.clone()?;
         let write_token: [u8; 32] = self.write_token.as_slice().try_into().ok()?;
@@ -1598,6 +1679,10 @@ pub enum Error {
     Storage(String),
     /// The passphrase does not open the vault.
     WrongPassphrase,
+    /// Key derivation was explicitly cancelled by the user or aborted on `pagehide`.
+    Cancelled,
+    /// The ephemeral `vault_kdf` worker failed or timed out.
+    Kdf(String),
     /// Existing vault has an unsupported/legacy schema version (detected pre-KDF).
     IncompatibleVersion(u32),
     /// A record does not decode, failed parameter validation, or failed rollback/integrity check.
@@ -1611,6 +1696,8 @@ impl fmt::Display for Error {
         match self {
             Self::Storage(e) => write!(f, "the browser's storage failed: {e}"),
             Self::WrongPassphrase => write!(f, "wrong passphrase"),
+            Self::Cancelled => write!(f, "key derivation was cancelled"),
+            Self::Kdf(e) => f.write_str(e),
             Self::IncompatibleVersion(v) => write!(
                 f,
                 "incompatible vault format version {v} (expected v{VAULT_VERSION_V3})"
@@ -1620,6 +1707,17 @@ impl fmt::Display for Error {
                 f,
                 "the vault was modified elsewhere (expected revision {expected}, found {actual}); reload this page"
             ),
+        }
+    }
+}
+
+impl From<KdfError> for Error {
+    fn from(error: KdfError) -> Self {
+        match error {
+            KdfError::Cancelled => Self::Cancelled,
+            KdfError::InvalidParams(msg) => Self::Corrupt(msg),
+            KdfError::Timeout => Self::Kdf(error.to_string()),
+            KdfError::Worker(msg) => Self::Kdf(msg),
         }
     }
 }
@@ -1641,6 +1739,8 @@ pub struct Vault {
     header: RefCell<VaultHeader>,
     /// Random non-zero vault-instance epoch bound into per-record AADs.
     record_epoch: u64,
+    /// Monotonic `glue::lock_generation()` captured when this vault was created/opened.
+    lock_generation: u64,
     /// Authoritative upload checkpoints persisted inside `STATE`.
     upload_checkpoints: RefCell<Vec<UploadCheckpoint>>,
     /// Authoritative per-outbox-record revisions persisted inside `STATE`.
@@ -1649,10 +1749,19 @@ pub struct Vault {
     peer_storage: RefCell<BTreeMap<PublicKey, PeerStorageIndex>>,
 }
 
-/// Fail closed before opening or mutating any IndexedDB transaction once `pagehide` has released
-/// this tab's exclusive Web Lock (or if the lock is not held).
-fn ensure_vault_lock_owned() -> Result<()> {
-    if !crate::glue::owns_lock() {
+impl Drop for Vault {
+    fn drop(&mut self) {
+        self.database.close();
+    }
+}
+
+/// Fail closed before opening or committing any IndexedDB transaction once `pagehide` has released
+/// this tab's exclusive Web Lock or bumped `glue::lock_generation()`.
+fn ensure_vault_lock_owned(expected_generation: u64) -> Result<()> {
+    if !crate::glue::owns_lock()
+        || crate::glue::lock_released()
+        || crate::glue::lock_generation() != expected_generation
+    {
         return Err(Error::Storage("page is closing; tab lock released".into()));
     }
     Ok(())
@@ -1755,11 +1864,26 @@ impl Vault {
         Ok(VaultPresence::Compatible)
     }
 
+    fn ensure_lock_owned(&self) -> Result<()> {
+        ensure_vault_lock_owned(self.lock_generation)
+    }
+
     /// A new v3 vault holding `state`, under `passphrase`, replacing any other.
-    pub async fn create(passphrase: &[u8], state: &AppState) -> Result<Self> {
-        ensure_vault_lock_owned()?;
+    pub async fn create(
+        passphrase: &[u8],
+        state: &AppState,
+        cancel: &KdfCancelToken,
+    ) -> Result<Self> {
+        let lock_generation = crate::glue::lock_generation();
+        ensure_vault_lock_owned(lock_generation)?;
+        let (header, keys) = VaultHeader::create_with_passphrase_async(passphrase, cancel).await?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        ensure_vault_lock_owned(lock_generation)?;
         let database = open().await?;
-        let (header, keys) = VaultHeader::create_with_passphrase(passphrase)?;
+        let close_on_err = scopeguard::guard(&database, |db| db.close());
+        ensure_vault_lock_owned(lock_generation)?;
         let header_bytes = header.encode_to_vec();
         let record_epoch = generate_record_epoch()?;
         let mut state_to_save = state.clone();
@@ -1768,18 +1892,20 @@ impl Vault {
         state_to_save.outbox_revisions.clear();
         state_to_save.peer_storage.clear();
         state_to_save.deferred_initials_digest = deferred_record_digest(&DeferredRecord::default());
+        scopeguard::ScopeGuard::into_inner(close_on_err);
         let vault = Self {
             database,
             keys,
             header: RefCell::new(header.clone()),
             record_epoch,
+            lock_generation,
             upload_checkpoints: RefCell::new(Vec::new()),
             outbox_revisions: RefCell::new(BTreeMap::new()),
             peer_storage: RefCell::new(BTreeMap::new()),
         };
         let sealed_state = vault.seal_state(&state_v3_aad(&header_bytes), &state_to_save)?;
         state_to_save.zeroize_secrets();
-        ensure_vault_lock_owned()?;
+        vault.ensure_lock_owned()?;
         let transaction = vault
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
@@ -1795,16 +1921,23 @@ impl Vault {
             return Err(e);
         }
         commit(transaction).await?;
+        vault.ensure_lock_owned()?;
         write_rollback_anchor(&RollbackAnchor::for_v3_header(&header));
         Ok(vault)
     }
 
     /// Open the v3 vault with `passphrase`, enforcing pre-KDF header/version/anchor validation,
-    /// KEK unwrapping, HKDF subkey derivation, and strict deferred sidecar digest verification.
-    pub async fn unlock(passphrase: &[u8]) -> Result<(Self, AppState, DeferredRecord)> {
-        ensure_vault_lock_owned()?;
+    /// ephemeral worker KDF + KEK unwrapping, HKDF subkey derivation, and strict deferred sidecar
+    /// digest verification.
+    pub async fn unlock(
+        passphrase: &[u8],
+        cancel: &KdfCancelToken,
+    ) -> Result<(Self, AppState, DeferredRecord)> {
+        let lock_generation = crate::glue::lock_generation();
+        ensure_vault_lock_owned(lock_generation)?;
         let database = open().await?;
-        ensure_vault_lock_owned()?;
+        let close_on_err = scopeguard::guard(&database, |db| db.close());
+        ensure_vault_lock_owned(lock_generation)?;
         // Read HEADER and STATE in one consistent ReadOnly snapshot.
         let (header_bytes, sealed_state) = {
             let tx = database.transaction(&[STORE], TransactionMode::ReadOnly)?;
@@ -1821,6 +1954,7 @@ impl Vault {
                 .ok_or_else(|| Error::Corrupt("no state".into()))?;
             (header, state)
         };
+        ensure_vault_lock_owned(lock_generation)?;
         let header = VaultHeader::decode(header_bytes.as_slice())
             .map_err(|e| Error::Corrupt(e.to_string()))?;
         // Validate version, revision, salt, Argon2 bounds, vault_id, wrapped_root_key, and
@@ -1829,7 +1963,11 @@ impl Vault {
         let anchor = read_rollback_anchor();
         check_unlock_against_anchor(anchor.as_ref(), &header)?;
 
-        let keys = header.unwrap_keys(passphrase)?;
+        let keys = header.unwrap_keys_async(passphrase, cancel).await?;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        ensure_vault_lock_owned(lock_generation)?;
         let plain = open_bytes(&keys.state_key, &state_v3_aad(&header_bytes), &sealed_state)
             .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
         let state =
@@ -1840,23 +1978,27 @@ impl Vault {
 
         let deferred_key = opaque_deferred_key(&keys.idb_mac_key);
         let sealed_deferred = get(&database, &deferred_key).await?;
+        ensure_vault_lock_owned(lock_generation)?;
         let deferred = match sealed_deferred {
             Some(sealed) => open_deferred(&keys.record_key, state.record_epoch, &sealed)?,
             None => DeferredRecord::default(),
         };
         verify_deferred_record_digest(&state.deferred_initials_digest, &deferred)?;
 
+        ensure_vault_lock_owned(lock_generation)?;
         let next_anchor = advance_anchor(anchor.as_ref(), &header);
         write_rollback_anchor(&next_anchor);
         let record_epoch = state.record_epoch;
         let checkpoints = state.upload_checkpoints.clone();
         let outbox_revs = outbox_revisions_from_proto(&state.outbox_revisions);
         let peer_storage = peer_storage_from_proto(&state.peer_storage);
+        scopeguard::ScopeGuard::into_inner(close_on_err);
         let vault = Self {
             database,
             keys,
             header: RefCell::new(header),
             record_epoch,
+            lock_generation,
             upload_checkpoints: RefCell::new(checkpoints),
             outbox_revisions: RefCell::new(outbox_revs),
             peer_storage: RefCell::new(peer_storage),
@@ -1864,12 +2006,12 @@ impl Vault {
         Ok((vault, state, deferred))
     }
 
-    /// Open an IndexedDB RW transaction and enforce lock ownership plus monotonic CAS revision
-    /// BEFORE any writes.
+    /// Open an IndexedDB RW transaction and enforce lock ownership, generation match, plus
+    /// monotonic CAS revision BEFORE any writes.
     async fn begin_checked_rw_tx(
         &self,
     ) -> Result<(idb::Transaction, idb::ObjectStore, VaultHeader)> {
-        ensure_vault_lock_owned()?;
+        self.ensure_lock_owned()?;
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
@@ -1881,7 +2023,7 @@ impl Vault {
                 return Err(Error::Corrupt("vault header missing".into()));
             }
         };
-        if let Err(e) = ensure_vault_lock_owned() {
+        if let Err(e) = self.ensure_lock_owned() {
             let _ = transaction.abort();
             return Err(e);
         }
@@ -1985,6 +2127,7 @@ impl Vault {
             return Err(e);
         }
         commit(transaction).await?;
+        self.ensure_lock_owned()?;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
         *self.peer_storage.borrow_mut() = next_peer_storage;
         self.commit_header_and_anchor(next_header);
@@ -2060,10 +2203,12 @@ impl Vault {
     }
 
     async fn file_data(&self, peer: &PublicKey, index: u64) -> Result<Option<Vec<u8>>> {
+        self.ensure_lock_owned()?;
         let key = opaque_file_key(&self.keys.idb_mac_key, peer, index);
         let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
         };
+        self.ensure_lock_owned()?;
         let record = open_bytes(
             &self.keys.record_key,
             &file_aad(peer, index, self.record_epoch),
@@ -2101,10 +2246,12 @@ impl Vault {
 
     /// The history entry `index` of the chat with `peer`, without its file, if any.
     pub async fn entry(&self, peer: &PublicKey, index: u64) -> Result<Option<HistoryEntry>> {
+        self.ensure_lock_owned()?;
         let key = opaque_history_key(&self.keys.idb_mac_key, peer, index);
         let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
         };
+        self.ensure_lock_owned()?;
         let entry = open_bytes(
             &self.keys.record_key,
             &history_aad(peer, index, self.record_epoch),
@@ -2119,10 +2266,12 @@ impl Vault {
     /// The record of the message waiting to be pushed that is the history entry `index` of the
     /// chat with `peer`.
     pub async fn outgoing(&self, peer: &PublicKey, index: u64) -> Result<OutgoingRecord> {
+        self.ensure_lock_owned()?;
         let key = opaque_outbox_key(&self.keys.idb_mac_key, peer, index);
         let sealed = get(&self.database, &key)
             .await?
             .ok_or_else(|| Error::Corrupt(format!("outbox record {index} is missing")))?;
+        self.ensure_lock_owned()?;
         let expected_rev = self
             .outbox_revisions
             .borrow()
@@ -2146,6 +2295,7 @@ impl Vault {
         history_len: u64,
         limit: u64,
     ) -> Result<Vec<(u64, HistoryEntry)>> {
+        self.ensure_lock_owned()?;
         let Some((first, last)) = history_bounds(history_len, limit) else {
             return Ok(vec![]);
         };
@@ -2163,6 +2313,7 @@ impl Vault {
             let Some(value) = req.await? else {
                 continue;
             };
+            self.ensure_lock_owned()?;
             let sealed = Uint8Array::new(&value).to_vec();
             let plain = open_bytes(
                 &self.keys.record_key,
@@ -2209,7 +2360,7 @@ impl Vault {
                 .get(JsValue::from_str(STATE))?
                 .await?
                 .ok_or_else(|| Error::Corrupt("no state".into()))?;
-            ensure_vault_lock_owned()?;
+            self.ensure_lock_owned()?;
             let state_bytes = Uint8Array::new(&state_raw).to_vec();
             let plain = open_bytes(
                 &self.keys.state_key,
@@ -2247,6 +2398,7 @@ impl Vault {
             }
         };
         commit(transaction).await?;
+        self.ensure_lock_owned()?;
         *self.peer_storage.borrow_mut() = next_peer_storage;
         self.commit_header_and_anchor(next);
         Ok(())
@@ -2254,8 +2406,11 @@ impl Vault {
 
     /// Chunk `index` of the attachment `id`, in the chat with `peer`, if kept.
     pub async fn chunk(&self, peer: &PublicKey, id: &[u8], index: u32) -> Result<Option<Vec<u8>>> {
+        self.ensure_lock_owned()?;
         let key = opaque_chunk_key(&self.keys.idb_mac_key, peer, id, index);
-        get(&self.database, &key).await
+        let chunk = get(&self.database, &key).await?;
+        self.ensure_lock_owned()?;
+        Ok(chunk)
     }
 
     /// How many chunks of the attachment `id`, in the chat with `peer`, are kept (O(1) bitmap count).
@@ -2371,6 +2526,7 @@ impl Vault {
             return Err(e);
         }
         commit(transaction).await?;
+        self.ensure_lock_owned()?;
         *self.upload_checkpoints.borrow_mut() = next_checkpoints;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
         *self.peer_storage.borrow_mut() = next_peer_storage;
@@ -2399,7 +2555,7 @@ impl Vault {
                 .get(JsValue::from_str(STATE))?
                 .await?
                 .ok_or_else(|| Error::Corrupt("no state".into()))?;
-            ensure_vault_lock_owned()?;
+            self.ensure_lock_owned()?;
             let state_bytes = Uint8Array::new(&state_raw).to_vec();
             let plain = open_bytes(
                 &self.keys.state_key,
@@ -2457,6 +2613,7 @@ impl Vault {
             }
         };
         commit(transaction).await?;
+        self.ensure_lock_owned()?;
         *self.upload_checkpoints.borrow_mut() = next_checkpoints;
         self.commit_header_and_anchor(next);
         Ok(())
@@ -2464,10 +2621,12 @@ impl Vault {
 
     /// The upload `id`, in the chat with `peer`, if kept and matching its `STATE` checkpoint.
     pub async fn upload(&self, peer: &PublicKey, id: &[u8]) -> Result<Option<PendingUpload>> {
+        self.ensure_lock_owned()?;
         let key = opaque_upload_key(&self.keys.idb_mac_key, peer, id);
         let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
         };
+        self.ensure_lock_owned()?;
         let checkpoints = self.upload_checkpoints.borrow();
         let cp = find_upload_checkpoint(&checkpoints, peer, id).ok_or_else(|| {
             Error::Corrupt("upload record missing authenticated upload checkpoint".into())
@@ -2492,6 +2651,7 @@ impl Vault {
         &self,
         peer: Option<&PublicKey>,
     ) -> Result<Vec<(PublicKey, PendingUpload)>> {
+        self.ensure_lock_owned()?;
         let matching: Vec<(PublicKey, UploadCheckpoint)> = self
             .upload_checkpoints
             .borrow()
@@ -2522,6 +2682,7 @@ impl Vault {
             let Some(val) = req.await? else {
                 continue;
             };
+            self.ensure_lock_owned()?;
             let sealed = Uint8Array::new(&val).to_vec();
             if let Some(upload) = decode_upload_with_checkpoint(
                 &self.keys.record_key,
@@ -2643,6 +2804,7 @@ impl Vault {
             return Err(e);
         }
         commit(transaction).await?;
+        self.ensure_lock_owned()?;
         *self.upload_checkpoints.borrow_mut() = next_checkpoints;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
         *self.peer_storage.borrow_mut() = next_peer_storage;
@@ -2652,10 +2814,11 @@ impl Vault {
 
     /// Delete the vault for good and clear both v1 and v3 external rollback anchors.
     pub async fn destroy() -> Result<()> {
-        ensure_vault_lock_owned()?;
+        let lock_generation = crate::glue::lock_generation();
+        ensure_vault_lock_owned(lock_generation)?;
         let database = open().await?;
         let result: Result<()> = async {
-            ensure_vault_lock_owned()?;
+            ensure_vault_lock_owned(lock_generation)?;
             let transaction = database.transaction(&[STORE], TransactionMode::ReadWrite)?;
             transaction.object_store(STORE)?.clear()?;
             commit(transaction).await?;
@@ -2664,6 +2827,7 @@ impl Vault {
         .await;
         database.close();
         result?;
+        ensure_vault_lock_owned(lock_generation)?;
         clear_rollback_anchor();
         Ok(())
     }
@@ -2727,9 +2891,36 @@ fn bytes(bytes: &[u8]) -> JsValue {
     Uint8Array::from(bytes).into()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn argon2_bounds_match_kdf_crate() {
+        assert_eq!(ARGON2_MEMORY_MIN, e2ee_chat_kdf::ARGON2_MEMORY_MIN);
+        assert_eq!(ARGON2_MEMORY_MAX, e2ee_chat_kdf::ARGON2_MEMORY_MAX);
+        assert_eq!(ARGON2_DEFAULT_MEMORY, e2ee_chat_kdf::ARGON2_DEFAULT_MEMORY);
+        assert_eq!(ARGON2_ITERATIONS_MIN, e2ee_chat_kdf::ARGON2_ITERATIONS_MIN);
+        assert_eq!(ARGON2_ITERATIONS_MAX, e2ee_chat_kdf::ARGON2_ITERATIONS_MAX);
+        assert_eq!(
+            ARGON2_DEFAULT_ITERATIONS,
+            e2ee_chat_kdf::ARGON2_DEFAULT_ITERATIONS
+        );
+        assert_eq!(
+            ARGON2_PARALLELISM_MIN,
+            e2ee_chat_kdf::ARGON2_PARALLELISM_MIN
+        );
+        assert_eq!(
+            ARGON2_PARALLELISM_MAX,
+            e2ee_chat_kdf::ARGON2_PARALLELISM_MAX
+        );
+        assert_eq!(
+            ARGON2_DEFAULT_PARALLELISM,
+            e2ee_chat_kdf::ARGON2_DEFAULT_PARALLELISM
+        );
+        assert_eq!(ARGON2_SALT_MIN, e2ee_chat_kdf::ARGON2_SALT_MIN);
+        assert_eq!(ARGON2_SALT_MAX, e2ee_chat_kdf::ARGON2_SALT_MAX);
+    }
 
     fn test_header_and_keys(passphrase: &[u8]) -> (VaultHeader, VaultKeys) {
         VaultHeader::create_with_params(passphrase, ARGON2_MEMORY_MIN, 1, 1)
@@ -3250,6 +3441,8 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn vault_v3_create_save_opaque_keys_chunks_uploads_forget_and_destroy() {
+        let _kdf = crate::kdf_worker::install_test_kdf_worker();
+        let cancel = KdfCancelToken::new();
         clean_browser_vault().await;
 
         // Real browser Web Lock exclusivity: a second acquisition attempt while held fails closed.
@@ -3262,11 +3455,11 @@ mod wasm_tests {
             let _released = LockReleaseGuard::released();
             assert!(!crate::glue::owns_lock());
             assert!(matches!(
-                Vault::create(b"locked-out", &AppState::default()).await,
+                Vault::create(b"locked-out", &AppState::default(), &cancel).await,
                 Err(Error::Storage(_))
             ));
             assert!(matches!(
-                Vault::unlock(b"locked-out").await,
+                Vault::unlock(b"locked-out", &cancel).await,
                 Err(Error::Storage(_))
             ));
             assert!(matches!(Vault::destroy().await, Err(Error::Storage(_))));
@@ -3278,7 +3471,7 @@ mod wasm_tests {
             server: "https://chat.example.com".to_string(),
             ..AppState::default()
         };
-        let vault = Vault::create(b"correct-horse-battery", &initial_state)
+        let vault = Vault::create(b"correct-horse-battery", &initial_state, &cancel)
             .await
             .expect("Vault::create");
         assert_eq!(
@@ -3440,14 +3633,15 @@ mod wasm_tests {
 
         // Wrong passphrase fails cleanly without disturbing stored records.
         assert!(matches!(
-            Vault::unlock(b"wrong-passphrase").await,
+            Vault::unlock(b"wrong-passphrase", &cancel).await,
             Err(Error::WrongPassphrase)
         ));
 
         // Reopen with correct passphrase and verify every record round-trips.
-        let (reopened, restored_state, restored_deferred) = Vault::unlock(b"correct-horse-battery")
-            .await
-            .expect("Vault::unlock");
+        let (reopened, restored_state, restored_deferred) =
+            Vault::unlock(b"correct-horse-battery", &cancel)
+                .await
+                .expect("Vault::unlock");
         assert_eq!(restored_state.name, "Alice Updated");
         assert_eq!(restored_state.pending_revokes.len(), 1);
         assert_ne!(restored_state.record_epoch, 0);
@@ -3485,6 +3679,20 @@ mod wasm_tests {
         assert_eq!(reopened.chunks_kept(&peer, &upload_id).await.unwrap(), 0);
         assert!(reopened.uploads(None).await.unwrap().is_empty());
 
+        // Bumping lock_generation (as pagehide does before releasing Web Lock) aborts reads & writes
+        // on an already-opened Vault handle even while `owns_lock()` is still true!
+        crate::glue::bump_lock_generation_for_test();
+        assert!(matches!(
+            reopened
+                .save(&restored_state, &empty_deferred, &[], &[])
+                .await,
+            Err(Error::Storage(_))
+        ));
+        assert!(matches!(
+            reopened.entry(&peer, 0).await,
+            Err(Error::Storage(_))
+        ));
+
         // Destroy clears BOTH v1 and v3 rollback anchors.
         set_raw_local_storage(LEGACY_ROLLBACK_ANCHOR_KEY, "v1:1:1:00");
         drop(reopened);
@@ -3493,6 +3701,8 @@ mod wasm_tests {
 
     #[wasm_bindgen_test]
     async fn vault_v3_rejects_incompatible_version_pre_kdf_and_rollback_anchor() {
+        let _kdf = crate::kdf_worker::install_test_kdf_worker();
+        let cancel = KdfCancelToken::new();
         clean_browser_vault().await;
 
         // Legacy v2 header with absurd Argon2 memory fails pre-KDF with IncompatibleVersion(2).
@@ -3516,13 +3726,13 @@ mod wasm_tests {
             VaultPresence::IncompatibleVersion(2)
         );
         assert!(matches!(
-            Vault::unlock(b"any").await,
+            Vault::unlock(b"any", &cancel).await,
             Err(Error::IncompatibleVersion(2))
         ));
 
         // Create a real v3 vault, advance revision to 2, then tamper anchor to test rejection.
         clean_browser_vault().await;
-        let vault = Vault::create(b"passphrase-rollback", &AppState::default())
+        let vault = Vault::create(b"passphrase-rollback", &AppState::default(), &cancel)
             .await
             .expect("create");
         let vault_id_hex = hex(&vault.header.borrow().vault_id);
@@ -3530,13 +3740,13 @@ mod wasm_tests {
 
         set_raw_local_storage(ROLLBACK_ANCHOR_KEY, &format!("v3:9:{vault_id_hex}"));
         assert!(matches!(
-            Vault::unlock(b"passphrase-rollback").await,
+            Vault::unlock(b"passphrase-rollback", &cancel).await,
             Err(Error::Corrupt(msg)) if msg.contains("behind anchor 9")
         ));
 
         set_raw_local_storage(ROLLBACK_ANCHOR_KEY, &format!("v3:1:{}", "ff".repeat(16)));
         assert!(matches!(
-            Vault::unlock(b"passphrase-rollback").await,
+            Vault::unlock(b"passphrase-rollback", &cancel).await,
             Err(Error::Corrupt(msg)) if msg.contains("vault_id does not match")
         ));
 

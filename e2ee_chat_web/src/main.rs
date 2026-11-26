@@ -6,6 +6,7 @@ mod content;
 mod engine;
 mod glue;
 mod icon;
+mod kdf_worker;
 mod notify;
 mod preview;
 mod qr;

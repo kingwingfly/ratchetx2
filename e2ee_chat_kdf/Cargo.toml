@@ -1,0 +1,22 @@
+[package]
+name = "e2ee_chat_kdf"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+description = "Ephemeral Argon2id KDF worker for the E2EE chat web client."
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
+zeroize.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook.workspace = true
+js-sys.workspace = true
+wasm-bindgen.workspace = true
+web-sys = { workspace = true, features = [
+    "DedicatedWorkerGlobalScope",
+    "MessageEvent",
+] }

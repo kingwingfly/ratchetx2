@@ -62,6 +62,7 @@ run env RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check --locked --targ
 run env RUSTFLAGS='--cfg getrandom_backend="custom"' cargo check --locked --target wasm32-unknown-unknown --features serde,prost -p session
 
 # The web client and the Worker, which enable the wasm_js backend themselves.
+run cargo clippy --locked --target wasm32-unknown-unknown -p e2ee_chat_kdf -- -D warnings
 run cargo clippy --locked --target wasm32-unknown-unknown -p e2ee_chat_web -p e2ee_chat_worker -- -D warnings
 run cargo clippy --locked --target wasm32-unknown-unknown --no-default-features -p e2ee_chat_web -- -D warnings
 run cargo clippy --locked --target wasm32-unknown-unknown --no-default-features --features ml-kem-768 -p e2ee_chat_web -- -D warnings

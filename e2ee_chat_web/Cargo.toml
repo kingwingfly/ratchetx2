@@ -16,7 +16,6 @@ ml-kem-768 = ["session/ml-kem-768", "party/ml-kem-768"]
 pq = ["ml-kem-1024", "ml-kem-768", "session/pq", "party/pq"]
 
 [dependencies]
-argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 base64.workspace = true
 bytes.workspace = true
 chacha20poly1305.workspace = true
@@ -116,6 +115,9 @@ zip = { version = "9.8", default-features = false }
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo-events = "0.2"
 gloo-timers = { version = "0.3", features = ["futures"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+e2ee_chat_kdf = { path = "../e2ee_chat_kdf" }
 
 [dev-dependencies]
 futures.workspace = true

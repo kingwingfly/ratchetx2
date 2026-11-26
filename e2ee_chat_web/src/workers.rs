@@ -329,6 +329,29 @@ fn stop(kind: Worker, calls: &Rc<Calls>, reason: &str) {
     calls.fail_all(reason);
 }
 
+/// Synchronously terminate every live preview worker, detach its event handlers, and reject all
+/// pending calls (called from `Engine::teardown_on_pagehide()`).
+pub(crate) fn terminate_all() {
+    let all: Vec<Rc<Running>> = RUNNING.with(|running| {
+        running
+            .borrow_mut()
+            .drain()
+            .map(|(_, worker)| worker)
+            .collect()
+    });
+    for running in all {
+        *running.listeners.borrow_mut() = None;
+        running.worker.terminate();
+        running.calls.fail_all("page is closing");
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn reset_manifest_cache() {
+    WORKER_MANIFEST.with(|cache| {
+        *cache.borrow_mut() = None;
+    });
+}
 /// What a call failed with, as text.
 fn failure(error: JsValue) -> String {
     error.as_string().unwrap_or_else(|| js_error(error))
@@ -570,12 +593,6 @@ mod wasm_tests {
     use web_sys::{Blob, BlobPropertyBag, Element, Url};
 
     use super::*;
-
-    fn reset_manifest_cache() {
-        WORKER_MANIFEST.with(|cache| {
-            *cache.borrow_mut() = None;
-        });
-    }
 
     struct ManifestMetaGuard {
         element: Element,
@@ -1107,5 +1124,27 @@ mod wasm_tests {
             markdown("recovered").await.as_deref(),
             Ok("<p>recovered</p>")
         );
+    }
+
+    #[wasm_bindgen_test]
+    async fn workers_terminate_all_stops_live_workers_and_fails_pending_calls() {
+        const HUNG_SEARCH_WORKER: &str = r#"
+            self.onmessage = (_event) => {
+                // Never reply so call stays pending until terminate_all() runs.
+            };
+            self.postMessage("ready");
+        "#;
+        let _harness = MockWorkerHarness::new(Worker::Search, &[HUNG_SEARCH_WORKER], Some(5_000));
+        spawn_local(async move {
+            crate::util::sleep(25).await;
+            assert!(current_start_id(Worker::Search).is_some());
+            terminate_all();
+            assert!(current_start_id(Worker::Search).is_none());
+        });
+        let err = find("secret text", "secret", false, false)
+            .await
+            .expect_err("terminate_all must reject in-flight worker call");
+        assert_eq!(err, "page is closing");
+        assert!(current_start_id(Worker::Search).is_none());
     }
 }

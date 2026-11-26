@@ -25,6 +25,10 @@ impl<V: VaultStore> Engine<V> {
     /// Push the messages waiting for `peer`, in order, each encrypted as its turn comes, then
     /// the events to tell the peer. Returns whether any went.
     pub(super) async fn flush(&self, peer: &PublicKey) -> Result<bool, String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
         if self.waits_sign_in.borrow().contains(peer) || self.is_approval_backed_off(peer) {
             return Ok(false);
         }
@@ -32,7 +36,10 @@ impl<V: VaultStore> Engine<V> {
         // having deleted the chat and started it again: taken first, it is sent on, rather than
         // another started, which the peer might set aside. If taking fails, one starts.
         let waits = {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
             guard.as_ref().is_some_and(|inner| {
                 inner.contacts.iter().any(|contact| {
                     contact.peer == *peer
@@ -44,7 +51,13 @@ impl<V: VaultStore> Engine<V> {
         if waits {
             let _ = self.take_initial_messages().await;
         }
-        let mut guard = self.inner.lock().await;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
         let Some(inner) = guard.as_mut() else {
             return Ok(false);
         };
@@ -52,6 +65,9 @@ impl<V: VaultStore> Engine<V> {
         // ensuring we never encrypt stale empty-content records after an earlier save failure.
         if inner.unsaved_state || inner.unsaved_outbox.iter().any(|(p, _, _)| p == peer) {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
+        }
+        if !self.is_live(vgen) {
+            return Ok(false);
         }
         // Never send or send receipts on a brand-new quarantined classical contact.
         if inner
@@ -62,6 +78,9 @@ impl<V: VaultStore> Engine<V> {
             return Ok(false);
         }
         if let Some(outcome) = inner.requeue_before_push(peer).await? {
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
             outcome.log_missing(&self.ui, peer);
             self.show_changes(inner, peer, &outcome.history);
         }
@@ -80,6 +99,9 @@ impl<V: VaultStore> Engine<V> {
         while let Some(contact) = inner.contact(peer)
             && let Some(outgoing) = contact.state.outbox.get(pushed_count).cloned()
         {
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
             // An attachment whose upload has not started: it, and what was sent after it, wait
             // for it to start.
             if outgoing.awaits_upload {
@@ -98,6 +120,7 @@ impl<V: VaultStore> Engine<V> {
                 // Encrypted now that it goes, so that its place is after what came so far; the
                 // ones after it wait their turn.
                 match inner.seal_next(peer).await {
+                    _ if !self.is_live(vgen) => return Ok(false),
                     Ok(SealOutcome::Ready) => {
                         if needed_new_session
                             && inner
@@ -119,6 +142,9 @@ impl<V: VaultStore> Engine<V> {
                             self.prepare_cancel_uploads_for_failed(inner, peer, &failed_indices)
                                 .await,
                         );
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
                         self.ui
                             .notify(format!("messages could not be sent: {reason}"));
                         if self.ui.open.get_untracked() == Some(*peer) {
@@ -132,6 +158,9 @@ impl<V: VaultStore> Engine<V> {
                             self.prepare_cancel_uploads_for_failed(inner, peer, &[dropped_index])
                                 .await,
                         );
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
                         self.ui.log(format!(
                             "Dropped corrupt pending message #{dropped_index} for {}: outbox record could not be recovered",
                             short(peer)
@@ -261,6 +290,7 @@ impl<V: VaultStore> Engine<V> {
                 })
                 .await
             {
+                _ if !self.is_live(vgen) => return Ok(false),
                 Ok(res) => res,
                 Err(e) => {
                     result = Err(e);
@@ -288,7 +318,9 @@ impl<V: VaultStore> Engine<V> {
                             contact.session.retire();
                         }
                         let _ = inner.save_state().await;
-                        self.ui.contacts.set(inner.views());
+                        if self.is_live(vgen) {
+                            self.ui.contacts.set(inner.views());
+                        }
                         break;
                     }
                     // Peer has not yet accepted our chat request: retry idempotent `SendInitialV2`
@@ -319,6 +351,9 @@ impl<V: VaultStore> Engine<V> {
                             }
                             let _ = inner.save_state().await;
                         }
+                    }
+                    if !self.is_live(vgen) {
+                        return Ok(false);
                     }
                     let delay_ms = self.record_approval_backoff(peer);
                     let label = inner
@@ -421,6 +456,9 @@ impl<V: VaultStore> Engine<V> {
                     }
                     return Err(describe(&e));
                 }
+                if !self.is_live(vgen) {
+                    return Ok(false);
+                }
                 self.show_changes(inner, peer, &entries);
                 let refused_indices: Vec<u64> = entries
                     .iter()
@@ -437,14 +475,14 @@ impl<V: VaultStore> Engine<V> {
         }
         // Not from a page that cannot sign in to the server, which takes no push from it: each
         // try would use up a key of the ratchet.
-        if result.is_ok() && signs_in_here {
+        if result.is_ok() && signs_in_here && self.is_live(vgen) {
             match self.push_events(inner, peer).await {
                 Ok(told) => changed |= told,
                 Err(e) => result = Err(e),
             }
         }
         drop(guard);
-        if !server_deletes.is_empty() {
+        if !server_deletes.is_empty() && self.is_live(vgen) {
             self.finish_server_deletes(peer, server_deletes).await;
         }
         result.map(|()| changed)
@@ -456,6 +494,10 @@ impl<V: VaultStore> Engine<V> {
     /// saved once, then pushed as it is until it goes, so that no key of the ratchet is used twice.
     /// Once pushed, clearing `sealed_events` is persisted immediately to the vault.
     async fn push_events(&self, inner: &mut Inner<V>, peer: &PublicKey) -> Result<bool, String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
         let Some(contact) = inner.contact(peer) else {
             return Ok(false);
         };
@@ -523,6 +565,9 @@ impl<V: VaultStore> Engine<V> {
                 contact.session.push_v2(&message).await
             })
             .await?;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
         match push_res {
             Ok(_) => {
                 self.clear_approval_backoff(peer);

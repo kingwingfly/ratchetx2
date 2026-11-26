@@ -39,10 +39,14 @@ impl<V: VaultStore> Engine<V> {
         pointer: &AttachmentPointer,
         clock: u64,
     ) -> Option<String> {
-        if !glue::streaming() {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) || !glue::streaming() {
             return None;
         }
         let fetching = self.fetching(peer, index, pointer).await.ok()?;
+        if !self.is_live(vgen) {
+            return None;
+        }
         let mut token = [0; 16];
         getrandom::fill(&mut token).ok()?;
         let token = hex(&token);
@@ -64,21 +68,26 @@ impl<V: VaultStore> Engine<V> {
 
     /// The first chunk of the stream at `url`, e.g. to read the tags of audio from.
     pub async fn stream_head(&self, url: &str) -> Option<DecryptedChunk> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return None;
+        }
         let token = url.strip_prefix("/media/")?;
-        self.stream_chunk(token, 0, &|| false).await.ok().flatten()
+        let aborted = || !self.is_live(vgen);
+        self.stream_chunk(token, 0, &aborted).await.ok().flatten()
     }
 
     /// Answer the service worker's `request` for a stream's bytes.
-    pub(super) async fn serve_media(&self, request: MediaRequest) {
-        if request.is_aborted() {
+    pub(super) async fn serve_media(&self, request: MediaRequest, vgen: u64) {
+        if !self.is_live(vgen) || request.is_aborted() {
             return;
         }
         let reply = {
-            let aborted = || request.is_aborted();
+            let aborted = || request.is_aborted() || !self.is_live(vgen);
             self.media_range(&request.token, &request.range, &aborted)
                 .await
         };
-        if request.is_aborted() {
+        if !self.is_live(vgen) || request.is_aborted() {
             return;
         }
         match reply {
@@ -218,10 +227,15 @@ impl<V: VaultStore> Engine<V> {
         let Some((chunk, fetched)) = loaded? else {
             return Ok(None);
         };
+        if aborted() {
+            return Ok(None);
+        }
         if fetched
             && clock > 0
             && self.all_kept(&fetching).await
+            && !aborted()
             && let Err(e) = self.downloaded(fetching.peer, clock).await
+            && !aborted()
         {
             self.ui.link.set(Link::Offline(e));
         }
@@ -281,6 +295,9 @@ impl<V: VaultStore> Engine<V> {
                 }
             }
         };
+        if aborted() {
+            return Ok(None);
+        }
         let chunk = Rc::new(Zeroizing::new(plaintext));
         let mut decrypted = self.decrypted.borrow_mut();
         decrypted.push_back((
@@ -300,7 +317,7 @@ impl<V: VaultStore> Engine<V> {
 
     /// Whether all the chunks of the attachment `fetching` fetches are kept here.
     pub(super) async fn all_kept(&self, fetching: &Fetching) -> bool {
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
         let Some(inner) = guard.as_ref() else {
             return false;
         };

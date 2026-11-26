@@ -142,13 +142,77 @@ impl FrameState {
     }
 }
 
+/// Synchronous handle that closes a live [`Subscription`]'s WebSocket immediately without
+/// awaiting the task that owns the [`Subscription`] (used by synchronous `pagehide` teardown).
+#[derive(Clone)]
+pub struct CloseHandle {
+    inner: Rc<CloseInner>,
+}
+
+struct CloseInner {
+    closed: Cell<bool>,
+    socket: Option<WebSocket>,
+    cancel: RefCell<Option<oneshot::Sender<()>>>,
+    sender: Rc<RefCell<Option<mpsc::Sender<Event>>>>,
+    frames: Rc<FrameState>,
+}
+
+impl CloseHandle {
+    /// Synchronously detach WebSocket handlers, close the socket, cancel its keep-alive task, and
+    /// close the event channel so any reader sees [`Event::Closed`]. Idempotent.
+    pub fn close(&self) {
+        if self.inner.closed.replace(true) {
+            return;
+        }
+        if let Some(cancel) = self.inner.cancel.borrow_mut().take() {
+            let _ = cancel.send(());
+        }
+        if let Some(ref socket) = self.inner.socket {
+            socket.set_onopen(None);
+            socket.set_onmessage(None);
+            socket.set_onclose(None);
+            let _ = socket.close();
+        }
+        if let Some(tx) = self.inner.sender.borrow_mut().take() {
+            self.inner.frames.close(tx);
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test() -> (Self, Rc<FrameState>, mpsc::Receiver<Event>) {
+        let (sender, events) = mpsc::channel(4);
+        let sender = Rc::new(RefCell::new(Some(sender)));
+        let frames = Rc::new(FrameState::default());
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let handle = Self {
+            inner: Rc::new(CloseInner {
+                closed: Cell::new(false),
+                socket: None,
+                cancel: RefCell::new(Some(cancel_tx)),
+                sender,
+                frames: frames.clone(),
+            }),
+        };
+        (handle, frames, events)
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn test_pair() -> (Self, mpsc::Receiver<Event>) {
+        let (handle, _frames, events) = Self::for_test();
+        (handle, events)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.inner.closed.get()
+    }
+}
+
 /// A WebSocket subscribed to a client's notifications. Closed when dropped.
 pub struct Subscription {
-    socket: WebSocket,
+    close_handle: CloseHandle,
     events: mpsc::Receiver<Event>,
     frames: Rc<FrameState>,
-    /// Dropping this cancels the background open-deadline & keep-alive task immediately.
-    _cancel: oneshot::Sender<()>,
     _on_open: Closure<dyn FnMut()>,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
     _on_close: Closure<dyn FnMut(CloseEvent)>,
@@ -243,6 +307,7 @@ impl Subscription {
         // An error is followed by a close. Dropping the shared sender guarantees the receiver ends.
         let on_close = {
             let frames = frames.clone();
+            let sender = sender.clone();
             Closure::<dyn FnMut(CloseEvent)>::new(move |_event: CloseEvent| {
                 if let Some(tx) = sender.borrow_mut().take() {
                     frames.close(tx);
@@ -253,15 +318,29 @@ impl Subscription {
         socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
         socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
         keep_alive(socket.clone(), frames.clone(), cancel_rx, open_rx, pong_tx);
+        let close_handle = CloseHandle {
+            inner: Rc::new(CloseInner {
+                closed: Cell::new(false),
+                socket: Some(socket),
+                cancel: RefCell::new(Some(cancel_tx)),
+                sender,
+                frames: frames.clone(),
+            }),
+        };
         Ok(Self {
-            socket,
+            close_handle,
             events,
             frames,
-            _cancel: cancel_tx,
             _on_open: on_open,
             _on_message: on_message,
             _on_close: on_close,
         })
+    }
+
+    /// Return a synchronous [`CloseHandle`] that closes this subscription's WebSocket immediately
+    /// without awaiting the listener task.
+    pub fn close_handle(&self) -> CloseHandle {
+        self.close_handle.clone()
     }
 
     /// The next event; [`Event::Closed`] is the last.
@@ -272,10 +351,7 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        self.socket.set_onopen(None);
-        self.socket.set_onmessage(None);
-        self.socket.set_onclose(None);
-        let _ = self.socket.close();
+        self.close_handle.close();
     }
 }
 
@@ -484,5 +560,19 @@ mod tests {
             Event::Resync
         ));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn close_handle_synchronously_closes_stream_and_is_idempotent() {
+        let (handle, frames, mut rx) = CloseHandle::for_test();
+        assert!(!handle.is_closed());
+        handle.close();
+        assert!(handle.is_closed());
+        // Second close is a clean no-op.
+        handle.close();
+        assert!(matches!(
+            futures::executor::block_on(frames.next(&mut rx)),
+            Event::Closed
+        ));
     }
 }

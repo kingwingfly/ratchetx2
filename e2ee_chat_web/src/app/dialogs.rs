@@ -59,8 +59,9 @@ pub(super) fn VaultDialog() -> impl IntoView {
     });
     let on_cancel = move |event: ev::Event| {
         restored_new_chat_non_cancelable.set_value(false);
-        // The vault's dialog stays until the vault opens.
+        // The vault's dialog stays until the vault opens; Escape still cancels any active KDF.
         if ui.phase.get_untracked() != Phase::Unlocked {
+            crate::kdf_worker::cancel_active();
             event.prevent_default();
         } else if ui
             .dialog

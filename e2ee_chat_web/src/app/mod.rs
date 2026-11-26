@@ -15,6 +15,10 @@ mod sidebar;
 mod tests;
 mod viewer;
 
+pub(crate) use media::{cancel_pending_previews, revoke_all_blob_urls};
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) use media::{live_blob_url_count, register_blob_url};
+
 use std::{cell::OnceCell, rc::Rc};
 
 use leptos::{ev, prelude::*, task::spawn_local};
@@ -55,6 +59,10 @@ fn ui() -> Ui {
     engine().ui()
 }
 
+pub(super) fn is_shutting_down() -> bool {
+    ENGINE.with(|cell| cell.get().is_some_and(|engine| engine.is_shutting_down()))
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let ui = Ui::new();
@@ -62,8 +70,12 @@ pub fn App() -> impl IntoView {
     let _ = ENGINE.with(|cell| cell.set(Engine::new(ui)));
     spawn_local(async move { engine().start().await });
 
-    // Unread messages and requests show in the tab's title.
+    // Unread messages and requests show in the tab's title only while unlocked and live.
     Effect::new(move || {
+        if crate::glue::lock_released() || is_shutting_down() || ui.phase.get() != Phase::Unlocked {
+            document().set_title("E2EE Chat");
+            return;
+        }
         let unread: u32 = ui.contacts.with(|contacts| {
             contacts.iter().fold(0u32, |acc, contact| {
                 acc.saturating_add(contact.unread)

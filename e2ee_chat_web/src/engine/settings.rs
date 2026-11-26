@@ -26,8 +26,15 @@ impl<V: VaultStore> Engine<V> {
     /// leaves rejected preferences persisted. Transient offline / sign-in failures keep the
     /// durable local preference with `needs_publish = true` and report that explicitly.
     pub async fn set_pq_config(&self, config: PqConfig) -> Result<PqSaveOutcome, String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_ref().ok_or("locked")?;
             if *inner.client.pq_config() == config
                 && !inner.state.needs_publish
@@ -40,8 +47,14 @@ impl<V: VaultStore> Engine<V> {
         // sync or tab close can never observe an unvalidated `strict_pq = true` on a classical-only
         // server.
         self.refresh_server_info(true).await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
 
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         if *inner.client.pq_config() == config
             && !inner.state.needs_publish
@@ -51,6 +64,9 @@ impl<V: VaultStore> Engine<V> {
         }
         let changed = *inner.client.pq_config() != config;
         inner.save_pq_config(config).await?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.publish_waits_settings.set(false);
         self.ui.me.set(Some(inner.me()));
         self.ui.contacts.set(inner.views());
@@ -58,7 +74,7 @@ impl<V: VaultStore> Engine<V> {
         // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.
         let outcome = classify_set_pq_publish_result(self.publish_full(inner, true).await);
         drop(guard);
-        if changed && outcome.is_ok() {
+        if changed && outcome.is_ok() && self.is_live(vgen) {
             self.wake();
         }
         outcome
@@ -67,8 +83,12 @@ impl<V: VaultStore> Engine<V> {
     /// Explicitly approve a classical fallback exception for `peer`, releasing any quarantined
     /// inbound classical initial message and/or resuming paused outbound messages.
     pub async fn approve_classical(&self, peer: PublicKey) -> Result<(), String> {
+        let vgen = self.vault_gen();
         {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             check_classical_approval(inner.client.pq_config())?;
             let local_pq = inner.local_pq_enabled();
@@ -229,6 +249,9 @@ impl<V: VaultStore> Engine<V> {
                 inner.roll_back(&peer, snapshot)?;
                 return Err(describe(&e));
             }
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             requeued.log_missing(&self.ui, &peer);
             self.show_changes(inner, &peer, &requeued.history);
             if self.ui.open.get_untracked() == Some(peer) {
@@ -261,24 +284,45 @@ impl<V: VaultStore> Engine<V> {
                 // receipts immediately.
                 self.reconcile_open_chat_read(inner, &peer, false).await;
             }
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             if should_stage_grant {
                 let _ = self.flush_pending_grants_for(inner, &peer).await;
             }
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             self.ui.contacts.set(inner.views());
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let _ = self.flush(&peer).await;
-        self.wake();
+        if self.is_live(vgen) {
+            self.wake();
+        }
         Ok(())
     }
 
     /// Initiate a fresh post-quantum session (`prepare_start_again_v2`) with `peer`, persisting
     /// before transmitting (H-2), to upgrade from a classical session or recover from a downgrade.
     pub async fn upgrade_to_pq(&self, peer: PublicKey) -> Result<(), String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         if PqConfig::compiled_suites().is_empty() {
             return Err("Post-quantum encryption is not compiled into this build.".to_string());
         }
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         let pq_cfg = inner.client.pq_config().clone();
         if !pq_cfg.pq_enabled || pq_cfg.offered_suites().is_empty() {
@@ -375,14 +419,18 @@ impl<V: VaultStore> Engine<V> {
                         }
                         _ => {}
                     }
-                    if let Err(save_err) = inner.save_state().await {
+                    if let Err(save_err) = inner.save_state().await
+                        && self.is_live(vgen)
+                    {
                         self.ui.log(format!(
                             "failed to save security alert (will retry): {}",
                             describe(&save_err)
                         ));
                     }
                 }
-                self.ui.contacts.set(inner.views());
+                if self.is_live(vgen) {
+                    self.ui.contacts.set(inner.views());
+                }
                 return Err(describe_upgrade_pq_error(
                     kind,
                     &inner.server_pq,
@@ -390,6 +438,11 @@ impl<V: VaultStore> Engine<V> {
                 ));
             }
         };
+        if !self.is_live(vgen) {
+            inner.state.next_session_seq = prev_next_session_seq;
+            let _ = inner.roll_back(&peer, snapshot);
+            return Err("locked".into());
+        }
         // Verify that the new session actually negotiated post-quantum encryption.
         let upgraded_is_pq = inner
             .contact(&peer)
@@ -397,7 +450,9 @@ impl<V: VaultStore> Engine<V> {
         if !upgraded_is_pq {
             inner.state.next_session_seq = prev_next_session_seq;
             inner.roll_back(&peer, snapshot)?;
-            self.ui.contacts.set(inner.views());
+            if self.is_live(vgen) {
+                self.ui.contacts.set(inner.views());
+            }
             return Err(
                 "Could not establish a post-quantum session with this peer (peer or server \
                  does not have post-quantum encryption enabled)."
@@ -483,6 +538,9 @@ impl<V: VaultStore> Engine<V> {
             inner.roll_back(&peer, snapshot)?;
             return Err(describe(&e));
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         requeued.log_missing(&self.ui, &peer);
         self.show_changes(inner, &peer, &requeued.history);
         if let Some(view) = added_view {
@@ -491,14 +549,21 @@ impl<V: VaultStore> Engine<V> {
         if was_quarantined {
             self.reconcile_open_chat_read(inner, &peer, false).await;
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         // Register our inbound write token on our DO before transmitting SendInitialV2 so the peer
         // can reply immediately upon accepting the upgraded PQ session.
         let _ = self.flush_pending_grants_for(inner, &peer).await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         if let Ok(Err(e)) = inner
             .transmit_with_greeting_delivery(&peer, true, true, async |inner| {
                 inner.client.send_prepared_initiate_v2(&outgoing).await
             })
             .await
+            && self.is_live(vgen)
         {
             self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
             self.ui.log(format!(
@@ -507,14 +572,22 @@ impl<V: VaultStore> Engine<V> {
                 describe(&e)
             ));
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.ui.contacts.set(inner.views());
         self.ui.log(format!(
             "upgraded chat with {} to post-quantum encryption",
             short(&peer)
         ));
         drop(guard);
-        self.wake();
+        if self.is_live(vgen) {
+            self.wake();
+        }
         Ok(())
     }
 
@@ -539,9 +612,13 @@ impl<V: VaultStore> Engine<V> {
 
     /// Clear transient security/approval alerts for `peer` and retry PQ session setup / flushing.
     pub async fn retry_pq(&self, peer: PublicKey) -> Result<(), String> {
+        let vgen = self.vault_gen();
         let waits_sign_in = self.waits_sign_in.borrow().contains(&peer);
         let use_flush = {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             let pq_ready = inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled;
             let contact = inner.contact(&peer).ok_or("no such chat")?;
@@ -569,10 +646,16 @@ impl<V: VaultStore> Engine<V> {
                         inner.save(&[]).await.map_err(|e| describe(&e))
                     })
                     .await?;
+                if !self.is_live(vgen) {
+                    return Err("locked".into());
+                }
                 self.ui.contacts.set(inner.views());
             }
             use_flush
         };
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         if use_flush {
             self.flush(&peer).await.map(drop)
         } else {

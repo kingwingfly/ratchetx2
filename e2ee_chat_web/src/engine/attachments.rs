@@ -318,9 +318,16 @@ impl<V: VaultStore> Engine<V> {
         peer: PublicKey,
         file: ChunkSource,
     ) -> Result<(), String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let size = file.size();
         let (started, signs_in_here, server) = {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             let contact = inner.contact(&peer).ok_or("no such chat")?;
             if contact.state.request {
@@ -336,13 +343,21 @@ impl<V: VaultStore> Engine<V> {
                 .await;
             (started, same_server(&server, &origin()), server)
         };
+        if !self.is_live(vgen) {
+            if let Ok(upload) = started {
+                let _ = upload.cancel(&Fetch::client(&server)).await;
+            }
+            return Err("locked".into());
+        }
         let upload = match started {
             Ok(upload) => upload,
             // The server keeps attachments only for those signed in to it: its message takes its
             // place in the chat, and waits, with what is sent after it, until this browser is.
             Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
                 self.wait_for_sign_in(peer, file).await?;
-                self.ask_sign_in();
+                if self.is_live(vgen) {
+                    self.ask_sign_in();
+                }
                 return Ok(());
             }
             // This page cannot sign in to the server, so the file never would go.
@@ -377,6 +392,9 @@ impl<V: VaultStore> Engine<V> {
             let _ = upload.cancel(&Fetch::client(&server)).await;
             return Err(e);
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.files.borrow_mut().insert(
             (peer, *upload.id(), attachment_key_hash(upload.key())),
             file.clone(),
@@ -388,7 +406,7 @@ impl<V: VaultStore> Engine<V> {
                 self.cancelled.borrow_mut().insert(*upload.id());
                 self.remove_attachment_caches(&peer, upload.id());
                 {
-                    let guard = self.inner.lock().await;
+                    let guard = self.lock_inner().await;
                     if let Some(inner) = guard.as_ref() {
                         let _ = inner.vault.forget_upload(&peer, upload.id()).await;
                     }
@@ -398,10 +416,11 @@ impl<V: VaultStore> Engine<V> {
             }
             Err(AnnounceError::SaveAfterSend { error, pending }) => {
                 let keep = {
-                    let guard = self.inner.lock().await;
-                    guard
-                        .as_ref()
-                        .is_some_and(|inner| self.may_keep(inner, &peer, upload.id()))
+                    let guard = self.lock_inner().await;
+                    self.is_live(vgen)
+                        && guard
+                            .as_ref()
+                            .is_some_and(|inner| self.may_keep(inner, &peer, upload.id()))
                 };
                 if keep {
                     self.show_upload(&peer, &pending, UploadState::Paused(error.clone()));
@@ -413,6 +432,9 @@ impl<V: VaultStore> Engine<V> {
                 return Err(error);
             }
         };
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         // A new upload, which nothing else runs.
         self.running.borrow_mut().insert(*upload.id());
         self.show_upload(&peer, &pending, UploadState::Running);
@@ -422,6 +444,7 @@ impl<V: VaultStore> Engine<V> {
             if let Err(e) = engine
                 .run_upload(peer, pending, file, VerifiedResume::fresh())
                 .await
+                && engine.is_live(vgen)
             {
                 engine.ui.notify(e);
             }
@@ -430,6 +453,7 @@ impl<V: VaultStore> Engine<V> {
         if let Err(e) = engine
             .run_upload(peer, pending, file, VerifiedResume::fresh())
             .await
+            && engine.is_live(vgen)
         {
             engine.ui.notify(e);
         }
@@ -446,9 +470,13 @@ impl<V: VaultStore> Engine<V> {
         peer: PublicKey,
         file: ChunkSource,
     ) -> Result<(), String> {
+        let vgen = self.vault_gen();
         let mut id = [0; 16];
         getrandom::fill(&mut id).map_err(|e| e.to_string())?;
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         let contact = inner.contact(&peer).ok_or("no such chat")?;
         let waiting = PendingUpload {
@@ -488,6 +516,9 @@ impl<V: VaultStore> Engine<V> {
                 return Err(e);
             }
         };
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.show_new(inner, &peer, vec![view]);
         self.ui.contacts.set(inner.views());
         drop(guard);
@@ -505,17 +536,29 @@ impl<V: VaultStore> Engine<V> {
 
     /// Start the uploads that waited for this browser to sign in, whose files are still here.
     pub(super) async fn start_waiting_uploads(self: &Rc<Self>) {
+        let vgen = self.vault_gen();
         let waiting = {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return;
+            }
             let Some(inner) = guard.as_ref() else {
                 return;
             };
             match inner.vault.uploads(None).await {
                 Ok(uploads) => uploads,
-                Err(e) => return self.ui.notify(describe(&e)),
+                Err(e) => {
+                    if self.is_live(vgen) {
+                        self.ui.notify(describe(&e));
+                    }
+                    return;
+                }
             }
         };
         for (peer, pending) in waiting.into_iter().filter(|(_, p)| !p.started()) {
+            if !self.is_live(vgen) {
+                return;
+            }
             let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
                 continue;
             };
@@ -527,7 +570,10 @@ impl<V: VaultStore> Engine<V> {
                 // Re-check under the lock so an upload already promoted by a concurrent
                 // `resume_upload` or dropped by `SealOutcome::Failed` is never resurrected.
                 let still_waiting = {
-                    let guard = self.inner.lock().await;
+                    let guard = self.lock_inner().await;
+                    if !self.is_live(vgen) {
+                        return;
+                    }
                     let Some(inner) = guard.as_ref() else {
                         return;
                     };
@@ -552,7 +598,7 @@ impl<V: VaultStore> Engine<V> {
                             })
                     }
                 };
-                if still_waiting {
+                if still_waiting && self.is_live(vgen) {
                     self.show_upload(
                         &peer,
                         &pending,
@@ -569,7 +615,9 @@ impl<V: VaultStore> Engine<V> {
             });
             let result = self.start_waiting(peer, id, file).await;
             drop(running_guard);
-            if let Err(e) = result {
+            if let Err(e) = result
+                && self.is_live(vgen)
+            {
                 self.ui.notify(e);
             }
         }
@@ -584,8 +632,9 @@ impl<V: VaultStore> Engine<V> {
         waiting: [u8; 16],
         file: ChunkSource,
     ) -> Result<(), String> {
-        let mut guard = self.inner.lock().await;
-        if self.is_cancelled(&waiting) {
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) || self.is_cancelled(&waiting) {
             return Ok(());
         }
         let inner = guard.as_mut().ok_or("locked")?;
@@ -642,7 +691,7 @@ impl<V: VaultStore> Engine<V> {
             Ok(upload) => upload,
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
                 drop(guard);
-                if self.is_cancelled(&waiting) {
+                if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                     return Ok(());
                 }
                 self.files
@@ -653,7 +702,7 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(());
             }
             Err(e) => {
-                if self.is_cancelled(&waiting) {
+                if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                     return Ok(());
                 }
                 // Report attachment 404/Unimplemented locally without tripping global update_required.
@@ -663,7 +712,7 @@ impl<V: VaultStore> Engine<V> {
         let server = inner.server.clone();
         // Cancelled meanwhile: the server forgets it too (outside the lock), and cancelling fails
         // its message.
-        if self.is_cancelled(&waiting) {
+        if !self.is_live(vgen) || self.is_cancelled(&waiting) {
             drop(guard);
             let _ = upload.cancel(&Fetch::client(&server)).await;
             return Ok(());
@@ -779,6 +828,9 @@ impl<V: VaultStore> Engine<V> {
             }
             return Ok(());
         }
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         self.show_changes(inner, &peer, &changed);
         drop(guard);
         // Under the server's ID and key hash from now on.
@@ -798,16 +850,18 @@ impl<V: VaultStore> Engine<V> {
         });
         self.show_upload(&peer, &pending, UploadState::Running);
         self.release(&peer, kept.history_index);
-        if let Err(e) = self.flush(&peer).await {
+        if let Err(e) = self.flush(&peer).await
+            && self.is_live(vgen)
+        {
             self.ui.link.set(Link::Offline(e));
         }
         // If `flush` permanently failed or `cancel_held`/`cancel_upload` cancelled the upload
         // while announcing, stop without uploading chunks to R2.
-        let cancelled = self.is_cancelled(&new_id);
+        let cancelled = !self.is_live(vgen) || self.is_cancelled(&new_id);
         let failed_or_cancelled = if cancelled {
             true
         } else {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
             if let Some(inner) = guard.as_ref() {
                 inner
                     .vault
@@ -822,7 +876,9 @@ impl<V: VaultStore> Engine<V> {
         };
         if failed_or_cancelled {
             drop(new_running_guard);
-            self.wake();
+            if self.is_live(vgen) {
+                self.wake();
+            }
             return Ok(());
         }
         // Transfer running ownership to the spawned `run_upload` task (which installs its own
@@ -835,6 +891,7 @@ impl<V: VaultStore> Engine<V> {
             if let Err(e) = engine
                 .run_upload(peer, pending, file, VerifiedResume::fresh())
                 .await
+                && engine.is_live(vgen)
             {
                 engine.ui.notify(e);
             }
@@ -843,6 +900,7 @@ impl<V: VaultStore> Engine<V> {
         if let Err(e) = engine
             .run_upload(peer, pending, file, VerifiedResume::fresh())
             .await
+            && engine.is_live(vgen)
         {
             engine.ui.notify(e);
         }
@@ -856,6 +914,10 @@ impl<V: VaultStore> Engine<V> {
         peer: &PublicKey,
         mut pending: PendingUpload,
     ) -> Result<Option<PendingUpload>, AnnounceError> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Err(AnnounceError::NotSent("locked".into()));
+        }
         if pending.is_announced() {
             return Ok(Some(pending));
         }
@@ -864,7 +926,10 @@ impl<V: VaultStore> Engine<V> {
         // cancellation/chat deletion, and adding a new outgoing message so a queued `cancel_upload`
         // or `delete(peer)` cannot slip in before `inner.add` and send a deleted attachment.
         let (index, added_new) = {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err(AnnounceError::NotSent("locked".into()));
+            }
             let Some(inner) = guard.as_mut() else {
                 return Err(AnnounceError::NotSent("locked".into()));
             };
@@ -874,6 +939,9 @@ impl<V: VaultStore> Engine<V> {
                 .map_err(|e| AnnounceError::NotSent(describe(&e)))?
                 .filter(|(_, entry)| entry.outgoing)
                 .map(|(idx, _)| idx);
+            if !self.is_live(vgen) {
+                return Err(AnnounceError::NotSent("locked".into()));
+            }
             if !self.may_keep(inner, peer, &pending.id) {
                 if let Some(id) = id_arr {
                     self.remove_attachment_caches(peer, &id);
@@ -898,6 +966,9 @@ impl<V: VaultStore> Engine<V> {
                         .add(peer, Kind::Attachment(pointer), false)
                         .await
                         .map_err(AnnounceError::NotSent)?;
+                    if !self.is_live(vgen) {
+                        return Err(AnnounceError::NotSent("locked".into()));
+                    }
                     let index = view.index;
                     self.show_new(inner, peer, vec![view]);
                     self.ui.contacts.set(inner.views());
@@ -907,7 +978,9 @@ impl<V: VaultStore> Engine<V> {
         };
         if added_new {
             // Saved, so it goes in a later sync if not now.
-            if let Err(e) = self.flush(peer).await {
+            if let Err(e) = self.flush(peer).await
+                && self.is_live(vgen)
+            {
                 self.ui.link.set(Link::Offline(e));
             }
             self.wake();
@@ -918,7 +991,13 @@ impl<V: VaultStore> Engine<V> {
         pending.announced = true;
         pending.upload_state = UPLOAD_STATE_ANNOUNCED;
         pending.history_index = index;
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err(AnnounceError::SaveAfterSend {
+                error: "locked".into(),
+                pending: Box::new(pending),
+            });
+        }
         let Some(inner) = guard.as_mut() else {
             return Err(AnnounceError::SaveAfterSend {
                 error: "locked".into(),
@@ -932,12 +1011,20 @@ impl<V: VaultStore> Engine<V> {
             .ok()
             .flatten()
             .is_some_and(|e| e.delivery() == Delivery::Failed);
+        if !self.is_live(vgen) {
+            return Err(AnnounceError::SaveAfterSend {
+                error: "locked".into(),
+                pending: Box::new(pending),
+            });
+        }
         if entry_failed {
             let jobs = self
                 .prepare_cancel_uploads_for_failed(inner, peer, &[index])
                 .await;
             drop(guard);
-            self.finish_server_deletes(peer, jobs).await;
+            if self.is_live(vgen) {
+                self.finish_server_deletes(peer, jobs).await;
+            }
             return Ok(None);
         }
         if !self.may_keep(inner, peer, &pending.id) {
@@ -961,7 +1048,7 @@ impl<V: VaultStore> Engine<V> {
     /// The bytes of the file of the history entry `index` of the chat with `peer`, which are
     /// kept apart from it.
     pub async fn file(&self, peer: PublicKey, index: u64) -> Result<Arc<Vec<u8>>, String> {
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
         inner
             .vault
@@ -1020,20 +1107,24 @@ impl<V: VaultStore> Engine<V> {
         });
         // Look up the pending upload once under the lock, exiting quietly if it was cancelled or
         // forgotten concurrently (e.g. by `cancel_upload`, `SealOutcome::Failed`, or `delete`).
+        let vgen = self.vault_gen();
         let pending = {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let Some(inner) = guard.as_ref() else {
                 return Err("locked".into());
             };
             match inner.vault.upload(&peer, &id).await {
                 Ok(Some(pending)) => {
-                    if self.is_cancelled(&id) {
+                    if !self.is_live(vgen) || self.is_cancelled(&id) {
                         return Ok(());
                     }
                     pending
                 }
                 Ok(None) => {
-                    if self.is_cancelled(&id) {
+                    if !self.is_live(vgen) || self.is_cancelled(&id) {
                         return Ok(());
                     }
                     return Err("that upload is gone".into());
@@ -1056,14 +1147,14 @@ impl<V: VaultStore> Engine<V> {
         let resume = match self.check(&peer, &pending, &file).await {
             Ok(resume) => resume,
             Err(e) => {
-                if !self.is_cancelled(&id) {
+                if self.is_live(vgen) && !self.is_cancelled(&id) {
                     self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
                 }
                 return Err(e);
             }
         };
         // Cancelled while the file was checked: it is not sent.
-        if self.is_cancelled(&id) {
+        if !self.is_live(vgen) || self.is_cancelled(&id) {
             return Ok(());
         }
         self.files.borrow_mut().insert(cache_key, file.clone());
@@ -1073,7 +1164,7 @@ impl<V: VaultStore> Engine<V> {
             Ok(None) => return Ok(()),
             Err(err) => {
                 let msg = err.into_message();
-                if !self.is_cancelled(&id) {
+                if self.is_live(vgen) && !self.is_cancelled(&id) {
                     self.show_upload(&peer, &before_announce, UploadState::Paused(msg.clone()));
                 }
                 return Err(msg);
@@ -1087,6 +1178,7 @@ impl<V: VaultStore> Engine<V> {
     /// Stop the upload `id`, in the chat with `peer`, and forget it. The server deletes what it
     /// has, so the peer finds the attachment gone; if it cannot be reached, what it has expires.
     pub async fn cancel_upload(&self, peer: PublicKey, id: [u8; 16]) -> Result<(), String> {
+        let vgen = self.vault_gen();
         // For good, running or not: what is on its way stops, and keeps nothing of it again.
         self.cancelled.borrow_mut().insert(id);
         self.remove_attachment_caches(&peer, &id);
@@ -1094,7 +1186,10 @@ impl<V: VaultStore> Engine<V> {
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != id));
         let (delete_job, failed_outbox) = {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             let pending = inner
                 .vault
@@ -1170,8 +1265,10 @@ impl<V: VaultStore> Engine<V> {
         };
         // Perform the HTTP cancel outside `self.inner.lock()` so slow deletes never block the UI.
         self.finish_server_deletes(&peer, vec![delete_job]).await;
-        if failed_outbox {
-            if let Err(e) = self.flush(&peer).await {
+        if failed_outbox && self.is_live(vgen) {
+            if let Err(e) = self.flush(&peer).await
+                && self.is_live(vgen)
+            {
                 self.ui.link.set(Link::Offline(e));
             }
             self.wake();
@@ -1183,8 +1280,12 @@ impl<V: VaultStore> Engine<V> {
     /// it fails, and what waited for it goes, unless it too needs the sign-in. One whose
     /// attachment's upload has not started goes with its upload.
     pub async fn cancel_held(&self, peer: PublicKey, index: u64) -> Result<(), String> {
+        let vgen = self.vault_gen();
         let waiting = {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_ref().ok_or("locked")?;
             let still_awaits = inner.contacts.iter().any(|c| {
                 c.peer == peer
@@ -1212,11 +1313,17 @@ impl<V: VaultStore> Engine<V> {
                 None
             }
         };
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         if let Some(id) = waiting {
             return self.cancel_upload(peer, id).await;
         }
         let server_deletes = {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             // Gone meanwhile, e.g. pushed as the sign-in came.
             let waits = inner.contact(&peer).is_some_and(|contact| {
@@ -1234,11 +1341,19 @@ impl<V: VaultStore> Engine<V> {
             self.prepare_cancel_uploads_for_failed(inner, &peer, &[index])
                 .await
         };
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         if !server_deletes.is_empty() {
             self.finish_server_deletes(&peer, server_deletes).await;
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.waits_sign_in.borrow_mut().remove(&peer);
-        if let Err(e) = self.flush(&peer).await {
+        if let Err(e) = self.flush(&peer).await
+            && self.is_live(vgen)
+        {
             self.ui.link.set(Link::Offline(e));
         }
         self.wake();
@@ -1355,18 +1470,24 @@ impl<V: VaultStore> Engine<V> {
     /// Execute deferred server-side attachment cancels/deletes outside `self.inner.lock()`, then
     /// mark confirmed-deleted entries `gone = true` in the vault.
     pub(super) async fn finish_server_deletes(&self, peer: &PublicKey, jobs: Vec<ServerDeleteJob>) {
+        let vgen = self.vault_gen();
         for job in jobs {
+            if !self.is_live(vgen) {
+                return;
+            }
             let client = Fetch::client(&job.server);
             let deleted_on_server = match job.kind {
                 ServerDeleteKind::CancelUpload(upload) => match upload.cancel(&client).await {
                     Ok(()) => true,
                     Err(e) if e.kind() == ErrorKind::NotFound => true,
                     Err(e) => {
-                        self.ui.log(format!(
-                            "the server keeps what it has of {} until it expires: {}",
-                            job.name,
-                            describe(&e)
-                        ));
+                        if self.is_live(vgen) {
+                            self.ui.log(format!(
+                                "the server keeps what it has of {} until it expires: {}",
+                                job.name,
+                                describe(&e)
+                            ));
+                        }
                         false
                     }
                 },
@@ -1375,16 +1496,18 @@ impl<V: VaultStore> Engine<V> {
                         Ok(()) => true,
                         Err(e) if e.kind() == ErrorKind::NotFound => true,
                         Err(e) => {
-                            self.ui.log(format!(
-                                "could not delete cancelled attachment from server: {}",
-                                describe(&e)
-                            ));
+                            if self.is_live(vgen) {
+                                self.ui.log(format!(
+                                    "could not delete cancelled attachment from server: {}",
+                                    describe(&e)
+                                ));
+                            }
                             false
                         }
                     }
                 }
             };
-            if deleted_on_server {
+            if deleted_on_server && self.is_live(vgen) {
                 let _ = self.note_gone_by_id(peer, job.history_index, &job.id).await;
             }
         }
@@ -1392,6 +1515,9 @@ impl<V: VaultStore> Engine<V> {
 
     /// Show the message at `index`, to `peer`, as held until this browser signs in.
     pub(super) fn hold(&self, peer: &PublicKey, index: u64) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         self.ui.held.update(|held| {
             held.insert((*peer, index));
         });
@@ -1399,6 +1525,9 @@ impl<V: VaultStore> Engine<V> {
 
     /// Show the message at `index`, to `peer`, as no longer held.
     pub(super) fn release(&self, peer: &PublicKey, index: u64) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         if self
             .ui
             .held
@@ -1439,6 +1568,7 @@ impl<V: VaultStore> Engine<V> {
         file: ChunkSource,
         resume: VerifiedResume,
     ) -> Result<(), String> {
+        let vgen = self.vault_gen();
         let id: [u8; 16] = pending
             .id
             .as_slice()
@@ -1462,8 +1592,8 @@ impl<V: VaultStore> Engine<V> {
             Err(e) => Err(e),
         };
         drop(running_guard);
-        // Cancelled, it stays so: what cancelled it forgot it.
-        if self.is_cancelled(&id) {
+        // Cancelled or torn down on `pagehide`: stop quietly without touching UI or IDB.
+        if !self.is_live(vgen) || self.is_cancelled(&id) {
             return Ok(());
         }
         match uploaded {
@@ -1483,20 +1613,23 @@ impl<V: VaultStore> Engine<V> {
                 ));
             }
             Err(e) => {
-                let cancelled = self.is_cancelled(&id);
+                let cancelled = !self.is_live(vgen) || self.is_cancelled(&id);
                 let gone = if cancelled {
                     true
                 } else {
-                    let guard = self.inner.lock().await;
-                    guard
-                        .as_ref()
-                        .is_some_and(|inner| !self.may_keep(inner, &peer, &id))
+                    let guard = self.lock_inner().await;
+                    !self.is_live(vgen)
+                        || guard
+                            .as_ref()
+                            .is_some_and(|inner| !self.may_keep(inner, &peer, &id))
                 };
                 if gone {
                     self.remove_attachment_caches(&peer, &id);
-                    self.ui
-                        .uploads
-                        .update(|uploads| uploads.retain(|upload| upload.id != id));
+                    if self.is_live(vgen) {
+                        self.ui
+                            .uploads
+                            .update(|uploads| uploads.retain(|upload| upload.id != id));
+                    }
                     return Ok(());
                 }
                 self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
@@ -1509,7 +1642,10 @@ impl<V: VaultStore> Engine<V> {
             .update(|uploads| uploads.retain(|upload| upload.id != id));
         // Forgotten, with its upload token, which is no use now: deleting it takes its delete
         // token, which its key gives.
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         let inner = guard.as_ref().ok_or("locked")?;
         inner
             .vault
@@ -1521,7 +1657,11 @@ impl<V: VaultStore> Engine<V> {
     /// Stop the upload `id`, in the chat with `peer`, if this client uploads it, for good, as
     /// the server no longer has it, and forget it.
     async fn drop_upload(&self, peer: &PublicKey, id: [u8; 16]) -> Result<(), String> {
-        let guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_ref().ok_or("locked")?;
         let kept = inner
             .vault
@@ -1529,6 +1669,9 @@ impl<V: VaultStore> Engine<V> {
             .await
             .map_err(|e| describe(&e))?
             .is_some();
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         if !kept && !self.running.borrow().contains(&id) {
             return Ok(());
         }
@@ -1555,12 +1698,16 @@ impl<V: VaultStore> Engine<V> {
         index: u64,
         pointer: &AttachmentPointer,
     ) -> Result<(), String> {
+        let vgen = self.vault_gen();
         let not_there = || format!("{} is not on the server", pointer.name);
         let id: [u8; 16] = pointer.id.as_slice().try_into().map_err(|_| not_there())?;
         let key = copy_zeroizing_array::<{ attachment::KEY_LENGTH }>(&pointer.key)
             .ok_or_else(not_there)?;
         let server = {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             guard.as_ref().ok_or("locked")?.server.clone()
         };
         match attachment::delete(&Fetch::client(&server), &id, &key).await {
@@ -1571,6 +1718,9 @@ impl<V: VaultStore> Engine<V> {
                 // Report attachment 404/Unimplemented locally without tripping global update_required.
                 return Err(describe(&e));
             }
+        }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
         }
         self.drop_upload(&peer, id).await?;
         self.note_gone(&peer, index, &id).await
@@ -1591,7 +1741,11 @@ impl<V: VaultStore> Engine<V> {
         hint_index: Option<u64>,
         id: &[u8; 16],
     ) -> Result<(), String> {
-        let mut guard = self.inner.lock().await;
+        let vgen = self.vault_gen();
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let inner = guard.as_mut().ok_or("locked")?;
         self.note_gone_inner(inner, peer, hint_index, id).await
     }
@@ -1610,6 +1764,9 @@ impl<V: VaultStore> Engine<V> {
         else {
             return Ok(());
         };
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return Err("locked".into());
+        }
         self.ui.gone.update(|gone| {
             gone.insert((*peer, index));
         });
@@ -1636,8 +1793,13 @@ impl<V: VaultStore> Engine<V> {
         mut hasher: Sha256,
         mut verified_chunks: HashMap<u32, Zeroizing<Vec<u8>>>,
     ) -> Result<bool, String> {
+        let vgen = self.vault_gen();
+        let lock_gen = crate::glue::lock_generation();
         let server = {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(true);
+            }
             guard.as_ref().ok_or("locked")?.server.clone()
         };
         // Each chunk shows how far it got as it goes: the bytes before it, and its share of what
@@ -1646,6 +1808,9 @@ impl<V: VaultStore> Engine<V> {
         let progress: Progress = {
             let (ui, before, id, size) = (self.ui, before.clone(), *upload.id(), pending.size);
             Rc::new(move |sent, total| {
+                if crate::glue::lock_released() || crate::glue::lock_generation() != lock_gen {
+                    return;
+                }
                 let chunk = (size - before.get()).min(CHUNK_SIZE as u64);
                 let done = before.get() + chunk * sent / total.max(1);
                 ui.uploads.update(|uploads| {
@@ -1657,7 +1822,7 @@ impl<V: VaultStore> Engine<V> {
         };
         let attachments = Fetch::reporting(&server, progress);
         for index in pending.uploaded..upload.chunks() {
-            if self.is_cancelled(upload.id()) {
+            if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
                 return Ok(true);
             }
             before.set((u64::from(index) * CHUNK_SIZE as u64).min(pending.size));
@@ -1675,6 +1840,9 @@ impl<V: VaultStore> Engine<V> {
                 }
                 raw
             };
+            if !self.is_live(vgen) {
+                return Ok(true);
+            }
             // Kept before the chunk is encrypted: from then on, the file must not change there.
             if index >= pending.encrypted {
                 hasher.update(plaintext.as_slice());
@@ -1693,6 +1861,9 @@ impl<V: VaultStore> Engine<V> {
             {
                 return Ok(false);
             }
+            if !self.is_live(vgen) {
+                return Ok(true);
+            }
             self.keep_chunk(peer, upload.id(), index, &chunk).await?;
             pending.uploaded = index + 1;
         }
@@ -1710,19 +1881,23 @@ impl<V: VaultStore> Engine<V> {
         index: u32,
         chunk: &[u8],
     ) -> Result<bool, String> {
+        let vgen = self.vault_gen();
         let mut wait = RETRY_MIN;
         loop {
+            if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
+                return Ok(true);
+            }
             match upload.put(attachments, index, chunk).await {
                 Ok(()) => return Ok(true),
                 Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
                 Err(e) if e.kind() == ErrorKind::Server => {
-                    if self.is_cancelled(upload.id()) {
+                    if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
                         return Ok(true);
                     }
                     self.show_upload(peer, pending, UploadState::Retrying);
                     sleep(wait).await;
                     wait = (wait * 2).min(RETRY_MAX);
-                    if self.is_cancelled(upload.id()) {
+                    if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
                         return Ok(true);
                     }
                 }
@@ -1734,7 +1909,7 @@ impl<V: VaultStore> Engine<V> {
     /// Keep `pending`, of the chat with `peer`, in the vault, unless it was cancelled or its chat
     /// deleted meanwhile, which forgot it: it must not come back.
     async fn save_upload(&self, peer: &PublicKey, pending: &PendingUpload) -> Result<(), String> {
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
         if !self.may_keep(inner, peer, &pending.id) {
             return Err(format!("the upload of {} was cancelled", pending.name));
@@ -1761,6 +1936,9 @@ impl<V: VaultStore> Engine<V> {
         pending: &PendingUpload,
         state: UploadState,
     ) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
             return;
         };
@@ -1795,6 +1973,10 @@ impl<V: VaultStore> Engine<V> {
         pointer: AttachmentPointer,
         clock: u64,
     ) -> Result<(), String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         // A message of this client's whose upload waits for it to sign in.
         if pointer.id.is_empty() {
             return Err(format!(
@@ -1817,15 +1999,18 @@ impl<V: VaultStore> Engine<V> {
         let fetched = self
             .fetch_attachment(peer, index, &id, pointer, Waiter::Viewer(token))
             .await;
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         if let Err(FetchError::NotFound(_)) = &fetched {
             let _ = self.note_gone_by_id(&peer, Some(index), &id).await;
         }
         let opened = self
             .told_downloaded(peer, clock, fetched.map_err(FetchError::into_message))
             .await;
-        // Unless the viewer closed, navigated away, or started another request (even for the same
-        // attachment ID) meanwhile.
-        if !self.opening(token, &id) {
+        // Unless the viewer closed, navigated away, tore down on `pagehide`, or started another
+        // request (even for the same attachment ID) meanwhile.
+        if !self.is_live(vgen) || !self.opening(token, &id) {
             return Ok(());
         }
         match opened {
@@ -1854,12 +2039,19 @@ impl<V: VaultStore> Engine<V> {
         clock: u64,
         shows: &dyn Fn() -> bool,
     ) -> Result<Option<Attachment>, String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Ok(None);
+        }
         let Ok(id) = <[u8; 16]>::try_from(pointer.id.as_slice()) else {
             return Err("the attachment is malformed".to_string());
         };
         let fetched = self
             .fetch_attachment(peer, index, &id, pointer, Waiter::Chat(shows))
             .await;
+        if !self.is_live(vgen) {
+            return Ok(None);
+        }
         if let Err(FetchError::NotFound(_)) = &fetched {
             let _ = self.note_gone_by_id(&peer, Some(index), &id).await;
         }
@@ -1875,12 +2067,17 @@ impl<V: VaultStore> Engine<V> {
         clock: u64,
         fetched: Result<Option<(Attachment, bool)>, String>,
     ) -> Result<Option<Attachment>, String> {
+        let vgen = self.vault_gen();
         let Some((attachment, from_server)) = fetched? else {
             return Ok(None);
         };
+        if !self.is_live(vgen) {
+            return Ok(None);
+        }
         if from_server
             && clock > 0
             && let Err(e) = self.downloaded(peer, clock).await
+            && self.is_live(vgen)
         {
             self.ui.link.set(Link::Offline(e));
         }
@@ -1889,19 +2086,29 @@ impl<V: VaultStore> Engine<V> {
 
     /// Tell `peer` that its attachment, sent in its message at `clock`, is downloaded.
     pub(super) async fn downloaded(&self, peer: PublicKey, clock: u64) -> Result<(), String> {
+        let vgen = self.vault_gen();
         {
-            let mut guard = self.inner.lock().await;
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_mut().ok_or("locked")?;
             let contact = inner.contact(&peer).ok_or("no such chat")?;
             if contact.tell_downloaded(clock) {
                 inner.save_state().await.map_err(|e| describe(&e))?;
             }
         }
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         self.flush(&peer).await.map(drop)
     }
 
     /// Whether the viewer still waits for the attachment `id` of preview request `token`.
     fn opening(&self, token: u64, id: &[u8; 16]) -> bool {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return false;
+        }
         self.ui.opening.with_untracked(|opening| {
             opening
                 .as_ref()
@@ -1911,6 +2118,9 @@ impl<V: VaultStore> Engine<V> {
 
     /// Note how far opening the attachment `id` of preview request `token` got.
     pub(super) fn opened(&self, token: u64, id: &[u8; 16], done: u64, waiting: bool) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
         self.ui.opening.update(|opening| {
             if let Some(opening) = opening
                 .as_mut()
@@ -1923,6 +2133,9 @@ impl<V: VaultStore> Engine<V> {
 
     /// Whether `waiter` still waits for the attachment `id`.
     pub(super) fn waits(&self, waiter: Waiter<'_>, id: &[u8; 16]) -> bool {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return false;
+        }
         match waiter {
             Waiter::Viewer(token) => self.opening(token, id),
             Waiter::Chat(shows) => shows(),
@@ -2007,7 +2220,7 @@ impl<V: VaultStore> Engine<V> {
         }
         let chunks =
             u32::try_from(attachment::chunk_count(pointer.size)).map_err(|_| malformed())?;
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
         let unfinished = inner
             .vault
@@ -2160,7 +2373,7 @@ impl<V: VaultStore> Engine<V> {
         index: u32,
         chunk: &[u8],
     ) -> Result<(), String> {
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
         if !self.may_keep(inner, peer, id) {
             return Ok(());
@@ -2179,7 +2392,7 @@ impl<V: VaultStore> Engine<V> {
         id: &[u8],
         index: u32,
     ) -> Result<Option<Vec<u8>>, String> {
-        let guard = self.inner.lock().await;
+        let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
         inner
             .vault
@@ -2193,15 +2406,22 @@ impl<V: VaultStore> Engine<V> {
     /// the files' bytes, each page under the lock of its own, so that syncing and sending go on
     /// meanwhile.
     pub async fn files(&self, peer: PublicKey) -> Result<Vec<FileView>, String> {
+        let vgen = self.vault_gen();
         let mut files = vec![];
         // The server's time, by which the attachments it deleted already are not offered.
         let now = {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             guard.as_ref().ok_or("locked")?.client.clock().now()
         };
         let mut end = u64::MAX;
         loop {
-            let guard = self.inner.lock().await;
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             let inner = guard.as_ref().ok_or("locked")?;
             let contact = inner
                 .contacts

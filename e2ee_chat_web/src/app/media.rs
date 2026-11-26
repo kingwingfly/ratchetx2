@@ -1,4 +1,8 @@
-use std::{cell::Cell, time::Duration};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    time::Duration,
+};
 
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use js_sys::Uint8Array;
@@ -25,6 +29,9 @@ thread_local! {
     /// Monotonic generation for viewer-opening requests so leaving a chat or closing the viewer
     /// cancels any in-flight local file read or attachment stream setup before it opens the viewer.
     static PREVIEW_GEN: Cell<u64> = const { Cell::new(0) };
+    /// Every live `blob:` object URL created by the app, tracked so `pagehide` can revoke all of
+    /// them synchronously while normal `revoke_blob_url` calls keep the set leak-free.
+    static LIVE_BLOB_URLS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 pub(super) fn begin_preview_request() -> u64 {
@@ -36,8 +43,49 @@ pub(super) fn begin_preview_request() -> u64 {
 }
 
 /// Invalidate any pending asynchronous viewer opens (local file reads or stream setups).
-pub(super) fn cancel_pending_previews() {
+pub(crate) fn cancel_pending_previews() {
     let _ = begin_preview_request();
+}
+
+/// Record a newly minted `blob:` object URL for synchronous revocation on `pagehide`.
+pub(crate) fn register_blob_url(url: &str) {
+    if url.starts_with("blob:") {
+        LIVE_BLOB_URLS.with(|urls| {
+            urls.borrow_mut().insert(url.to_string());
+        });
+    }
+}
+
+/// Revoke `url` (if `blob:`) and remove it from `LIVE_BLOB_URLS` so long sessions never leak
+/// tracked entries.
+pub(crate) fn revoke_blob_url(url: &str) {
+    if !url.starts_with("blob:") {
+        return;
+    }
+    LIVE_BLOB_URLS.with(|urls| {
+        urls.borrow_mut().remove(url);
+    });
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = Url::revoke_object_url(url);
+    }
+}
+
+/// Synchronously drain and revoke every remaining `blob:` object URL created by the app (invoked
+/// inside `pagehide` teardown).
+pub(crate) fn revoke_all_blob_urls() {
+    let urls: Vec<String> = LIVE_BLOB_URLS.with(|urls| urls.borrow_mut().drain().collect());
+    #[cfg(target_arch = "wasm32")]
+    for url in urls {
+        let _ = Url::revoke_object_url(&url);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = urls;
+}
+
+#[cfg(test)]
+pub(crate) fn live_blob_url_count() -> usize {
+    LIVE_BLOB_URLS.with(|urls| urls.borrow().len())
 }
 
 fn is_preview_current(token: u64, peer: PublicKey) -> bool {
@@ -95,7 +143,7 @@ pub(super) fn release(url: &str) {
         let url = url.to_string();
         set_timeout(move || engine().end_stream(&url), STREAM_GRACE);
     } else if url.starts_with("blob:") {
-        let _ = Url::revoke_object_url(url);
+        revoke_blob_url(url);
     }
 }
 
@@ -670,14 +718,20 @@ pub(super) fn duration(seconds: f64) -> String {
     }
 }
 
-/// A blob URL of this origin for `data`, typed `mime`.
+/// A blob URL of this origin for `data`, typed `mime`, tracked for synchronous `pagehide`
+/// revocation. Returns `None` once `pagehide` or manual lock teardown has begun.
 pub(super) fn blob_url(data: &[u8], mime: &str) -> Option<String> {
+    if crate::glue::lock_released() || super::is_shutting_down() {
+        return None;
+    }
     let parts = js_sys::Array::of1(&Uint8Array::from(data));
     let options = BlobPropertyBag::new();
     options.set_type(mime);
-    Blob::new_with_u8_array_sequence_and_options(&parts, &options)
+    let url = Blob::new_with_u8_array_sequence_and_options(&parts, &options)
         .and_then(|blob| Url::create_object_url_with_blob(&blob))
-        .ok()
+        .ok()?;
+    register_blob_url(&url);
+    Some(url)
 }
 
 /// A URL that shows the image `data`, of the MIME type `mime`: a blob URL of this origin, but for
@@ -691,5 +745,40 @@ pub(super) fn image_url(data: &[u8], mime: &str) -> Option<String> {
         ))
     } else {
         blob_url(data, mime)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_blob_urls_do_not_leak_and_drain_on_revoke_all() {
+        revoke_all_blob_urls();
+        assert_eq!(live_blob_url_count(), 0);
+
+        // Non-blob URLs are ignored.
+        register_blob_url("data:image/svg+xml;base64,AAAA");
+        register_blob_url("/media/deadbeef");
+        assert_eq!(live_blob_url_count(), 0);
+
+        // Normal create + revoke cycles keep the registry at 0 entries (zero leak).
+        for i in 0..256u32 {
+            let url = format!("blob:https://chat.example/{i}");
+            register_blob_url(&url);
+            assert_eq!(live_blob_url_count(), 1);
+            revoke_blob_url(&url);
+            assert_eq!(live_blob_url_count(), 0);
+        }
+
+        // Remaining active URLs are drained synchronously on `revoke_all_blob_urls`.
+        register_blob_url("blob:https://chat.example/a");
+        register_blob_url("blob:https://chat.example/b");
+        register_blob_url("blob:https://chat.example/c");
+        assert_eq!(live_blob_url_count(), 3);
+        revoke_blob_url("blob:https://chat.example/b");
+        assert_eq!(live_blob_url_count(), 2);
+        revoke_all_blob_urls();
+        assert_eq!(live_blob_url_count(), 0);
     }
 }

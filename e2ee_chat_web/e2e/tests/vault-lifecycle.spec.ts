@@ -58,6 +58,116 @@ test.describe('vault lifecycle', () => {
     await expect(page.locator('.sidebar-foot .whoami strong')).toHaveText('Alice');
   });
 
+  test('vault_kdf worker manifest wiring, cancelable KDF UX during create & unlock, and real derivation', async ({
+    page,
+  }) => {
+    await page.goto('/');
+    const dialog = page.locator('dialog.modal');
+    await expect(dialog.getByRole('heading', { name: 'Create your vault' })).toBeVisible();
+
+    // 1. Verify `<meta name="e2ee-worker-manifest">` contains hashed `"vault_kdf"` loader entry.
+    const manifest = await page.evaluate(() => {
+      const meta = document.querySelector('meta[name="e2ee-worker-manifest"]');
+      return meta ? (JSON.parse(meta.getAttribute('content') || '{}') as Record<string, string>) : null;
+    });
+    expect(manifest).not.toBeNull();
+    expect(manifest!.vault_kdf).toMatch(/^\/assets\/vault_kdf-[0-9a-f]+_loader\.js$/);
+
+    // 2. Cancel during Create: pause the `vault_kdf` worker script fetch deterministically so we
+    //    can assert the accessible KDF spinner, status text, disabled inputs, and working Cancel
+    //    button regardless of host CPU speed.
+    let releaseCreateRoute: (() => void) | null = null;
+    const createRouteGate = new Promise<void>((resolve) => {
+      releaseCreateRoute = resolve;
+    });
+    let sawCreateKdfRequest = false;
+    const holdCreateRoute = async (route: import('@playwright/test').Route) => {
+      sawCreateKdfRequest = true;
+      await createRouteGate;
+      // Clicking Cancel invokes `worker.terminate()`, which already aborts this intercepted fetch.
+      await route.continue().catch(() => {});
+    };
+    await page.route('**/assets/vault_kdf-*_loader.js', holdCreateRoute);
+
+    await dialog.locator('#name').fill('Alice KDF');
+    await dialog.locator('#password').fill(TEST_PASSPHRASE);
+    await dialog.locator('#repeat').fill(TEST_PASSPHRASE);
+    await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+
+    await expect(dialog.locator('.error.working')).toBeVisible();
+    await expect(dialog.locator('.error.working .kdf-spinner')).toBeVisible();
+    await expect(dialog.locator('.error.working')).toContainText('Deriving encryption key…');
+    await expect(dialog.locator('#password')).toBeDisabled();
+    const cancelBtn = dialog.getByRole('button', { name: 'Cancel', exact: true });
+    await expect(cancelBtn).toBeVisible();
+    await expect.poll(() => sawCreateKdfRequest).toBe(true);
+
+    // Click Cancel: terminates ephemeral worker immediately and returns to editable form cleanly.
+    await cancelBtn.click();
+    await expect(dialog.locator('#password')).toBeEnabled();
+    await expect(dialog.locator('.error.working')).toHaveCount(0);
+    await expect(dialog.getByRole('heading', { name: 'Create your vault' })).toBeVisible();
+    await page.unroute('**/assets/vault_kdf-*_loader.js', holdCreateRoute);
+    releaseCreateRoute!();
+
+    // Confirm zero vault was written to IndexedDB after cancelled Create.
+    const anchorAfterCancel = await page.evaluate(
+      (key) => localStorage.getItem(key),
+      ROLLBACK_ANCHOR_KEY,
+    );
+    expect(anchorAfterCancel).toBeNull();
+
+    // 3. Complete real vault creation via the ephemeral `vault_kdf` worker.
+    await dialog.locator('#password').fill(TEST_PASSPHRASE);
+    await dialog.locator('#repeat').fill(TEST_PASSPHRASE);
+    await dialog.getByRole('button', { name: 'Create', exact: true }).click();
+    await expect(page.getByRole('button', { name: 'Lock the vault' })).toBeVisible();
+    await expect(page.locator('.sidebar-foot .whoami strong')).toHaveText('Alice KDF');
+
+    // Dismiss auto-opened SignInDialog cleanly before locking.
+    const signInHeading = dialog.getByRole('heading', { name: 'Sign in to this server' });
+    await expect(signInHeading).toBeVisible();
+    await dialog.getByRole('button', { name: 'Not now', exact: true }).click();
+    await expect(signInHeading).toBeHidden();
+
+    // 4. Lock vault and verify Cancel during Unlock.
+    await lockVault(page);
+
+    let releaseUnlockRoute: (() => void) | null = null;
+    const unlockRouteGate = new Promise<void>((resolve) => {
+      releaseUnlockRoute = resolve;
+    });
+    let sawUnlockKdfRequest = false;
+    const holdUnlockRoute = async (route: import('@playwright/test').Route) => {
+      sawUnlockKdfRequest = true;
+      await unlockRouteGate;
+      await route.continue().catch(() => {});
+    };
+    await page.route('**/assets/vault_kdf-*_loader.js', holdUnlockRoute);
+
+    await dialog.locator('#password').fill(TEST_PASSPHRASE);
+    await dialog.getByRole('button', { name: 'Unlock', exact: true }).click();
+
+    await expect(dialog.locator('.error.working')).toBeVisible();
+    await expect(dialog.locator('.error.working .kdf-spinner')).toBeVisible();
+    await expect(dialog.locator('.error.working')).toContainText('Deriving encryption key…');
+    await expect(dialog.locator('#password')).toBeDisabled();
+    const unlockCancelBtn = dialog.getByRole('button', { name: 'Cancel', exact: true });
+    await expect(unlockCancelBtn).toBeVisible();
+    await expect.poll(() => sawUnlockKdfRequest).toBe(true);
+
+    await unlockCancelBtn.click();
+    await expect(dialog.locator('#password')).toBeEnabled();
+    await expect(dialog.locator('.error.working')).toHaveCount(0);
+    await expect(dialog.getByRole('button', { name: 'Forgot it: start over', exact: true })).toBeVisible();
+    await page.unroute('**/assets/vault_kdf-*_loader.js', holdUnlockRoute);
+    releaseUnlockRoute!();
+
+    // 5. Complete real Unlock via the ephemeral `vault_kdf` worker.
+    await unlockVault(page, TEST_PASSPHRASE);
+    await expect(page.locator('.sidebar-foot .whoami strong')).toHaveText('Alice KDF');
+  });
+
   test('v3 rollback anchor rejection (stale revision & vault_id swap) and 2-step ConfirmGuard reset', async ({
     page,
   }) => {

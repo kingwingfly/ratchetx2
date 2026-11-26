@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use leptos::{ev, html, leptos_dom::helpers::TimeoutHandle, prelude::*, task::spawn_local};
 use session::PublicKey;
-use web_sys::{FileList, HtmlInputElement, Url};
+use web_sys::{FileList, HtmlInputElement};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -167,8 +167,10 @@ pub(super) fn writable_recipients(
         .collect()
 }
 
-/// Lock the vault: the page starts over, keeping nothing in memory.
+/// Lock the vault: synchronously revoke lock ownership, scrub all unlocked state, release the
+/// exclusive Web Lock, and reload cleanly.
 pub(super) fn lock() {
+    crate::glue::teardown_and_release_lock();
     let _ = window().location().reload();
 }
 
@@ -216,7 +218,7 @@ pub(super) fn download_blob(
     let _ = anchor.remove_attribute("download");
     set_timeout(
         move || {
-            let _ = Url::revoke_object_url(&url);
+            super::media::revoke_blob_url(&url);
         },
         Duration::from_secs(60),
     );
@@ -538,8 +540,17 @@ impl Progress {
 
     pub(super) fn view(self) -> impl IntoView {
         view! {
-            <p class="error" class:working=move || self.working.get() role="alert">
-                {move || self.message.get()}
+            <p
+                class="error"
+                class:working=move || self.working.get()
+                role=move || if self.working.get() { "status" } else { "alert" }
+                aria-live=move || if self.working.get() { "polite" } else { "assertive" }
+                aria-busy=move || self.working.get().then_some("true")
+            >
+                <Show when=move || self.working.get()>
+                    <span class="kdf-spinner" aria-hidden="true"></span>
+                </Show>
+                <span>{move || self.message.get()}</span>
             </p>
         }
     }
