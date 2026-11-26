@@ -665,6 +665,7 @@ pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
         hello_name: String::new(),
         unread: 0,
         last_activity: 0,
+        last_message: None,
         security: SecurityView::default(),
         has_active_session: false,
         pq_pinned: false,

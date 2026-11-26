@@ -2,8 +2,11 @@ use e2ee_chat_preview::rpc::{DIAGRAM_SOURCE_MAX, HIGHLIGHT_MAX};
 use session::{PqSuite, PublicKey};
 
 use crate::{
+    icon::Icon,
     preview::validate_highlight_html,
-    state::{ClassicalPrompt, SecurityAlert, SecurityView, ServerPqStatus},
+    state::{
+        ClassicalPrompt, LastMessage, LastMessageKind, SecurityAlert, SecurityView, ServerPqStatus,
+    },
     util::{hex, key_to_text, key_to_url, sanitize_filename, sanitize_shared_name},
 };
 
@@ -19,7 +22,7 @@ use super::{
     media::duration,
     pdf::{MAX_PDF_PAGES, cap_pdf_pages, pdf_aspect_ratio},
     settings::{server_pq_pill, strict_pq_toggle_disabled},
-    sidebar::chat_item_meta,
+    sidebar::{ChatItemMeta, ChatItemSubtitle, KindBadge, chat_item_meta, last_message_badge},
     viewer::{
         EnhancePlan, MAX_ENHANCE_BLOCKS, plan_enhance_block, preview_fragment_candidates,
         sanitize_archive_path,
@@ -131,42 +134,34 @@ fn active_sessions_show_pq_or_classical_badges_and_upgrade_rules() {
 
 #[test]
 fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
+    let status = |request_accent, warn, downgrade, text: &str| ChatItemMeta {
+        request_accent,
+        warn,
+        downgrade,
+        subtitle: ChatItemSubtitle::Status(text.to_string()),
+    };
+
     let mut accepted_q = make_contact(7, "Alice");
     accepted_q.classical_prompt = ClassicalPrompt::InboundQuarantined {
         peer_was_pq_pinned: false,
     };
     assert_eq!(
         chat_item_meta(&accepted_q),
-        (
-            false,
-            true,
-            false,
-            "classical chat (quarantined)".to_string()
-        )
+        status(false, true, false, "classical chat (quarantined)")
     );
 
     let mut request_q = accepted_q.clone();
     request_q.request = true;
     assert_eq!(
         chat_item_meta(&request_q),
-        (
-            false,
-            true,
-            false,
-            "classical request (quarantined)".to_string()
-        )
+        status(false, true, false, "classical request (quarantined)")
     );
 
     let mut downgrade_q = accepted_q;
     downgrade_q.downgrade_detected = true;
     assert_eq!(
         chat_item_meta(&downgrade_q),
-        (
-            false,
-            false,
-            true,
-            "downgrade detected (quarantined)".to_string()
-        )
+        status(false, false, true, "downgrade detected (quarantined)")
     );
 
     let mut outbound = make_contact(7, "Alice");
@@ -175,20 +170,114 @@ fn chat_item_meta_distinguishes_quarantined_chats_requests_and_alerts() {
     };
     assert_eq!(
         chat_item_meta(&outbound),
-        (false, true, false, "classical approval needed".to_string())
+        status(false, true, false, "classical approval needed")
     );
 
     let mut expired = make_contact(7, "Alice");
     expired.alert = SecurityAlert::ManifestExpired;
     assert_eq!(
         chat_item_meta(&expired),
-        (false, true, false, "peer PQ manifest expired".to_string())
+        status(false, true, false, "peer PQ manifest expired")
     );
     let mut strict = make_contact(7, "Alice");
     strict.alert = SecurityAlert::PqRequired;
     assert_eq!(
         chat_item_meta(&strict),
-        (false, true, false, "PQ required (paused)".to_string())
+        status(false, true, false, "PQ required (paused)")
+    );
+}
+
+#[test]
+fn chat_item_meta_shows_typed_last_message_and_prevents_text_spoofing() {
+    let mut chat = make_contact(7, "Alice");
+    assert_eq!(
+        chat_item_meta(&chat).subtitle,
+        ChatItemSubtitle::Status(crate::util::short(&chat.peer))
+    );
+
+    // Plain text that mimics a photo label renders as plain text with NO badge.
+    let spoofed_text = LastMessage {
+        kind: LastMessageKind::Text,
+        outgoing: false,
+        text: "Photo - super girl.jpeg".to_string(),
+    };
+    assert_eq!(last_message_badge(&spoofed_text), None);
+    chat.last_message = Some(spoofed_text.clone());
+    assert_eq!(
+        chat_item_meta(&chat).subtitle,
+        ChatItemSubtitle::Message(spoofed_text)
+    );
+
+    // A real image/video/audio/file/contact/system event carries a typed badge the sender cannot forge.
+    let real_photo = LastMessage {
+        kind: LastMessageKind::Image,
+        outgoing: false,
+        text: "super girl.jpeg".to_string(),
+    };
+    assert_eq!(
+        last_message_badge(&real_photo),
+        Some(KindBadge {
+            icon: Some(Icon::Photo),
+            label: "Photo",
+            class: "chat-kind-badge",
+        })
+    );
+    assert_eq!(
+        last_message_badge(&LastMessage {
+            kind: LastMessageKind::Video,
+            outgoing: true,
+            text: "clip.mp4".to_string(),
+        }),
+        Some(KindBadge {
+            icon: Some(Icon::Video),
+            label: "Video",
+            class: "chat-kind-badge",
+        })
+    );
+    assert_eq!(
+        last_message_badge(&LastMessage {
+            kind: LastMessageKind::Deleted,
+            outgoing: false,
+            text: String::new(),
+        }),
+        Some(KindBadge {
+            icon: Some(Icon::Delete),
+            label: "Deleted chat",
+            class: "chat-kind-badge warn",
+        })
+    );
+
+    // Requests and security alerts still take precedence over last_message.
+    chat.last_message = Some(real_photo);
+    let mut request = chat.clone();
+    request.request = true;
+    assert_eq!(
+        chat_item_meta(&request),
+        ChatItemMeta {
+            request_accent: true,
+            warn: false,
+            downgrade: false,
+            subtitle: ChatItemSubtitle::Status("wants to chat".to_string()),
+        }
+    );
+
+    let mut expired = chat.clone();
+    expired.alert = SecurityAlert::ManifestExpired;
+    assert_eq!(
+        chat_item_meta(&expired).subtitle,
+        ChatItemSubtitle::Status("peer PQ manifest expired".to_string())
+    );
+
+    let mut downgrade = chat;
+    downgrade.downgrade_detected = true;
+    assert_eq!(
+        chat_item_meta(&downgrade),
+        ChatItemMeta {
+            request_accent: false,
+            warn: false,
+            downgrade: true,
+            subtitle: ChatItemSubtitle::Status("downgrade detected".to_string()),
+        }
     );
 }
 

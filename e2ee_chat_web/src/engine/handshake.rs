@@ -1636,6 +1636,7 @@ impl Engine {
             place: 1,
             ..HistoryEntry::default()
         };
+        let last_message = Some(super::contact::preview_for_entry(&entry));
         inner.contacts.push(Contact {
             peer,
             session,
@@ -1645,6 +1646,7 @@ impl Engine {
                 name,
                 history_len: 1,
                 last_activity: now(),
+                last_message,
                 clock: 1,
                 greeting_delivery: GREETING_DELIVERY_UNSENT,
                 acked_ranges: vec![IndexRange { start: 0, end: 1 }],

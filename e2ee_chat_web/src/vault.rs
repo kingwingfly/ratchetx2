@@ -50,7 +50,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::{
     content::{Content, Events, Kind},
     preview::{self, Sort},
-    state::Delivery,
+    state::{Delivery, LastMessage, LastMessageKind},
     util::{from_hex, hex},
 };
 
@@ -813,6 +813,41 @@ pub struct ContactState {
     /// Durable fallback farewells from a previously established session.
     #[prost(message, repeated, tag = "29")]
     pub fallback_farewells: Vec<Farewell>,
+    /// Structured single-line preview of the most recent message in this chat.
+    #[prost(message, optional, tag = "30")]
+    pub last_message: Option<LastMessageRecord>,
+}
+
+/// Persisted structured preview of the most recent message in a chat.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct LastMessageRecord {
+    #[prost(enumeration = "LastMessageKind", tag = "1")]
+    pub kind: i32,
+    #[prost(bool, tag = "2")]
+    pub outgoing: bool,
+    /// Sanitized single-line text, filename, or shared contact label.
+    #[prost(string, tag = "3")]
+    pub text: String,
+}
+
+impl LastMessageRecord {
+    pub fn to_view(&self) -> Option<LastMessage> {
+        if self.kind == i32::from(LastMessageKind::None) {
+            return None;
+        }
+        let kind = LastMessageKind::try_from(self.kind).unwrap_or(LastMessageKind::Unknown);
+        Some(LastMessage {
+            kind,
+            outgoing: self.outgoing,
+            text: self.text.clone(),
+        })
+    }
+
+    pub fn zeroize_secrets(&mut self) {
+        self.text.zeroize();
+        self.kind = 0;
+        self.outgoing = false;
+    }
 }
 
 impl ContactState {
@@ -821,6 +856,9 @@ impl ContactState {
         drop(self.session.take());
         drop(self.quarantined_session.take());
         self.quarantined_first_message.zeroize();
+        if let Some(mut last) = self.last_message.take() {
+            last.zeroize_secrets();
+        }
         for buf in &mut self.pending_carried_initials {
             buf.zeroize();
         }

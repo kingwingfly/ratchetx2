@@ -3,22 +3,120 @@
 use super::EVENTS_KEPT;
 use crate::content::{Content, Events, Kind};
 use crate::state::{
-    Attachment, Body, ClassicalPrompt, ContactView, Delivery, IsolatedContactView, LocalFile,
-    MessageView, RemoteFile, SecurityAlert, SecurityView, Step,
+    Attachment, Body, ClassicalPrompt, ContactView, Delivery, IsolatedContactView, LastMessageKind,
+    LocalFile, MessageView, RemoteFile, SecurityAlert, SecurityView, Step, message_order_key,
 };
 use crate::transport::{Connect, Fetch};
-use crate::util::{describe, now, short};
+use crate::util::{describe, now, sanitize_filename, sanitize_preview_text, short};
 use crate::vault::{
     Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
     ContactState, GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_LEGACY_UNKNOWN,
     GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, IndexRange,
-    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
-    SECURITY_ALERT_PQ_REQUIRED,
+    LastMessageRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
+    SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
 };
 use crate::{content, preview};
 use session::{ErrorKind, PublicKey, Session, SessionState, proto};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Maximum characters stored for a chat's single-line sidebar preview text.
+pub(super) const LAST_MESSAGE_PREVIEW_MAX_CHARS: usize = 120;
+
+fn media_preview_kind(sort: preview::Sort) -> LastMessageKind {
+    match sort {
+        preview::Sort::Image => LastMessageKind::Image,
+        preview::Sort::Video => LastMessageKind::Video,
+        preview::Sort::Audio => LastMessageKind::Audio,
+        _ => LastMessageKind::File,
+    }
+}
+
+fn sanitized_file_preview_name(name: &str) -> String {
+    if name.trim().is_empty() {
+        String::new()
+    } else {
+        sanitize_preview_text(&sanitize_filename(name), LAST_MESSAGE_PREVIEW_MAX_CHARS)
+    }
+}
+
+/// Build a bounded, typed single-line chat-list preview for `entry`.
+pub(super) fn preview_for_entry(entry: &HistoryEntry) -> LastMessageRecord {
+    let make = |kind: LastMessageKind, outgoing: bool, text: String| LastMessageRecord {
+        kind: kind.into(),
+        outgoing,
+        text,
+    };
+    if entry.evicted {
+        return make(LastMessageKind::Evicted, false, String::new());
+    }
+    match entry.content.as_ref().and_then(|c| c.kind.as_ref()) {
+        Some(Kind::Text(text)) => make(
+            LastMessageKind::Text,
+            entry.outgoing,
+            sanitize_preview_text(text, LAST_MESSAGE_PREVIEW_MAX_CHARS),
+        ),
+        Some(Kind::Image(_)) => make(LastMessageKind::Image, entry.outgoing, String::new()),
+        Some(Kind::File(file)) => {
+            let sort = if entry.file > 0 {
+                if !entry.media.is_empty() {
+                    preview::sort(&file.name, &entry.media, &[])
+                } else {
+                    entry.sort()
+                }
+            } else {
+                preview::sort(&file.name, &file.mime, &file.data)
+            };
+            make(
+                media_preview_kind(sort),
+                entry.outgoing,
+                sanitized_file_preview_name(&file.name),
+            )
+        }
+        Some(Kind::Attachment(pointer)) => {
+            let sort = preview::sort(&pointer.name, &pointer.mime, &[]);
+            make(
+                media_preview_kind(sort),
+                entry.outgoing,
+                sanitized_file_preview_name(&pointer.name),
+            )
+        }
+        Some(Kind::Contact(contact)) => match PublicKey::try_from(contact.key.as_slice()) {
+            Ok(key) => {
+                let clean_name = super::sanitize_shared_name(&contact.name);
+                let label = if !clean_name.is_empty() {
+                    clean_name
+                } else {
+                    short(&key)
+                };
+                make(
+                    LastMessageKind::Contact,
+                    entry.outgoing,
+                    sanitize_preview_text(&label, LAST_MESSAGE_PREVIEW_MAX_CHARS),
+                )
+            }
+            Err(_) => make(LastMessageKind::Unknown, entry.outgoing, String::new()),
+        },
+        Some(Kind::Hello(_)) => make(LastMessageKind::Hello, entry.outgoing, String::new()),
+        Some(Kind::Deleted(_)) => make(LastMessageKind::Deleted, false, String::new()),
+        None => make(LastMessageKind::Unknown, entry.outgoing, String::new()),
+    }
+}
+
+/// Pick the bottom-most message in display order from `entries` and return its sidebar preview.
+pub(super) fn latest_entry_preview(
+    entries: &[(u64, HistoryEntry)],
+    me: &PublicKey,
+    peer: &PublicKey,
+) -> Option<LastMessageRecord> {
+    let mine_first = me < peer;
+    entries
+        .iter()
+        .max_by_key(|(index, entry)| {
+            message_order_key(entry.place, entry.outgoing, mine_first, *index)
+        })
+        .map(|(_, entry)| preview_for_entry(entry))
+}
 
 /// Keep the last [`EVENTS_KEPT`] of `list`.
 pub(super) fn keep_last<T>(list: &mut Vec<T>) {
@@ -317,6 +415,11 @@ impl Contact {
             hello_name: self.state.hello_name.clone(),
             unread: self.state.unread,
             last_activity: self.state.last_activity,
+            last_message: self
+                .state
+                .last_message
+                .as_ref()
+                .and_then(LastMessageRecord::to_view),
             security: SecurityView::from_session(active_security.unwrap_or_default()),
             has_active_session: active_security.is_some(),
             pq_pinned: peer_pq.pq_pinned,
@@ -337,6 +440,11 @@ impl Contact {
         Ok(index)
     }
 
+    /// Update the cached single-line sidebar preview from `entry`.
+    pub(super) fn record_last_message(&mut self, entry: &HistoryEntry) {
+        self.state.last_message = Some(preview_for_entry(entry));
+    }
+
     /// Record an evicted (undecryptable-aged) message distinctly in history.
     pub(super) fn add_evicted(&mut self) -> Result<(u64, HistoryEntry), &'static str> {
         let index = self.next_history_index()?;
@@ -353,6 +461,7 @@ impl Contact {
             evicted: true,
             ..HistoryEntry::default()
         };
+        self.record_last_message(&entry);
         Ok((index, entry))
     }
 
@@ -394,6 +503,7 @@ impl Contact {
             place,
             ..HistoryEntry::default()
         };
+        self.record_last_message(&entry);
         Ok((index, entry))
     }
 

@@ -141,6 +141,34 @@ pub enum ClassicalPrompt {
     InboundQuarantined { peer_was_pq_pinned: bool },
 }
 
+/// What kind of message a chat's sidebar preview represents. Non-text kinds render with a styled
+/// UI badge/icon so a sender cannot impersonate media, files, shared contacts, or system notes
+/// using plain text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, prost::Enumeration)]
+#[repr(i32)]
+pub enum LastMessageKind {
+    None = 0,
+    Text = 1,
+    Image = 2,
+    Video = 3,
+    Audio = 4,
+    File = 5,
+    Contact = 6,
+    Hello = 7,
+    Deleted = 8,
+    Evicted = 9,
+    Unknown = 10,
+}
+
+/// Structured preview of the most recent message in a chat, shown in the chat list.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LastMessage {
+    pub kind: LastMessageKind,
+    pub outgoing: bool,
+    /// Plain text body for `Text`, sanitized filename for media/files, or shared contact label.
+    pub text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContactView {
     pub peer: PublicKey,
@@ -151,6 +179,8 @@ pub struct ContactView {
     pub hello_name: String,
     pub unread: u32,
     pub last_activity: u64,
+    /// Structured preview of the most recent message in this chat, if any.
+    pub last_message: Option<LastMessage>,
     /// Active session cryptographic security level.
     pub security: SecurityView,
     pub has_active_session: bool,
@@ -253,7 +283,12 @@ impl MessageRow {
     }
 }
 
-fn order_key(place: u64, outgoing: bool, mine_first: bool, index: u64) -> (bool, u64, bool, u64) {
+pub(crate) fn message_order_key(
+    place: u64,
+    outgoing: bool,
+    mine_first: bool,
+    index: u64,
+) -> (bool, u64, bool, u64) {
     (place == 0, place, outgoing != mine_first, index)
 }
 
@@ -263,7 +298,7 @@ fn order_key(place: u64, outgoing: bool, mine_first: bool, index: u64) -> (bool,
 pub fn order(messages: &mut [MessageView], me: &PublicKey, peer: &PublicKey) {
     let mine_first = me < peer;
     messages.sort_by_key(|message| {
-        order_key(message.place, message.outgoing, mine_first, message.index)
+        message_order_key(message.place, message.outgoing, mine_first, message.index)
     });
 }
 
@@ -271,7 +306,7 @@ pub fn order(messages: &mut [MessageView], me: &PublicKey, peer: &PublicKey) {
 pub fn order_rows(messages: &mut [MessageRow], me: &PublicKey, peer: &PublicKey) {
     let mine_first = me < peer;
     messages.sort_by_key(|message| {
-        order_key(message.place, message.outgoing, mine_first, message.index)
+        message_order_key(message.place, message.outgoing, mine_first, message.index)
     });
 }
 
