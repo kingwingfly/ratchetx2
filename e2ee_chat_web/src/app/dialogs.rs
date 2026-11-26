@@ -20,7 +20,7 @@ use super::{
         AllowClassical, ConfirmGuard, ContactKey, CopyButton, CopyFeedbackButton, Copyable,
         InvitationLink, Progress, act_while, avatar_letters, can_allow_classical, close_dialog,
         default_shared_contact_name, download_blob, flash_copied, invitation_link, pq_available,
-        send, server_pq_disabled, shareable_contacts, shared_contact_pq_pinned, strict_pq_enabled,
+        send, server_pq_disabled, shared_contact_pq_pinned, strict_pq_enabled,
         upgrade_disabled_tip, writable_recipients,
     },
     engine,
@@ -162,10 +162,9 @@ pub(super) fn VaultDialog() -> impl IntoView {
                 (Phase::Unlocked, Some(Dialog::Contact(peer))) => {
                     view! { <ContactInfo peer /> }.into_any()
                 }
-                (
-                    Phase::Unlocked,
-                    Some(Dialog::ShareContact { subject, recipient }),
-                ) => view! { <ShareContact subject recipient /> }.into_any(),
+                (Phase::Unlocked, Some(Dialog::ShareContact(subject))) => {
+                    view! { <ShareContact subject /> }.into_any()
+                }
                 (Phase::Unlocked, Some(Dialog::Files(peer))) => {
                     view! { <FileBrowser peer /> }.into_any()
                 }
@@ -824,23 +823,19 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
 }
 
 #[component]
-fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> impl IntoView {
+fn ShareContact(subject: PublicKey) -> impl IntoView {
     let ui = ui();
-    let from_contact_info = subject.is_some() && recipient.is_none();
     let picked = RwSignal::new(None::<PublicKey>);
     let query = RwSignal::new(String::new());
-    let initial_name = subject
-        .and_then(|peer| ui.contact(&peer))
+    let initial_name = ui
+        .contact(&subject)
         .map(|contact| default_shared_contact_name(&contact))
         .unwrap_or_default();
     let shared_name = RwSignal::new(initial_name);
 
     let candidates = Memo::new(move |_| {
-        ui.contacts.with(|contacts| match (subject, recipient) {
-            (Some(subject_peer), None) => writable_recipients(contacts, subject_peer),
-            (None, Some(recipient_peer)) => shareable_contacts(contacts, recipient_peer),
-            _ => Vec::new(),
-        })
+        ui.contacts
+            .with(|contacts| writable_recipients(contacts, subject))
     });
     let filtered_peers = Memo::new(move |_| {
         let needle = query.get().trim().to_lowercase();
@@ -855,28 +850,22 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
             .collect::<Vec<_>>()
     });
     // Only treat a picked peer as active while it remains visible in the current filtered list so
-    // pressing Enter or clicking Share can never send to/for a hidden selection.
-    let selected_peer = Memo::new(move |_| {
+    // pressing Enter or clicking Share can never send to a hidden selection.
+    let selected_recipient = Memo::new(move |_| {
         picked
             .get()
             .filter(|peer| filtered_peers.with(|list| list.contains(peer)))
     });
-    let active_subject = move || subject.or_else(|| selected_peer.get());
-    let active_recipient = move || recipient.or_else(|| selected_peer.get());
     let will_pin_pq = Memo::new(move |_| {
-        active_subject()
-            .and_then(|peer| ui.contact(&peer))
+        ui.contact(&subject)
             .is_some_and(|contact| shared_contact_pq_pinned(&contact, server_pq_disabled(ui)))
     });
     let can_submit = move || {
-        let (Some(subject_peer), Some(recipient_peer)) = (active_subject(), active_recipient())
-        else {
+        let Some(recipient_peer) = selected_recipient.get() else {
             return false;
         };
-        subject_peer != recipient_peer
-            && ui
-                .contact(&subject_peer)
-                .is_some_and(|contact| !contact.request)
+        subject != recipient_peer
+            && ui.contact(&subject).is_some_and(|contact| !contact.request)
             && ui
                 .contact(&recipient_peer)
                 .is_some_and(|contact| !contact.request && !contact.is_quarantined())
@@ -884,16 +873,13 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
 
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
-        let (Some(subject_peer), Some(recipient_peer)) = (
-            subject.or_else(|| selected_peer.get_untracked()),
-            recipient.or_else(|| selected_peer.get_untracked()),
-        ) else {
+        let Some(recipient_peer) = selected_recipient.get_untracked() else {
             return;
         };
-        if subject_peer == recipient_peer {
+        if subject == recipient_peer {
             return;
         }
-        let Some(subject_contact) = ui.contact(&subject_peer) else {
+        let Some(subject_contact) = ui.contact(&subject) else {
             ui.notify("That contact is no longer in your chats.");
             return;
         };
@@ -914,7 +900,7 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
         send(
             recipient_peer,
             content::Kind::Contact(content::Contact {
-                key: subject_peer.to_vec(),
+                key: subject.to_vec(),
                 name,
                 pq_pinned,
             }),
@@ -927,39 +913,20 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
         ));
     };
 
-    let title = if from_contact_info {
-        "Share contact"
-    } else {
-        "Share a contact"
-    };
-    let intro = move || match (subject, recipient) {
-        (Some(subject_peer), None) => {
-            let who = ui
-                .contact(&subject_peer)
-                .map(|c| c.label())
-                .unwrap_or_else(|| short(&subject_peer));
-            format!(
-                "Send {who}'s public identity key to another chat so they can start an encrypted chat."
-            )
-        }
-        (None, Some(recipient_peer)) => {
-            let who = ui
-                .contact(&recipient_peer)
-                .map(|c| c.label())
-                .unwrap_or_else(|| short(&recipient_peer));
-            format!(
-                "Send a contact's public identity key to {who} so they can start an encrypted chat."
-            )
-        }
-        _ => String::new(),
+    let intro = move || {
+        let who = ui
+            .contact(&subject)
+            .map(|c| c.label())
+            .unwrap_or_else(|| short(&subject));
+        format!("Send {who}'s contact card to another chat so they can start an encrypted chat.")
     };
 
     view! {
         <form on:submit=submit>
-            <h2>{title}</h2>
+            <h2>"Share this contact"</h2>
             <p>{intro}</p>
             {move || {
-                subject.and_then(|peer| ui.contact(&peer)).map(|contact| {
+                ui.contact(&subject).map(|contact| {
                     let letters = avatar_letters(&contact.name, &contact.peer);
                     let pq = shared_contact_pq_pinned(&contact, server_pq_disabled(ui));
                     view! {
@@ -974,7 +941,7 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
                     }
                 })
             }}
-            <label>{if from_contact_info { "Send to" } else { "Contact to share" }}</label>
+            <label>"Send to"</label>
             <Show when=move || candidates.with(|list| list.len() > 5)>
                 <input
                     type="search"
@@ -988,7 +955,7 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
                     }
                 />
             </Show>
-            <div class="share-list" role="listbox" aria-label=if from_contact_info { "Choose a chat" } else { "Choose a contact" }>
+            <div class="share-list" role="listbox" aria-label="Choose a chat">
                 <For
                     each=move || filtered_peers.get()
                     key=|peer| *peer
@@ -998,20 +965,10 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
                             <button
                                 type="button"
                                 class="share-option"
-                                class:selected=move || selected_peer.get() == Some(peer)
+                                class:selected=move || selected_recipient.get() == Some(peer)
                                 role="option"
-                                aria-selected=move || if selected_peer.get() == Some(peer) { "true" } else { "false" }
-                                on:click=move |_| {
-                                    let changed = picked.get_untracked() != Some(peer);
-                                    picked.set(Some(peer));
-                                    if !from_contact_info && changed {
-                                        let next_name = ui
-                                            .contact(&peer)
-                                            .map(|c| default_shared_contact_name(&c))
-                                            .unwrap_or_default();
-                                        shared_name.set(next_name);
-                                    }
-                                }
+                                aria-selected=move || if selected_recipient.get() == Some(peer) { "true" } else { "false" }
+                                on:click=move |_| picked.set(Some(peer))
                             >
                                 <span class="avatar">
                                     {move || {
@@ -1034,19 +991,7 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
                                     </strong>
                                     <span>{short(&peer)}</span>
                                 </span>
-                                {move || {
-                                    let c = live.get()?;
-                                    if from_contact_info {
-                                        Some(security_badge(&c, false))
-                                    } else if shared_contact_pq_pinned(&c, server_pq_disabled(ui)) {
-                                        Some(
-                                            view! { <span class="sec-badge pq">"PQ pinned"</span> }
-                                                .into_any(),
-                                        )
-                                    } else {
-                                        None
-                                    }
-                                }}
+                                {move || live.get().map(|c| security_badge(&c, false))}
                             </button>
                         }
                     }
@@ -1056,43 +1001,35 @@ fn ShareContact(subject: Option<PublicKey>, recipient: Option<PublicKey>) -> imp
                         {move || {
                             if !candidates.with(Vec::is_empty) {
                                 "No matching chats."
-                            } else if from_contact_info {
-                                "No eligible chats to share with yet."
                             } else {
-                                "No other contacts to share yet."
+                                "No eligible chats to share with yet."
                             }
                         }}
                     </p>
                 </Show>
             </div>
-            <Show when=move || active_subject().is_some()>
-                <label for="share-name">"Name to share (optional)"</label>
-                <input
-                    id="share-name"
-                    autocomplete="off"
-                    maxlength=NAME_MAX
-                    placeholder="Leave blank to share key only"
-                    bind:value=shared_name
-                />
-                <Show when=move || will_pin_pq.get()>
-                    <p class="pq-pin-hint">
-                        <span class="sec-badge pq">"PQ pinned"</span>
-                        " Includes post-quantum pinning so their new chat refuses classical downgrades."
-                    </p>
-                </Show>
+            <label for="share-name">"Name to share (optional)"</label>
+            <input
+                id="share-name"
+                autocomplete="off"
+                maxlength=NAME_MAX
+                placeholder="Leave blank to share key only"
+                bind:value=shared_name
+            />
+            <Show when=move || will_pin_pq.get()>
+                <p class="pq-pin-hint">
+                    <span class="sec-badge pq">"PQ pinned"</span>
+                    " Includes post-quantum pinning so their new chat refuses classical downgrades."
+                </p>
             </Show>
             <div class="actions">
-                {subject.filter(|_| from_contact_info).map(|peer| {
-                    view! {
-                        <button
-                            type="button"
-                            class="btn aside"
-                            on:click=move |_| ui.dialog.set(Some(Dialog::Contact(peer)))
-                        >
-                            "Back"
-                        </button>
-                    }
-                })}
+                <button
+                    type="button"
+                    class="btn aside"
+                    on:click=move |_| ui.dialog.set(Some(Dialog::Contact(subject)))
+                >
+                    "Back"
+                </button>
                 <button type="button" class="btn" on:click=move |_| close_dialog()>
                     "Cancel"
                 </button>

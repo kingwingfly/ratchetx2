@@ -4,7 +4,6 @@ use session::PublicKey;
 use crate::{
     content,
     icon::{Icon, icon},
-    state::Dialog,
 };
 
 use super::common::{send, send_files_to};
@@ -96,21 +95,6 @@ pub(super) fn Composer(
                 }
             >
                 {icon(Icon::Attach)}
-            </button>
-            <button
-                type="button"
-                class="btn icon"
-                title="Share a contact"
-                aria-label="Share a contact"
-                disabled=disabled
-                on:click=move |_| {
-                    super::ui().dialog.set(Some(Dialog::ShareContact {
-                        subject: None,
-                        recipient: Some(peer),
-                    }));
-                }
-            >
-                {icon(Icon::ShareContact)}
             </button>
             <textarea
                 node_ref=textarea

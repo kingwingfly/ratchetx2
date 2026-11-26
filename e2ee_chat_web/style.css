@@ -218,11 +218,11 @@ h1, h2, h3 { margin: 0; font-weight: 550; color: var(--text-bright); }
 .welcome p { margin: 0; color: var(--muted); line-height: 1.7; }
 .section-label { margin-bottom: 8px; font-size: 12px; color: var(--muted); }
 .key { padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--sunken); color: var(--accent); font-family: var(--mono); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; user-select: all; }
-/* A key or a link, with action buttons beside it. */
-.copyable { display: flex; align-items: flex-start; gap: 8px; }
-.copyable .key { flex: 1; min-width: 0; }
+/* A key or a link, clipped to one line, with matching-height action buttons beside it. */
+.copyable { display: flex; align-items: center; gap: 8px; }
+.copyable .key { flex: 1; min-width: 0; height: 41px; padding: 0 12px; line-height: 39px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; overflow-wrap: normal; }
 .copyable-actions { display: flex; align-items: center; gap: 8px; flex: none; }
-/* As tall as a line of the box. */
+/* Same height as the single-line key/link box. */
 .copyable .btn.icon { width: 41px; height: 41px; }
 .copyable + .section-label { margin-top: 16px; }
 .key.safety { display: grid; grid-template-columns: repeat(4, max-content); justify-content: space-between; gap: 2px 12px; color: var(--text-bright); font-size: 14px; letter-spacing: 2px; }
@@ -567,6 +567,5 @@ pre.code { margin: 0; padding: 24px; font-family: var(--mono); font-size: 13px; 
 }
 @media (max-width: 480px) {
   .key.safety { grid-template-columns: repeat(2, max-content); justify-content: space-around; gap: 4px 16px; }
-  .copyable-actions { flex-direction: column; }
 }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }

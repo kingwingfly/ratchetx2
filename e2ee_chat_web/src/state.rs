@@ -498,11 +498,8 @@ pub enum Dialog {
     Settings,
     /// A contact's name, key, security level, and safety number; for a request, accept or delete it.
     Contact(PublicKey),
-    /// Share one peer's public identity into another peer's chat (`subject` or `recipient` pre-filled).
-    ShareContact {
-        subject: Option<PublicKey>,
-        recipient: Option<PublicKey>,
-    },
+    /// Share this peer's public identity card into another accepted chat.
+    ShareContact(PublicKey),
     /// The files of the chat with a peer.
     Files(PublicKey),
     /// Sign in to the server, which keeps files only for those who do.
@@ -744,7 +741,7 @@ impl SignInFlow {
                 | Dialog::InviteQr { .. }
                 | Dialog::Settings
                 | Dialog::Contact(_)
-                | Dialog::ShareContact { .. }
+                | Dialog::ShareContact(_)
                 | Dialog::Files(_)
                 | Dialog::Activity,
             ) => None,
@@ -1240,14 +1237,7 @@ mod tests {
             None
         );
         assert_eq!(
-            flow.on_ask_sign_in(
-                Some(&Dialog::ShareContact {
-                    subject: Some([1; 32]),
-                    recipient: None,
-                }),
-                true,
-                true,
-            ),
+            flow.on_ask_sign_in(Some(&Dialog::ShareContact([1; 32])), true, true),
             None
         );
         assert_eq!(
