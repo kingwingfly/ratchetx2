@@ -17,6 +17,8 @@ use web_sys::{
     Navigator, PageTransitionEvent, ServiceWorkerContainer,
 };
 
+use crate::util::{EventListener, Timeout};
+
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(extends = Navigator)]
@@ -176,39 +178,33 @@ fn install_lock_lifecycle() {
     let Some(window) = web_sys::window() else {
         return;
     };
-    let on_pagehide =
-        Closure::<dyn FnMut(PageTransitionEvent)>::new(move |_event: PageTransitionEvent| {
-            LOCK_RELEASED.with(|released| released.set(true));
-            LOCK_HELD.with(|held| held.set(false));
-            MEDIA_HANDLER.with(|handler| *handler.borrow_mut() = None);
-            if let Some((cancelled, controller)) =
-                LOCK_WAIT_ABORT.with(|slot| slot.borrow_mut().take())
-            {
-                cancelled.set(true);
-                controller.abort();
-            }
-            if let Some(wake) = LOCK_INACTIVE_WAKE.with(|slot| slot.borrow_mut().take()) {
-                wake();
-            }
-            if let Some(resolve) = LOCK_RESOLVER.with(|slot| slot.borrow_mut().take()) {
-                let _ = resolve.call0(&JsValue::UNDEFINED);
-            }
-        });
-    let _ =
-        window.add_event_listener_with_callback("pagehide", on_pagehide.as_ref().unchecked_ref());
-    on_pagehide.forget();
+    EventListener::new(&window, "pagehide", move |_event| {
+        LOCK_RELEASED.with(|released| released.set(true));
+        LOCK_HELD.with(|held| held.set(false));
+        MEDIA_HANDLER.with(|handler| *handler.borrow_mut() = None);
+        if let Some((cancelled, controller)) = LOCK_WAIT_ABORT.with(|slot| slot.borrow_mut().take())
+        {
+            cancelled.set(true);
+            controller.abort();
+        }
+        if let Some(wake) = LOCK_INACTIVE_WAKE.with(|slot| slot.borrow_mut().take()) {
+            wake();
+        }
+        if let Some(resolve) = LOCK_RESOLVER.with(|slot| slot.borrow_mut().take()) {
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        }
+    })
+    .forget();
 
-    let on_pageshow =
-        Closure::<dyn FnMut(PageTransitionEvent)>::new(move |event: PageTransitionEvent| {
-            if event.persisted()
-                && let Some(window) = web_sys::window()
-            {
-                let _ = window.location().reload();
-            }
-        });
-    let _ =
-        window.add_event_listener_with_callback("pageshow", on_pageshow.as_ref().unchecked_ref());
-    on_pageshow.forget();
+    EventListener::new(&window, "pageshow", move |event| {
+        if let Some(event) = event.dyn_ref::<PageTransitionEvent>()
+            && event.persisted()
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.location().reload();
+        }
+    })
+    .forget();
 }
 
 /// Return a held Web Lock promise whose `resolve` callback is stored for `pagehide` release.
@@ -290,12 +286,31 @@ async fn request_lock_if_available(
 }
 
 struct EventListenerGuard {
-    window: web_sys::Window,
-    window_event: &'static str,
-    doc: Option<web_sys::Document>,
-    on_window: Closure<dyn FnMut()>,
-    on_vis: Closure<dyn FnMut()>,
+    _window_listener: EventListener,
+    _doc_listener: Option<EventListener>,
     clear_inactive_wake: bool,
+}
+
+impl EventListenerGuard {
+    fn attach(
+        window: &web_sys::Window,
+        window_event: &'static str,
+        clear_inactive_wake: bool,
+        callback: impl Fn() + Clone + 'static,
+    ) -> Self {
+        let on_window = {
+            let callback = callback.clone();
+            EventListener::new(window, window_event, move |_| callback())
+        };
+        let on_vis = window
+            .document()
+            .map(|doc| EventListener::new(&doc, "visibilitychange", move |_| callback()));
+        Self {
+            _window_listener: on_window,
+            _doc_listener: on_vis,
+            clear_inactive_wake,
+        }
+    }
 }
 
 impl Drop for EventListenerGuard {
@@ -305,30 +320,14 @@ impl Drop for EventListenerGuard {
                 *slot.borrow_mut() = None;
             });
         }
-        let _ = self.window.remove_event_listener_with_callback(
-            self.window_event,
-            self.on_window.as_ref().unchecked_ref(),
-        );
-        if let Some(ref doc) = self.doc {
-            let _ = doc.remove_event_listener_with_callback(
-                "visibilitychange",
-                self.on_vis.as_ref().unchecked_ref(),
-            );
-        }
     }
 }
 
-struct TimeoutGuard {
-    window: web_sys::Window,
-    handle: Rc<Cell<Option<i32>>>,
-    _closure: Closure<dyn FnMut()>,
-}
+struct TimeoutGuard(Rc<RefCell<Option<Timeout>>>);
 
 impl Drop for TimeoutGuard {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            self.window.clear_timeout_with_handle(handle);
-        }
+        self.0.borrow_mut().take();
     }
 }
 
@@ -365,15 +364,11 @@ async fn request_lock_with_signal(
     };
     let cancelled = Rc::new(Cell::new(false));
     let aborted_inactive = Rc::new(Cell::new(false));
-    let timer_handle = Rc::new(Cell::new(None::<i32>));
+    let timeout_slot = Rc::new(RefCell::new(None::<Timeout>));
     let clear_timer = {
-        let timer_handle = timer_handle.clone();
+        let timeout_slot = timeout_slot.clone();
         move || {
-            if let Some(handle) = timer_handle.take()
-                && let Some(window) = web_sys::window()
-            {
-                window.clear_timeout_with_handle(handle);
-            }
+            timeout_slot.borrow_mut().take();
         }
     };
     LOCK_WAIT_ABORT.with(|slot| {
@@ -398,12 +393,15 @@ async fn request_lock_with_signal(
     );
     let mut _inactive_listeners: Option<EventListenerGuard> = None;
     if abort_when_inactive && let Some(window) = web_sys::window() {
-        let make_abort = || {
-            let cancelled = cancelled.clone();
-            let aborted_inactive = aborted_inactive.clone();
-            let controller = controller.clone();
-            let tell = tell.clone();
-            Closure::<dyn FnMut()>::new(move || {
+        let cancelled = cancelled.clone();
+        let aborted_inactive = aborted_inactive.clone();
+        let controller = controller.clone();
+        let tell = tell.clone();
+        _inactive_listeners = Some(EventListenerGuard::attach(
+            &window,
+            "blur",
+            false,
+            move || {
                 if !is_tab_active() {
                     aborted_inactive.set(true);
                     cancelled.set(true);
@@ -411,53 +409,21 @@ async fn request_lock_with_signal(
                     controller.abort();
                     tell(SignalWaitResult::AbortedInactive);
                 }
-            })
-        };
-        let on_blur = make_abort();
-        let on_vis = make_abort();
-        let _ = window.add_event_listener_with_callback("blur", on_blur.as_ref().unchecked_ref());
-        let doc = window.document();
-        if let Some(ref doc) = doc {
-            let _ = doc.add_event_listener_with_callback(
-                "visibilitychange",
-                on_vis.as_ref().unchecked_ref(),
-            );
-        }
-        _inactive_listeners = Some(EventListenerGuard {
-            window,
-            window_event: "blur",
-            doc,
-            on_window: on_blur,
-            on_vis,
-            clear_inactive_wake: false,
-        });
+            },
+        ));
     }
     let mut _timeout_guard: Option<TimeoutGuard> = None;
-    if let Some(ms) = timeout_ms
-        && let Some(window) = web_sys::window()
-    {
+    if let Some(ms) = timeout_ms {
         let cancelled = cancelled.clone();
         let controller = controller.clone();
         let tell = tell.clone();
-        let timer_handle_fire = timer_handle.clone();
-        let on_timeout = Closure::<dyn FnMut()>::new(move || {
-            timer_handle_fire.set(None);
+        *timeout_slot.borrow_mut() = Some(Timeout::new(ms, move || {
             cancelled.set(true);
             clear_lock_wait_abort(&cancelled);
             controller.abort();
             tell(SignalWaitResult::Status(LockStatus::HeldElsewhere));
-        });
-        if let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            on_timeout.as_ref().unchecked_ref(),
-            ms,
-        ) {
-            timer_handle.set(Some(handle));
-            _timeout_guard = Some(TimeoutGuard {
-                window,
-                handle: timer_handle.clone(),
-                _closure: on_timeout,
-            });
-        }
+        }));
+        _timeout_guard = Some(TimeoutGuard(timeout_slot));
     }
     let granted = {
         let tell = tell.clone();
@@ -545,35 +511,13 @@ async fn wait_until_tab_active() {
         let wake = wake.clone();
         *slot.borrow_mut() = Some(Box::new(wake));
     });
-    let on_focus = {
+    let _listeners = {
         let wake = wake.clone();
-        Closure::<dyn FnMut()>::new(move || {
+        EventListenerGuard::attach(&window, "focus", true, move || {
             if is_tab_active() || lock_released() {
                 wake();
             }
         })
-    };
-    let on_vis = {
-        let wake = wake.clone();
-        Closure::<dyn FnMut()>::new(move || {
-            if is_tab_active() || lock_released() {
-                wake();
-            }
-        })
-    };
-    let _ = window.add_event_listener_with_callback("focus", on_focus.as_ref().unchecked_ref());
-    let doc = window.document();
-    if let Some(ref doc) = doc {
-        let _ = doc
-            .add_event_listener_with_callback("visibilitychange", on_vis.as_ref().unchecked_ref());
-    }
-    let _listeners = EventListenerGuard {
-        window,
-        window_event: "focus",
-        doc,
-        on_window: on_focus,
-        on_vis,
-        clear_inactive_wake: true,
     };
     if is_tab_active() || lock_released() {
         wake();
@@ -785,7 +729,10 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
         MEDIA_LISTENER_INSTALLED.with(|installed| installed.set(false));
         return;
     };
-    let listener = Closure::<dyn Fn(MessageEvent)>::new(move |event: MessageEvent| {
+    let listener = EventListener::new(&container, "message", move |event| {
+        let Some(event) = event.dyn_ref::<MessageEvent>() else {
+            return;
+        };
         let data = event.data();
         if !data.is_object() || data.is_null() {
             return;
@@ -856,8 +803,6 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
             req.reply(Err(MediaError::Status(404)));
         }
     });
-    let _ =
-        container.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref());
     // Messages are let through once the page loads, or once asked to, which web-sys cannot.
     let _ = container.try_start_messages();
     // Listening once for as long as the page lives.

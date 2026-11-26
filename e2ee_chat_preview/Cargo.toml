@@ -121,10 +121,12 @@ arborium-zig = { version = "2.18", optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
 data-url = { version = "0.3", optional = true }
 hayro = { version = "0.9", optional = true }
+infer = { version = "0.19", default-features = false }
 js-sys = { workspace = true, optional = true }
 lofty = { version = "0.25", optional = true }
 # Without the ELK layout (EPL-2.0) or embedded KaTeX math fonts (`math` feature).
 merman = { version = "0.11", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"], optional = true }
+mime = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"], optional = true }
 pulldown-latex = { version = "0.8", optional = true }
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"], optional = true }

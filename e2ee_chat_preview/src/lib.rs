@@ -34,6 +34,7 @@ pub mod pdf;
 pub mod rpc;
 #[cfg(feature = "search")]
 pub mod search;
+pub mod sniff;
 #[cfg(feature = "worker")]
 pub mod worker;
 

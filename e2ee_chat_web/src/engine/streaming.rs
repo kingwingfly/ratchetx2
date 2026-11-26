@@ -312,96 +312,11 @@ impl<V: VaultStore> Engine<V> {
     }
 }
 
-/// Whether `byte` is an RFC 9110 HTTP token character (`tchar`).
-fn is_http_token_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
-}
-
-/// Validate optional RFC 9110 media-type parameters (e.g. `codecs=avc1`, `codecs="avc1, mp4a"`),
-/// rejecting control characters or malformed syntax.
-fn valid_mime_params(mut rest: &str) -> bool {
-    while !rest.is_empty() {
-        rest = rest.trim_start_matches([' ', '\t']);
-        if rest.is_empty() {
-            return true;
-        }
-        let Some((name, after_eq)) = rest.split_once('=') else {
-            return false;
-        };
-        if name.is_empty() || !name.bytes().all(is_http_token_byte) {
-            return false;
-        }
-        let after_eq = after_eq.trim_start_matches([' ', '\t']);
-        if let Some(mut quoted) = after_eq.strip_prefix('"') {
-            let mut closed = false;
-            let mut escaped = false;
-            let mut end_idx = 0;
-            for (idx, ch) in quoted.char_indices() {
-                if escaped {
-                    if ch < ' ' && ch != '\t' || ch == '\x7f' {
-                        return false;
-                    }
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == '"' {
-                    closed = true;
-                    end_idx = idx + 1;
-                    break;
-                } else if ch < ' ' && ch != '\t' || ch == '\x7f' {
-                    return false;
-                }
-            }
-            if !closed {
-                return false;
-            }
-            quoted = quoted[end_idx..].trim_start_matches([' ', '\t']);
-            if quoted.is_empty() {
-                return true;
-            }
-            let Some(next) = quoted.strip_prefix(';') else {
-                return false;
-            };
-            rest = next;
-        } else {
-            let (value, next) = match after_eq.split_once(';') {
-                Some((v, n)) => (v.trim_end_matches([' ', '\t']), n),
-                None => (after_eq.trim_end_matches([' ', '\t']), ""),
-            };
-            if value.is_empty() || !value.bytes().all(is_http_token_byte) {
-                return false;
-            }
-            rest = next;
-        }
-    }
-    true
-}
-
 /// The MIME type a stream is served as until its first bytes tell, from the page's origin: the
 /// bare `video/*` or `audio/*` essence its sender gave (accepting valid parameters such as
 /// `; codecs=...` and stripping them cleanly), else `application/octet-stream`.
 pub(super) fn stream_mime(mime: &str) -> String {
-    let (essence, params) = match mime.split_once(';') {
-        Some((essence, params)) => (essence.trim(), Some(params)),
-        None => (mime.trim(), None),
-    };
-    if let Some(params) = params
-        && !valid_mime_params(params)
-    {
-        return "application/octet-stream".to_string();
-    }
-    let essence = essence.to_ascii_lowercase();
-    if let Some((kind, subtype)) = essence.split_once('/')
-        && matches!(kind, "video" | "audio")
-        && !subtype.is_empty()
-        && subtype
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"+-.".contains(&byte))
-    {
-        essence
-    } else {
-        "application/octet-stream".to_string()
-    }
+    e2ee_chat_preview::sniff::stream_media_mime(mime)
 }
 
 #[cfg(test)]

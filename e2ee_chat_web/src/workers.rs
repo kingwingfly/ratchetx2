@@ -22,11 +22,11 @@ use e2ee_chat_preview::{
 };
 use futures_util::lock::Mutex;
 use js_sys::{Function, Promise};
-use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{Event, ImageData, MessageEvent};
+use web_sys::{ImageData, MessageEvent};
 
-use crate::util::js_error;
+use crate::util::{EventListener, Timeout, js_error};
 
 /// How long an active head-of-line call or worker start may take, in milliseconds.
 const TIMEOUT: i32 = 60_000;
@@ -137,41 +137,20 @@ fn next_start_id(current: u32) -> u32 {
 
 /// Clears a browser timeout before dropping its closure, even if the awaiting future is cancelled.
 struct TimeoutGuard {
-    window: web_sys::Window,
-    timer: Option<i32>,
-    _closure: Closure<dyn FnMut()>,
+    _timeout: Timeout,
 }
 
 impl TimeoutGuard {
     fn arm(kind: Worker, calls: &Rc<Calls>, id: u32, reason: &'static str) -> Self {
         let calls = Rc::downgrade(calls);
-        let closure = Closure::<dyn FnMut()>::new(move || {
+        let timeout = Timeout::new(timeout_ms(), move || {
             if let Some(calls) = calls.upgrade()
                 && calls.pending.borrow().contains_key(&id)
             {
                 stop(kind, &calls, reason);
             }
         });
-        let window = web_sys::window().expect("a window");
-        let timer = window
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                closure.as_ref().unchecked_ref(),
-                timeout_ms(),
-            )
-            .ok();
-        Self {
-            window,
-            timer,
-            _closure: closure,
-        }
-    }
-}
-
-impl Drop for TimeoutGuard {
-    fn drop(&mut self) {
-        if let Some(timer) = self.timer.take() {
-            self.window.clear_timeout_with_handle(timer);
-        }
+        Self { _timeout: timeout }
     }
 }
 
@@ -197,10 +176,8 @@ struct Running {
     /// Client-side FIFO serializer so queued calls wait without arming premature timeouts.
     queue: Rc<Mutex<()>>,
     calls: Rc<Calls>,
-    // Its handlers, kept for as long as it runs.
-    _on_message: Closure<dyn FnMut(MessageEvent)>,
-    _on_message_error: Closure<dyn FnMut(MessageEvent)>,
-    _on_error: Closure<dyn FnMut(Event)>,
+    // Its event listeners, detached on stop or automatically on drop.
+    listeners: RefCell<Option<[EventListener; 3]>>,
 }
 
 /// The calls a worker has yet to answer: how to resolve and reject each, by ID. ID 0 is reserved
@@ -276,8 +253,11 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
     let ready = calls.add_ready();
     let on_message = {
         let calls = calls.clone();
-        Closure::<dyn FnMut(MessageEvent)>::new(
-            move |event: MessageEvent| match WorkerEvent::decode(event.data()) {
+        EventListener::new(&worker, "message", move |event| {
+            let Some(event) = event.dyn_ref::<MessageEvent>() else {
+                return;
+            };
+            match WorkerEvent::decode(event.data()) {
                 Ok(WorkerEvent::Ready) => {
                     calls.ready.set(true);
                     calls.settle(READY_ID, true, &JsValue::UNDEFINED);
@@ -287,14 +267,14 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
                     Err(error) => calls.settle(id, false, &error),
                 },
                 _ => {}
-            },
-        )
+            }
+        })
     };
     let on_message_error = {
         let calls = calls.clone();
-        Closure::<dyn FnMut(MessageEvent)>::new(move |_event: MessageEvent| {
+        EventListener::new(&worker, "messageerror", move |_event| {
             // Mark stopped & fail pending synchronously so no same-tick call posts to this worker;
-            // terminate & drop closures on the next microtask to avoid dropping self inside handler.
+            // terminate & drop listeners on the next microtask to avoid dropping self inside handler.
             calls.fail_all("the preview reply could not be decoded");
             let calls = calls.clone();
             spawn_local(
@@ -304,7 +284,7 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
     };
     let on_error = {
         let calls = calls.clone();
-        Closure::<dyn FnMut(Event)>::new(move |event: Event| {
+        EventListener::new_cancellable(&worker, "error", move |event| {
             event.prevent_default();
             let reason = if !calls.ready.get() && is_online() {
                 DEPLOY_SKEW_NOTICE
@@ -312,15 +292,12 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
                 "the preview failed"
             };
             // Synchronously mark stopped & reject pending callers before yielding, preventing
-            // same-tick posts to a crashed worker while deferring handler drop via `spawn_local`.
+            // same-tick posts to a crashed worker while deferring listener drop via `spawn_local`.
             calls.fail_all(reason);
             let calls = calls.clone();
             spawn_local(async move { stop(kind, &calls, reason) });
         })
     };
-    worker.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    worker.set_onmessageerror(Some(on_message_error.as_ref().unchecked_ref()));
-    worker.set_onerror(Some(on_error.as_ref().unchecked_ref()));
     let start = STARTS.with(|starts| {
         let next = next_start_id(starts.get());
         starts.set(next);
@@ -332,9 +309,7 @@ fn running(kind: Worker) -> Result<Rc<Running>, String> {
         ready,
         queue: Rc::new(Mutex::new(())),
         calls,
-        _on_message: on_message,
-        _on_message_error: on_message_error,
-        _on_error: on_error,
+        listeners: RefCell::new(Some([on_message, on_message_error, on_error])),
     });
     RUNNING.with(|all| all.borrow_mut().insert(kind, running.clone()));
     Ok(running)
@@ -348,20 +323,10 @@ fn stop(kind: Worker, calls: &Rc<Calls>, reason: &str) {
         Rc::ptr_eq(&current.calls, calls).then(|| running.remove(&kind))?
     });
     if let Some(stopped) = stopped {
-        stopped.worker.set_onmessage(None);
-        stopped.worker.set_onmessageerror(None);
-        stopped.worker.set_onerror(None);
+        *stopped.listeners.borrow_mut() = None;
         stopped.worker.terminate();
     }
     calls.fail_all(reason);
-}
-
-impl Drop for Running {
-    fn drop(&mut self) {
-        self.worker.set_onmessage(None);
-        self.worker.set_onmessageerror(None);
-        self.worker.set_onerror(None);
-    }
 }
 
 /// What a call failed with, as text.

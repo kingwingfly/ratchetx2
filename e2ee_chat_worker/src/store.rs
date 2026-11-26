@@ -379,29 +379,18 @@ pub(crate) async fn delete_objects(bucket: &Bucket, objects: Vec<String>) -> wor
     Ok(())
 }
 
-/// Pre-sized lowercase hex encoder with zero intermediate allocations.
+/// Lowercase hex encoder backed by `const-hex`.
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    const LUT: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(LUT[(byte >> 4) as usize] as char);
-        out.push(LUT[(byte & 0x0f) as usize] as char);
-    }
-    out
+    const_hex::encode(bytes)
 }
 
+/// Strict fixed-length hex decoder backed by `const-hex` (accepts lowercase and uppercase ASCII
+/// hex digits, rejects wrong lengths, `0x`/`0X` prefixes, and invalid characters).
 pub(crate) fn decode_hex_fixed<const N: usize>(hex: &str) -> Option<[u8; N]> {
-    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
-    if pairs.len() != N || !remainder.is_empty() {
+    if hex.len() != N * 2 {
         return None;
     }
-    let mut out = [0; N];
-    for (byte, &[hi, lo]) in out.iter_mut().zip(pairs) {
-        let hi = char::from(hi).to_digit(16)?;
-        let lo = char::from(lo).to_digit(16)?;
-        *byte = (hi << 4 | lo) as u8;
-    }
-    Some(out)
+    const_hex::decode_to_array(hex).ok()
 }
 
 /// A failed object or R2 call, logged internally while returning a generic message to clients.
@@ -446,6 +435,8 @@ mod tests {
         for len in [0, 63, 65, 128] {
             assert!(decode_hex_fixed::<32>(&"0".repeat(len)).is_none());
         }
+        assert!(decode_hex_fixed::<32>(&format!("0x{}", "0".repeat(64))).is_none());
+        assert!(decode_hex_fixed::<32>(&format!("0X{}", "0".repeat(64))).is_none());
         for pair in ["+1", "zz", "é"] {
             assert!(decode_hex_fixed::<32>(&pair.repeat(32)).is_none());
         }

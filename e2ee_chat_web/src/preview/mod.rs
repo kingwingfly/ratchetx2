@@ -11,7 +11,10 @@ mod tests;
 
 pub use archive::{Entry, Listing};
 pub use e2ee_chat_preview::audio::Tags;
-use e2ee_chat_preview::language::{self, Language};
+use e2ee_chat_preview::{
+    language::{self, Language},
+    sniff,
+};
 use flate2::read::MultiGzDecoder;
 #[allow(unused_imports)] // `Card` is part of the public `Cards` preview API.
 pub use structured::{Card, Cards, Diff, DiffLine, Table};
@@ -41,9 +44,6 @@ pub const ENTRIES_MAX: usize = 10_000;
 pub const UNPACKED_MAX: u64 = 64 << 20;
 /// The most bytes of ZIP central directory metadata indexed for a listing.
 pub const ZIP_CENTRAL_DIR_MAX: u64 = 8 << 20;
-
-/// Prefix length inspected for UTF-8 text classification and `<svg` tag sniffing.
-const SNIFF_PREFIX_MAX: usize = 8 * 1024;
 
 /// Shared bounded counter used across preview parsers to cap items, fields, cells, or bytes.
 #[derive(Debug, Clone, Copy)]
@@ -128,50 +128,6 @@ pub enum Sort {
     Other = 7,
 }
 
-/// Extract the lowercase MIME essence (`type/subtype`), stripping any `;param=...` parameters.
-fn base_mime(mime: &str) -> String {
-    mime.split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase()
-}
-
-/// Check whether `data` starts with valid NUL-free UTF-8 text within its first [`SNIFF_PREFIX_MAX`]
-/// bytes, tolerating a multi-byte character split cleanly across the prefix boundary.
-fn is_utf8_text_prefix(data: &[u8]) -> bool {
-    if data.is_empty() {
-        return false;
-    }
-    let sample = &data[..data.len().min(SNIFF_PREFIX_MAX)];
-    if sample.contains(&0) {
-        return false;
-    }
-    match std::str::from_utf8(sample) {
-        Ok(_) => true,
-        Err(err) => sample.len() < data.len() && err.error_len().is_none(),
-    }
-}
-
-/// Decode the valid UTF-8 prefix of `data` (up to [`SNIFF_PREFIX_MAX`] bytes), returning `None`
-/// if `data` contains NUL bytes or invalid UTF-8 in that prefix.
-fn utf8_prefix(data: &[u8]) -> Option<&str> {
-    if data.is_empty() {
-        return None;
-    }
-    let sample = &data[..data.len().min(SNIFF_PREFIX_MAX)];
-    if sample.contains(&0) {
-        return None;
-    }
-    match std::str::from_utf8(sample) {
-        Ok(text) => Some(text),
-        Err(err) if sample.len() < data.len() && err.error_len().is_none() => {
-            std::str::from_utf8(&sample[..err.valid_up_to()]).ok()
-        }
-        Err(_) => None,
-    }
-}
-
 /// The sort of `data`, the file `name` of the MIME type `mime` by its sender: by its content
 /// first, for the formats with a signature known here, as the sender's name and type are only
 /// hints; then by its name, then by its type. `data` is empty if its bytes are not here, as for
@@ -181,29 +137,17 @@ pub fn sort(name: &str, mime: &str, data: &[u8]) -> Sort {
     let extension = lower
         .rsplit_once('.')
         .map_or("", |(_, extension)| extension);
-    let mime = base_mime(mime);
-    if let Some(media) = media_mime(&lower, &mime, data) {
+    if let Some(media) = media_mime(&lower, mime, data) {
         return media_sort(media);
     }
-    if data.starts_with(b"%PDF-") {
+    if sniff::is_pdf(data) {
         return Sort::Document;
     }
     // Before archives by content, as office documents are ZIP archives.
     if OFFICE.contains(&extension) || DOCUMENTS.contains(&extension) {
         return Sort::Document;
     }
-    let archive = matches!(
-        data,
-        [b'P', b'K', 3, 4, ..]
-            | [b'P', b'K', 5, 6, ..]
-            | [0x1F, 0x8B, ..]
-            | [b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, ..]
-            | [b'R', b'a', b'r', b'!', 0x1A, 0x07, ..]
-            | [0xFD, b'7', b'z', b'X', b'Z', 0, ..]
-            | [b'B', b'Z', b'h', ..]
-            | [0x28, 0xB5, 0x2F, 0xFD, ..]
-    ) || data.get(257..262) == Some(b"ustar");
-    if archive || ARCHIVES.contains(&extension) {
+    if sniff::sniff_archive(data).is_some() || ARCHIVES.contains(&extension) {
         return Sort::Archive;
     }
     if IMAGES.contains(&extension) {
@@ -218,19 +162,25 @@ pub fn sort(name: &str, mime: &str, data: &[u8]) -> Sort {
     if language::of_file(&lower).is_some() {
         return Sort::Code;
     }
-    match mime.split_once('/') {
-        Some(("image", _)) => return Sort::Image,
-        Some(("video", _)) => return Sort::Video,
-        Some(("audio", _)) => return Sort::Audio,
-        Some(("text", _)) => return Sort::Document,
-        _ if mime == "application/pdf" => return Sort::Document,
-        _ if mime.contains("zip") || mime.contains("compressed") || mime.ends_with("x-tar") => {
-            return Sort::Archive;
+    if let Some(parsed) = sniff::parse_mime(mime) {
+        let essence = parsed.essence_str();
+        match parsed.type_().as_str() {
+            "image" => return Sort::Image,
+            "video" => return Sort::Video,
+            "audio" => return Sort::Audio,
+            "text" => return Sort::Document,
+            _ if essence == "application/pdf" => return Sort::Document,
+            _ if essence.contains("zip")
+                || essence.contains("compressed")
+                || essence.ends_with("x-tar") =>
+            {
+                return Sort::Archive;
+            }
+            _ => {}
         }
-        _ => {}
     }
     // Any other text is a document, as its sender wrote it.
-    if is_utf8_text_prefix(data) {
+    if sniff::is_utf8_text_prefix(data) {
         Sort::Document
     } else {
         Sort::Other
@@ -239,10 +189,12 @@ pub fn sort(name: &str, mime: &str, data: &[u8]) -> Sort {
 
 /// The sort of media of the MIME type `mime`.
 fn media_sort(mime: &str) -> Sort {
-    match mime.split_once('/') {
-        Some(("image", _)) => Sort::Image,
-        Some(("video", _)) => Sort::Video,
-        _ => Sort::Audio,
+    if mime.starts_with("image/") {
+        Sort::Image
+    } else if mime.starts_with("video/") {
+        Sort::Video
+    } else {
+        Sort::Audio
     }
 }
 
@@ -263,7 +215,7 @@ pub fn media_mime(name: &str, mime: &str, data: &[u8]) -> Option<&'static str> {
 
 /// Media without a signature known here, as the sender's browser named them.
 fn hinted_media(mime: &str) -> Option<Kind> {
-    Some(match base_mime(mime).as_str() {
+    Some(match sniff::mime_essence(mime)?.as_str() {
         "video/mp4" => Kind::Video("video/mp4"),
         "video/webm" => Kind::Video("video/webm"),
         "audio/mpeg" => Kind::Audio("audio/mpeg"),
@@ -383,189 +335,61 @@ fn code(text: String, language: Option<&'static Language>) -> Kind {
     Kind::Code { text, language }
 }
 
-/// Validate a Windows/OS2 BMP header (14-byte file header + known DIB header size, plane count,
-/// valid bits-per-pixel, and consistent file size / pixel data offset) so plain text starting
-/// with `"BM"` is never misclassified as an image.
-fn is_bmp(data: &[u8]) -> bool {
-    if data.len() < 26 || !data.starts_with(b"BM") {
-        return false;
-    }
-    let file_size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
-    let reserved = &data[6..10];
-    let pixel_offset = u32::from_le_bytes([data[10], data[11], data[12], data[13]]);
-    let dib_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
-    if reserved != [0, 0, 0, 0] {
-        return false;
-    }
-    if !matches!(dib_size, 12 | 40 | 52 | 56 | 64 | 108 | 124) {
-        return false;
-    }
-    let header_end = 14u32.saturating_add(dib_size);
-    if data.len() < header_end as usize || file_size < header_end || pixel_offset < header_end {
-        return false;
-    }
-    if pixel_offset > file_size {
-        return false;
-    }
-    let (planes, bpp) = if dib_size == 12 {
-        (
-            u16::from_le_bytes([data[22], data[23]]),
-            u16::from_le_bytes([data[24], data[25]]),
-        )
-    } else {
-        (
-            u16::from_le_bytes([data[26], data[27]]),
-            u16::from_le_bytes([data[28], data[29]]),
-        )
-    };
-    planes == 1 && matches!(bpp, 1 | 2 | 4 | 8 | 16 | 24 | 32)
-}
-
-/// Validate an ID3v2 header (10 bytes: `"ID3"`, version `2..=4`, non-0xFF revision, valid version
-/// flags, and 4 synchsafe size bytes `< 0x80`) so text starting with `"ID3"` is not misclassified.
-fn is_id3v2(data: &[u8]) -> bool {
-    if data.len() < 10 || !data.starts_with(b"ID3") {
-        return false;
-    }
-    let version = data[3];
-    let revision = data[4];
-    let flags = data[5];
-    let valid_flags = match version {
-        2 => flags & 0x3F == 0,
-        3 => flags & 0x1F == 0,
-        4 => flags & 0x0F == 0,
-        _ => return false,
-    };
-    revision != 0xFF && valid_flags && data[6..10].iter().all(|&b| b < 0x80)
-}
-
-/// Validate an Ogg page header (version `0`, valid `header_type` with BOS flag set on page 0,
-/// and complete segment lacing table) so text starting with `"OggS"` is not misclassified.
-fn is_ogg(data: &[u8]) -> bool {
-    if data.len() < 28 || !data.starts_with(b"OggS") {
-        return false;
-    }
-    let version = data[4];
-    let header_type = data[5];
-    let page_segments = usize::from(data[26]);
-    version == 0
-        && header_type & !0x07 == 0
-        && header_type & 0x02 != 0
-        && page_segments > 0
-        && data.len() >= 27 + page_segments
-}
-
-/// Validate a FLAC stream marker followed by the mandatory 34-byte STREAMINFO metadata block so
-/// text starting with `"fLaC"` is not misclassified.
-fn is_flac(data: &[u8]) -> bool {
-    if data.len() < 42 || !data.starts_with(b"fLaC") {
-        return false;
-    }
-    let block_type = data[4] & 0x7F;
-    let block_len =
-        (usize::from(data[5]) << 16) | (usize::from(data[6]) << 8) | usize::from(data[7]);
-    block_type == 0 && block_len == 34
-}
-
 /// The MIME type of the image `data`, the file `name`, if the browser shows it: PNG, JPEG, GIF,
 /// WebP, AVIF, BMP and ICO by their first bytes, and bounded SVG by its name and prefix tag. An
 /// SVG shows as an image only, where its scripts do not run.
+#[cfg(test)]
 pub fn image_mime(name: &str, data: &[u8]) -> Option<&'static str> {
-    if let Some(mime) = crate::content::image_type(data) {
-        return Some(mime);
-    }
-    match data {
-        [
-            _,
-            _,
-            _,
-            _,
-            b'f',
-            b't',
-            b'y',
-            b'p',
-            b'a',
-            b'v',
-            b'i',
-            b'f' | b's',
-            ..,
-        ] => Some("image/avif"),
-        _ if is_bmp(data) => Some("image/bmp"),
-        [0, 0, 1, 0, count, ..] if *count > 0 => Some("image/x-icon"),
-        _ if data.len() <= SVG_MAX
-            && name.to_lowercase().ends_with(".svg")
-            && utf8_prefix(data).is_some_and(|prefix| prefix.contains("<svg")) =>
-        {
-            Some("image/svg+xml")
-        }
-        _ => None,
-    }
+    sniff::sniff_preview_image(name, data, SVG_MAX)
 }
 
 /// The kind of the file `name`, lowercase, by its first bytes, for the formats that have them.
 fn sniff(name: &str, data: &[u8]) -> Option<Kind> {
-    if data.starts_with(b"%PDF-") {
+    if sniff::is_pdf(data) {
         return Some(Kind::Pdf);
     }
     if let Some(media) = sniff_media(name, data) {
         return Some(media);
     }
-    Some(match data {
-        [b'P', b'K', 3, 4, ..] | [b'P', b'K', 5, 6, ..] => Kind::Archive(archive::zip(data)?),
-        [0x1F, 0x8B, ..] => Kind::Archive(archive::tar(MultiGzDecoder::new(data), UNPACKED_MAX)?),
+    Some(match sniff::sniff_archive(data)? {
+        sniff::ArchiveKind::Zip => Kind::Archive(archive::zip(data)?),
+        sniff::ArchiveKind::Gzip => {
+            Kind::Archive(archive::tar(MultiGzDecoder::new(data), UNPACKED_MAX)?)
+        }
         // Uncompressed tar: seek over entry payloads in O(1).
-        _ if data.get(257..262) == Some(b"ustar") => Kind::Archive(archive::tar_slice(data)?),
-        _ => return None,
+        sniff::ArchiveKind::Tar => Kind::Archive(archive::tar_slice(data)?),
+        sniff::ArchiveKind::Other => return None,
     })
 }
 
 /// The kind of the media file `name`, lowercase, by its first bytes, if it is media: an image,
 /// a video or audio, or [`Kind::None`] for media no browser here shows.
 fn sniff_media(name: &str, data: &[u8]) -> Option<Kind> {
-    if let Some(mime) = image_mime(name, data) {
-        return Some(Kind::Image(mime));
+    match sniff::sniff_media(name, data, SVG_MAX)? {
+        sniff::MediaKind::Image(mime) => Some(Kind::Image(mime)),
+        sniff::MediaKind::Video(mime) => Some(Kind::Video(mime)),
+        sniff::MediaKind::Audio(mime) => Some(Kind::Audio(mime)),
+        sniff::MediaKind::Unsupported => Some(Kind::None),
     }
-    let window = &data[..data.len().min(64)];
-    let has = |needle: &[u8]| window.windows(needle.len()).any(|bytes| bytes == needle);
-    Some(match data {
-        // ISO base media: MP4, QuickTime, M4A; HEIF images no browser here shows.
-        [_, _, _, _, b'f', b't', b'y', b'p', brand @ ..] => match brand.get(..4)? {
-            b"qt  " => Kind::Video("video/quicktime"),
-            b"M4A " | b"M4B " | b"M4P " => Kind::Audio("audio/mp4"),
-            b"heic" | b"heix" | b"hevc" | b"mif1" | b"msf1" => Kind::None,
-            _ => Kind::Video("video/mp4"),
-        },
-        [0x1A, 0x45, 0xDF, 0xA3, ..] if has(b"webm") => Kind::Video("video/webm"),
-        [0x1A, 0x45, 0xDF, 0xA3, ..] => Kind::Video("video/x-matroska"),
-        _ if is_ogg(data) => {
-            if has(b"theora") {
-                Kind::Video("video/ogg")
-            } else {
-                Kind::Audio("audio/ogg")
-            }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+    use e2ee_chat_preview::sniff;
+    use wasm_bindgen_test::*;
+
+    use super::{SVG_MAX, Sort, sort};
+
+    #[wasm_bindgen_test]
+    fn sniff_handles_zstd_skippable_32bit_overflow_payload_without_panic() {
+        for payload in [
+            b"\x50\x2A\x4D\x18\xF8\xFF\xFF\xFF".as_slice(),
+            b"\x50\x2A\x4D\x18\xFF\xFF\xFF\xFF".as_slice(),
+        ] {
+            assert_eq!(sniff::sniff_basic_image(payload), None);
+            assert_eq!(sniff::sniff_media("probe.bin", payload, SVG_MAX), None);
+            assert_eq!(sniff::sniff_archive(payload), None);
+            assert_eq!(sort("probe.bin", "", payload), Sort::Other);
         }
-        _ if is_flac(data) => Kind::Audio("audio/flac"),
-        [
-            b'R',
-            b'I',
-            b'F',
-            b'F',
-            _,
-            _,
-            _,
-            _,
-            b'W',
-            b'A',
-            b'V',
-            b'E',
-            ..,
-        ] => Kind::Audio("audio/wav"),
-        _ if is_id3v2(data) => Kind::Audio("audio/mpeg"),
-        // ADTS AAC, then MPEG audio frames.
-        [0xFF, second, ..] if second & 0xF6 == 0xF0 => Kind::Audio("audio/aac"),
-        [0xFF, second, ..] if second & 0xE0 == 0xE0 && second & 0x06 != 0 => {
-            Kind::Audio("audio/mpeg")
-        }
-        _ => return None,
-    })
+    }
 }
