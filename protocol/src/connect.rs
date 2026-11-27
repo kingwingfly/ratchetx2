@@ -476,6 +476,7 @@ enum Code {
     InvalidArgument,
     Unauthenticated,
     FailedPrecondition,
+    OutOfRange,
     Aborted,
     NotFound,
     ResourceExhausted,
@@ -488,10 +489,11 @@ enum Code {
 
 impl Code {
     #[cfg(all(test, feature = "server"))]
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::InvalidArgument,
         Self::Unauthenticated,
         Self::FailedPrecondition,
+        Self::OutOfRange,
         Self::Aborted,
         Self::NotFound,
         Self::ResourceExhausted,
@@ -507,6 +509,7 @@ impl Code {
             Self::InvalidArgument => "invalid_argument",
             Self::Unauthenticated => "unauthenticated",
             Self::FailedPrecondition => "failed_precondition",
+            Self::OutOfRange => "out_of_range",
             Self::Aborted => "aborted",
             Self::NotFound => "not_found",
             Self::ResourceExhausted => "resource_exhausted",
@@ -525,6 +528,7 @@ impl Code {
             "invalid_argument" => Some(Self::InvalidArgument),
             "unauthenticated" => Some(Self::Unauthenticated),
             "failed_precondition" => Some(Self::FailedPrecondition),
+            "out_of_range" => Some(Self::OutOfRange),
             "aborted" => Some(Self::Aborted),
             "not_found" => Some(Self::NotFound),
             "resource_exhausted" => Some(Self::ResourceExhausted),
@@ -540,7 +544,7 @@ impl Code {
     /// The HTTP status of an error response with this code.
     fn status(self) -> u16 {
         match self {
-            Self::InvalidArgument | Self::FailedPrecondition => 400,
+            Self::InvalidArgument | Self::FailedPrecondition | Self::OutOfRange => 400,
             Self::Unauthenticated => 401,
             Self::PermissionDenied => 403,
             Self::NotFound => 404,
@@ -575,11 +579,12 @@ impl From<ErrorKind> for Code {
             ErrorKind::Malformed => Self::InvalidArgument,
             ErrorKind::InvalidSignature => Self::Unauthenticated,
             ErrorKind::StaleTimestamp => Self::FailedPrecondition,
+            ErrorKind::StaleVersion => Self::OutOfRange,
             ErrorKind::WriteTokenRejected => Self::Aborted,
             ErrorKind::NotFound => Self::NotFound,
             ErrorKind::LimitExceeded => Self::ResourceExhausted,
+            ErrorKind::MailboxFull | ErrorKind::Storage => Self::Unavailable,
             ErrorKind::SignInRequired => Self::PermissionDenied,
-            ErrorKind::Storage => Self::Unavailable,
             ErrorKind::Unimplemented => Self::Unimplemented,
             _ => Self::Internal,
         }
@@ -592,6 +597,7 @@ impl From<Code> for ErrorKind {
             Code::InvalidArgument => Self::Malformed,
             Code::Unauthenticated => Self::InvalidSignature,
             Code::FailedPrecondition => Self::StaleTimestamp,
+            Code::OutOfRange => Self::StaleVersion,
             Code::Aborted => Self::WriteTokenRejected,
             Code::NotFound => Self::NotFound,
             Code::ResourceExhausted => Self::LimitExceeded,

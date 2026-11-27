@@ -1,7 +1,7 @@
 //! Server notifications, synchronization, write-token grants/revocations, and unified mailbox
 //! receive with cross-peer stall isolation.
 
-use super::contact::Contact;
+use super::contact::{Contact, pq_incompatible_isolated_token_hashes};
 use super::handshake::{
     DEFERRED_REPLAY_WINDOW_MS, Incoming, record_carried_timestamps, stage_carried_initials,
 };
@@ -17,14 +17,15 @@ use crate::state::{Link, ServerPqStatus};
 use crate::transport::Fetch;
 use crate::util::{describe, monotonic_now_ms, now, short, sleep};
 use crate::vault::{
-    ContactState, DeferredEnvelope, Farewell, HistoryEntry, OutgoingRecord,
+    ContactState, DeferredEnvelope, Farewell, GREETING_DELIVERY_CONFIRMED,
+    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, OutgoingRecord,
     SECURITY_ALERT_DOWNGRADE,
 };
 use futures_util::future::{Either, select};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use prost::Message as _;
-use session::protocol::handshake_v2::InitialMessageV2 as WireInitialMessageV2;
+use session::protocol::handshake_v2::{InitialMessageV2 as WireInitialMessageV2, LocalHandshakeV2};
 use session::protocol::mailbox_v2::{LocalMailboxV2, PushV2Request};
 use session::protocol::notify::{self, Notification};
 use session::{ClientState, ErrorKind, PqSuite, PublicKey, proto};
@@ -39,20 +40,27 @@ pub(super) const MAX_TOTAL_DEFERRED_ENVELOPES: usize = 256;
 const MAX_MAILBOX_PAGES: usize = 20;
 
 /// Prune expired (`> DEFERRED_REPLAY_WINDOW_MS`), malformed, or unknown-peer `DeferredEnvelope`s
-/// on unlock or before replay. Returns how many entries were removed.
+/// on unlock or before replay, preserving envelopes belonging to PQ-incompatible isolated contacts
+/// so they decrypt once a capable build unlocks the vault. Returns how many entries were removed.
 pub(super) fn prune_deferred_envelopes(
     envelopes: &mut Vec<DeferredEnvelope>,
     contacts: &[Contact],
+    isolated_contacts: &[ContactState],
+    me: &PublicKey,
     now_ms: u64,
 ) -> usize {
     let before = envelopes.len();
+    let pq_isolated_peers: BTreeSet<PublicKey> = isolated_contacts
+        .iter()
+        .filter_map(|state| pq_incompatible_isolated_token_hashes(state, me).map(|(p, _)| p))
+        .collect();
     let mut seen: BTreeSet<(PublicKey, u64)> = BTreeSet::new();
     let mut per_peer: HashMap<PublicKey, usize> = HashMap::new();
     envelopes.retain(|env| {
         let Ok(peer) = PublicKey::try_from(env.peer.as_slice()) else {
             return false;
         };
-        if !contacts.iter().any(|c| c.peer == peer) {
+        if !contacts.iter().any(|c| c.peer == peer) && !pq_isolated_peers.contains(&peer) {
             return false;
         }
         if env.deferred_at != 0
@@ -148,12 +156,10 @@ impl<V: VaultStore> Inner<V> {
                             .remove_pending_grant(&grant.token_hash, grant.grant_version);
                     }
                 }
-                // Stale/superseded grant version (`grant_version <= revoked_below_version`) or
-                // terminal protocol refusal: drop the stale grant so later grants proceed.
-                Err(e)
-                    if e.is_server_refusal()
-                        && matches!(e.kind(), ErrorKind::Protocol | ErrorKind::LimitExceeded) =>
-                {
+                // Stale/superseded grant version (`grant_version <= revoked_below_version`):
+                // drop ONLY on explicit `StaleVersion` so later grants proceed; preserve on
+                // transient `StaleTimestamp`/`Protocol` or `LimitExceeded` so grants retry!
+                Err(e) if e.kind() == ErrorKind::StaleVersion => {
                     if let Some(contact) = self.contact(peer) {
                         removed_any |= contact
                             .session
@@ -259,13 +265,20 @@ impl<V: VaultStore> Engine<V> {
             }
             let remove = match rpc_res {
                 Ok(()) => true,
-                // Stale/superseded grant version (`grant_version <= revoked_below_version`) or
-                // terminal protocol refusal: drop the stale grant so later grants proceed.
-                Err(e)
-                    if e.is_server_refusal()
-                        && matches!(e.kind(), ErrorKind::Protocol | ErrorKind::LimitExceeded) =>
-                {
-                    true
+                // Stale/superseded grant version (`grant_version <= revoked_below_version`):
+                // drop ONLY on explicit `StaleVersion` so newer grants proceed. Never discard on
+                // transient clock-skew `StaleTimestamp`/`Protocol` or `LimitExceeded`.
+                Err(e) if e.kind() == ErrorKind::StaleVersion => true,
+                Err(e) if e.kind() == ErrorKind::LimitExceeded => {
+                    let msg = format!(
+                        "Could not register write token for {}: active server grant limit reached ({})",
+                        short(peer),
+                        describe(&e)
+                    );
+                    self.ui.log(msg.clone());
+                    self.ui.notify(msg);
+                    first_err = Some(describe(&e));
+                    break;
                 }
                 Err(e) => {
                     self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
@@ -767,6 +780,15 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return false;
         }
+        match self.retry_pending_greetings().await {
+            Ok(retried) => active |= retried,
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
+        }
+        if !self.is_live(vgen) {
+            return false;
+        }
         match self.receive_mailbox().await {
             Ok(affected) => {
                 if !affected.is_empty() {
@@ -951,6 +973,173 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
+    /// Lock-free retry of unconfirmed initial greetings (`SendInitialV2`) for outbound chats whose
+    /// initial request failed before reaching the server (even when their outbox is empty).
+    pub(super) async fn retry_pending_greetings(&self) -> Result<bool, String> {
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
+        let candidates: Vec<PublicKey> = {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
+            let Some(inner) = guard.as_ref() else {
+                return Ok(false);
+            };
+            inner
+                .contacts
+                .iter()
+                .filter(|c| {
+                    !c.state.request
+                        && !c.state.quarantined
+                        && !c.session.needs_new_session()
+                        && !c.session.is_known_by_peer()
+                        && c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
+                        && c.session.pending_initial_request().is_some()
+                })
+                .map(|c| c.peer)
+                .collect()
+        };
+        let mut retried_any = false;
+        let mut first_err: Option<String> = None;
+        for peer in candidates {
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
+            if self.queue.waits_for_sign_in(&peer) {
+                continue;
+            }
+            let peer_lock = self.queue.peer_flush_lock(&peer);
+            let _peer_guard = peer_lock.lock().await;
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
+            if self.queue.waits_for_sign_in(&peer) {
+                continue;
+            }
+            let prepared = {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(false);
+                }
+                let Some(inner) = guard.as_mut() else {
+                    return Ok(false);
+                };
+                let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
+                    continue;
+                };
+                if contact.state.request
+                    || contact.state.quarantined
+                    || contact.session.needs_new_session()
+                    || contact.session.is_known_by_peer()
+                    || contact.state.greeting_delivery == GREETING_DELIVERY_CONFIRMED
+                {
+                    continue;
+                }
+                let Some(req) = contact.session.pending_initial_request() else {
+                    continue;
+                };
+                let session_id = contact.session.active_id().copied();
+                let promoted_from_unsent =
+                    contact.state.greeting_delivery == GREETING_DELIVERY_UNSENT;
+                if promoted_from_unsent {
+                    if let Err(e) = inner
+                        .with_contact_tx(&peer, async |inner| {
+                            if let Some(c) = inner.contact(&peer) {
+                                c.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                            }
+                            inner.save(&[]).await.map_err(|e| describe(&e))
+                        })
+                        .await
+                    {
+                        first_err.get_or_insert(e);
+                        continue;
+                    }
+                    if !self.is_live(vgen) {
+                        return Ok(false);
+                    }
+                }
+                (
+                    inner.server.clone(),
+                    same_server(&inner.server, &origin()),
+                    session_id,
+                    req,
+                    promoted_from_unsent,
+                )
+            };
+            let (server, signs_in_here, session_id, req, promoted_from_unsent) = prepared;
+            let send_res: session::Result<()> = Fetch::client(&server)
+                .send_initial_v2(req)
+                .await
+                .map(|_| ())
+                .map_err(session::Error::from);
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(false);
+            };
+            let matches_session = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .is_some_and(|c| c.session.active_id() == session_id.as_ref());
+            match send_res {
+                Ok(()) if matches_session => {
+                    if inner
+                        .contact(&peer)
+                        .is_some_and(Contact::mark_greeting_confirmed)
+                    {
+                        let _ = inner.save_state().await;
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
+                    }
+                    self.refresh_contacts(inner);
+                    retried_any = true;
+                }
+                Ok(()) => {}
+                Err(e) => {
+                    if e.is_server_refusal() && promoted_from_unsent && matches_session {
+                        let reverted = inner.contact(&peer).is_some_and(|c| {
+                            if c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                                c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                                true
+                            } else {
+                                false
+                            }
+                        });
+                        if reverted {
+                            let _ = inner.save_state().await;
+                            if !self.is_live(vgen) {
+                                return Ok(false);
+                            }
+                        }
+                    }
+                    if e.kind() == ErrorKind::SignInRequired && signs_in_here {
+                        self.queue.mark_waits_sign_in(peer);
+                        self.ask_sign_in();
+                        self.refresh_contacts(inner);
+                    } else {
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                        self.refresh_contacts(inner);
+                        first_err.get_or_insert(describe(&e));
+                    }
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(retried_any),
+        }
+    }
+
     pub(super) async fn peers(&self) -> Vec<PublicKey> {
         let inner = self.lock_inner().await;
         inner
@@ -975,205 +1164,188 @@ impl<V: VaultStore> Engine<V> {
         let mut upgrades: BTreeSet<PublicKey> = BTreeSet::new();
         let mut peers_needing_replay: BTreeSet<PublicKey> = BTreeSet::new();
 
+        let _mailbox_guard = self.mailbox_lock.lock().await;
+        if !self.is_live(vgen) {
+            return Ok(Vec::new());
+        }
+
         for _ in 0..MAX_MAILBOX_PAGES {
             if !self.is_live(vgen) {
                 return Ok(Vec::new());
             }
-            let mut guard = self.lock_inner().await;
+            // Phase 1 under `self.inner`: sign `FetchSignedRequest` and release `self.inner`
+            // across the network RTT so UI actions and other peers never stall.
+            let (server, fetch_req, req_limit, piggybacked_ack, expected_cursor) = {
+                let guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(Vec::new());
+                }
+                let Some(inner) = guard.as_ref() else {
+                    break;
+                };
+                match inner.client.sign_fetch_mailbox_v2(&inner.audience, 100) {
+                    Ok(req) => (
+                        inner.server.clone(),
+                        req.clone(),
+                        req.limit,
+                        req.ack_up_to_sequence,
+                        inner.client.mailbox_cursor(),
+                    ),
+                    Err(e) => {
+                        if e.kind() == ErrorKind::ClockSkew {
+                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                        }
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                        return Err(describe(&e));
+                    }
+                }
+            };
+
+            let raw_page: session::Result<_> = Fetch::client(&server)
+                .fetch_signed(fetch_req)
+                .await
+                .map_err(session::Error::from);
             if !self.is_live(vgen) {
                 return Ok(Vec::new());
             }
-            let Some(inner) = guard.as_mut() else {
-                break;
-            };
-            let local_pq = inner.local_pq_enabled();
-            let mut token_map: HashMap<[u8; 32], PublicKey> = HashMap::new();
-            for contact in &inner.contacts {
-                for th in contact.session.inbound_token_hashes() {
-                    token_map.insert(th, contact.peer);
-                }
-            }
-
-            let mailbox = Fetch::client(&inner.server);
-            let page = match inner
-                .client
-                .fetch_mailbox_v2(&mailbox, &inner.audience, 100)
-                .await
-            {
-                _ if !self.is_live(vgen) => return Ok(Vec::new()),
-                Ok(page) => page,
+            let response = match raw_page {
+                Ok(resp) => resp,
                 Err(e) => {
                     self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                     return Err(describe(&e));
                 }
             };
-            if page.messages.is_empty() {
-                if page.piggybacked_ack > 0 {
-                    inner.client.clear_pending_mailbox_ack(page.piggybacked_ack);
-                    let _ = inner.save_state().await;
+
+            // Phase 2 under `self.inner`: validate cursor, decrypt/defer envelopes, and commit
+            // atomically before releasing `self.inner` again for any explicit final ACK.
+            let mut explicit_ack: Option<(
+                String,
+                u64,
+                session::protocol::mailbox_v2::AckMessagesRequest,
+            )> = None;
+            let mut should_break = false;
+            {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(Vec::new());
                 }
-                break;
-            }
-
-            let last_seq = page.last_sequence().unwrap_or(0);
-            let has_more = page.has_more;
-            let piggybacked_ack = page.piggybacked_ack;
-
-            // Snapshots for atomic rollback if any step or vault commit fails.
-            let client_snapshot = proto::ClientState::from(inner.client.state());
-            let saved_envelopes = inner.deferred_envelopes.clone();
-            let saved_carried_ts = inner.carried_deferred_timestamps.clone();
-            let mut contact_snapshots: HashMap<PublicKey, (proto::SessionState, ContactState)> =
-                HashMap::new();
-
-            let mut per_peer_entries: BTreeMap<PublicKey, Vec<(u64, HistoryEntry)>> =
-                BTreeMap::new();
-            let mut per_peer_steps: BTreeMap<PublicKey, Vec<(u64, crate::state::Step)>> =
-                BTreeMap::new();
-            let mut per_peer_settled: BTreeMap<PublicKey, Vec<(u64, u64)>> = BTreeMap::new();
-            let mut per_peer_carried: BTreeMap<PublicKey, Vec<Incoming>> = BTreeMap::new();
-            let mut peer_deleted: BTreeSet<PublicKey> = BTreeSet::new();
-            let mut peer_evicted_counts: HashMap<PublicKey, usize> = HashMap::new();
-            let now_ms = now();
-
-            let mut process_err: Option<String> = None;
-            for env in page.messages {
-                let Ok(token_hash) = <[u8; 32]>::try_from(env.token_hash.as_ref()) else {
-                    continue;
+                let Some(inner) = guard.as_mut() else {
+                    break;
                 };
-                let Some(&peer) = token_map.get(&token_hash) else {
-                    // Unknown/revoked token hash: drop silently.
+                if inner.client.mailbox_cursor() != expected_cursor {
                     continue;
-                };
-                let Some(contact_idx) = inner.contacts.iter().position(|c| c.peer == peer) else {
-                    continue;
-                };
-                contact_snapshots
-                    .entry(peer)
-                    .or_insert_with(|| inner.contacts[contact_idx].snapshot());
+                }
+                let page =
+                    match inner
+                        .client
+                        .validate_mailbox_page(req_limit, piggybacked_ack, response)
+                    {
+                        Ok(page) => page,
+                        Err(e) => {
+                            self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                            return Err(describe(&e));
+                        }
+                    };
+                if page.messages.is_empty() {
+                    if page.piggybacked_ack > 0 {
+                        inner.client.clear_pending_mailbox_ack(page.piggybacked_ack);
+                        let _ = inner.save_state().await;
+                    }
+                    break;
+                }
 
-                let peer_has_buffered = inner
-                    .deferred_envelopes
-                    .iter()
-                    .any(|e| e.peer.as_slice() == peer.as_slice());
-                let peer_awaiting_user_or_upgrade = inner.contacts[contact_idx].state.quarantined
-                    || inner.contacts[contact_idx].is_new_quarantined()
-                    || inner.contacts[contact_idx].deferred_carried > 0
-                    || inner.has_deferred_initial_for(&peer);
-                let peer_blocked = peer_has_buffered || peer_awaiting_user_or_upgrade;
+                let local_pq = inner.local_pq_enabled();
+                let me = inner.client.identity_key();
+                let mut token_map: HashMap<[u8; 32], PublicKey> = HashMap::new();
+                for contact in &inner.contacts {
+                    for th in contact.session.inbound_token_hashes() {
+                        token_map.insert(th, contact.peer);
+                    }
+                }
+                let mut isolated_token_map: HashMap<[u8; 32], PublicKey> = HashMap::new();
+                for iso in &inner.isolated_contacts {
+                    if let Some((iso_peer, hashes)) =
+                        pq_incompatible_isolated_token_hashes(iso, &me)
+                    {
+                        for th in hashes {
+                            isolated_token_map.entry(th).or_insert(iso_peer);
+                        }
+                    }
+                }
 
-                if peer_blocked {
-                    let buffered = push_deferred_envelope(
-                        &mut inner.deferred_envelopes,
-                        &peer,
-                        env.sequence,
-                        env.message,
-                        env.initial_message,
-                        now_ms,
-                    );
-                    if !buffered {
-                        match inner.contacts[contact_idx].add_evicted() {
-                            Ok(entry) => {
-                                per_peer_entries.entry(peer).or_default().push(entry);
-                                *peer_evicted_counts.entry(peer).or_insert(0) += 1;
-                            }
-                            Err(reason) => {
-                                process_err = Some(reason.to_string());
+                let last_seq = page.last_sequence().unwrap_or(0);
+                let has_more = page.has_more;
+                let piggybacked_ack = page.piggybacked_ack;
+
+                // Snapshots for atomic rollback if any step or vault commit fails.
+                let client_snapshot = proto::ClientState::from(inner.client.state());
+                let saved_envelopes = inner.deferred_envelopes.clone();
+                let saved_carried_ts = inner.carried_deferred_timestamps.clone();
+                let mut contact_snapshots: HashMap<PublicKey, (proto::SessionState, ContactState)> =
+                    HashMap::new();
+
+                let mut per_peer_entries: BTreeMap<PublicKey, Vec<(u64, HistoryEntry)>> =
+                    BTreeMap::new();
+                let mut per_peer_steps: BTreeMap<PublicKey, Vec<(u64, crate::state::Step)>> =
+                    BTreeMap::new();
+                let mut per_peer_settled: BTreeMap<PublicKey, Vec<(u64, u64)>> = BTreeMap::new();
+                let mut per_peer_carried: BTreeMap<PublicKey, Vec<Incoming>> = BTreeMap::new();
+                let mut peer_deleted: BTreeSet<PublicKey> = BTreeSet::new();
+                let mut peer_evicted_counts: HashMap<PublicKey, usize> = HashMap::new();
+                let now_ms = now();
+
+                let mut process_err: Option<String> = None;
+                for env in page.messages {
+                    let Ok(token_hash) = <[u8; 32]>::try_from(env.token_hash.as_ref()) else {
+                        continue;
+                    };
+                    let Some(&peer) = token_map.get(&token_hash) else {
+                        if let Some(&iso_peer) = isolated_token_map.get(&token_hash) {
+                            let buffered = push_deferred_envelope(
+                                &mut inner.deferred_envelopes,
+                                &iso_peer,
+                                env.sequence,
+                                env.message,
+                                env.initial_message,
+                                now_ms,
+                            );
+                            if !buffered {
+                                process_err = Some(format!(
+                                    "Deferred envelope buffer full for isolated contact {}; pausing mailbox sync to prevent message loss.",
+                                    short(&iso_peer)
+                                ));
                                 break;
                             }
                         }
-                    }
-                    if !peer_awaiting_user_or_upgrade {
-                        peers_needing_replay.insert(peer);
-                    }
-                    continue;
-                }
+                        // Unknown/revoked token hash: drop silently.
+                        continue;
+                    };
+                    let Some(contact_idx) = inner.contacts.iter().position(|c| c.peer == peer)
+                    else {
+                        continue;
+                    };
+                    contact_snapshots
+                        .entry(peer)
+                        .or_insert_with(|| inner.contacts[contact_idx].snapshot());
 
-                // Active peer: stage any carried initial message and attempt immediate decrypt.
-                let mut staged_carried_init = false;
-                if let Some(ref wire_init) = env.initial_message
-                    && let Ok(inc) = Incoming::try_from(wire_init)
-                {
-                    per_peer_carried.entry(peer).or_default().push(inc);
-                    peers_needing_replay.insert(peer);
-                    staged_carried_init = true;
-                }
-                let Some(ref msg) = env.message else {
-                    continue;
-                };
-                match inner.contacts[contact_idx].session.decrypt_envelope(msg) {
-                    Ok(decrypted) => {
-                        let contact = &mut inner.contacts[contact_idx];
-                        let mut content = Content::from_bytes(&decrypted.content);
-                        if !decrypted.earlier {
-                            contact.mark_greeting_confirmed();
-                        }
-                        affected_peers.insert(peer);
-                        if let Some(events) = content.events.take() {
-                            let told = contact.told(&events);
-                            per_peer_steps.entry(peer).or_default().extend(told.steps);
-                            per_peer_settled
-                                .entry(peer)
-                                .or_default()
-                                .extend(told.settled_outbox);
-                            if content.kind.is_none() {
-                                continue;
-                            }
-                        }
-                        if let Some(Kind::Hello(ref hello)) = content.kind {
-                            let hc = contact.session.check_peer_hello(hello, local_pq);
-                            if hc.downgrade_detected {
-                                contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                                if hc.recommend_start_again
-                                    && !contact.state.request
-                                    && !contact.state.quarantined
-                                {
-                                    upgrades.insert(peer);
-                                }
-                            }
-                        }
-                        if matches!(content.kind, Some(Kind::Deleted(_))) && !decrypted.earlier {
-                            contact.session.retire();
-                            peer_deleted.insert(peer);
-                        }
-                        match contact.add_received(content, false) {
-                            Ok(entry) => per_peer_entries.entry(peer).or_default().push(entry),
-                            Err(reason) => {
-                                process_err = Some(reason.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    Err(e) if e.kind() == ErrorKind::DuplicateMessage => continue,
-                    Err(e) if e.kind() == ErrorKind::EvictedMessage => {
-                        match inner.contacts[contact_idx].add_evicted() {
-                            Ok(entry) => {
-                                per_peer_entries.entry(peer).or_default().push(entry);
-                                *peer_evicted_counts.entry(peer).or_insert(0) += 1;
-                                affected_peers.insert(peer);
-                            }
-                            Err(reason) => {
-                                process_err = Some(reason.to_string());
-                                break;
-                            }
-                        }
-                    }
-                    Err(_) => {
-                        // Buffer temporarily undecryptable envelope (e.g. rekey race) so server
-                        // mailbox cursor advances for all peers while we fetch/join initials next.
-                        // Omit `initial_message` if it was already captured into `per_peer_carried`
-                        // above so `replay_deferred_envelopes` never processes it a second time.
-                        let deferred_init = if staged_carried_init {
-                            None
-                        } else {
-                            env.initial_message
-                        };
+                    let peer_has_buffered = inner
+                        .deferred_envelopes
+                        .iter()
+                        .any(|e| e.peer.as_slice() == peer.as_slice());
+                    let peer_awaiting_user_or_upgrade =
+                        inner.contacts[contact_idx].state.quarantined
+                            || inner.contacts[contact_idx].is_new_quarantined()
+                            || inner.contacts[contact_idx].deferred_carried > 0
+                            || inner.has_deferred_initial_for(&peer);
+                    let peer_blocked = peer_has_buffered || peer_awaiting_user_or_upgrade;
+
+                    if peer_blocked {
                         let buffered = push_deferred_envelope(
                             &mut inner.deferred_envelopes,
                             &peer,
                             env.sequence,
                             env.message,
-                            deferred_init,
+                            env.initial_message,
                             now_ms,
                         );
                         if !buffered {
@@ -1188,35 +1360,168 @@ impl<V: VaultStore> Engine<V> {
                                 }
                             }
                         }
+                        if !peer_awaiting_user_or_upgrade {
+                            peers_needing_replay.insert(peer);
+                        }
+                        continue;
+                    }
+
+                    // Active peer: stage any carried initial message and attempt immediate decrypt.
+                    let mut staged_carried_init = false;
+                    if let Some(ref wire_init) = env.initial_message
+                        && let Ok(inc) = Incoming::try_from(wire_init)
+                    {
+                        per_peer_carried.entry(peer).or_default().push(inc);
                         peers_needing_replay.insert(peer);
+                        staged_carried_init = true;
+                    }
+                    let Some(ref msg) = env.message else {
+                        continue;
+                    };
+                    match inner.contacts[contact_idx].session.decrypt_envelope(msg) {
+                        Ok(decrypted) => {
+                            let contact = &mut inner.contacts[contact_idx];
+                            let mut content = Content::from_bytes(&decrypted.content);
+                            if !decrypted.earlier {
+                                contact.mark_greeting_confirmed();
+                                contact.state.awaiting_peer_acceptance = false;
+                            }
+                            affected_peers.insert(peer);
+                            if let Some(events) = content.events.take() {
+                                let told = contact.told(&events);
+                                per_peer_steps.entry(peer).or_default().extend(told.steps);
+                                per_peer_settled
+                                    .entry(peer)
+                                    .or_default()
+                                    .extend(told.settled_outbox);
+                                if content.kind.is_none() {
+                                    continue;
+                                }
+                            }
+                            if let Some(Kind::Hello(ref hello)) = content.kind {
+                                let hc = contact.session.check_peer_hello(hello, local_pq);
+                                if hc.downgrade_detected {
+                                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                                    if hc.recommend_start_again
+                                        && !contact.state.request
+                                        && !contact.state.quarantined
+                                    {
+                                        upgrades.insert(peer);
+                                    }
+                                }
+                            }
+                            if matches!(content.kind, Some(Kind::Deleted(_))) && !decrypted.earlier
+                            {
+                                contact.session.retire();
+                                peer_deleted.insert(peer);
+                            }
+                            match contact.add_received(content, false) {
+                                Ok(entry) => per_peer_entries.entry(peer).or_default().push(entry),
+                                Err(reason) => {
+                                    process_err = Some(reason.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) if e.kind() == ErrorKind::DuplicateMessage => continue,
+                        Err(e) if e.kind() == ErrorKind::EvictedMessage => {
+                            match inner.contacts[contact_idx].add_evicted() {
+                                Ok(entry) => {
+                                    per_peer_entries.entry(peer).or_default().push(entry);
+                                    *peer_evicted_counts.entry(peer).or_insert(0) += 1;
+                                    affected_peers.insert(peer);
+                                }
+                                Err(reason) => {
+                                    process_err = Some(reason.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // Buffer temporarily undecryptable envelope (e.g. rekey race) so server
+                            // mailbox cursor advances for all peers while we fetch/join initials next.
+                            // Omit `initial_message` if it was already captured into `per_peer_carried`
+                            // above so `replay_deferred_envelopes` never processes it a second time.
+                            let deferred_init = if staged_carried_init {
+                                None
+                            } else {
+                                env.initial_message
+                            };
+                            let buffered = push_deferred_envelope(
+                                &mut inner.deferred_envelopes,
+                                &peer,
+                                env.sequence,
+                                env.message,
+                                deferred_init,
+                                now_ms,
+                            );
+                            if !buffered {
+                                match inner.contacts[contact_idx].add_evicted() {
+                                    Ok(entry) => {
+                                        per_peer_entries.entry(peer).or_default().push(entry);
+                                        *peer_evicted_counts.entry(peer).or_insert(0) += 1;
+                                    }
+                                    Err(reason) => {
+                                        process_err = Some(reason.to_string());
+                                        break;
+                                    }
+                                }
+                            }
+                            peers_needing_replay.insert(peer);
+                        }
                     }
                 }
-            }
 
-            if let Some(err) = process_err {
-                rollback_mailbox_page(
-                    inner,
-                    client_snapshot,
-                    contact_snapshots,
-                    saved_envelopes,
-                    saved_carried_ts,
-                )?;
-                return Err(err);
-            }
+                if let Some(err) = process_err {
+                    rollback_mailbox_page(
+                        inner,
+                        client_snapshot,
+                        contact_snapshots,
+                        saved_envelopes,
+                        saved_carried_ts,
+                    )?;
+                    return Err(err);
+                }
 
-            // Stage carried initials, apply delivery steps & requeues across all affected peers.
-            let mut all_records: Vec<(PublicKey, u64, HistoryEntry)> = Vec::new();
-            let mut all_outbox_updates: Vec<(PublicKey, u64, Option<OutgoingRecord>)> = Vec::new();
-            let mut per_peer_changed: BTreeMap<PublicKey, Vec<(u64, HistoryEntry)>> =
-                BTreeMap::new();
-            let mut requeued_outcomes: Vec<(PublicKey, RequeueOutcome)> = Vec::new();
+                // Stage carried initials, apply delivery steps & requeues across all affected peers.
+                let mut all_records: Vec<(PublicKey, u64, HistoryEntry)> = Vec::new();
+                let mut all_outbox_updates: Vec<(PublicKey, u64, Option<OutgoingRecord>)> =
+                    Vec::new();
+                let mut per_peer_changed: BTreeMap<PublicKey, Vec<(u64, HistoryEntry)>> =
+                    BTreeMap::new();
+                let mut requeued_outcomes: Vec<(PublicKey, RequeueOutcome)> = Vec::new();
 
-            let touched_peers: BTreeSet<PublicKey> = contact_snapshots.keys().copied().collect();
-            for peer in &touched_peers {
-                if let Some(initials) = per_peer_carried.get(peer)
-                    && let Some(contact) = inner.contact(peer)
-                {
-                    if let Err(err) = stage_carried_initials(&mut contact.state, initials) {
+                let touched_peers: BTreeSet<PublicKey> =
+                    contact_snapshots.keys().copied().collect();
+                for peer in &touched_peers {
+                    if let Some(initials) = per_peer_carried.get(peer)
+                        && let Some(contact) = inner.contact(peer)
+                    {
+                        if let Err(err) = stage_carried_initials(&mut contact.state, initials) {
+                            rollback_mailbox_page(
+                                inner,
+                                client_snapshot,
+                                contact_snapshots,
+                                saved_envelopes,
+                                saved_carried_ts,
+                            )?;
+                            return Err(err);
+                        }
+                        let carried = contact.state.pending_carried_initials.clone();
+                        record_carried_timestamps(
+                            &mut inner.carried_deferred_timestamps,
+                            &carried,
+                            now_ms,
+                        );
+                    }
+
+                    let steps = per_peer_steps.remove(peer).unwrap_or_default();
+                    let settled = per_peer_settled.remove(peer).unwrap_or_default();
+                    let deleted = peer_deleted.contains(peer);
+                    let mut changed = BTreeMap::new();
+                    if !steps.is_empty()
+                        && let Err(e) = inner.step(peer, &mut changed, steps).await
+                    {
                         rollback_mailbox_page(
                             inner,
                             client_snapshot,
@@ -1224,23 +1529,66 @@ impl<V: VaultStore> Engine<V> {
                             saved_envelopes,
                             saved_carried_ts,
                         )?;
-                        return Err(err);
+                        return Err(describe(&e));
                     }
-                    let carried = contact.state.pending_carried_initials.clone();
-                    record_carried_timestamps(
-                        &mut inner.carried_deferred_timestamps,
-                        &carried,
-                        now_ms,
-                    );
+                    let mut settled_non_attachments = Vec::new();
+                    for &(history_index, clock) in &settled {
+                        if let Some(entry) = changed.get_mut(&history_index) {
+                            if entry.place == 0 {
+                                entry.place = clock;
+                                entry.content.get_or_insert_default().clock = clock;
+                            }
+                            let is_attachment = matches!(
+                                entry.content.as_ref().and_then(|c| c.kind.as_ref()),
+                                Some(Kind::Attachment(_))
+                            );
+                            if !is_attachment {
+                                settled_non_attachments.push(history_index);
+                            }
+                        }
+                        all_outbox_updates.push((*peer, history_index, None));
+                    }
+                    if !settled_non_attachments.is_empty()
+                        && let Some(contact) = inner.contact(peer)
+                    {
+                        contact
+                            .state
+                            .awaiting
+                            .retain(|a| !settled_non_attachments.contains(&a.history_index));
+                    }
+                    if deleted || needs_new_session(inner, peer) {
+                        match inner.requeue(peer, deleted, &changed).await {
+                            Ok(requeued) => {
+                                all_outbox_updates.extend(requeued.outbox.clone());
+                                changed.extend(requeued.history.iter().cloned());
+                                requeued_outcomes.push((*peer, requeued));
+                            }
+                            Err(e) => {
+                                rollback_mailbox_page(
+                                    inner,
+                                    client_snapshot,
+                                    contact_snapshots,
+                                    saved_envelopes,
+                                    saved_carried_ts,
+                                )?;
+                                return Err(e);
+                            }
+                        }
+                    }
+                    let changed_vec: Vec<_> = changed.into_iter().collect();
+                    if let Some(entries) = per_peer_entries.get(peer) {
+                        all_records.extend(records(peer, entries));
+                    }
+                    all_records.extend(records(peer, &changed_vec));
+                    if !changed_vec.is_empty() {
+                        per_peer_changed.insert(*peer, changed_vec);
+                    }
                 }
 
-                let steps = per_peer_steps.remove(peer).unwrap_or_default();
-                let settled = per_peer_settled.remove(peer).unwrap_or_default();
-                let deleted = peer_deleted.contains(peer);
-                let mut changed = BTreeMap::new();
-                if !steps.is_empty()
-                    && let Err(e) = inner.step(peer, &mut changed, steps).await
-                {
+                if piggybacked_ack > 0 {
+                    inner.client.clear_pending_mailbox_ack(piggybacked_ack);
+                }
+                if let Err(e) = inner.client.commit_mailbox_page(last_seq, last_seq) {
                     rollback_mailbox_page(
                         inner,
                         client_snapshot,
@@ -1250,150 +1598,113 @@ impl<V: VaultStore> Engine<V> {
                     )?;
                     return Err(describe(&e));
                 }
-                let mut settled_non_attachments = Vec::new();
-                for &(history_index, clock) in &settled {
-                    if let Some(entry) = changed.get_mut(&history_index) {
-                        if entry.place == 0 {
-                            entry.place = clock;
-                            entry.content.get_or_insert_default().clock = clock;
-                        }
-                        let is_attachment = matches!(
-                            entry.content.as_ref().and_then(|c| c.kind.as_ref()),
-                            Some(Kind::Attachment(_))
-                        );
-                        if !is_attachment {
-                            settled_non_attachments.push(history_index);
+
+                if let Err(e) = inner.save_with(&all_records, &all_outbox_updates).await {
+                    rollback_mailbox_page(
+                        inner,
+                        client_snapshot,
+                        contact_snapshots,
+                        saved_envelopes,
+                        saved_carried_ts,
+                    )?;
+                    return Err(describe(&e));
+                }
+                if !self.is_live(vgen) {
+                    return Ok(Vec::new());
+                }
+
+                // Durable commit succeeded: log evicted counts, update open chat UI & contact views.
+                for (peer, evicted_count) in peer_evicted_counts {
+                    let label = inner
+                        .contact(&peer)
+                        .map_or_else(|| short(&peer), |c| c.view().label());
+                    self.ui.log(format!(
+                        "{evicted_count} message(s) from {label} could not be decrypted or exceeded the deferred buffer cap"
+                    ));
+                }
+                for (peer, outcome) in requeued_outcomes {
+                    outcome.log_missing(&self.ui, &peer);
+                }
+                if let Some(open) = self.ui.open.get_untracked() {
+                    if let Some(changed_vec) = per_peer_changed.get(&open) {
+                        self.show_changes(inner, &open, changed_vec);
+                    }
+                    if let Some(entries) = per_peer_entries.remove(&open)
+                        && !entries.is_empty()
+                    {
+                        let displayed_entries: Vec<_> = entries
+                            .iter()
+                            .map(|(index, entry)| {
+                                let (counts_unread, clock) =
+                                    super::handshake::entry_read_tracking(entry);
+                                super::contact::DisplayedEntry {
+                                    index: *index,
+                                    counts_unread,
+                                    clock,
+                                }
+                            })
+                            .collect();
+                        let views: Option<Vec<_>> = inner.contact(&open).map(|contact| {
+                            entries
+                                .into_iter()
+                                .map(|(index, entry)| contact.message(index, entry))
+                                .collect()
+                        });
+                        if let Some(views) = views {
+                            self.show_new(inner, &open, views);
+                            self.acknowledge_appended_displayed(inner, &open, &displayed_entries)
+                                .await;
                         }
                     }
-                    all_outbox_updates.push((*peer, history_index, None));
                 }
-                if !settled_non_attachments.is_empty()
-                    && let Some(contact) = inner.contact(peer)
-                {
-                    contact
-                        .state
-                        .awaiting
-                        .retain(|a| !settled_non_attachments.contains(&a.history_index));
+                if !self.is_live(vgen) {
+                    return Ok(Vec::new());
                 }
-                if deleted || needs_new_session(inner, peer) {
-                    match inner.requeue(peer, deleted, &changed).await {
-                        Ok(requeued) => {
-                            all_outbox_updates.extend(requeued.outbox.clone());
-                            changed.extend(requeued.history.iter().cloned());
-                            requeued_outcomes.push((*peer, requeued));
-                        }
-                        Err(e) => {
-                            rollback_mailbox_page(
-                                inner,
-                                client_snapshot,
-                                contact_snapshots,
-                                saved_envelopes,
-                                saved_carried_ts,
-                            )?;
-                            return Err(e);
-                        }
-                    }
-                }
-                let changed_vec: Vec<_> = changed.into_iter().collect();
-                if let Some(entries) = per_peer_entries.get(peer) {
-                    all_records.extend(records(peer, entries));
-                }
-                all_records.extend(records(peer, &changed_vec));
-                if !changed_vec.is_empty() {
-                    per_peer_changed.insert(*peer, changed_vec);
-                }
-            }
+                self.refresh_contacts(inner);
 
-            if piggybacked_ack > 0 {
-                inner.client.clear_pending_mailbox_ack(piggybacked_ack);
-            }
-            if let Err(e) = inner.client.commit_mailbox_page(last_seq, last_seq) {
-                rollback_mailbox_page(
-                    inner,
-                    client_snapshot,
-                    contact_snapshots,
-                    saved_envelopes,
-                    saved_carried_ts,
-                )?;
-                return Err(describe(&e));
-            }
-
-            if let Err(e) = inner.save_with(&all_records, &all_outbox_updates).await {
-                rollback_mailbox_page(
-                    inner,
-                    client_snapshot,
-                    contact_snapshots,
-                    saved_envelopes,
-                    saved_carried_ts,
-                )?;
-                return Err(describe(&e));
-            }
-            if !self.is_live(vgen) {
-                return Ok(Vec::new());
-            }
-
-            // Durable commit succeeded: log evicted counts, update open chat UI & contact views.
-            for (peer, evicted_count) in peer_evicted_counts {
-                let label = inner
-                    .contact(&peer)
-                    .map_or_else(|| short(&peer), |c| c.view().label());
-                self.ui.log(format!(
-                    "{evicted_count} message(s) from {label} could not be decrypted or exceeded the deferred buffer cap"
-                ));
-            }
-            for (peer, outcome) in requeued_outcomes {
-                outcome.log_missing(&self.ui, &peer);
-            }
-            if let Some(open) = self.ui.open.get_untracked() {
-                if let Some(changed_vec) = per_peer_changed.get(&open) {
-                    self.show_changes(inner, &open, changed_vec);
-                }
-                if let Some(entries) = per_peer_entries.remove(&open)
-                    && !entries.is_empty()
-                {
-                    let displayed_entries: Vec<_> = entries
-                        .iter()
-                        .map(|(index, entry)| {
-                            let (counts_unread, clock) =
-                                super::handshake::entry_read_tracking(entry);
-                            super::contact::DisplayedEntry {
-                                index: *index,
-                                counts_unread,
-                                clock,
+                // Sign explicit ACK under `self.inner` on the final page, then run the RPC after
+                // dropping `guard`.
+                if !has_more {
+                    should_break = true;
+                    let up_to = inner.client.pending_mailbox_ack();
+                    if up_to > 0 {
+                        match inner.client.sign_ack_mailbox_v2(&inner.audience, up_to) {
+                            Ok(ack_req) => {
+                                explicit_ack = Some((inner.server.clone(), up_to, ack_req));
                             }
-                        })
-                        .collect();
-                    let views: Option<Vec<_>> = inner.contact(&open).map(|contact| {
-                        entries
-                            .into_iter()
-                            .map(|(index, entry)| contact.message(index, entry))
-                            .collect()
-                    });
-                    if let Some(views) = views {
-                        self.show_new(inner, &open, views);
-                        self.acknowledge_appended_displayed(inner, &open, &displayed_entries)
-                            .await;
+                            Err(e) => {
+                                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                            }
+                        }
                     }
                 }
             }
-            if !self.is_live(vgen) {
-                return Ok(Vec::new());
-            }
-            self.refresh_contacts(inner);
 
-            // Unconditionally ACK server mailbox prefix on the final page (earlier pages piggyback).
-            if !has_more {
-                if inner.client.pending_mailbox_ack() > 0 {
-                    match inner.client.ack_mailbox_v2(&mailbox, &inner.audience).await {
-                        _ if !self.is_live(vgen) => return Ok(Vec::new()),
-                        Ok(_) => {
+            if let Some((ack_server, up_to, ack_req)) = explicit_ack {
+                let ack_res: session::Result<_> = Fetch::client(&ack_server)
+                    .ack_messages(ack_req)
+                    .await
+                    .map_err(session::Error::from);
+                if !self.is_live(vgen) {
+                    return Ok(Vec::new());
+                }
+                match ack_res {
+                    Ok(_) => {
+                        let mut guard = self.lock_inner().await;
+                        if !self.is_live(vgen) {
+                            return Ok(Vec::new());
+                        }
+                        if let Some(inner) = guard.as_mut() {
+                            inner.client.clear_pending_mailbox_ack(up_to);
                             let _ = inner.save_state().await;
                         }
-                        Err(e) => {
-                            self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-                        }
+                    }
+                    Err(e) => {
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                     }
                 }
+            }
+            if should_break {
                 break;
             }
         }
@@ -1658,6 +1969,7 @@ impl<V: VaultStore> Engine<V> {
                     let mut content = Content::from_bytes(&decrypted.content);
                     if !decrypted.earlier {
                         contact.mark_greeting_confirmed();
+                        contact.state.awaiting_peer_acceptance = false;
                     }
                     replayed_peers.insert(peer);
                     if let Some(events) = content.events.take() {

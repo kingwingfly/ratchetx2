@@ -82,17 +82,19 @@ pub(crate) async fn check_rate_limit(env: &Env, binding: &str, key: String) -> b
     }
 
     let Ok(val) = js_sys::Reflect::get(env.as_ref(), &JsValue::from_str(binding)) else {
-        return true;
+        console_error!("rate limiter binding `{binding}` could not be read from env");
+        return !password_configured(env);
     };
     if val.is_undefined() || val.is_null() {
-        return true;
+        console_error!("rate limiter binding `{binding}` is missing from env");
+        return !password_configured(env);
     }
     let has_limit = js_sys::Reflect::get(&val, &JsValue::from_str("limit"))
         .map(|f| f.is_function())
         .unwrap_or(false);
     if !has_limit {
         console_error!("rate limiter binding `{binding}` has no limit() method");
-        return true;
+        return !password_configured(env);
     }
     let opts = js_sys::Object::new();
     if js_sys::Reflect::set(&opts, &JsValue::from_str("key"), &JsValue::from_str(&key)).is_err() {

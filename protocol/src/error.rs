@@ -73,6 +73,7 @@ impl Error {
                     | ErrorKind::Malformed
                     | ErrorKind::InvalidSignature
                     | ErrorKind::StaleTimestamp
+                    | ErrorKind::StaleVersion
                     | ErrorKind::WriteTokenRejected
             )
     }
@@ -124,10 +125,12 @@ impl From<storage::Error> for Error {
     fn from(error: storage::Error) -> Self {
         let kind = match error.kind() {
             storage::ErrorKind::LimitExceeded => ErrorKind::LimitExceeded,
+            storage::ErrorKind::MailboxFull => ErrorKind::MailboxFull,
             storage::ErrorKind::InvalidArgument => ErrorKind::Malformed,
             storage::ErrorKind::NotFound => ErrorKind::NotFound,
             storage::ErrorKind::WriteTokenRejected => ErrorKind::WriteTokenRejected,
-            storage::ErrorKind::StaleVersion => ErrorKind::StaleTimestamp,
+            storage::ErrorKind::StaleVersion => ErrorKind::StaleVersion,
+            storage::ErrorKind::StaleTimestamp => ErrorKind::StaleTimestamp,
             _ => ErrorKind::Storage,
         };
         Self::new(kind, error)
@@ -150,10 +153,13 @@ pub enum ErrorKind {
     /// A request's or a prekey's signature, or an upload token, does not verify.
     #[error("invalid signature")]
     InvalidSignature,
-    /// A signed request's timestamp is not greater than the previous request's, a subscription's
-    /// is too far from the server's clock, or a write-token grant version is stale.
+    /// A signed request's timestamp is not greater than the previous request's or is too far from
+    /// the server's clock.
     #[error("stale timestamp")]
     StaleTimestamp,
+    /// A write-token registration's grant version does not exceed the peer's revoked version floor.
+    #[error("stale grant version")]
+    StaleVersion,
     /// The mailbox write token is unknown or has been revoked by the recipient.
     #[error("write token rejected")]
     WriteTokenRejected,
@@ -163,6 +169,9 @@ pub enum ErrorKind {
     /// Too many one-time prekeys, initial messages or chunks, or a message or chunk too large.
     #[error("limit exceeded")]
     LimitExceeded,
+    /// The recipient's mailbox backlog quota is temporarily full; callers should retry later.
+    #[error("recipient mailbox full")]
+    MailboxFull,
     /// The server stores this only for clients signed in to it, e.g. with its password: a large
     /// message, or an attachment, which cost it storage.
     #[error("sign-in required")]

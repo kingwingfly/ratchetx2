@@ -23,7 +23,6 @@ use crate::objects::{
 #[derive(Clone)]
 pub struct Store {
     env: Env,
-    bucket: Bucket,
     /// Most bytes one mailbox read returns, unless its first message alone is larger.
     max_read_size: usize,
 }
@@ -31,12 +30,18 @@ pub struct Store {
 impl Store {
     /// The stores over `env`'s bindings, whose mailbox reads return at most `max_read_size` bytes,
     /// unless the first message alone is larger.
+    ///
+    /// Resolves the R2 `BUCKET` lazily inside attachment operations so a missing R2 binding never
+    /// breaks SQLite-backed handshake or mailbox RPCs.
     pub fn new(env: &Env, max_read_size: usize) -> worker::Result<Self> {
         Ok(Self {
             env: env.clone(),
-            bucket: env.bucket(crate::BUCKET)?,
             max_read_size,
         })
+    }
+
+    fn bucket(&self) -> Result<Bucket> {
+        self.env.bucket(crate::BUCKET).map_err(unavailable)
     }
 
     /// Make typed `call` of the `IdentityV2` object of `identity_key`.
@@ -58,7 +63,7 @@ impl Store {
     /// Read an attachment chunk from R2 under `object`; `None` if not uploaded or expired.
     async fn object(&self, object: &str) -> Result<Option<Bytes>> {
         let Some(object) = self
-            .bucket
+            .bucket()?
             .get(object)
             .execute()
             .await
@@ -248,6 +253,7 @@ impl LocalIdempotentMailboxStore for Store {
         {
             AppendOutcome::Appended(seq) | AppendOutcome::Deduplicated(seq) => Ok(seq),
             AppendOutcome::WriteTokenRejected => Err(ErrorKind::WriteTokenRejected.into()),
+            AppendOutcome::MailboxFull => Err(ErrorKind::MailboxFull.into()),
             AppendOutcome::LimitExceeded => Err(ErrorKind::LimitExceeded.into()),
         }
     }
@@ -301,6 +307,7 @@ impl LocalIdempotentMailboxStore for Store {
             RegisterWriteTokenOutcome::Registered => Ok(()),
             RegisterWriteTokenOutcome::NotFound => Err(ErrorKind::NotFound.into()),
             RegisterWriteTokenOutcome::StaleVersion => Err(ErrorKind::StaleVersion.into()),
+            RegisterWriteTokenOutcome::StaleTimestamp => Err(ErrorKind::StaleTimestamp.into()),
             RegisterWriteTokenOutcome::InvalidArgument => Err(ErrorKind::InvalidArgument.into()),
             RegisterWriteTokenOutcome::LimitExceeded => Err(ErrorKind::LimitExceeded.into()),
         }
@@ -337,10 +344,11 @@ impl LocalAttachmentStore for Store {
             etag_does_not_match: Some("*".to_string()),
             ..Conditional::default()
         };
+        let bucket = self.bucket()?;
         // `Vec::from(data)` reuses the allocation zero-copy when `data` is uniquely owned, and
         // `PutOptionsBuilder::execute` copies into a JS `Uint8Array` and drops the Rust `Vec`
         // BEFORE awaiting the R2 put promise.
-        self.bucket
+        bucket
             .put(&object, Vec::from(data))
             .only_if(absent)
             .execute()
@@ -348,7 +356,7 @@ impl LocalAttachmentStore for Store {
             .map_err(unavailable)?;
         let noted = self.attachment_call(id, rpc::NoteChunk { index }).await?;
         if !noted {
-            self.bucket.delete(&object).await.map_err(unavailable)?;
+            bucket.delete(&object).await.map_err(unavailable)?;
             return Err(Error::new(
                 ErrorKind::NotFound,
                 "the attachment was deleted",

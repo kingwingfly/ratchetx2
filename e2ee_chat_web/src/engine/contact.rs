@@ -314,6 +314,7 @@ impl Contact {
             // A peer-initiated session took over as the active session, replacing any unconfirmed
             // local greeting and any superseded fallback farewells on the previous session.
             self.mark_greeting_confirmed();
+            self.state.awaiting_peer_acceptance = false;
             self.state.sealed_events = None;
             self.state.needs_requeue_sealed |= self.state.outbox.iter().any(|o| o.sealed);
         }
@@ -393,12 +394,16 @@ impl Contact {
         let peer_pq = self.session.peer_pq_state();
         let active_security = self.session.security();
         let has_active_session = active_security.is_some();
-        let awaiting_acceptance = !self.state.request
+        let pending_peer = !self.state.request
             && !self.state.quarantined
             && has_active_session
             && !self.session.is_known_by_peer()
-            && ((self.state.peer_last == 0 && self.state.awaiting.is_empty())
+            && (self.state.awaiting_peer_acceptance
+                || (self.state.peer_last == 0 && self.state.awaiting.is_empty())
                 || approval_backed_off);
+        let greeting_unsent =
+            pending_peer && self.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED;
+        let awaiting_acceptance = pending_peer && !greeting_unsent;
         let alert = match self.state.security_alert {
             SECURITY_ALERT_DOWNGRADE => SecurityAlert::DowngradeDetected,
             SECURITY_ALERT_MANIFEST_EXPIRED => SecurityAlert::ManifestExpired,
@@ -420,6 +425,7 @@ impl Contact {
             peer: self.peer,
             name: self.state.name.clone(),
             request: self.state.request,
+            greeting_unsent,
             awaiting_acceptance,
             hello_name: self.state.hello_name.clone(),
             unread: self.state.unread,
@@ -698,6 +704,7 @@ impl Contact {
                     history_index: outgoing.history_index,
                     read: true,
                     attachment: true,
+                    content_digest: outgoing.content_digest.clone(),
                 });
             }
             false
@@ -892,6 +899,40 @@ pub(super) fn is_pq_incompatible_isolated(state: &ContactState, me: &PublicKey) 
         .as_ref()
         .is_some_and(|s| s.is_pq && is_unsupported_known_pq_suite(s.suite));
     active_kem || earlier_kem || active_sec
+}
+
+/// Extract every valid 32-byte inbound write-token hash from a PQ-incompatible isolated contact's
+/// raw `SessionState` (`inbound_token_hash`, `others[*].inbound_token_hash`, and
+/// `pending_register_grants[*].token_hash`) so unified mailbox receive can defer its envelopes
+/// instead of silently discarding and ACKing them.
+pub(super) fn pq_incompatible_isolated_token_hashes(
+    state: &ContactState,
+    me: &PublicKey,
+) -> Option<(PublicKey, Vec<[u8; 32]>)> {
+    if !is_pq_incompatible_isolated(state, me) {
+        return None;
+    }
+    let peer = PublicKey::try_from(state.peer.as_slice()).ok()?;
+    let raw = state.session.as_ref()?;
+    let mut hashes = Vec::new();
+    if let Ok(h) = <[u8; 32]>::try_from(raw.inbound_token_hash.as_slice()) {
+        hashes.push(h);
+    }
+    for earlier in &raw.others {
+        if let Ok(h) = <[u8; 32]>::try_from(earlier.inbound_token_hash.as_slice())
+            && !hashes.contains(&h)
+        {
+            hashes.push(h);
+        }
+    }
+    for grant in &raw.pending_register_grants {
+        if let Ok(h) = <[u8; 32]>::try_from(grant.token_hash.as_slice())
+            && !hashes.contains(&h)
+        {
+            hashes.push(h);
+        }
+    }
+    Some((peer, hashes))
 }
 
 /// Restore each contact independently. Validate from borrowed fields so every failure retains

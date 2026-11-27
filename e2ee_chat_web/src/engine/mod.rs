@@ -28,8 +28,8 @@ use crate::transport::{Connect, Fetch};
 use crate::util::{describe, key_to_url, short, size_u64, sleep};
 use crate::vault::{
     AppState, CarriedDeferredTimestamp, ContactState, DeferredEnvelope, DeferredInitial,
-    DeferredRecord, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry,
-    OutgoingRecord, PendingRevoke, PendingUpload, Vault, VaultPresence,
+    DeferredRecord, HistoryEntry, OutgoingRecord, PendingRevoke, PendingUpload, Vault,
+    VaultPresence,
 };
 use crate::{glue, transport};
 use attachments::{ChunkSource, upload_of};
@@ -166,6 +166,8 @@ const EVENTS_KEPT: usize = 1_000;
 pub struct Engine<V = Vault> {
     ui: Ui,
     inner: Mutex<Option<Inner<V>>>,
+    /// Serializes unified `mailbox.v2` fetch/ack passes without holding `self.inner` across RTTs.
+    mailbox_lock: Mutex<()>,
     /// Monotonic vault lifecycle generation bumped on every create/unlock and synchronously inside
     /// [`Engine::teardown_on_pagehide`] so any in-flight async continuation aborts cleanly without
     /// mutating IndexedDB or repopulating `Ui` signals.
@@ -406,6 +408,7 @@ impl<V: VaultStore> Engine<V> {
         let engine = Rc::new(Self {
             ui,
             inner: Mutex::new(None),
+            mailbox_lock: Mutex::new(()),
             vault_generation: Cell::new(0),
             shutting_down: Cell::new(false),
             ws_close: RefCell::new(None),
@@ -1173,8 +1176,13 @@ impl Engine<Vault> {
             &mut deferred.carried_timestamps,
             contacts.iter(),
         );
-        let pruned_envelopes =
-            sync::prune_deferred_envelopes(&mut deferred.envelopes, &contacts, now_ms);
+        let pruned_envelopes = sync::prune_deferred_envelopes(
+            &mut deferred.envelopes,
+            &contacts,
+            &isolated_contacts,
+            &client.identity_key(),
+            now_ms,
+        );
         let mut inner = Inner::new(
             vault,
             address,
@@ -1862,7 +1870,7 @@ impl<V: VaultStore> Engine<V> {
         }
         // Register write token outside `self.inner` BEFORE pushing `Events { accepted: true }` so
         // the peer's follow-up messages are immediately accepted on our DO without stalling UI.
-        let _ = self.flush_pending_grants_for_peer(&peer).await;
+        let grant_res = self.flush_pending_grants_for_peer(&peer).await;
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
@@ -1882,8 +1890,19 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        // Wake the peer immediately with `Events { accepted: true }` + any read receipts.
-        let _ = self.flush(&peer).await;
+        // Only push `Events { accepted: true }` once write-token registration succeeded; otherwise
+        // keep `accepted = true` staged so the next sync registers the grant first, then wakes peer.
+        match grant_res {
+            Ok(()) => {
+                let _ = self.flush(&peer).await;
+            }
+            Err(e) => {
+                self.ui.log(format!(
+                    "accepted chat with {}; write-token registration will retry before notifying peer: {e}",
+                    short(&peer)
+                ));
+            }
+        }
         if self.is_live(vgen) {
             self.wake();
         }
@@ -2770,55 +2789,6 @@ impl<V: VaultStore> Inner<V> {
                 Err(err)
             }
         }
-    }
-
-    /// Coordinate `GREETING_DELIVERY_{UNSENT,UNCERTAIN,CONFIRMED}` transitions around a network
-    /// transmission for `peer`:
-    /// - When `!already_uncertain` and `greeting_delivery == GREETING_DELIVERY_UNSENT`, persists
-    ///   `GREETING_DELIVERY_UNCERTAIN` before transmitting (rolling back if that save fails).
-    /// - On `Ok` with `confirm_on_ok`, marks greeting confirmed and saves state.
-    /// - On a definitive server refusal (`e.is_server_refusal()`), reverts to
-    ///   `GREETING_DELIVERY_UNSENT` and saves state so deleting the chat suppresses farewells.
-    pub(super) async fn transmit_with_greeting_delivery<T>(
-        &mut self,
-        peer: &PublicKey,
-        already_uncertain: bool,
-        confirm_on_ok: bool,
-        transmit: impl AsyncFnOnce(&mut Self) -> session::Result<T>,
-    ) -> Result<session::Result<T>, String> {
-        let promoted_from_unsent = !already_uncertain
-            && self
-                .contacts
-                .iter()
-                .any(|c| c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT);
-        if promoted_from_unsent {
-            self.with_contact_tx(peer, async |inner| {
-                if let Some(contact) = inner.contact(peer) {
-                    contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-                }
-                inner.save(&[]).await.map_err(|e| describe(&e))
-            })
-            .await?;
-        }
-        let result = transmit(self).await;
-        match &result {
-            Ok(_) if confirm_on_ok => {
-                if self
-                    .contact(peer)
-                    .is_some_and(Contact::mark_greeting_confirmed)
-                {
-                    let _ = self.save_state().await;
-                }
-            }
-            Err(e) if e.is_server_refusal() && (already_uncertain || promoted_from_unsent) => {
-                if let Some(contact) = self.contact(peer) {
-                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                }
-                let _ = self.save_state().await;
-            }
-            _ => {}
-        }
-        Ok(result)
     }
 
     /// Undo the changes to the contact `peer` since `snapshot`, after saving them failed, so

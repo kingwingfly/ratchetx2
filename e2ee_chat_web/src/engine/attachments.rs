@@ -740,7 +740,9 @@ impl<V: VaultStore> Engine<V> {
             sealed_chunk_hash: Vec::new(),
         };
         let content = Kind::Attachment(pointer);
-        let record = OutgoingRecord::unsealed(content.to_bytes());
+        let content_bytes = content.to_bytes();
+        let content_digest = crate::vault::content_kind_digest(&content_bytes);
+        let record = OutgoingRecord::unsealed(content_bytes);
         entry.content = Some(Content {
             kind: Some(content),
             ..entry.content.unwrap_or_default()
@@ -758,6 +760,7 @@ impl<V: VaultStore> Engine<V> {
                 for outgoing in &mut contact.state.outbox {
                     if outgoing.history_index == kept.history_index {
                         outgoing.awaits_upload = false;
+                        outgoing.content_digest = content_digest.clone();
                     }
                 }
                 inner

@@ -1679,6 +1679,20 @@ impl<M> Session<M> {
             .is_some_and(|active| active.known_by_peer)
     }
 
+    /// Build a wire [`protocol::handshake_v2::SendInitialV2Request`] for the active session's
+    /// carried `initial_message`, if any (used to retry an unconfirmed initial greeting).
+    pub fn pending_initial_request(&self) -> Option<protocol::handshake_v2::SendInitialV2Request> {
+        let raw = &self.state.active.as_ref()?.initial_message;
+        if raw.is_empty() {
+            return None;
+        }
+        let wire = decode_carried_initial(raw)?;
+        Some(protocol::handshake_v2::SendInitialV2Request {
+            recipient: Bytes::copy_from_slice(&self.state.peer),
+            message: Some(wire),
+        })
+    }
+
     /// `SHA-256(t_{peer->me})` of the active session, if any (the hash to register on our relay
     /// via [`Client::register_write_token_v2`]).
     pub fn active_inbound_token_hash(&self) -> Option<[u8; WRITE_TOKEN_HASH_LENGTH]> {

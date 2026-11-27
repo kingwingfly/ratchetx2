@@ -56,8 +56,14 @@ pub(super) struct PeerGrantRow {
 
 #[derive(Deserialize)]
 pub(super) struct WriteTokenRow {
+    pub(super) peer_slot_id: Blob,
+}
+
+#[derive(Deserialize)]
+pub(super) struct WriteTokenAuthRow {
     pub(super) token_hash: Blob,
     pub(super) peer_slot_id: Blob,
+    pub(super) grant_version: u64,
 }
 
 #[derive(Deserialize)]

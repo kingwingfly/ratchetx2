@@ -110,6 +110,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
     let contact = move || ui.contact(&peer);
     let label = move || contact().map(|contact| contact.label()).unwrap_or_default();
     let request = move || contact().is_some_and(|contact| contact.request);
+    let greeting_unsent = move || contact().is_some_and(|contact| contact.greeting_unsent);
     let awaiting_acceptance = move || contact().is_some_and(|contact| contact.awaiting_acceptance);
     let quarantined = move || contact().is_some_and(|contact| contact.is_quarantined());
     let strict_pq = Memo::new(move |_| strict_pq_enabled(ui));
@@ -123,7 +124,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             }
         } else if request() {
             "Accept the request to write"
-        } else if awaiting_acceptance() {
+        } else if greeting_unsent() || awaiting_acceptance() {
             "Write a message (delivers once accepted)"
         } else {
             "Write a message"
@@ -450,6 +451,18 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                     </button>
                 </div>
             </Show>
+            <Show when=move || greeting_unsent() && !request() && !quarantined()>
+                <div class="banner awaiting-acceptance" role="status">
+                    <span>
+                        {move || {
+                            format!(
+                                "Sending chat request to {}… It hasn't reached the server yet and will retry automatically once connected.",
+                                label(),
+                            )
+                        }}
+                    </span>
+                </div>
+            </Show>
             <Show when=move || awaiting_acceptance() && !request() && !quarantined()>
                 <div class="banner awaiting-acceptance" role="status">
                     <span>
@@ -465,6 +478,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             <Messages
                 peer
                 label=Signal::derive(label)
+                greeting_unsent=Signal::derive(greeting_unsent)
                 awaiting_acceptance=Signal::derive(awaiting_acceptance)
             />
             <Uploads peer />
@@ -521,6 +535,7 @@ fn restore_visible_anchor(list: &web_sys::Element, anchor: &(String, f64)) {
 fn Messages(
     peer: PublicKey,
     label: Signal<String>,
+    greeting_unsent: Signal<bool>,
     awaiting_acceptance: Signal<bool>,
 ) -> impl IntoView {
     let ui = ui();
@@ -636,7 +651,9 @@ fn Messages(
             <For
                 each=move || ui.messages.get()
                 key=|message| message.index
-                children=move |message| message_item(peer, message, label, awaiting_acceptance)
+                children=move |message| {
+                    message_item(peer, message, label, greeting_unsent, awaiting_acceptance)
+                }
             />
         </div>
     }
@@ -650,6 +667,7 @@ fn message_item(
     chat_peer: PublicKey,
     message: MessageRow,
     label: Signal<String>,
+    greeting_unsent: Signal<bool>,
     awaiting_acceptance: Signal<bool>,
 ) -> AnyView {
     let ui = ui();
@@ -739,7 +757,11 @@ fn message_item(
         Delivery::Received => None,
         Delivery::Pending => Some((
             Icon::Pending,
-            if awaiting_acceptance.get() {
+            if ui.held.with(|held| held.contains(&(chat_peer, index))) {
+                "waiting for server sign-in"
+            } else if greeting_unsent.get() {
+                "waiting to send chat request"
+            } else if awaiting_acceptance.get() {
                 "waiting for peer to accept"
             } else {
                 "waiting to be sent"

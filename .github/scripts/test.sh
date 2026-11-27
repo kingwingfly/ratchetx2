@@ -51,6 +51,10 @@ run cargo test --locked --features prost -p ratchetx2 -p x3dh -p party -p sessio
 run cargo test --locked --features ml-kem-768,prost -p ratchetx2 -p x3dh -p party -p session
 run cargo test --locked --features ml-kem-1024,prost -p ratchetx2 -p x3dh -p party -p session
 run cargo test --locked --features pq,prost -p ratchetx2 -p x3dh -p party -p session
+# Reduced-PQ web engine host test matrix (ensuring suite-incompatible isolation/deferral paths run in CI).
+run cargo test --locked --no-default-features -p e2ee_chat_web
+run cargo test --locked --no-default-features --features ml-kem-768 -p e2ee_chat_web
+run cargo test --locked --no-default-features --features ml-kem-1024 -p e2ee_chat_web
 
 run env RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps "${LIBS[@]}"
 run env RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps --all-features "${LIBS[@]}"

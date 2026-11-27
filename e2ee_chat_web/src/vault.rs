@@ -91,6 +91,8 @@ const OUTBOX_V3_AAD_PREFIX: &[u8] = b"outbox/v3\0";
 const UPLOAD_V3_AAD_PREFIX: &[u8] = b"upload/v3\0";
 /// Prefix for `deferred` per-record AAD and SHA-256 digest.
 const DEFERRED_V3_PREFIX: &[u8] = b"deferred/v3\0";
+/// Prefix for authenticated SHA-256 digest binding outbox/awaiting entries to history/file content.
+const CONTENT_KIND_DIGEST_PREFIX: &[u8] = b"outbox-content/v3\0";
 
 /// HKDF-SHA256 info strings for the three Vault v3 subkeys.
 const HKDF_INFO_STATE: &[u8] = b"ratchetx2/vault/v3/state";
@@ -228,24 +230,37 @@ pub fn state_v3_aad(header_bytes: &[u8]) -> Vec<u8> {
     aad
 }
 
-/// Static per-record AAD for `history` records: `b"history/v3\0" || peer || index_be || epoch_be`.
-pub fn history_aad(peer: &PublicKey, index: u64, epoch: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(HISTORY_V3_AAD_PREFIX.len() + 32 + 16);
+/// Static per-record AAD for `history` records:
+/// `b"history/v3\0" || peer || index_be || epoch_be || conversation_gen_be`.
+pub fn history_aad(peer: &PublicKey, index: u64, epoch: u64, conversation_gen: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(HISTORY_V3_AAD_PREFIX.len() + 32 + 24);
     aad.extend_from_slice(HISTORY_V3_AAD_PREFIX);
     aad.extend_from_slice(peer);
     aad.extend_from_slice(&index.to_be_bytes());
     aad.extend_from_slice(&epoch.to_be_bytes());
+    aad.extend_from_slice(&conversation_gen.to_be_bytes());
     aad
 }
 
-/// Static per-record AAD for `file` records: `b"file/v3\0" || peer || index_be || epoch_be`.
-pub fn file_aad(peer: &PublicKey, index: u64, epoch: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(FILE_V3_AAD_PREFIX.len() + 32 + 16);
+/// Static per-record AAD for `file` records:
+/// `b"file/v3\0" || peer || index_be || epoch_be || conversation_gen_be`.
+pub fn file_aad(peer: &PublicKey, index: u64, epoch: u64, conversation_gen: u64) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(FILE_V3_AAD_PREFIX.len() + 32 + 24);
     aad.extend_from_slice(FILE_V3_AAD_PREFIX);
     aad.extend_from_slice(peer);
     aad.extend_from_slice(&index.to_be_bytes());
     aad.extend_from_slice(&epoch.to_be_bytes());
+    aad.extend_from_slice(&conversation_gen.to_be_bytes());
     aad
+}
+
+/// SHA-256 digest binding an [`Outgoing`] or [`Awaiting`] entry inside authenticated `STATE`
+/// to the exact serialized [`Kind`] bytes stored in its `history`/`file` records.
+pub fn content_kind_digest(bytes: &[u8]) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(CONTENT_KIND_DIGEST_PREFIX);
+    hasher.update(bytes);
+    hasher.finalize().to_vec()
 }
 
 /// Revision-bound AAD for `outbox` records: `b"outbox/v3\0" || peer || index_be || epoch_be || rev_be`.
@@ -913,6 +928,10 @@ pub struct PeerStorageIndex {
     /// Kept attachment chunk bitmaps for `peer`.
     #[prost(message, repeated, tag = "4")]
     pub kept_chunks: Vec<AttachmentChunks>,
+    /// Monotonic conversation generation incremented on [`Vault::forget`] so deleted history and
+    /// file ciphertexts cannot be spliced into a future chat with the same `peer`.
+    #[prost(uint64, tag = "5")]
+    pub conversation_gen: u64,
 }
 
 /// Bitmap tracking which chunk indices of attachment `id` are cached locally in IndexedDB.
@@ -1173,6 +1192,11 @@ pub struct ContactState {
     /// Structured single-line preview of the most recent message in this chat.
     #[prost(message, optional, tag = "30")]
     pub last_message: Option<LastMessageRecord>,
+    /// Durable flag set when an outbound chat/rekey hits `WriteTokenRejected` while
+    /// `!is_known_by_peer()`, keeping the awaiting-acceptance notice stable across reloads and
+    /// manual syncs until the peer accepts or a push succeeds.
+    #[prost(bool, tag = "31")]
+    pub awaiting_peer_acceptance: bool,
 }
 
 /// Persisted structured preview of the most recent message in a chat.
@@ -1266,6 +1290,10 @@ pub struct Awaiting {
     /// Whether it is an attachment, which waits for both.
     #[prost(bool, tag = "4")]
     pub attachment: bool,
+    /// SHA-256 digest of the serialized [`Kind`] bytes in history/file records, verified before
+    /// reconstructing an outbox resend on peer chat deletion.
+    #[prost(bytes = "vec", tag = "5")]
+    pub content_digest: Vec<u8>,
 }
 
 /// An attachment being uploaded, kept so that the upload can go on after the page goes, with
@@ -1368,6 +1396,10 @@ pub struct Outgoing {
     /// It is an attachment whose upload has not started.
     #[prost(bool, tag = "6")]
     pub awaits_upload: bool,
+    /// SHA-256 digest of the serialized [`Kind`] bytes in history/file records, verified before
+    /// reconstructing a missing/corrupt or requeued [`OutgoingRecord`].
+    #[prost(bytes = "vec", tag = "7")]
+    pub content_digest: Vec<u8>,
 }
 
 /// What a message not pushed yet is: its content, encrypted just before it goes.
@@ -1801,6 +1833,10 @@ fn peer_storage_from_proto(list: &[PeerStorageIndex]) -> BTreeMap<PublicKey, Pee
     map
 }
 
+fn peer_conversation_gen(storage: &BTreeMap<PublicKey, PeerStorageIndex>, peer: &PublicKey) -> u64 {
+    storage.get(peer).map_or(0, |ps| ps.conversation_gen)
+}
+
 fn record_peer_entry(
     storage: &mut BTreeMap<PublicKey, PeerStorageIndex>,
     peer: PublicKey,
@@ -1812,6 +1848,7 @@ fn record_peer_entry(
         max_history_len: 0,
         file_indices: Vec::new(),
         kept_chunks: Vec::new(),
+        conversation_gen: 0,
     });
     ps.max_history_len = ps.max_history_len.max(index.saturating_add(1));
     if has_file && let Err(pos) = ps.file_indices.binary_search(&index) {
@@ -1830,6 +1867,7 @@ fn set_peer_chunk_bit(
         max_history_len: 0,
         file_indices: Vec::new(),
         kept_chunks: Vec::new(),
+        conversation_gen: 0,
     });
     if let Some(existing) = ps.kept_chunks.iter_mut().find(|a| a.id.as_slice() == id) {
         existing.set_bit(index)
@@ -2115,7 +2153,7 @@ impl Vault {
             }
         };
         let write_res: Result<()> = (|| {
-            self.put_prepared_entries(&store, prepared_entries)?;
+            self.put_prepared_entries(&store, prepared_entries, &next_peer_storage)?;
             self.put_outgoing(&store, &outgoing_vec, next_header.revision)?;
             self.put_deferred(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
@@ -2174,21 +2212,27 @@ impl Vault {
         &self,
         store: &idb::ObjectStore,
         entries: Vec<PreparedEntry>,
+        peer_storage: &BTreeMap<PublicKey, PeerStorageIndex>,
     ) -> Result<()> {
         for (peer, index, mut entry, data) in entries {
+            let conversation_gen = peer_conversation_gen(peer_storage, &peer);
             if let Some(data) = data {
                 let fkey = opaque_file_key(&self.keys.idb_mac_key, &peer, index);
                 let mut record = FileRecord {
                     data: data.to_vec(),
                 };
-                let sealed =
-                    self.seal_record(&file_aad(&peer, index, self.record_epoch), &record)?;
+                let sealed = self.seal_record(
+                    &file_aad(&peer, index, self.record_epoch, conversation_gen),
+                    &record,
+                )?;
                 record.data.zeroize();
                 store.put(&bytes(&sealed), Some(&fkey.as_str().into()))?;
             }
             let hkey = opaque_history_key(&self.keys.idb_mac_key, &peer, index);
-            let sealed_entry =
-                self.seal_record(&history_aad(&peer, index, self.record_epoch), &entry)?;
+            let sealed_entry = self.seal_record(
+                &history_aad(&peer, index, self.record_epoch, conversation_gen),
+                &entry,
+            )?;
             entry.zeroize_secrets();
             store.put(&bytes(&sealed_entry), Some(&hkey.as_str().into()))?;
         }
@@ -2204,6 +2248,7 @@ impl Vault {
 
     async fn file_data(&self, peer: &PublicKey, index: u64) -> Result<Option<Vec<u8>>> {
         self.ensure_lock_owned()?;
+        let conversation_gen = peer_conversation_gen(&self.peer_storage.borrow(), peer);
         let key = opaque_file_key(&self.keys.idb_mac_key, peer, index);
         let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
@@ -2211,7 +2256,7 @@ impl Vault {
         self.ensure_lock_owned()?;
         let record = open_bytes(
             &self.keys.record_key,
-            &file_aad(peer, index, self.record_epoch),
+            &file_aad(peer, index, self.record_epoch, conversation_gen),
             &sealed,
         )
         .ok_or_else(|| Error::Corrupt(format!("file record {index} does not decrypt")))?;
@@ -2247,6 +2292,7 @@ impl Vault {
     /// The history entry `index` of the chat with `peer`, without its file, if any.
     pub async fn entry(&self, peer: &PublicKey, index: u64) -> Result<Option<HistoryEntry>> {
         self.ensure_lock_owned()?;
+        let conversation_gen = peer_conversation_gen(&self.peer_storage.borrow(), peer);
         let key = opaque_history_key(&self.keys.idb_mac_key, peer, index);
         let Some(sealed) = get(&self.database, &key).await? else {
             return Ok(None);
@@ -2254,7 +2300,7 @@ impl Vault {
         self.ensure_lock_owned()?;
         let entry = open_bytes(
             &self.keys.record_key,
-            &history_aad(peer, index, self.record_epoch),
+            &history_aad(peer, index, self.record_epoch, conversation_gen),
             &sealed,
         )
         .ok_or_else(|| Error::Corrupt(format!("history entry {index} does not decrypt")))?;
@@ -2299,6 +2345,7 @@ impl Vault {
         let Some((first, last)) = history_bounds(history_len, limit) else {
             return Ok(vec![]);
         };
+        let conversation_gen = peer_conversation_gen(&self.peer_storage.borrow(), peer);
         let transaction = self
             .database
             .transaction(&[STORE], TransactionMode::ReadOnly)?;
@@ -2317,7 +2364,7 @@ impl Vault {
             let sealed = Uint8Array::new(&value).to_vec();
             let plain = open_bytes(
                 &self.keys.record_key,
-                &history_aad(peer, index, self.record_epoch),
+                &history_aad(peer, index, self.record_epoch, conversation_gen),
                 &sealed,
             )
             .ok_or_else(|| Error::Corrupt(format!("history entry {index} does not decrypt")))?;
@@ -2514,7 +2561,7 @@ impl Vault {
             if old_key != new_key {
                 store.delete(JsValue::from_str(&old_key))?;
             }
-            self.put_prepared_entries(&store, prepared_entries)?;
+            self.put_prepared_entries(&store, prepared_entries, &next_peer_storage)?;
             self.put_outgoing(&store, &outgoing_vec, next_header.revision)?;
             self.put_deferred(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
@@ -2716,10 +2763,12 @@ impl Vault {
             .map(|(p, index, record)| (*p, *index, record.as_ref()))
             .collect();
 
-        // Collect all opaque keys to delete for `peer` from authenticated STATE indices.
+        // Collect all opaque keys to delete for `peer` from authenticated STATE indices, and bump
+        // `conversation_gen` so deleted history/file ciphertexts can never decrypt if spliced into
+        // a recreated conversation with the same `peer`.
         let mut keys_to_delete: Vec<String> = Vec::new();
         let mut next_peer_storage = self.peer_storage.borrow().clone();
-        if let Some(old_ps) = next_peer_storage.remove(peer) {
+        let next_gen = if let Some(old_ps) = next_peer_storage.remove(peer) {
             for idx in 0..old_ps.max_history_len {
                 keys_to_delete.push(opaque_history_key(&self.keys.idb_mac_key, peer, idx));
             }
@@ -2736,7 +2785,20 @@ impl Vault {
                     ));
                 }
             }
-        }
+            old_ps.conversation_gen.saturating_add(1)
+        } else {
+            1
+        };
+        next_peer_storage.insert(
+            *peer,
+            PeerStorageIndex {
+                peer: peer.to_vec(),
+                max_history_len: 0,
+                file_indices: Vec::new(),
+                kept_chunks: Vec::new(),
+                conversation_gen: next_gen,
+            },
+        );
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
         next_outbox_revs.retain(|&(p, idx), _| {
             if p == *peer {
@@ -2792,7 +2854,7 @@ impl Vault {
             for key in &keys_to_delete {
                 store.delete(JsValue::from_str(key))?;
             }
-            self.put_prepared_entries(&store, prepared_entries)?;
+            self.put_prepared_entries(&store, prepared_entries, &next_peer_storage)?;
             self.put_outgoing(&store, &outgoing_vec, next_header.revision)?;
             self.put_deferred(&store, deferred)?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
@@ -3272,6 +3334,23 @@ mod tests {
         assert!(open_bytes(&keys.record_key, &outbox_aad(&peer, 7, 9, 6), &sealed_out).is_none());
         assert!(open_bytes(&keys.record_key, &outbox_aad(&peer, 7, 10, 5), &sealed_out).is_none());
 
+        // History and file AADs bind conversation_gen so deleted-chat ciphertexts cannot splice
+        // into a future chat with the same peer.
+        let sealed_hist =
+            try_seal_bytes(&keys.record_key, &history_aad(&peer, 0, 9, 0), b"old-msg").unwrap();
+        assert!(open_bytes(&keys.record_key, &history_aad(&peer, 0, 9, 0), &sealed_hist).is_some());
+        assert!(open_bytes(&keys.record_key, &history_aad(&peer, 0, 9, 1), &sealed_hist).is_none());
+        let sealed_file =
+            try_seal_bytes(&keys.record_key, &file_aad(&peer, 0, 9, 0), b"old-file").unwrap();
+        assert!(open_bytes(&keys.record_key, &file_aad(&peer, 0, 9, 0), &sealed_file).is_some());
+        assert!(open_bytes(&keys.record_key, &file_aad(&peer, 0, 9, 1), &sealed_file).is_none());
+
+        // Content digest is domain-separated and detects tampering.
+        let d1 = content_kind_digest(b"hello");
+        let d2 = content_kind_digest(b"tampered");
+        assert_eq!(d1.len(), 32);
+        assert_ne!(d1, d2);
+
         let sealed_up =
             try_seal_bytes(&keys.record_key, &upload_aad(&peer, &id, 9, 5), b"up-v5").unwrap();
         assert!(open_bytes(&keys.record_key, &upload_aad(&peer, &id, 9, 5), &sealed_up).is_some());
@@ -3662,7 +3741,20 @@ mod wasm_tests {
         assert_eq!(reopened.uploads(Some(&peer)).await.unwrap().len(), 1);
         assert_eq!(reopened.chunks_kept(&peer, &upload_id).await.unwrap(), 1);
 
-        // Forget peer: leaves ZERO orphan keys for peer in IndexedDB!
+        // Capture raw ciphertext of history[0] and file[1] before forget to verify splicing into
+        // a recreated conversation fails authentication due to bumped `conversation_gen`.
+        let old_hist_key = opaque_history_key(&reopened.keys.idb_mac_key, &peer, 0);
+        let old_file_key = opaque_file_key(&reopened.keys.idb_mac_key, &peer, 1);
+        let old_hist_raw = get(&reopened.database, &old_hist_key)
+            .await
+            .unwrap()
+            .expect("old history[0] raw bytes");
+        let old_file_raw = get(&reopened.database, &old_file_key)
+            .await
+            .unwrap()
+            .expect("old file[1] raw bytes");
+
+        // Forget peer: leaves ZERO orphan keys for peer in IndexedDB and bumps conversation_gen!
         let empty_deferred = DeferredRecord::default();
         reopened
             .forget(&restored_state, &empty_deferred, &peer, &[], &[])
@@ -3678,6 +3770,22 @@ mod wasm_tests {
         assert!(keys_after_forget.contains(&STATE.to_string()));
         assert_eq!(reopened.chunks_kept(&peer, &upload_id).await.unwrap(), 0);
         assert!(reopened.uploads(None).await.unwrap().is_empty());
+
+        // Splicing deleted history[0] / file[1] ciphertexts back under the same opaque keys MUST
+        // fail decryption after `forget` bumped `conversation_gen`.
+        raw_idb_put(&[
+            (&old_hist_key, &old_hist_raw),
+            (&old_file_key, &old_file_raw),
+        ])
+        .await;
+        assert!(matches!(
+            reopened.entry(&peer, 0).await,
+            Err(Error::Corrupt(_))
+        ));
+        assert!(matches!(
+            reopened.file(&peer, 1).await,
+            Err(Error::Corrupt(_))
+        ));
 
         // Bumping lock_generation (as pagehide does before releasing Web Lock) aborts reads & writes
         // on an already-opened Vault handle even while `owns_lock()` is still true!

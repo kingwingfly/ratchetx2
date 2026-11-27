@@ -1,6 +1,6 @@
 //! Encryption settings, classical approvals and post-quantum upgrades.
 
-use super::contact::FarewellMode;
+use super::contact::{Contact, FarewellMode};
 use super::handshake::{PublishError, encrypt_session_farewells};
 use super::outbox::RequeueOutcome;
 use super::{Engine, Inner, PqSaveOutcome, ProtocolRpcScope, VaultStore, records};
@@ -10,10 +10,12 @@ use crate::transport::Fetch;
 use crate::util::{describe, now, short};
 use crate::vault::{
     CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF, ContactState,
-    GREETING_DELIVERY_UNCERTAIN, HistoryEntry, PendingPqRollback, SECURITY_ALERT_DOWNGRADE,
-    SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
+    GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, PendingPqRollback,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED, SECURITY_ALERT_NONE,
+    SECURITY_ALERT_PQ_REQUIRED,
 };
 use leptos::prelude::*;
+use session::protocol::handshake_v2::LocalHandshakeV2;
 use session::{ErrorKind, PqConfig, PublicKey, Session, SessionState};
 
 impl<V: VaultStore> Engine<V> {
@@ -84,7 +86,7 @@ impl<V: VaultStore> Engine<V> {
     /// inbound classical initial message and/or resuming paused outbound messages.
     pub async fn approve_classical(&self, peer: PublicKey) -> Result<(), String> {
         let vgen = self.vault_gen();
-        {
+        let should_stage_grant = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
@@ -287,17 +289,27 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            if should_stage_grant {
-                let _ = self.flush_pending_grants_for(inner, &peer).await;
-            }
-            if !self.is_live(vgen) {
-                return Err("locked".into());
-            }
-            let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
-            if !self.is_live(vgen) {
-                return Err("locked".into());
-            }
             self.refresh_contacts(inner);
+            should_stage_grant
+        };
+        if should_stage_grant {
+            let _ = self.flush_pending_grants_for_peer(&peer).await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+        }
+        {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            if let Some(inner) = guard.as_mut() {
+                let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+                if !self.is_live(vgen) {
+                    return Err("locked".into());
+                }
+                self.refresh_contacts(inner);
+            }
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -309,9 +321,14 @@ impl<V: VaultStore> Engine<V> {
         Ok(())
     }
 
-    /// Initiate a fresh post-quantum session (`prepare_start_again_v2`) with `peer`, persisting
-    /// before transmitting (H-2), to upgrade from a classical session or recover from a downgrade.
+    /// Initiate a fresh post-quantum session (`claim_peer_bundle_v2` +
+    /// `finish_prepare_start_again_v2`) with `peer`, persisting before transmitting (H-2), to
+    /// upgrade from a classical session or recover from a downgrade.
+    ///
+    /// Serialized per peer via `peer_flush_locks` while releasing `self.inner` across all network
+    /// RPCs (`ClaimBundle`, `RegisterWriteToken`, `SendInitialV2`).
     pub async fn upgrade_to_pq(&self, peer: PublicKey) -> Result<(), String> {
+        const MAX_CONFIG_RETRIES: usize = 2;
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -319,258 +336,345 @@ impl<V: VaultStore> Engine<V> {
         if PqConfig::compiled_suites().is_empty() {
             return Err("Post-quantum encryption is not compiled into this build.".to_string());
         }
-        let mut guard = self.lock_inner().await;
+        let peer_lock = self.queue.peer_flush_lock(&peer);
+        let _peer_guard = peer_lock.lock().await;
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        let inner = guard.as_mut().ok_or("locked")?;
-        let pq_cfg = inner.client.pq_config().clone();
-        if !pq_cfg.pq_enabled || pq_cfg.offered_suites().is_empty() {
-            return Err("Enable post-quantum encryption in Settings first.".to_string());
-        }
-        if inner.server_pq == ServerPqStatus::Disabled {
-            return Err(describe_upgrade_pq_error(
-                ErrorKind::Unimplemented,
-                &inner.server_pq,
-                String::new(),
-            ));
-        }
-        let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
-            return Err("no such chat".to_string());
-        };
-        let snapshot = inner.contacts[index].snapshot();
-        let old_farewell_mode = inner.contacts[index].farewell_mode();
-        let old_had_session = !inner.contacts[index].session.needs_new_session();
-        let old_was_request_or_quarantined =
-            inner.contacts[index].state.request || inner.contacts[index].state.quarantined;
-        // Clear any prior classical exception before attempting PQ upgrade so
-        // `prepare_start_again_v2` cannot silently negotiate another classical session.
-        inner.contacts[index]
-            .session
-            .peer_pq_state_mut()
-            .clear_classical_exception();
-        let prev_next_session_seq = inner.state.next_session_seq;
-        let session_seq = inner.next_new_chat_session_seq();
-        inner.state.next_session_seq = session_seq
-            .saturating_add(1)
-            .min(session::protocol::MAX_SAFE_INTEGER);
-        let hello = Kind::Hello(
-            inner
-                .client
-                .make_hello(inner.state.name.clone(), session_seq),
-        );
-        inner.contacts[index].state.clock = inner.contacts[index].state.clock.saturating_add(1);
-        let clock = inner.contacts[index].state.clock;
-        let mut greeting = hello.to_bytes();
-        stamp(&mut greeting, clock);
 
-        let prepared = {
-            let audience = &inner.audience;
-            let client = &mut inner.client;
-            let contact = &mut inner.contacts[index];
-            // Never archive an unapproved quarantined primary classical session into `others`:
-            // snapshot rollback still restores it if the PQ upgrade fails.
-            if contact.is_new_quarantined() {
-                contact.session.discard_active();
+        let mut attempt = 0usize;
+        let (server, new_session_id, outgoing_req) = loop {
+            if !self.is_live(vgen) {
+                return Err("locked".into());
             }
-            client
-                .prepare_start_again_v2(audience, &mut contact.session, &greeting)
-                .await
-        };
-        let outgoing = match prepared {
-            Ok(outgoing) => outgoing,
-            Err(e) => {
+            // Phase 1 under `self.inner`: validate preconditions and snapshot claim inputs without
+            // mutating live session state.
+            let (server, audience, pq_cfg, clock, peer_pq_for_claim) = {
+                let guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Err("locked".into());
+                }
+                let inner = guard.as_ref().ok_or("locked")?;
+                let pq_cfg = inner.client.pq_config().clone();
+                if !pq_cfg.pq_enabled || pq_cfg.offered_suites().is_empty() {
+                    return Err("Enable post-quantum encryption in Settings first.".to_string());
+                }
+                if inner.server_pq == ServerPqStatus::Disabled {
+                    return Err(describe_upgrade_pq_error(
+                        ErrorKind::Unimplemented,
+                        &inner.server_pq,
+                        String::new(),
+                    ));
+                }
+                let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
+                    return Err("no such chat".to_string());
+                };
+                // Clear any prior classical exception on the local clone used for bundle claim so
+                // `claim_peer_bundle_v2` cannot silently negotiate another classical session.
+                let mut peer_pq_for_claim = contact.session.peer_pq_state().clone();
+                peer_pq_for_claim.clear_classical_exception();
+                (
+                    inner.server.clone(),
+                    inner.audience.clone(),
+                    pq_cfg,
+                    inner.client.clock().clone(),
+                    peer_pq_for_claim,
+                )
+            };
+
+            // Phase 2 outside `self.inner`: claim peer bundle over the network.
+            let claim_res = session::claim_peer_bundle_v2(
+                &Fetch::client(&server),
+                &audience,
+                &peer,
+                &peer_pq_for_claim,
+                &pq_cfg,
+                &clock,
+            )
+            .await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+
+            // Phase 3 under `self.inner`: re-validate live state, run synchronous Phase-2 key
+            // agreement, and atomically persist upgraded PQ session + Hello + requeued outbox.
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let inner = guard.as_mut().ok_or("locked")?;
+            if *inner.client.pq_config() != pq_cfg {
+                drop(claim_res);
+                if attempt < MAX_CONFIG_RETRIES {
+                    attempt += 1;
+                    continue;
+                }
+                return Err(
+                    "Post-quantum settings changed while upgrading; please retry.".to_string(),
+                );
+            }
+            if inner.server_pq == ServerPqStatus::Disabled {
+                drop(claim_res);
+                return Err(describe_upgrade_pq_error(
+                    ErrorKind::Unimplemented,
+                    &inner.server_pq,
+                    String::new(),
+                ));
+            }
+            let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
+                return Err("no such chat".to_string());
+            };
+            let claimed = match claim_res {
+                Ok(claimed) => claimed,
+                Err(e) => {
+                    return Err(self.handle_upgrade_pq_error(vgen, inner, &peer, e).await);
+                }
+            };
+
+            let snapshot = inner.contacts[index].snapshot();
+            let old_farewell_mode = inner.contacts[index].farewell_mode();
+            let old_had_session = !inner.contacts[index].session.needs_new_session();
+            let old_was_request_or_quarantined =
+                inner.contacts[index].state.request || inner.contacts[index].state.quarantined;
+            inner.contacts[index]
+                .session
+                .peer_pq_state_mut()
+                .clear_classical_exception();
+            let prev_next_session_seq = inner.state.next_session_seq;
+            let session_seq = inner.next_new_chat_session_seq();
+            inner.state.next_session_seq = session_seq
+                .saturating_add(1)
+                .min(session::protocol::MAX_SAFE_INTEGER);
+            let hello = Kind::Hello(
+                inner
+                    .client
+                    .make_hello(inner.state.name.clone(), session_seq),
+            );
+            inner.contacts[index].state.clock = inner.contacts[index].state.clock.saturating_add(1);
+            let clock_val = inner.contacts[index].state.clock;
+            let mut greeting = hello.to_bytes();
+            stamp(&mut greeting, clock_val);
+
+            let prepared = {
+                let client = &inner.client;
+                let contact = &mut inner.contacts[index];
+                // Never archive an unapproved quarantined primary classical session into `others`:
+                // snapshot rollback still restores it if the PQ upgrade fails.
+                if contact.is_new_quarantined() {
+                    contact.session.discard_active();
+                }
+                client.finish_prepare_start_again_v2(claimed, &mut contact.session, &greeting)
+            };
+            let outgoing_req = match prepared {
+                Ok(outgoing) => outgoing,
+                Err(e) => {
+                    inner.state.next_session_seq = prev_next_session_seq;
+                    inner.roll_back(&peer, snapshot)?;
+                    return Err(self.handle_upgrade_pq_error(vgen, inner, &peer, e).await);
+                }
+            };
+            // Verify that the new session actually negotiated post-quantum encryption.
+            let upgraded_is_pq = inner
+                .contact(&peer)
+                .is_some_and(|c| c.session.security().is_some_and(|s| s.is_pq));
+            if !upgraded_is_pq {
                 inner.state.next_session_seq = prev_next_session_seq;
                 inner.roll_back(&peer, snapshot)?;
-                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-                let kind = e.kind();
-                if kind == ErrorKind::ClockSkew {
-                    self.warn_clock_skew(inner.client.clock().offset_ms());
-                }
-                let persist_alert = inner
-                    .contact(&peer)
-                    .is_some_and(|c| c.session.needs_new_session() || c.state.quarantined);
-                if persist_alert && let Some(contact) = inner.contact(&peer) {
-                    match kind {
-                        ErrorKind::DowngradeDetected => {
-                            contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                            contact.session.peer_pq_state_mut().downgrade_detected = true;
-                            contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
-                        }
-                        ErrorKind::PeerManifestExpired => {
-                            contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                            contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
-                        }
-                        ErrorKind::PqRequired => {
-                            contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                            contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
-                        }
-                        ErrorKind::ClassicalApprovalRequired => {
-                            if matches!(
-                                contact.state.security_alert,
-                                SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
-                            ) {
-                                contact.state.security_alert = SECURITY_ALERT_NONE;
-                            }
-                            if !contact.state.quarantined {
-                                contact.state.classical_approval_needed =
-                                    CLASSICAL_APPROVAL_SIGNED_OFF;
-                            }
-                        }
-                        _ => {}
-                    }
-                    if let Err(save_err) = inner.save_state().await
-                        && self.is_live(vgen)
-                    {
-                        self.ui.log(format!(
-                            "failed to save security alert (will retry): {}",
-                            describe(&save_err)
-                        ));
-                    }
-                }
                 if self.is_live(vgen) {
                     self.refresh_contacts(inner);
                 }
-                return Err(describe_upgrade_pq_error(
-                    kind,
-                    &inner.server_pq,
-                    describe(&e),
-                ));
+                return Err(
+                    "Could not establish a post-quantum session with this peer (peer or server \
+                     does not have post-quantum encryption enabled)."
+                        .to_string(),
+                );
             }
-        };
-        if !self.is_live(vgen) {
-            inner.state.next_session_seq = prev_next_session_seq;
-            let _ = inner.roll_back(&peer, snapshot);
-            return Err("locked".into());
-        }
-        // Verify that the new session actually negotiated post-quantum encryption.
-        let upgraded_is_pq = inner
-            .contact(&peer)
-            .is_some_and(|c| c.session.security().is_some_and(|s| s.is_pq));
-        if !upgraded_is_pq {
-            inner.state.next_session_seq = prev_next_session_seq;
-            inner.roll_back(&peer, snapshot)?;
-            if self.is_live(vgen) {
-                self.refresh_contacts(inner);
-            }
-            return Err(
-                "Could not establish a post-quantum session with this peer (peer or server \
-                 does not have post-quantum encryption enabled)."
-                    .to_string(),
-            );
-        }
-        // Preserve a durable deletion path on the previous established session until the
-        // upgraded PQ greeting is confirmed delivered (e.g. if SendInitialV2 is refused and the
-        // user deletes the chat before sending another message).
-        let old_session_farewells = if old_had_session
-            && old_farewell_mode != FarewellMode::Suppress
-            && let Ok(restored) = SessionState::try_from(&snapshot.0)
-        {
-            let mut old_session = Session::restore(Fetch::client(&inner.server), restored);
-            encrypt_session_farewells(
-                &mut old_session,
-                snapshot.1.clock.saturating_add(1),
-                snapshot.1.sealed_events.clone(),
-                snapshot.1.events.clone(),
-                old_farewell_mode,
-            )
-        } else {
-            vec![]
-        };
-        let mut history_records = vec![];
-        let mut added_view = None;
-        let mut was_quarantined = false;
-        if let Some(contact) = inner.contact(&peer) {
-            was_quarantined = contact.state.quarantined;
-            contact.clear_quarantine_and_alerts();
-            // Persist `GREETING_DELIVERY_UNCERTAIN` directly in the single atomic commit below so
-            // we transmit immediately after without a redundant second full-state save.
-            contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-            contact.state.sealed_events = None;
-            if old_was_request_or_quarantined {
-                contact.state.fallback_farewells.clear();
-            } else if old_farewell_mode == FarewellMode::Normal {
-                contact.state.fallback_farewells = old_session_farewells;
-            } else if !old_session_farewells.is_empty() {
-                // Keep any earlier fallback farewells alongside this uncertain session's farewell.
-                contact
-                    .state
-                    .fallback_farewells
-                    .extend(old_session_farewells);
-                const MAX_FALLBACK_FAREWELLS: usize = 4;
-                if contact.state.fallback_farewells.len() > MAX_FALLBACK_FAREWELLS {
-                    let drop_count =
-                        contact.state.fallback_farewells.len() - MAX_FALLBACK_FAREWELLS;
-                    contact.state.fallback_farewells.drain(0..drop_count);
+            // Preserve a durable deletion path on the previous established session until the
+            // upgraded PQ greeting is confirmed delivered (e.g. if SendInitialV2 is refused and
+            // the user deletes the chat before sending another message).
+            let old_session_farewells = if old_had_session
+                && old_farewell_mode != FarewellMode::Suppress
+                && let Ok(restored) = SessionState::try_from(&snapshot.0)
+            {
+                let mut old_session = Session::restore(Fetch::client(&inner.server), restored);
+                encrypt_session_farewells(
+                    &mut old_session,
+                    snapshot.1.clock.saturating_add(1),
+                    snapshot.1.sealed_events.clone(),
+                    snapshot.1.events.clone(),
+                    old_farewell_mode,
+                )
+            } else {
+                vec![]
+            };
+            let mut history_records = vec![];
+            let mut added_view = None;
+            let mut was_quarantined = false;
+            if let Some(contact) = inner.contact(&peer) {
+                was_quarantined = contact.state.quarantined;
+                contact.clear_quarantine_and_alerts();
+                // Persist `GREETING_DELIVERY_UNCERTAIN` directly in the single atomic commit below
+                // so we transmit immediately after without a redundant second full-state save.
+                contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                contact.state.sealed_events = None;
+                if old_was_request_or_quarantined {
+                    contact.state.fallback_farewells.clear();
+                } else if old_farewell_mode == FarewellMode::Normal {
+                    contact.state.fallback_farewells = old_session_farewells;
+                } else if !old_session_farewells.is_empty() {
+                    contact
+                        .state
+                        .fallback_farewells
+                        .extend(old_session_farewells);
+                    const MAX_FALLBACK_FAREWELLS: usize = 4;
+                    if contact.state.fallback_farewells.len() > MAX_FALLBACK_FAREWELLS {
+                        let drop_count =
+                            contact.state.fallback_farewells.len() - MAX_FALLBACK_FAREWELLS;
+                        contact.state.fallback_farewells.drain(0..drop_count);
+                    }
+                }
+                if let Some((entry_index, entry)) = finalize_upgrade_to_pq_request_state(
+                    &mut contact.state,
+                    hello,
+                    clock_val,
+                    now(),
+                ) {
+                    contact.mark_index_acked(entry_index);
+                    history_records.push((peer, entry_index, entry.clone()));
+                    added_view = Some(contact.message(entry_index, entry));
                 }
             }
-            if let Some((entry_index, entry)) =
-                finalize_upgrade_to_pq_request_state(&mut contact.state, hello, clock, now())
+            let new_session_id = inner
+                .contact(&peer)
+                .and_then(|c| c.session.active_id().copied());
+            if let Some(token_hash) = inner
+                .contact(&peer)
+                .and_then(|c| c.session.active_inbound_token_hash())
+                && let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true)
             {
-                contact.mark_index_acked(entry_index);
-                history_records.push((peer, entry_index, entry.clone()));
-                added_view = Some(contact.message(entry_index, entry));
-            }
-        }
-        if let Some(token_hash) = inner
-            .contact(&peer)
-            .and_then(|c| c.session.active_inbound_token_hash())
-            && let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true)
-        {
-            inner.state.next_session_seq = prev_next_session_seq;
-            inner.roll_back(&peer, snapshot)?;
-            return Err(e);
-        }
-        // Requeue any outbox messages sealed on the previous session so they re-encrypt
-        // on the new PQ session instead of pushing old-session ciphertexts with the PQ initial.
-        let requeued = match inner.requeue_sealed(&peer).await {
-            Ok(requeued) => requeued,
-            Err(e) => {
                 inner.state.next_session_seq = prev_next_session_seq;
                 inner.roll_back(&peer, snapshot)?;
                 return Err(e);
             }
+            // Requeue any outbox messages sealed on the previous session so they re-encrypt
+            // on the new PQ session instead of pushing old-session ciphertexts with the PQ initial.
+            let requeued = match inner.requeue_sealed(&peer).await {
+                Ok(requeued) => requeued,
+                Err(e) => {
+                    inner.state.next_session_seq = prev_next_session_seq;
+                    inner.roll_back(&peer, snapshot)?;
+                    return Err(e);
+                }
+            };
+            // H-2: Persist upgraded PQ session + Hello history + requeued outbox BEFORE transmitting!
+            history_records.extend(records(&peer, &requeued.history));
+            if let Err(e) = inner.save_with(&history_records, &requeued.outbox).await {
+                inner.state.next_session_seq = prev_next_session_seq;
+                inner.roll_back(&peer, snapshot)?;
+                return Err(describe(&e));
+            }
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            requeued.log_missing(&self.ui, &peer);
+            self.show_changes(inner, &peer, &requeued.history);
+            if let Some(view) = added_view {
+                self.show_new(inner, &peer, vec![view]);
+            }
+            if was_quarantined {
+                self.reconcile_open_chat_read(inner, &peer, false).await;
+            }
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            self.refresh_contacts(inner);
+            break (inner.server.clone(), new_session_id, outgoing_req);
         };
-        // H-2: Persist upgraded PQ session + Hello history + requeued outbox BEFORE transmitting!
-        history_records.extend(records(&peer, &requeued.history));
-        if let Err(e) = inner.save_with(&history_records, &requeued.outbox).await {
-            inner.state.next_session_seq = prev_next_session_seq;
-            inner.roll_back(&peer, snapshot)?;
-            return Err(describe(&e));
-        }
+
+        // Phase 4 outside `self.inner`: register our inbound write token on our DO before
+        // transmitting `SendInitialV2` so the peer can reply immediately upon accepting the
+        // upgraded PQ session.
+        let _ = self.flush_pending_grants_for_peer(&peer).await;
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        requeued.log_missing(&self.ui, &peer);
-        self.show_changes(inner, &peer, &requeued.history);
-        if let Some(view) = added_view {
-            self.show_new(inner, &peer, vec![view]);
-        }
-        if was_quarantined {
-            self.reconcile_open_chat_read(inner, &peer, false).await;
-        }
-        if !self.is_live(vgen) {
-            return Err("locked".into());
-        }
-        // Register our inbound write token on our DO before transmitting SendInitialV2 so the peer
-        // can reply immediately upon accepting the upgraded PQ session.
-        let _ = self.flush_pending_grants_for(inner, &peer).await;
-        if !self.is_live(vgen) {
-            return Err("locked".into());
-        }
-        if let Ok(Err(e)) = inner
-            .transmit_with_greeting_delivery(&peer, true, true, async |inner| {
-                inner.client.send_prepared_initiate_v2(&outgoing).await
+        // Re-verify contact existence and matching session immediately before transmitting
+        // `SendInitialV2` so a concurrent delete or inbound session never emits a stale initial.
+        let still_active = {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            guard.as_ref().is_some_and(|inner| {
+                inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer)
+                    .is_some_and(|c| c.session.active_id() == new_session_id.as_ref())
             })
+        };
+        if !still_active {
+            return Ok(());
+        }
+
+        let send_res: session::Result<()> = Fetch::client(&server)
+            .send_initial_v2(outgoing_req)
             .await
-            && self.is_live(vgen)
-        {
-            self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-            self.ui.log(format!(
-                "upgraded session with {} saved locally; initial message will carry on next send: {}",
-                short(&peer),
-                describe(&e)
-            ));
+            .map(|_| ())
+            .map_err(session::Error::from);
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
+
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
+        let Some(inner) = guard.as_mut() else {
+            return Err("locked".into());
+        };
+        let matches_session = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == peer)
+            .is_some_and(|c| c.session.active_id() == new_session_id.as_ref());
+        match send_res {
+            Ok(()) if matches_session => {
+                if inner
+                    .contact(&peer)
+                    .is_some_and(Contact::mark_greeting_confirmed)
+                {
+                    let _ = inner.save_state().await;
+                    if !self.is_live(vgen) {
+                        return Err("locked".into());
+                    }
+                }
+            }
+            Ok(()) => {}
+            Err(e) => {
+                if e.is_server_refusal() && matches_session {
+                    let reverted = inner.contact(&peer).is_some_and(|contact| {
+                        if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                            contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if reverted {
+                        let _ = inner.save_state().await;
+                        if !self.is_live(vgen) {
+                            return Err("locked".into());
+                        }
+                    }
+                }
+                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                self.ui.log(format!(
+                    "upgraded session with {} saved locally; initial message will retry automatically: {}",
+                    short(&peer),
+                    describe(&e)
+                ));
+            }
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -589,6 +693,64 @@ impl<V: VaultStore> Engine<V> {
             self.wake();
         }
         Ok(())
+    }
+
+    async fn handle_upgrade_pq_error(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<V>,
+        peer: &PublicKey,
+        e: session::Error,
+    ) -> String {
+        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+        let kind = e.kind();
+        if kind == ErrorKind::ClockSkew {
+            self.warn_clock_skew(inner.client.clock().offset_ms());
+        }
+        let persist_alert = inner
+            .contact(peer)
+            .is_some_and(|c| c.session.needs_new_session() || c.state.quarantined);
+        if persist_alert && let Some(contact) = inner.contact(peer) {
+            match kind {
+                ErrorKind::DowngradeDetected => {
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                    contact.session.peer_pq_state_mut().downgrade_detected = true;
+                    contact.state.security_alert = SECURITY_ALERT_DOWNGRADE;
+                }
+                ErrorKind::PeerManifestExpired => {
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                    contact.state.security_alert = SECURITY_ALERT_MANIFEST_EXPIRED;
+                }
+                ErrorKind::PqRequired => {
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                    contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                }
+                ErrorKind::ClassicalApprovalRequired => {
+                    if matches!(
+                        contact.state.security_alert,
+                        SECURITY_ALERT_PQ_REQUIRED | SECURITY_ALERT_MANIFEST_EXPIRED
+                    ) {
+                        contact.state.security_alert = SECURITY_ALERT_NONE;
+                    }
+                    if !contact.state.quarantined {
+                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_SIGNED_OFF;
+                    }
+                }
+                _ => {}
+            }
+            if let Err(save_err) = inner.save_state().await
+                && self.is_live(vgen)
+            {
+                self.ui.log(format!(
+                    "failed to save security alert (will retry): {}",
+                    describe(&save_err)
+                ));
+            }
+        }
+        if self.is_live(vgen) {
+            self.refresh_contacts(inner);
+        }
+        describe_upgrade_pq_error(kind, &inner.server_pq, describe(&e))
     }
 
     /// Dismiss the active downgrade/security banner for `peer` without removing `pq_pinned`.

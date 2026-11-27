@@ -1139,4 +1139,62 @@ describe("workerd runtime twins", () => {
 
     await waitOnExecutionContext(ctx);
   });
+
+  // -------------------------------------------------------------------------
+  // 8. Fail-closed /notifications auth without PASSWORD, lazy R2 binding,
+  //    and fail-closed rate limiter when PASSWORD is set
+  // -------------------------------------------------------------------------
+  it("fails closed on /notifications when PASSWORD is unset, tolerates missing ATTACHMENTS on core RPCs, and fails closed on missing rate limiter when PASSWORD is set", async () => {
+    // 8a. Missing PASSWORD + no Access/Cookie still fails closed on GET /notifications (403)
+    //     just like call_connect, and missing ATTACHMENTS R2 binding does NOT break core RPCs.
+    {
+      const ctx = createExecutionContext();
+      const minimalEnv = Object.assign(Object.create(Object.getPrototypeOf(env)), env, {
+        PASSWORD: undefined,
+        ATTACHMENTS: undefined,
+      });
+      const worker = new WorkerEntrypoint(ctx, minimalEnv);
+
+      const unauthedWs = await worker.fetch(
+        new Request(`${ORIGIN}/notifications`, {
+          headers: { Upgrade: "websocket", "CF-Connecting-IP": "198.51.100.210" },
+        }),
+      );
+      expect(unauthedWs.status).toBe(403);
+
+      const infoRes = await worker.fetch(
+        new Request(`${ORIGIN}/handshake.v2.HandshakeService/GetServerInfo`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/proto",
+            "connect-protocol-version": "1",
+          },
+          body: new Uint8Array(0),
+        }),
+      );
+      expect(infoRes.status).toBe(200);
+      await waitOnExecutionContext(ctx);
+    }
+
+    // 8b. Missing AUTH_RATE_LIMITER binding fails closed (429) when PASSWORD is configured.
+    {
+      const ctx = createExecutionContext();
+      const missingRlEnv = Object.assign(Object.create(Object.getPrototypeOf(env)), env, {
+        AUTH_RATE_LIMITER: undefined,
+      });
+      const worker = new WorkerEntrypoint(ctx, missingRlEnv);
+      const res = await worker.fetch(
+        new Request(`${ORIGIN}/auth/password`, {
+          method: "POST",
+          headers: {
+            "Sec-Fetch-Site": "same-origin",
+            "CF-Connecting-IP": "198.51.100.211",
+          },
+          body: env.PASSWORD,
+        }),
+      );
+      expect(res.status).toBe(429);
+      await waitOnExecutionContext(ctx);
+    }
+  });
 });

@@ -520,11 +520,6 @@ impl<V: VaultStore> Engine<V> {
                             }
                         }
                     }
-                    if !session_matches {
-                        // Active session changed or requeue became pending while `PushV2` was
-                        // suspended: loop to requeue and re-seal cleanly on the active session.
-                        continue;
-                    }
                     let head_matches = inner.contact(peer).is_some_and(|c| {
                         c.state.outbox.first().is_some_and(|head| {
                             head.history_index == outgoing.history_index
@@ -535,6 +530,13 @@ impl<V: VaultStore> Engine<V> {
                     if !head_matches {
                         // Head item was already settled (e.g. via peer receipt), requeued, or
                         // cancelled while `PushV2` was suspended: continue with the new head.
+                        continue;
+                    }
+                    // If `PushV2` already succeeded on the relay, commit `Step::Pushed` even if a
+                    // concurrent inbound session rotated `active_id` or set `needs_requeue_sealed`
+                    // (otherwise looping to requeue would re-encrypt and duplicate a delivered
+                    // message). Only retry/requeue on failure when the session rotated.
+                    if push_res.is_err() && !session_matches {
                         continue;
                     }
 
@@ -550,6 +552,7 @@ impl<V: VaultStore> Engine<V> {
                                     &outgoing,
                                     Step::Pushed,
                                     outgoing.clock,
+                                    session_matches,
                                     &mut server_deletes,
                                 )
                                 .await
@@ -590,6 +593,7 @@ impl<V: VaultStore> Engine<V> {
                             let greeting_unconfirmed = inner.contact(peer).is_some_and(|c| {
                                 c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
                             });
+                            let mut retry_failed = false;
                             if greeting_unconfirmed && let Some(retry_req) = retry_initial {
                                 let mut retry_promoted = promoted_from_unsent;
                                 let mut ready_for_retry = true;
@@ -651,45 +655,83 @@ impl<V: VaultStore> Engine<V> {
                                         Ok(()) if still_matches => {
                                             if let Some(contact) = inner.contact(peer) {
                                                 contact.mark_greeting_confirmed();
+                                                contact.state.awaiting_peer_acceptance = true;
                                             }
                                             let _ = inner.save_state().await;
                                             if !self.is_live(vgen) {
                                                 return Ok(false);
                                             }
                                         }
-                                        Err(retry_err)
+                                        Ok(()) => {}
+                                        Err(retry_err) => {
+                                            retry_failed = true;
                                             if retry_err.is_server_refusal()
                                                 && retry_promoted
-                                                && still_matches =>
-                                        {
-                                            // Only revert `UNCERTAIN -> UNSENT`; never downgrade
-                                            // a greeting already confirmed concurrently.
-                                            let reverted =
-                                                inner.contact(peer).is_some_and(|contact| {
-                                                    if contact.state.greeting_delivery
-                                                        == GREETING_DELIVERY_UNCERTAIN
-                                                    {
-                                                        contact.state.greeting_delivery =
-                                                            GREETING_DELIVERY_UNSENT;
-                                                        true
-                                                    } else {
-                                                        false
+                                                && still_matches
+                                            {
+                                                // Only revert `UNCERTAIN -> UNSENT`; never
+                                                // downgrade a greeting already confirmed
+                                                // concurrently.
+                                                let reverted =
+                                                    inner.contact(peer).is_some_and(|contact| {
+                                                        if contact.state.greeting_delivery
+                                                            == GREETING_DELIVERY_UNCERTAIN
+                                                        {
+                                                            contact.state.greeting_delivery =
+                                                                GREETING_DELIVERY_UNSENT;
+                                                            true
+                                                        } else {
+                                                            false
+                                                        }
+                                                    });
+                                                if reverted {
+                                                    let _ = inner.save_state().await;
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
                                                     }
-                                                });
-                                            if reverted {
-                                                let _ = inner.save_state().await;
-                                                if !self.is_live(vgen) {
-                                                    return Ok(false);
                                                 }
                                             }
+                                            if retry_err.kind() == ErrorKind::SignInRequired
+                                                && signs_in_here
+                                            {
+                                                self.queue.mark_waits_sign_in(*peer);
+                                                self.hold(peer, outgoing.history_index);
+                                                self.ask_sign_in();
+                                                self.refresh_contacts(inner);
+                                            } else if retry_err.kind() == ErrorKind::SignInRequired
+                                            {
+                                                self.refresh_contacts(inner);
+                                                result = Err(NOT_SIGNED_IN_HERE.to_string());
+                                            } else {
+                                                self.check_protocol_error(
+                                                    ProtocolRpcScope::CoreV2,
+                                                    &retry_err,
+                                                );
+                                                self.refresh_contacts(inner);
+                                                result = Err(describe(&retry_err));
+                                            }
                                         }
-                                        _ => {}
                                     }
                                 }
                             }
-                            if let Some(inner) = guard.as_mut()
+                            if !retry_failed
+                                && let Some(inner) = guard.as_mut()
                                 && inner.contact(peer).is_some()
                             {
+                                let mark_awaiting = inner.contact(peer).is_some_and(|contact| {
+                                    if !contact.state.awaiting_peer_acceptance {
+                                        contact.state.awaiting_peer_acceptance = true;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
+                                if mark_awaiting {
+                                    let _ = inner.save_state().await;
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                }
                                 let delay_ms = self.queue.record_approval_backoff(peer);
                                 self.refresh_contacts(inner);
                                 let label = inner
@@ -724,6 +766,7 @@ impl<V: VaultStore> Engine<V> {
                                     &outgoing,
                                     Step::Refused,
                                     0,
+                                    session_matches,
                                     &mut server_deletes,
                                 )
                                 .await
@@ -749,6 +792,7 @@ impl<V: VaultStore> Engine<V> {
                                     &outgoing,
                                     Step::Refused,
                                     0,
+                                    session_matches,
                                     &mut server_deletes,
                                 )
                                 .await
@@ -801,6 +845,7 @@ impl<V: VaultStore> Engine<V> {
         outgoing: &Outgoing,
         step: Step,
         clock: u64,
+        confirm_session: bool,
         server_deletes: &mut Vec<ServerDeleteJob>,
     ) -> Result<CommitOutcome, String> {
         let index = outgoing.history_index;
@@ -825,6 +870,7 @@ impl<V: VaultStore> Engine<V> {
                     history_index: index,
                     read: false,
                     attachment,
+                    content_digest: outgoing.content_digest.clone(),
                 });
             }
             entries.push((index, entry));
@@ -839,8 +885,9 @@ impl<V: VaultStore> Engine<V> {
             {
                 contact.state.outbox.remove(pos);
             }
-            if step == Step::Pushed {
+            if step == Step::Pushed && confirm_session {
                 contact.mark_greeting_confirmed();
+                contact.state.awaiting_peer_acceptance = false;
             }
             if let Some(awaiting) = new_awaiting {
                 contact.state.awaiting.push(awaiting);
@@ -1156,6 +1203,27 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(RekeyOutcome::Aborted);
         }
+        // Re-verify contact existence and active session immediately before transmitting
+        // `SendInitialV2` so a concurrent delete or inbound session replacement during grant
+        // registration never emits a phantom or superseded initial request.
+        {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
+            let Some(inner) = guard.as_ref() else {
+                return Ok(RekeyOutcome::Aborted);
+            };
+            if inner.is_isolated_peer(peer) {
+                return Ok(RekeyOutcome::ContactGone);
+            }
+            let Some(contact) = inner.contacts.iter().find(|c| c.peer == *peer) else {
+                return Ok(RekeyOutcome::ContactGone);
+            };
+            if contact.session.active_id() != new_session_id.as_ref() {
+                return Ok(RekeyOutcome::Ready);
+            }
+        }
 
         let send_res: session::Result<()> = Fetch::client(&server)
             .send_initial_v2(outgoing_req)
@@ -1250,6 +1318,19 @@ impl<V: VaultStore> Engine<V> {
                 || !contact.state.outbox.is_empty()
                 || contact.session.needs_new_session()
             {
+                return Ok(false);
+            }
+            // Never transmit `Events { accepted: true }` while our write-token registration for
+            // this peer is still pending confirmation on our DO (otherwise the peer wakes up and
+            // hits `WriteTokenRejected`).
+            let carries_accepted = contact.state.events.as_ref().is_some_and(|e| e.accepted)
+                || contact
+                    .state
+                    .sealed_events
+                    .as_ref()
+                    .and_then(|s| s.events.as_ref())
+                    .is_some_and(|e| e.accepted);
+            if carries_accepted && !contact.session.pending_register_grants().is_empty() {
                 return Ok(false);
             }
             let active = contact.session.active_id().map(|id| id.to_vec());
@@ -1408,6 +1489,15 @@ impl<V: VaultStore> Engine<V> {
                         self.refresh_contacts(inner);
                     }
                 } else {
+                    if let Some(contact) = inner.contact(peer)
+                        && !contact.state.awaiting_peer_acceptance
+                    {
+                        contact.state.awaiting_peer_acceptance = true;
+                        let _ = inner.save_state().await;
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
+                    }
                     self.queue.record_approval_backoff(peer);
                     self.refresh_contacts(inner);
                 }
@@ -1435,6 +1525,7 @@ impl<V: VaultStore> Engine<V> {
                     .contact(peer)
                     .ok_or_else(|| "no such chat".to_string())?;
                 contact.mark_greeting_confirmed();
+                contact.state.awaiting_peer_acceptance = false;
                 contact.state.sealed_events = None;
                 if let (Some(events), Some(told)) = (&mut contact.state.events, &sealed.events) {
                     forget_told(events, told);
@@ -1526,13 +1617,16 @@ impl<V: VaultStore> Inner<V> {
             let index = contact.next_history_index().map_err(str::to_string)?;
             contact.mark_index_acked(index);
             // Encrypted as it goes, once its place in the chat is known, see `flush`.
-            let record = OutgoingRecord::unsealed(content.to_bytes());
+            let content_bytes = content.to_bytes();
+            let content_digest = crate::vault::content_kind_digest(&content_bytes);
+            let record = OutgoingRecord::unsealed(content_bytes);
             contact.state.last_activity = now();
             contact.state.outbox.push(Outgoing {
                 history_index: index,
                 sealed: false,
                 clock: 0,
                 awaits_upload,
+                content_digest,
             });
             let entry = HistoryEntry {
                 outgoing: true,
@@ -1628,6 +1722,11 @@ impl<V: VaultStore> Inner<V> {
         peer: &PublicKey,
         index: u64,
     ) -> Result<CorruptOutboxRecovery, String> {
+        let expected_digest = self
+            .contact(peer)
+            .and_then(|c| c.state.outbox.iter().find(|o| o.history_index == index))
+            .map(|o| o.content_digest.clone())
+            .unwrap_or_default();
         let entry = match self.vault.entry(peer, index).await {
             Ok(entry) => entry,
             Err(crate::vault::Error::Corrupt(_)) => None,
@@ -1641,9 +1740,17 @@ impl<V: VaultStore> Inner<V> {
             },
             None => None,
         };
-        match (entry, content) {
+        let verified_bytes = match (&entry, content) {
             (Some(_), Some(kind)) => {
                 let bytes = kind.to_bytes();
+                let digest_ok = expected_digest.len() == 32
+                    && crate::vault::content_kind_digest(&bytes) == expected_digest;
+                digest_ok.then_some(bytes)
+            }
+            _ => None,
+        };
+        match verified_bytes {
+            Some(bytes) => {
                 let rebuilt = OutgoingRecord::unsealed(bytes.clone());
                 self.with_contact_tx(peer, async |inner| {
                     let contact = inner
@@ -1666,7 +1773,7 @@ impl<V: VaultStore> Inner<V> {
                 .await?;
                 Ok(CorruptOutboxRecovery::Rebuilt(bytes))
             }
-            (entry, _) => {
+            None => {
                 let history = match entry {
                     Some(mut entry) => {
                         entry.set_delivery(Delivery::Failed);
@@ -1825,13 +1932,21 @@ impl<V: VaultStore> Inner<V> {
         entries: &BTreeMap<u64, HistoryEntry>,
     ) -> Result<RequeueOutcome, String> {
         let contact = self.contact(peer).ok_or("no such chat")?;
-        let sealed = contact
-            .state
-            .outbox
-            .iter()
-            .filter(|o| all_sealed && o.sealed)
-            .map(|o| o.history_index)
-            .collect();
+        let mut expected_digests: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+        for a in &contact.state.awaiting {
+            if again.contains(&a.history_index) {
+                expected_digests.insert(a.history_index, a.content_digest.clone());
+            }
+        }
+        let mut sealed = BTreeSet::new();
+        for o in &contact.state.outbox {
+            if all_sealed && o.sealed {
+                sealed.insert(o.history_index);
+                expected_digests
+                    .entry(o.history_index)
+                    .or_insert_with(|| o.content_digest.clone());
+            }
+        }
         let mut outcome = RequeueOutcome::default();
         for &index in again.union(&sealed) {
             let entry = match entries.get(&index) {
@@ -1850,11 +1965,22 @@ impl<V: VaultStore> Inner<V> {
                     .map_err(|e| describe(&e))?,
                 None => None,
             };
-            outcome.stage(peer, index, entry, content, again.contains(&index));
+            let expected = expected_digests
+                .get(&index)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            outcome.stage(
+                peer,
+                index,
+                entry,
+                content,
+                expected,
+                again.contains(&index),
+            );
         }
         // No contact state changes until every fallible history and file read has completed.
         let state = &mut self.contact(peer).ok_or("no such chat")?.state;
-        outcome.apply(state, &again, &sealed);
+        outcome.apply(state, &again, &sealed, &expected_digests);
         if all_sealed {
             state.needs_requeue_sealed = false;
         }
@@ -1876,10 +2002,24 @@ impl RequeueOutcome {
         index: u64,
         entry: Option<HistoryEntry>,
         content: Option<Kind>,
+        expected_digest: &[u8],
         resend: bool,
     ) {
-        let record = match (entry, content) {
-            (Some(mut entry), Some(kind)) => {
+        let verified = match (entry, content) {
+            (Some(entry), Some(kind)) => {
+                let bytes = kind.to_bytes();
+                let digest_ok = expected_digest.len() == 32
+                    && crate::vault::content_kind_digest(&bytes) == expected_digest;
+                if digest_ok {
+                    Ok((entry, bytes))
+                } else {
+                    Err(Some(entry))
+                }
+            }
+            (entry, _) => Err(entry),
+        };
+        let record = match verified {
+            Ok((mut entry, bytes)) => {
                 if resend {
                     entry.set_delivery(entry.delivery().after(Step::Resent));
                     if entry.delivery() == Delivery::Pending {
@@ -1887,9 +2027,9 @@ impl RequeueOutcome {
                     }
                     self.history.push((index, entry));
                 }
-                Some(OutgoingRecord::unsealed(kind.to_bytes()))
+                Some(OutgoingRecord::unsealed(bytes))
             }
-            (entry, _) => {
+            Err(entry) => {
                 if let Some(mut entry) = entry {
                     entry.set_delivery(Delivery::Failed);
                     self.history.push((index, entry));
@@ -1901,7 +2041,13 @@ impl RequeueOutcome {
         self.outbox.push((*peer, index, record));
     }
 
-    fn apply(&self, state: &mut ContactState, again: &BTreeSet<u64>, sealed: &BTreeSet<u64>) {
+    fn apply(
+        &self,
+        state: &mut ContactState,
+        again: &BTreeSet<u64>,
+        sealed: &BTreeSet<u64>,
+        expected_digests: &BTreeMap<u64, Vec<u8>>,
+    ) {
         state.outbox.retain_mut(|outgoing| {
             let index = outgoing.history_index;
             if sealed.contains(&index) {
@@ -1916,6 +2062,7 @@ impl RequeueOutcome {
                 .difference(&self.dropped_missing)
                 .map(|&index| Outgoing {
                     history_index: index,
+                    content_digest: expected_digests.get(&index).cloned().unwrap_or_default(),
                     ..Default::default()
                 }),
         );
@@ -1924,7 +2071,7 @@ impl RequeueOutcome {
     pub(super) fn log_missing(&self, ui: &Ui, peer: &PublicKey) {
         for index in &self.dropped_missing {
             ui.log(format!(
-                "Dropped pending message #{index} for {}: original history content missing",
+                "Dropped pending message #{index} for {}: original history content missing or failed integrity check",
                 short(peer)
             ));
         }

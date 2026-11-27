@@ -14,8 +14,8 @@ use crate::util::{describe, key_from_text, now, short};
 use crate::vault::{
     CLASSICAL_APPROVAL_NONE, CarriedDeferredTimestamp, ContactState, DeferredInitial, Farewell,
     GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT,
-    HistoryEntry, IndexRange, OutgoingRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE,
-    SealedEvents,
+    HistoryEntry, IndexRange, OutgoingRecord, PendingRevoke, SECURITY_ALERT_DOWNGRADE,
+    SECURITY_ALERT_NONE, SealedEvents,
 };
 use leptos::prelude::*;
 use prost::Message as _;
@@ -2053,7 +2053,7 @@ impl<V: VaultStore> Engine<V> {
             // contact locally so it neither lingers nor transmits a carried greeting on deletion.
             if self.is_submission_cancelled(submission_id) {
                 self.startup.end_new_chat_submit(submission_id);
-                self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, false)
+                self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, false, false)
                     .await;
                 return Err(StartChatError::Cancelled);
             }
@@ -2091,6 +2091,7 @@ impl<V: VaultStore> Engine<V> {
                     &peer,
                     &retained_farewells,
                     ready_to_send,
+                    false,
                 )
                 .await;
                 return Err(StartChatError::Cancelled);
@@ -2136,13 +2137,15 @@ impl<V: VaultStore> Engine<V> {
             return Err(StartChatError::Cancelled);
         }
         // If cancelled while `RegisterWriteToken` was in flight (before `SendInitialV2` left),
-        // roll back the never-announced contact cleanly if it still matches our created session.
+        // roll back the never-announced contact cleanly AND stage a `PendingRevoke` so any
+        // write-token grant already registered on our DO is revoked cleanly.
         if self.is_submission_cancelled(submission_id) {
             self.startup.end_new_chat_submit(submission_id);
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
+            let mut rolled_back = false;
             if let Some(inner) = guard.as_mut()
                 && inner
                     .contacts
@@ -2154,10 +2157,40 @@ impl<V: VaultStore> Engine<V> {
                             && c.state.history_len == 1
                     })
             {
-                self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true)
+                self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true, true)
                     .await;
+                rolled_back = true;
+            }
+            drop(guard);
+            if rolled_back && self.is_live(vgen) {
+                self.wake();
             }
             return Err(StartChatError::Cancelled);
+        }
+        // Re-verify contact existence and matching session immediately before transmitting
+        // `SendInitialV2` so a concurrent delete or inbound session during grant registration
+        // never emits a phantom or superseded initial request.
+        {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err(StartChatError::Cancelled);
+            }
+            let Some(inner) = guard.as_ref() else {
+                return Err(StartChatError::Cancelled);
+            };
+            let still_matches = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .is_some_and(|c| c.session.active_id() == created_session_id.as_ref());
+            if !still_matches {
+                self.startup.end_new_chat_submit(submission_id);
+                return if inner.contacts.iter().any(|c| c.peer == peer) {
+                    Ok(peer)
+                } else {
+                    Err(StartChatError::Cancelled)
+                };
+            }
         }
 
         let send_res: session::Result<()> = Fetch::client(&server_url)
@@ -2216,8 +2249,18 @@ impl<V: VaultStore> Engine<V> {
                                     && c.state.history_len == 1
                             })
                     {
-                        self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true)
-                            .await;
+                        self.rollback_cancelled_start_chat(
+                            inner,
+                            &peer,
+                            &retained_farewells,
+                            true,
+                            true,
+                        )
+                        .await;
+                        drop(guard);
+                        if self.is_live(vgen) {
+                            self.wake();
+                        }
                         return Err(StartChatError::Cancelled);
                     }
                     // Only revert `UNCERTAIN -> UNSENT`; never downgrade a greeting already
@@ -2277,17 +2320,30 @@ impl<V: VaultStore> Engine<V> {
 
     /// Roll back a newly saved but never-transmitted chat after cancellation, restoring only
     /// `retained_farewells` into live `AppState.farewells` so concurrent deletes/deliveries for
-    /// other peers are never clobbered.
+    /// other peers are never clobbered. When `revoke_grant` is `true` (because
+    /// `RegisterWriteToken` may already have committed on our DO), stages a durable
+    /// [`PendingRevoke`] inside the same rollback transaction.
     async fn rollback_cancelled_start_chat(
         &self,
         inner: &mut Inner<V>,
         peer: &PublicKey,
         retained_farewells: &[Farewell],
         uncertain_persisted: bool,
+        revoke_grant: bool,
     ) {
         if let Some(contact) = inner.contact(peer) {
             contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
         }
+        let staged_revoke = if revoke_grant {
+            let peer_slot_id = inner.client.peer_slot_id(peer);
+            inner
+                .client
+                .allocate_grant_version()
+                .ok()
+                .map(|min_grant_version| (peer_slot_id, min_grant_version))
+        } else {
+            None
+        };
         let mut last_err = None;
         for _ in 0..2 {
             if self.shutting_down.get() || crate::glue::lock_released() {
@@ -2295,6 +2351,20 @@ impl<V: VaultStore> Engine<V> {
             }
             let mut state = inner.app_state();
             state.contacts.retain(|contact| contact.peer != *peer);
+            if let Some((peer_slot_id, min_grant_version)) = staged_revoke {
+                if let Some(existing) = state
+                    .pending_revokes
+                    .iter_mut()
+                    .find(|r| r.peer_slot_id.as_slice() == peer_slot_id.as_slice())
+                {
+                    existing.min_grant_version = existing.min_grant_version.max(min_grant_version);
+                } else {
+                    state.pending_revokes.push(PendingRevoke {
+                        peer_slot_id: peer_slot_id.to_vec(),
+                        min_grant_version,
+                    });
+                }
+            }
             for farewell in retained_farewells {
                 if !state
                     .farewells

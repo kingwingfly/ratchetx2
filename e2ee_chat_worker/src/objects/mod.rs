@@ -103,7 +103,9 @@ pub enum AppendOutcome {
     Deduplicated(u64),
     /// The write token hash is unknown or revoked (checked before deduplication).
     WriteTokenRejected,
-    /// Rejected before commit because per-peer or per-recipient row/byte quotas would be exceeded.
+    /// Rejected before commit because per-peer or per-recipient backlog quotas are temporarily full.
+    MailboxFull,
+    /// Rejected before commit because a permanent mailbox bound (e.g. sequence ceiling) was hit.
     LimitExceeded,
 }
 
@@ -131,6 +133,7 @@ pub enum RegisterWriteTokenOutcome {
     Registered,
     NotFound,
     StaleVersion,
+    StaleTimestamp,
     InvalidArgument,
     LimitExceeded,
 }
@@ -572,6 +575,7 @@ mod tests {
                         token_hash: [3; 32],
                         grant_version: 1,
                         pin_active: true,
+                        timestamp: 0,
                     },
                 }
                 .encode()

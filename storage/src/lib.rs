@@ -207,6 +207,9 @@ pub enum ErrorKind {
     /// A per-peer, per-recipient, or per-inbox quota was exceeded.
     #[error("storage limit exceeded")]
     LimitExceeded,
+    /// A recipient's mailbox backlog quota is temporarily full; callers should retry later.
+    #[error("mailbox queue full")]
+    MailboxFull,
     /// An argument violates storage bounds (e.g. an integer exceeding [`MAX_SAFE_INTEGER`],
     /// an ACK sequence beyond the high-water mark, a cross-peer `token_hash` collision, or a
     /// mismatched idempotent initial payload).
@@ -222,6 +225,9 @@ pub enum ErrorKind {
     /// floor.
     #[error("stale grant version")]
     StaleVersion,
+    /// A signed storage operation's timestamp fell outside the freshness window at commit time.
+    #[error("stale timestamp")]
+    StaleTimestamp,
     /// Any other error; see its [`source`](std::error::Error::source).
     #[error("storage error")]
     Other,
@@ -375,6 +381,7 @@ mod serde_tests {
             token_hash: [0x03; 32],
             grant_version: 42,
             pin_active: true,
+            timestamp: 1_700_000_000_000,
         });
         roundtrip(&RevokeWriteTokenRecord {
             recipient: [0x01; 32],

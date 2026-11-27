@@ -247,6 +247,11 @@ pub struct RegisterWriteTokenRecord {
     /// Whether to pin this token as the peer's active (never-evicted) grant when `grant_version`
     /// exceeds the peer's `max_version` or no active grant is currently pinned.
     pub pin_active: bool,
+    /// Signed request timestamp in milliseconds since the Unix epoch (`0` if omitted in direct
+    /// unit tests). When non-zero, storage backends re-verify freshness at commit time so delayed
+    /// registrations can never outlive revocation-floor tombstones.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub timestamp: u64,
 }
 
 /// Write-token revocation payload passed to [`LocalIdempotentMailboxStore::revoke_write_token`].

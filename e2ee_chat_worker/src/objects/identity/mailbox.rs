@@ -21,6 +21,10 @@ use crate::objects::{
 
 pub(super) const DEDUP_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub(super) const MAX_DEDUP_TOMBSTONES_PER_TOKEN: u64 = 4096;
+/// Retention for empty revoked `peer_grants` tombstones: covers the full `2 * MAX_CLOCK_SKEW`
+/// bidirectional `verify_recent` window plus a 1-minute safety margin (11 minutes) so a
+/// pre-revocation `RegisterWriteToken` signed by a fast clock can never outlive its floor.
+pub(super) const REVOCATION_TOMBSTONE_TTL_MS: u64 = 2 * MAX_CLOCK_SKEW + 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MailboxQuotaSnapshot {
@@ -73,12 +77,12 @@ pub(super) fn apply_deleted_usage<S: SqlExec>(
     Ok(total_count)
 }
 
-/// Prunes empty revoked `peer_grants` tombstones once `revoked_at + MAX_CLOCK_SKEW < now_ms`.
+/// Prunes empty revoked `peer_grants` tombstones once `revoked_at + REVOCATION_TOMBSTONE_TTL_MS < now_ms`.
 pub(super) fn prune_expired_peer_grants_sql<S: SqlExec>(sql: &S, now_ms: u64) -> Result<()> {
-    if now_ms <= MAX_CLOCK_SKEW {
+    if now_ms <= REVOCATION_TOMBSTONE_TTL_MS {
         return Ok(());
     }
-    let cutoff = now_ms - MAX_CLOCK_SKEW;
+    let cutoff = now_ms - REVOCATION_TOMBSTONE_TTL_MS;
     sql.exec(
         "DELETE FROM peer_grants \
          WHERE revoked_at > 0 \
@@ -120,16 +124,27 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         if !self.has_tables()? {
             return Ok(false);
         }
-        let Some(row) = self.sql.query_opt::<TokenHashRow>(
-            "SELECT token_hash FROM write_tokens WHERE token_hash = ?",
+        let Some(row) = self.sql.query_opt::<WriteTokenAuthRow>(
+            "SELECT token_hash, peer_slot_id, grant_version \
+             FROM write_tokens WHERE token_hash = ?",
             params![token_hash.as_slice()]?,
         )?
         else {
             return Ok(false);
         };
-        Ok(bool::from(
-            row.token_hash.as_ref().ct_eq(token_hash.as_slice()),
-        ))
+        if !bool::from(row.token_hash.as_ref().ct_eq(token_hash.as_slice())) {
+            return Ok(false);
+        }
+        let Some(peer) = self.sql.query_opt::<PeerGrantRow>(
+            "SELECT max_version, revoked_below_version, active_token_hash, \
+             message_count, total_bytes \
+             FROM peer_grants WHERE peer_slot_id = ?",
+            params![row.peer_slot_id.as_ref()]?,
+        )?
+        else {
+            return Ok(false);
+        };
+        Ok(row.grant_version > peer.revoked_below_version)
     }
 
     /// Auth-before-dedup unified append into `messages` authorized by `token_hash`.
@@ -147,10 +162,12 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             return Ok(AppendOutcome::WriteTokenRejected);
         }
         self.sql.transaction_sync(|sql| {
-            // 1. Auth-before-dedup: verify `write_tokens` with constant-time comparison strictly
-            //    BEFORE inspecting `mailbox_dedup`.
-            let Some(token_row) = sql.query_opt::<WriteTokenRow>(
-                "SELECT token_hash, peer_slot_id FROM write_tokens WHERE token_hash = ?",
+            // 1. Auth-before-dedup: verify `write_tokens` with constant-time comparison AND
+            //    verify `grant_version > peer_grants.revoked_below_version` strictly BEFORE
+            //    inspecting `mailbox_dedup`.
+            let Some(token_row) = sql.query_opt::<WriteTokenAuthRow>(
+                "SELECT token_hash, peer_slot_id, grant_version \
+                 FROM write_tokens WHERE token_hash = ?",
                 params![token_hash.as_slice()]?,
             )?
             else {
@@ -160,6 +177,18 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 return Ok(AppendOutcome::WriteTokenRejected);
             }
             let peer_slot_id = token_row.peer_slot_id;
+            let Some(peer) = sql.query_opt::<PeerGrantRow>(
+                "SELECT max_version, revoked_below_version, active_token_hash, \
+                 message_count, total_bytes \
+                 FROM peer_grants WHERE peer_slot_id = ?",
+                params![peer_slot_id.as_ref()]?,
+            )?
+            else {
+                return Ok(AppendOutcome::WriteTokenRejected);
+            };
+            if token_row.grant_version <= peer.revoked_below_version {
+                return Ok(AppendOutcome::WriteTokenRejected);
+            }
 
             // 2. Deduplication lookup scoped to `(token_hash, client_message_id)`.
             let mut replacing_expired_dedup = false;
@@ -180,15 +209,6 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             let incoming_bytes = (header.len() as u64)
                 .saturating_add(content.len() as u64)
                 .saturating_add(initial_message.map_or(0, |m| m.len() as u64));
-            let Some(peer) = sql.query_opt::<PeerGrantRow>(
-                "SELECT max_version, revoked_below_version, active_token_hash, \
-                 message_count, total_bytes \
-                 FROM peer_grants WHERE peer_slot_id = ?",
-                params![peer_slot_id.as_ref()]?,
-            )?
-            else {
-                return Ok(AppendOutcome::WriteTokenRejected);
-            };
             let stats = sql
                 .query_opt::<RecipientStatsRow>(
                     "SELECT last_sequence, total_bytes, authorized_peer_count \
@@ -207,7 +227,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 recipient_bytes: stats.total_bytes,
             };
             if !within_mailbox_quotas(quota, incoming_bytes) {
-                return Ok(AppendOutcome::LimitExceeded);
+                return Ok(AppendOutcome::MailboxFull);
             }
 
             let Some(next_sequence) = stats
@@ -398,11 +418,16 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             if !Self::has_manifest_sql(sql)? {
                 return Ok(RegisterWriteTokenOutcome::NotFound);
             }
+            // Enforce signed timestamp freshness at DO commit time so a delayed registration can
+            // never outlive `REVOCATION_TOMBSTONE_TTL_MS` (2 * MAX_CLOCK_SKEW + 60s).
+            if record.timestamp > 0 && now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW {
+                return Ok(RegisterWriteTokenOutcome::StaleTimestamp);
+            }
             prune_expired_peer_grants_sql(sql, now_ms)?;
 
             // Check cross-peer `token_hash` PK collision before any mutation.
             let existing_token = sql.query_opt::<WriteTokenRow>(
-                "SELECT token_hash, peer_slot_id FROM write_tokens WHERE token_hash = ?",
+                "SELECT peer_slot_id FROM write_tokens WHERE token_hash = ?",
                 params![record.token_hash.as_slice()]?,
             )?;
             if let Some(ref existing) = existing_token
@@ -563,16 +588,28 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             )?;
             let had_live_tokens = before_count.count > 0;
 
+            // Enforce the monotonic revocation floor strictly in both modes:
+            // - `token_hash == None`: revoke only grants with `grant_version <= min_grant_version`
+            //   so a delayed revoke never deletes a newly registered higher-version grant.
+            // - `token_hash == Some(h)`: revoke `h` AND every grant with
+            //   `grant_version <= min_grant_version` so no below-floor token survives or gets
+            //   promoted to `active_token_hash`.
             let deleted: Vec<TokenHashRow> = match &record.token_hash {
                 None => sql.query(
-                    "DELETE FROM write_tokens WHERE peer_slot_id = ? RETURNING token_hash",
-                    params![record.peer_slot_id.as_slice()]?,
+                    "DELETE FROM write_tokens \
+                     WHERE peer_slot_id = ? AND grant_version <= ? \
+                     RETURNING token_hash",
+                    params![record.peer_slot_id.as_slice(), record.min_grant_version]?,
                 )?,
                 Some(hash) => sql.query(
                     "DELETE FROM write_tokens \
-                     WHERE peer_slot_id = ? AND token_hash = ? \
+                     WHERE peer_slot_id = ? AND (token_hash = ? OR grant_version <= ?) \
                      RETURNING token_hash",
-                    params![record.peer_slot_id.as_slice(), hash.as_slice()]?,
+                    params![
+                        record.peer_slot_id.as_slice(),
+                        hash.as_slice(),
+                        record.min_grant_version
+                    ]?,
                 )?,
             };
             let revoked = deleted.len() as u32;
@@ -621,7 +658,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                  ON CONFLICT (peer_slot_id) DO UPDATE SET \
                  max_version = max(peer_grants.max_version, excluded.max_version), \
                  revoked_below_version = max(peer_grants.revoked_below_version, excluded.revoked_below_version), \
-                 revoked_at = excluded.revoked_at, \
+                 revoked_at = max(peer_grants.revoked_at, excluded.revoked_at), \
                  active_token_hash = excluded.active_token_hash",
                 params![
                     record.peer_slot_id.as_slice(),
@@ -870,6 +907,7 @@ mod tests {
                             token_hash: tok(1),
                             grant_version: 1,
                             pin_active: true,
+                            timestamp: 0,
                         },
                         1_000
                     )
@@ -927,6 +965,7 @@ mod tests {
                             token_hash: tok(1),
                             grant_version: 1,
                             pin_active: true,
+                            timestamp: 0,
                         },
                         1_000
                     )
@@ -943,6 +982,7 @@ mod tests {
                             token_hash: tok(1),
                             grant_version: 1,
                             pin_active: true,
+                            timestamp: 0,
                         },
                         1_000
                     )
@@ -960,6 +1000,7 @@ mod tests {
                                 token_hash: tok(ver),
                                 grant_version: u64::from(ver),
                                 pin_active: false,
+                                timestamp: 0,
                             },
                             1_000 + u64::from(ver)
                         )
@@ -977,6 +1018,7 @@ mod tests {
                             token_hash: tok(2),
                             grant_version: 99,
                             pin_active: false,
+                            timestamp: 0,
                         },
                         2_000
                     )
@@ -993,6 +1035,7 @@ mod tests {
                             token_hash: tok(5),
                             grant_version: 5,
                             pin_active: false,
+                            timestamp: 0,
                         },
                         2_001
                     )
@@ -1013,7 +1056,8 @@ mod tests {
                 AppendOutcome::Appended(1)
             );
 
-            // Revoke tok(1) with min_grant_version = 10 -> auth-before-dedup rejects cid retry!
+            // Targeted revoke of tok(1) with min_grant_version = 2 deletes only tok(1), leaving
+            // tok(3), tok(4), tok(5) live; auth-before-dedup rejects cid retry!
             assert_eq!(
                 store
                     .revoke_write_token(
@@ -1021,7 +1065,7 @@ mod tests {
                             recipient: BOB,
                             peer_slot_id: slot(1),
                             token_hash: Some(tok(1)),
-                            min_grant_version: 10,
+                            min_grant_version: 2,
                         },
                         3_000
                     )
@@ -1034,6 +1078,33 @@ mod tests {
                     .unwrap(),
                 AppendOutcome::WriteTokenRejected
             );
+
+            // Targeted revoke of tok(5) with min_grant_version = 10 deletes tok(3), tok(4), tok(5)
+            // in the same transaction so no below-floor token survives or gets promoted to active!
+            assert_eq!(
+                store
+                    .revoke_write_token(
+                        &RevokeWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(1),
+                            token_hash: Some(tok(5)),
+                            min_grant_version: 10,
+                        },
+                        3_500
+                    )
+                    .unwrap(),
+                RevokeWriteTokenOutcome::Revoked(3)
+            );
+            assert_eq!(stats(&env).authorized_peer_count, 0);
+            for revoked_tok in [tok(3), tok(4), tok(5)] {
+                assert!(!store.has_write_token(&revoked_tok).unwrap());
+                assert_eq!(
+                    store
+                        .append_idempotent(&revoked_tok, b"h", b"c", None, None, 3_501)
+                        .unwrap(),
+                    AppendOutcome::WriteTokenRejected
+                );
+            }
             // grant_version <= 10 -> StaleVersion.
             assert_eq!(
                 store
@@ -1044,14 +1115,49 @@ mod tests {
                             token_hash: tok(99),
                             grant_version: 10,
                             pin_active: true,
+                            timestamp: 3_501,
                         },
-                        3_001
+                        3_501
                     )
                     .unwrap(),
                 RegisterWriteTokenOutcome::StaleVersion
             );
 
-            // Revoke all remaining tokens for peer 1 (tok 3, 4, 5) -> authorized_peer_count -> 0.
+            // Register newer grant v11, then replay a delayed unconditional revoke with
+            // min_grant_version = 10 -> MUST NOT delete v11!
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(1),
+                            token_hash: tok(11),
+                            grant_version: 11,
+                            pin_active: true,
+                            timestamp: 3_600,
+                        },
+                        3_600
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::Registered
+            );
+            assert_eq!(
+                store
+                    .revoke_write_token(
+                        &RevokeWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(1),
+                            token_hash: None,
+                            min_grant_version: 10,
+                        },
+                        3_700
+                    )
+                    .unwrap(),
+                RevokeWriteTokenOutcome::Revoked(0)
+            );
+            assert!(store.has_write_token(&tok(11)).unwrap());
+
+            // Unconditional revoke with min_grant_version = 12 removes tok(11) -> authorized_peer_count -> 0.
             assert_eq!(
                 store
                     .revoke_write_token(
@@ -1064,13 +1170,13 @@ mod tests {
                         4_000
                     )
                     .unwrap(),
-                RevokeWriteTokenOutcome::Revoked(3)
+                RevokeWriteTokenOutcome::Revoked(1)
             );
             assert_eq!(stats(&env).authorized_peer_count, 0);
 
-            // Still has 1 queued message, so peer_grants tombstone is NOT pruned even past skew.
+            // Still has 1 queued message, so peer_grants tombstone is NOT pruned even past TTL.
             store
-                .prune_expired_peer_grants(4_000 + MAX_CLOCK_SKEW + 10)
+                .prune_expired_peer_grants(4_000 + REVOCATION_TOMBSTONE_TTL_MS + 10)
                 .unwrap();
             let remaining_grants: CountRow = env
                 .sql
@@ -1078,11 +1184,20 @@ mod tests {
                 .unwrap();
             assert_eq!(remaining_grants.count, 1);
 
-            // After ACK empties messages, tombstone stays through `revoked_at + MAX_CLOCK_SKEW`
-            // and is pruned strictly past `revoked_at + MAX_CLOCK_SKEW`.
+            // After ACK empties messages, tombstone stays through `revoked_at + REVOCATION_TOMBSTONE_TTL_MS`
+            // (covering the full 2*MAX_CLOCK_SKEW + 60s window) and is pruned strictly past it.
             assert_eq!(store.ack_messages(1).unwrap(), AckMessagesOutcome::Acked(1));
             store
-                .prune_expired_peer_grants(4_000 + MAX_CLOCK_SKEW)
+                .prune_expired_peer_grants(4_000 + MAX_CLOCK_SKEW + 1)
+                .unwrap();
+            let still_protected_past_5m: CountRow = env
+                .sql
+                .query_one("SELECT count(*) AS count FROM peer_grants", vec![])
+                .unwrap();
+            assert_eq!(still_protected_past_5m.count, 1);
+
+            store
+                .prune_expired_peer_grants(4_000 + REVOCATION_TOMBSTONE_TTL_MS)
                 .unwrap();
             let still_protected: CountRow = env
                 .sql
@@ -1090,14 +1205,32 @@ mod tests {
                 .unwrap();
             assert_eq!(still_protected.count, 1);
 
-            store
-                .prune_expired_peer_grants(4_000 + MAX_CLOCK_SKEW + 1)
-                .unwrap();
+            // Once pruned past REVOCATION_TOMBSTONE_TTL_MS, a pre-revocation registration signed
+            // even +MAX_CLOCK_SKEW ahead of `revoked_at` (4_000 + MAX_CLOCK_SKEW) is STILL
+            // rejected at DO commit time with `StaleTimestamp`!
+            let after_prune = 4_000 + REVOCATION_TOMBSTONE_TTL_MS + 1;
+            store.prune_expired_peer_grants(after_prune).unwrap();
             let pruned: CountRow = env
                 .sql
                 .query_one("SELECT count(*) AS count FROM peer_grants", vec![])
                 .unwrap();
             assert_eq!(pruned.count, 0);
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(1),
+                            token_hash: tok(1),
+                            grant_version: 1,
+                            pin_active: true,
+                            timestamp: 4_000 + MAX_CLOCK_SKEW,
+                        },
+                        after_prune
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::StaleTimestamp
+            );
 
             // Authorized peer cap enforcement.
             assert_eq!(
@@ -1109,6 +1242,7 @@ mod tests {
                             token_hash: tok(10),
                             grant_version: 1,
                             pin_active: true,
+                            timestamp: 0,
                         },
                         5_000,
                         1
@@ -1125,6 +1259,7 @@ mod tests {
                             token_hash: tok(11),
                             grant_version: 1,
                             pin_active: true,
+                            timestamp: 0,
                         },
                         5_000,
                         1
@@ -1150,6 +1285,7 @@ mod tests {
                                 token_hash: tok(token_id),
                                 grant_version: 1,
                                 pin_active: true,
+                                timestamp: 0,
                             },
                             1_000
                         )

@@ -168,12 +168,19 @@ pub fn bump_lock_generation() -> u64 {
     })
 }
 
+fn post_aborted(port: &MessagePort) {
+    let msg = Object::new();
+    let _ = Reflect::set(&msg, &JsValue::from_str("aborted"), &JsValue::TRUE);
+    let _ = port.post_message(&msg);
+}
+
 /// Synchronously abort, detach, and close every active service-worker media `MessagePort`.
 pub fn close_all_media_ports() {
     MEDIA_HANDLER.with(|handler| *handler.borrow_mut() = None);
     let ports: Vec<_> = ACTIVE_MEDIA_PORTS.with(|map| map.borrow_mut().drain().collect());
     for (_, (aborted, port)) in ports {
         aborted.set(true);
+        post_aborted(&port);
         port.set_onmessage(None);
         port.close();
     }
@@ -747,6 +754,7 @@ pub struct MediaRequest {
     pub range: MediaRange,
     reply: MessagePort,
     aborted: Rc<Cell<bool>>,
+    replied: bool,
     _on_abort: Option<Closure<dyn FnMut(MessageEvent)>>,
 }
 
@@ -760,10 +768,11 @@ impl MediaRequest {
         self.aborted.get()
     }
 
-    pub fn reply(self, reply: MediaReply<'_>) {
+    pub fn reply(mut self, reply: MediaReply<'_>) {
         if self.aborted.get() {
             return;
         }
+        self.replied = true;
         let message: MediaReplyMsg = Object::new().unchecked_into();
         let transfer = Array::new();
         match reply {
@@ -793,6 +802,9 @@ impl Drop for MediaRequest {
         ACTIVE_MEDIA_PORTS.with(|map| {
             map.borrow_mut().remove(&self.id);
         });
+        if !self.replied && !self.aborted.get() {
+            post_aborted(&self.reply);
+        }
         self.reply.set_onmessage(None);
         self.reply.close();
     }
@@ -829,6 +841,7 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
             return;
         };
         if lock_released() {
+            post_aborted(&reply);
             reply.close();
             return;
         }
@@ -894,6 +907,7 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
             range,
             reply,
             aborted,
+            replied: false,
             _on_abort: Some(on_abort),
         };
         if let Some(handler) = MEDIA_HANDLER.with(|h| h.borrow().clone()) {

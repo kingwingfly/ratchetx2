@@ -79,6 +79,7 @@ impl From<protocol::Error> for Error {
             Kind::LimitExceeded => ErrorKind::LimitExceeded,
             Kind::SignInRequired => ErrorKind::SignInRequired,
             Kind::WriteTokenRejected => ErrorKind::WriteTokenRejected,
+            Kind::StaleVersion => ErrorKind::StaleVersion,
             Kind::Unimplemented => ErrorKind::Unimplemented,
             Kind::Malformed | Kind::InvalidSignature | Kind::StaleTimestamp => ErrorKind::Protocol,
             _ => ErrorKind::Server,
@@ -145,6 +146,9 @@ pub enum ErrorKind {
     /// The recipient's mailbox rejected the write token (not yet approved or revoked).
     #[error("write token rejected")]
     WriteTokenRejected,
+    /// A write-token registration's grant version does not exceed the peer's revoked version floor.
+    #[error("stale grant version")]
+    StaleVersion,
     /// The server rejected a request, or sent a malformed reply.
     #[error("protocol error")]
     Protocol,

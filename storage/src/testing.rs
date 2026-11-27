@@ -510,6 +510,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: tok_a1,
                 grant_version: 1,
                 pin_active: true,
+                timestamp: 0,
             })
             .await
             .unwrap_err()
@@ -580,6 +581,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_a1,
             grant_version: 1,
             pin_active: true,
+            timestamp: 0,
         })
         .await
         .unwrap();
@@ -592,6 +594,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: tok_a1,
                 grant_version: 1,
                 pin_active: true,
+                timestamp: 0,
             })
             .await
             .unwrap_err()
@@ -607,6 +610,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: tok,
                 grant_version: ver,
                 pin_active: false,
+                timestamp: 0,
             })
             .await
             .unwrap();
@@ -619,6 +623,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_a2,
             grant_version: 99,
             pin_active: false,
+            timestamp: 0,
         })
         .await
         .unwrap();
@@ -630,6 +635,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_a5,
             grant_version: 5,
             pin_active: false,
+            timestamp: 0,
         })
         .await
         .unwrap();
@@ -680,6 +686,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_b1,
             grant_version: 1,
             pin_active: true,
+            timestamp: 0,
         })
         .await
         .unwrap();
@@ -775,14 +782,16 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
         .unwrap();
     assert_eq!(seq3, 3);
 
-    // 7. Auth-before-dedup on revocation & StaleVersion floor enforcement.
+    // 7. Auth-before-dedup on revocation & monotonic version-floor enforcement.
+    // Targeted revoke of tok_a1 with min_grant_version = 2 removes only tok_a1 (v=1), leaving
+    // tok_a3 (v=3), tok_a4 (v=4), tok_a5 (v=5) live and promoting tok_a5.
     assert_eq!(
         store
             .revoke_write_token(RevokeWriteTokenRecord {
                 recipient: bob,
                 peer_slot_id: peer_a,
                 token_hash: Some(tok_a1),
-                min_grant_version: 10,
+                min_grant_version: 2,
             })
             .await
             .unwrap(),
@@ -797,6 +806,31 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             .kind(),
         ErrorKind::WriteTokenRejected
     );
+    // Targeted revoke of tok_a5 with min_grant_version = 10 MUST also delete every older token
+    // with grant_version <= 10 (tok_a3, tok_a4, tok_a5 -> 3 removed) so no below-floor token
+    // stays live or gets promoted to active.
+    assert_eq!(
+        store
+            .revoke_write_token(RevokeWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: Some(tok_a5),
+                min_grant_version: 10,
+            })
+            .await
+            .unwrap(),
+        3
+    );
+    for revoked_tok in [tok_a3, tok_a4, tok_a5] {
+        assert_eq!(
+            store
+                .append_idempotent(&bob, &revoked_tok, Bytes::new(), Bytes::new(), None, None)
+                .await
+                .unwrap_err()
+                .kind(),
+            ErrorKind::WriteTokenRejected
+        );
+    }
     // Registering a grant <= min_grant_version (10) fails with StaleVersion.
     assert_eq!(
         store
@@ -806,6 +840,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: [0xA9; 32],
                 grant_version: 10,
                 pin_active: true,
+                timestamp: 0,
             })
             .await
             .unwrap_err()
@@ -820,10 +855,37 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: [0xA9; 32],
             grant_version: 11,
             pin_active: true,
+            timestamp: 0,
         })
         .await
         .unwrap();
-    // Revoking all grants for peer_a clears tok_a3, tok_a4, tok_a5, and [0xA9; 32] (4 tokens).
+    // A delayed unconditional revoke with min_grant_version = 10 MUST NOT delete the newer
+    // grant_version = 11 token!
+    assert_eq!(
+        store
+            .revoke_write_token(RevokeWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: None,
+                min_grant_version: 10,
+            })
+            .await
+            .unwrap(),
+        0
+    );
+    let seq4 = store
+        .append_idempotent(
+            &bob,
+            &[0xA9; 32],
+            Bytes::from_static(b"h4"),
+            Bytes::from_static(b"c4"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(seq4, 4);
+    // Revoking peer_a with min_grant_version = 12 removes [0xA9; 32] (1 token).
     assert_eq!(
         store
             .revoke_write_token(RevokeWriteTokenRecord {
@@ -834,7 +896,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             })
             .await
             .unwrap(),
-        4
+        1
     );
     assert_eq!(
         store

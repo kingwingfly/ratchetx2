@@ -659,7 +659,7 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         resp.headers_mut().set("retry-after", "60")?;
         return with_security_headers(resp);
     }
-    if auth::password_configured(env) && auth_info.is_none() {
+    if auth_info.is_none() {
         return with_security_headers(Response::error("sign in to this server to use it", 403)?);
     }
 

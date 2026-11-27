@@ -28,9 +28,10 @@ pub const DEFAULT_MAX_DEDUP_TOMBSTONES: usize = 4096;
 pub const DEFAULT_MAX_DEDUP_BUCKETS: usize = 4096;
 /// Default retention for inbox initial messages before expiry pruning (30 days).
 pub const DEFAULT_INITIAL_MESSAGE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// Default retention for empty revoked `peer_grants` tombstones (matches protocol `MAX_CLOCK_SKEW`:
-/// 5 minutes, preventing in-flight `RegisterWriteToken` replays within ±5m).
-pub const DEFAULT_REVOCATION_TOMBSTONE_TTL: Duration = Duration::from_secs(5 * 60);
+/// Default retention for empty revoked `peer_grants` tombstones: covers the full `2 * 5 min`
+/// `verify_recent` bidirectional skew window plus a 1-minute safety margin (11 minutes) so a
+/// pre-revocation registration signed by a fast client clock can never outlive the floor.
+pub const DEFAULT_REVOCATION_TOMBSTONE_TTL: Duration = Duration::from_secs(11 * 60);
 
 const DEDUP_SWEEP_BUDGET: usize = 8;
 
@@ -759,6 +760,12 @@ impl IdempotentMailboxStore for MemoryStore {
             if !bool::from(entry.token_hash.ct_eq(token_hash)) {
                 return Err(ErrorKind::WriteTokenRejected.into());
             }
+            let Some(peer) = mailbox.peer_grants.get(&entry.peer_slot_id) else {
+                return Err(ErrorKind::WriteTokenRejected.into());
+            };
+            if entry.grant_version <= peer.revoked_below_version {
+                return Err(ErrorKind::WriteTokenRejected.into());
+            }
             entry.peer_slot_id
         };
 
@@ -793,7 +800,7 @@ impl IdempotentMailboxStore for MemoryStore {
                 || peer.total_bytes.saturating_add(incoming_bytes) > MAX_QUEUE_BYTES
                 || mailbox.total_bytes.saturating_add(incoming_bytes) > MAX_RECIPIENT_BYTES
             {
-                return Err(ErrorKind::LimitExceeded.into());
+                return Err(ErrorKind::MailboxFull.into());
             }
             let next = mailbox
                 .last_sequence
@@ -1052,32 +1059,25 @@ impl IdempotentMailboxStore for MemoryStore {
             .get(&record.peer_slot_id)
             .is_some_and(|p| p.live_tokens > 0);
 
-        let revoked: u32 = match record.token_hash {
-            None => {
-                let to_remove: Vec<WriteTokenHash> = mailbox
-                    .write_tokens
-                    .values()
-                    .filter(|entry| entry.peer_slot_id == record.peer_slot_id)
-                    .map(|entry| entry.token_hash)
-                    .collect();
-                for hash in &to_remove {
-                    mailbox.write_tokens.remove(hash);
-                }
-                to_remove.len() as u32
-            }
-            Some(hash) => {
-                if mailbox
-                    .write_tokens
-                    .get(&hash)
-                    .is_some_and(|entry| entry.peer_slot_id == record.peer_slot_id)
-                {
-                    mailbox.write_tokens.remove(&hash);
-                    1
-                } else {
-                    0
-                }
-            }
-        };
+        // Enforce the monotonic revocation floor strictly in both modes:
+        // - `token_hash == None`: revoke only grants with `grant_version <= min_grant_version` so
+        //   a delayed revoke never wipes a newly registered higher-version grant.
+        // - `token_hash == Some(h)`: revoke `h` AND every grant with
+        //   `grant_version <= min_grant_version` so no below-floor token survives or gets promoted.
+        let to_remove: Vec<WriteTokenHash> = mailbox
+            .write_tokens
+            .values()
+            .filter(|entry| {
+                entry.peer_slot_id == record.peer_slot_id
+                    && (entry.grant_version <= record.min_grant_version
+                        || record.token_hash == Some(entry.token_hash))
+            })
+            .map(|entry| entry.token_hash)
+            .collect();
+        for hash in &to_remove {
+            mailbox.write_tokens.remove(hash);
+        }
+        let revoked = to_remove.len() as u32;
 
         // Recompute remaining highest-version token for promotion if active_token_hash was deleted.
         let highest_remaining = mailbox
@@ -1215,6 +1215,7 @@ mod test {
                 token_hash,
                 grant_version,
                 pin_active,
+                timestamp: 0,
             })
             .await
             .unwrap();
@@ -1285,6 +1286,7 @@ mod test {
                         token_hash: [0x02; 32],
                         grant_version: 1,
                         pin_active: true,
+                        timestamp: 0,
                     })
                     .await
                     .unwrap_err()
@@ -1590,6 +1592,7 @@ mod test {
                         token_hash: [33; 32],
                         grant_version: 1,
                         pin_active: true,
+                        timestamp: 0,
                     })
                     .await
                     .unwrap_err()
@@ -1621,6 +1624,7 @@ mod test {
                         token_hash: [23; 32],
                         grant_version: 5,
                         pin_active: true,
+                        timestamp: 0,
                     })
                     .await
                     .unwrap_err()

@@ -13,7 +13,7 @@ mod ws;
 
 use std::cell::Cell;
 
-use protocol::{MAX_CLOCK_SKEW, notify::Notification};
+use protocol::notify::Notification;
 use storage::MAX_SAFE_INTEGER;
 use worker::{
     Date, DurableObject, Env, Error, Method, Request, Response, Result, State, WebSocket,
@@ -115,7 +115,10 @@ impl<'a, S: SqlExec> IdentityStore<'a, S> {
                     vec![],
                 )?
                 .and_then(|row| row.oldest)
-                .map(|ts| ts.saturating_add(MAX_CLOCK_SKEW).saturating_add(1));
+                .map(|ts| {
+                    ts.saturating_add(mailbox::REVOCATION_TOMBSTONE_TTL_MS)
+                        .saturating_add(1)
+                });
 
             (msg, initial, dedup, tombstone)
         } else {
@@ -384,7 +387,10 @@ impl IdentityV2 {
                 let now = Date::now().as_millis();
                 let outcome = self.with_store(|store| store.revoke_write_token(&req.record, now));
                 if matches!(outcome, Ok(RevokeWriteTokenOutcome::Revoked(_))) {
-                    let prune_at = now.saturating_add(MAX_CLOCK_SKEW).saturating_add(1);
+                    let prune_at = now
+                        .saturating_add(mailbox::REVOCATION_TOMBSTONE_TTL_MS)
+                        .saturating_add(1)
+                        .min(MAX_SAFE_INTEGER);
                     if let Err(e) = self.update_alarm(AlarmUpdate::PullEarlier(prune_at)).await {
                         console_error!("cannot schedule peer_grants tombstone prune alarm: {e}");
                     }
@@ -398,7 +404,12 @@ impl IdentityV2 {
     /// an earlier deadline even when the mailbox already has a retention alarm.
     async fn schedule_message_expiry(&self, with_tombstone: bool) -> Result<()> {
         let now = Date::now().as_millis();
-        let mut at = now.saturating_add(self.retention());
+        // `expire_messages_and_initials` deletes strictly older rows (`created_at < now - retention`),
+        // so add +1 ms matching `compute_earliest_deadline` to avoid firing 1 ms early.
+        let mut at = now
+            .saturating_add(self.retention())
+            .saturating_add(1)
+            .min(MAX_SAFE_INTEGER);
         if with_tombstone {
             at = at.min(
                 now.saturating_add(mailbox::DEDUP_TTL_MS)
@@ -555,6 +566,7 @@ mod tests {
                         token_hash,
                         grant_version: 1,
                         pin_active: true,
+                        timestamp: 0,
                     },
                     1_000,
                 )
@@ -584,7 +596,8 @@ mod tests {
                 .unwrap();
             assert_eq!(store.compute_earliest_deadline(None).unwrap(), None);
 
-            // Revoking the grant creates an empty tombstone whose deadline is revoked_at + MAX_CLOCK_SKEW + 1.
+            // Revoking the grant creates an empty tombstone whose deadline is
+            // revoked_at + REVOCATION_TOMBSTONE_TTL_MS + 1.
             store
                 .revoke_write_token(
                     &RevokeWriteTokenRecord {
@@ -598,12 +611,12 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 store.compute_earliest_deadline(None).unwrap(),
-                Some(20_000 + MAX_CLOCK_SKEW + 1)
+                Some(20_000 + mailbox::REVOCATION_TOMBSTONE_TTL_MS + 1)
             );
 
-            // Pruning past skew removes tombstone and clears deadline.
+            // Pruning past TTL removes tombstone and clears deadline.
             store
-                .prune_expired_peer_grants(20_000 + MAX_CLOCK_SKEW + 1)
+                .prune_expired_peer_grants(20_000 + mailbox::REVOCATION_TOMBSTONE_TTL_MS + 1)
                 .unwrap();
             assert_eq!(store.compute_earliest_deadline(None).unwrap(), None);
         }

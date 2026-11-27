@@ -652,6 +652,7 @@ mod server {
                 request.verify(&self.server_id, now_millis())?;
             let grant_version = request.grant_version;
             let pin_active = request.pin_active;
+            let timestamp = request.timestamp;
             drop(request);
             self.store
                 .register_write_token(RegisterWriteTokenRecord {
@@ -660,6 +661,7 @@ mod server {
                     token_hash,
                     grant_version,
                     pin_active,
+                    timestamp,
                 })
                 .await?;
             Ok(RegisterWriteTokenResponse {})
@@ -1087,7 +1089,7 @@ mod server {
                 .kind(),
                 ErrorKind::WriteTokenRejected
             );
-            // Stale grant_version <= 5 maps storage::ErrorKind::StaleVersion -> StaleTimestamp.
+            // Stale grant_version <= 5 maps storage::ErrorKind::StaleVersion -> ErrorKind::StaleVersion.
             assert_eq!(
                 v2.register_write_token(
                     RegisterWriteTokenRequest::sign(
@@ -1104,7 +1106,7 @@ mod server {
                 .await
                 .unwrap_err()
                 .kind(),
-                ErrorKind::StaleTimestamp
+                ErrorKind::StaleVersion
             );
         }
 

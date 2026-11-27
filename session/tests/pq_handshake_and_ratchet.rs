@@ -449,8 +449,9 @@ async fn unified_mailbox_multi_peer_routing_pinned_grants_revocation_and_write_t
     assert_eq!(err.kind(), ErrorKind::WriteTokenRejected);
     assert!(err.is_server_refusal());
 
-    // Registering with version <= revoke_ver is definitively refused (`StaleVersion` -> `Protocol`
-    // with `is_server_refusal() == true`), while a fresh monotonic version > revoke_ver succeeds.
+    // Registering with version <= revoke_ver is definitively refused as `StaleVersion`
+    // (distinct from clock-skew `StaleTimestamp` -> `Protocol`), while a fresh monotonic version
+    // > revoke_ver succeeds.
     let stale_reg = bob
         .register_write_token_v2(
             &mb,
@@ -462,7 +463,7 @@ async fn unified_mailbox_multi_peer_routing_pinned_grants_revocation_and_write_t
         )
         .await
         .unwrap_err();
-    assert_eq!(stale_reg.kind(), ErrorKind::Protocol);
+    assert_eq!(stale_reg.kind(), ErrorKind::StaleVersion);
     assert!(stale_reg.is_server_refusal());
 
     let recreated_ver = bob.allocate_grant_version().unwrap();
@@ -1742,5 +1743,42 @@ mod pq_flow {
                 .messages
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn finish_prepare_initiate_v2_rejects_bundle_that_expired_after_phase_1() {
+        let store = SharedStore::default();
+        let hs = V2OnlyHandshake::new(store.clone(), AUDIENCE);
+        let mb = V2OnlyMailbox::new(store, AUDIENCE);
+        let clock = session::ServerClock::with_max_drift(u64::MAX / 2);
+
+        let mut bob = Client::new(hs.clone()).with_clock(clock.clone());
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+
+        let alice = Client::new(hs.clone()).with_clock(clock.clone());
+        let claimed = session::claim_peer_bundle_v2(
+            &hs,
+            AUDIENCE,
+            &bob.identity_key(),
+            &PeerPqState::default(),
+            alice.pq_config(),
+            &clock,
+        )
+        .await
+        .unwrap();
+
+        // Advance the observed server clock past the claimed manifest's expiration window before
+        // Phase 2 key agreement (e.g. long background tab suspension between ClaimBundle and finish).
+        let expired_time = claimed
+            .manifest()
+            .expires_at
+            .saturating_add(protocol::MAX_CLOCK_SKEW)
+            .saturating_add(60_000);
+        clock.observe(expired_time);
+
+        let err = alice
+            .finish_prepare_initiate_v2(claimed, &PeerPqState::default(), b"late-hello", mb)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PeerManifestExpired);
     }
 }

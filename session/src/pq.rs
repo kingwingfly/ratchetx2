@@ -1665,6 +1665,12 @@ mod v2 {
             content: &[u8],
             mailbox: M,
         ) -> Result<PreparedInitiateV2<M>> {
+            // Re-validate the manifest window against the current bounded clock pair immediately
+            // before Phase 2 key agreement so a bundle claimed near expiry cannot be used after
+            // expiring while awaiting locks.
+            let (local_now, server_now) = self.clock.trusted_clock_pair()?;
+            check_manifest_window_bounded(&claimed.manifest, local_now, server_now)
+                .map_err(|e| Error::new(ErrorKind::PeerManifestExpired, e))?;
             let policy =
                 evaluate_claimed_bundle_policy(&claimed, peer_state, &self.state.pq_config)?;
             match policy {

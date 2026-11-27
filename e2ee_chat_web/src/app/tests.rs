@@ -279,6 +279,19 @@ fn chat_item_meta_shows_typed_last_message_and_prevents_text_spoofing() {
         }
     );
 
+    // Unsent outbound chat request shows "sending request…" distinctly from "waiting for acceptance".
+    let mut unsent = chat.clone();
+    unsent.greeting_unsent = true;
+    assert_eq!(
+        chat_item_meta(&unsent),
+        ChatItemMeta {
+            request_accent: false,
+            warn: false,
+            downgrade: false,
+            subtitle: ChatItemSubtitle::Status("sending request…".to_string()),
+        }
+    );
+
     // Outbound chat awaiting peer acceptance shows "waiting for acceptance" even with a queued
     // last_message, while incoming requests and security warnings still take precedence.
     let mut awaiting = chat.clone();
