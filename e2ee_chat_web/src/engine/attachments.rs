@@ -400,7 +400,12 @@ impl<V: VaultStore> Engine<V> {
             .save_upload_for_gen(&peer, &pending, Some(conv_gen))
             .await
         {
-            let _ = upload.cancel(&Fetch::client(&server)).await;
+            // R9-P1-1: If vault teardown / `pagehide` fired during the IDB commit, the write may
+            // already have committed before `ensure_lock_owned()` failed; preserve the server
+            // allocation so unlock can resume cleanly instead of stranding a 404 orphan.
+            if self.is_live(vgen) {
+                let _ = upload.cancel(&Fetch::client(&server)).await;
+            }
             return Err(e);
         }
         if !self.is_live(vgen) {
@@ -415,21 +420,37 @@ impl<V: VaultStore> Engine<V> {
         let pending = match self.announce_for_gen(&peer, pending, Some(conv_gen)).await {
             Ok(Some(pending)) => pending,
             Ok(None) => {
+                if !self.is_live(vgen) {
+                    return Err("locked".into());
+                }
                 self.uploads.mark_cancelled(*upload.id());
                 self.remove_attachment_caches(&peer, upload.id());
                 let _ = upload.cancel(&Fetch::client(&server)).await;
                 return Ok(());
             }
             Err(AnnounceError::NotSent(e)) => {
+                // R9-P1-1: `PendingUpload` (and possibly the `HistoryEntry` + `Outbox` item) was
+                // already saved durably before `announce_for_gen`; NEVER send `DeleteAttachment`
+                // on vault lock / `pagehide` teardown or if forgetting the vault record failed.
+                if !self.is_live(vgen) {
+                    return Err(e);
+                }
                 self.uploads.mark_cancelled(*upload.id());
                 self.remove_attachment_caches(&peer, upload.id());
-                {
+                let forgot = {
                     let guard = self.lock_inner().await;
-                    if let Some(inner) = guard.as_ref() {
-                        let _ = inner.vault.forget_upload(&peer, upload.id()).await;
+                    if !self.is_live(vgen) {
+                        false
+                    } else if let Some(inner) = guard.as_ref() {
+                        inner.vault.forget_upload(&peer, upload.id()).await.is_ok()
+                            && self.is_live(vgen)
+                    } else {
+                        false
                     }
+                };
+                if forgot {
+                    let _ = upload.cancel(&Fetch::client(&server)).await;
                 }
-                let _ = upload.cancel(&Fetch::client(&server)).await;
                 return Err(e);
             }
             Err(AnnounceError::SaveAfterSend { error, pending }) => {
@@ -867,8 +888,16 @@ impl<V: VaultStore> Engine<V> {
             .await;
         if let Err(e) = promoted {
             drop(guard);
-            let _ = upload.cancel(&Fetch::client(&server)).await;
+            // R9-P1-1: If vault teardown / `pagehide` fired while the atomic promotion transaction
+            // was committing, `promote_upload_with` may have already committed before
+            // `ensure_lock_owned()` returned `Err`; preserve the server allocation across teardown.
+            if self.is_live(vgen) {
+                let _ = upload.cancel(&Fetch::client(&server)).await;
+            }
             return Err(e);
+        }
+        if !self.is_live(vgen) {
+            return Ok(());
         }
         // Cancelled while it started, which found nothing left to cancel: it goes no further,
         // and its message reverts to an un-uploaded failed attachment without publishing the
@@ -878,6 +907,9 @@ impl<V: VaultStore> Engine<V> {
             self.remove_attachment_caches(&peer, &waiting);
             self.remove_attachment_caches(&peer, upload.id());
             let _ = inner.vault.forget_upload(&peer, upload.id()).await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
             if let Some(Kind::Attachment(pointer)) = changed[0]
                 .1
                 .content
@@ -907,14 +939,19 @@ impl<V: VaultStore> Engine<V> {
                         .map_err(|e| describe(&e))
                 })
                 .await;
-            if reverted.is_ok() {
+            if reverted.is_ok() && self.is_live(vgen) {
                 self.release(&peer, kept.history_index);
                 self.show_changes(inner, &peer, &changed);
             }
             drop(guard);
-            let _ = upload.cancel(&Fetch::client(&server)).await;
+            if self.is_live(vgen) {
+                let _ = upload.cancel(&Fetch::client(&server)).await;
+            }
             reverted?;
-            if let Err(e) = self.flush(&peer).await {
+            if self.is_live(vgen)
+                && let Err(e) = self.flush(&peer).await
+                && self.is_live(vgen)
+            {
                 self.ui.link.set(Link::Offline(e));
             }
             return Ok(());
@@ -1081,9 +1118,25 @@ impl<V: VaultStore> Engine<V> {
                     let view = inner
                         .add(peer, Kind::Attachment(pointer), false)
                         .await
-                        .map_err(AnnounceError::NotSent)?;
+                        .map_err(|e| {
+                            if !self.is_live(vgen) {
+                                AnnounceError::SaveAfterSend {
+                                    error: e,
+                                    pending: Box::new(pending.clone()),
+                                }
+                            } else {
+                                AnnounceError::NotSent(e)
+                            }
+                        })?;
                     if !self.is_live(vgen) {
-                        return Err(AnnounceError::NotSent("locked".into()));
+                        // R9-P1-1: `inner.add` already persisted the `HistoryEntry` and `Outbox`
+                        // item durably; classify as `SaveAfterSend` so callers never delete the
+                        // server upload allocation on teardown.
+                        pending.history_index = view.index;
+                        return Err(AnnounceError::SaveAfterSend {
+                            error: "locked".into(),
+                            pending: Box::new(pending),
+                        });
                     }
                     let index = view.index;
                     self.show_new(inner, peer, vec![view]);

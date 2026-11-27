@@ -486,6 +486,55 @@ impl LocalPrekeys {
         self.generations.back().map(|g| g.signed_prekey)
     }
 
+    /// Whether any currently retained prekey generation has `signed_prekey`.
+    pub fn contains_signed_prekey(&self, signed_prekey: &PublicKey) -> bool {
+        self.generations
+            .iter()
+            .any(|g| g.signed_prekey == *signed_prekey)
+    }
+
+    /// Signed prekeys that [`prune_to_kept`](Self::prune_to_kept) would retain without mutating
+    /// `self`.
+    pub fn retained_signed_prekeys_after_prune(
+        &self,
+        preserve_signed_prekeys: &[PublicKey],
+    ) -> Vec<PublicKey> {
+        let mut start = 0;
+        let len = self.generations.len();
+        while len - start > KEPT_GENERATIONS {
+            if preserve_signed_prekeys.contains(&self.generations[start].signed_prekey) {
+                break;
+            }
+            start += 1;
+        }
+        self.generations
+            .iter()
+            .skip(start)
+            .map(|g| g.signed_prekey)
+            .collect()
+    }
+
+    /// Existing signed prekeys that [`prune_to_kept`](Self::prune_to_kept) would still retain
+    /// after pushing one new rotated generation on top of `self`.
+    pub fn retained_signed_prekeys_after_rotation(
+        &self,
+        preserve_signed_prekeys: &[PublicKey],
+    ) -> Vec<PublicKey> {
+        let mut start = 0;
+        let len = self.generations.len();
+        while (len + 1) - start > KEPT_GENERATIONS {
+            if preserve_signed_prekeys.contains(&self.generations[start].signed_prekey) {
+                break;
+            }
+            start += 1;
+        }
+        self.generations
+            .iter()
+            .skip(start)
+            .map(|g| g.signed_prekey)
+            .collect()
+    }
+
     /// The signed prekey of the oldest generation that the next [`generate`](Self::generate)
     /// would evict, if `self.generations.len() >= KEPT_GENERATIONS`.
     pub fn oldest_evictable_signed_prekey(&self) -> Option<PublicKey> {

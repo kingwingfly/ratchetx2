@@ -514,7 +514,7 @@ mod v2 {
         pub(crate) prev_manifest_seq: u64,
         pub(crate) prev_prekey_generation: u64,
         pub(crate) manifest_digest: [u8; 32],
-        pub(crate) evicted_manifest_digest: Vec<(usize, [u8; 32])>,
+        pub(crate) evicted_manifest_digest: Vec<(usize, [u8; 32], Option<PublicKey>)>,
         pub(crate) classical: PublishedPrekeys,
         pub(crate) rollback: PrekeyRollback,
         pub(crate) was_publishing: bool,
@@ -1197,7 +1197,10 @@ mod v2 {
             if strict_pq && !pq_enabled {
                 return Err(ErrorKind::PqRequired.into());
             }
-            if !self.has_spare_manifest_digest_slot(preserve_manifest_digests) {
+            if !self.has_spare_manifest_digest_slot_for_publish(
+                preserve_signed_prekeys,
+                preserve_manifest_digests,
+            ) {
                 return Err(ErrorKind::LimitExceeded.into());
             }
 
@@ -1494,7 +1497,7 @@ mod v2 {
             if let Some(d) = relay_digest {
                 // Record the verified relay manifest digest as confirmed so subsequent failed
                 // publish attempts can never evict it from the rolling 16-entry window.
-                self.state.record_confirmed_manifest_digest(d);
+                self.state.record_confirmed_manifest_digest(d, relay_spk);
                 if !eff_digests.contains(&d) {
                     eff_digests.push(d);
                 }
@@ -1539,8 +1542,10 @@ mod v2 {
             preserve_manifest_digests: &[[u8; 32]],
         ) {
             self.state.publishing = false;
-            self.state
-                .record_confirmed_manifest_digest(prepared.manifest_digest);
+            self.state.record_confirmed_manifest_digest(
+                prepared.manifest_digest,
+                Some(prepared.classical.signed_prekey),
+            );
             self.state.prekeys.prune_to_kept(preserve_signed_prekeys);
             self.state
                 .prune_manifest_digests_preserving(preserve_manifest_digests);
@@ -1585,12 +1590,22 @@ mod v2 {
                 if !orig_manifest.pq_enabled {
                     return Err(ErrorKind::Protocol.into());
                 }
+                let post_commit_spks = self
+                    .state
+                    .prekeys
+                    .retained_signed_prekeys_after_prune(&prepared.preserve_signed_prekeys);
                 let preserved_other = self
                     .state
                     .recent_manifest_digests
                     .iter()
                     .filter(|d| {
-                        **d != prepared.manifest_digest && preserve_manifest_digests.contains(d)
+                        **d != prepared.manifest_digest
+                            && (preserve_manifest_digests.contains(d)
+                                || self
+                                    .state
+                                    .manifest_digest_spks
+                                    .get(*d)
+                                    .is_some_and(|spk| post_commit_spks.contains(spk)))
                     })
                     .count();
                 if preserved_other >= crate::MAX_RETAINED_MANIFEST_DIGESTS {

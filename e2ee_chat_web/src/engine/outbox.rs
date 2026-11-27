@@ -2648,10 +2648,12 @@ impl<V: VaultStore> Inner<V> {
         let mut clear_dispatched: Vec<(u64, u64)> = Vec::new();
         if let Some(retired_id) = active_id {
             for (idx, clock) in dispatched_candidates {
-                if let Ok(rec) = self.vault.outgoing(peer, idx).await
-                    && rec.session_id.as_slice() == retired_id.as_slice()
-                {
-                    clear_dispatched.push((idx, clock));
+                match self.vault.outgoing(peer, idx).await {
+                    Ok(rec) if rec.session_id.as_slice() == retired_id.as_slice() => {
+                        clear_dispatched.push((idx, clock));
+                    }
+                    Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
+                    Err(e) => return Err(describe(&e)),
                 }
             }
         }

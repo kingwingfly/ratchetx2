@@ -1894,9 +1894,14 @@ impl<V: VaultStore> Engine<V> {
                     let peer_blocked = peer_has_buffered || peer_awaiting_user_or_upgrade;
 
                     if peer_blocked {
+                        // R9-P1-3: Only gate unsupported-suite carried initials by
+                        // `can_pin_deferred_digest`; NEVER strip a supported-suite carried
+                        // initial from a healthy peer's buffered envelope before ACKing.
                         let initial_message = env.initial_message.filter(|wire| {
-                            Incoming::try_from(wire)
-                                .is_ok_and(|inc| inner.can_pin_deferred_digest(&inc, now_ms))
+                            Incoming::try_from(wire).is_ok_and(|inc| {
+                                !inc.pq_suite().is_some_and(|suite| !suite.is_supported())
+                                    || inner.can_pin_deferred_digest(&inc, now_ms)
+                            })
                         });
                         let buffered = push_deferred_envelope(
                             &mut inner.deferred_envelopes,
@@ -2029,7 +2034,8 @@ impl<V: VaultStore> Engine<V> {
                             } else {
                                 env.initial_message.filter(|wire| {
                                     Incoming::try_from(wire).is_ok_and(|inc| {
-                                        inner.can_pin_deferred_digest(&inc, now_ms)
+                                        !inc.pq_suite().is_some_and(|suite| !suite.is_supported())
+                                            || inner.can_pin_deferred_digest(&inc, now_ms)
                                     })
                                 })
                             };

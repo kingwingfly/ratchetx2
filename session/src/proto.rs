@@ -32,7 +32,17 @@ impl fmt::Debug for ClientState {
                 "confirmed_manifest_digests",
                 &self.confirmed_manifest_digests.len(),
             )
+            .field("manifest_digest_spks", &self.manifest_digest_spks.len())
             .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Debug for SignedPrekeyManifestDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignedPrekeyManifestDigest")
+            .field("digest_len", &self.digest.len())
+            .field("signed_prekey_len", &self.signed_prekey.len())
+            .finish()
     }
 }
 

@@ -351,6 +351,12 @@ pub(super) struct Inner<V = Vault> {
     last_server_pq_opks_by_suite: Option<std::collections::BTreeMap<session::PqSuite, u32>>,
     /// Per-suite PQOPKs consumed locally since the latest publish or refill baseline.
     used_pq_by_suite: std::collections::BTreeMap<session::PqSuite, u32>,
+    /// Pre-refill classical OPK claims already deducted in the latest relay `RefillPrekeys`
+    /// response whose corresponding greetings have not yet been accepted locally (`R9-P3-1`).
+    unmatched_server_classical_claims: u32,
+    /// Pre-refill per-suite PQOPK claims already deducted in the latest relay `RefillPrekeys`
+    /// response whose corresponding greetings have not yet been accepted locally (`R9-P3-1`).
+    unmatched_server_pq_claims_by_suite: std::collections::BTreeMap<session::PqSuite, u32>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
     /// Encrypted inbox initials retained in the separate `deferred` vault sidecar record.
@@ -2851,6 +2857,8 @@ impl<V: VaultStore> Inner<V> {
             last_server_classical_opks: None,
             last_server_pq_opks_by_suite: None,
             used_pq_by_suite: std::collections::BTreeMap::new(),
+            unmatched_server_classical_claims: 0,
+            unmatched_server_pq_claims_by_suite: std::collections::BTreeMap::new(),
             unsaved_state: false,
             deferred_acks_after_save: vec![],
             contacts_dirty_late: false,

@@ -96,6 +96,7 @@ async fn state_validation_on_prost_restore_rejects_corruption() {
         pending_mailbox_ack: 0,
         next_grant_version: 0,
         confirmed_manifest_digests: vec![],
+        manifest_digest_spks: vec![],
     };
     let restored_client = session::ClientState::try_from(&default_v3_client).unwrap();
     assert_eq!(restored_client.next_grant_version(), 1);

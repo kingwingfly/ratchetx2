@@ -42,6 +42,18 @@ message ClientState {
   // (bounded <= 16); prioritized ahead of unconfirmed staged digests so repeated failed
   // publish attempts cannot evict the last confirmed relay manifest digest.
   repeated bytes confirmed_manifest_digests = 15;
+  // Optional mapping from retained CapabilityManifest digest to the signed prekey it binds,
+  // allowing local retention to keep every manifest digest associated with relay-admissible
+  // signed prekeys until those prekeys are evicted.
+  repeated SignedPrekeyManifestDigest manifest_digest_spks = 16;
+}
+
+// Binding between a locally signed CapabilityManifest digest and its signed prekey.
+message SignedPrekeyManifestDigest {
+  // SHA-256 digest of the signed CapabilityManifest (32 bytes).
+  bytes digest = 1;
+  // Signed prekey public key bound by that manifest (32 bytes).
+  bytes signed_prekey = 2;
 }
 
 // Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.

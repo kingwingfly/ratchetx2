@@ -14,6 +14,7 @@ pub mod proto;
 mod safety;
 
 use core::mem;
+use std::collections::BTreeMap;
 
 use bon::Builder;
 use bytes::Bytes;
@@ -259,6 +260,14 @@ pub struct ClientState {
         )
     )]
     pub(crate) confirmed_manifest_digests: Vec<[u8; 32]>,
+    /// Mapping from retained `CapabilityManifest` digest to the `signed_prekey` it bound, so
+    /// every manifest digest for a still-retained (relay-admissible) signed prekey stays protected
+    /// against rolling truncation until that signed prekey is evicted (`R9-P2-4`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, serialize_with = "serialize_digest_spk_map")
+    )]
+    pub(crate) manifest_digest_spks: BTreeMap<[u8; 32], PublicKey>,
     /// Unified mailbox high-water sequence number last committed locally.
     pub(crate) mailbox_cursor: u64,
     /// Unified mailbox sequence number committed locally and awaiting server prefix ACK (`0` if none).
@@ -279,15 +288,27 @@ impl ClientState {
             prekey_generation: 0,
             recent_manifest_digests: vec![],
             confirmed_manifest_digests: vec![],
+            manifest_digest_spks: BTreeMap::new(),
             mailbox_cursor: 0,
             pending_mailbox_ack: 0,
             next_grant_version: 1,
         }
     }
 
+    fn is_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
+        self.manifest_digest_spks
+            .get(digest)
+            .is_some_and(|spk| self.prekeys.contains_signed_prekey(spk))
+    }
+
     /// Record a manifest digest that has been confirmed stored on the relay (either via a
-    /// confirmed `PublishV2` commit or a verified `GetManifest` reconciliation).
-    pub(crate) fn record_confirmed_manifest_digest(&mut self, digest: [u8; 32]) {
+    /// confirmed `PublishV2` commit or a verified `GetManifest` reconciliation), optionally
+    /// associating it with the `signed_prekey` bound by that manifest.
+    pub(crate) fn record_confirmed_manifest_digest(
+        &mut self,
+        digest: [u8; 32],
+        signed_prekey: Option<PublicKey>,
+    ) {
         if let Some(pos) = self
             .confirmed_manifest_digests
             .iter()
@@ -299,15 +320,27 @@ impl ClientState {
         while self.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
             self.confirmed_manifest_digests.remove(0);
         }
+        if let Some(spk) = signed_prekey {
+            self.manifest_digest_spks.insert(digest, spk);
+        }
         if !self.recent_manifest_digests.contains(&digest) {
             self.recent_manifest_digests.push(digest);
             while self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS {
                 let candidate_end = self.recent_manifest_digests.len() - 1;
                 let evict_idx = self.recent_manifest_digests[..candidate_end]
                     .iter()
-                    .position(|d| !self.confirmed_manifest_digests.contains(d))
+                    .position(|d| {
+                        !self.is_digest_for_retained_spk(d)
+                            && !self.confirmed_manifest_digests.contains(d)
+                    })
+                    .or_else(|| {
+                        self.recent_manifest_digests[..candidate_end]
+                            .iter()
+                            .position(|d| !self.confirmed_manifest_digests.contains(d))
+                    })
                     .unwrap_or(0);
-                self.recent_manifest_digests.remove(evict_idx);
+                let removed = self.recent_manifest_digests.remove(evict_idx);
+                self.manifest_digest_spks.remove(&removed);
             }
         }
     }
@@ -323,16 +356,59 @@ impl ClientState {
         preserved_in_recent < MAX_RETAINED_MANIFEST_DIGESTS
     }
 
+    /// Exact capacity check for a `PublishV2` attempt with `(preserve_spks, preserve_digests)`,
+    /// accounting for BOTH explicitly preserved digests AND all manifest digests bound to signed
+    /// prekeys that will remain retained after this publish commits (`R9-P2-4`).
+    ///
+    /// Non-retry in-place extends reserve 1 slot (`< MAX_RETAINED_MANIFEST_DIGESTS - 1`) so the
+    /// current signed prekey can always rotate to a fresh generation and eventually release older
+    /// SPK-bound digests once the previous SPK is evicted.
+    pub fn has_spare_manifest_digest_slot_for_publish(
+        &self,
+        preserve_spks: &[PublicKey],
+        preserve_digests: &[[u8; 32]],
+    ) -> bool {
+        let preserve_oldest = self
+            .prekeys
+            .oldest_evictable_signed_prekey()
+            .is_some_and(|spk| preserve_spks.contains(&spk));
+        let extended = (self.publishing || preserve_oldest) && self.prekeys.generation_count() > 0;
+        let post_commit_spks = if extended {
+            self.prekeys
+                .retained_signed_prekeys_after_prune(preserve_spks)
+        } else {
+            self.prekeys
+                .retained_signed_prekeys_after_rotation(preserve_spks)
+        };
+        let post_commit_pinned = self
+            .recent_manifest_digests
+            .iter()
+            .filter(|d| {
+                preserve_digests.contains(d)
+                    || self
+                        .manifest_digest_spks
+                        .get(*d)
+                        .is_some_and(|spk| post_commit_spks.contains(spk))
+            })
+            .count();
+        let limit = if extended && !self.publishing {
+            MAX_RETAINED_MANIFEST_DIGESTS - 1
+        } else {
+            MAX_RETAINED_MANIFEST_DIGESTS
+        };
+        post_commit_pinned < limit
+    }
+
     /// Stage a freshly signed manifest digest WITHOUT evicting any existing rolling digest yet
     /// (allowing up to `MAX_STORED_MANIFEST_DIGESTS` while a publish is in flight). Only trims if
     /// already at the hard `MAX_STORED_MANIFEST_DIGESTS` ceiling, preferring to evict unconfirmed
-    /// non-preserved staged digests first. Call
+    /// non-preserved digests outside retained signed prekeys first. Call
     /// [`prune_manifest_digests_preserving`](Self::prune_manifest_digests_preserving) on commit.
     pub(crate) fn stage_manifest_digest(
         &mut self,
         digest: [u8; 32],
         preserve: &[[u8; 32]],
-    ) -> Vec<(usize, [u8; 32])> {
+    ) -> Vec<(usize, [u8; 32], Option<PublicKey>)> {
         if let Some(pos) = self
             .recent_manifest_digests
             .iter()
@@ -346,22 +422,41 @@ impl ClientState {
             let candidate_end = self.recent_manifest_digests.len() - 1;
             let evict_idx = self.recent_manifest_digests[..candidate_end]
                 .iter()
-                .position(|d| !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d))
+                .position(|d| {
+                    !preserve.contains(d)
+                        && !self.is_digest_for_retained_spk(d)
+                        && !self.confirmed_manifest_digests.contains(d)
+                })
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| !preserve.contains(d) && !self.is_digest_for_retained_spk(d))
+                })
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| {
+                            !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d)
+                        })
+                })
                 .or_else(|| {
                     self.recent_manifest_digests[..candidate_end]
                         .iter()
                         .position(|d| !preserve.contains(d))
                 })
                 .unwrap_or(0);
-            evicted.push((evict_idx, self.recent_manifest_digests.remove(evict_idx)));
+            let removed = self.recent_manifest_digests.remove(evict_idx);
+            let removed_spk = self.manifest_digest_spks.remove(&removed);
+            evicted.push((evict_idx, removed, removed_spk));
         }
         evicted
     }
 
-    /// Trim `recent_manifest_digests` down to at most `MAX_RECENT_MANIFEST_DIGESTS` rolling
-    /// non-preserved digests PLUS preserved digests (up to `MAX_RETAINED_MANIFEST_DIGESTS` total),
-    /// never evicting the newest `last()` entry and prioritizing confirmed relay digests ahead of
-    /// unconfirmed staged attempts. Called once a publish is confirmed on the relay.
+    /// Trim `recent_manifest_digests` down to at most `MAX_RECENT_MANIFEST_DIGESTS` non-preserved
+    /// digests PLUS explicitly preserved digests (while never evicting confirmed digests bound to
+    /// still-retained signed prekeys, up to `MAX_RETAINED_MANIFEST_DIGESTS` total), never evicting
+    /// the newest `last()` entry and prioritizing confirmed relay digests ahead of unconfirmed
+    /// staged attempts. Called once a publish is confirmed on the relay (AFTER `prekeys.prune_to_kept`).
     pub(crate) fn prune_manifest_digests_preserving(&mut self, preserve: &[[u8; 32]]) {
         loop {
             let candidate_end = self.recent_manifest_digests.len().saturating_sub(1);
@@ -375,29 +470,51 @@ impl ClientState {
             }
             let Some(evict_idx) = self.recent_manifest_digests[..candidate_end]
                 .iter()
-                .position(|d| !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d))
+                .position(|d| {
+                    !preserve.contains(d)
+                        && !self.is_digest_for_retained_spk(d)
+                        && !self.confirmed_manifest_digests.contains(d)
+                })
                 .or_else(|| {
                     self.recent_manifest_digests[..candidate_end]
                         .iter()
-                        .position(|d| !preserve.contains(d))
+                        .position(|d| !preserve.contains(d) && !self.is_digest_for_retained_spk(d))
                 })
             else {
                 break;
             };
-            self.recent_manifest_digests.remove(evict_idx);
+            let removed = self.recent_manifest_digests.remove(evict_idx);
+            self.manifest_digest_spks.remove(&removed);
         }
         while self.recent_manifest_digests.len() > MAX_RETAINED_MANIFEST_DIGESTS {
             let candidate_end = self.recent_manifest_digests.len() - 1;
             let evict_idx = self.recent_manifest_digests[..candidate_end]
                 .iter()
-                .position(|d| !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d))
+                .position(|d| {
+                    !preserve.contains(d)
+                        && !self.is_digest_for_retained_spk(d)
+                        && !self.confirmed_manifest_digests.contains(d)
+                })
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| !preserve.contains(d) && !self.is_digest_for_retained_spk(d))
+                })
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| {
+                            !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d)
+                        })
+                })
                 .or_else(|| {
                     self.recent_manifest_digests[..candidate_end]
                         .iter()
                         .position(|d| !preserve.contains(d))
                 })
                 .unwrap_or(0);
-            self.recent_manifest_digests.remove(evict_idx);
+            let removed = self.recent_manifest_digests.remove(evict_idx);
+            self.manifest_digest_spks.remove(&removed);
         }
     }
 
@@ -406,17 +523,23 @@ impl ClientState {
     pub(crate) fn rollback_manifest_digest(
         &mut self,
         added: [u8; 32],
-        evicted: &[(usize, [u8; 32])],
+        evicted: &[(usize, [u8; 32], Option<PublicKey>)],
     ) {
         if self.recent_manifest_digests.last() == Some(&added) {
             self.recent_manifest_digests.pop();
+            if !self.recent_manifest_digests.contains(&added) {
+                self.manifest_digest_spks.remove(&added);
+            }
         }
-        for &(pos, restored) in evicted.iter().rev() {
+        for &(pos, restored, restored_spk) in evicted.iter().rev() {
             if self.recent_manifest_digests.len() < MAX_STORED_MANIFEST_DIGESTS
                 && !self.recent_manifest_digests.contains(&restored)
             {
                 let idx = pos.min(self.recent_manifest_digests.len());
                 self.recent_manifest_digests.insert(idx, restored);
+                if let Some(spk) = restored_spk {
+                    self.manifest_digest_spks.insert(restored, spk);
+                }
             }
         }
     }
@@ -464,6 +587,11 @@ impl ClientState {
             || self.next_grant_version > protocol::MAX_SAFE_INTEGER
             || self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS
             || self.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            || self.manifest_digest_spks.len() > MAX_STORED_MANIFEST_DIGESTS
+            || self
+                .manifest_digest_spks
+                .keys()
+                .any(|d| !self.recent_manifest_digests.contains(d))
             || (self.manifest_seq > 0 && self.recent_manifest_digests.is_empty())
         {
             return Err(ErrorKind::MalformedState.into());
@@ -521,6 +649,22 @@ where
 }
 
 #[cfg(feature = "serde")]
+fn serialize_digest_spk_map<S>(
+    map: &BTreeMap<[u8; 32], PublicKey>,
+    serializer: S,
+) -> core::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq as _;
+    let mut seq = serializer.serialize_seq(Some(map.len()))?;
+    for (digest, spk) in map {
+        seq.serialize_element(&(digest, spk))?;
+    }
+    seq.end()
+}
+
+#[cfg(feature = "serde")]
 fn default_grant_version() -> u64 {
     1
 }
@@ -549,6 +693,11 @@ struct RawClientState {
         deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
     )]
     confirmed_manifest_digests: Vec<[u8; 32]>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_MANIFEST_DIGESTS>"
+    )]
+    manifest_digest_spks: Vec<([u8; 32], PublicKey)>,
     #[serde(default)]
     mailbox_cursor: u64,
     #[serde(default)]
@@ -562,6 +711,12 @@ impl TryFrom<RawClientState> for ClientState {
     type Error = Error;
 
     fn try_from(raw: RawClientState) -> Result<Self> {
+        let mut manifest_digest_spks = BTreeMap::new();
+        for (digest, spk) in raw.manifest_digest_spks {
+            if manifest_digest_spks.insert(digest, spk).is_some() {
+                return Err(ErrorKind::MalformedState.into());
+            }
+        }
         let state = Self {
             identity: raw.identity,
             prekeys: raw.prekeys,
@@ -572,6 +727,7 @@ impl TryFrom<RawClientState> for ClientState {
             prekey_generation: raw.prekey_generation,
             recent_manifest_digests: raw.recent_manifest_digests,
             confirmed_manifest_digests: raw.confirmed_manifest_digests,
+            manifest_digest_spks,
             mailbox_cursor: raw.mailbox_cursor,
             pending_mailbox_ack: raw.pending_mailbox_ack,
             next_grant_version: raw.next_grant_version.max(1),
@@ -605,6 +761,14 @@ impl From<&ClientState> for proto::ClientState {
                 .iter()
                 .map(|d| d.to_vec())
                 .collect(),
+            manifest_digest_spks: state
+                .manifest_digest_spks
+                .iter()
+                .map(|(digest, spk)| proto::SignedPrekeyManifestDigest {
+                    digest: digest.to_vec(),
+                    signed_prekey: spk.to_vec(),
+                })
+                .collect(),
             mailbox_cursor: state.mailbox_cursor,
             pending_mailbox_ack: state.pending_mailbox_ack,
             next_grant_version: state.next_grant_version.max(1),
@@ -636,6 +800,7 @@ impl TryFrom<&proto::ClientState> for ClientState {
         }
         if state.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS
             || state.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            || state.manifest_digest_spks.len() > MAX_STORED_MANIFEST_DIGESTS
         {
             return Err(ErrorKind::MalformedState.into());
         }
@@ -655,6 +820,16 @@ impl TryFrom<&proto::ClientState> for ClientState {
                     .map_err(|_| Error::from(ErrorKind::MalformedState))
             })
             .collect::<Result<Vec<_>>>()?;
+        let mut manifest_digest_spks = BTreeMap::new();
+        for entry in &state.manifest_digest_spks {
+            let digest = <[u8; 32]>::try_from(entry.digest.as_slice())
+                .map_err(|_| Error::from(ErrorKind::MalformedState))?;
+            let spk = PublicKey::try_from(entry.signed_prekey.as_slice())
+                .map_err(|_| Error::from(ErrorKind::MalformedState))?;
+            if manifest_digest_spks.insert(digest, spk).is_some() {
+                return Err(ErrorKind::MalformedState.into());
+            }
+        }
         let pq_config = PqConfig {
             pq_enabled: !state.pq_disabled,
             preferred_suite,
@@ -676,6 +851,7 @@ impl TryFrom<&proto::ClientState> for ClientState {
             prekey_generation: state.prekey_generation,
             recent_manifest_digests,
             confirmed_manifest_digests,
+            manifest_digest_spks,
             mailbox_cursor: state.mailbox_cursor,
             pending_mailbox_ack: state.pending_mailbox_ack,
             next_grant_version: state.next_grant_version.max(1),
@@ -760,10 +936,27 @@ impl<H> Client<H> {
         self.state.has_spare_manifest_digest_slot(preserve)
     }
 
+    /// Exact capacity check for a `PublishV2` attempt preserving `(preserve_spks, preserve_digests)`
+    /// as well as every manifest digest bound to signed prekeys that will remain retained after
+    /// commit (`R9-P2-4`).
+    pub fn has_spare_manifest_digest_slot_for_publish(
+        &self,
+        preserve_spks: &[PublicKey],
+        preserve_digests: &[[u8; 32]],
+    ) -> bool {
+        self.state
+            .has_spare_manifest_digest_slot_for_publish(preserve_spks, preserve_digests)
+    }
+
     /// SHA-256 digests of all locally signed `CapabilityManifest`s currently retained by this
     /// client (both rolling and preserved).
     pub fn recent_manifest_digests(&self) -> &[[u8; 32]] {
         &self.state.recent_manifest_digests
+    }
+
+    /// SHA-256 digests of locally signed `CapabilityManifest`s confirmed stored on the relay.
+    pub fn confirmed_manifest_digests(&self) -> &[[u8; 32]] {
+        &self.state.confirmed_manifest_digests
     }
 
     /// Prekey generation number last prepared/published via v2 by this client.
@@ -4823,5 +5016,110 @@ mod test {
         );
         // Dropping 1 pin frees a slot cleanly (`143 < 144`).
         assert!(client.has_spare_manifest_digest_slot(&pinned[1..]));
+    }
+
+    #[test]
+    fn r9_p2_4_retained_spk_manifest_digests_survive_inplace_publishes_and_rotation() {
+        let mut client = Client::new(());
+        // Generation 1 (SPK A)
+        let pa = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_a = pa.classical.signed_prekey;
+        client.commit_publish_v2(pa);
+
+        // Generation 2 (SPK B, manifest M0)
+        let pb0 = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_b = pb0.classical.signed_prekey;
+        assert_ne!(spk_a, spk_b);
+        let m0 = pb0.request.manifest.clone().unwrap();
+        let d0 = protocol::handshake_v2::manifest_digest(&m0).unwrap();
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        let m0_pq_lr = pb0.request.pq_last_resort[0].clone();
+        client.commit_publish_v2(pb0);
+
+        // Perform 16 confirmed in-place publishes on SPK B while SPK A is preserved (undrained
+        // inbox), producing M1..M16 all bound to SPK B.
+        for _ in 0..16 {
+            let p_ext = client
+                .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+                .unwrap();
+            assert_eq!(p_ext.classical.signed_prekey, spk_b);
+            client.commit_publish_v2_preserving(p_ext, &[spk_a], &[]);
+        }
+        assert!(client.recent_manifest_digests().contains(&d0));
+
+        // Inbox drains (`preserve = &[]`) and next publish rotates from B -> C (M17).
+        // Relay still accepts SPK B as `prev_signed_prekey`, so M0 MUST stay retained!
+        let pc = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_c = pc.classical.signed_prekey;
+        assert_ne!(spk_c, spk_b);
+        client.commit_publish_v2(pc);
+        assert!(
+            client.recent_manifest_digests().contains(&d0),
+            "R9-P2-4: oldest manifest digest M0 on relay-admissible prev_signed_prekey B must NOT be pruned"
+        );
+
+        #[cfg(feature = "prost")]
+        {
+            let wire = proto::ClientState::from(client.state());
+            let restored = ClientState::try_from(&wire).unwrap();
+            assert_eq!(
+                restored.manifest_digest_spks,
+                client.state.manifest_digest_spks
+            );
+            assert!(restored.recent_manifest_digests.contains(&d0));
+        }
+
+        // Delayed PQ greeting referencing M0 on SPK B must be ACCEPTED (not DowngradeDetected!).
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            let alice_id = XEdDSAPrivateKey::generate();
+            let suite = PqSuite::from_u8(m0_pq_lr.suite as u8).unwrap();
+            let mut lr_sig = [0u8; 64];
+            lr_sig.copy_from_slice(&m0_pq_lr.signature);
+            let pq_bundle = x3dh::PqPrekeyBundle {
+                signed_prekey: spk_b,
+                signed_prekey_signature: None,
+                one_time_prekey: None,
+                pq_suite: suite,
+                pq_prekey: m0_pq_lr.encapsulation_key.to_vec(),
+                pq_prekey_signature: lr_sig,
+                pq_last_resort: true,
+            };
+            let (pq_init, agreement) = pq_bundle
+                .initiate_pq(&alice_id, &client.identity_key(), Some(&d0))
+                .unwrap();
+            let ratchet =
+                Ratchet::alice(&SharedKeys::from_secret(&agreement.secret_key), &spk_b).unwrap();
+            let mut party = Party::new(ratchet, agreement.associated_data);
+            let first_message = party.encrypt(b"delayed-m0").unwrap();
+            let msg = InitialMessageV2 {
+                id: 42,
+                sender: alice_id.compute_public_key().to_bytes(),
+                kind: InitialMessageKind::Pq {
+                    x3dh: pq_init,
+                    first_message,
+                    manifest_digest: Some(d0),
+                },
+            };
+            let res = client.accept_initial_v2(
+                &alice_id.compute_public_key().to_bytes(),
+                &PeerPqState::default(),
+                &msg,
+                (),
+            );
+            assert!(
+                res.is_ok(),
+                "R9-P2-4: delayed PQ greeting for M0 on prev_signed_prekey B must succeed: {res:?}"
+            );
+        }
+
+        // Next rotation C -> D evicts SPK B from LocalPrekeys (and relay prev_signed_prekey), so
+        // B's digests automatically become eligible for rolling trim back down to 16.
+        let pd = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        client.commit_publish_v2(pd);
+        assert!(
+            client.recent_manifest_digests().len() <= MAX_RECENT_MANIFEST_DIGESTS,
+            "R9-P2-4: once SPK B is evicted, its digests must prune cleanly back to <= 16"
+        );
     }
 }
