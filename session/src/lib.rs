@@ -48,7 +48,7 @@ pub(crate) const MAX_RECEIVE_PAGE: u32 = 100;
 
 /// Maximum number of rolling non-preserved locally signed `CapabilityManifest` digests retained in
 /// `ClientState`.
-pub(crate) const MAX_RECENT_MANIFEST_DIGESTS: usize = 16;
+pub const MAX_RECENT_MANIFEST_DIGESTS: usize = 16;
 
 /// Hard upper bound on `recent_manifest_digests` including digests explicitly preserved for
 /// deferred unsupported-suite initial messages (16 rolling + up to 128 deferred-initial pins).
@@ -315,11 +315,12 @@ impl ClientState {
     /// Whether recording another manifest digest can fit within `MAX_RETAINED_MANIFEST_DIGESTS`
     /// without evicting any digest listed in `preserve`.
     pub fn has_spare_manifest_digest_slot(&self, preserve: &[[u8; 32]]) -> bool {
-        self.recent_manifest_digests.len() < MAX_RETAINED_MANIFEST_DIGESTS
-            || self
-                .recent_manifest_digests
-                .iter()
-                .any(|d| !preserve.contains(d))
+        let preserved_in_recent = self
+            .recent_manifest_digests
+            .iter()
+            .filter(|d| preserve.contains(d))
+            .count();
+        preserved_in_recent < MAX_RETAINED_MANIFEST_DIGESTS
     }
 
     /// Stage a freshly signed manifest digest WITHOUT evicting any existing rolling digest yet
@@ -753,10 +754,16 @@ impl<H> Client<H> {
         self.state.manifest_seq
     }
 
-    /// Whether recording another manifest digest can fit within `MAX_RECENT_MANIFEST_DIGESTS`
+    /// Whether recording another manifest digest can fit within [`MAX_RETAINED_MANIFEST_DIGESTS`]
     /// without evicting any digest listed in `preserve`.
     pub fn has_spare_manifest_digest_slot(&self, preserve: &[[u8; 32]]) -> bool {
         self.state.has_spare_manifest_digest_slot(preserve)
+    }
+
+    /// SHA-256 digests of all locally signed `CapabilityManifest`s currently retained by this
+    /// client (both rolling and preserved).
+    pub fn recent_manifest_digests(&self) -> &[[u8; 32]] {
+        &self.state.recent_manifest_digests
     }
 
     /// Prekey generation number last prepared/published via v2 by this client.
@@ -4768,5 +4775,53 @@ mod test {
                 client.state.confirmed_manifest_digests
             );
         }
+    }
+
+    #[test]
+    fn r8_p2_7_has_spare_digest_slot_and_prepare_refuse_unsatisfiable_preserve() {
+        let mut client = Client::new(());
+        let mut pinned = Vec::new();
+        for _ in 0..MAX_RETAINED_MANIFEST_DIGESTS {
+            let prep = client
+                .prepare_publish_v2_preserving("relay.example", 1, 1, &[], &pinned)
+                .unwrap();
+            let d =
+                protocol::handshake_v2::manifest_digest(prep.request.manifest.as_ref().unwrap())
+                    .unwrap();
+            pinned.push(d);
+            client.commit_publish_v2(prep);
+        }
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert!(
+            !client.has_spare_manifest_digest_slot(&pinned),
+            "144 preserved digests leave zero spare slots"
+        );
+        let seq_before = client.manifest_seq();
+        let err = client
+            .prepare_publish_v2_preserving("relay.example", 1, 1, &[], &pinned)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::LimitExceeded);
+        assert_eq!(client.manifest_seq(), seq_before);
+        assert!(
+            client.recent_manifest_digests().contains(&pinned[0]),
+            "unsatisfiable preserve set must fail before mutating state or evicting index 0"
+        );
+
+        // Even if an unconfirmed 145th digest is staged alongside 144 preserved digests,
+        // `has_spare_manifest_digest_slot` MUST still return false (no off-by-one!).
+        client.state.stage_manifest_digest([0xee; 32], &pinned);
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_STORED_MANIFEST_DIGESTS
+        );
+        assert!(
+            !client.has_spare_manifest_digest_slot(&pinned),
+            "144 preserved + 1 unconfirmed staged (145 total) still has zero spare slots"
+        );
+        // Dropping 1 pin frees a slot cleanly (`143 < 144`).
+        assert!(client.has_spare_manifest_digest_slot(&pinned[1..]));
     }
 }

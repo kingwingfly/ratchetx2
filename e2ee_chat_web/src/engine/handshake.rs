@@ -464,7 +464,60 @@ pub(super) fn prune_invalid_inbox_acks(pending: &mut Vec<u64>) -> usize {
     before - pending.len()
 }
 
+/// Maximum distinct local manifest digests that deferred initial messages may pin, reserving
+/// [`session::MAX_RECENT_MANIFEST_DIGESTS`] (16) slots for rolling/mandatory manifest renewals
+/// (`R8-P2-7`).
+const MAX_DEFERRED_PINNED_DIGESTS: usize =
+    session::MAX_RETAINED_MANIFEST_DIGESTS - session::MAX_RECENT_MANIFEST_DIGESTS;
+
+/// Pin the oldest evictable signed prekey AND every locally retained manifest digest whenever
+/// `inbox_ready_for_eviction == false` so an undrained inbox (`listed = 1` row whose list response
+/// was lost or un-ACKed) can never lose either its SPK (`R7-P1-4`) or its manifest digest `M0`
+/// (`R8-P0-1`) across repeated publishes.
+fn preserve_undrained_inbox_prekeys<V: VaultStore>(
+    inner: &Inner<V>,
+    inbox_ready_for_eviction: bool,
+    preserve_spks: &mut Vec<PublicKey>,
+    preserve_digests: &mut Vec<[u8; 32]>,
+) {
+    if inbox_ready_for_eviction {
+        return;
+    }
+    if let Some(oldest_spk) = inner.client.oldest_evictable_signed_prekey()
+        && !preserve_spks.contains(&oldest_spk)
+    {
+        preserve_spks.push(oldest_spk);
+    }
+    for &digest in inner.client.recent_manifest_digests() {
+        if !preserve_digests.contains(&digest) {
+            preserve_digests.push(digest);
+        }
+    }
+}
+
 impl<V: VaultStore> Inner<V> {
+    /// Whether deferring `message` would stay within [`MAX_DEFERRED_PINNED_DIGESTS`] distinct
+    /// locally retained manifest digests, preserving rolling/renewal manifest capacity (`R8-P2-7`).
+    pub(super) fn can_pin_deferred_digest(&self, message: &Incoming, now_ms: u64) -> bool {
+        let (_, new_digest) = initial_spk_and_digest(message);
+        let Some(digest) = new_digest else {
+            return true;
+        };
+        let recent = self.client.recent_manifest_digests();
+        if !recent.contains(&digest) {
+            return true;
+        }
+        let (_, existing_digests) = preserved_deferred_prekeys(self, now_ms);
+        if existing_digests.contains(&digest) {
+            return true;
+        }
+        let pinned_in_recent = recent
+            .iter()
+            .filter(|d| existing_digests.contains(d))
+            .count();
+        pinned_in_recent < MAX_DEFERRED_PINNED_DIGESTS
+    }
+
     /// Reserve a local copy deduplicated by payload (ignoring relay-assigned inbox ID) and
     /// include its ack ID in the same vault transaction.
     pub(super) fn defer_inbox_initial(&mut self, message: &Incoming) -> DeferInboxOutcome {
@@ -477,12 +530,15 @@ impl<V: VaultStore> Inner<V> {
             .iter()
             .any(|entry| entry.initial.as_ref() == Some(&wire));
         if !already_stored {
-            if self.deferred_initials.len() >= MAX_DEFERRED_INITIALS {
+            let now_ms = now();
+            if self.deferred_initials.len() >= MAX_DEFERRED_INITIALS
+                || !self.can_pin_deferred_digest(message, now_ms)
+            {
                 return DeferInboxOutcome::CapFull;
             }
             self.deferred_initials.push(DeferredInitial {
                 initial: Some(wire),
-                deferred_at: now(),
+                deferred_at: now_ms,
             });
         }
         let dirty =
@@ -709,6 +765,13 @@ impl PublishError {
 enum RefillV2Outcome {
     Handled,
     PqDisabled,
+    MixedLimitExceeded,
+}
+
+#[derive(PartialEq, Eq)]
+enum PublishFullOutcome {
+    Published,
+    Deferred,
 }
 
 impl<V: VaultStore> Engine<V> {
@@ -1584,16 +1647,16 @@ impl<V: VaultStore> Engine<V> {
         };
         let prev_seq = inner.client.manifest_seq();
         let prev_gen = inner.client.prekey_generation();
-        let (mut preserve_spks, preserve_digests) = preserved_deferred_prekeys(inner, now());
+        let (mut preserve_spks, mut preserve_digests) = preserved_deferred_prekeys(inner, now());
         let inbox_ready_for_eviction = allow_scheduled_rotation
             && self.inbox_drained_clean.get()
             && inner.state.pending_inbox_acks.is_empty();
-        if !inbox_ready_for_eviction
-            && let Some(oldest_spk) = inner.client.oldest_evictable_signed_prekey()
-            && !preserve_spks.contains(&oldest_spk)
-        {
-            preserve_spks.push(oldest_spk);
-        }
+        preserve_undrained_inbox_prekeys(
+            inner,
+            inbox_ready_for_eviction,
+            &mut preserve_spks,
+            &mut preserve_digests,
+        );
         let landed = inner.client.reconcile_interrupted_publish(
             verified_manifest.as_ref(),
             &preserve_spks,
@@ -1665,7 +1728,9 @@ impl<V: VaultStore> Engine<V> {
         vgen: u64,
         now_anyway: bool,
     ) -> Result<(), PublishError> {
-        self.publish_full_locked_gated(vgen, now_anyway, true).await
+        self.publish_full_locked_gated(vgen, now_anyway, true)
+            .await
+            .map(|_| ())
     }
 
     async fn publish_full_locked_gated(
@@ -1673,7 +1738,7 @@ impl<V: VaultStore> Engine<V> {
         vgen: u64,
         now_anyway: bool,
         allow_scheduled_rotation: bool,
-    ) -> Result<(), PublishError> {
+    ) -> Result<PublishFullOutcome, PublishError> {
         // Mandatory renewal threshold (25 days < 30-day manifest TTL) so an expired or
         // near-expired manifest always renews in place even when scheduled SPK rotation is
         // deferred by an undrained inbox (`R7-P2-4`).
@@ -1697,7 +1762,7 @@ impl<V: VaultStore> Engine<V> {
             .reconcile_pending_publish_locked(vgen, now_anyway, allow_scheduled_rotation)
             .await?
         {
-            return Ok(());
+            return Ok(PublishFullOutcome::Published);
         }
         // Phase 1 under `self.inner`: re-verify schedule/pause state under `publish_lock`,
         // prepare signed manifest + prekeys (retaining the prior SPKs and digests in `ClientState`
@@ -1724,13 +1789,11 @@ impl<V: VaultStore> Engine<V> {
                     || manifest_near_expiry
                     || now_ms.saturating_sub(inner.state.published_at) > REPUBLISH_AGE;
                 if !full_due || self.startup.is_publish_paused() {
-                    return Ok(());
+                    return Ok(PublishFullOutcome::Deferred);
                 }
             }
-            let (mut preserve_spks, preserve_digests) = preserved_deferred_prekeys(inner, now_ms);
-            let has_spare_digest = inner
-                .client
-                .has_spare_manifest_digest_slot(&preserve_digests);
+            let (mut preserve_spks, mut preserve_digests) =
+                preserved_deferred_prekeys(inner, now_ms);
             let is_scheduled_rotation = !now_anyway
                 && !inner.state.needs_publish
                 && !has_unreconciled
@@ -1745,11 +1808,24 @@ impl<V: VaultStore> Engine<V> {
                 self.ui.log(
                     "Deferred scheduled prekey rotation until pending inbox initial messages are acknowledged.",
                 );
-                return Ok(());
+                return Ok(PublishFullOutcome::Deferred);
             }
-            // Never evict a pinned deferred manifest digest on an automatic publish (including
-            // age-based manifest renewal) when all 144 digest slots are pinned by deferred
-            // initials awaiting replay (`R3-P2-6`).
+            // R7-P1-4 + R8-P0-1: When the inbox has not cleanly drained yet, pin BOTH
+            // `oldest_evictable_signed_prekey` AND every locally retained manifest digest so
+            // repeated publishes can never destroy a key or manifest digest referenced by an
+            // unseen `listed = 1` inbox row.
+            preserve_undrained_inbox_prekeys(
+                inner,
+                inbox_ready_for_eviction,
+                &mut preserve_spks,
+                &mut preserve_digests,
+            );
+            let has_spare_digest = inner
+                .client
+                .has_spare_manifest_digest_slot(&preserve_digests);
+            // Never evict a pinned deferred or undrained-inbox manifest digest on an automatic
+            // publish (including age-based manifest renewal) when all 144 digest slots are pinned
+            // (`R3-P2-6`, `R8-P2-7`). Return `Deferred` so non-rotating OPK refills still run.
             if !now_anyway
                 && !inner.state.needs_publish
                 && !has_unreconciled
@@ -1759,19 +1835,9 @@ impl<V: VaultStore> Engine<V> {
                 && !has_spare_digest
             {
                 self.ui.log(
-                    "Deferred scheduled prekey rotation: all manifest digest slots are pinned by deferred initial messages awaiting replay.",
+                    "Deferred scheduled prekey rotation: all manifest digest slots are pinned by deferred or pending inbox initial messages.",
                 );
-                return Ok(());
-            }
-            // For mandatory publishes (manual, settings change, expired manifest renewal, or
-            // unreconciled retry) when the inbox has not cleanly drained yet, pin
-            // `oldest_evictable_signed_prekey` so `prepare_publish_v2_preserving` renews/extends
-            // the current SPK in place instead of destroying a key needed by a `listed = 1` row.
-            if !inbox_ready_for_eviction
-                && let Some(oldest_spk) = inner.client.oldest_evictable_signed_prekey()
-                && !preserve_spks.contains(&oldest_spk)
-            {
-                preserve_spks.push(oldest_spk);
+                return Ok(PublishFullOutcome::Deferred);
             }
             let pre_classical_used = inner.state.used_one_time_prekeys;
             let pre_pq_used = inner.state.used_pq_one_time_prekeys;
@@ -1828,7 +1894,17 @@ impl<V: VaultStore> Engine<V> {
                     let Some(inner) = guard.as_mut() else {
                         return Err(PublishError::locked());
                     };
-                    let (_, preserve_digests) = preserved_deferred_prekeys(inner, now());
+                    let (mut preserve_spks, mut preserve_digests) =
+                        preserved_deferred_prekeys(inner, now());
+                    let inbox_ready_for_eviction = allow_scheduled_rotation
+                        && self.inbox_drained_clean.get()
+                        && inner.state.pending_inbox_acks.is_empty();
+                    preserve_undrained_inbox_prekeys(
+                        inner,
+                        inbox_ready_for_eviction,
+                        &mut preserve_spks,
+                        &mut preserve_digests,
+                    );
                     prepared = match inner
                         .client
                         .prepare_publish_v2_classical_off(prepared, &preserve_digests)
@@ -1846,7 +1922,8 @@ impl<V: VaultStore> Engine<V> {
                                     PublishError::prepare(e),
                                     now_anyway,
                                 )
-                                .await;
+                                .await
+                                .map(|()| PublishFullOutcome::Deferred);
                         }
                     };
                     if let Err(e) = inner.save(&[]).await {
@@ -1903,17 +1980,17 @@ impl<V: VaultStore> Engine<V> {
                         }
                     }
                 }
-                let (mut preserve_spks, preserve_digests) =
+                let (mut preserve_spks, mut preserve_digests) =
                     preserved_deferred_prekeys(inner, now());
                 let inbox_ready_for_eviction = allow_scheduled_rotation
                     && self.inbox_drained_clean.get()
                     && inner.state.pending_inbox_acks.is_empty();
-                if !inbox_ready_for_eviction
-                    && let Some(oldest_spk) = inner.client.oldest_evictable_signed_prekey()
-                    && !preserve_spks.contains(&oldest_spk)
-                {
-                    preserve_spks.push(oldest_spk);
-                }
+                preserve_undrained_inbox_prekeys(
+                    inner,
+                    inbox_ready_for_eviction,
+                    &mut preserve_spks,
+                    &mut preserve_digests,
+                );
                 inner.client.commit_publish_v2_preserving(
                     prepared,
                     &preserve_spks,
@@ -1972,7 +2049,7 @@ impl<V: VaultStore> Engine<V> {
                     self.ui.me.set(Some(inner.me()));
                     self.ui.log(log_msg);
                 }
-                Ok(())
+                Ok(PublishFullOutcome::Published)
             }
             Ok(PublishV2Outcome::ServerPqDisabled) => {
                 inner.client.rollback_publish_v2_on_refusal(prepared);
@@ -1982,13 +2059,16 @@ impl<V: VaultStore> Engine<V> {
                     now_anyway,
                 )
                 .await
+                .map(|()| PublishFullOutcome::Deferred)
             }
             Err(e) => {
                 self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 let error = PublishError::transmitted(e);
                 if error.definitive_refusal {
                     inner.client.rollback_publish_v2_on_refusal(prepared);
-                    self.finish_publish_rollback(inner, error, now_anyway).await
+                    self.finish_publish_rollback(inner, error, now_anyway)
+                        .await
+                        .map(|()| PublishFullOutcome::Deferred)
                 } else {
                     Err(error)
                 }
@@ -2092,9 +2172,28 @@ impl<V: VaultStore> Engine<V> {
         classical_count: usize,
         pq_counts: &[(PqSuite, usize)],
     ) -> Result<RefillV2Outcome, String> {
+        // R8-P2-8: Serialize non-rotating OPK refills behind `inbox_lock` (preserving acyclic
+        // `publish_lock -> inbox_lock -> Engine::inner`) so notification-driven inbox accepts
+        // cannot overlap `RefillPrekeys` and double-count pre-refill claims already reflected in
+        // the relay response.
+        let _inbox_guard = self.inbox_lock.lock().await;
+        if !self.is_live(vgen) {
+            return Ok(RefillV2Outcome::Handled);
+        }
         let wants_pq = pq_counts.iter().any(|(_, c)| *c > 0);
         // Phase 1 under `self.inner`: prepare & persist newly generated OPKs before transmitting.
-        let (server, audience, prepared, pre_classical_used, pre_pq_used, pre_pq_by_suite) = {
+        let (
+            server,
+            audience,
+            prepared,
+            pre_classical_used,
+            pre_pq_used,
+            pre_pq_by_suite,
+            prev_server_classical,
+            prev_server_pq,
+            added_classical,
+            added_pq_by_suite,
+        ) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Ok(RefillV2Outcome::Handled);
@@ -2105,6 +2204,8 @@ impl<V: VaultStore> Engine<V> {
             let pre_classical_used = inner.state.used_one_time_prekeys;
             let pre_pq_used = inner.state.used_pq_one_time_prekeys;
             let pre_pq_by_suite = inner.used_pq_by_suite.clone();
+            let prev_server_classical = inner.last_server_classical_opks;
+            let prev_server_pq = inner.last_server_pq_opks_by_suite.clone();
             let prepared = inner
                 .client
                 .prepare_refill_v2_per_suite(&inner.audience, classical_count, pq_counts)
@@ -2114,6 +2215,14 @@ impl<V: VaultStore> Engine<V> {
             {
                 inner.client.rollback_refill_v2_on_refusal(prepared);
                 return Ok(RefillV2Outcome::Handled);
+            }
+            let added_classical = prepared.request.one_time_prekeys.len() as u32;
+            let mut added_pq_by_suite: std::collections::BTreeMap<PqSuite, u32> =
+                std::collections::BTreeMap::new();
+            for pk in &prepared.request.pq_one_time_prekeys {
+                if let Some(suite) = u8::try_from(pk.suite).ok().and_then(PqSuite::from_u8) {
+                    *added_pq_by_suite.entry(suite).or_insert(0) += 1;
+                }
             }
             if let Err(e) = inner.save(&[]).await {
                 inner.client.rollback_refill_v2_on_refusal(prepared);
@@ -2129,6 +2238,10 @@ impl<V: VaultStore> Engine<V> {
                 pre_classical_used,
                 pre_pq_used,
                 pre_pq_by_suite,
+                prev_server_classical,
+                prev_server_pq,
+                added_classical,
+                added_pq_by_suite,
             )
         };
 
@@ -2169,6 +2282,14 @@ impl<V: VaultStore> Engine<V> {
                         self.startup.set_publish_waits_sign_in(true);
                         Ok(RefillV2Outcome::Handled)
                     }
+                    ErrorKind::LimitExceeded if sent_classical && sent_pq => {
+                        // R8-P2-9: Relay enforces classical and PQ caps independently and rejects
+                        // a mixed batch atomically without revealing which pool is full. Do NOT
+                        // fabricate full counts for either pool; let the caller retry each pool
+                        // separately so the non-full pool replenishes and restores authoritative
+                        // relay counts for both pools.
+                        Ok(RefillV2Outcome::MixedLimitExceeded)
+                    }
                     ErrorKind::LimitExceeded => {
                         if sent_classical {
                             inner.state.used_one_time_prekeys = 0;
@@ -2178,10 +2299,20 @@ impl<V: VaultStore> Engine<V> {
                         if sent_pq {
                             inner.state.used_pq_one_time_prekeys = 0;
                             inner.used_pq_by_suite.clear();
+                            // R8-P2-9 (Gemini P3-1): Distribute the shared 100-key cap across ALL
+                            // offered suites instead of assigning 100% to `offered[0]` so claims
+                            // on secondary suites (e.g. `MlKem768`) still reduce `total_est_rem`
+                            // and trigger future replenishment.
                             let mut full_map = std::collections::BTreeMap::new();
                             let offered = inner.client.pq_config().offered_suites();
-                            if let Some(&first) = offered.first() {
-                                full_map.insert(first, SERVER_MAX_PQ_ONE_TIME_PREKEYS as u32);
+                            if !offered.is_empty() {
+                                let n = offered.len() as u32;
+                                let base = (SERVER_MAX_PQ_ONE_TIME_PREKEYS as u32) / n;
+                                let rem = (SERVER_MAX_PQ_ONE_TIME_PREKEYS as u32) % n;
+                                for (idx, &suite) in offered.iter().enumerate() {
+                                    let share = base + if idx == 0 { rem } else { 0 };
+                                    full_map.insert(suite, share);
+                                }
                             }
                             inner.last_server_pq_opks_by_suite = Some(full_map);
                         }
@@ -2232,25 +2363,6 @@ impl<V: VaultStore> Engine<V> {
             }
         };
         inner.client.commit_refill_v2(prepared);
-        let concurrent_classical = inner
-            .state
-            .used_one_time_prekeys
-            .saturating_sub(pre_classical_used);
-        let concurrent_pq = inner
-            .state
-            .used_pq_one_time_prekeys
-            .saturating_sub(pre_pq_used);
-        let mut next_used_pq_by_suite = std::collections::BTreeMap::new();
-        for (&suite, &after) in &inner.used_pq_by_suite {
-            let delta = after.saturating_sub(pre_pq_by_suite.get(&suite).copied().unwrap_or(0));
-            if delta > 0 {
-                next_used_pq_by_suite.insert(suite, delta);
-            }
-        }
-        // Record authoritative relay counts as the single baseline BEFORE deducting concurrent
-        // consumption deltas, and reset `used_*` to those exact concurrent deltas so each claim is
-        // deducted once and never twice (`R7-P3-1`), retaining per-suite counts (`R7-P2-5`).
-        inner.last_server_classical_opks = Some(response.classical_one_time_count);
         let mut server_pq_map = std::collections::BTreeMap::new();
         for suite in inner.client.pq_config().offered_suites() {
             server_pq_map.insert(suite, 0);
@@ -2260,19 +2372,132 @@ impl<V: VaultStore> Engine<V> {
                 server_pq_map.insert(suite, sc.count);
             }
         }
+        // R8-P2-8: Reconcile any concurrent OPK accepts (e.g. from `carried_initial` during the
+        // `RefillPrekeys` RTT) against pre-refill claims already reflected in the relay's
+        // authoritative post-refill counts so overlapping claims are never counted twice.
+        let raw_concurrent_classical = inner
+            .state
+            .used_one_time_prekeys
+            .saturating_sub(pre_classical_used);
+        let already_counted_classical = prev_server_classical.map_or(0, |prev| {
+            prev.saturating_sub(pre_classical_used)
+                .saturating_add(added_classical)
+                .saturating_sub(response.classical_one_time_count)
+        });
+        let concurrent_classical =
+            raw_concurrent_classical.saturating_sub(already_counted_classical);
+
+        let mut next_used_pq_by_suite = std::collections::BTreeMap::new();
+        let mut total_already_counted_pq = 0u32;
+        for (&suite, &after) in &inner.used_pq_by_suite {
+            let pre_s = pre_pq_by_suite.get(&suite).copied().unwrap_or(0);
+            let delta = after.saturating_sub(pre_s);
+            let already_s = prev_server_pq.as_ref().map_or(0, |prev_map| {
+                let prev_s = prev_map.get(&suite).copied().unwrap_or(0);
+                let added_s = added_pq_by_suite.get(&suite).copied().unwrap_or(0);
+                let resp_s = server_pq_map.get(&suite).copied().unwrap_or(0);
+                prev_s
+                    .saturating_sub(pre_s)
+                    .saturating_add(added_s)
+                    .saturating_sub(resp_s)
+            });
+            total_already_counted_pq = total_already_counted_pq.saturating_add(already_s);
+            let effective_delta = delta.saturating_sub(already_s);
+            if effective_delta > 0 {
+                next_used_pq_by_suite.insert(suite, effective_delta);
+            }
+        }
+        let raw_concurrent_pq = inner
+            .state
+            .used_pq_one_time_prekeys
+            .saturating_sub(pre_pq_used);
+        let tracked_concurrent_pq = next_used_pq_by_suite
+            .values()
+            .copied()
+            .fold(0u32, u32::saturating_add);
+        let concurrent_pq = raw_concurrent_pq
+            .saturating_sub(total_already_counted_pq)
+            .max(tracked_concurrent_pq);
+
+        // Record authoritative relay counts as the single baseline BEFORE deducting concurrent
+        // consumption deltas, and reset `used_*` to those reconciled concurrent deltas so each
+        // claim is deducted once and never twice (`R7-P3-1`, `R8-P2-8`), retaining per-suite
+        // counts (`R7-P2-5`).
+        inner.last_server_classical_opks = Some(response.classical_one_time_count);
         inner.last_server_pq_opks_by_suite = Some(server_pq_map);
         inner.state.used_one_time_prekeys = concurrent_classical;
         inner.state.used_pq_one_time_prekeys = concurrent_pq;
         inner.used_pq_by_suite = next_used_pq_by_suite;
         if sent_pq {
-            inner.bump_server_pq_epoch();
+            // R8-P2-10: Mirror `publish_full_locked_gated` — a successful PQ refill proves the
+            // relay accepted PQ prekeys, so clear any stale `Disabled` status to `Unknown` (and
+            // bump epoch) so subsequent refills and settings saves are not wedged on `Disabled`.
+            if inner.server_pq == ServerPqStatus::Disabled {
+                inner.set_server_pq(ServerPqStatus::Unknown);
+            } else {
+                inner.bump_server_pq_epoch();
+            }
         }
         inner.save_state().await.map_err(|e| describe(&e))?;
         if self.is_live(vgen) {
+            self.ui.me.set(Some(inner.me()));
             self.ui
                 .log("replenished one-time prekeys without rotating signed prekey");
         }
         Ok(RefillV2Outcome::Handled)
+    }
+
+    /// Compute the headroom-clamped non-rotating OPK/PQOPK refill batch under `inner`, resetting
+    /// stale local usage counters when the relay is already confirmed at its 100-key cap.
+    async fn plan_refill_batch_locked(
+        &self,
+        inner: &mut Inner<V>,
+    ) -> Result<(usize, Vec<(PqSuite, usize)>), String> {
+        let offered_suites: Vec<PqSuite> =
+            if inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled {
+                inner.client.pq_config().offered_suites().to_vec()
+            } else {
+                vec![]
+            };
+        let classical_headroom = inner.client.remaining_one_time_headroom();
+        let mut pq_headroom = inner.client.remaining_pq_one_time_headroom();
+        let (raw_classical, raw_pq_per_suite) = refill_batch_counts_per_suite(
+            inner.state.used_one_time_prekeys,
+            inner.state.used_pq_one_time_prekeys,
+            &inner.used_pq_by_suite,
+            &offered_suites,
+            inner.last_server_classical_opks,
+            inner.last_server_pq_opks_by_suite.as_ref(),
+        );
+        let classical_count = raw_classical.min(classical_headroom);
+        let mut pq_counts = Vec::with_capacity(raw_pq_per_suite.len());
+        for &(suite, raw_count) in &raw_pq_per_suite {
+            let take = raw_count.min(pq_headroom);
+            if take > 0 {
+                pq_counts.push((suite, take));
+                pq_headroom = pq_headroom.saturating_sub(take);
+            }
+        }
+        // If server is already at its 100-key cap, reset counters so sync doesn't loop.
+        if classical_count == 0 && pq_counts.is_empty() {
+            let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;
+            let pq_low =
+                !offered_suites.is_empty() && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
+            let mut cleared = false;
+            if classical_low && raw_classical == 0 {
+                inner.state.used_one_time_prekeys = 0;
+                cleared = true;
+            }
+            if pq_low && raw_pq_per_suite.is_empty() {
+                inner.state.used_pq_one_time_prekeys = 0;
+                inner.used_pq_by_suite.clear();
+                cleared = true;
+            }
+            if cleared {
+                inner.save_state().await.map_err(|e| describe(&e))?;
+            }
+        }
+        Ok((classical_count, pq_counts))
     }
 
     /// Publish new prekeys (SPK rotation / PQ manifest) if due or requested, or replenish low
@@ -2300,12 +2525,12 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(());
         }
-        let refill_plan = {
-            let mut guard = self.lock_inner().await;
+        let should_try_full = {
+            let guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            let Some(inner) = guard.as_mut() else {
+            let Some(inner) = guard.as_ref() else {
                 return Ok(());
             };
             let now_ms = now();
@@ -2323,91 +2548,99 @@ impl<V: VaultStore> Engine<V> {
                 && self.inbox_drained_clean.get()
                 && inner.state.pending_inbox_acks.is_empty()
                 && now_ms.saturating_sub(inner.state.published_at) > REPUBLISH_AGE;
-            if mandatory_full || scheduled_full {
-                if self.startup.is_publish_paused() && !now_anyway {
-                    return Ok(());
-                }
-                if now_anyway {
-                    self.startup.set_publish_waits_settings(false);
-                }
-                drop(guard);
-                return match self
-                    .publish_full_locked_gated(vgen, now_anyway, allow_scheduled_rotation)
-                    .await
-                {
-                    Ok(()) => Ok(()),
-                    Err(_) if !self.is_live(vgen) => Ok(()),
-                    Err(e) => Err(e.message),
-                };
-            }
-
-            // M-5: Non-rotating OPK/PQOPK refill (does NOT rotate SPK!).
-            if self.startup.is_publish_paused() {
-                return Ok(());
-            }
-            let offered_suites: Vec<PqSuite> =
-                if inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled {
-                    inner.client.pq_config().offered_suites().to_vec()
-                } else {
-                    vec![]
-                };
-            let classical_headroom = inner.client.remaining_one_time_headroom();
-            let mut pq_headroom = inner.client.remaining_pq_one_time_headroom();
-            let (raw_classical, raw_pq_per_suite) = refill_batch_counts_per_suite(
-                inner.state.used_one_time_prekeys,
-                inner.state.used_pq_one_time_prekeys,
-                &inner.used_pq_by_suite,
-                &offered_suites,
-                inner.last_server_classical_opks,
-                inner.last_server_pq_opks_by_suite.as_ref(),
-            );
-            let classical_count = raw_classical.min(classical_headroom);
-            let mut pq_counts = Vec::with_capacity(raw_pq_per_suite.len());
-            for &(suite, raw_count) in &raw_pq_per_suite {
-                let take = raw_count.min(pq_headroom);
-                if take > 0 {
-                    pq_counts.push((suite, take));
-                    pq_headroom = pq_headroom.saturating_sub(take);
-                }
-            }
-            // If server is already at its 100-key cap, reset counters so sync doesn't loop.
-            if classical_count == 0 && pq_counts.is_empty() {
-                let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;
-                let pq_low = !offered_suites.is_empty()
-                    && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
-                let mut cleared = false;
-                if classical_low && raw_classical == 0 {
-                    inner.state.used_one_time_prekeys = 0;
-                    cleared = true;
-                }
-                if pq_low && raw_pq_per_suite.is_empty() {
-                    inner.state.used_pq_one_time_prekeys = 0;
-                    inner.used_pq_by_suite.clear();
-                    cleared = true;
-                }
-                if cleared {
-                    inner.save_state().await.map_err(|e| describe(&e))?;
-                }
-                return Ok(());
-            }
-            (classical_count, pq_counts)
+            mandatory_full || scheduled_full
         };
-        let (classical_count, pq_counts) = refill_plan;
-        if self
-            .try_refill_v2_locked(vgen, classical_count, &pq_counts)
-            .await?
-            == RefillV2Outcome::Handled
-            || classical_count == 0
-        {
+        if should_try_full {
+            if self.startup.is_publish_paused() && !now_anyway {
+                return Ok(());
+            }
+            if now_anyway {
+                self.startup.set_publish_waits_settings(false);
+            }
+            match self
+                .publish_full_locked_gated(vgen, now_anyway, allow_scheduled_rotation)
+                .await
+            {
+                Ok(PublishFullOutcome::Published) => return Ok(()),
+                Ok(PublishFullOutcome::Deferred) => {
+                    // R8-P2-7: When automatic full rotation/renewal is deferred (e.g. undrained
+                    // inbox or 144 pinned digests), fall through to non-rotating OPK refill unless
+                    // `now_anyway` was requested or an unreconciled publish is still pending.
+                    if now_anyway {
+                        return Ok(());
+                    }
+                }
+                Err(_) if !self.is_live(vgen) => return Ok(()),
+                Err(e) => return Err(e.message),
+            }
+        }
+
+        // M-5: Non-rotating OPK/PQOPK refill (does NOT rotate SPK!).
+        if !self.is_live(vgen) || self.startup.is_publish_paused() {
             return Ok(());
         }
-        // A PQ-disabled v2 server can still accept a classical-only v2 refill.
-        if !pq_counts.is_empty() && self.is_live(vgen) {
-            let _ = self
-                .try_refill_v2_locked(vgen, classical_count, &[])
-                .await?;
+        let refill_plan = {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(());
+            };
+            if inner.state.published_at == 0
+                || inner.client.manifest_seq() == 0
+                || inner.client.prekey_generation() == 0
+                || inner.client.has_unreconciled_publish()
+            {
+                return Ok(());
+            }
+            self.plan_refill_batch_locked(inner).await?
+        };
+        let (classical_count, pq_counts) = refill_plan;
+        if classical_count == 0 && pq_counts.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        match self
+            .try_refill_v2_locked(vgen, classical_count, &pq_counts)
+            .await?
+        {
+            RefillV2Outcome::Handled => Ok(()),
+            RefillV2Outcome::PqDisabled => {
+                // A PQ-disabled v2 server can still accept a classical-only v2 refill.
+                if classical_count > 0 && !pq_counts.is_empty() && self.is_live(vgen) {
+                    let _ = self
+                        .try_refill_v2_locked(vgen, classical_count, &[])
+                        .await?;
+                }
+                Ok(())
+            }
+            RefillV2Outcome::MixedLimitExceeded => {
+                // R8-P2-9: Retry classical-only first; if it succeeds, it updates authoritative
+                // counts for BOTH pools so we recompute the PQ batch before attempting PQ-only.
+                if classical_count > 0 && self.is_live(vgen) && !self.startup.is_publish_paused() {
+                    let _ = self
+                        .try_refill_v2_locked(vgen, classical_count, &[])
+                        .await?;
+                }
+                if !self.is_live(vgen) || self.startup.is_publish_paused() {
+                    return Ok(());
+                }
+                let retry_pq = {
+                    let mut guard = self.lock_inner().await;
+                    if !self.is_live(vgen) {
+                        return Ok(());
+                    }
+                    let Some(inner) = guard.as_mut() else {
+                        return Ok(());
+                    };
+                    self.plan_refill_batch_locked(inner).await?.1
+                };
+                if !retry_pq.is_empty() && self.is_live(vgen) && !self.startup.is_publish_paused() {
+                    let _ = self.try_refill_v2_locked(vgen, 0, &retry_pq).await?;
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Map a `session::Error` from `claim_peer_bundle_v2` or `finish_prepare_initiate_v2` into
@@ -3025,39 +3258,21 @@ impl<V: VaultStore> Engine<V> {
             };
             if self.is_submission_cancelled(submission_id) {
                 self.startup.end_new_chat_submit(submission_id);
-                let same_provisional =
-                    inner
-                        .contacts
-                        .iter()
-                        .find(|c| c.peer == peer)
-                        .is_some_and(|c| {
-                            c.state.conversation_gen == created_conv_gen
-                                && c.state.provisional
-                                && is_pure_unconfirmed_start(c, created_session_id.as_ref())
-                        });
-                if same_provisional {
-                    self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true)
-                        .await;
-                    rolled_back_on_cancel = true;
-                } else if inner
-                    .contacts
-                    .iter()
-                    .find(|c| c.peer == peer)
-                    .is_some_and(|c| {
-                        c.state.conversation_gen == created_conv_gen && c.state.provisional
-                    })
+                if !self
+                    .handle_cancelled_start_chat_locked(
+                        vgen,
+                        inner,
+                        &peer,
+                        created_conv_gen,
+                        created_session_id.as_ref(),
+                        &retained_farewells,
+                        true,
+                    )
+                    .await
                 {
-                    // Crossed-start inbound session (accepted OR quarantined) arrived before
-                    // cancellation took effect: revoke our abandoned outbound grant, discard our
-                    // never-transmitted outbound session if still active, clear pending grants,
-                    // and convert the contact into an explicit unaccepted request.
-                    self.convert_crossed_cancelled_start_to_request(inner, &peer)
-                        .await;
-                    if !self.is_live(vgen) {
-                        return Err(StartChatError::Cancelled);
-                    }
-                    rolled_back_on_cancel = true;
+                    return Err(StartChatError::Cancelled);
                 }
+                rolled_back_on_cancel = true;
             } else {
                 let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
                     self.startup.end_new_chat_submit(submission_id);
@@ -3105,16 +3320,66 @@ impl<V: VaultStore> Engine<V> {
                         if !self.is_live(vgen) {
                             return Err(StartChatError::Cancelled);
                         }
+                        // R8-P1-1: Re-check cancellation after `save_state().await` so closing
+                        // New Chat during IDB persistence converts the crossed contact to a
+                        // request + staged revoke instead of approving it.
+                        if self.is_submission_cancelled(submission_id) {
+                            self.startup.end_new_chat_submit(submission_id);
+                            let live = self
+                                .handle_cancelled_start_chat_locked(
+                                    vgen,
+                                    inner,
+                                    &peer,
+                                    created_conv_gen,
+                                    created_session_id.as_ref(),
+                                    &retained_farewells,
+                                    true,
+                                )
+                                .await;
+                            drop(guard);
+                            if live {
+                                self.wake();
+                            }
+                            return Err(StartChatError::Cancelled);
+                        }
                         self.refresh_contacts(inner);
                     }
-                    self.startup.end_new_chat_submit(submission_id);
                     drop(guard);
                     if flush_winning_grant {
                         let _ = self.flush_pending_grants_for_peer(&peer).await;
                         if !self.is_live(vgen) {
                             return Err(StartChatError::Cancelled);
                         }
+                        // R8-P1-1: Re-check cancellation after awaiting grant registration so
+                        // closing New Chat during that RTT converts the crossed contact to a
+                        // request + staged revoke instead of returning `Ok(peer)`.
+                        if self.is_submission_cancelled(submission_id) {
+                            self.startup.end_new_chat_submit(submission_id);
+                            let mut guard = self.lock_inner().await;
+                            if !self.is_live(vgen) {
+                                return Err(StartChatError::Cancelled);
+                            }
+                            if let Some(inner) = guard.as_mut() {
+                                let _ = self
+                                    .handle_cancelled_start_chat_locked(
+                                        vgen,
+                                        inner,
+                                        &peer,
+                                        created_conv_gen,
+                                        created_session_id.as_ref(),
+                                        &retained_farewells,
+                                        true,
+                                    )
+                                    .await;
+                            }
+                            drop(guard);
+                            if self.is_live(vgen) {
+                                self.wake();
+                            }
+                            return Err(StartChatError::Cancelled);
+                        }
                     }
+                    self.startup.end_new_chat_submit(submission_id);
                     drop(peer_guard);
                     self.wake();
                     return Ok(peer);
@@ -3148,6 +3413,28 @@ impl<V: VaultStore> Engine<V> {
                         inner.unsaved_state = true;
                     }
                     if !self.is_live(vgen) {
+                        return Err(StartChatError::Cancelled);
+                    }
+                    // R8-P1-1: Re-check cancellation after awaiting IDB save on the pending-grant
+                    // exit so a cancelled start is rolled back / converted to a request instead of
+                    // waking `sync()` to register the token and transmit the cancelled greeting.
+                    if self.is_submission_cancelled(submission_id) {
+                        self.startup.end_new_chat_submit(submission_id);
+                        let live = self
+                            .handle_cancelled_start_chat_locked(
+                                vgen,
+                                inner,
+                                &peer,
+                                created_conv_gen,
+                                created_session_id.as_ref(),
+                                &retained_farewells,
+                                true,
+                            )
+                            .await;
+                        drop(guard);
+                        if live {
+                            self.wake();
+                        }
                         return Err(StartChatError::Cancelled);
                     }
                     self.startup.end_new_chat_submit(submission_id);
@@ -3186,42 +3473,34 @@ impl<V: VaultStore> Engine<V> {
                     if !self.is_live(vgen) {
                         return Err(StartChatError::Cancelled);
                     }
-                    self.startup.end_new_chat_submit(submission_id);
-                    self.refresh_contacts(inner);
-                    self.ui.log(format!(
-                        "saved chat with {}, but could not prepare its initial greeting yet (it will carry on the first message): {}",
-                        short(&peer),
-                        describe(&e)
-                    ));
+                    if !self.is_submission_cancelled(submission_id) {
+                        self.startup.end_new_chat_submit(submission_id);
+                        self.refresh_contacts(inner);
+                        self.ui.log(format!(
+                            "saved chat with {}, but could not prepare its initial greeting yet (it will carry on the first message): {}",
+                            short(&peer),
+                            describe(&e)
+                        ));
+                    }
                 } else if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
                 } else if self.is_submission_cancelled(submission_id) {
                     self.startup.end_new_chat_submit(submission_id);
-                    let pure_unconfirmed = inner
-                        .contacts
-                        .iter()
-                        .find(|c| c.peer == peer)
-                        .is_some_and(|c| {
-                            c.state.conversation_gen == created_conv_gen
-                                && c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
-                                && is_pure_unconfirmed_start(c, created_session_id.as_ref())
-                        });
-                    if pure_unconfirmed {
-                        self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true)
-                            .await;
-                        rolled_back_on_cancel = true;
-                    } else if inner
-                        .contacts
-                        .iter()
-                        .any(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen)
+                    if !self
+                        .handle_cancelled_start_chat_locked(
+                            vgen,
+                            inner,
+                            &peer,
+                            created_conv_gen,
+                            created_session_id.as_ref(),
+                            &retained_farewells,
+                            true,
+                        )
+                        .await
                     {
-                        self.convert_crossed_cancelled_start_to_request(inner, &peer)
-                            .await;
-                        if !self.is_live(vgen) {
-                            return Err(StartChatError::Cancelled);
-                        }
-                        rolled_back_on_cancel = true;
+                        return Err(StartChatError::Cancelled);
                     }
+                    rolled_back_on_cancel = true;
                 }
             }
         }
@@ -3237,45 +3516,82 @@ impl<V: VaultStore> Engine<V> {
                 return Err(StartChatError::Cancelled);
             }
         }
-        // R7-P1-3: If the user cancelled `start_chat` during the lock-free `flush_extra_grants`
-        // `.await` (or before `!ready_to_send` return), re-acquire `self.inner`, revalidate
-        // `conversation_gen`, and run rollback or crossed-start request conversion so
-        // `retry_pending_greetings` never transmits the cancelled `SendInitialV2`.
-        if self.is_submission_cancelled(submission_id) {
-            self.startup.end_new_chat_submit(submission_id);
+        // R7-P1-3 + R8-P1-1 + R8-P2-4: Re-check cancellation after `flush_extra_grants` (or after
+        // a failed save) AND revalidate conversation generation / active session / request /
+        // quarantine state after `flush_extra_grants` so neither a cancelled start nor a
+        // superseded outbound session can transmit `SendInitialV2`.
+        if self.is_submission_cancelled(submission_id) || (flush_extra_grants && ready_to_send) {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
-            if let Some(inner) = guard.as_mut()
-                && inner
-                    .contacts
-                    .iter()
-                    .any(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen)
-            {
-                let pure_unconfirmed =
-                    inner
-                        .contacts
-                        .iter()
-                        .find(|c| c.peer == peer)
-                        .is_some_and(|c| {
-                            (c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
-                                || c.state.greeting_delivery == GREETING_DELIVERY_UNSENT)
-                                && is_pure_unconfirmed_start(c, created_session_id.as_ref())
-                        });
-                if pure_unconfirmed {
-                    self.rollback_cancelled_start_chat(inner, &peer, &retained_farewells, true)
-                        .await;
-                } else {
-                    self.convert_crossed_cancelled_start_to_request(inner, &peer)
+            if self.is_submission_cancelled(submission_id) {
+                self.startup.end_new_chat_submit(submission_id);
+                if let Some(inner) = guard.as_mut() {
+                    let _ = self
+                        .handle_cancelled_start_chat_locked(
+                            vgen,
+                            inner,
+                            &peer,
+                            created_conv_gen,
+                            created_session_id.as_ref(),
+                            &retained_farewells,
+                            true,
+                        )
                         .await;
                 }
+                drop(guard);
+                if self.is_live(vgen) {
+                    self.wake();
+                }
+                return Err(StartChatError::Cancelled);
             }
-            drop(guard);
-            if self.is_live(vgen) {
-                self.wake();
+            if let Some(inner) = guard.as_mut() {
+                let state_check = inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen)
+                    .map(|c| {
+                        (
+                            c.session.active_id() == created_session_id.as_ref(),
+                            !c.state.request && !c.state.quarantined,
+                        )
+                    });
+                match state_check {
+                    Some((true, true)) => {}
+                    None => {
+                        self.startup.end_new_chat_submit(submission_id);
+                        return Err(StartChatError::Cancelled);
+                    }
+                    Some((matches_active, _)) => {
+                        // A newer inbound peer session won the tie-break (or quarantined/converted
+                        // the contact) while `flush_extra_grants` awaited: do NOT dispatch the
+                        // superseded `SendInitialV2`.
+                        if !matches_active
+                            && let Some(c) = inner.contact(&peer)
+                            && c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
+                        {
+                            c.state.greeting_delivery = GREETING_DELIVERY_CONFIRMED;
+                            c.state.greeting_sent_at = 0;
+                            c.state.awaiting_peer_acceptance = false;
+                            if inner.save_state().await.is_err() {
+                                inner.unsaved_state = true;
+                            }
+                            if !self.is_live(vgen) {
+                                return Err(StartChatError::Cancelled);
+                            }
+                        }
+                        self.startup.end_new_chat_submit(submission_id);
+                        self.refresh_contacts(inner);
+                        drop(guard);
+                        drop(peer_guard);
+                        self.wake();
+                        return Ok(peer);
+                    }
+                }
+            } else {
+                return Err(StartChatError::Cancelled);
             }
-            return Err(StartChatError::Cancelled);
         }
         if !ready_to_send {
             drop(peer_guard);
@@ -3307,7 +3623,10 @@ impl<V: VaultStore> Engine<V> {
             .contacts
             .iter()
             .find(|c| c.peer == peer)
-            .is_some_and(|c| c.session.active_id() == created_session_id.as_ref());
+            .is_some_and(|c| {
+                c.state.conversation_gen == created_conv_gen
+                    && c.session.active_id() == created_session_id.as_ref()
+            });
 
         match send_res {
             Err(e) => {
@@ -3328,45 +3647,29 @@ impl<V: VaultStore> Engine<V> {
                 } else {
                     self.startup.end_new_chat_submit(submission_id);
                 }
-                if e.is_server_refusal() && matches_session {
-                    if self.is_submission_cancelled(submission_id) {
-                        let pure_unconfirmed = inner
-                            .contacts
-                            .iter()
-                            .find(|c| c.peer == peer)
-                            .is_some_and(|c| {
-                                c.state.conversation_gen == created_conv_gen
-                                    && c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
-                                    && is_pure_unconfirmed_start(c, created_session_id.as_ref())
-                            });
-                        if pure_unconfirmed {
-                            self.rollback_cancelled_start_chat(
-                                inner,
-                                &peer,
-                                &retained_farewells,
-                                true,
-                            )
-                            .await;
-                            drop(guard);
-                            if self.is_live(vgen) {
-                                self.wake();
-                            }
-                            return Err(StartChatError::Cancelled);
-                        }
-                        if inner
-                            .contacts
-                            .iter()
-                            .any(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen)
-                        {
-                            self.convert_crossed_cancelled_start_to_request(inner, &peer)
-                                .await;
-                            drop(guard);
-                            if self.is_live(vgen) {
-                                self.wake();
-                            }
-                            return Err(StartChatError::Cancelled);
-                        }
+                // R8-P1-1: On any definitive `SendInitialV2` refusal of a cancelled submission,
+                // roll back a pure start OR convert a crossed contact (even when an inbound
+                // session already won the tie-break so `matches_session == false`) keyed strictly
+                // to `created_conv_gen`.
+                if e.is_server_refusal() && self.is_submission_cancelled(submission_id) {
+                    let live = self
+                        .handle_cancelled_start_chat_locked(
+                            vgen,
+                            inner,
+                            &peer,
+                            created_conv_gen,
+                            created_session_id.as_ref(),
+                            &retained_farewells,
+                            true,
+                        )
+                        .await;
+                    drop(guard);
+                    if live {
+                        self.wake();
                     }
+                    return Err(StartChatError::Cancelled);
+                }
+                if e.is_server_refusal() && matches_session {
                     // Only revert `UNCERTAIN -> UNSENT`; never downgrade a greeting already
                     // confirmed concurrently on this session.
                     let reverted = inner.contact(&peer).is_some_and(|contact| {
@@ -3421,6 +3724,41 @@ impl<V: VaultStore> Engine<V> {
         drop(peer_guard);
         self.wake();
         Ok(peer)
+    }
+
+    /// Unified `conversation_gen`-keyed cancellation handler for `start_chat` (`R8-P1-1`): rolls
+    /// back a pure unconfirmed outbound start or converts a crossed-start contact into an explicit
+    /// unaccepted request with a staged revoke. Returns whether `vgen` is still live afterwards.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_cancelled_start_chat_locked(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<V>,
+        peer: &PublicKey,
+        created_conv_gen: u64,
+        created_session_id: Option<&[u8; 32]>,
+        retained_farewells: &[Farewell],
+        revoke_grant: bool,
+    ) -> bool {
+        let Some(contact) = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == *peer && c.state.conversation_gen == created_conv_gen)
+        else {
+            return self.is_live(vgen);
+        };
+        let pure_unconfirmed = (contact.state.provisional
+            || contact.state.greeting_delivery == GREETING_DELIVERY_UNSENT
+            || contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN)
+            && is_pure_unconfirmed_start(contact, created_session_id);
+        if pure_unconfirmed {
+            self.rollback_cancelled_start_chat(inner, peer, retained_farewells, revoke_grant)
+                .await;
+        } else {
+            self.convert_crossed_cancelled_start_to_request(inner, peer)
+                .await;
+        }
+        self.is_live(vgen)
     }
 
     /// Convert a cancelled outbound `start_chat` contact that received an incoming crossed-start

@@ -1197,6 +1197,9 @@ mod v2 {
             if strict_pq && !pq_enabled {
                 return Err(ErrorKind::PqRequired.into());
             }
+            if !self.has_spare_manifest_digest_slot(preserve_manifest_digests) {
+                return Err(ErrorKind::LimitExceeded.into());
+            }
 
             let timestamp = self.trusted_timestamp()?;
             let issued_at = timestamp;
@@ -1581,6 +1584,17 @@ mod v2 {
                     .ok_or(ErrorKind::Protocol)?;
                 if !orig_manifest.pq_enabled {
                     return Err(ErrorKind::Protocol.into());
+                }
+                let preserved_other = self
+                    .state
+                    .recent_manifest_digests
+                    .iter()
+                    .filter(|d| {
+                        **d != prepared.manifest_digest && preserve_manifest_digests.contains(d)
+                    })
+                    .count();
+                if preserved_other >= crate::MAX_RETAINED_MANIFEST_DIGESTS {
+                    return Err(ErrorKind::LimitExceeded.into());
                 }
                 let timestamp = self.trusted_timestamp()?;
                 let expires_at = timestamp

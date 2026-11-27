@@ -243,17 +243,20 @@ fn copy_zeroizing_array<const N: usize>(bytes: &[u8]) -> Option<Zeroizing<[u8; N
     Some(out)
 }
 
-/// Error fetching an attachment chunk, preserving HTTP 404 (`NotFound`) so callers can mark the
-/// attachment gone from the server.
+/// Error fetching an attachment chunk, preserving HTTP 404 (`NotFound`) and the pinned
+/// conversation generation so callers only mark the attachment gone in the same conversation.
 pub(super) enum FetchError {
-    NotFound(String),
+    NotFound {
+        message: String,
+        conversation_gen: Option<u64>,
+    },
     Other(String),
 }
 
 /// Error announcing a newly started attachment in chat history, distinguishing pre-send failure
 /// (safe to cancel on the server) from post-send vault save failure (where the peer may already
 /// hold the attachment pointer).
-enum AnnounceError {
+pub(super) enum AnnounceError {
     NotSent(String),
     SaveAfterSend {
         error: String,
@@ -272,7 +275,7 @@ impl AnnounceError {
 impl FetchError {
     fn into_message(self) -> String {
         match self {
-            Self::NotFound(msg) | Self::Other(msg) => msg,
+            Self::NotFound { message, .. } | Self::Other(message) => message,
         }
     }
 }
@@ -281,6 +284,8 @@ impl FetchError {
 pub(super) struct Fetching {
     /// The chat it is in.
     pub(super) peer: PublicKey,
+    /// Conversation generation captured when starting the fetch (`R8-P2-5`).
+    pub(super) conversation_gen: u64,
     /// Its entry in the history.
     pub(super) index: u64,
     pub(super) id: [u8; 16],
@@ -399,7 +404,8 @@ impl<V: VaultStore> Engine<V> {
             return Err(e);
         }
         if !self.is_live(vgen) {
-            let _ = upload.cancel(&Fetch::client(&server)).await;
+            // R8-P1-4: `save_upload_for_gen` already persisted `PendingUpload` durably; preserve
+            // the server allocation across lock/`pagehide` teardown so unlock can resume cleanly.
             return Err("locked".into());
         }
         self.uploads.insert_file(
@@ -427,19 +433,42 @@ impl<V: VaultStore> Engine<V> {
                 return Err(e);
             }
             Err(AnnounceError::SaveAfterSend { error, pending }) => {
-                let keep = {
+                // R8-P1-4: Once the pointer may already have reached the peer, NEVER send
+                // `DeleteAttachment` solely because the tab locked or closed (`!is_live(vgen)`).
+                // Only cancel on the server when the vault is still live and explicitly discarded
+                // the upload (cancelled or deleted/recreated conversation).
+                if !self.is_live(vgen) {
+                    return Err(error);
+                }
+                enum PostSendAction {
+                    Locked,
+                    Keep,
+                    Cancel,
+                }
+                let action = {
                     let guard = self.lock_inner().await;
-                    self.is_live(vgen)
-                        && guard.as_ref().is_some_and(|inner| {
-                            self.may_keep_for_gen(inner, &peer, upload.id(), Some(conv_gen))
-                        })
+                    if !self.is_live(vgen) {
+                        PostSendAction::Locked
+                    } else if let Some(inner) = guard.as_ref() {
+                        if self.may_keep_for_gen(inner, &peer, upload.id(), Some(conv_gen)) {
+                            PostSendAction::Keep
+                        } else {
+                            PostSendAction::Cancel
+                        }
+                    } else {
+                        PostSendAction::Locked
+                    }
                 };
-                if keep {
-                    self.show_upload(&peer, &pending, UploadState::Paused(error.clone()));
-                } else {
-                    self.uploads.mark_cancelled(*upload.id());
-                    self.remove_attachment_caches(&peer, upload.id());
-                    let _ = upload.cancel(&Fetch::client(&server)).await;
+                match action {
+                    PostSendAction::Locked => {}
+                    PostSendAction::Keep => {
+                        self.show_upload(&peer, &pending, UploadState::Paused(error.clone()));
+                    }
+                    PostSendAction::Cancel => {
+                        self.uploads.mark_cancelled(*upload.id());
+                        self.remove_attachment_caches(&peer, upload.id());
+                        let _ = upload.cancel(&Fetch::client(&server)).await;
+                    }
                 }
                 return Err(error);
             }
@@ -979,7 +1008,7 @@ impl<V: VaultStore> Engine<V> {
         self.announce_for_gen(peer, pending, None).await
     }
 
-    async fn announce_for_gen(
+    pub(super) async fn announce_for_gen(
         &self,
         peer: &PublicKey,
         mut pending: PendingUpload,
@@ -1013,13 +1042,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err(AnnounceError::NotSent("locked".into()));
             }
-            let can_send_new = found.is_some()
-                || inner
-                    .contacts
-                    .iter()
-                    .find(|c| c.peer == *peer)
-                    .is_some_and(|c| !c.state.request && !c.state.quarantined);
-            if !self.may_keep_for_gen(inner, peer, &pending.id, expected_gen) || !can_send_new {
+            if !self.may_keep_for_gen(inner, peer, &pending.id, expected_gen) {
                 if let Some(id) = id_arr {
                     self.remove_attachment_caches(peer, &id);
                     self.ui
@@ -1027,6 +1050,22 @@ impl<V: VaultStore> Engine<V> {
                         .update(|uploads| uploads.retain(|item| item.id != id));
                 }
                 return Ok(None);
+            }
+            // R8-P2-1: If the conversation still exists at the same `conversation_gen` and the
+            // upload was NOT cancelled, but the contact became a request or quarantined before
+            // announcement, return `Err(AnnounceError::NotSent)` instead of `Ok(None)` so
+            // `send_attachment` forgets the vault record + cancels server allocation + reports the
+            // error, while `resume_upload_source` keeps the upload visibly paused with the reason.
+            if found.is_none()
+                && let Some(c) = inner.contacts.iter().find(|c| c.peer == *peer)
+                && (c.state.request || c.state.quarantined)
+            {
+                let reason = if c.state.request {
+                    "accept the request first"
+                } else {
+                    "approve classical encryption or upgrade to post-quantum first"
+                };
+                return Err(AnnounceError::NotSent(reason.into()));
             }
             match found {
                 Some(index) => (index, false),
@@ -1979,12 +2018,31 @@ impl<V: VaultStore> Engine<V> {
         hint_index: Option<u64>,
         id: &[u8; 16],
     ) -> Result<(), String> {
+        self.note_gone_by_id_for_gen(peer, hint_index, id, None)
+            .await
+    }
+
+    pub(super) async fn note_gone_by_id_for_gen(
+        &self,
+        peer: &PublicKey,
+        hint_index: Option<u64>,
+        id: &[u8; 16],
+        expected_gen: Option<u64>,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
         let mut guard = self.lock_inner().await;
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
         let inner = guard.as_mut().ok_or("locked")?;
+        if let Some(expected) = expected_gen
+            && !inner
+                .contacts
+                .iter()
+                .any(|c| c.peer == *peer && c.state.conversation_gen == expected)
+        {
+            return Ok(());
+        }
         self.note_gone_inner(inner, peer, hint_index, id).await
     }
 
@@ -2102,7 +2160,9 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(true);
             }
-            self.keep_chunk(peer, upload.id(), index, &chunk).await?;
+            let _ = self
+                .keep_chunk_for_gen(peer, upload.id(), index, &chunk, None)
+                .await?;
             pending.uploaded = index + 1;
         }
         Ok(true)
@@ -2273,8 +2333,13 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(());
         }
-        if let Err(FetchError::NotFound(_)) = &fetched {
-            let _ = self.note_gone_by_id(&peer, Some(index), &id).await;
+        if let Err(FetchError::NotFound {
+            conversation_gen, ..
+        }) = &fetched
+        {
+            let _ = self
+                .note_gone_by_id_for_gen(&peer, Some(index), &id, *conversation_gen)
+                .await;
         }
         let opened = self
             .told_downloaded(peer, clock, fetched.map_err(FetchError::into_message))
@@ -2323,8 +2388,13 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(None);
         }
-        if let Err(FetchError::NotFound(_)) = &fetched {
-            let _ = self.note_gone_by_id(&peer, Some(index), &id).await;
+        if let Err(FetchError::NotFound {
+            conversation_gen, ..
+        }) = &fetched
+        {
+            let _ = self
+                .note_gone_by_id_for_gen(&peer, Some(index), &id, *conversation_gen)
+                .await;
         }
         self.told_downloaded(peer, clock, fetched.map_err(FetchError::into_message))
             .await
@@ -2336,10 +2406,10 @@ impl<V: VaultStore> Engine<V> {
         &self,
         peer: PublicKey,
         clock: u64,
-        fetched: Result<Option<(Attachment, bool)>, String>,
+        fetched: Result<Option<(Attachment, bool, Option<u64>)>, String>,
     ) -> Result<Option<Attachment>, String> {
         let vgen = self.vault_gen();
-        let Some((attachment, from_server)) = fetched? else {
+        let Some((attachment, from_server, conversation_gen)) = fetched? else {
             return Ok(None);
         };
         if !self.is_live(vgen) {
@@ -2347,7 +2417,7 @@ impl<V: VaultStore> Engine<V> {
         }
         if from_server
             && clock > 0
-            && let Err(e) = self.downloaded(peer, clock).await
+            && let Err(e) = self.downloaded_for_gen(peer, clock, conversation_gen).await
             && self.is_live(vgen)
         {
             self.ui.link.set(Link::Offline(e));
@@ -2355,8 +2425,15 @@ impl<V: VaultStore> Engine<V> {
         Ok(Some(attachment))
     }
 
-    /// Tell `peer` that its attachment, sent in its message at `clock`, is downloaded.
-    pub(super) async fn downloaded(&self, peer: PublicKey, clock: u64) -> Result<(), String> {
+    /// Tell `peer` that its attachment, sent in its message at `clock`, is downloaded, verifying
+    /// `expected_gen` under `self.inner` so a stale download can never queue a receipt on a
+    /// deleted-and-recreated conversation (`R8-P2-5`).
+    pub(super) async fn downloaded_for_gen(
+        &self,
+        peer: PublicKey,
+        clock: u64,
+        expected_gen: Option<u64>,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
         {
             let mut guard = self.lock_inner().await;
@@ -2365,6 +2442,9 @@ impl<V: VaultStore> Engine<V> {
             }
             let inner = guard.as_mut().ok_or("locked")?;
             let contact = inner.contact(&peer).ok_or("no such chat")?;
+            if expected_gen.is_some_and(|expected| contact.state.conversation_gen != expected) {
+                return Ok(());
+            }
             if contact.tell_downloaded(clock) {
                 inner.save_state().await.map_err(|e| describe(&e))?;
             }
@@ -2423,7 +2503,7 @@ impl<V: VaultStore> Engine<V> {
         id: &[u8; 16],
         mut pointer: AttachmentPointer,
         waiter: Waiter<'_>,
-    ) -> Result<Option<(Attachment, bool)>, FetchError> {
+    ) -> Result<Option<(Attachment, bool, Option<u64>)>, FetchError> {
         // The sender's own, while on the page that chose it: keyed by `(peer, id, key_hash)` so
         // another peer or mismatched key can never read a cached plaintext file (M-13).
         let key_hash = attachment_key_hash(&pointer.key);
@@ -2435,7 +2515,7 @@ impl<V: VaultStore> Engine<V> {
                 mime: std::mem::take(&mut pointer.mime),
                 data: Arc::new(data),
             };
-            return Ok(Some((attachment, false)));
+            return Ok(Some((attachment, false, None)));
         }
         let fetching = self
             .fetching(peer, index, &pointer)
@@ -2466,7 +2546,7 @@ impl<V: VaultStore> Engine<V> {
             mime: std::mem::take(&mut pointer.mime),
             data: Arc::new(data),
         };
-        Ok(Some((attachment, fetched)))
+        Ok(Some((attachment, fetched, Some(fetching.conversation_gen))))
     }
 
     /// What fetching the attachment `pointer`, in the chat with `peer`, takes.
@@ -2493,6 +2573,12 @@ impl<V: VaultStore> Engine<V> {
             u32::try_from(attachment::chunk_count(pointer.size)).map_err(|_| malformed())?;
         let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
+        let conversation_gen = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == peer)
+            .map(|c| c.state.conversation_gen)
+            .ok_or("no such chat")?;
         let unfinished = inner
             .vault
             .upload(&peer, &id)
@@ -2501,6 +2587,7 @@ impl<V: VaultStore> Engine<V> {
             .map(|pending| pending.uploaded);
         Ok(Fetching {
             peer,
+            conversation_gen,
             index,
             id,
             key,
@@ -2569,6 +2656,7 @@ impl<V: VaultStore> Engine<V> {
                 &fetching.name,
                 &fetching.id,
                 index,
+                fetching.conversation_gen,
                 waiter,
             )
             .await?
@@ -2576,11 +2664,21 @@ impl<V: VaultStore> Engine<V> {
             return Ok(None);
         };
         let plaintext = decrypt_and_validate(&chunk)?;
-        // Kept only once it decrypts AND matches `expected_len`, repairing any corrupt cached
-        // chunk while preventing spoofed `pointer.size` from polluting IndexedDB.
-        self.keep_chunk(&fetching.peer, &fetching.id, index, &chunk)
+        // Kept only once it decrypts, matches `expected_len`, AND belongs to the same
+        // conversation generation (`R8-P2-5`), aborting cleanly if the chat was deleted/recreated.
+        if !self
+            .keep_chunk_for_gen(
+                &fetching.peer,
+                &fetching.id,
+                index,
+                &chunk,
+                Some(fetching.conversation_gen),
+            )
             .await
-            .map_err(FetchError::Other)?;
+            .map_err(FetchError::Other)?
+        {
+            return Ok(None);
+        }
         Ok(Some((plaintext, true)))
     }
 
@@ -2593,6 +2691,7 @@ impl<V: VaultStore> Engine<V> {
         name: &str,
         id: &[u8; 16],
         index: u32,
+        conversation_gen: u64,
         waiter: Waiter<'_>,
     ) -> Result<Option<Vec<u8>>, FetchError> {
         let (mut waited, mut wait) = (0, POLL_CHUNK_MIN);
@@ -2624,11 +2723,14 @@ impl<V: VaultStore> Engine<V> {
                     )));
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {
-                    return Err(FetchError::NotFound(format!(
-                        "{name} is no longer on the server: it was deleted from the server, its \
-                         upload was cancelled, or it expired (the server keeps attachments \
-                         temporarily)"
-                    )));
+                    return Err(FetchError::NotFound {
+                        message: format!(
+                            "{name} is no longer on the server: it was deleted from the server, its \
+                             upload was cancelled, or it expired (the server keeps attachments \
+                             temporarily)"
+                        ),
+                        conversation_gen: Some(conversation_gen),
+                    });
                 }
                 Err(e) => return Err(FetchError::Other(describe(&e))),
             }
@@ -2636,24 +2738,26 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Keep chunk `index` of the attachment `id`, in the chat with `peer`, unless its upload was
-    /// cancelled or the chat deleted meanwhile.
-    async fn keep_chunk(
+    /// cancelled or the chat deleted/recreated meanwhile. Returns `Ok(true)` if kept.
+    async fn keep_chunk_for_gen(
         &self,
         peer: &PublicKey,
         id: &[u8],
         index: u32,
         chunk: &[u8],
-    ) -> Result<(), String> {
+        expected_gen: Option<u64>,
+    ) -> Result<bool, String> {
         let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
-        if !self.may_keep(inner, peer, id) {
-            return Ok(());
+        if !self.may_keep_for_gen(inner, peer, id, expected_gen) {
+            return Ok(false);
         }
         inner
             .vault
             .put_chunk(peer, id, index, chunk)
             .await
-            .map_err(|e| describe(&e))
+            .map_err(|e| describe(&e))?;
+        Ok(true)
     }
 
     /// Chunk `index` of the attachment `id`, in the chat with `peer`, if kept.

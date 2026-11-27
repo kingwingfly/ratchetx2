@@ -482,10 +482,19 @@ impl<V: VaultStore> Engine<V> {
                     // promoted from `UNSENT`) BEFORE dropping `guard` and transmitting `PushV2` so
                     // a reload or lost response never lets `requeue_sealed` unseal and duplicate an
                     // already-dispatched message.
+                    // R8-P2-2: Only promote `UNSENT -> UNCERTAIN` when this sealed record actually
+                    // carries an initial for the CURRENT active session (never when retrying old
+                    // ciphertext from a superseded session `S1` while `S2` is still `UNSENT`).
                     let first_dispatch = !outgoing.dispatched;
-                    let promoted_from_unsent = inner.contacts.iter().any(|c| {
-                        c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT
-                    });
+                    let promoted_from_unsent = !record.carried_initial.is_empty()
+                        && inner.contacts.iter().any(|c| {
+                            c.peer == *peer
+                                && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT
+                                && (record.session_id.is_empty()
+                                    || c.session.active_id().is_some_and(|id| {
+                                        id.as_slice() == record.session_id.as_slice()
+                                    }))
+                        });
                     if first_dispatch || promoted_from_unsent {
                         let target_index = outgoing.history_index;
                         let target_clock = outgoing.clock;
@@ -618,8 +627,13 @@ impl<V: VaultStore> Engine<V> {
                         Ok(RekeyOutcome::Ready) => continue,
                         Ok(RekeyOutcome::Paused | RekeyOutcome::ContactGone) => break,
                         Ok(RekeyOutcome::Failed) => {
+                            // R8-P1-2: `fail_waiting` already failed every unsealed item in
+                            // `outbox` (and is a no-op when `outbox` is empty with
+                            // `events.accepted == true`). Record approval backoff and break so an
+                            // empty-outbox acceptance rekey never livelocks on `NotFound`/`InvalidKeys`.
+                            self.queue.record_approval_backoff(peer);
                             changed = true;
-                            continue;
+                            break;
                         }
                         Ok(RekeyOutcome::UpdateRequired(reason)) => {
                             self.require_update(reason.clone());
@@ -1134,26 +1148,41 @@ impl<V: VaultStore> Engine<V> {
                                                         == ErrorKind::StaleVersion =>
                                             {
                                                 // Recipient retired the SPK used by this cached
-                                                // greeting: retire locally and immediately re-claim
-                                                // a fresh bundle on the next loop iteration while
-                                                // preserving queued messages.
-                                                if let Some(contact) = inner.contact(peer) {
-                                                    contact.session.retire();
-                                                    contact.state.needs_requeue_sealed = true;
-                                                    contact.state.greeting_delivery =
-                                                        GREETING_DELIVERY_UNSENT;
-                                                    contact.state.greeting_sent_at = 0;
-                                                    contact.state.greeting_target_generation = 0;
-                                                    contact.state.greeting_delivery_verified =
-                                                        false;
+                                                // greeting within the delivery-tombstone window:
+                                                // Bob never received this session or registered
+                                                // its write token, so atomically clear `dispatched`
+                                                // on sealed items belonging ONLY to this unreceived
+                                                // session (`R8-P1-3`), retire locally, and re-claim
+                                                // a fresh bundle while preserving queued messages.
+                                                match inner
+                                                    .retire_unreceived_session_on_stale_version(
+                                                        peer,
+                                                        Some(session_id.as_slice()),
+                                                    )
+                                                    .await
+                                                {
+                                                    Ok(true) => {
+                                                        if !self.is_live(vgen) {
+                                                            return Ok(false);
+                                                        }
+                                                        self.refresh_contacts(inner);
+                                                        retry_failed = true;
+                                                        retry_retired_spk = true;
+                                                    }
+                                                    Ok(false) => {
+                                                        if !self.is_live(vgen) {
+                                                            return Ok(false);
+                                                        }
+                                                        stale_aborted = true;
+                                                    }
+                                                    Err(err) => {
+                                                        if !self.is_live(vgen) {
+                                                            return Ok(false);
+                                                        }
+                                                        retry_failed = true;
+                                                        result = Err(err);
+                                                    }
                                                 }
-                                                let _ = inner.save_state().await;
-                                                if !self.is_live(vgen) {
-                                                    return Ok(false);
-                                                }
-                                                self.refresh_contacts(inner);
-                                                retry_failed = true;
-                                                retry_retired_spk = true;
                                             }
                                             Err(retry_err) => {
                                                 retry_failed = true;
@@ -2581,6 +2610,73 @@ impl<V: VaultStore> Inner<V> {
             contact.state.unseen.clear();
         }
         Ok(outcome)
+    }
+
+    /// Atomically retire an unreceived (`!is_known_by_peer()`) active session after
+    /// `SendInitialV2` returned `StaleVersion` within the delivery-tombstone window (`R8-P1-3`).
+    ///
+    /// Because `StaleVersion` proves the recipient never received this session's initial or
+    /// registered its write token (and `PushV2` enforces auth-before-dedup), any sealed outbox
+    /// items belonging strictly to this retired session could never have been accepted by the
+    /// relay: clearing `dispatched = false` on those exact items lets `requeue_sealed` re-encrypt
+    /// and deliver them on the replacement session instead of dropping them as `Step::Unknown`.
+    pub(super) async fn retire_unreceived_session_on_stale_version(
+        &mut self,
+        peer: &PublicKey,
+        expected_session_id: Option<&[u8]>,
+    ) -> Result<bool, String> {
+        let Some(contact) = self.contact(peer) else {
+            return Ok(false);
+        };
+        if contact.session.needs_new_session() || contact.session.is_known_by_peer() {
+            return Ok(false);
+        }
+        let active_id = contact.session.active_id().copied();
+        if let Some(expected) = expected_session_id
+            && !expected.is_empty()
+            && active_id.as_ref().map(|id| id.as_slice()) != Some(expected)
+        {
+            return Ok(false);
+        }
+        let dispatched_candidates: Vec<(u64, u64)> = contact
+            .state
+            .outbox
+            .iter()
+            .filter(|o| o.sealed && o.dispatched)
+            .map(|o| (o.history_index, o.clock))
+            .collect();
+        let mut clear_dispatched: Vec<(u64, u64)> = Vec::new();
+        if let Some(retired_id) = active_id {
+            for (idx, clock) in dispatched_candidates {
+                if let Ok(rec) = self.vault.outgoing(peer, idx).await
+                    && rec.session_id.as_slice() == retired_id.as_slice()
+                {
+                    clear_dispatched.push((idx, clock));
+                }
+            }
+        }
+        self.with_contact_tx(peer, async |inner| {
+            let Some(contact) = inner.contact(peer) else {
+                return Ok(false);
+            };
+            for o in &mut contact.state.outbox {
+                if o.sealed
+                    && o.dispatched
+                    && clear_dispatched.contains(&(o.history_index, o.clock))
+                {
+                    o.dispatched = false;
+                }
+            }
+            contact.session.retire();
+            contact.state.needs_requeue_sealed = true;
+            contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+            contact.state.greeting_sent_at = 0;
+            contact.state.greeting_target_generation = 0;
+            contact.state.greeting_delivery_verified = false;
+            inner.save_state().await.map_err(|e| describe(&e))?;
+            Ok(true)
+        })
+        .await
     }
 
     /// Complete a deferred requeue before flush can read or transmit any sealed record.

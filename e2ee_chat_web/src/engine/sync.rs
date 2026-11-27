@@ -187,14 +187,6 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(());
         }
-        // Flush any queued `PendingRevoke` for `peer`'s slot (serialized against background
-        // `flush_pending_revokes` under `grant_sync_lock`) BEFORE issuing any `RegisterWriteToken`
-        // for `peer`, then release `grant_sync_lock` so concurrent grant registrations remain
-        // non-blocking.
-        self.flush_pending_revoke_for_peer(vgen, peer).await?;
-        if !self.is_live(vgen) {
-            return Ok(());
-        }
         let mut first_err: Option<String> = None;
         let mut attempted: Vec<([u8; 32], u64)> = Vec::new();
         loop {
@@ -221,24 +213,41 @@ impl<V: VaultStore> Engine<V> {
                 else {
                     break;
                 };
-                match inner.client.sign_register_write_token_v2(
-                    &inner.audience,
-                    peer,
-                    &grant.token_hash,
-                    grant.grant_version,
-                    grant.pin_active,
-                ) {
-                    Ok(request) => (inner.server.clone(), grant, request),
-                    Err(e) => {
-                        if e.kind() == ErrorKind::ClockSkew {
-                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                // R7-P2-1 + R8-P2-3: Re-check `pending_revokes` under the SAME `inner` guard that
+                // selects EACH grant so a concurrent flusher finishing an earlier RPC can never
+                // register a newly staged grant version ahead of a staged `PendingRevoke`, then
+                // release `grant_sync_lock` before issuing `RegisterWriteToken`.
+                let peer_slot_id = inner.client.peer_slot_id(peer);
+                let has_pending_revoke = inner
+                    .state
+                    .pending_revokes
+                    .iter()
+                    .any(|r| r.peer_slot_id.as_slice() == peer_slot_id.as_slice());
+                if has_pending_revoke {
+                    None
+                } else {
+                    match inner.client.sign_register_write_token_v2(
+                        &inner.audience,
+                        peer,
+                        &grant.token_hash,
+                        grant.grant_version,
+                        grant.pin_active,
+                    ) {
+                        Ok(request) => Some((inner.server.clone(), grant, request)),
+                        Err(e) => {
+                            if e.kind() == ErrorKind::ClockSkew {
+                                self.warn_clock_skew(inner.client.clock().offset_ms());
+                            }
+                            first_err = Some(describe(&e));
+                            break;
                         }
-                        first_err = Some(describe(&e));
-                        break;
                     }
                 }
             };
-            let (server, grant, request) = next;
+            let Some((server, grant, request)) = next else {
+                self.flush_pending_revoke_for_peer(vgen, peer).await?;
+                continue;
+            };
             attempted.push((grant.token_hash, grant.grant_version));
             let rpc_res: session::Result<()> = Fetch::client(&server)
                 .register_write_token(request)
@@ -887,23 +896,26 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return false;
         }
-        let (reached, inbox_drained_all) = match self.take_initial_messages_with_replayed().await {
+        let inbox_drained_all = match self.take_initial_messages_with_replayed().await {
             Ok((taken, _, drained_all)) => {
                 active |= taken;
-                (true, drained_all)
+                drained_all
             }
             Err(e) => {
                 failure.get_or_insert(e);
-                (false, false)
+                false
             }
         };
         if !self.is_live(vgen) {
             return false;
         }
-        if reached
-            && let Err(e) = self
-                .publish_with_rotation_gate(false, inbox_drained_all)
-                .await
+        // R8-P2-6: Always run `publish_with_rotation_gate(false, inbox_drained_all)` even when
+        // `ListInitialMessages` failed (`inbox_drained_all == false`) so mandatory day-25 manifest
+        // renewal / unreconciled publish recovery can still renew in place while scheduled SPK
+        // rotation stays deferred and `failure` remains preserved.
+        if let Err(e) = self
+            .publish_with_rotation_gate(false, inbox_drained_all)
+            .await
         {
             failure.get_or_insert(e);
         }
@@ -1556,22 +1568,35 @@ impl<V: VaultStore> Engine<V> {
                         if allow_reclaim {
                             // Recipient retired the signed prekey generation targeted by this
                             // cached greeting while still inside the delivery-tombstone window:
-                            // retire the unaccepted session locally and immediately claim a fresh
-                            // bundle while preserving queued messages.
-                            if let Some(c) = inner.contact(&peer) {
-                                c.session.retire();
-                                c.state.needs_requeue_sealed = true;
-                                c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                                c.state.greeting_sent_at = 0;
-                                c.state.greeting_target_generation = 0;
-                                c.state.greeting_delivery_verified = false;
+                            // clear `dispatched` on sealed items belonging strictly to this
+                            // unreceived session (`R8-P1-3`), retire locally, and immediately claim
+                            // a fresh bundle while preserving queued messages.
+                            match inner
+                                .retire_unreceived_session_on_stale_version(
+                                    &peer,
+                                    session_id.as_ref().map(|id| id.as_slice()),
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                    self.refresh_contacts(inner);
+                                    reclaim_retired = true;
+                                }
+                                Ok(false) => {
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                }
+                                Err(err) => {
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                    first_err.get_or_insert(err);
+                                }
                             }
-                            let _ = inner.save_state().await;
-                            if !self.is_live(vgen) {
-                                return Ok(false);
-                            }
-                            self.refresh_contacts(inner);
-                            reclaim_retired = true;
                         } else if was_confirmed_probe {
                             self.queue.record_confirmed_probe_backoff(&peer);
                         } else {
@@ -1818,12 +1843,16 @@ impl<V: VaultStore> Engine<V> {
                     };
                     let Some(&peer) = token_map.get(&token_hash) else {
                         if let Some(&iso_peer) = isolated_token_map.get(&token_hash) {
+                            let initial_message = env.initial_message.filter(|wire| {
+                                Incoming::try_from(wire)
+                                    .is_ok_and(|inc| inner.can_pin_deferred_digest(&inc, now_ms))
+                            });
                             let buffered = push_deferred_envelope(
                                 &mut inner.deferred_envelopes,
                                 &iso_peer,
                                 env.sequence,
                                 env.message,
-                                env.initial_message,
+                                initial_message,
                                 now_ms,
                                 true,
                             );
@@ -1865,12 +1894,16 @@ impl<V: VaultStore> Engine<V> {
                     let peer_blocked = peer_has_buffered || peer_awaiting_user_or_upgrade;
 
                     if peer_blocked {
+                        let initial_message = env.initial_message.filter(|wire| {
+                            Incoming::try_from(wire)
+                                .is_ok_and(|inc| inner.can_pin_deferred_digest(&inc, now_ms))
+                        });
                         let buffered = push_deferred_envelope(
                             &mut inner.deferred_envelopes,
                             &peer,
                             env.sequence,
                             env.message,
-                            env.initial_message,
+                            initial_message,
                             now_ms,
                             false,
                         );
@@ -1901,21 +1934,26 @@ impl<V: VaultStore> Engine<V> {
                     if let Some(ref wire_init) = env.initial_message
                         && let Ok(inc) = Incoming::try_from(wire_init)
                     {
-                        match stage_carried_initial_one(
-                            &mut inner.contacts[contact_idx].state,
-                            &inc,
-                        ) {
-                            Ok(true) => {
-                                peers_with_staged_carried.insert(peer);
-                                peers_needing_replay.insert(peer);
-                                staged_carried_init = true;
-                            }
-                            Ok(false) => {
-                                peers_needing_replay.insert(peer);
-                            }
-                            Err(reason) => {
-                                process_err = Some(reason);
-                                break;
+                        let allow_stage =
+                            !inc.pq_suite().is_some_and(|suite| !suite.is_supported())
+                                || inner.can_pin_deferred_digest(&inc, now_ms);
+                        if allow_stage {
+                            match stage_carried_initial_one(
+                                &mut inner.contacts[contact_idx].state,
+                                &inc,
+                            ) {
+                                Ok(true) => {
+                                    peers_with_staged_carried.insert(peer);
+                                    peers_needing_replay.insert(peer);
+                                    staged_carried_init = true;
+                                }
+                                Ok(false) => {
+                                    peers_needing_replay.insert(peer);
+                                }
+                                Err(reason) => {
+                                    process_err = Some(reason);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1989,7 +2027,11 @@ impl<V: VaultStore> Engine<V> {
                             let deferred_init = if staged_carried_init {
                                 None
                             } else {
-                                env.initial_message
+                                env.initial_message.filter(|wire| {
+                                    Incoming::try_from(wire).is_ok_and(|inc| {
+                                        inner.can_pin_deferred_digest(&inc, now_ms)
+                                    })
+                                })
                             };
                             let buffered = push_deferred_envelope(
                                 &mut inner.deferred_envelopes,

@@ -212,7 +212,9 @@ impl<V: VaultStore> Engine<V> {
             && clock > 0
             && self.all_kept(&fetching).await
             && !aborted()
-            && let Err(e) = self.downloaded(fetching.peer, clock).await
+            && let Err(e) = self
+                .downloaded_for_gen(fetching.peer, clock, Some(fetching.conversation_gen))
+                .await
             && !aborted()
         {
             self.ui.link.set(Link::Offline(e));
@@ -245,9 +247,14 @@ impl<V: VaultStore> Engine<V> {
                 match self.chunk(fetching, index, Waiter::Chat(&plays)).await {
                     Ok(Some(chunk)) => chunk,
                     Ok(None) => return Ok(None),
-                    Err(FetchError::NotFound(msg)) => {
+                    Err(FetchError::NotFound { message: msg, .. }) => {
                         let _ = self
-                            .note_gone_by_id(&fetching.peer, Some(fetching.index), &fetching.id)
+                            .note_gone_by_id_for_gen(
+                                &fetching.peer,
+                                Some(fetching.index),
+                                &fetching.id,
+                                Some(fetching.conversation_gen),
+                            )
                             .await;
                         return Err(msg);
                     }

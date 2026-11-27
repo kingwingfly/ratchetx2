@@ -17085,3 +17085,1513 @@ fn r7_p2_1_p2_3_p2_5_p3_1_p3_2_revoke_order_attachment_gen_per_suite_refill_and_
         );
     });
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r8_p0_1_p2_6_p2_7_undrained_inbox_pins_digests_offline_renewal_and_refill_on_deferral() {
+    use futures::executor::LocalPool;
+    use protocol::handshake_v2::{PublishV2Response, RefillPrekeysResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    pool.run_until(async {
+        // R8-P0-1: When `inbox_drained_clean == false`, 18 consecutive manual publishes MUST NOT
+        // evict the initial confirmed manifest digest `M0` (still referenced by an unseen
+        // `listed = 1` inbox row). Once `inbox_drained_clean == true`, the next publish prunes
+        // back to `<= 16`.
+        let (mut inner, _peer) = unlocked_client();
+        inner.server = TEST_SERVER.to_string();
+        inner.audience = "localhost".to_string();
+        let engine = Engine::with_inner(Ui::new(), inner);
+        engine.inbox_drained_clean.set(false);
+        let m0_digest = {
+            let _mock = crate::transport::mock_fetch(|_s, path, _b| {
+                assert!(path.ends_with("/PublishV2"), "unexpected RPC {path}");
+                Ok((200, PublishV2Response {}.encode_to_vec()))
+            });
+            let vgen = engine.vault_gen();
+            engine.publish_full(vgen, true).await.unwrap();
+            let d0 = *engine
+                .inner
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .client
+                .recent_manifest_digests()
+                .last()
+                .unwrap();
+            for _ in 0..18 {
+                engine.publish_full(vgen, true).await.unwrap();
+            }
+            d0
+        };
+        {
+            let guard = engine.inner.lock().await;
+            let recent = guard.as_ref().unwrap().client.recent_manifest_digests();
+            assert!(
+                recent.contains(&m0_digest),
+                "R8-P0-1: M0 MUST remain retained across 18 publishes while inbox is undrained (len={})",
+                recent.len()
+            );
+            assert_eq!(recent.len(), 19);
+        }
+        // Once the inbox cleanly drains, the next publish prunes rolling digests back down to <= 16.
+        engine.inbox_drained_clean.set(true);
+        {
+            let _mock = crate::transport::mock_fetch(|_s, path, _b| {
+                assert!(path.ends_with("/PublishV2"), "unexpected RPC {path}");
+                Ok((200, PublishV2Response {}.encode_to_vec()))
+            });
+            let vgen = engine.vault_gen();
+            engine.publish_full(vgen, true).await.unwrap();
+        }
+        {
+            let guard = engine.inner.lock().await;
+            let recent = guard.as_ref().unwrap().client.recent_manifest_digests();
+            assert!(
+                recent.len() <= session::MAX_RECENT_MANIFEST_DIGESTS,
+                "after inbox drain, publish must prune rolling digests back to <= 16 (got {})",
+                recent.len()
+            );
+        }
+
+        // R8-P2-6: When `ListInitialMessages` fails with 503 Unavailable during `sync()`, a
+        // manifest past day 25 (`MANIFEST_RENEW_MANDATORY_AGE`) MUST still renew in place via
+        // `PublishV2` (keeping same SPK and keeping `inbox_drained_clean == false`).
+        let (spk_before, seq_before) = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contacts.clear();
+            inner.state.published_at = crate::util::now().saturating_sub(26 * 24 * 60 * 60 * 1000);
+            inner.state.needs_publish = false;
+            let spk = inner.client.current_signed_prekey().unwrap();
+            let seq = inner.client.manifest_seq();
+            (spk, seq)
+        };
+        let publish_hits = Rc::new(Cell::new(0usize));
+        {
+            let ph = publish_hits.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ListInitialMessages") {
+                    Ok((
+                        503,
+                        br#"{"code":"unavailable","message":"inbox down"}"#.to_vec(),
+                    ))
+                } else if path.ends_with("/PublishV2") {
+                    ph.set(ph.get() + 1);
+                    Ok((200, PublishV2Response {}.encode_to_vec()))
+                } else if path.ends_with("/GetServerInfo") {
+                    Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "localhost".into(),
+                            pq_enabled: true,
+                            supported_suites: vec![1, 2],
+                            pq_ratchet_supported: true,
+                        }
+                        .encode_to_vec(),
+                    ))
+                } else if path.ends_with("/FetchSigned") {
+                    Ok((
+                        200,
+                        protocol::mailbox_v2::FetchSignedResponse::default().encode_to_vec(),
+                    ))
+                } else {
+                    panic!("unexpected RPC during R8-P2-6 sync: {path}");
+                }
+            });
+            engine.sync().await;
+        }
+        assert_eq!(
+            publish_hits.get(),
+            1,
+            "R8-P2-6: day-25 mandatory manifest renewal must still run when ListInitialMessages fails"
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert_eq!(
+                inner.client.current_signed_prekey(),
+                Some(spk_before),
+                "mandatory renewal during failed inbox list must renew SPK in place"
+            );
+            assert!(inner.client.manifest_seq() > seq_before);
+            assert!(!engine.inbox_drained_clean.get());
+        }
+
+        // R8-P2-7: (a) With all 144 manifest digest slots pinned, automatic deferral in
+        // `publish_with_rotation_gate` MUST still run non-rotating `RefillPrekeys`, AND
+        // forced `publish(true)` MUST refuse before transmitting without evicting index 0;
+        // (b) `defer_inbox_initial` MUST reserve the 16 rolling/renewal slots (`CapFull` at 128).
+        let (mut inner2, _) = unlocked_client();
+        inner2.server = TEST_SERVER.to_string();
+        inner2.audience = "localhost".to_string();
+        let mut pinned = Vec::new();
+        for i in 0..(session::MAX_RETAINED_MANIFEST_DIGESTS as u16) {
+            let prep = inner2
+                .client
+                .prepare_publish_v2_preserving("localhost", 1, 1, &[], &pinned)
+                .unwrap();
+            let digest = session::protocol::handshake_v2::manifest_digest(
+                prep.request.manifest.as_ref().unwrap(),
+            )
+            .unwrap();
+            pinned.push(digest);
+            inner2.client.commit_publish_v2(prep);
+            let mut id_key = [0x51u8; 32];
+            id_key[..2].copy_from_slice(&i.to_be_bytes());
+            let mut eph_key = [0x71u8; 32];
+            eph_key[..2].copy_from_slice(&i.to_be_bytes());
+            inner2.deferred_initials.push(crate::vault::DeferredInitial {
+                initial: Some(WireInitialMessageV2 {
+                    id: 0,
+                    version: 2,
+                    identity_key: Bytes::copy_from_slice(&id_key),
+                    ephemeral_key: Bytes::copy_from_slice(&eph_key),
+                    signed_prekey: Bytes::copy_from_slice(&[0x70; 32]),
+                    first_message: Some(party::EncryptedMessage {
+                        header: Bytes::from_static(b"h"),
+                        content: Bytes::from_static(b"c"),
+                    }),
+                    pq_suite: PqSuite::MlKem1024.as_u8().into(),
+                    pq_prekey_id: Bytes::from_static(&[0x88; 32]),
+                    pq_ciphertext: Bytes::from(vec![0x88; PqSuite::MlKem1024.ct_len()]),
+                    manifest_digest: Bytes::copy_from_slice(&digest),
+                    ..WireInitialMessageV2::default()
+                }),
+                deferred_at: crate::util::now(),
+            });
+        }
+        inner2.state.published_at = 1;
+        inner2.state.needs_publish = false;
+        inner2.state.used_one_time_prekeys = 10;
+        inner2.last_server_classical_opks = Some(20);
+        let engine2 = Engine::with_inner(Ui::new(), inner2);
+        let refill_hits = Rc::new(Cell::new(0usize));
+        {
+            let rh = refill_hits.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/RefillPrekeys") {
+                    rh.set(rh.get() + 1);
+                    Ok((
+                        200,
+                        RefillPrekeysResponse {
+                            classical_one_time_count: 20,
+                            pq_one_time_counts: vec![],
+                        }
+                        .encode_to_vec(),
+                    ))
+                } else {
+                    panic!("unexpected RPC when 144 digests pinned: {path}");
+                }
+            });
+            engine2.publish_with_rotation_gate(false, true).await.unwrap();
+            assert_eq!(
+                refill_hits.get(),
+                1,
+                "R8-P2-7: non-rotating RefillPrekeys must still run when scheduled rotation defers"
+            );
+            // Forced manual publish must fail BEFORE transmitting and preserve digest 0!
+            let err = engine2.publish(true).await.unwrap_err();
+            assert!(!err.is_empty());
+        }
+        {
+            let guard = engine2.inner.lock().await;
+            let recent = guard.as_ref().unwrap().client.recent_manifest_digests();
+            assert_eq!(recent.len(), session::MAX_RETAINED_MANIFEST_DIGESTS);
+            assert!(
+                recent.contains(&pinned[0]),
+                "R8-P2-7: forced publish at 144 pins must never evict digest 0"
+            );
+        }
+
+        // Admission cap: 128 distinct pinned digests causes `defer_inbox_initial` for a 129th
+        // digest to return `CapFull`, keeping the 16 rolling/renewal slots available!
+        let (mut inner3, _) = unlocked_client();
+        inner3.server = TEST_SERVER.to_string();
+        inner3.audience = "localhost".to_string();
+        let mut pinned3 = Vec::new();
+        for i in 0..129u16 {
+            let prep = inner3
+                .client
+                .prepare_publish_v2_preserving("localhost", 1, 1, &[], &pinned3)
+                .unwrap();
+            let digest = session::protocol::handshake_v2::manifest_digest(
+                prep.request.manifest.as_ref().unwrap(),
+            )
+            .unwrap();
+            pinned3.push(digest);
+            inner3.client.commit_publish_v2(prep);
+            if i < 128 {
+                let mut id_key = [0x61u8; 32];
+                id_key[..2].copy_from_slice(&i.to_be_bytes());
+                let mut eph_key = [0x81u8; 32];
+                eph_key[..2].copy_from_slice(&i.to_be_bytes());
+                let wire = WireInitialMessageV2 {
+                    id: 0,
+                    version: 2,
+                    identity_key: Bytes::copy_from_slice(&id_key),
+                    ephemeral_key: Bytes::copy_from_slice(&eph_key),
+                    signed_prekey: Bytes::copy_from_slice(&[0x70; 32]),
+                    first_message: Some(party::EncryptedMessage {
+                        header: Bytes::from_static(b"h"),
+                        content: Bytes::from_static(b"c"),
+                    }),
+                    pq_suite: PqSuite::MlKem1024.as_u8().into(),
+                    pq_prekey_id: Bytes::from_static(&[0x88; 32]),
+                    pq_ciphertext: Bytes::from(vec![0x88; PqSuite::MlKem1024.ct_len()]),
+                    manifest_digest: Bytes::copy_from_slice(&digest),
+                    ..WireInitialMessageV2::default()
+                };
+                if i < 90 {
+                    inner3.deferred_initials.push(crate::vault::DeferredInitial {
+                        initial: Some(wire),
+                        deferred_at: crate::util::now(),
+                    });
+                } else {
+                    inner3
+                        .deferred_envelopes
+                        .push(crate::vault::DeferredEnvelope {
+                            peer: id_key.to_vec(),
+                            sequence: u64::from(i) + 1,
+                            message: None,
+                            initial_message: Some(wire),
+                            deferred_at: crate::util::now(),
+                            pq_isolated: true,
+                        });
+                }
+            }
+        }
+        let extra_wire = WireInitialMessageV2 {
+            id: 999,
+            version: 2,
+            identity_key: Bytes::copy_from_slice(&[0x99; 32]),
+            ephemeral_key: Bytes::copy_from_slice(&[0x9a; 32]),
+            signed_prekey: Bytes::copy_from_slice(&[0x70; 32]),
+            first_message: Some(party::EncryptedMessage {
+                header: Bytes::from_static(b"h"),
+                content: Bytes::from_static(b"c"),
+            }),
+            pq_suite: PqSuite::MlKem1024.as_u8().into(),
+            pq_prekey_id: Bytes::from_static(&[0x88; 32]),
+            pq_ciphertext: Bytes::from(vec![0x88; PqSuite::MlKem1024.ct_len()]),
+            manifest_digest: Bytes::copy_from_slice(&pinned3[128]),
+            ..WireInitialMessageV2::default()
+        };
+        let extra_incoming = Incoming::try_from(&extra_wire).unwrap();
+        assert_eq!(
+            inner3.defer_inbox_initial(&extra_incoming),
+            super::handshake::DeferInboxOutcome::CapFull,
+            "R8-P2-7: admitting a 129th distinct local manifest digest must return CapFull to reserve renewal slots"
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r8_p1_2_p1_3_p2_2_empty_outbox_rekey_no_livelock_stale_version_clears_dispatched_and_old_record_does_not_promote_s2()
+ {
+    use futures::executor::LocalPool;
+    use protocol::handshake_v2::{ListInitialMessagesResponse, SendInitialV2Response};
+    use protocol::mailbox_v2::{PushV2Response, RegisterWriteTokenResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    pool.run_until(async {
+        // R8-P1-2: Empty outbox + `events.accepted == true` + `needs_new_session()` hitting
+        // `ClaimBundle -> NotFound` MUST exit after 1 attempt with approval backoff (no livelock!).
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.session.discard_active();
+            c.state.outbox.clear();
+            c.state.events = Some(crate::content::Events {
+                accepted: true,
+                ..Default::default()
+            });
+            inner.save_state().await.unwrap();
+        }
+        let claim_calls = Rc::new(Cell::new(0usize));
+        {
+            let cc = claim_calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ListInitialMessages") {
+                    Ok((200, ListInitialMessagesResponse::default().encode_to_vec()))
+                } else if path.ends_with("/ClaimBundle") {
+                    cc.set(cc.get() + 1);
+                    assert!(cc.get() <= 2, "R8-P1-2 livelock detected");
+                    Ok((
+                        404,
+                        br#"{"code":"not_found","message":"no bundle"}"#.to_vec(),
+                    ))
+                } else {
+                    panic!("unexpected RPC in R8-P1-2: {path}");
+                }
+            });
+            let _ = engine.flush(&peer).await;
+        }
+        assert_eq!(
+            claim_calls.get(),
+            1,
+            "R8-P1-2: empty-outbox accepted rekey must attempt ClaimBundle once and break"
+        );
+        assert!(engine.queue.is_approval_backed_off(&peer));
+
+        // R8-P1-3: `SendInitialV2 -> StaleVersion` reclaim on an unaccepted session `S1` whose
+        // sealed head `M1` has `dispatched = true` MUST clear `dispatched = false` on `M1` so `M1`
+        // is re-encrypted and delivered on `S2` instead of dropped as `Step::Unknown`!
+        let (engine_s, peer_s, mut bob_s) = established_engine_on_localhost().await;
+        let fresh_bob_bundle_s2 = publish_bundle_for_test(&mut bob_s, "localhost", 2)
+            .into_iter()
+            .next()
+            .unwrap();
+        let m1_index = {
+            let mut guard = engine_s.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer_s).unwrap();
+            assert!(!c.session.is_known_by_peer());
+            c.session.clear_pending_grants();
+            c.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNCERTAIN;
+            c.state.greeting_sent_at = crate::util::now();
+            c.state.awaiting_peer_acceptance = false;
+            c.state.outbox.clear();
+            let view = inner
+                .add(&peer_s, Kind::Text("must not be lost".into()), false)
+                .await
+                .unwrap();
+            let _ = inner.seal_head_on_active_session(&peer_s).await.unwrap();
+            inner.contact(&peer_s).unwrap().state.outbox[0].dispatched = true;
+            inner.save_state().await.unwrap();
+            view.index
+        };
+        let push_calls = Rc::new(Cell::new(0usize));
+        let send_init_calls = Rc::new(Cell::new(0usize));
+        {
+            let pc = push_calls.clone();
+            let sic = send_init_calls.clone();
+            let b2 = fresh_bob_bundle_s2.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ListInitialMessages") {
+                    Ok((200, ListInitialMessagesResponse::default().encode_to_vec()))
+                } else if path.ends_with("/PushV2") {
+                    let n = pc.get() + 1;
+                    pc.set(n);
+                    if n == 1 {
+                        Ok((
+                            409,
+                            br#"{"code":"aborted","message":"write token rejected"}"#.to_vec(),
+                        ))
+                    } else {
+                        Ok((200, PushV2Response { sequence: 10 }.encode_to_vec()))
+                    }
+                } else if path.ends_with("/SendInitialV2") {
+                    let s = sic.get() + 1;
+                    sic.set(s);
+                    if s == 1 {
+                        Ok((
+                            400,
+                            br#"{"code":"out_of_range","message":"stale prekey"}"#.to_vec(),
+                        ))
+                    } else {
+                        Ok((200, SendInitialV2Response { id: 2 }.encode_to_vec()))
+                    }
+                } else if path.ends_with("/ClaimBundle") {
+                    Ok((200, b2.encode_to_vec()))
+                } else if path.ends_with("/RegisterWriteToken") {
+                    Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                } else {
+                    panic!("unexpected RPC in R8-P1-3: {path}");
+                }
+            });
+            engine_s.flush(&peer_s).await.unwrap();
+        }
+        assert_eq!(
+            push_calls.get(),
+            2,
+            "R8-P1-3: M1 must be re-sealed and pushed on S2 (not dropped as Step::Unknown)"
+        );
+        {
+            let guard = engine_s.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(
+                inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer_s)
+                    .unwrap()
+                    .state
+                    .outbox
+                    .is_empty()
+            );
+            let entry = inner.vault.entry(&peer_s, m1_index).await.unwrap().unwrap();
+            assert_eq!(
+                entry.delivery(),
+                Delivery::Sent,
+                "R8-P1-3: M1 must reach Delivery::Sent on S2"
+            );
+        }
+
+        // R8-P2-2: Retrying a retained `dispatched = true` sealed record from old `S1` while
+        // active `S2` has `greeting_delivery == UNSENT` MUST NOT promote `S2` to `UNCERTAIN`!
+        let (engine_p, peer_p, mut bob_p) = established_engine_on_localhost().await;
+        let b_s2 = publish_bundle_for_test(&mut bob_p, "localhost", 2)
+            .into_iter()
+            .next()
+            .unwrap();
+        {
+            let mut guard = engine_p.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contact(&peer_p).unwrap().state.outbox.clear();
+            let _ = inner
+                .add(&peer_p, Kind::Text("from s1".into()), false)
+                .await
+                .unwrap();
+            let _ = inner.seal_head_on_active_session(&peer_p).await.unwrap();
+            inner.contact(&peer_p).unwrap().state.outbox[0].dispatched = true;
+            inner.save_state().await.unwrap();
+        }
+        let claimed_s2 = {
+            let b_s2_c = b_s2.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                assert!(path.ends_with("/ClaimBundle"), "unexpected RPC {path}");
+                Ok((200, b_s2_c.encode_to_vec()))
+            });
+            let (pq_cfg, clock) = {
+                let guard = engine_p.inner.lock().await;
+                let inner = guard.as_ref().unwrap();
+                (
+                    inner.client.pq_config().clone(),
+                    inner.client.clock().clone(),
+                )
+            };
+            session::claim_peer_bundle_v2(
+                &Fetch::client(TEST_SERVER),
+                "localhost",
+                &peer_p,
+                &session::PeerPqState::default(),
+                &pq_cfg,
+                &clock,
+            )
+            .await
+            .unwrap()
+        };
+        {
+            let mut guard = engine_p.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let hello = Kind::Hello(inner.client.make_hello("Alice", 2)).to_bytes();
+            let req2 = inner
+                .client
+                .finish_prepare_initiate_v2(
+                    claimed_s2,
+                    &session::PeerPqState::default(),
+                    &hello,
+                    Fetch::client(TEST_SERVER),
+                )
+                .unwrap();
+            let c = inner.contact(&peer_p).unwrap();
+            c.session = req2.session;
+            c.session.clear_pending_grants();
+            c.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNSENT;
+            c.state.greeting_sent_at = 0;
+            inner.save_state().await.unwrap();
+        }
+        {
+            let _mock = crate::transport::mock_fetch(|_s, path, _b| {
+                if path.ends_with("/ListInitialMessages") {
+                    Ok((200, ListInitialMessagesResponse::default().encode_to_vec()))
+                } else if path.ends_with("/PushV2") {
+                    Ok((
+                        503,
+                        br#"{"code":"unavailable","message":"retry later"}"#.to_vec(),
+                    ))
+                } else {
+                    panic!("unexpected RPC in R8-P2-2: {path}");
+                }
+            });
+            let _ = engine_p.flush(&peer_p).await;
+        }
+        {
+            let guard = engine_p.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer_p)
+                .unwrap();
+            assert_eq!(
+                c.state.greeting_delivery,
+                crate::vault::GREETING_DELIVERY_UNSENT,
+                "R8-P2-2: retrying S1 ciphertext must NOT promote S2 from UNSENT to UNCERTAIN"
+            );
+            assert_eq!(c.state.greeting_sent_at, 0);
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r8_p1_1_p2_3_p2_4_start_chat_cancel_exits_post_extra_grants_and_per_grant_revoke() {
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::handshake_v2::{ClaimBundleRequest, ClaimBundleResponse, SendInitialV2Response};
+    use protocol::mailbox_v2::{RegisterWriteTokenResponse, RevokeWriteTokenResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    // Part 1 (R8-P2-3): Concurrent grant flusher finishing an older `RegisterWriteToken`
+    // MUST check `pending_revokes` inside its loop before registering a newly staged grant,
+    // so `RevokeWriteToken` runs STRICTLY BEFORE the subsequent `RegisterWriteToken`.
+    let (engine_g, peer_g, _bob_g) = pool.run_until(established_engine_on_localhost());
+    let tok_hash = [0x44u8; 32];
+    pool.run_until(async {
+        let mut guard = engine_g.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
+        inner
+            .contact(&peer_g)
+            .unwrap()
+            .session
+            .clear_pending_grants();
+        inner
+            .stage_write_token_grant(&peer_g, tok_hash, false)
+            .unwrap();
+        inner.save_state().await.unwrap();
+    });
+    let rpc_order = Rc::new(RefCell::new(Vec::<String>::new()));
+    let (reg1_entered_tx, reg1_entered_rx) = oneshot::channel::<()>();
+    let reg1_entered_tx = Rc::new(RefCell::new(Some(reg1_entered_tx)));
+    let (reg1_release_tx, reg1_release_rx) = oneshot::channel::<()>();
+    let reg1_release_rx = Rc::new(RefCell::new(Some(reg1_release_rx)));
+    let reg_count = Rc::new(Cell::new(0usize));
+    {
+        let order = rpc_order.clone();
+        let entered = reg1_entered_tx.clone();
+        let release = reg1_release_rx.clone();
+        let rc = reg_count.clone();
+        let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+            let path = path.to_string();
+            let order = order.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            let rc = rc.clone();
+            async move {
+                if path.ends_with("/RegisterWriteToken") {
+                    let n = rc.get() + 1;
+                    rc.set(n);
+                    if n == 1 {
+                        order.borrow_mut().push("register-1".into());
+                        if let Some(tx) = entered.borrow_mut().take() {
+                            let _ = tx.send(());
+                        }
+                        await_gate(&release).await;
+                    } else {
+                        order.borrow_mut().push(format!("register-{n}"));
+                    }
+                    Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                } else if path.ends_with("/RevokeWriteToken") {
+                    order.borrow_mut().push("revoke".into());
+                    Ok((200, RevokeWriteTokenResponse { revoked: 1 }.encode_to_vec()))
+                } else {
+                    panic!("unexpected RPC in R8-P2-3: {path}");
+                }
+            }
+        });
+        let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
+        let eg = engine_g.clone();
+        spawner
+            .spawn_local(async move {
+                let _ = done_tx.send(eg.flush_pending_grants_for_peer(&peer_g).await);
+            })
+            .unwrap();
+        pool.run_until(async {
+            let _ = reg1_entered_rx.await;
+            {
+                let mut guard = engine_g.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let slot = inner.client.peer_slot_id(&peer_g);
+                let v_rev = inner.client.allocate_grant_version().unwrap();
+                inner
+                    .state
+                    .pending_revokes
+                    .push(crate::vault::PendingRevoke {
+                        peer_slot_id: slot.to_vec(),
+                        min_grant_version: v_rev,
+                    });
+                inner
+                    .stage_write_token_grant(&peer_g, tok_hash, false)
+                    .unwrap();
+                inner.save_state().await.unwrap();
+            }
+            let _ = reg1_release_tx.send(());
+            done_rx.await.unwrap().unwrap();
+        });
+    }
+    assert_eq!(
+        *rpc_order.borrow(),
+        vec!["register-1", "revoke", "register-2"],
+        "R8-P2-3: newly staged PendingRevoke MUST execute before subsequent RegisterWriteToken in the same flusher loop"
+    );
+
+    // Part 2 (R8-P1-1): Cancelling `start_chat` during Phase 4 `SendInitialV2` while an inbound
+    // crossed session replaces `active_id` (`matches_session == false`) AND `SendInitialV2`
+    // returns a definitive refusal MUST convert the crossed contact to a request + stage revoke.
+    pool.run_until(async {
+        let (mut alice_inner, _) = unlocked_client();
+        alice_inner.contacts.clear();
+        alice_inner.server = TEST_SERVER.to_string();
+        alice_inner.audience = "localhost".to_string();
+        let a_pub = alice_inner
+            .client
+            .prepare_publish_v2("localhost", 2, 2)
+            .unwrap();
+        let a_m = a_pub.request.manifest.clone().unwrap();
+        let alice_bundle = ClaimBundleResponse {
+            signed_prekey: a_m.signed_prekey.clone(),
+            signed_prekey_signature: a_pub.request.signed_prekey_signature.clone(),
+            one_time_prekey: a_pub.request.one_time_prekeys.first().cloned(),
+            manifest: Some(a_m),
+            pq_last_resort: a_pub.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: a_pub.request.pq_one_time_prekeys.first().cloned(),
+        };
+        alice_inner.client.commit_publish_v2(a_pub);
+        alice_inner.state.published_at = crate::util::now();
+        let alice_id = alice_inner.client.identity_key();
+
+        let mut bob = Client::new(Fetch::client(TEST_SERVER));
+        let bob_bundle = publish_bundle_for_test(&mut bob, "localhost", 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let bob_id = bob.identity_key();
+
+        let engine_c = Engine::with_inner(Ui::new(), alice_inner);
+        let (send_entered_tx, send_entered_rx) = oneshot::channel::<()>();
+        let send_entered_tx = Rc::new(RefCell::new(Some(send_entered_tx)));
+        let (send_release_tx, send_release_rx) = oneshot::channel::<()>();
+        let send_release_rx = Rc::new(RefCell::new(Some(send_release_rx)));
+        {
+            let a_resp = alice_bundle.clone();
+            let b_resp = bob_bundle.clone();
+            let entered = send_entered_tx.clone();
+            let release = send_release_rx.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let a_resp = a_resp.clone();
+                let b_resp = b_resp.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        let req = ClaimBundleRequest::decode(body.as_slice()).unwrap();
+                        if req.identity_key.as_ref() == alice_id.as_slice() {
+                            Ok((200, a_resp.encode_to_vec()))
+                        } else {
+                            Ok((200, b_resp.encode_to_vec()))
+                        }
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/SendInitialV2") {
+                        if let Some(tx) = entered.borrow_mut().take() {
+                            let _ = tx.send(());
+                        }
+                        await_gate(&release).await;
+                        Ok((
+                            400,
+                            br#"{"code":"out_of_range","message":"refused"}"#.to_vec(),
+                        ))
+                    } else {
+                        panic!("unexpected RPC in R8-P1-1: {path}");
+                    }
+                }
+            });
+            let bob_key_text = crate::util::key_to_text(&bob_id);
+            let sub_id = engine_c.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key_text.clone(),
+                name: "Bob".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: false,
+                auto_start: false,
+            });
+            let (done_tx, done_rx) = oneshot::channel::<Result<PublicKey, StartChatError>>();
+            let ec = engine_c.clone();
+            spawner
+                .spawn_local(async move {
+                    let _ = done_tx.send(
+                        ec.start_chat(sub_id, &bob_key_text, "Bob".into(), None, false, false)
+                            .await,
+                    );
+                })
+                .unwrap();
+            let _ = send_entered_rx.await;
+            engine_c.cancel_startup_submission(sub_id);
+            let claimed = session::claim_peer_bundle_v2(
+                &Fetch::client(TEST_SERVER),
+                "localhost",
+                &alice_id,
+                &session::PeerPqState::default(),
+                bob.pq_config(),
+                bob.clock(),
+            )
+            .await
+            .unwrap();
+            let hello = Kind::Hello(bob.make_hello("Bob", 1)).to_bytes();
+            let bob_init = bob
+                .finish_prepare_initiate_v2(
+                    claimed,
+                    &session::PeerPqState::default(),
+                    &hello,
+                    Fetch::client(TEST_SERVER),
+                )
+                .unwrap();
+            let incoming = Incoming::try_from(bob_init.request.message.as_ref().unwrap()).unwrap();
+            {
+                let mut guard = engine_c.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let accepted = inner
+                    .client
+                    .accept_initial_v2(
+                        &bob_id,
+                        &session::PeerPqState::default(),
+                        &incoming,
+                        Fetch::client(TEST_SERVER),
+                    )
+                    .unwrap();
+                let session::AcceptedInitial::Accepted { session, .. } = accepted else {
+                    panic!("expected Accepted");
+                };
+                inner.contact(&bob_id).unwrap().session = session;
+                inner.save_state().await.unwrap();
+            }
+            let _ = send_release_tx.send(());
+            assert_eq!(
+                done_rx.await.unwrap(),
+                Err(StartChatError::Cancelled),
+                "R8-P1-1: cancelled start_chat must return Cancelled on refusal even when active_id changed"
+            );
+        }
+        let guard = engine_c.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        let c = inner.contacts.iter().find(|c| c.peer == bob_id).unwrap();
+        assert!(
+            c.state.request,
+            "R8-P1-1: cancelled crossed start must be converted to an unaccepted request"
+        );
+        assert!(
+            !inner.state.pending_revokes.is_empty(),
+            "R8-P1-1: cancelled crossed start must stage a PendingRevoke"
+        );
+    });
+
+    // Part 3 (R8-P2-4): During `start_chat`'s `flush_extra_grants` (`RegisterWriteToken` #2), if
+    // a newer inbound peer session replaces `active_id`, `start_chat` MUST NOT transmit the
+    // superseded `SendInitialV2`.
+    pool.run_until(async {
+        let (mut alice_inner, _) = unlocked_client();
+        alice_inner.contacts.clear();
+        alice_inner.server = TEST_SERVER.to_string();
+        alice_inner.audience = "localhost".to_string();
+        let a_pub = alice_inner
+            .client
+            .prepare_publish_v2("localhost", 4, 4)
+            .unwrap();
+        let a_m = a_pub.request.manifest.clone().unwrap();
+        let alice_bundle = ClaimBundleResponse {
+            signed_prekey: a_m.signed_prekey.clone(),
+            signed_prekey_signature: a_pub.request.signed_prekey_signature.clone(),
+            one_time_prekey: None,
+            manifest: Some(a_m),
+            pq_last_resort: a_pub.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: None,
+        };
+        alice_inner.client.commit_publish_v2(a_pub);
+        alice_inner.state.published_at = crate::util::now();
+        let alice_id = alice_inner.client.identity_key();
+
+        let mut bob = Client::new(Fetch::client(TEST_SERVER));
+        let bob_bundle = publish_bundle_for_test(&mut bob, "localhost", 1)
+            .into_iter()
+            .next()
+            .unwrap();
+        let bob_id = bob.identity_key();
+
+        let engine_x = Engine::with_inner(Ui::new(), alice_inner);
+        let (reg1_x_tx, reg1_x_rx) = oneshot::channel::<()>();
+        let reg1_x_tx = Rc::new(RefCell::new(Some(reg1_x_tx)));
+        let (reg1_x_rel_tx, reg1_x_rel_rx) = oneshot::channel::<()>();
+        let reg1_x_rel_rx = Rc::new(RefCell::new(Some(reg1_x_rel_rx)));
+        let (reg2_x_tx, reg2_x_rx) = oneshot::channel::<()>();
+        let reg2_x_tx = Rc::new(RefCell::new(Some(reg2_x_tx)));
+        let (reg2_x_rel_tx, reg2_x_rel_rx) = oneshot::channel::<()>();
+        let reg2_x_rel_rx = Rc::new(RefCell::new(Some(reg2_x_rel_rx)));
+        let reg_x_calls = Rc::new(Cell::new(0usize));
+        let send_x_calls = Rc::new(Cell::new(0usize));
+        {
+            let a_resp = alice_bundle.clone();
+            let b_resp = bob_bundle.clone();
+            let r1_tx = reg1_x_tx.clone();
+            let r1_rx = reg1_x_rel_rx.clone();
+            let r2_tx = reg2_x_tx.clone();
+            let r2_rx = reg2_x_rel_rx.clone();
+            let rc = reg_x_calls.clone();
+            let sc = send_x_calls.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let a_resp = a_resp.clone();
+                let b_resp = b_resp.clone();
+                let r1_tx = r1_tx.clone();
+                let r1_rx = r1_rx.clone();
+                let r2_tx = r2_tx.clone();
+                let r2_rx = r2_rx.clone();
+                let rc = rc.clone();
+                let sc = sc.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        let req = ClaimBundleRequest::decode(body.as_slice()).unwrap();
+                        if req.identity_key.as_ref() == alice_id.as_slice() {
+                            Ok((200, a_resp.encode_to_vec()))
+                        } else {
+                            Ok((200, b_resp.encode_to_vec()))
+                        }
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        let n = rc.get() + 1;
+                        rc.set(n);
+                        if n == 1 {
+                            if let Some(tx) = r1_tx.borrow_mut().take() {
+                                let _ = tx.send(());
+                            }
+                            await_gate(&r1_rx).await;
+                        } else if n == 2 {
+                            if let Some(tx) = r2_tx.borrow_mut().take() {
+                                let _ = tx.send(());
+                            }
+                            await_gate(&r2_rx).await;
+                        }
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/SendInitialV2") {
+                        sc.set(sc.get() + 1);
+                        Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+                    } else {
+                        panic!("unexpected RPC in R8-P2-4: {path}");
+                    }
+                }
+            });
+            let bob_key_text = crate::util::key_to_text(&bob_id);
+            let sub_id = engine_x.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key_text.clone(),
+                name: "BobX".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: false,
+                auto_start: false,
+            });
+            let (done_tx, done_rx) = oneshot::channel::<Result<PublicKey, StartChatError>>();
+            let ex = engine_x.clone();
+            spawner
+                .spawn_local(async move {
+                    let _ = done_tx.send(
+                        ex.start_chat(sub_id, &bob_key_text, "BobX".into(), None, false, false)
+                            .await,
+                    );
+                })
+                .unwrap();
+            let _ = reg1_x_rx.await;
+            let alice_orig_id = {
+                let guard = engine_x.inner.lock().await;
+                let inner = guard.as_ref().unwrap();
+                let c = inner.contacts.iter().find(|c| c.peer == bob_id).unwrap();
+                session::proto::SessionState::from(c.session.state())
+                    .id
+                    .clone()
+            };
+            let bob_losing_incoming = loop {
+                let claimed = session::claim_peer_bundle_v2(
+                    &Fetch::client(TEST_SERVER),
+                    "localhost",
+                    &alice_id,
+                    &session::PeerPqState::default(),
+                    bob.pq_config(),
+                    bob.clock(),
+                )
+                .await
+                .unwrap();
+                let hello = Kind::Hello(bob.make_hello("Bob", 1)).to_bytes();
+                let init = bob
+                    .finish_prepare_initiate_v2(
+                        claimed,
+                        &session::PeerPqState::default(),
+                        &hello,
+                        Fetch::client(TEST_SERVER),
+                    )
+                    .unwrap();
+                let mut wire = init.request.message.unwrap();
+                if wire.ephemeral_key.as_ref() < alice_orig_id.as_slice() {
+                    wire.id = 99;
+                    break Incoming::try_from(&wire).unwrap();
+                }
+            };
+            {
+                let mut guard = engine_x.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let mut batch = InitialBatch::default();
+                engine_x.process_inbox_messages(
+                    inner,
+                    ListedInitialMessages {
+                        messages: vec![bob_losing_incoming],
+                        has_more: false,
+                        malformed_ids: vec![],
+                        next_after_id: None,
+                    },
+                    &mut batch,
+                );
+            }
+            let _ = reg1_x_rel_tx.send(());
+            let _ = reg2_x_rx.await;
+            let claimed2 = session::claim_peer_bundle_v2(
+                &Fetch::client(TEST_SERVER),
+                "localhost",
+                &alice_id,
+                &session::PeerPqState::default(),
+                bob.pq_config(),
+                bob.clock(),
+            )
+            .await
+            .unwrap();
+            let hello2 = Kind::Hello(bob.make_hello("Bob", 2)).to_bytes();
+            let init2 = bob
+                .finish_prepare_initiate_v2(
+                    claimed2,
+                    &session::PeerPqState::default(),
+                    &hello2,
+                    Fetch::client(TEST_SERVER),
+                )
+                .unwrap();
+            let incoming2 = Incoming::try_from(init2.request.message.as_ref().unwrap()).unwrap();
+            {
+                let mut guard = engine_x.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let accepted = inner
+                    .client
+                    .accept_initial_v2(
+                        &bob_id,
+                        &session::PeerPqState::default(),
+                        &incoming2,
+                        Fetch::client(TEST_SERVER),
+                    )
+                    .unwrap();
+                let session::AcceptedInitial::Accepted { session, .. } = accepted else {
+                    panic!("expected Accepted");
+                };
+                inner.contact(&bob_id).unwrap().session = session;
+                inner.save_state().await.unwrap();
+            }
+            let _ = reg2_x_rel_tx.send(());
+            assert_eq!(done_rx.await.unwrap().unwrap(), bob_id);
+        }
+        assert_eq!(
+            send_x_calls.get(),
+            0,
+            "R8-P2-4: start_chat MUST NOT send superseded SendInitialV2 after flush_extra_grants"
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r8_p1_4_p2_1_p2_5_attachments_teardown_no_delete_not_sent_no_orphan_and_download_conv_gen() {
+    use super::contact::Contact;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use protocol::attachment::{GetChunkResponse, StartUploadResponse};
+    use protocol::handshake_v2::ListInitialMessagesResponse;
+    use protocol::mailbox_v2::PushV2Response;
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+
+    // Part 1 (R8-P1-4): Triggering `pagehide` / Lock (`bump_vault_generation`) during `PushV2` of
+    // an attachment pointer MUST NOT send `DeleteAttachment`, keeping the server allocation intact.
+    let (engine_t, peer_t, _bob_t) = pool.run_until(established_engine_on_localhost());
+    let cancel_calls = Rc::new(Cell::new(0usize));
+    let upload_id = [0x91u8; 16];
+    let upload_tok = [0x92u8; 16];
+    {
+        let cc = cancel_calls.clone();
+        let eng_hook = engine_t.clone();
+        let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+            let path = path.to_string();
+            let cc = cc.clone();
+            let eng_hook = eng_hook.clone();
+            async move {
+                if path.ends_with("/StartUpload") {
+                    Ok((
+                        200,
+                        StartUploadResponse {
+                            id: Bytes::copy_from_slice(&upload_id),
+                            upload_token: Bytes::copy_from_slice(&upload_tok),
+                            expires: crate::util::now() + 3_600_000,
+                        }
+                        .encode_to_vec(),
+                    ))
+                } else if path.ends_with("/ListInitialMessages") {
+                    Ok((200, ListInitialMessagesResponse::default().encode_to_vec()))
+                } else if path.ends_with("/PushV2") {
+                    eng_hook.bump_vault_generation();
+                    Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+                } else if path.ends_with("/DeleteAttachment") {
+                    cc.set(cc.get() + 1);
+                    Ok((200, vec![]))
+                } else {
+                    panic!("unexpected RPC in R8-P1-4: {path}");
+                }
+            }
+        });
+        pool.run_until(async {
+            let src = super::attachments::ChunkSource::from_bytes(
+                "report.txt",
+                "text/plain",
+                b"hello attachment".to_vec(),
+            );
+            let res = engine_t.send_attachment(peer_t, src).await;
+            assert!(res.is_err());
+        });
+    }
+    assert_eq!(
+        cancel_calls.get(),
+        0,
+        "R8-P1-4: closing tab after pointer push MUST NOT send DeleteAttachment"
+    );
+
+    // Part 2 (R8-P2-1): If the contact becomes quarantined (same `conv_gen`) before
+    // `announce_for_gen`, `announce_for_gen` MUST return `Err(AnnounceError::NotSent(_))` (not
+    // `Ok(None)`), so `send_attachment` forgets the vault upload and `resume_upload_source`
+    // visibly pauses instead of dropping it silently.
+    let (engine_q, peer_q, _bob_q) = pool.run_until(established_engine_on_localhost());
+    let q_id = [0x93u8; 16];
+    let q_tok = [0x94u8; 16];
+    let q_pending = crate::vault::PendingUpload {
+        id: q_id.to_vec(),
+        token: q_tok.to_vec(),
+        key: vec![0x95u8; session::attachment::KEY_LENGTH],
+        expires: crate::util::now() + 3_600_000,
+        name: "file.bin".into(),
+        mime: "application/octet-stream".into(),
+        size: 16,
+        uploaded: 0,
+        encrypted: 0,
+        prefix_hash: vec![0u8; 32],
+        announced: false,
+        history_index: 0,
+        upload_state: crate::vault::UPLOAD_STATE_STARTED,
+        sealed_chunk_hash: vec![],
+    };
+    pool.run_until(async {
+        let conv_gen = {
+            let mut guard = engine_q.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let g = inner.contact(&peer_q).unwrap().state.conversation_gen;
+            inner.vault.save_upload(&peer_q, &q_pending).await.unwrap();
+            inner.contact(&peer_q).unwrap().state.quarantined = true;
+            g
+        };
+        let res = engine_q
+            .announce_for_gen(&peer_q, q_pending, Some(conv_gen))
+            .await;
+        assert!(
+            matches!(res, Err(super::attachments::AnnounceError::NotSent(_))),
+            "R8-P2-1: announce_for_gen must return Err(NotSent) when contact is quarantined"
+        );
+    });
+
+    // Part 3 (R8-P2-5): Start downloading a 1-chunk inbound attachment; while `GetChunk` is
+    // suspended, delete the chat and recreate a fresh chat with the same peer (`conv_gen`
+    // incremented); release `GetChunk` -> chunk MUST NOT be cached in the new chat and NO
+    // download receipt may be queued on the new chat!
+    let (engine_d, peer_d, mut bob_d) = pool.run_until(established_engine_on_localhost());
+    let att_id = [0x96u8; 16];
+    let att_key = [0x97u8; session::attachment::KEY_LENGTH];
+    let plaintext = b"secret bytes for gen1";
+    let ciphertext = session::attachment::encrypt_chunk(&att_key, &att_id, 0, true, plaintext);
+    let pointer = crate::content::AttachmentPointer {
+        id: att_id.to_vec(),
+        key: att_key.to_vec(),
+        size: plaintext.len() as u64,
+        name: "secret.txt".into(),
+        mime: "text/plain".into(),
+        expires: crate::util::now() + 3_600_000,
+    };
+    let (dl_entered_tx, dl_entered_rx) = oneshot::channel::<()>();
+    let dl_entered_tx = Rc::new(RefCell::new(Some(dl_entered_tx)));
+    let (dl_release_tx, dl_release_rx) = oneshot::channel::<()>();
+    let dl_release_rx = Rc::new(RefCell::new(Some(dl_release_rx)));
+    let bob_bundle_new = publish_bundle_for_test(&mut bob_d, "localhost", 1)
+        .into_iter()
+        .next()
+        .unwrap();
+    {
+        let entered = dl_entered_tx.clone();
+        let release = dl_release_rx.clone();
+        let ct = ciphertext.clone();
+        let b_new = bob_bundle_new.clone();
+        let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+            let path = path.to_string();
+            let entered = entered.clone();
+            let release = release.clone();
+            let ct = ct.clone();
+            let b_new = b_new.clone();
+            async move {
+                if path.ends_with("/GetChunk") {
+                    if let Some(tx) = entered.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                    await_gate(&release).await;
+                    Ok((
+                        200,
+                        GetChunkResponse {
+                            data: Bytes::from(ct),
+                            uploaded: true,
+                        }
+                        .encode_to_vec(),
+                    ))
+                } else if path.ends_with("/ClaimBundle") {
+                    Ok((200, b_new.encode_to_vec()))
+                } else {
+                    panic!(
+                        "unexpected RPC in R8-P2-5 (must not flush receipt on recreated chat): {path}"
+                    );
+                }
+            }
+        });
+        let (done_tx, done_rx) = oneshot::channel::<Result<(), String>>();
+        let ed = engine_d.clone();
+        let ptr = pointer.clone();
+        spawner
+            .spawn_local(async move {
+                let _ = done_tx.send(ed.open_attachment(1, peer_d, 0, ptr, 42).await);
+            })
+            .unwrap();
+        pool.run_until(async {
+            let _ = dl_entered_rx.await;
+            engine_d.delete(peer_d).await.unwrap();
+            let (pq_cfg, clock) = {
+                let guard = engine_d.inner.lock().await;
+                let inner = guard.as_ref().unwrap();
+                (
+                    inner.client.pq_config().clone(),
+                    inner.client.clock().clone(),
+                )
+            };
+            let claimed = session::claim_peer_bundle_v2(
+                &Fetch::client(TEST_SERVER),
+                "localhost",
+                &peer_d,
+                &session::PeerPqState::default(),
+                &pq_cfg,
+                &clock,
+            )
+            .await
+            .unwrap();
+            {
+                let mut guard = engine_d.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let new_gen = inner.allocate_conversation_gen();
+                let hello = Kind::Hello(inner.client.make_hello("Alice", 1)).to_bytes();
+                let init = inner
+                    .client
+                    .finish_prepare_initiate_v2(
+                        claimed,
+                        &session::PeerPqState::default(),
+                        &hello,
+                        Fetch::client(TEST_SERVER),
+                    )
+                    .unwrap();
+                let c = Contact {
+                    peer: peer_d,
+                    session: init.session,
+                    state: ContactState {
+                        name: "Bob recreated".into(),
+                        conversation_gen: new_gen,
+                        ..Default::default()
+                    },
+                    deferred_carried: 0,
+                };
+                inner.contacts.push(c);
+                inner.save_state().await.unwrap();
+            }
+            let _ = dl_release_tx.send(());
+            done_rx.await.unwrap().unwrap();
+        });
+    }
+    pool.run_until(async {
+        let guard = engine_d.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert!(
+            inner
+                .vault
+                .chunk(&peer_d, &att_id, 0)
+                .await
+                .unwrap()
+                .is_none(),
+            "R8-P2-5: old download MUST NOT cache chunk into recreated chat"
+        );
+        let c = inner.contacts.iter().find(|c| c.peer == peer_d).unwrap();
+        assert!(
+            c.state.events.is_none(),
+            "R8-P2-5: old download MUST NOT queue download receipt onto recreated chat"
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r8_p2_8_p2_9_p2_10_refill_concurrent_reconcile_mixed_limit_and_server_pq_recovery() {
+    use futures::executor::LocalPool;
+    use protocol::handshake_v2::RefillPrekeysResponse;
+    #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    use protocol::handshake_v2::{RefillPrekeysRequest, SuiteCount};
+    #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    pool.run_until(async {
+        // Part 1 (R8-P2-8): Overlapping pre-refill OPK claims reflected in relay's `RefillPrekeys`
+        // response MUST NOT be double-counted when opened concurrently during the RTT.
+        let (mut inner, _peer) = unlocked_client();
+        inner.server = TEST_SERVER.to_string();
+        inner.audience = "localhost".to_string();
+        let prep = inner
+            .client
+            .prepare_publish_v2("localhost", 20, 20)
+            .unwrap();
+        inner.client.commit_publish_v2(prep);
+        inner.state.published_at = crate::util::now();
+        inner.last_server_classical_opks = Some(20);
+        inner.state.used_one_time_prekeys = 10;
+        let engine = Engine::with_inner(Ui::new(), inner);
+        {
+            let e_hook = engine.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let e_hook = e_hook.clone();
+                async move {
+                    assert!(path.ends_with("/RefillPrekeys"), "unexpected RPC {path}");
+                    {
+                        let mut guard = e_hook.inner.lock().await;
+                        guard.as_mut().unwrap().state.used_one_time_prekeys += 6;
+                    }
+                    Ok((
+                        200,
+                        RefillPrekeysResponse {
+                            classical_one_time_count: 14,
+                            pq_one_time_counts: vec![],
+                        }
+                        .encode_to_vec(),
+                    ))
+                }
+            });
+            engine.publish_with_rotation_gate(false, true).await.unwrap();
+        }
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert_eq!(inner.last_server_classical_opks, Some(14));
+            assert_eq!(
+                inner.state.used_one_time_prekeys, 0,
+                "R8-P2-8: 6 pre-refill claims already reflected in relay response=14 MUST NOT remain in used_one_time_prekeys"
+            );
+        }
+
+        // Part 2 (R8-P2-9): Mixed classical+PQ refill hitting `LimitExceeded` because PQ pool is
+        // full MUST retry classical-only (replenishing classical and restoring authoritative counts
+        // for both pools), AND single-pool PQ `LimitExceeded` MUST distribute cap across all
+        // offered suites so secondary suites (`MlKem768`) are never starved.
+        #[cfg(all(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            let (mut inner_m, _) = unlocked_client();
+            inner_m.server = TEST_SERVER.to_string();
+            inner_m.audience = "localhost".to_string();
+            let prep = inner_m
+                .client
+                .prepare_publish_v2("localhost", 20, 20)
+                .unwrap();
+            inner_m.client.commit_publish_v2(prep);
+            inner_m.state.published_at = crate::util::now();
+            inner_m.server_pq = ServerPqStatus::Enabled {
+                suites: vec![PqSuite::MlKem1024, PqSuite::MlKem768],
+                pq_ratchet: true,
+            };
+            inner_m.last_server_classical_opks = Some(20);
+            inner_m.state.used_one_time_prekeys = 20;
+            inner_m.last_server_pq_opks_by_suite = None;
+            inner_m.state.used_pq_one_time_prekeys = 10;
+            let engine_m = Engine::with_inner(Ui::new(), inner_m);
+            let refill_shapes = Rc::new(RefCell::new(Vec::<(usize, usize)>::new()));
+            {
+                let shapes = refill_shapes.clone();
+                let _mock = crate::transport::mock_fetch(move |_s, path, body| {
+                    assert!(path.ends_with("/RefillPrekeys"), "unexpected RPC {path}");
+                    let req = RefillPrekeysRequest::decode(body.as_slice()).unwrap();
+                    let c_len = req.one_time_prekeys.len();
+                    let p_len = req.pq_one_time_prekeys.len();
+                    shapes.borrow_mut().push((c_len, p_len));
+                    if p_len > 0 {
+                        Ok((
+                            429,
+                            br#"{"code":"resource_exhausted","message":"pq full"}"#.to_vec(),
+                        ))
+                    } else {
+                        Ok((
+                            200,
+                            RefillPrekeysResponse {
+                                classical_one_time_count: c_len as u32,
+                                pq_one_time_counts: vec![
+                                    SuiteCount {
+                                        suite: PqSuite::MlKem1024.as_u8().into(),
+                                        count: 50,
+                                    },
+                                    SuiteCount {
+                                        suite: PqSuite::MlKem768.as_u8().into(),
+                                        count: 50,
+                                    },
+                                ],
+                            }
+                            .encode_to_vec(),
+                        ))
+                    }
+                });
+                engine_m
+                    .publish_with_rotation_gate(false, true)
+                    .await
+                    .unwrap();
+            }
+            let shapes = refill_shapes.borrow().clone();
+            assert_eq!(
+                shapes.len(),
+                2,
+                "must try mixed then classical-only retry (and stop once authoritative PQ=100 is learned)"
+            );
+            assert!(shapes[0].0 > 0 && shapes[0].1 > 0);
+            assert!(shapes[1].0 > 0 && shapes[1].1 == 0);
+            {
+                let guard = engine_m.inner.lock().await;
+                let inner = guard.as_ref().unwrap();
+                assert_eq!(inner.last_server_classical_opks, Some(shapes[1].0 as u32));
+                assert_eq!(
+                    inner
+                        .last_server_pq_opks_by_suite
+                        .as_ref()
+                        .unwrap()
+                        .get(&PqSuite::MlKem768),
+                    Some(&50)
+                );
+            }
+
+            {
+                let mut guard = engine_m.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                inner.last_server_classical_opks = Some(100);
+                inner.state.used_one_time_prekeys = 0;
+                inner.last_server_pq_opks_by_suite = None;
+                inner.state.used_pq_one_time_prekeys = 10;
+            }
+            {
+                let _mock = crate::transport::mock_fetch(|_s, path, _b| {
+                    assert!(path.ends_with("/RefillPrekeys"), "unexpected RPC {path}");
+                    Ok((
+                        429,
+                        br#"{"code":"resource_exhausted","message":"pq full"}"#.to_vec(),
+                    ))
+                });
+                engine_m
+                    .publish_with_rotation_gate(false, true)
+                    .await
+                    .unwrap();
+            }
+            {
+                let guard = engine_m.inner.lock().await;
+                let inner = guard.as_ref().unwrap();
+                let map = inner.last_server_pq_opks_by_suite.as_ref().unwrap();
+                assert_eq!(map.get(&PqSuite::MlKem1024), Some(&50));
+                assert_eq!(map.get(&PqSuite::MlKem768), Some(&50));
+                let mut used_768 = std::collections::BTreeMap::new();
+                used_768.insert(PqSuite::MlKem768, 50);
+                let (_c, pq_next) = super::handshake::refill_batch_counts_per_suite(
+                    0,
+                    50,
+                    &used_768,
+                    &[PqSuite::MlKem1024, PqSuite::MlKem768],
+                    Some(100),
+                    Some(map),
+                );
+                assert!(
+                    pq_next.iter().any(|(s, c)| *s == PqSuite::MlKem768 && *c > 0),
+                    "R8-P2-9: MlKem768 claims after PQ LimitExceeded must trigger replenishment (not starve)"
+                );
+            }
+        }
+
+        // Part 3 (R8-P2-10): Successful PQ `RefillPrekeys` transitions stale `ServerPqStatus::Disabled`
+        // to `ServerPqStatus::Unknown` (matching `publish_full_locked_gated`).
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            let (mut inner_r, _) = unlocked_client();
+            inner_r.server = TEST_SERVER.to_string();
+            inner_r.audience = "localhost".to_string();
+            let prep = inner_r
+                .client
+                .prepare_publish_v2("localhost", 20, 20)
+                .unwrap();
+            inner_r.client.commit_publish_v2(prep);
+            inner_r.state.published_at = crate::util::now();
+            inner_r.state.used_pq_one_time_prekeys = 10;
+            inner_r.server_pq = ServerPqStatus::Enabled {
+                suites: inner_r.client.pq_config().offered_suites().to_vec(),
+                pq_ratchet: true,
+            };
+            let engine_r = Engine::with_inner(Ui::new(), inner_r);
+            {
+                let er = engine_r.clone();
+                let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                    let path = path.to_string();
+                    let er = er.clone();
+                    async move {
+                        assert!(path.ends_with("/RefillPrekeys"), "unexpected RPC {path}");
+                        {
+                            let mut guard = er.inner.lock().await;
+                            guard
+                                .as_mut()
+                                .unwrap()
+                                .set_server_pq(ServerPqStatus::Disabled);
+                        }
+                        Ok((
+                            200,
+                            RefillPrekeysResponse {
+                                classical_one_time_count: 20,
+                                pq_one_time_counts: vec![],
+                            }
+                            .encode_to_vec(),
+                        ))
+                    }
+                });
+                engine_r
+                    .publish_with_rotation_gate(false, true)
+                    .await
+                    .unwrap();
+            }
+            let guard = engine_r.inner.lock().await;
+            assert_eq!(
+                guard.as_ref().unwrap().server_pq,
+                ServerPqStatus::Unknown,
+                "R8-P2-10: successful PQ RefillPrekeys must transition stale Disabled -> Unknown"
+            );
+        }
+    });
+}
