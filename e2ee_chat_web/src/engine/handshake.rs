@@ -38,6 +38,9 @@ const MAX_DEFERRED_INITIALS: usize = 100;
 /// Maximum age (30 days in ms) for which deferred initials preserve their target signed prekey
 /// generation and manifest digest across scheduled prekey rotations.
 pub(super) const DEFERRED_REPLAY_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Cooldown (1 hour in ms, matching the Worker's hourly OPK claim window) applied after an
+/// empty-OPK fallback refill probe proves the relay still had stocked OPKs (`R12-P2-4`).
+const OPK_FALLBACK_PROBE_COOLDOWN_MS: u64 = 60 * 60 * 1000;
 
 /// Result of [`Engine::join_carried`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -727,8 +730,11 @@ impl<V: VaultStore> Inner<V> {
         //   no longer in the replacement FIFO queue, or whose SPK != current_signed_prekey).
         // - Greetings referencing `current_signed_prekey` that fell back to SPK-only or PQ
         //   last-resort (`one_time_prekey() == None` / `pq_one_time_prekey_id() == None`) prove
-        //   that pool hit 0 on the relay (e.g. from abandoned bundle claims), snapping
-        //   `last_server_*` to `0` so the next sync replenishes immediately.
+        //   that pool hit 0 on the relay (e.g. from abandoned bundle claims) OR the Worker's hourly
+        //   32-claim OPK budget throttled the claim (`R11-P2-5`, `R12-P2-4`, `R12-P2-5`). Bump the
+        //   local usage counter to trigger a single bounded refill probe (rate-limited by a 1-hour
+        //   cooldown if the relay responds with stocked keys) WITHOUT clobbering `last_server_*`,
+        //   fabricating a partial multi-suite map after reload, or discarding FIFO queue tracking.
         const MAX_TRACKED_OPK_CLAIMS: usize = 1024;
         let on_current_spk = self.client.current_signed_prekey() == Some(message.signed_prekey());
         let unreconciled = self.client.has_unreconciled_publish();
@@ -747,11 +753,12 @@ impl<V: VaultStore> Inner<V> {
                     }
                 }
             }
-        } else if on_current_spk && !unreconciled {
-            self.last_server_classical_opks = Some(0);
-            self.relay_classical_opk_queue = None;
-            self.relay_claimed_classical_opks.clear();
-            self.accepted_classical_since_baseline.clear();
+        } else if on_current_spk
+            && !unreconciled
+            && now() >= self.classical_fallback_probe_cooldown_until
+        {
+            self.state.used_one_time_prekeys = self.state.used_one_time_prekeys.max(REFILL_USED);
+            self.classical_fallback_probe_pending = true;
         }
         if let Some(pq_id) = message.pq_one_time_prekey_id() {
             let absorbed_pq = if let Some(suite) = pq_suite
@@ -768,9 +775,13 @@ impl<V: VaultStore> Inner<V> {
             if !absorbed_pq {
                 let charge_pq_pool = unreconciled
                     || match (pq_suite, self.relay_pq_opk_queue_by_suite.as_ref()) {
-                        (Some(suite), Some(queues)) => {
-                            queues.get(&suite).is_some_and(|q| q.contains(&pq_id))
-                        }
+                        (Some(suite), Some(queues)) => match queues.get(&suite) {
+                            Some(q) => q.contains(&pq_id),
+                            // R12-P2-3: A per-suite queue removed on ambiguous error or untracked
+                            // refill means that suite's queue is unknown (not empty); fall back to
+                            // `on_current_spk` just like when the outer `Option` is `None`.
+                            None => on_current_spk,
+                        },
                         _ => on_current_spk,
                     };
                 if charge_pq_pool {
@@ -789,15 +800,18 @@ impl<V: VaultStore> Inner<V> {
         } else if on_current_spk
             && !unreconciled
             && let Some(suite) = pq_suite
+            && now()
+                >= self
+                    .pq_fallback_probe_cooldown_until
+                    .get(&suite)
+                    .copied()
+                    .unwrap_or(0)
         {
-            self.last_server_pq_opks_by_suite
-                .get_or_insert_with(std::collections::BTreeMap::new)
-                .insert(suite, 0);
-            if let Some(queues) = self.relay_pq_opk_queue_by_suite.as_mut() {
-                queues.remove(&suite);
-            }
-            self.relay_claimed_pq_opks_by_suite.remove(&suite);
-            self.accepted_pq_since_baseline.remove(&suite);
+            let entry = self.used_pq_by_suite.entry(suite).or_insert(0);
+            *entry = (*entry).max(REFILL_USED);
+            self.state.used_pq_one_time_prekeys =
+                self.state.used_pq_one_time_prekeys.max(REFILL_USED);
+            self.pq_fallback_probe_pending.insert(suite);
         }
         Ok(opened)
     }
@@ -1886,6 +1900,10 @@ impl<V: VaultStore> Engine<V> {
                 inner.state.needs_publish = false;
                 inner.state.pending_pq_rollback = None;
                 inner.deferred_refill_rejected_pq_suites.clear();
+                inner.classical_fallback_probe_pending = false;
+                inner.classical_fallback_probe_cooldown_until = 0;
+                inner.pq_fallback_probe_pending.clear();
+                inner.pq_fallback_probe_cooldown_until.clear();
                 inner.save_state().await.map_err(PublishError::storage)?;
                 if self.is_live(vgen) {
                     self.ui.me.set(Some(inner.me()));
@@ -2253,6 +2271,10 @@ impl<V: VaultStore> Engine<V> {
                     }
                 });
                 inner.deferred_refill_rejected_pq_suites.clear();
+                inner.classical_fallback_probe_pending = false;
+                inner.classical_fallback_probe_cooldown_until = 0;
+                inner.pq_fallback_probe_pending.clear();
+                inner.pq_fallback_probe_cooldown_until.clear();
                 let log_msg = match outcome {
                     PublishV2Outcome::V2Pq => {
                         inner.confirmed_relay_pq_suites =
@@ -2561,7 +2583,11 @@ impl<V: VaultStore> Engine<V> {
                         Ok(RefillV2Outcome::MixedLimitExceeded)
                     }
                     ErrorKind::LimitExceeded => {
+                        let cooldown_until = now().saturating_add(OPK_FALLBACK_PROBE_COOLDOWN_MS);
                         if sent_classical {
+                            if std::mem::take(&mut inner.classical_fallback_probe_pending) {
+                                inner.classical_fallback_probe_cooldown_until = cooldown_until;
+                            }
                             inner.state.used_one_time_prekeys = 0;
                             inner.relay_classical_opk_queue = None;
                             inner.relay_claimed_classical_opks.clear();
@@ -2570,6 +2596,13 @@ impl<V: VaultStore> Engine<V> {
                                 Some(SERVER_MAX_ONE_TIME_PREKEYS as u32);
                         }
                         if sent_pq {
+                            for &suite in added_pq_ids_by_suite.keys() {
+                                if inner.pq_fallback_probe_pending.remove(&suite) {
+                                    inner
+                                        .pq_fallback_probe_cooldown_until
+                                        .insert(suite, cooldown_until);
+                                }
+                            }
                             inner.state.used_pq_one_time_prekeys = 0;
                             inner.used_pq_by_suite.clear();
                             inner.relay_pq_opk_queue_by_suite = None;
@@ -2625,13 +2658,15 @@ impl<V: VaultStore> Engine<V> {
                         self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                         Err(describe(&e))
                     }
-                    ErrorKind::Protocol if sent_pq && inner.state.needs_publish => {
-                        // R10-P2-1 + R11-P3-2: When a settings/suite change is pending in
-                        // `needs_publish`, the relay's confirmed manifest may not offer one of the
-                        // newly enabled local PQ suites. If a single suite was sent, record it in
-                        // `deferred_refill_rejected_pq_suites` so subsequent syncs do not repeat
-                        // vault writes / refused RPCs; multi-suite batches are probed individually
-                        // by the caller.
+                    ErrorKind::Protocol
+                        if sent_pq && inner.state.needs_publish && e.is_protocol_malformed() =>
+                    {
+                        // R10-P2-1 + R11-P3-2 + R12-P2-6: When a settings/suite change is pending
+                        // in `needs_publish`, the relay's confirmed manifest may reject a newly
+                        // enabled PQ suite with `InvalidArgument` / `Malformed` (`SuiteNotOffered`).
+                        // Only cache definitive `Malformed` refusals (never transient
+                        // `StaleTimestamp` / `InvalidSignature`) so subsequent syncs skip only
+                        // genuinely unoffered suites while multi-suite batches are probed singly.
                         inner.state.needs_publish = true;
                         if added_pq_ids_by_suite.len() == 1
                             && let Some(&suite) = added_pq_ids_by_suite.keys().next()
@@ -2680,6 +2715,16 @@ impl<V: VaultStore> Engine<V> {
         // zero ambiguous carry-forward credits so abandoned pre-refill claims can never erase
         // genuine post-snapshot RTT consumption.
         const MAX_TRACKED_OPK_CLAIMS: usize = 1024;
+        let cooldown_until = now().saturating_add(OPK_FALLBACK_PROBE_COOLDOWN_MS);
+        let added_classical_len = added_classical_keys.len() as u32;
+        if sent_classical && std::mem::take(&mut inner.classical_fallback_probe_pending) {
+            // R12-P2-4: If the relay still held stocked classical OPKs before our probe batch
+            // (`count > added`), the fallback greeting was throttled by the hourly OPK claim
+            // budget rather than an empty pool; apply a 1-hour probe cooldown.
+            if response.classical_one_time_count > added_classical_len {
+                inner.classical_fallback_probe_cooldown_until = cooldown_until;
+            }
+        }
         let raw_concurrent_classical = inner
             .state
             .used_one_time_prekeys
@@ -2732,6 +2777,16 @@ impl<V: VaultStore> Engine<V> {
         for suite in all_pq_suites {
             let resp_s = server_pq_map.get(&suite).copied().unwrap_or(0);
             let added_ids = added_pq_ids_by_suite.remove(&suite).unwrap_or_default();
+            let added_pq_len = added_ids.len() as u32;
+            if added_pq_len > 0 && inner.pq_fallback_probe_pending.remove(&suite) {
+                // R12-P2-4: Stocked relay PQOPKs before our probe batch indicate hourly budget
+                // throttling rather than an empty pool; apply a 1-hour cooldown for this suite.
+                if resp_s > added_pq_len {
+                    inner
+                        .pq_fallback_probe_cooldown_until
+                        .insert(suite, cooldown_until);
+                }
+            }
             if let Some(pq_queues) = inner.relay_pq_opk_queue_by_suite.as_mut()
                 && let Some(queue) = pq_queues.get_mut(&suite)
                 && queue.len().saturating_add(added_ids.len()) >= resp_s as usize
@@ -3235,27 +3290,30 @@ impl<V: VaultStore> Engine<V> {
                 let cur_request = inner.contacts[index].state.request;
                 let cur_provisional = inner.contacts[index].state.provisional;
                 let cur_quarantined = inner.contacts[index].state.quarantined;
-                // R11-P1-2: Never stage grants for or accept an unquarantined classical request
-                // when local policy now requires PQ (`strict_pq`) or the peer/invitation is PQ-pinned
-                // without an explicit classical exception.
+                // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3: Never stage grants for or accept an
+                // unquarantined classical request (active OR archived in `others`) when local
+                // policy requires PQ (`strict_pq`), a fresh `pin_pq` invitation supersedes any
+                // prior classical exception, or ordinary local PQ requires explicit classical
+                // approval (`ClassicalApprovalRequired`).
                 let pq_block_err = if cur_request
                     && !cur_quarantined
-                    && inner.contacts[index]
-                        .session
-                        .security()
-                        .is_some_and(|s| !s.is_pq)
+                    && inner.contacts[index].is_classical_session()
                 {
                     if inner.client.pq_config().strict_pq {
                         Some(StartChatError::PqRequired)
-                    } else if inner.local_pq_enabled()
-                        && (pin_pq || inner.contacts[index].session.peer_pq_state().pq_pinned)
-                        && !allow_classical
-                        && !inner.contacts[index]
-                            .session
-                            .peer_pq_state()
-                            .allow_classical_exception
-                    {
-                        Some(StartChatError::DowngradeDetected)
+                    } else if inner.local_pq_enabled() && !allow_classical {
+                        let peer_pq = inner.contacts[index].session.peer_pq_state();
+                        if pin_pq {
+                            Some(StartChatError::DowngradeDetected)
+                        } else if !peer_pq.allow_classical_exception {
+                            if peer_pq.pq_pinned {
+                                Some(StartChatError::DowngradeDetected)
+                            } else {
+                                Some(StartChatError::ClassicalApprovalRequired)
+                            }
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -3546,32 +3604,32 @@ impl<V: VaultStore> Engine<V> {
             let was_request = inner.contacts[index].state.request;
             let was_provisional = inner.contacts[index].state.provisional;
             let quarantined = inner.contacts[index].state.quarantined;
-            // R11-P1-2: Re-check classical request PQ policy under Phase B's `guard` (in case
-            // `strict_pq` or peer session changed while Phase A awaited `RegisterWriteToken`).
-            let phase_b_pq_block = if was_request
-                && !quarantined
-                && inner.contacts[index]
-                    .session
-                    .security()
-                    .is_some_and(|s| !s.is_pq)
-            {
-                if inner.client.pq_config().strict_pq {
-                    Some(StartChatError::PqRequired)
-                } else if inner.local_pq_enabled()
-                    && (pin_pq || inner.contacts[index].session.peer_pq_state().pq_pinned)
-                    && !allow_classical
-                    && !inner.contacts[index]
-                        .session
-                        .peer_pq_state()
-                        .allow_classical_exception
-                {
-                    Some(StartChatError::DowngradeDetected)
+            // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3: Re-check classical request PQ policy
+            // under Phase B's `guard` (in case `strict_pq`, `pq_enabled`, or peer session changed
+            // while Phase A awaited `RegisterWriteToken`).
+            let phase_b_pq_block =
+                if was_request && !quarantined && inner.contacts[index].is_classical_session() {
+                    if inner.client.pq_config().strict_pq {
+                        Some(StartChatError::PqRequired)
+                    } else if inner.local_pq_enabled() && !allow_classical {
+                        let peer_pq = inner.contacts[index].session.peer_pq_state();
+                        if pin_pq {
+                            Some(StartChatError::DowngradeDetected)
+                        } else if !peer_pq.allow_classical_exception {
+                            if peer_pq.pq_pinned {
+                                Some(StartChatError::DowngradeDetected)
+                            } else {
+                                Some(StartChatError::ClassicalApprovalRequired)
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
             if let Some(block_err) = phase_b_pq_block {
                 let mut dirty = false;
                 if pin_pq && matches!(block_err, StartChatError::DowngradeDetected) {

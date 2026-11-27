@@ -90,6 +90,7 @@ pub(super) fn security_badge_parts(
 pub(super) fn contact_can_upgrade_to_pq(contact: &ContactView) -> bool {
     contact.has_downgrade()
         || contact.is_quarantined()
+        || (!contact.has_active_session && contact.has_classical_earlier)
         || (contact.has_active_session && !contact.security.is_pq)
 }
 

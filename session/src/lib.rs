@@ -346,32 +346,78 @@ impl ClientState {
         if !self.recent_manifest_digests.contains(&digest) {
             self.recent_manifest_digests.push(digest);
             while self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS {
-                let candidate_end = self.recent_manifest_digests.len() - 1;
-                let evict_idx = self.recent_manifest_digests[..candidate_end]
-                    .iter()
-                    .position(|d| {
-                        !self.is_digest_for_retained_spk(d)
-                            && !self.is_unconfirmed_digest_for_retained_spk(d)
-                            && !self.confirmed_manifest_digests.contains(d)
-                    })
-                    .or_else(|| {
-                        self.recent_manifest_digests[..candidate_end]
-                            .iter()
-                            .position(|d| {
-                                !self.is_digest_for_retained_spk(d)
-                                    && !self.confirmed_manifest_digests.contains(d)
-                            })
-                    })
-                    .or_else(|| {
-                        self.recent_manifest_digests[..candidate_end]
-                            .iter()
-                            .position(|d| !self.confirmed_manifest_digests.contains(d))
-                    })
-                    .unwrap_or(0);
+                let evict_idx = self.evict_excess_manifest_digest_idx(&[]);
                 let removed = self.recent_manifest_digests.remove(evict_idx);
                 self.manifest_digest_spks.remove(&removed);
             }
         }
+    }
+
+    /// Choose the lowest-priority index in `recent_manifest_digests[..len - 1]` to evict when the
+    /// manifest digest table exceeds its capacity (`MAX_STORED_MANIFEST_DIGESTS` or
+    /// `MAX_RETAINED_MANIFEST_DIGESTS`), preserving explicitly pinned digests and protecting up to
+    /// [`MAX_RECENT_MANIFEST_DIGESTS`] confirmed digests per retained signed prekey (`R12-P2-2`).
+    fn evict_excess_manifest_digest_idx(&self, preserve: &[[u8; 32]]) -> usize {
+        let candidate_end = self.recent_manifest_digests.len().saturating_sub(1);
+        let mut confirmed_per_retained_spk: BTreeMap<PublicKey, usize> = BTreeMap::new();
+        for d in &self.recent_manifest_digests {
+            if let Some(&(spk, confirmed)) = self.manifest_digest_spks.get(d)
+                && confirmed
+                && self.prekeys.contains_signed_prekey(&spk)
+            {
+                *confirmed_per_retained_spk.entry(spk).or_insert(0) += 1;
+            }
+        }
+        let is_surplus_retained_spk = |d: &[u8; 32]| {
+            self.manifest_digest_spks
+                .get(d)
+                .is_some_and(|&(spk, confirmed)| {
+                    confirmed
+                        && confirmed_per_retained_spk
+                            .get(&spk)
+                            .is_some_and(|&count| count > MAX_RECENT_MANIFEST_DIGESTS)
+                })
+        };
+        let candidates = &self.recent_manifest_digests[..candidate_end];
+        candidates
+            .iter()
+            .position(|d| {
+                !preserve.contains(d)
+                    && !self.is_digest_for_retained_spk(d)
+                    && !self.is_unconfirmed_digest_for_retained_spk(d)
+                    && !self.confirmed_manifest_digests.contains(d)
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d)
+                        && !self.is_digest_for_retained_spk(d)
+                        && !self.is_unconfirmed_digest_for_retained_spk(d)
+                })
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d) && self.is_unconfirmed_digest_for_retained_spk(d)
+                })
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d)
+                        && is_surplus_retained_spk(d)
+                        && !self.confirmed_manifest_digests.contains(d)
+                })
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .position(|d| !preserve.contains(d) && is_surplus_retained_spk(d))
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d)
+                })
+            })
+            .or_else(|| candidates.iter().position(|d| !preserve.contains(d)))
+            .unwrap_or(0)
     }
 
     /// Whether recording another manifest digest can fit within `MAX_RETAINED_MANIFEST_DIGESTS`
@@ -479,46 +525,7 @@ impl ClientState {
         }
         let mut evicted = Vec::new();
         while self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS {
-            let candidate_end = self.recent_manifest_digests.len() - 1;
-            let evict_idx = self.recent_manifest_digests[..candidate_end]
-                .iter()
-                .position(|d| {
-                    !preserve.contains(d)
-                        && !self.is_digest_for_retained_spk(d)
-                        && !self.is_unconfirmed_digest_for_retained_spk(d)
-                        && !self.confirmed_manifest_digests.contains(d)
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| {
-                            !preserve.contains(d)
-                                && !self.is_digest_for_retained_spk(d)
-                                && !self.is_unconfirmed_digest_for_retained_spk(d)
-                        })
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| {
-                            !preserve.contains(d)
-                                && !self.is_digest_for_retained_spk(d)
-                                && !self.confirmed_manifest_digests.contains(d)
-                        })
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| {
-                            !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d)
-                        })
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| !preserve.contains(d))
-                })
-                .unwrap_or(0);
+            let evict_idx = self.evict_excess_manifest_digest_idx(preserve);
             let removed = self.recent_manifest_digests.remove(evict_idx);
             let removed_spk = self.manifest_digest_spks.remove(&removed);
             evicted.push((evict_idx, removed, removed_spk));
@@ -581,44 +588,7 @@ impl ClientState {
             self.manifest_digest_spks.remove(&removed);
         }
         while self.recent_manifest_digests.len() > MAX_RETAINED_MANIFEST_DIGESTS {
-            let candidate_end = self.recent_manifest_digests.len() - 1;
-            let evict_idx = self.recent_manifest_digests[..candidate_end]
-                .iter()
-                .position(|d| {
-                    !preserve.contains(d)
-                        && !self.is_digest_for_retained_spk(d)
-                        && !self.is_unconfirmed_digest_for_retained_spk(d)
-                        && !self.confirmed_manifest_digests.contains(d)
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| {
-                            !preserve.contains(d)
-                                && !self.is_digest_for_retained_spk(d)
-                                && !self.is_unconfirmed_digest_for_retained_spk(d)
-                        })
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| {
-                            !preserve.contains(d) && self.is_unconfirmed_digest_for_retained_spk(d)
-                        })
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| {
-                            !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d)
-                        })
-                })
-                .or_else(|| {
-                    self.recent_manifest_digests[..candidate_end]
-                        .iter()
-                        .position(|d| !preserve.contains(d))
-                })
-                .unwrap_or(0);
+            let evict_idx = self.evict_excess_manifest_digest_idx(preserve);
             let removed = self.recent_manifest_digests.remove(evict_idx);
             self.manifest_digest_spks.remove(&removed);
         }
@@ -816,7 +786,11 @@ impl<'de> serde::Deserialize<'de> for RawManifestDigestSpk {
             }
         }
 
-        deserializer.deserialize_seq(Visitor)
+        // Match `serialize_digest_spk_map`'s `serialize_tuple(3)` so non-self-describing binary
+        // formats (`postcard`, `bincode`) read 3 elements without expecting a per-entry length
+        // prefix, while self-describing formats still delegate to `SeqAccess` and accept legacy
+        // 2-element `(digest, spk)` tuples (`R12-P2-1`).
+        deserializer.deserialize_tuple(3, Visitor)
     }
 }
 
@@ -2375,6 +2349,15 @@ impl<M> Session<M> {
     /// Cryptographic security level of the active session, if any.
     pub fn security(&self) -> Option<SessionSecurity> {
         self.state.security()
+    }
+
+    /// Whether any archived earlier session in `others` is classical (not PQXDH), e.g. when a
+    /// cancelled crossed start discarded `active` while preserving the peer's classical session.
+    pub fn has_classical_earlier(&self) -> bool {
+        self.state
+            .others
+            .iter()
+            .any(|e| e.party.associated_data().len() != x3dh::PQXDH_ASSOCIATED_DATA_LENGTH)
     }
 
     /// Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
@@ -5928,5 +5911,174 @@ mod test {
             .unwrap();
             assert_eq!(three.0, (d, s, false));
         }
+    }
+
+    #[test]
+    fn r12_p2_1_p2_2_tuple_serde_and_surplus_spk_trim() {
+        // --- Part 1 (R12-P2-1): Non-self-describing binary format (no per-tuple length prefix,
+        //     matching `postcard` / `bincode`) MUST round-trip `RawManifestDigestSpk` via
+        //     `deserialize_tuple(3, ...)` even when `digest[0] == 0x00`! ---
+        #[cfg(feature = "serde")]
+        {
+            use serde::Deserialize;
+            use serde::de;
+
+            #[derive(Debug)]
+            struct BinErr(String);
+            impl core::fmt::Display for BinErr {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+            impl std::error::Error for BinErr {}
+            impl de::Error for BinErr {
+                fn custom<T: core::fmt::Display>(msg: T) -> Self {
+                    Self(msg.to_string())
+                }
+            }
+
+            // Minimal strict non-self-describing binary deserializer (exact `postcard` semantics):
+            // - `deserialize_tuple(len)` reads `len` elements with NO length prefix.
+            // - `deserialize_seq` reads a 1-byte length prefix from the stream (failing on a
+            //   lengthless tuple whose first byte is `0x00`!).
+            struct StrictBinDe<'a> {
+                bytes: &'a [u8],
+            }
+            impl<'a> StrictBinDe<'a> {
+                fn take_byte(&mut self) -> core::result::Result<u8, BinErr> {
+                    let (&b, rest) = self
+                        .bytes
+                        .split_first()
+                        .ok_or_else(|| BinErr("eof".into()))?;
+                    self.bytes = rest;
+                    Ok(b)
+                }
+            }
+            struct FixedLenSeq<'a, 'b> {
+                de: &'b mut StrictBinDe<'a>,
+                remaining: usize,
+            }
+            impl<'de, 'b> de::SeqAccess<'de> for FixedLenSeq<'de, 'b> {
+                type Error = BinErr;
+                fn next_element_seed<T: de::DeserializeSeed<'de>>(
+                    &mut self,
+                    seed: T,
+                ) -> core::result::Result<Option<T::Value>, BinErr> {
+                    if self.remaining == 0 {
+                        return Ok(None);
+                    }
+                    self.remaining -= 1;
+                    seed.deserialize(&mut *self.de).map(Some)
+                }
+            }
+            impl<'de> de::Deserializer<'de> for &mut StrictBinDe<'de> {
+                type Error = BinErr;
+                fn deserialize_any<V: de::Visitor<'de>>(
+                    self,
+                    _visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    Err(BinErr("non-self-describing".into()))
+                }
+                fn deserialize_bool<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    match self.take_byte()? {
+                        0 => visitor.visit_bool(false),
+                        1 => visitor.visit_bool(true),
+                        b => Err(BinErr(format!("invalid bool {b}"))),
+                    }
+                }
+                fn deserialize_u8<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    visitor.visit_u8(self.take_byte()?)
+                }
+                fn deserialize_tuple<V: de::Visitor<'de>>(
+                    self,
+                    len: usize,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    visitor.visit_seq(FixedLenSeq {
+                        de: self,
+                        remaining: len,
+                    })
+                }
+                fn deserialize_seq<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    let len = usize::from(self.take_byte()?);
+                    visitor.visit_seq(FixedLenSeq {
+                        de: self,
+                        remaining: len,
+                    })
+                }
+                fn deserialize_ignored_any<V: de::Visitor<'de>>(
+                    self,
+                    _visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    Err(BinErr("ignored_any not supported".into()))
+                }
+                serde::forward_to_deserialize_any! {
+                    i8 i16 i32 i64 u16 u32 u64 f32 f64 char str string bytes byte_buf
+                    option unit unit_struct newtype_struct tuple_struct map struct enum identifier
+                }
+            }
+
+            let digest = [0x00u8; 32]; // first byte 0x00 immediately fails `deserialize_seq`!
+            let spk = [0x5au8; 32];
+            let mut wire = Vec::with_capacity(65);
+            wire.extend_from_slice(&digest);
+            wire.extend_from_slice(&spk);
+            wire.push(0); // confirmed = false
+            let mut de = StrictBinDe { bytes: &wire };
+            let decoded = RawManifestDigestSpk::deserialize(&mut de).unwrap();
+            assert_eq!(decoded.0, (digest, spk, false));
+            assert!(de.bytes.is_empty());
+        }
+
+        // --- Part 2 (R12-P2-2): Trimming from 145 -> 144 MUST evict a surplus confirmed digest
+        //     from over-represented SPK B (143 digests) rather than the sole confirmed digest of
+        //     retained SPK A! ---
+        let mut client = Client::new(());
+        let pa = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_a = pa.classical.signed_prekey;
+        let d_a = pa.manifest_digest;
+        client.commit_publish_v2(pa);
+
+        let pb = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_b = pb.classical.signed_prekey;
+        client.commit_publish_v2(pb);
+        for i in 0..142u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x77;
+            client
+                .state
+                .record_confirmed_manifest_digest(d, Some(spk_b));
+        }
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert_eq!(client.recent_manifest_digests()[0], d_a);
+        assert!(client.has_spare_manifest_digest_slot_for_publish(&[], &[]));
+
+        // In-place publish on SPK B (preserving SPK A so SPK A stays retained):
+        let pb_next = client
+            .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+            .unwrap();
+        assert_eq!(pb_next.classical.signed_prekey, spk_b);
+        client.commit_publish_v2_preserving(pb_next, &[spk_a], &[]);
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert!(
+            client.recent_manifest_digests().contains(&d_a),
+            "R12-P2-2: sole confirmed digest for retained SPK A must survive trim when SPK B has surplus digests"
+        );
     }
 }

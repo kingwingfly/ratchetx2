@@ -383,6 +383,19 @@ pub(super) struct Inner<V = Vault> {
     /// baseline.
     accepted_pq_since_baseline:
         std::collections::BTreeMap<session::PqSuite, HashSet<session::PqPrekeyId>>,
+    /// Whether an empty-OPK greeting on `current_signed_prekey` requested a bounded classical refill
+    /// probe (`R12-P2-4`). Cleared once the probe succeeds or hits `LimitExceeded`.
+    classical_fallback_probe_pending: bool,
+    /// Unix ms timestamp before which classical empty-OPK greetings will not trigger another
+    /// refill probe (set for 1h when a probe confirms the relay still had stocked OPKs, matching
+    /// the Worker's hourly OPK claim budget — `R12-P2-4`).
+    classical_fallback_probe_cooldown_until: u64,
+    /// PQ suites for which a last-resort greeting on `current_signed_prekey` requested a bounded
+    /// refill probe (`R12-P2-4`, `R12-P2-5`).
+    pq_fallback_probe_pending: std::collections::BTreeSet<session::PqSuite>,
+    /// Per-suite Unix ms cooldown timestamp after a PQ last-resort probe confirmed stocked relay
+    /// PQOPKs (`R12-P2-4`).
+    pq_fallback_probe_cooldown_until: std::collections::BTreeMap<session::PqSuite, u64>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
     /// Encrypted inbox initials retained in the separate `deferred` vault sidecar record.
@@ -2111,12 +2124,11 @@ impl<V: VaultStore> Engine<V> {
                         if expected_gen.is_some_and(|want| contact.state.conversation_gen != want) {
                             return Err("chat changed; please retry.".to_string());
                         }
-                        // R11-P1-2: Do not silently accept an unquarantined classical request when
-                        // local PQ policy now requires PQ (`strict_pq`) or the peer is PQ-pinned
-                        // without an explicit classical exception.
-                        if contact.state.request
-                            && contact.session.security().is_some_and(|s| !s.is_pq)
-                        {
+                        // R11-P1-2 + R12-P1-1 + R12-P1-3: Do not silently accept an unquarantined
+                        // classical request (active OR archived in `others` after a cancelled
+                        // crossed start) when local policy requires PQ (`strict_pq`) or ordinary
+                        // local PQ is enabled without an explicit classical exception.
+                        if contact.state.request && contact.is_classical_session() {
                             if strict_pq {
                                 return Err(
                                     "Require post-quantum (strict mode) is enabled; upgrade to PQ before accepting this classical request."
@@ -2124,11 +2136,16 @@ impl<V: VaultStore> Engine<V> {
                                 );
                             }
                             if local_pq_enabled
-                                && contact.session.peer_pq_state().pq_pinned
                                 && !contact.session.peer_pq_state().allow_classical_exception
                             {
+                                if contact.session.peer_pq_state().pq_pinned {
+                                    return Err(
+                                        "Peer is post-quantum pinned; upgrade to PQ or allow classical encryption before accepting this request."
+                                            .to_string(),
+                                    );
+                                }
                                 return Err(
-                                    "Peer is post-quantum pinned; upgrade to PQ or allow classical encryption before accepting this request."
+                                    "Post-quantum encryption is enabled; upgrade to PQ or allow classical encryption before accepting this classical request."
                                         .to_string(),
                                 );
                             }
@@ -2926,6 +2943,10 @@ impl<V: VaultStore> Inner<V> {
             relay_pq_opk_queue_by_suite: None,
             relay_claimed_pq_opks_by_suite: std::collections::BTreeMap::new(),
             accepted_pq_since_baseline: std::collections::BTreeMap::new(),
+            classical_fallback_probe_pending: false,
+            classical_fallback_probe_cooldown_until: 0,
+            pq_fallback_probe_pending: std::collections::BTreeSet::new(),
+            pq_fallback_probe_cooldown_until: std::collections::BTreeMap::new(),
             unsaved_state: false,
             deferred_acks_after_save: vec![],
             contacts_dirty_late: false,

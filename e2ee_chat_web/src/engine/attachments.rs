@@ -1377,6 +1377,18 @@ impl<V: VaultStore> Engine<V> {
                 return Err(msg);
             }
         };
+        // R12-P1-4: If this upload was already announced on disk with 0 chunks uploaded before a
+        // reload, `Engine::flush` held its outbox announcement until the file was re-attached above.
+        // Flush now that `self.uploads` holds the file handle before chunk upload begins.
+        if before_announce.is_announced()
+            && before_announce.uploaded == 0
+            && self.is_live(vgen)
+            && !self.is_cancelled(&id)
+            && let Err(e) = self.flush(&peer).await
+            && self.is_live(vgen)
+        {
+            self.ui.link.set(Link::Offline(e));
+        }
         let result = self.run_upload(peer, pending, file, resume).await;
         drop(running_guard);
         result

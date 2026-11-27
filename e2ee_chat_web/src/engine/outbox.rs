@@ -344,15 +344,42 @@ impl<V: VaultStore> Engine<V> {
                         step = NextPush::Done;
                         break;
                     }
+                    let needs_new_session = contact.session.needs_new_session();
+                    let pause_sealing = contact.state.quarantined
+                        || contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
+                        || contact.state.security_alert != SECURITY_ALERT_NONE;
+                    // R12-P1-4: Never seal or announce an un-dispatched attachment whose upload
+                    // has 0 chunks uploaded to the server and no live file handle in memory (e.g.
+                    // after a reload/teardown following a failed cancel-after-promote rollback, or
+                    // a paused 0-chunk upload waiting for the user to re-select or cancel the file).
+                    if !outgoing.dispatched {
+                        match inner.vault.uploads(Some(peer)).await {
+                            _ if !self.is_live(vgen) => return Ok(false),
+                            Ok(uploads) => {
+                                let blocks_announcement = uploads.iter().any(|(_, p)| {
+                                    p.is_announced()
+                                        && p.history_index == outgoing.history_index
+                                        && p.uploaded == 0
+                                        && !<[u8; 16]>::try_from(p.id.as_slice())
+                                            .is_ok_and(|id| self.uploads.has_file(peer, &id))
+                                });
+                                if blocks_announcement {
+                                    step = NextPush::Done;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                result = Err(describe(&e));
+                                step = NextPush::Done;
+                                break;
+                            }
+                        }
+                    }
                     if !outgoing.sealed {
-                        if contact.session.needs_new_session() {
+                        if needs_new_session {
                             // Pause sealing if waiting on explicit user action (quarantine /
                             // classical approval / security alert).
-                            if contact.state.quarantined
-                                || contact.state.classical_approval_needed
-                                    != CLASSICAL_APPROVAL_NONE
-                                || contact.state.security_alert != SECURITY_ALERT_NONE
-                            {
+                            if pause_sealing {
                                 step = NextPush::Done;
                                 break;
                             }

@@ -679,6 +679,7 @@ pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
         last_message: None,
         security: SecurityView::default(),
         has_active_session: false,
+        has_classical_earlier: false,
         pq_pinned: false,
         peer_pq_capable: false,
         allow_classical_exception: false,

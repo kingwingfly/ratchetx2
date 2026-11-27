@@ -371,6 +371,14 @@ impl Contact {
         accept_contact_request_state(&mut self.state, name)
     }
 
+    /// Whether this contact's active session (or archived earlier session when `active` was
+    /// discarded, e.g. after a cancelled crossed start) is classical (non-PQ).
+    pub(super) fn is_classical_session(&self) -> bool {
+        self.session
+            .security()
+            .map_or_else(|| self.session.has_classical_earlier(), |s| !s.is_pq)
+    }
+
     /// Clear quarantine state and active security prompts after establishing a verified PQ session.
     pub(super) fn clear_quarantine_and_alerts(&mut self) {
         self.state.quarantined = false;
@@ -442,6 +450,7 @@ impl Contact {
                 .and_then(LastMessageRecord::to_view),
             security: SecurityView::from_session(active_security.unwrap_or_default()),
             has_active_session,
+            has_classical_earlier: self.session.has_classical_earlier(),
             pq_pinned: peer_pq.pq_pinned,
             peer_pq_capable: peer_pq.peer_pq_capable,
             allow_classical_exception: peer_pq.allow_classical_exception,

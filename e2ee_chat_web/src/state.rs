@@ -199,6 +199,7 @@ pub struct ContactView {
     /// Active session cryptographic security level.
     pub security: SecurityView,
     pub has_active_session: bool,
+    pub has_classical_earlier: bool,
     pub pq_pinned: bool,
     pub peer_pq_capable: bool,
     pub allow_classical_exception: bool,

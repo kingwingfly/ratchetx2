@@ -50,6 +50,16 @@ impl Error {
             .is_some_and(|err| err.kind() == x3dh::ErrorKind::Replayed)
     }
 
+    /// Whether this error originated from a server [`protocol::ErrorKind::Malformed`]
+    /// (`Connect` `InvalidArgument`) refusal, as opposed to transient `StaleTimestamp`
+    /// (`FailedPrecondition`) or `InvalidSignature` (`Unauthenticated`).
+    pub fn is_protocol_malformed(&self) -> bool {
+        self.source
+            .as_deref()
+            .and_then(|src| src.downcast_ref::<protocol::Error>())
+            .is_some_and(|err| err.kind() == protocol::ErrorKind::Malformed)
+    }
+
     pub(crate) fn from_protocol_with_kind(kind: ErrorKind, error: protocol::Error) -> Self {
         Self {
             server_refusal: error.is_server_refusal(),

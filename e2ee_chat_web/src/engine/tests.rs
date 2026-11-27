@@ -14932,6 +14932,14 @@ fn r5_p2_3_cancel_upload_serializes_with_in_flight_push_and_preserves_dispatched
             inner.vault.save_upload(&peer, &pending).await.unwrap();
             view.index
         };
+        engine.uploads.insert_file(
+            (peer, att_id, super::attachment_key_hash(&[0x77; 32])),
+            super::attachments::ChunkSource::from_bytes(
+                "demo.bin",
+                "application/octet-stream",
+                vec![0u8; 16],
+            ),
+        );
 
         let (entered_tx, entered_rx) = futures::channel::oneshot::channel::<()>();
         let entered_cell = Rc::new(RefCell::new(Some(entered_tx)));
@@ -21544,6 +21552,21 @@ fn r11_p1_1_p1_2_p1_3_approval_lock_pq_gate_and_provisional_send_guard() {
             done_rx.try_recv().unwrap().is_none(),
             "R11-P1-1: approve_classical_for_gen must block behind peer_flush_lock"
         );
+        // R12-P3-1: Prove approval blocked AT ENTRY (before mutating contact or registering any
+        // write token), not merely at its final `self.flush(&peer)`!
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let c = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(
+                c.state.quarantined && c.state.provisional,
+                "R12-P3-1: contact must remain quarantined and provisional while peer_flush_lock is held"
+            );
+            assert!(
+                registered.borrow().is_empty(),
+                "R12-P3-1: zero RegisterWriteToken RPCs may run while peer_flush_lock is held"
+            );
+        }
         drop(peer_guard);
         assert_eq!(done_rx.await.unwrap(), Ok(()));
         {
@@ -22256,22 +22279,664 @@ fn r11_p2_1_to_p2_5_p3_1_p3_2_cancel_rollback_and_refill_hardening() {
         let _ = inner
             .open_initial(&empty_peer.identity_key(), &empty_inc)
             .unwrap();
+        assert!(
+            inner.state.used_one_time_prekeys >= REFILL_USED
+                && inner.classical_fallback_probe_pending,
+            "R11-P2-5 + R12-P2-4: SPK-only fallback greeting on current SPK must trigger a bounded classical refill probe"
+        );
         assert_eq!(
             inner.last_server_classical_opks,
-            Some(0),
-            "R11-P2-5: SPK-only fallback greeting on current SPK must snap classical baseline to 0"
+            Some(20),
+            "R12-P2-4: fallback greeting must NOT clobber last_server_classical_opks before probe confirms pool empty"
+        );
+        assert!(
+            inner.relay_classical_opk_queue.is_some(),
+            "R12-P2-4: fallback greeting must NOT discard FIFO queue tracking before probe confirms pool empty"
         );
         #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
         {
             let suite = inner.client.pq_config().offered_suites()[0];
-            assert_eq!(
-                inner
-                    .last_server_pq_opks_by_suite
-                    .as_ref()
-                    .and_then(|m| m.get(&suite)),
-                Some(&0),
-                "R11-P2-5: PQ last-resort fallback greeting on current SPK must snap suite baseline to 0"
+            assert!(
+                inner.last_server_pq_opks_by_suite.is_none(),
+                "R12-P2-5: post-reload PQ last-resort greeting must NOT fabricate a partial single-suite baseline map"
+            );
+            assert!(
+                inner.used_pq_by_suite.get(&suite).copied().unwrap_or(0) >= REFILL_USED
+                    && inner.pq_fallback_probe_pending.contains(&suite),
+                "R11-P2-5 + R12-P2-5: PQ last-resort fallback greeting must trigger a bounded probe strictly for that suite"
             );
         }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r12_p1_1_p1_2_p1_3_p1_4_archived_classical_policy_and_reload_cancel_guard() {
+    use bytes::Bytes;
+    use protocol::attachment::StartUploadResponse;
+
+    let mut pool = futures::executor::LocalPool::new();
+
+    // Part 1 (R12-P1-1 + R12-P1-2 + R12-P1-3):
+    //   - Unpinned classical request received while PQ was OFF -> enabling ordinary PQ blocks
+    //     `accept` and `start_chat` (`ClassicalApprovalRequired`), until explicit approval.
+    //   - Fresh `pin_pq = true, allow_classical = false` invitation supersedes a prior
+    //     `allow_classical_exception` (`DowngradeDetected`, clears exception, leaves `request`).
+    //   - Cancelled crossed-start with `active == None` and archived classical session in `others`
+    //     is STILL blocked by `strict_pq`, `pin_pq`, and ordinary `pq_enabled`!
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    pool.run_until(async {
+        use super::Contact;
+        use protocol::handshake_v2::ClaimBundleResponse;
+        use protocol::mailbox_v2::{PushV2Response, RegisterWriteTokenResponse};
+        let (mut alice_inner, _) = unlocked_client();
+        alice_inner.contacts.clear();
+        alice_inner.server = LOCAL_SERVER.to_string();
+        alice_inner.audience = "localhost".to_string();
+        let mut cfg_off = alice_inner.client.pq_config().clone();
+        cfg_off.pq_enabled = false;
+        cfg_off.strict_pq = false;
+        alice_inner.client.set_pq_config(cfg_off).unwrap();
+        let a_pub = alice_inner
+            .client
+            .prepare_publish_v2("localhost", 2, 0)
+            .unwrap();
+        let a_m = a_pub.request.manifest.clone().unwrap();
+        let alice_bundle = ClaimBundleResponse {
+            signed_prekey: a_m.signed_prekey.clone(),
+            signed_prekey_signature: a_pub.request.signed_prekey_signature.clone(),
+            one_time_prekey: None,
+            manifest: Some(a_m),
+            pq_last_resort: None,
+            pq_one_time_prekey: None,
+        };
+        alice_inner.client.commit_publish_v2(a_pub);
+        alice_inner.state.published_at = crate::util::now();
+        let alice_id = alice_inner.client.identity_key();
+
+        async fn make_classical_inc(
+            bob: &session::Client<()>,
+            alice_id: &PublicKey,
+            alice_bundle: &ClaimBundleResponse,
+            seq: u64,
+        ) -> Incoming {
+            let ab = alice_bundle.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let ab = ab.clone();
+                let path = path.to_string();
+                async move {
+                    assert!(path.ends_with("/ClaimBundle"));
+                    Ok((200, ab.encode_to_vec()))
+                }
+            });
+            let mut pps = session::PeerPqState::default();
+            pps.approve_classical_exception();
+            let claimed = session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                alice_id,
+                &pps,
+                bob.pq_config(),
+                bob.clock(),
+            )
+            .await
+            .unwrap();
+            let hello = Kind::Hello(bob.make_hello("Bob", seq)).to_bytes();
+            let prep = bob
+                .finish_prepare_initiate_v2(claimed, &pps, &hello, Fetch::client(LOCAL_SERVER))
+                .unwrap();
+            Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap()
+        }
+
+        let mut bob = session::Client::new(());
+        let mut b_cfg = bob.pq_config().clone();
+        b_cfg.pq_enabled = false;
+        b_cfg.strict_pq = false;
+        bob.set_pq_config(b_cfg).unwrap();
+        let bob_id = bob.identity_key();
+        let b_inc = make_classical_inc(&bob, &alice_id, &alice_bundle, 1).await;
+        let opened = alice_inner.open_initial(&bob_id, &b_inc).unwrap();
+        alice_inner.contacts.push(Contact {
+            peer: bob_id,
+            session: opened.session,
+            deferred_carried: 0,
+            state: ContactState {
+                peer: bob_id.to_vec(),
+                name: "Bob".into(),
+                request: true,
+                provisional: false,
+                quarantined: false,
+                conversation_gen: 1,
+                history_len: 1,
+                ..ContactState::default()
+            },
+        });
+        // Enable ordinary local PQ (`pq_enabled = true, strict_pq = false`)!
+        let mut cfg_pq = alice_inner.client.pq_config().clone();
+        cfg_pq.pq_enabled = true;
+        cfg_pq.strict_pq = false;
+        alice_inner.client.set_pq_config(cfg_pq).unwrap();
+        let engine = Engine::with_inner(Ui::new(), alice_inner);
+        let bob_key = crate::util::key_to_text(&bob_id);
+
+        // (R12-P1-3) Unpinned classical request MUST be blocked by both `accept` and `start_chat`
+        // until classical approval is granted.
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!("R12-P1-3: unapproved classical request must not issue RPC: {path}");
+            });
+            assert!(
+                engine.accept(bob_id, "Bob".into()).await.is_err(),
+                "R12-P1-3: accept must reject unpinned classical request when local PQ is ON"
+            );
+            let sub = engine.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key.clone(),
+                name: "Bob".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: false,
+                auto_start: false,
+            });
+            assert_eq!(
+                engine
+                    .start_chat(sub, &bob_key, "Bob".into(), None, false, false)
+                    .await,
+                Err(StartChatError::ClassicalApprovalRequired),
+                "R12-P1-3: start_chat must require classical approval when local PQ is ON"
+            );
+        }
+
+        // (R12-P1-2) Grant `allow_classical_exception` on the request, then open a fresh PQ-pinned
+        // invitation (`pin_pq = true, allow_classical = false`): MUST fail with
+        // `DowngradeDetected`, clear `allow_classical_exception`, pin PQ, and keep `request = true`!
+        engine.approve_classical_for_gen(bob_id, 1).await.unwrap();
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!("R12-P1-2: fresh pin_pq invite must not register token or push: {path}");
+            });
+            let sub = engine.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key.clone(),
+                name: "Bob".into(),
+                server: None,
+                pq_pinned: true,
+                allow_classical: false,
+                auto_start: false,
+            });
+            assert_eq!(
+                engine
+                    .start_chat(sub, &bob_key, "Bob".into(), None, true, false)
+                    .await,
+                Err(StartChatError::DowngradeDetected),
+                "R12-P1-2: fresh pin_pq invitation must supersede prior allow_classical_exception"
+            );
+        }
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == bob_id)
+                .unwrap();
+            assert!(c.state.request);
+            assert!(c.session.peer_pq_state().pq_pinned);
+            assert!(
+                !c.session.peer_pq_state().allow_classical_exception,
+                "R12-P1-2: pin_peer_pq must clear stale allow_classical_exception"
+            );
+        }
+
+        // (R12-P1-1) Simulate a cancelled crossed-start: `active == None`, archived classical
+        // session in `session.others`, `request == true`!
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let b_inc2 = make_classical_inc(&bob, &alice_id, &alice_bundle, 2).await;
+            let opened2 = inner.open_initial(&bob_id, &b_inc2).unwrap();
+            let c = inner.contact(&bob_id).unwrap();
+            // Force `opened2` into `others` by taking over or archiving, then discard `active`.
+            let _ = c
+                .session
+                .accept_replacement_with_policy(opened2.session, false);
+            c.session.discard_active();
+            assert!(c.session.security().is_none());
+            assert!(c.session.has_classical_earlier());
+            c.state.request = true;
+            c.state.quarantined = false;
+            c.state.provisional = false;
+            c.session.peer_pq_state_mut().pq_pinned = false;
+            c.session.peer_pq_state_mut().clear_classical_exception();
+            let mut cfg_strict = inner.client.pq_config().clone();
+            cfg_strict.pq_enabled = true;
+            cfg_strict.strict_pq = true;
+            inner.client.set_pq_config(cfg_strict).unwrap();
+        }
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!("R12-P1-1: archived classical request under strict_pq must not issue RPC: {path}");
+            });
+            assert!(
+                engine.accept(bob_id, "Bob".into()).await.is_err(),
+                "R12-P1-1: accept must block archived classical session under strict_pq"
+            );
+            let sub = engine.begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key.clone(),
+                name: "Bob".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: true,
+                auto_start: false,
+            });
+            assert_eq!(
+                engine
+                    .start_chat(sub, &bob_key, "Bob".into(), None, false, true)
+                    .await,
+                Err(StartChatError::PqRequired),
+                "R12-P1-1: start_chat must return PqRequired for archived classical session under strict_pq"
+            );
+        }
+        // Now disable `strict_pq`, explicitly allow classical, and verify `accept` succeeds cleanly.
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut cfg = inner.client.pq_config().clone();
+            cfg.strict_pq = false;
+            inner.client.set_pq_config(cfg).unwrap();
+        }
+        engine.approve_classical_for_gen(bob_id, 1).await.unwrap();
+        {
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                async move {
+                    if path.ends_with("/RegisterWriteToken") {
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/PushV2") {
+                        Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            assert_eq!(engine.accept(bob_id, "Bob".into()).await, Ok(()));
+        }
+    });
+
+    // Part 2 (R12-P1-4): `start_waiting` cancel-after-promote rollback fails, then vault reloads
+    // (fresh `Engine` with empty `UploadRegistry`, storage recovered): `Engine::flush` MUST NOT
+    // announce the cancelled 0-chunk attachment pointer across reload!
+    pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let conv_gen = {
+            let mut guard = engine.inner.lock().await;
+            guard
+                .as_mut()
+                .unwrap()
+                .contact(&peer)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+        let src = super::attachments::ChunkSource::from_bytes(
+            "private.pdf",
+            "application/pdf",
+            b"do not announce after reload".to_vec(),
+        );
+        engine.wait_for_sign_in(peer, conv_gen, src).await.unwrap();
+        let waiting_id = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let (_, p) = inner
+                .vault
+                .uploads(Some(&peer))
+                .await
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            <[u8; 16]>::try_from(p.id.as_slice()).unwrap()
+        };
+        let promoted_id = [0xd1u8; 16];
+        let promoted_tok = [0xd2u8; 16];
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            inner.vault.fail_promote_upload_delete.set(true);
+            let e_hook = engine.clone();
+            *inner.vault.on_save.borrow_mut() = Some(Box::new(move || {
+                e_hook.uploads.mark_cancelled(waiting_id);
+            }));
+        }
+        {
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                async move {
+                    assert!(path.ends_with("/StartUpload"), "unexpected {path}");
+                    Ok((
+                        200,
+                        StartUploadResponse {
+                            id: Bytes::copy_from_slice(&promoted_id),
+                            upload_token: Bytes::copy_from_slice(&promoted_tok),
+                            expires: crate::util::now() + 3_600_000,
+                        }
+                        .encode_to_vec(),
+                    ))
+                }
+            });
+            let src2 = super::attachments::ChunkSource::from_bytes(
+                "private.pdf",
+                "application/pdf",
+                b"do not announce after reload".to_vec(),
+            );
+            assert!(engine.start_waiting(peer, waiting_id, src2).await.is_err());
+        }
+        // Simulate full tab reload: recover storage and move `Inner` into a brand-new `Engine`
+        // (empty `UploadRegistry`, zero `pending_cancel_rollbacks`!).
+        let reloaded_inner = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.take().unwrap();
+            inner.vault.fail_promote_upload_delete.set(false);
+            *inner.vault.on_save.borrow_mut() = None;
+            inner
+        };
+        let reloaded_engine = Engine::with_inner(Ui::new(), reloaded_inner);
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!("R12-P1-4: reloaded Engine::flush must NEVER announce paused 0-chunk upload: {path}");
+            });
+            assert_eq!(reloaded_engine.flush(&peer).await, Ok(false));
+        }
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r12_p2_3_p2_4_p2_5_p2_6_pq_queue_fallback_cooldown_and_stale_ts() {
+    use protocol::handshake_v2::{ClaimBundleResponse, RefillPrekeysResponse};
+    use std::rc::Rc;
+
+    let mut pool = futures::executor::LocalPool::new();
+
+    // Part 1 (R12-P2-3 + R12-P2-4 + R12-P2-5):
+    //   - Removing one PQ suite from `Some(relay_pq_opk_queue_by_suite)` still charges valid
+    //     current-SPK greetings for that suite (`R12-P2-3`).
+    //   - Rate-limited fallback greeting against stocked relay triggers at most 1 bounded probe,
+    //     sets 1h cooldown (`resp > added`), keeps FIFO queue intact, and suppresses subsequent
+    //     throttled greetings (`R12-P2-4`).
+    //   - Post-reload single-suite last-resort greeting refills ONLY that suite without inflating
+    //     unaffected suites (`R12-P2-5`).
+    pool.run_until(async {
+        use protocol::handshake_v2::{RefillPrekeysRequest, SuiteCount};
+        let (mut inner, _) = unlocked_client();
+        inner.contacts.clear();
+        inner.server = TEST_SERVER.to_string();
+        inner.audience = "localhost".to_string();
+        let prep = inner.client.prepare_publish_v2("localhost", 20, 20).unwrap();
+        let m = prep.request.manifest.clone().unwrap();
+        let sig = prep.request.signed_prekey_signature.clone();
+        let offered = inner.client.pq_config().offered_suites();
+        let suite0 = offered[0];
+        let pq_opk0 = prep
+            .request
+            .pq_one_time_prekeys
+            .iter()
+            .find(|k| k.suite == u32::from(suite0.as_u8()))
+            .unwrap()
+            .clone();
+        let pq_lr0 = prep
+            .request
+            .pq_last_resort
+            .iter()
+            .find(|k| k.suite == u32::from(suite0.as_u8()))
+            .unwrap()
+            .clone();
+        let classical_keys: Vec<PublicKey> = prep
+            .request
+            .one_time_prekeys
+            .iter()
+            .map(|b| PublicKey::try_from(b.as_ref()).unwrap())
+            .collect();
+        inner.client.commit_publish_v2(prep);
+        inner.state.published_at = crate::util::now();
+        inner.last_server_classical_opks = Some(20);
+        inner.relay_classical_opk_queue = Some(std::collections::VecDeque::from(classical_keys));
+        // Outer `Some(map)` present, but `suite0` was removed (simulating ambiguous 5xx refill):
+        inner.relay_pq_opk_queue_by_suite = Some(std::collections::BTreeMap::new());
+        let alice_id = inner.client.identity_key();
+
+        let make_inc = |bundle: ClaimBundleResponse| async move {
+            let peer = session::Client::new(());
+            let b = bundle.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let b = b.clone();
+                let path = path.to_string();
+                async move {
+                    assert!(path.ends_with("/ClaimBundle"));
+                    Ok((200, b.encode_to_vec()))
+                }
+            });
+            let pps = session::PeerPqState::default();
+            let claimed = session::claim_peer_bundle_v2(
+                &Fetch::client(TEST_SERVER),
+                "localhost",
+                &alice_id,
+                &pps,
+                peer.pq_config(),
+                peer.clock(),
+            )
+            .await
+            .unwrap();
+            let hello = Kind::Hello(peer.make_hello("Peer", 1)).to_bytes();
+            let prep = peer
+                .finish_prepare_initiate_v2(claimed, &pps, &hello, Fetch::client(TEST_SERVER))
+                .unwrap();
+            (
+                peer.identity_key(),
+                Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap(),
+            )
+        };
+
+        // (R12-P2-3) Current-SPK PQOPK greeting for `suite0` MUST still increment usage counters!
+        let (p1, inc1) = make_inc(ClaimBundleResponse {
+            signed_prekey: m.signed_prekey.clone(),
+            signed_prekey_signature: sig.clone(),
+            one_time_prekey: None,
+            manifest: Some(m.clone()),
+            pq_last_resort: Some(pq_lr0.clone()),
+            pq_one_time_prekey: Some(pq_opk0),
+        })
+        .await;
+        let _ = inner.open_initial(&p1, &inc1).unwrap();
+        assert_eq!(
+            inner.state.used_pq_one_time_prekeys, 1,
+            "R12-P2-3: invalidated single-suite PQ queue must fall back to on_current_spk accounting"
+        );
+        assert_eq!(inner.used_pq_by_suite.get(&suite0).copied(), Some(1));
+
+        // Reset counters and test (R12-P2-4) + (R12-P2-5): post-reload `last_server_pq_opks_by_suite`
+        // is `None`; rate-limited greeting (`one_time_prekey: None`, `pq_one_time_prekey: None`)
+        // triggers ONE bounded probe strictly for `suite0`, sees stocked counts (`30 > 10`), sets
+        // 1h cooldown, keeps classical queue intact, and ignores a second throttled greeting!
+        inner.state.used_one_time_prekeys = 0;
+        inner.state.used_pq_one_time_prekeys = 0;
+        inner.used_pq_by_suite.clear();
+        inner.classical_fallback_probe_pending = false;
+        inner.classical_fallback_probe_cooldown_until = 0;
+        inner.pq_fallback_probe_pending.clear();
+        inner.pq_fallback_probe_cooldown_until.clear();
+        inner.last_server_pq_opks_by_suite = None;
+        let (p2, inc2) = make_inc(ClaimBundleResponse {
+            signed_prekey: m.signed_prekey.clone(),
+            signed_prekey_signature: sig.clone(),
+            one_time_prekey: None,
+            manifest: Some(m.clone()),
+            pq_last_resort: Some(pq_lr0.clone()),
+            pq_one_time_prekey: None,
+        })
+        .await;
+        let _ = inner.open_initial(&p2, &inc2).unwrap();
+        let engine = Engine::with_inner(Ui::new(), inner);
+        let rpc_calls = Rc::new(Cell::new(0usize));
+        {
+            let rc = rpc_calls.clone();
+            let offered_for_mock = offered.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let body = body.to_vec();
+                let rc = rc.clone();
+                let offered_for_mock = offered_for_mock.clone();
+                async move {
+                    assert!(path.ends_with("/RefillPrekeys"));
+                    let req = RefillPrekeysRequest::decode(body.as_slice()).unwrap();
+                    rc.set(rc.get() + 1);
+                    // R12-P2-5: Post-reload probe must ONLY request `suite0`, never unaffected suites!
+                    assert!(!req.pq_one_time_prekeys.is_empty());
+                    assert!(
+                        req.pq_one_time_prekeys
+                            .iter()
+                            .all(|k| k.suite == u32::from(suite0.as_u8())),
+                        "R12-P2-5: post-reload fallback probe must only replenish suite0"
+                    );
+                    let pq_counts: Vec<SuiteCount> = offered_for_mock
+                        .iter()
+                        .map(|s| {
+                            let added = req
+                                .pq_one_time_prekeys
+                                .iter()
+                                .filter(|k| k.suite == u32::from(s.as_u8()))
+                                .count() as u32;
+                            SuiteCount {
+                                suite: u32::from(s.as_u8()),
+                                count: 20 + added,
+                            }
+                        })
+                        .collect();
+                    Ok((
+                        200,
+                        RefillPrekeysResponse {
+                            classical_one_time_count: 20 + req.one_time_prekeys.len() as u32,
+                            pq_one_time_counts: pq_counts,
+                        }
+                        .encode_to_vec(),
+                    ))
+                }
+            });
+            engine.publish_with_rotation_gate(false, true).await.unwrap();
+        }
+        assert_eq!(rpc_calls.get(), 1);
+        // Second rate-limited greeting within the same hour MUST NOT trigger another probe!
+        let (p3, inc3) = make_inc(ClaimBundleResponse {
+            signed_prekey: m.signed_prekey.clone(),
+            signed_prekey_signature: sig,
+            one_time_prekey: None,
+            manifest: Some(m),
+            pq_last_resort: Some(pq_lr0),
+            pq_one_time_prekey: None,
+        })
+        .await;
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            assert!(inner.relay_classical_opk_queue.is_some());
+            assert!(inner.classical_fallback_probe_cooldown_until > crate::util::now());
+            assert!(
+                inner
+                    .pq_fallback_probe_cooldown_until
+                    .get(&suite0)
+                    .copied()
+                    .unwrap_or(0)
+                    > crate::util::now()
+            );
+            let _ = inner.open_initial(&p3, &inc3).unwrap();
+            assert_eq!(
+                inner.state.used_one_time_prekeys, 0,
+                "R12-P2-4: throttled greeting during cooldown must not bump classical usage"
+            );
+            assert_eq!(
+                inner.state.used_pq_one_time_prekeys, 0,
+                "R12-P2-4: throttled greeting during cooldown must not bump PQ usage"
+            );
+        }
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!("R12-P2-4: throttled greeting during cooldown must issue zero RPCs: {path}");
+            });
+            engine.publish_with_rotation_gate(false, true).await.unwrap();
+        }
+    });
+
+    // Part 2 (R12-P2-6): Transient `StaleTimestamp` (`failed_precondition`) on a single-suite PQ
+    // refill while `needs_publish == true` MUST NOT cache the suite in
+    // `deferred_refill_rejected_pq_suites`!
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    pool.run_until(async {
+        let (mut inner, _) = unlocked_client();
+        inner.contacts.clear();
+        inner.server = TEST_SERVER.to_string();
+        inner.audience = "localhost".to_string();
+        let prep = inner.client.prepare_publish_v2("localhost", 20, 20).unwrap();
+        inner.client.commit_publish_v2(prep);
+        let offered_suite = inner.client.pq_config().offered_suites()[0];
+        let mut wire = session::proto::ClientState::from(inner.client.state());
+        let cur_spk = wire.prekeys.as_ref().unwrap().generations[0]
+            .signed_prekey
+            .clone();
+        wire.recent_manifest_digests.clear();
+        wire.confirmed_manifest_digests.clear();
+        wire.manifest_digest_spks.clear();
+        for i in 0..144u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x62;
+            wire.recent_manifest_digests.push(d.to_vec());
+            if i >= 128 {
+                wire.confirmed_manifest_digests.push(d.to_vec());
+            }
+            wire.manifest_digest_spks
+                .push(session::proto::SignedPrekeyManifestDigest {
+                    digest: d.to_vec(),
+                    signed_prekey: cur_spk.clone(),
+                    unconfirmed: false,
+                });
+        }
+        inner.client = session::Client::restore(
+            Fetch::client(&inner.server),
+            session::ClientState::try_from(&wire).unwrap(),
+        );
+        inner.state.published_at = crate::util::now();
+        inner.state.needs_publish = true;
+        inner.last_server_classical_opks = Some(20);
+        inner.last_server_pq_opks_by_suite = None;
+        inner.state.used_one_time_prekeys = 0;
+        inner.state.used_pq_one_time_prekeys = 12;
+        inner.used_pq_by_suite.insert(offered_suite, 12);
+        let engine = Engine::with_inner(Ui::new(), inner);
+        {
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                async move {
+                    assert!(path.ends_with("/RefillPrekeys"));
+                    Ok((
+                        400,
+                        br#"{"code":"failed_precondition","message":"stale timestamp"}"#.to_vec(),
+                    ))
+                }
+            });
+            assert!(
+                engine
+                    .publish_with_rotation_gate(false, false)
+                    .await
+                    .is_err()
+            );
+        }
+        let guard = engine.inner.lock().await;
+        let inner = guard.as_ref().unwrap();
+        assert!(
+            inner.deferred_refill_rejected_pq_suites.is_empty(),
+            "R12-P2-6: StaleTimestamp (failed_precondition) must NOT permanently disable a supported PQ suite"
+        );
     });
 }
