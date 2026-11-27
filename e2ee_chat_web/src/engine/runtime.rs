@@ -31,6 +31,16 @@ use std::rc::{Rc, Weak};
 // 1. UploadRegistry
 // ---------------------------------------------------------------------------
 
+/// Cancelled promoted upload whose atomic local rollback transaction failed transiently
+/// (`R11-P2-1`): blocks `Engine::flush` from announcing the cancelled pointer and lets `flush`
+/// complete the atomic vault rollback + server `DeleteAttachment` once storage recovers.
+#[derive(Clone)]
+pub(super) struct PendingCancelRollback {
+    pub(super) conversation_gen: u64,
+    pub(super) pending: crate::vault::PendingUpload,
+    pub(super) failed_entry: crate::vault::HistoryEntry,
+}
+
 /// Active attachment upload state: local plaintext file handles, in-flight upload task IDs, and
 /// cancelled upload IDs.
 #[derive(Default)]
@@ -43,6 +53,8 @@ pub(super) struct UploadRegistry {
     /// Uploads cancelled, or whose chat was deleted, on this page: running tasks stop before their
     /// next chunk and are never persisted to the vault again.
     cancelled: RefCell<HashSet<[u8; 16]>>,
+    /// Promoted uploads cancelled after promotion whose rollback transaction failed transiently.
+    pending_cancel_rollbacks: RefCell<HashMap<(PublicKey, u64), PendingCancelRollback>>,
 }
 
 impl UploadRegistry {
@@ -95,10 +107,44 @@ impl UploadRegistry {
         self.cancelled.borrow_mut().insert(id);
     }
 
+    pub(super) fn insert_pending_cancel_rollback(
+        &self,
+        key: (PublicKey, u64),
+        rollback: PendingCancelRollback,
+    ) {
+        self.pending_cancel_rollbacks
+            .borrow_mut()
+            .insert(key, rollback);
+    }
+
+    pub(super) fn get_pending_cancel_rollback(
+        &self,
+        peer: &PublicKey,
+        history_index: u64,
+    ) -> Option<PendingCancelRollback> {
+        self.pending_cancel_rollbacks
+            .borrow()
+            .get(&(*peer, history_index))
+            .cloned()
+    }
+
+    pub(super) fn remove_pending_cancel_rollback(&self, peer: &PublicKey, history_index: u64) {
+        self.pending_cancel_rollbacks
+            .borrow_mut()
+            .remove(&(*peer, history_index));
+    }
+
+    pub(super) fn remove_peer_cancel_rollbacks(&self, peer: &PublicKey) {
+        self.pending_cancel_rollbacks
+            .borrow_mut()
+            .retain(|(p, _), _| p != peer);
+    }
+
     pub(super) fn clear_on_teardown(&self) {
         self.files.borrow_mut().clear();
         self.running.borrow_mut().clear();
         self.cancelled.borrow_mut().clear();
+        self.pending_cancel_rollbacks.borrow_mut().clear();
     }
 
     #[cfg(all(test, not(target_arch = "wasm32")))]

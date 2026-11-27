@@ -651,6 +651,14 @@ mod v2 {
             }
         }
 
+        /// Classical signed prekey public key referenced by this initial message.
+        pub fn signed_prekey(&self) -> PublicKey {
+            match &self.kind {
+                InitialMessageKind::Classical { x3dh, .. } => x3dh.signed_prekey,
+                InitialMessageKind::Pq { x3dh, .. } => x3dh.signed_prekey,
+            }
+        }
+
         /// Whether this initial message references a classical one-time prekey.
         pub fn uses_one_time_prekey(&self) -> bool {
             self.one_time_prekey().is_some()
@@ -1610,20 +1618,11 @@ mod v2 {
                     .state
                     .prekeys
                     .retained_signed_prekeys_after_prune(&prepared.preserve_signed_prekeys);
-                let preserved_other = self
-                    .state
-                    .recent_manifest_digests
-                    .iter()
-                    .filter(|d| {
-                        **d != prepared.manifest_digest
-                            && (preserve_manifest_digests.contains(d)
-                                || self.state.manifest_digest_spks.get(*d).is_some_and(
-                                    |&(spk, confirmed)| {
-                                        confirmed && post_commit_spks.contains(&spk)
-                                    },
-                                ))
-                    })
-                    .count();
+                let preserved_other = self.state.count_hard_pinned_manifest_digests(
+                    &post_commit_spks,
+                    preserve_manifest_digests,
+                    Some(prepared.manifest_digest),
+                );
                 if preserved_other >= crate::MAX_RETAINED_MANIFEST_DIGESTS {
                     return Err(ErrorKind::LimitExceeded.into());
                 }

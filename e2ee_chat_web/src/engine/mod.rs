@@ -349,6 +349,14 @@ pub(super) struct Inner<V = Vault> {
     /// Last known server-stored PQOPK counts keyed by `PqSuite` (baseline at last publish or
     /// `RefillPrekeysResponse`, before subtracting `used_pq_by_suite`).
     last_server_pq_opks_by_suite: Option<std::collections::BTreeMap<session::PqSuite, u32>>,
+    /// PQ suites confirmed advertised by the relay's current published manifest (updated ONLY on
+    /// full publish and verified `GetManifest` reconciliation, never overwritten by
+    /// `RefillPrekeysResponse` whose `GROUP BY suite` omits 0-row exhausted suites — `R11-P2-2`).
+    confirmed_relay_pq_suites: Option<std::collections::BTreeSet<session::PqSuite>>,
+    /// PQ suites rejected by the relay (`Protocol` / `SuiteNotOffered`) while `needs_publish` is
+    /// deferred so subsequent syncs do not repeat refused PQ refill RPCs (`R11-P3-2`). Cleared
+    /// once a full publish succeeds or `needs_publish` clears.
+    deferred_refill_rejected_pq_suites: std::collections::BTreeSet<session::PqSuite>,
     /// Per-suite PQOPKs consumed locally since the latest publish or refill baseline.
     used_pq_by_suite: std::collections::BTreeMap<session::PqSuite, u32>,
     /// Exact classical OPKs currently believed queued on the relay in FIFO order (front = next to
@@ -2094,12 +2102,36 @@ impl<V: VaultStore> Engine<V> {
             let inner = guard.as_mut().ok_or("locked")?;
             inner
                 .with_contact_tx(&peer, async |inner| {
+                    let strict_pq = inner.client.pq_config().strict_pq;
+                    let local_pq_enabled = inner.local_pq_enabled();
                     let (token_hash, earlier_tokens) = {
                         let contact = inner
                             .contact(&peer)
                             .ok_or_else(|| "no such chat".to_string())?;
                         if expected_gen.is_some_and(|want| contact.state.conversation_gen != want) {
                             return Err("chat changed; please retry.".to_string());
+                        }
+                        // R11-P1-2: Do not silently accept an unquarantined classical request when
+                        // local PQ policy now requires PQ (`strict_pq`) or the peer is PQ-pinned
+                        // without an explicit classical exception.
+                        if contact.state.request
+                            && contact.session.security().is_some_and(|s| !s.is_pq)
+                        {
+                            if strict_pq {
+                                return Err(
+                                    "Require post-quantum (strict mode) is enabled; upgrade to PQ before accepting this classical request."
+                                        .to_string(),
+                                );
+                            }
+                            if local_pq_enabled
+                                && contact.session.peer_pq_state().pq_pinned
+                                && !contact.session.peer_pq_state().allow_classical_exception
+                            {
+                                return Err(
+                                    "Peer is post-quantum pinned; upgrade to PQ or allow classical encryption before accepting this request."
+                                        .to_string(),
+                                );
+                            }
                         }
                         contact.accept_request(&name)?;
                         contact.state.events.get_or_insert_default().accepted = true;
@@ -2408,6 +2440,7 @@ impl<V: VaultStore> Engine<V> {
         }
         self.purge_peer_transient_state(&peer);
         self.uploads.remove_peer_files(&peer);
+        self.uploads.remove_peer_cancel_rollbacks(&peer);
         self.media.remove_peer(&peer);
         if self
             .ui
@@ -2884,6 +2917,8 @@ impl<V: VaultStore> Inner<V> {
             server_pq_epoch: 0,
             last_server_classical_opks: None,
             last_server_pq_opks_by_suite: None,
+            confirmed_relay_pq_suites: None,
+            deferred_refill_rejected_pq_suites: std::collections::BTreeSet::new(),
             used_pq_by_suite: std::collections::BTreeMap::new(),
             relay_classical_opk_queue: None,
             relay_claimed_classical_opks: HashSet::new(),

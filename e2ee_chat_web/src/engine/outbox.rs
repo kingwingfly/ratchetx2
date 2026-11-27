@@ -165,12 +165,12 @@ impl<V: VaultStore> Engine<V> {
                         return Ok(false);
                     }
                 }
-                // Never send or send receipts on a brand-new quarantined classical contact.
-                if inner
-                    .contacts
-                    .iter()
-                    .any(|c| c.peer == *peer && c.is_new_quarantined())
-                {
+                // Never send or send receipts on an unaccepted request, provisional start, or
+                // brand-new quarantined classical contact (`R11-P1-3`).
+                if inner.contacts.iter().any(|c| {
+                    c.peer == *peer
+                        && (c.state.request || c.state.provisional || c.is_new_quarantined())
+                }) {
                     return Ok(false);
                 }
                 // If a previous `PushV2` already succeeded on the relay (`relayed == true`) but
@@ -259,6 +259,72 @@ impl<V: VaultStore> Engine<V> {
                 {
                     if !self.is_live(vgen) {
                         return Ok(false);
+                    }
+                    if contact.state.request || contact.state.provisional {
+                        step = NextPush::Done;
+                        break;
+                    }
+                    // R11-P2-1: If this outbox head is a promoted attachment whose cancel-after-
+                    // promote rollback failed transiently, refuse to announce it and complete the
+                    // atomic rollback + server delete before flushing any subsequent items.
+                    if let Some(cancel_rb) = self
+                        .uploads
+                        .get_pending_cancel_rollback(peer, outgoing.history_index)
+                    {
+                        if contact.state.conversation_gen != cancel_rb.conversation_gen {
+                            self.uploads
+                                .remove_pending_cancel_rollback(peer, outgoing.history_index);
+                        } else {
+                            let failed_changes =
+                                [(outgoing.history_index, cancel_rb.failed_entry.clone())];
+                            let rollback_res = inner
+                                .with_contact_tx(peer, async |inner| {
+                                    let contact = inner
+                                        .contact(peer)
+                                        .ok_or_else(|| "no such chat".to_string())?;
+                                    contact
+                                        .state
+                                        .outbox
+                                        .retain(|o| o.history_index != outgoing.history_index);
+                                    inner
+                                        .promote_upload_with(
+                                            peer,
+                                            &cancel_rb.pending.id,
+                                            None,
+                                            &records(peer, &failed_changes),
+                                            &[(*peer, outgoing.history_index, None)],
+                                        )
+                                        .await
+                                        .map_err(|e| describe(&e))
+                                })
+                                .await;
+                            match rollback_res {
+                                Ok(()) => {
+                                    self.uploads.remove_pending_cancel_rollback(
+                                        peer,
+                                        outgoing.history_index,
+                                    );
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                    self.release(peer, outgoing.history_index);
+                                    self.show_changes(inner, peer, &failed_changes);
+                                    if let Ok(job) = ServerDeleteJob::for_cancelled_pending(
+                                        inner.server.clone(),
+                                        &cancel_rb.pending,
+                                    ) {
+                                        server_deletes.push(job);
+                                    }
+                                    changed = true;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    result = Err(e);
+                                    step = NextPush::Done;
+                                    break;
+                                }
+                            }
+                        }
                     }
                     // Never transmit `PushV2` while the active session's inbound write-token
                     // registration is still pending confirmation on our DO: otherwise the peer
@@ -1945,6 +2011,7 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(false);
             };
             if contact.state.request
+                || contact.state.provisional
                 || contact.state.quarantined
                 || !contact.state.outbox.is_empty()
                 || contact.session.needs_new_session()
@@ -2271,6 +2338,9 @@ impl<V: VaultStore> Inner<V> {
         let contact = self.contact(peer).ok_or("no such chat")?;
         if contact.state.request {
             return Err("accept the request first".into());
+        }
+        if contact.state.provisional {
+            return Err("chat is still starting; please wait.".into());
         }
         if contact.state.quarantined {
             return Err("approve classical encryption or upgrade to post-quantum first".into());

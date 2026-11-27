@@ -109,6 +109,27 @@ enum ServerDeleteKind {
     DeleteCompleted(Zeroizing<[u8; attachment::KEY_LENGTH]>),
 }
 
+impl ServerDeleteJob {
+    pub(super) fn for_cancelled_pending(
+        server: String,
+        pending: &PendingUpload,
+    ) -> Result<Self, String> {
+        let id: [u8; 16] = pending
+            .id
+            .as_slice()
+            .try_into()
+            .map_err(|_| "corrupt upload id".to_string())?;
+        let upload = upload_of(pending)?;
+        Ok(Self {
+            server,
+            id,
+            history_index: Some(pending.history_index),
+            name: pending.name.clone(),
+            kind: ServerDeleteKind::CancelUpload(upload),
+        })
+    }
+}
+
 /// Verified prefix hash, cached plaintext chunks, and per-chunk SHA-256 digests for resuming an
 /// interrupted upload without re-reading already-encrypted chunks from a mutable `File` handle.
 pub(super) struct VerifiedResume {
@@ -344,6 +365,9 @@ impl<V: VaultStore> Engine<V> {
             if contact.state.request {
                 return Err("accept the request first".into());
             }
+            if contact.state.provisional {
+                return Err("chat is still starting; please wait.".into());
+            }
             if contact.state.quarantined {
                 return Err("approve classical encryption or upgrade to post-quantum first".into());
             }
@@ -547,6 +571,9 @@ impl<V: VaultStore> Engine<V> {
         }
         if contact.state.request {
             return Err("accept the request first".into());
+        }
+        if contact.state.provisional {
+            return Err("chat is still starting; please wait.".into());
         }
         if contact.state.quarantined {
             return Err("approve classical encryption or upgrade to post-quantum first".into());
@@ -940,12 +967,26 @@ impl<V: VaultStore> Engine<V> {
                         .map_err(|e| describe(&e))
                 })
                 .await;
-            if reverted.is_ok() && self.is_live(vgen) {
+            if self.is_live(vgen) {
                 self.uploads.mark_cancelled(*upload.id());
                 self.remove_attachment_caches(&peer, &waiting);
                 self.remove_attachment_caches(&peer, upload.id());
-                self.release(&peer, kept.history_index);
-                self.show_changes(inner, &peer, &changed);
+                if reverted.is_ok() {
+                    self.release(&peer, kept.history_index);
+                    self.show_changes(inner, &peer, &changed);
+                } else {
+                    // R11-P2-1: Atomic rollback failed transiently. Block `Engine::flush` from
+                    // announcing the cancelled pointer and complete the atomic vault rollback +
+                    // server `DeleteAttachment` as soon as storage recovers.
+                    self.uploads.insert_pending_cancel_rollback(
+                        (peer, kept.history_index),
+                        super::runtime::PendingCancelRollback {
+                            conversation_gen: conv_gen,
+                            pending: pending.clone(),
+                            failed_entry: changed[0].1.clone(),
+                        },
+                    );
+                }
             }
             drop(guard);
             if reverted.is_ok() && self.is_live(vgen) {

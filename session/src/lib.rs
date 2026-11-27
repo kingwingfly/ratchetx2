@@ -385,9 +385,44 @@ impl ClientState {
         preserved_in_recent < MAX_RETAINED_MANIFEST_DIGESTS
     }
 
+    /// Count hard-pinned manifest digests in `recent_manifest_digests` (excluding `exclude`) for
+    /// publish-capacity checks: every explicitly preserved digest (`preserve_digests`) counts,
+    /// plus at most [`MAX_RECENT_MANIFEST_DIGESTS`] (16) confirmed digests per retained signed
+    /// prekey in `post_commit_spks`. Capping per-SPK hard pins at 16 preserves automatic deferral
+    /// when 128 deferred pins + 16 confirmed digests fill 144 slots (`R9-P2-5`), while ensuring
+    /// repeated ambiguous retries on one SPK can never permanently deadlock rotation (`R11-P2-7`).
+    pub(crate) fn count_hard_pinned_manifest_digests(
+        &self,
+        post_commit_spks: &[PublicKey],
+        preserve_digests: &[[u8; 32]],
+        exclude: Option<[u8; 32]>,
+    ) -> usize {
+        let mut pinned = 0usize;
+        let mut confirmed_per_spk: BTreeMap<PublicKey, usize> = BTreeMap::new();
+        for d in &self.recent_manifest_digests {
+            if exclude == Some(*d) {
+                continue;
+            }
+            if preserve_digests.contains(d) {
+                pinned += 1;
+            } else if let Some(&(spk, confirmed)) = self.manifest_digest_spks.get(d)
+                && confirmed
+                && post_commit_spks.contains(&spk)
+            {
+                let count = confirmed_per_spk.entry(spk).or_insert(0);
+                if *count < MAX_RECENT_MANIFEST_DIGESTS {
+                    *count += 1;
+                    pinned += 1;
+                }
+            }
+        }
+        pinned
+    }
+
     /// Exact capacity check for a `PublishV2` attempt with `(preserve_spks, preserve_digests)`,
-    /// accounting for BOTH explicitly preserved digests AND all confirmed manifest digests bound
-    /// to signed prekeys that will remain retained after this publish commits (`R9-P2-4`).
+    /// accounting for BOTH explicitly preserved digests AND up to [`MAX_RECENT_MANIFEST_DIGESTS`]
+    /// confirmed manifest digests per signed prekey that will remain retained after commit
+    /// (`R9-P2-4`, `R11-P2-7`).
     ///
     /// Unconfirmed staged attempts are excluded from this hard refusal limit so repeated offline
     /// publish retries can never brick future publishes. Non-retry in-place extends reserve 1 slot
@@ -409,19 +444,8 @@ impl ClientState {
             self.prekeys
                 .retained_signed_prekeys_after_rotation(preserve_spks)
         };
-        let post_commit_pinned = self
-            .recent_manifest_digests
-            .iter()
-            .filter(|d| {
-                preserve_digests.contains(d)
-                    || self
-                        .manifest_digest_spks
-                        .get(*d)
-                        .is_some_and(|&(spk, confirmed)| {
-                            confirmed && post_commit_spks.contains(&spk)
-                        })
-            })
-            .count();
+        let post_commit_pinned =
+            self.count_hard_pinned_manifest_digests(&post_commit_spks, preserve_digests, None);
         let limit = if extended && !self.publishing {
             MAX_RETAINED_MANIFEST_DIGESTS - 1
         } else {
@@ -752,6 +776,51 @@ fn default_grant_version() -> u64 {
 }
 
 #[cfg(feature = "serde")]
+struct RawManifestDigestSpk(([u8; 32], PublicKey, bool));
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RawManifestDigestSpk {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RawManifestDigestSpk;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(
+                    f,
+                    "a 2- or 3-element tuple (digest, signed_prekey[, confirmed])"
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let digest: [u8; 32] = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let spk: PublicKey = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                // Accept both 2-element `(digest, spk)` from earlier snapshots (defaulting to
+                // `confirmed = true`) and 3-element `(digest, spk, confirmed)` (`R11-P2-8`).
+                let confirmed: bool = seq.next_element()?.unwrap_or(true);
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(4, &self));
+                }
+                Ok(RawManifestDigestSpk((digest, spk, confirmed)))
+            }
+        }
+
+        deserializer.deserialize_seq(Visitor)
+    }
+}
+
+#[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 #[serde(rename = "ClientState")]
 struct RawClientState {
@@ -787,7 +856,7 @@ struct RawClientState {
         default,
         deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_MANIFEST_DIGESTS>"
     )]
-    manifest_digest_spks: Vec<([u8; 32], PublicKey, bool)>,
+    manifest_digest_spks: Vec<RawManifestDigestSpk>,
 }
 
 #[cfg(any(feature = "prost", feature = "serde"))]
@@ -797,32 +866,39 @@ fn backfill_legacy_manifest_digest_spks(
     prekeys: &LocalPrekeys,
     map: &mut BTreeMap<[u8; 32], (PublicKey, bool)>,
 ) {
-    if !map.is_empty() || recent.is_empty() {
+    if recent.is_empty() {
         return;
     }
     let Some(cur_spk) = prekeys.current_signed_prekey() else {
         return;
     };
-    if confirmed.is_empty() {
-        let start = recent.len().saturating_sub(MAX_RECENT_MANIFEST_DIGESTS);
-        for &digest in &recent[start..] {
-            map.insert(digest, (cur_spk, true));
-        }
-    } else {
-        for &digest in confirmed {
-            if recent.contains(&digest) {
+    if map.is_empty() {
+        if confirmed.is_empty() {
+            let start = recent.len().saturating_sub(MAX_RECENT_MANIFEST_DIGESTS);
+            for &digest in &recent[start..] {
                 map.insert(digest, (cur_spk, true));
             }
+        } else {
+            for &digest in confirmed {
+                if recent.contains(&digest) {
+                    map.insert(digest, (cur_spk, true));
+                }
+            }
         }
-        let mut unconfirmed_bound = 0usize;
-        for &digest in recent.iter().rev() {
-            if unconfirmed_bound >= MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS {
-                break;
-            }
-            if let std::collections::btree_map::Entry::Vacant(e) = map.entry(digest) {
-                e.insert((cur_spk, false));
-                unconfirmed_bound += 1;
-            }
+    }
+    // R11-P2-6: Always backfill up to `MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS` newest unbound
+    // non-confirmed digests in `recent` as `(cur_spk, false)` even when `map` is already
+    // non-empty (e.g. a snapshot containing confirmed bindings plus an unbound ambiguous attempt).
+    let mut unconfirmed_bound = map.values().filter(|(_, c)| !*c).count();
+    for &digest in recent.iter().rev() {
+        if unconfirmed_bound >= MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS {
+            break;
+        }
+        if !confirmed.contains(&digest)
+            && let std::collections::btree_map::Entry::Vacant(e) = map.entry(digest)
+        {
+            e.insert((cur_spk, false));
+            unconfirmed_bound += 1;
         }
     }
 }
@@ -833,7 +909,7 @@ impl TryFrom<RawClientState> for ClientState {
 
     fn try_from(raw: RawClientState) -> Result<Self> {
         let mut manifest_digest_spks = BTreeMap::new();
-        for (digest, spk, confirmed) in raw.manifest_digest_spks {
+        for RawManifestDigestSpk((digest, spk, confirmed)) in raw.manifest_digest_spks {
             if manifest_digest_spks
                 .insert(digest, (spk, confirmed))
                 .is_some()
@@ -5651,6 +5727,206 @@ mod test {
                 Some(EXPECTED_FIELDS),
                 "R10-P2-4: RawClientState Deserialize field order must keep manifest_digest_spks LAST"
             );
+        }
+    }
+
+    #[test]
+    fn r11_p2_6_p2_7_p2_8_backfill_retry_reserve_and_two_tuple_serde() {
+        // --- Part 1 (R11-P2-6): Non-empty `manifest_digest_spks` (Round-9 snapshot with confirmed
+        //     bindings + unbound ambiguous digest `u0`) still backfills `u0` as `(cur_spk, false)`
+        //     so `u0` survives 16 in-place renewals + one rotation until `cur_spk` retires. ---
+        #[cfg(feature = "prost")]
+        {
+            let mut client = Client::new(());
+            let pa = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+            let spk_a = pa.classical.signed_prekey;
+            client.commit_publish_v2(pa);
+            let pb = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+            let spk_b = pb.classical.signed_prekey;
+            let b0 = pb.manifest_digest;
+            client.commit_publish_v2(pb);
+
+            let mut wire = proto::ClientState::from(client.state());
+            let u0 = [0xabu8; 32];
+            // Keep confirmed `b0` bound in `manifest_digest_spks` (non-empty map!), leave `u0`
+            // unbound in `recent_manifest_digests` (exact Round-9 `f7b194c` state).
+            assert!(!wire.manifest_digest_spks.is_empty());
+            wire.recent_manifest_digests.push(u0.to_vec());
+            let restored = ClientState::try_from(&wire).unwrap();
+            assert_eq!(
+                restored.manifest_digest_spks.get(&u0),
+                Some(&(spk_b, false)),
+                "R11-P2-6: unbound ambiguous digest u0 in non-empty Round-9 map must backfill as (cur_spk, false)"
+            );
+            assert_eq!(restored.manifest_digest_spks.get(&b0), Some(&(spk_b, true)));
+            let mut rc = Client::restore((), restored);
+            for _ in 0..16 {
+                let p = rc
+                    .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+                    .unwrap();
+                rc.commit_publish_v2_preserving(p, &[spk_a], &[]);
+            }
+            let pc = rc.prepare_publish_v2("relay.example", 2, 2).unwrap();
+            rc.commit_publish_v2(pc);
+            assert!(
+                rc.recent_manifest_digests().contains(&u0),
+                "R11-P2-6: backfilled u0 must survive 16 renewals + rotation while SPK B is retained"
+            );
+        }
+
+        // --- Part 2 (R11-P2-7): Accumulating 144 confirmed digests on a single SPK (0 deferred
+        //     pins) MUST NOT permanently block rotation or renewal; meanwhile 128 deferred + 16
+        //     confirmed on SPK_1 = 144 still defers cleanly (`R9-P2-5`). ---
+        let mut client2 = Client::new(());
+        let p0 = client2.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_1 = p0.classical.signed_prekey;
+        client2.commit_publish_v2(p0);
+        for i in 0..143u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x33;
+            client2
+                .state
+                .record_confirmed_manifest_digest(d, Some(spk_1));
+        }
+        assert_eq!(
+            client2.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert!(
+            client2.has_spare_manifest_digest_slot_for_publish(&[], &[]),
+            "R11-P2-7: 144 confirmed digests on a single SPK with 0 deferred pins must NOT deadlock rotation"
+        );
+        let p_rot = client2.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        assert_ne!(p_rot.classical.signed_prekey, spk_1);
+        client2.commit_publish_v2(p_rot);
+        assert_eq!(
+            client2.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+
+        // Control check (`R9-P2-5`): 128 deferred pins + 16 confirmed digests on retained SPK = 144
+        // still reports no spare digest slot.
+        let mut client3 = Client::new(());
+        let p3 = client3.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_3 = p3.classical.signed_prekey;
+        client3.commit_publish_v2(p3);
+        let mut deferred_128 = Vec::new();
+        for i in 0..128u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x44;
+            client3.state.stage_manifest_digest(d, None, &[]);
+            deferred_128.push(d);
+        }
+        for i in 0..16u8 {
+            let d = [0x80 + i; 32];
+            client3
+                .state
+                .record_confirmed_manifest_digest(d, Some(spk_3));
+        }
+        assert!(
+            !client3.has_spare_manifest_digest_slot_for_publish(&[], &deferred_128),
+            "R9-P2-5 control: 128 deferred pins + 16 confirmed retained-SPK digests must still defer"
+        );
+
+        // --- Part 3 (R11-P2-8): `RawManifestDigestSpk` deserializes BOTH 2-element `(digest, spk)`
+        //     (defaulting `confirmed = true`) and 3-element `(digest, spk, confirmed)` tuples. ---
+        #[cfg(feature = "serde")]
+        {
+            use serde::Deserialize;
+            use serde::de::{self, IntoDeserializer};
+
+            #[derive(Debug)]
+            struct SeqErr(String);
+            impl core::fmt::Display for SeqErr {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+            impl std::error::Error for SeqErr {}
+            impl de::Error for SeqErr {
+                fn custom<T: core::fmt::Display>(msg: T) -> Self {
+                    Self(msg.to_string())
+                }
+            }
+
+            enum Elem {
+                Bytes([u8; 32]),
+                Bool(bool),
+            }
+            struct ElemDe(Elem);
+            impl<'de> de::Deserializer<'de> for ElemDe {
+                type Error = SeqErr;
+                fn deserialize_any<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, SeqErr> {
+                    match self.0 {
+                        Elem::Bytes(b) => b
+                            .into_iter()
+                            .collect::<Vec<u8>>()
+                            .into_deserializer()
+                            .deserialize_seq(visitor),
+                        Elem::Bool(b) => visitor.visit_bool(b),
+                    }
+                }
+                fn deserialize_tuple<V: de::Visitor<'de>>(
+                    self,
+                    _len: usize,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, SeqErr> {
+                    self.deserialize_any(visitor)
+                }
+                serde::forward_to_deserialize_any! {
+                    bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+                    option unit unit_struct newtype_struct seq tuple_struct map struct enum
+                    identifier ignored_any
+                }
+            }
+            struct TupleSeq(std::vec::IntoIter<Elem>);
+            impl<'de> de::SeqAccess<'de> for TupleSeq {
+                type Error = SeqErr;
+                fn next_element_seed<T: de::DeserializeSeed<'de>>(
+                    &mut self,
+                    seed: T,
+                ) -> core::result::Result<Option<T::Value>, SeqErr> {
+                    match self.0.next() {
+                        Some(elem) => seed.deserialize(ElemDe(elem)).map(Some),
+                        None => Ok(None),
+                    }
+                }
+            }
+            struct TupleDe(Vec<Elem>);
+            impl<'de> de::Deserializer<'de> for TupleDe {
+                type Error = SeqErr;
+                fn deserialize_any<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, SeqErr> {
+                    visitor.visit_seq(TupleSeq(self.0.into_iter()))
+                }
+                serde::forward_to_deserialize_any! {
+                    bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+                    option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum
+                    identifier ignored_any
+                }
+            }
+
+            let d = [0x12u8; 32];
+            let s = [0x34u8; 32];
+            let two =
+                RawManifestDigestSpk::deserialize(TupleDe(vec![Elem::Bytes(d), Elem::Bytes(s)]))
+                    .unwrap();
+            assert_eq!(two.0, (d, s, true));
+
+            let three = RawManifestDigestSpk::deserialize(TupleDe(vec![
+                Elem::Bytes(d),
+                Elem::Bytes(s),
+                Elem::Bool(false),
+            ]))
+            .unwrap();
+            assert_eq!(three.0, (d, s, false));
         }
     }
 }

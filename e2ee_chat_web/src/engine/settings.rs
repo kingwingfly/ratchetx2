@@ -121,6 +121,15 @@ impl<V: VaultStore> Engine<V> {
         expected_gen: Option<u64>,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
+        // R11-P1-1: Serialize classical approval behind Rank-1 `peer_flush_lock(&peer)` (acquired
+        // strictly BEFORE `Engine::inner` and dropped strictly BEFORE `upgrade_to_pq_auto` /
+        // `self.flush(&peer)`) so concurrent `start_chat` cancellation/revocation can never race
+        // with classical approval or revoke the newly registered write token.
+        let peer_lock = self.queue.peer_flush_lock(&peer);
+        let peer_guard = peer_lock.lock().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let should_stage_grant = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
@@ -260,17 +269,38 @@ impl<V: VaultStore> Engine<V> {
                 }
                 if !stale_discarded && !contact.state.request {
                     should_stage_grant = true;
+                    contact.state.provisional = false;
                     contact.state.events.get_or_insert_default().accepted = true;
                 }
             }
-            if should_stage_grant
-                && let Some(token_hash) = inner
+            if should_stage_grant {
+                let (active_token, earlier_tokens) = inner
                     .contact(&peer)
-                    .and_then(|c| c.session.active_inbound_token_hash())
-                && let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true)
-            {
-                inner.roll_back(&peer, snapshot)?;
-                return Err(e);
+                    .map(|c| {
+                        let active = c.session.active_inbound_token_hash();
+                        let earlier: Vec<[u8; 32]> = c
+                            .session
+                            .earlier_inbound_token_hashes()
+                            .filter(|h| Some(*h) != active)
+                            .collect();
+                        (active, earlier)
+                    })
+                    .unwrap_or((None, vec![]));
+                if let Some(token_hash) = active_token
+                    && let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true)
+                {
+                    inner.roll_back(&peer, snapshot)?;
+                    return Err(e);
+                }
+                // R11-P1-1 (Codex #4): Also stage non-active grants for any archived incoming
+                // crossed-start session (e.g. when `replace_session` kept our outbound session
+                // active and archived the explicitly approved incoming classical session).
+                for earlier_hash in earlier_tokens {
+                    if let Err(e) = inner.stage_write_token_grant(&peer, earlier_hash, false) {
+                        inner.roll_back(&peer, snapshot)?;
+                        return Err(e);
+                    }
+                }
             }
             let requeued = if replaced_session {
                 match inner.requeue_sealed(&peer).await {
@@ -366,6 +396,8 @@ impl<V: VaultStore> Engine<V> {
             }
             let _ = self.flush_pending_grants_for_peer(&gp).await;
         }
+        // R11-P1-1: Drop Rank-1 `peer_guard` strictly BEFORE `upgrade_to_pq_auto` / `flush(&peer)`.
+        drop(peer_guard);
         for (up_peer, conv_gen) in replay_upgrades {
             if !self.is_live(vgen) {
                 return Err("locked".into());
