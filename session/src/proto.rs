@@ -42,6 +42,7 @@ impl fmt::Debug for SignedPrekeyManifestDigest {
         f.debug_struct("SignedPrekeyManifestDigest")
             .field("digest_len", &self.digest.len())
             .field("signed_prekey_len", &self.signed_prekey.len())
+            .field("unconfirmed", &self.unconfirmed)
             .finish()
     }
 }

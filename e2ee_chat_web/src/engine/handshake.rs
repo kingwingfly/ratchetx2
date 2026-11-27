@@ -470,7 +470,7 @@ pub(super) enum DeferInboxOutcome {
 }
 
 pub(super) struct OpenedInitial {
-    session: Session<Connect>,
+    pub(super) session: Session<Connect>,
     first_message: Vec<u8>,
     /// A held classical initial and whether the peer was already pinned.
     quarantine: Option<bool>,
@@ -553,7 +553,7 @@ fn preserve_undrained_inbox_prekeys<V: VaultStore>(
 /// `MAX_RETAINED_MANIFEST_DIGESTS - 1` (newest confirmed digests first) so
 /// `prune_manifest_digests_preserving` always evicts the oldest unpinned rolling/unconfirmed digest
 /// instead of falling back to index `0` (the oldest deferred-pinned digest `D_0`).
-fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
+pub(super) fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
     inner: &Inner<V>,
     inbox_ready_for_eviction: bool,
     preserve_spks: &mut Vec<PublicKey>,
@@ -583,9 +583,11 @@ fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
         .filter(|d| preserve_digests.contains(d))
         .count();
     let confirmed = inner.client.confirmed_manifest_digests();
-    // Prioritize newest confirmed digests first, then newest unconfirmed digests, leaving the
-    // oldest non-deferred rolling (or unconfirmed) digest unpinned so pruning never hits index 0.
-    for require_confirmed in [true, false] {
+    // R10-P2-2: Prioritize confirmed retained-SPK digests first (so a relay-admissible
+    // `current`/`prev` SPK's older confirmed digests are never outranked by unconfirmed attempts
+    // even after 16+ in-place renewals), then confirmed rolling digests, then unconfirmed
+    // retained-SPK digests, then remaining unconfirmed digests.
+    for tier in 0..4u8 {
         for &digest in candidates.iter().rev() {
             if pinned_candidates >= max_candidate_pins {
                 return;
@@ -593,7 +595,13 @@ fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
             if preserve_digests.contains(&digest) {
                 continue;
             }
-            if require_confirmed && !confirmed.contains(&digest) {
+            let matches = match tier {
+                0 => inner.client.is_digest_for_retained_spk(&digest),
+                1 => confirmed.contains(&digest),
+                2 => inner.client.is_unconfirmed_digest_for_retained_spk(&digest),
+                _ => true,
+            };
+            if !matches {
                 continue;
             }
             preserve_digests.push(digest);
@@ -713,27 +721,25 @@ impl<V: VaultStore> Inner<V> {
                 None,
             ),
         };
-        let classical_used = message.uses_one_time_prekey();
-        let pq_used = message.uses_pq_one_time_prekey();
-        // R9-P3-1: Absorb any pre-refill relay claims already reflected in the latest
-        // `RefillPrekeysResponse` before incrementing local post-baseline usage counters so
-        // delayed greetings arriving after a refill are never deducted twice.
-        if classical_used {
-            if self.unmatched_server_classical_claims > 0 {
-                self.unmatched_server_classical_claims -= 1;
-            } else {
-                self.state.used_one_time_prekeys =
-                    self.state.used_one_time_prekeys.saturating_add(1);
+        // R10-P2-5: Track exact OPK/PQOPK identifiers rather than scalar counts so only greetings
+        // matching keys already popped by the relay before a `RefillPrekeysResponse` are absorbed;
+        // abandoned pre-refill claims can never hide newer post-refill depletion.
+        const MAX_TRACKED_OPK_CLAIMS: usize = 1024;
+        if let Some(opk) = message.one_time_prekey()
+            && !self.relay_claimed_classical_opks.remove(&opk)
+        {
+            self.state.used_one_time_prekeys = self.state.used_one_time_prekeys.saturating_add(1);
+            if self.accepted_classical_since_baseline.len() < MAX_TRACKED_OPK_CLAIMS {
+                self.accepted_classical_since_baseline.insert(opk);
             }
         }
-        if pq_used {
+        if let Some(pq_id) = message.pq_one_time_prekey_id() {
             let absorbed_pq = if let Some(suite) = pq_suite
-                && let Some(credit) = self.unmatched_server_pq_claims_by_suite.get_mut(&suite)
-                && *credit > 0
+                && let Some(claimed) = self.relay_claimed_pq_opks_by_suite.get_mut(&suite)
+                && claimed.remove(&pq_id)
             {
-                *credit -= 1;
-                if *credit == 0 {
-                    self.unmatched_server_pq_claims_by_suite.remove(&suite);
+                if claimed.is_empty() {
+                    self.relay_claimed_pq_opks_by_suite.remove(&suite);
                 }
                 true
             } else {
@@ -745,6 +751,10 @@ impl<V: VaultStore> Inner<V> {
                 if let Some(suite) = pq_suite {
                     let entry = self.used_pq_by_suite.entry(suite).or_insert(0);
                     *entry = entry.saturating_add(1);
+                    let accepted = self.accepted_pq_since_baseline.entry(suite).or_default();
+                    if accepted.len() < MAX_TRACKED_OPK_CLAIMS {
+                        accepted.insert(pq_id);
+                    }
                 }
             }
         }
@@ -894,6 +904,7 @@ impl PublishError {
 enum RefillV2Outcome {
     Handled,
     PqDisabled,
+    SuiteMismatchNeedsClassicalOnly,
     MixedLimitExceeded,
 }
 
@@ -1810,8 +1821,12 @@ impl<V: VaultStore> Engine<V> {
             inner.state.published_at = now_ms.saturating_sub(manifest_age_ms).max(1);
             inner.last_server_classical_opks = None;
             inner.last_server_pq_opks_by_suite = None;
-            inner.unmatched_server_classical_claims = 0;
-            inner.unmatched_server_pq_claims_by_suite.clear();
+            inner.relay_classical_opk_queue = None;
+            inner.relay_claimed_classical_opks.clear();
+            inner.accepted_classical_since_baseline.clear();
+            inner.relay_pq_opk_queue_by_suite = None;
+            inner.relay_claimed_pq_opks_by_suite.clear();
+            inner.accepted_pq_since_baseline.clear();
             let matches_config =
                 manifest_matches_local_config(m, inner.client.pq_config(), &inner.server_pq);
             if matches_config && manifest_fresh {
@@ -2099,16 +2114,37 @@ impl<V: VaultStore> Engine<V> {
                 // consumption, which remains in `used_*_one_time_prekeys` / `used_pq_by_suite` so
                 // each consumption delta is deducted exactly once — R7-P3-1).
                 let published_classical = prepared.request.one_time_prekeys.len() as u32;
+                let published_classical_keys: Vec<PublicKey> = prepared
+                    .request
+                    .one_time_prekeys
+                    .iter()
+                    .filter_map(|raw| PublicKey::try_from(raw.as_ref()).ok())
+                    .collect();
+                let published_classical_set: std::collections::HashSet<PublicKey> =
+                    published_classical_keys.iter().copied().collect();
                 let mut published_pq_by_suite: std::collections::BTreeMap<PqSuite, u32> =
                     std::collections::BTreeMap::new();
+                let mut published_pq_queues: std::collections::BTreeMap<
+                    PqSuite,
+                    std::collections::VecDeque<session::PqPrekeyId>,
+                > = std::collections::BTreeMap::new();
+                let mut published_pq_sets: std::collections::BTreeMap<
+                    PqSuite,
+                    std::collections::HashSet<session::PqPrekeyId>,
+                > = std::collections::BTreeMap::new();
                 if matches!(outcome, PublishV2Outcome::V2Pq) {
                     for suite in inner.client.pq_config().offered_suites() {
                         published_pq_by_suite.insert(suite, 0);
+                        published_pq_queues.insert(suite, std::collections::VecDeque::new());
                     }
                     for pk in &prepared.request.pq_one_time_prekeys {
                         if let Some(suite) = u8::try_from(pk.suite).ok().and_then(PqSuite::from_u8)
                         {
                             *published_pq_by_suite.entry(suite).or_insert(0) += 1;
+                            if let Ok(id) = session::PqPrekeyId::try_from(pk.prekey_id.as_ref()) {
+                                published_pq_queues.entry(suite).or_default().push_back(id);
+                                published_pq_sets.entry(suite).or_default().insert(id);
+                            }
                         }
                     }
                 }
@@ -2148,11 +2184,25 @@ impl<V: VaultStore> Engine<V> {
                 inner.used_pq_by_suite = next_used_pq_by_suite;
                 inner.state.used_pq_one_time_prekeys = concurrent_pq;
                 inner.last_server_classical_opks = Some(published_classical);
-                inner.unmatched_server_classical_claims = 0;
-                inner.unmatched_server_pq_claims_by_suite.clear();
+                inner.relay_classical_opk_queue =
+                    Some(std::collections::VecDeque::from(published_classical_keys));
+                inner.relay_claimed_classical_opks.clear();
+                inner
+                    .accepted_classical_since_baseline
+                    .retain(|k| published_classical_set.contains(k));
+                inner.relay_claimed_pq_opks_by_suite.clear();
+                inner.accepted_pq_since_baseline.retain(|suite, ids| {
+                    if let Some(published) = published_pq_sets.get(suite) {
+                        ids.retain(|id| published.contains(id));
+                        !ids.is_empty()
+                    } else {
+                        false
+                    }
+                });
                 let log_msg = match outcome {
                     PublishV2Outcome::V2Pq => {
                         inner.last_server_pq_opks_by_suite = Some(published_pq_by_suite);
+                        inner.relay_pq_opk_queue_by_suite = Some(published_pq_queues);
                         if inner.server_pq == ServerPqStatus::Disabled {
                             inner.set_server_pq(ServerPqStatus::Unknown);
                         } else {
@@ -2165,6 +2215,7 @@ impl<V: VaultStore> Engine<V> {
                     PublishV2Outcome::V2ClassicalOff => {
                         inner.last_server_pq_opks_by_suite =
                             Some(std::collections::BTreeMap::new());
+                        inner.relay_pq_opk_queue_by_suite = Some(std::collections::BTreeMap::new());
                         if inner.local_pq_enabled() {
                             inner.set_server_pq(ServerPqStatus::Disabled);
                             "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
@@ -2323,10 +2374,14 @@ impl<V: VaultStore> Engine<V> {
             pre_classical_used,
             pre_pq_used,
             pre_pq_by_suite,
+            pre_accepted_classical,
+            pre_accepted_pq,
             prev_server_classical,
             prev_server_pq,
             added_classical,
+            added_classical_keys,
             added_pq_by_suite,
+            mut added_pq_ids_by_suite,
         ) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
@@ -2338,6 +2393,8 @@ impl<V: VaultStore> Engine<V> {
             let pre_classical_used = inner.state.used_one_time_prekeys;
             let pre_pq_used = inner.state.used_pq_one_time_prekeys;
             let pre_pq_by_suite = inner.used_pq_by_suite.clone();
+            let pre_accepted_classical = inner.accepted_classical_since_baseline.clone();
+            let pre_accepted_pq = inner.accepted_pq_since_baseline.clone();
             let prev_server_classical = inner.last_server_classical_opks;
             let prev_server_pq = inner.last_server_pq_opks_by_suite.clone();
             let prepared = inner
@@ -2351,11 +2408,24 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(RefillV2Outcome::Handled);
             }
             let added_classical = prepared.request.one_time_prekeys.len() as u32;
+            let added_classical_keys: Vec<PublicKey> = prepared
+                .request
+                .one_time_prekeys
+                .iter()
+                .filter_map(|raw| PublicKey::try_from(raw.as_ref()).ok())
+                .collect();
             let mut added_pq_by_suite: std::collections::BTreeMap<PqSuite, u32> =
                 std::collections::BTreeMap::new();
+            let mut added_pq_ids_by_suite: std::collections::BTreeMap<
+                PqSuite,
+                Vec<session::PqPrekeyId>,
+            > = std::collections::BTreeMap::new();
             for pk in &prepared.request.pq_one_time_prekeys {
                 if let Some(suite) = u8::try_from(pk.suite).ok().and_then(PqSuite::from_u8) {
                     *added_pq_by_suite.entry(suite).or_insert(0) += 1;
+                    if let Ok(id) = session::PqPrekeyId::try_from(pk.prekey_id.as_ref()) {
+                        added_pq_ids_by_suite.entry(suite).or_default().push(id);
+                    }
                 }
             }
             if let Err(e) = inner.save(&[]).await {
@@ -2372,10 +2442,14 @@ impl<V: VaultStore> Engine<V> {
                 pre_classical_used,
                 pre_pq_used,
                 pre_pq_by_suite,
+                pre_accepted_classical,
+                pre_accepted_pq,
                 prev_server_classical,
                 prev_server_pq,
                 added_classical,
+                added_classical_keys,
                 added_pq_by_suite,
+                added_pq_ids_by_suite,
             )
         };
 
@@ -2427,14 +2501,18 @@ impl<V: VaultStore> Engine<V> {
                     ErrorKind::LimitExceeded => {
                         if sent_classical {
                             inner.state.used_one_time_prekeys = 0;
-                            inner.unmatched_server_classical_claims = 0;
+                            inner.relay_classical_opk_queue = None;
+                            inner.relay_claimed_classical_opks.clear();
+                            inner.accepted_classical_since_baseline.clear();
                             inner.last_server_classical_opks =
                                 Some(SERVER_MAX_ONE_TIME_PREKEYS as u32);
                         }
                         if sent_pq {
                             inner.state.used_pq_one_time_prekeys = 0;
                             inner.used_pq_by_suite.clear();
-                            inner.unmatched_server_pq_claims_by_suite.clear();
+                            inner.relay_pq_opk_queue_by_suite = None;
+                            inner.relay_claimed_pq_opks_by_suite.clear();
+                            inner.accepted_pq_since_baseline.clear();
                             // R8-P2-9 (Gemini P3-1): Distribute the shared 100-key cap across ALL
                             // offered suites instead of assigning 100% to `offered[0]` so claims
                             // on secondary suites (e.g. `MlKem768`) still reduce `total_est_rem`
@@ -2485,6 +2563,14 @@ impl<V: VaultStore> Engine<V> {
                         self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                         Err(describe(&e))
                     }
+                    ErrorKind::Protocol if sent_pq && inner.state.needs_publish => {
+                        // R10-P2-1: When a settings/suite change is pending in `needs_publish`,
+                        // the relay's confirmed manifest may not offer one of the newly enabled
+                        // local PQ suites; keep `needs_publish = true` and fall back to a
+                        // classical-only refill instead of wedging `sync()` offline.
+                        inner.state.needs_publish = true;
+                        Ok(RefillV2Outcome::SuiteMismatchNeedsClassicalOnly)
+                    }
                     ErrorKind::NotFound | ErrorKind::Protocol => {
                         inner.state.needs_publish = true;
                         Err(describe(&e))
@@ -2501,76 +2587,150 @@ impl<V: VaultStore> Engine<V> {
         inner.client.commit_refill_v2(prepared);
         let mut server_pq_map = std::collections::BTreeMap::new();
         for suite in inner.client.pq_config().offered_suites() {
-            server_pq_map.insert(suite, 0);
+            if !inner.state.needs_publish
+                || inner
+                    .last_server_pq_opks_by_suite
+                    .as_ref()
+                    .is_some_and(|m| m.contains_key(&suite))
+            {
+                server_pq_map.insert(suite, 0);
+            }
         }
         for sc in &response.pq_one_time_counts {
             if let Some(suite) = u8::try_from(sc.suite).ok().and_then(PqSuite::from_u8) {
                 server_pq_map.insert(suite, sc.count);
             }
         }
-        // R8-P2-8 + R9-P3-1: Reconcile any concurrent OPK accepts (e.g. from `carried_initial`
-        // during the `RefillPrekeys` RTT) against pre-refill claims already reflected in the
-        // relay's authoritative post-refill counts, AND carry any remaining unmatched pre-refill
-        // claims forward per pool / PQ suite so delayed greetings arriving after this refill
-        // releases `inbox_lock` are absorbed once instead of deducted twice.
-        const MAX_UNMATCHED_CLAIM_CREDIT: u32 = 1024;
+        // R8-P2-8 + R10-P2-5: Reconcile concurrent RTT accepts and delayed pre-refill relay claims
+        // using the exact FIFO OPK/PQOPK queue order from the relay (`ORDER BY position LIMIT 1`).
+        // Popped keys not yet accepted locally are tracked by exact key ID so abandoned pre-refill
+        // claims can never hide newer post-refill depletion. When queue state is unknown (e.g.
+        // after reload before the next full publish), fall back conservatively to R8-P2-8 with
+        // zero ambiguous carry-forward credits.
+        const MAX_TRACKED_OPK_CLAIMS: usize = 1024;
         let raw_concurrent_classical = inner
             .state
             .used_one_time_prekeys
             .saturating_sub(pre_classical_used);
-        let already_counted_classical = prev_server_classical.map_or(0, |prev| {
-            prev.saturating_sub(pre_classical_used)
-                .saturating_add(added_classical)
-                .saturating_sub(response.classical_one_time_count)
-        });
-        let concurrent_classical =
-            raw_concurrent_classical.saturating_sub(already_counted_classical);
-        let excess_unmatched_classical =
-            already_counted_classical.saturating_sub(raw_concurrent_classical);
-        inner.unmatched_server_classical_claims = inner
-            .unmatched_server_classical_claims
-            .saturating_add(excess_unmatched_classical)
-            .min(MAX_UNMATCHED_CLAIM_CREDIT);
+        let concurrent_classical = if let Some(queue) = inner.relay_classical_opk_queue.as_mut()
+            && queue.len().saturating_add(added_classical_keys.len())
+                >= response.classical_one_time_count as usize
+        {
+            let rtt_accepted: std::collections::HashSet<PublicKey> = inner
+                .accepted_classical_since_baseline
+                .iter()
+                .copied()
+                .filter(|k| !pre_accepted_classical.contains(k))
+                .collect();
+            queue.extend(added_classical_keys);
+            let popped_count = queue
+                .len()
+                .saturating_sub(response.classical_one_time_count as usize);
+            for _ in 0..popped_count {
+                if let Some(key) = queue.pop_front()
+                    && !inner.accepted_classical_since_baseline.contains(&key)
+                    && inner.relay_claimed_classical_opks.len() < MAX_TRACKED_OPK_CLAIMS
+                {
+                    inner.relay_claimed_classical_opks.insert(key);
+                }
+            }
+            let still_in_queue: std::collections::HashSet<PublicKey> = rtt_accepted
+                .into_iter()
+                .filter(|k| queue.contains(k))
+                .collect();
+            let count = still_in_queue.len() as u32;
+            inner.accepted_classical_since_baseline = still_in_queue;
+            count
+        } else {
+            inner.relay_classical_opk_queue = None;
+            inner.relay_claimed_classical_opks.clear();
+            inner.accepted_classical_since_baseline.clear();
+            let already_counted_classical = prev_server_classical.map_or(0, |prev| {
+                prev.saturating_sub(pre_classical_used)
+                    .saturating_add(added_classical)
+                    .saturating_sub(response.classical_one_time_count)
+            });
+            raw_concurrent_classical.saturating_sub(already_counted_classical)
+        };
 
         let mut all_pq_suites = BTreeSet::new();
         all_pq_suites.extend(server_pq_map.keys().copied());
         all_pq_suites.extend(inner.used_pq_by_suite.keys().copied());
-        all_pq_suites.extend(inner.unmatched_server_pq_claims_by_suite.keys().copied());
+        all_pq_suites.extend(inner.relay_claimed_pq_opks_by_suite.keys().copied());
         if let Some(prev_map) = prev_server_pq.as_ref() {
             all_pq_suites.extend(prev_map.keys().copied());
         }
         let mut next_used_pq_by_suite = std::collections::BTreeMap::new();
-        let mut next_unmatched_pq_by_suite = std::collections::BTreeMap::new();
         let mut total_already_counted_pq = 0u32;
+        let mut any_pq_untracked = false;
         for suite in all_pq_suites {
-            let after = inner.used_pq_by_suite.get(&suite).copied().unwrap_or(0);
-            let pre_s = pre_pq_by_suite.get(&suite).copied().unwrap_or(0);
-            let delta = after.saturating_sub(pre_s);
-            let already_s = prev_server_pq.as_ref().map_or(0, |prev_map| {
-                let prev_s = prev_map.get(&suite).copied().unwrap_or(0);
-                let added_s = added_pq_by_suite.get(&suite).copied().unwrap_or(0);
-                let resp_s = server_pq_map.get(&suite).copied().unwrap_or(0);
-                prev_s
-                    .saturating_sub(pre_s)
-                    .saturating_add(added_s)
-                    .saturating_sub(resp_s)
-            });
-            total_already_counted_pq = total_already_counted_pq.saturating_add(already_s);
-            let effective_delta = delta.saturating_sub(already_s);
-            if effective_delta > 0 {
-                next_used_pq_by_suite.insert(suite, effective_delta);
-            }
-            let excess_s = already_s.saturating_sub(delta);
-            let prev_unmatched_s = inner
-                .unmatched_server_pq_claims_by_suite
-                .get(&suite)
-                .copied()
-                .unwrap_or(0);
-            let next_unmatched_s = prev_unmatched_s
-                .saturating_add(excess_s)
-                .min(MAX_UNMATCHED_CLAIM_CREDIT);
-            if next_unmatched_s > 0 {
-                next_unmatched_pq_by_suite.insert(suite, next_unmatched_s);
+            let resp_s = server_pq_map.get(&suite).copied().unwrap_or(0);
+            let added_ids = added_pq_ids_by_suite.remove(&suite).unwrap_or_default();
+            if let Some(pq_queues) = inner.relay_pq_opk_queue_by_suite.as_mut()
+                && let Some(queue) = pq_queues.get_mut(&suite)
+                && queue.len().saturating_add(added_ids.len()) >= resp_s as usize
+            {
+                let accepted_s = inner
+                    .accepted_pq_since_baseline
+                    .remove(&suite)
+                    .unwrap_or_default();
+                let pre_accepted_s = pre_accepted_pq.get(&suite);
+                let rtt_accepted_s: std::collections::HashSet<session::PqPrekeyId> = accepted_s
+                    .iter()
+                    .copied()
+                    .filter(|id| !pre_accepted_s.is_some_and(|pre| pre.contains(id)))
+                    .collect();
+                queue.extend(added_ids);
+                let popped_count = queue.len().saturating_sub(resp_s as usize);
+                for _ in 0..popped_count {
+                    if let Some(id) = queue.pop_front()
+                        && !accepted_s.contains(&id)
+                    {
+                        let claimed = inner
+                            .relay_claimed_pq_opks_by_suite
+                            .entry(suite)
+                            .or_default();
+                        if claimed.len() < MAX_TRACKED_OPK_CLAIMS {
+                            claimed.insert(id);
+                        }
+                    }
+                }
+                let still_in_queue: std::collections::HashSet<session::PqPrekeyId> = rtt_accepted_s
+                    .into_iter()
+                    .filter(|id| queue.contains(id))
+                    .collect();
+                let effective_delta = still_in_queue.len() as u32;
+                if !still_in_queue.is_empty() {
+                    inner
+                        .accepted_pq_since_baseline
+                        .insert(suite, still_in_queue);
+                }
+                if effective_delta > 0 {
+                    next_used_pq_by_suite.insert(suite, effective_delta);
+                }
+            } else {
+                any_pq_untracked = true;
+                if let Some(pq_queues) = inner.relay_pq_opk_queue_by_suite.as_mut() {
+                    pq_queues.remove(&suite);
+                }
+                inner.relay_claimed_pq_opks_by_suite.remove(&suite);
+                inner.accepted_pq_since_baseline.remove(&suite);
+                let after = inner.used_pq_by_suite.get(&suite).copied().unwrap_or(0);
+                let pre_s = pre_pq_by_suite.get(&suite).copied().unwrap_or(0);
+                let delta = after.saturating_sub(pre_s);
+                let already_s = prev_server_pq.as_ref().map_or(0, |prev_map| {
+                    let prev_s = prev_map.get(&suite).copied().unwrap_or(0);
+                    let added_s = added_pq_by_suite.get(&suite).copied().unwrap_or(0);
+                    prev_s
+                        .saturating_sub(pre_s)
+                        .saturating_add(added_s)
+                        .saturating_sub(resp_s)
+                });
+                total_already_counted_pq = total_already_counted_pq.saturating_add(already_s);
+                let effective_delta = delta.saturating_sub(already_s);
+                if effective_delta > 0 {
+                    next_used_pq_by_suite.insert(suite, effective_delta);
+                }
             }
         }
         let raw_concurrent_pq = inner
@@ -2581,20 +2741,23 @@ impl<V: VaultStore> Engine<V> {
             .values()
             .copied()
             .fold(0u32, u32::saturating_add);
-        let concurrent_pq = raw_concurrent_pq
-            .saturating_sub(total_already_counted_pq)
-            .max(tracked_concurrent_pq);
+        let concurrent_pq = if any_pq_untracked {
+            raw_concurrent_pq
+                .saturating_sub(total_already_counted_pq)
+                .max(tracked_concurrent_pq)
+        } else {
+            tracked_concurrent_pq
+        };
 
         // Record authoritative relay counts as the single baseline BEFORE deducting concurrent
         // consumption deltas, and reset `used_*` to those reconciled concurrent deltas so each
-        // claim is deducted once and never twice (`R7-P3-1`, `R8-P2-8`, `R9-P3-1`), retaining
+        // claim is deducted once and never twice (`R7-P3-1`, `R8-P2-8`, `R10-P2-5`), retaining
         // per-suite counts (`R7-P2-5`).
         inner.last_server_classical_opks = Some(response.classical_one_time_count);
         inner.last_server_pq_opks_by_suite = Some(server_pq_map);
         inner.state.used_one_time_prekeys = concurrent_classical;
         inner.state.used_pq_one_time_prekeys = concurrent_pq;
         inner.used_pq_by_suite = next_used_pq_by_suite;
-        inner.unmatched_server_pq_claims_by_suite = next_unmatched_pq_by_suite;
         if sent_pq {
             // R8-P2-10: Mirror `publish_full_locked_gated` — a successful PQ refill proves the
             // relay accepted PQ prekeys, so clear any stale `Disabled` status to `Unknown` (and
@@ -2622,7 +2785,31 @@ impl<V: VaultStore> Engine<V> {
     ) -> Result<(usize, Vec<(PqSuite, usize)>), String> {
         let offered_suites: Vec<PqSuite> =
             if inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled {
-                inner.client.pq_config().offered_suites().to_vec()
+                let mut suites: Vec<PqSuite> = inner
+                    .client
+                    .pq_config()
+                    .offered_suites()
+                    .iter()
+                    .copied()
+                    .filter(|&suite| inner.client.has_current_pq_last_resort(suite))
+                    .collect();
+                if inner.state.needs_publish {
+                    // R10-P2-1: When a settings change (e.g. PQ-OFF -> PQ-ON or suite change) is
+                    // still pending in `needs_publish`, restrict PQ refills to suites confirmed on
+                    // the relay's current manifest so unpublished suites never cause `PqPrekeyNotFound`
+                    // or `SuiteNotOffered` and starve classical OPK replenishment.
+                    if inner
+                        .state
+                        .pending_pq_rollback
+                        .as_ref()
+                        .is_some_and(|rb| !rb.pq_enabled)
+                    {
+                        suites.clear();
+                    } else if let Some(last_pq) = inner.last_server_pq_opks_by_suite.as_ref() {
+                        suites.retain(|suite| last_pq.contains_key(suite));
+                    }
+                }
+                suites
             } else {
                 vec![]
             };
@@ -2648,8 +2835,9 @@ impl<V: VaultStore> Engine<V> {
         // If server is already at its 100-key cap, reset counters so sync doesn't loop.
         if classical_count == 0 && pq_counts.is_empty() {
             let classical_low = inner.state.used_one_time_prekeys >= REFILL_USED;
-            let pq_low =
-                !offered_suites.is_empty() && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
+            let pq_low = !inner.state.needs_publish
+                && !offered_suites.is_empty()
+                && inner.state.used_pq_one_time_prekeys >= REFILL_USED;
             let mut cleared = false;
             if classical_low && raw_classical == 0 {
                 inner.state.used_one_time_prekeys = 0;
@@ -2772,8 +2960,9 @@ impl<V: VaultStore> Engine<V> {
             .await?
         {
             RefillV2Outcome::Handled => Ok(()),
-            RefillV2Outcome::PqDisabled => {
-                // A PQ-disabled v2 server can still accept a classical-only v2 refill.
+            RefillV2Outcome::PqDisabled | RefillV2Outcome::SuiteMismatchNeedsClassicalOnly => {
+                // A PQ-disabled relay or a relay whose confirmed manifest predates a deferred
+                // local PQ suite change (`R10-P2-1`) can still accept a classical-only v2 refill.
                 if classical_count > 0 && !pq_counts.is_empty() && self.is_live(vgen) {
                     let _ = self
                         .try_refill_v2_locked(vgen, classical_count, &[])
@@ -2848,18 +3037,26 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Complete [`Engine::start_chat`] when `peer` already exists in `inner.contacts` (either on
-    /// entry or because an inbound initial arrived while `ClaimBundle` was suspended). Releases
-    /// `guard` across `RegisterWriteToken` and `flush`.
+    /// entry or because an inbound initial arrived while `ClaimBundle` was suspended). Caller MUST
+    /// hold `peer_flush_lock(&peer)` (`peer_guard`, Rank 1) and `Engine::inner` (`guard`, Rank 5).
+    /// Releases `guard` across `RegisterWriteToken` and drops `peer_guard` strictly before
+    /// `upgrade_to_pq_auto` / `flush`.
     ///
-    /// R9-P1-2: When accepting a pending request or resuming a provisional contact, keep `request`
-    /// and `provisional` untouched while `RegisterWriteToken` is in flight, then re-verify
-    /// cancellation and `conversation_gen` before committing acceptance. On cancellation, keep the
-    /// contact unaccepted, clear pending grants, and stage a `PendingRevoke` for any grant that
-    /// may have registered on the relay.
+    /// R9-P1-2 + R10-P1-1 + R10-P1-2 + R10-P1-3:
+    /// - Marks `(request = true, provisional = true)` durably while `RegisterWriteToken` is in
+    ///   flight so reload cleanup (`cleanup_abandoned_provisional_contacts`) revokes any abandoned
+    ///   grant and background `flush_pending_grants` skips unaccepted/quarantined requests.
+    /// - Loops Phase A if a concurrent inbound rekey introduced a new session token during
+    ///   `RegisterWriteToken`, ensuring `Events { accepted: true }` never ships with an
+    ///   unregistered write token.
+    /// - On cancellation, mid-flight quarantine, or Phase-B `inner.save` failure, restores
+    ///   `provisional = false` (if set by Phase A), clears pending grants, and stages a
+    ///   `PendingRevoke` before releasing `peer_guard`.
     #[allow(clippy::too_many_arguments)]
     async fn finish_existing_contact_start_chat(
         &self,
         mut guard: InnerGuard<'_, V>,
+        peer_guard: impl Drop,
         vgen: u64,
         submission_id: u64,
         peer: PublicKey,
@@ -2886,89 +3083,263 @@ impl<V: VaultStore> Engine<V> {
             }
         };
 
-        // Phase A (under `guard`): check if grant registration is needed for a request/provisional
-        // contact. If so, stage grants while keeping `request`/`provisional` untouched so
-        // cancelling during `RegisterWriteToken` can never approve the contact.
-        let (initial_conv_gen, initial_was_request, initial_was_provisional, flushed_grants) = {
+        let (initial_conv_gen, initial_was_request, initial_was_provisional) = {
             let inner = guard
-                .as_mut()
+                .as_ref()
                 .ok_or_else(|| StartChatError::Other("locked".into()))?;
-            let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
+            let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
                 self.startup.end_new_chat_submit(submission_id);
                 return Err(StartChatError::Cancelled);
             };
-            let conv_gen = inner.contacts[index].state.conversation_gen;
-            let was_request = inner.contacts[index].state.request;
-            let was_provisional = inner.contacts[index].state.provisional;
-            let quarantined = inner.contacts[index].state.quarantined;
-            let will_accept = was_request && !quarantined;
-            let will_resume = was_provisional && !was_request && !quarantined;
-            let needs_provisional_grant = will_resume
-                && !inner.contacts[index].session.has_pending_active_grant()
-                && !inner.contacts[index].session.is_known_by_peer();
+            (
+                contact.state.conversation_gen,
+                contact.state.request,
+                contact.state.provisional,
+            )
+        };
 
-            if will_accept || will_resume {
-                let pre_stage_snapshot = inner.contacts[index].snapshot();
-                let active_token = inner.contacts[index].session.active_inbound_token_hash();
-                let earlier_tokens: Vec<[u8; 32]> = inner.contacts[index]
-                    .session
-                    .earlier_inbound_token_hashes()
-                    .filter(|h| Some(*h) != active_token)
-                    .collect();
-                let mut staged_any = false;
-                if (will_accept || needs_provisional_grant)
-                    && let Some(token_hash) = active_token
-                {
-                    if let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true) {
-                        let _ = inner.roll_back(&peer, pre_stage_snapshot);
-                        return Err(StartChatError::Other(e));
-                    }
-                    staged_any = true;
-                }
-                for earlier_hash in earlier_tokens {
-                    if let Err(e) = inner.stage_write_token_grant(&peer, earlier_hash, false) {
-                        let _ = inner.roll_back(&peer, pre_stage_snapshot);
-                        return Err(StartChatError::Other(e));
-                    }
-                    staged_any = true;
-                }
-                if staged_any {
-                    if let Err(e) = inner.save(&[]).await {
-                        let _ = inner.roll_back(&peer, pre_stage_snapshot);
-                        if !self.is_live(vgen) {
-                            return Err(StartChatError::Cancelled);
+        // Phase A (bounded loop): stage & flush write-token grants while keeping `request = true`
+        // and marking `provisional = true` durably on acceptance-in-progress (`R10-P1-1`),
+        // repeating if an inbound rekey installs a new session during `RegisterWriteToken`
+        // (`R10-P1-3`).
+        const MAX_GRANT_PASSES: usize = 4;
+        let mut staged_tokens: BTreeSet<[u8; 32]> = BTreeSet::new();
+        let mut flushed_grants = false;
+        let mut marked_provisional_for_accept = false;
+
+        for pass in 0..MAX_GRANT_PASSES {
+            let need_flush = {
+                let inner = guard
+                    .as_mut()
+                    .ok_or_else(|| StartChatError::Other("locked".into()))?;
+                if self.is_submission_cancelled(submission_id) {
+                    self.startup.end_new_chat_submit(submission_id);
+                    if (flushed_grants || marked_provisional_for_accept)
+                        && let Some(c) = inner.contacts.iter_mut().find(|c| {
+                            c.peer == peer && c.state.conversation_gen == initial_conv_gen
+                        })
+                        && ((initial_was_request && c.state.request)
+                            || (initial_was_provisional && c.state.provisional))
+                    {
+                        if marked_provisional_for_accept {
+                            c.state.provisional = false;
                         }
-                        return Err(StartChatError::Other(describe(&e)));
-                    }
-                    if !self.is_live(vgen) {
-                        return Err(StartChatError::Cancelled);
-                    }
-                    if self.is_submission_cancelled(submission_id) {
-                        self.startup.end_new_chat_submit(submission_id);
-                        let _ = inner.roll_back(&peer, pre_stage_snapshot);
+                        c.session.clear_pending_grants();
+                        if flushed_grants {
+                            stage_revoke(inner);
+                        }
                         if inner.save_state().await.is_err() {
                             inner.unsaved_state = true;
                         }
-                        if self.is_live(vgen) {
-                            self.refresh_contacts(inner);
+                        if !self.is_live(vgen) {
+                            return Err(StartChatError::Cancelled);
                         }
-                        return Err(StartChatError::Cancelled);
+                        self.refresh_contacts(inner);
+                        drop(guard);
+                        drop(peer_guard);
+                        if flushed_grants {
+                            self.wake();
+                        }
                     }
+                    return Err(StartChatError::Cancelled);
                 }
-                let has_grants = inner
+                let Some(index) = inner
                     .contacts
                     .iter()
-                    .find(|c| c.peer == peer && c.state.conversation_gen == conv_gen)
-                    .is_some_and(|c| !c.session.pending_register_grants().is_empty());
-                (conv_gen, was_request, was_provisional, has_grants)
-            } else {
-                (conv_gen, was_request, was_provisional, false)
+                    .position(|c| c.peer == peer && c.state.conversation_gen == initial_conv_gen)
+                else {
+                    self.startup.end_new_chat_submit(submission_id);
+                    return Err(StartChatError::Cancelled);
+                };
+                let cur_request = inner.contacts[index].state.request;
+                let cur_provisional = inner.contacts[index].state.provisional;
+                let cur_quarantined = inner.contacts[index].state.quarantined;
+                let cur_will_accept = cur_request && !cur_quarantined;
+                let cur_will_resume = cur_provisional && !cur_request && !cur_quarantined;
+                if !(cur_will_accept || cur_will_resume) {
+                    false
+                } else {
+                    let active_token = inner.contacts[index].session.active_inbound_token_hash();
+                    let earlier_tokens: Vec<[u8; 32]> = inner.contacts[index]
+                        .session
+                        .earlier_inbound_token_hashes()
+                        .filter(|h| Some(*h) != active_token)
+                        .collect();
+                    let need_active = active_token.filter(|t| {
+                        !staged_tokens.contains(t)
+                            && (cur_will_accept
+                                || pass > 0
+                                || (!inner.contacts[index].session.has_pending_active_grant()
+                                    && !inner.contacts[index].session.is_known_by_peer()))
+                    });
+                    let need_earlier: Vec<[u8; 32]> = earlier_tokens
+                        .into_iter()
+                        .filter(|t| !staged_tokens.contains(t))
+                        .collect();
+                    let has_existing_pending = pass == 0
+                        && !inner.contacts[index]
+                            .session
+                            .pending_register_grants()
+                            .is_empty();
+                    if need_active.is_none() && need_earlier.is_empty() && !has_existing_pending {
+                        false
+                    } else {
+                        let pre_stage_snapshot = inner.contacts[index].snapshot();
+                        let prev_marked_provisional = marked_provisional_for_accept;
+                        let mut mutated = false;
+                        let mut newly_staged = Vec::new();
+                        if cur_will_accept && !inner.contacts[index].state.provisional {
+                            inner.contacts[index].state.provisional = true;
+                            marked_provisional_for_accept = true;
+                            mutated = true;
+                        }
+                        let mut stage_err: Option<String> = None;
+                        if let Some(token_hash) = need_active {
+                            match inner.stage_write_token_grant(&peer, token_hash, true) {
+                                Ok(()) => {
+                                    newly_staged.push(token_hash);
+                                    mutated = true;
+                                }
+                                Err(e) => stage_err = Some(e),
+                            }
+                        }
+                        if stage_err.is_none() {
+                            for earlier_hash in need_earlier {
+                                match inner.stage_write_token_grant(&peer, earlier_hash, false) {
+                                    Ok(()) => {
+                                        newly_staged.push(earlier_hash);
+                                        mutated = true;
+                                    }
+                                    Err(e) => {
+                                        stage_err = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(e) = stage_err {
+                            let _ = inner.roll_back(&peer, pre_stage_snapshot);
+                            marked_provisional_for_accept = prev_marked_provisional;
+                            if flushed_grants || marked_provisional_for_accept {
+                                if let Some(c) = inner.contacts.iter_mut().find(|c| {
+                                    c.peer == peer && c.state.conversation_gen == initial_conv_gen
+                                }) {
+                                    if marked_provisional_for_accept {
+                                        c.state.provisional = false;
+                                    }
+                                    c.session.clear_pending_grants();
+                                }
+                                if flushed_grants {
+                                    stage_revoke(inner);
+                                }
+                                if inner.save_state().await.is_err() {
+                                    inner.unsaved_state = true;
+                                }
+                                if self.is_live(vgen) {
+                                    self.refresh_contacts(inner);
+                                }
+                                drop(guard);
+                                drop(peer_guard);
+                                if flushed_grants && self.is_live(vgen) {
+                                    self.wake();
+                                }
+                            }
+                            return Err(StartChatError::Other(e));
+                        }
+                        if mutated {
+                            if let Err(e) = inner.save(&[]).await {
+                                let _ = inner.roll_back(&peer, pre_stage_snapshot);
+                                marked_provisional_for_accept = prev_marked_provisional;
+                                if !self.is_live(vgen) {
+                                    return Err(StartChatError::Cancelled);
+                                }
+                                let cancelled = self.is_submission_cancelled(submission_id);
+                                if cancelled {
+                                    self.startup.end_new_chat_submit(submission_id);
+                                }
+                                if flushed_grants || marked_provisional_for_accept {
+                                    if let Some(c) = inner.contacts.iter_mut().find(|c| {
+                                        c.peer == peer
+                                            && c.state.conversation_gen == initial_conv_gen
+                                    }) {
+                                        if marked_provisional_for_accept {
+                                            c.state.provisional = false;
+                                        }
+                                        c.session.clear_pending_grants();
+                                    }
+                                    if flushed_grants {
+                                        stage_revoke(inner);
+                                    }
+                                    if inner.save_state().await.is_err() {
+                                        inner.unsaved_state = true;
+                                    }
+                                    if !self.is_live(vgen) {
+                                        return Err(StartChatError::Cancelled);
+                                    }
+                                    self.refresh_contacts(inner);
+                                    drop(guard);
+                                    drop(peer_guard);
+                                    if flushed_grants {
+                                        self.wake();
+                                    }
+                                }
+                                return if cancelled {
+                                    Err(StartChatError::Cancelled)
+                                } else {
+                                    Err(StartChatError::Other(describe(&e)))
+                                };
+                            }
+                            if !self.is_live(vgen) {
+                                return Err(StartChatError::Cancelled);
+                            }
+                            if self.is_submission_cancelled(submission_id) {
+                                self.startup.end_new_chat_submit(submission_id);
+                                let _ = inner.roll_back(&peer, pre_stage_snapshot);
+                                if flushed_grants || prev_marked_provisional {
+                                    if let Some(c) = inner.contacts.iter_mut().find(|c| {
+                                        c.peer == peer
+                                            && c.state.conversation_gen == initial_conv_gen
+                                    }) {
+                                        if prev_marked_provisional {
+                                            c.state.provisional = false;
+                                        }
+                                        c.session.clear_pending_grants();
+                                    }
+                                    if flushed_grants {
+                                        stage_revoke(inner);
+                                    }
+                                }
+                                if inner.save_state().await.is_err() {
+                                    inner.unsaved_state = true;
+                                }
+                                if self.is_live(vgen) {
+                                    self.refresh_contacts(inner);
+                                }
+                                drop(guard);
+                                drop(peer_guard);
+                                if flushed_grants && self.is_live(vgen) {
+                                    self.wake();
+                                }
+                                return Err(StartChatError::Cancelled);
+                            }
+                        }
+                        staged_tokens.extend(newly_staged);
+                        inner
+                            .contacts
+                            .iter()
+                            .find(|c| {
+                                c.peer == peer && c.state.conversation_gen == initial_conv_gen
+                            })
+                            .is_some_and(|c| !c.session.pending_register_grants().is_empty())
+                    }
+                }
+            };
+            if !need_flush {
+                break;
             }
-        };
-
-        if flushed_grants {
             drop(guard);
             let _ = self.flush_pending_grants_for_peer(&peer).await;
+            flushed_grants = true;
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
@@ -2978,15 +3349,16 @@ impl<V: VaultStore> Engine<V> {
             }
         }
 
-        // Phase B (under `guard`): re-verify cancellation and `conversation_gen`, then commit
-        // acceptance / metadata updates.
-        let (accepted_now, resumed_provisional) = {
+        // Phase B (under the exact same `guard` as the final Phase-A check): re-verify
+        // cancellation and `conversation_gen`, then commit acceptance / metadata updates (or
+        // clean up Phase-A grants if the contact became quarantined mid-flight or `save` fails).
+        let (accepted_now, resumed_provisional, phase_b_extra_grants, revoked_in_phase_b) = {
             let inner = guard
                 .as_mut()
                 .ok_or_else(|| StartChatError::Other("locked".into()))?;
             if self.is_submission_cancelled(submission_id) {
                 self.startup.end_new_chat_submit(submission_id);
-                if flushed_grants
+                if (flushed_grants || marked_provisional_for_accept)
                     && let Some(c) = inner
                         .contacts
                         .iter_mut()
@@ -2994,8 +3366,13 @@ impl<V: VaultStore> Engine<V> {
                     && ((initial_was_request && c.state.request)
                         || (initial_was_provisional && c.state.provisional))
                 {
+                    if marked_provisional_for_accept {
+                        c.state.provisional = false;
+                    }
                     c.session.clear_pending_grants();
-                    stage_revoke(inner);
+                    if flushed_grants {
+                        stage_revoke(inner);
+                    }
                     if inner.save_state().await.is_err() {
                         inner.unsaved_state = true;
                     }
@@ -3004,7 +3381,10 @@ impl<V: VaultStore> Engine<V> {
                     }
                     self.refresh_contacts(inner);
                     drop(guard);
-                    self.wake();
+                    drop(peer_guard);
+                    if flushed_grants {
+                        self.wake();
+                    }
                     return Err(StartChatError::Cancelled);
                 }
                 return Err(StartChatError::Cancelled);
@@ -3023,6 +3403,19 @@ impl<V: VaultStore> Engine<V> {
             let quarantined = inner.contacts[index].state.quarantined;
             let accepted_now = was_request && !quarantined;
             let resumed_provisional = was_provisional && !was_request && !quarantined;
+            let mut phase_b_extra_grants = false;
+            let mut revoke_staged = false;
+            let extra_tokens: (Option<[u8; 32]>, Vec<[u8; 32]>) = if accepted_now {
+                let active = inner.contacts[index].session.active_inbound_token_hash();
+                let earlier: Vec<[u8; 32]> = inner.contacts[index]
+                    .session
+                    .earlier_inbound_token_hashes()
+                    .filter(|h| Some(*h) != active && !staged_tokens.contains(h))
+                    .collect();
+                (active.filter(|t| !staged_tokens.contains(t)), earlier)
+            } else {
+                (None, vec![])
+            };
             {
                 let contact = &mut inner.contacts[index];
                 if pin_pq {
@@ -3046,17 +3439,80 @@ impl<V: VaultStore> Engine<V> {
                     contact.state.events.get_or_insert_default().accepted = true;
                 } else if resumed_provisional {
                     contact.state.provisional = false;
+                } else if flushed_grants || marked_provisional_for_accept {
+                    // R10-P1-1: Contact became quarantined during Phase A (or is no longer
+                    // eligible for acceptance): clear our temporary provisional flag, drop any
+                    // pending grants, and revoke any grant registered in Phase A.
+                    if marked_provisional_for_accept {
+                        contact.state.provisional = false;
+                    }
+                    contact.session.clear_pending_grants();
                 }
                 if !name.is_empty() {
                     contact.state.name = name;
                 }
+            }
+            if accepted_now {
+                if let Some(token_hash) = extra_tokens.0
+                    && inner
+                        .stage_write_token_grant(&peer, token_hash, true)
+                        .is_ok()
+                {
+                    phase_b_extra_grants = true;
+                }
+                for earlier_hash in extra_tokens.1 {
+                    if inner
+                        .stage_write_token_grant(&peer, earlier_hash, false)
+                        .is_ok()
+                    {
+                        phase_b_extra_grants = true;
+                    }
+                }
+            } else if !resumed_provisional && flushed_grants {
+                stage_revoke(inner);
+                revoke_staged = true;
             }
             if let Err(e) = inner.save(&[]).await {
                 let _ = inner.roll_back(&peer, snapshot);
                 if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
                 }
-                return Err(StartChatError::Other(describe(&e)));
+                let cancelled = self.is_submission_cancelled(submission_id);
+                if cancelled {
+                    self.startup.end_new_chat_submit(submission_id);
+                }
+                if flushed_grants || marked_provisional_for_accept {
+                    if let Some(c) = inner
+                        .contacts
+                        .iter_mut()
+                        .find(|c| c.peer == peer && c.state.conversation_gen == initial_conv_gen)
+                    {
+                        if marked_provisional_for_accept {
+                            c.state.provisional = false;
+                        }
+                        c.session.clear_pending_grants();
+                    }
+                    if flushed_grants && !revoke_staged {
+                        stage_revoke(inner);
+                    }
+                    if inner.save_state().await.is_err() {
+                        inner.unsaved_state = true;
+                    }
+                    if !self.is_live(vgen) {
+                        return Err(StartChatError::Cancelled);
+                    }
+                    self.refresh_contacts(inner);
+                    drop(guard);
+                    drop(peer_guard);
+                    if flushed_grants {
+                        self.wake();
+                    }
+                }
+                return if cancelled {
+                    Err(StartChatError::Cancelled)
+                } else {
+                    Err(StartChatError::Other(describe(&e)))
+                };
             }
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
@@ -3064,14 +3520,19 @@ impl<V: VaultStore> Engine<V> {
             if self.is_submission_cancelled(submission_id) {
                 self.startup.end_new_chat_submit(submission_id);
                 let _ = inner.roll_back(&peer, snapshot);
-                if flushed_grants
+                if (flushed_grants || marked_provisional_for_accept)
                     && let Some(c) = inner
                         .contacts
                         .iter_mut()
                         .find(|c| c.peer == peer && c.state.conversation_gen == initial_conv_gen)
                 {
+                    if marked_provisional_for_accept {
+                        c.state.provisional = false;
+                    }
                     c.session.clear_pending_grants();
-                    stage_revoke(inner);
+                    if flushed_grants && !revoke_staged {
+                        stage_revoke(inner);
+                    }
                 }
                 let mut last_err = None;
                 for _ in 0..2 {
@@ -3105,6 +3566,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 self.refresh_contacts(inner);
                 drop(guard);
+                drop(peer_guard);
                 if flushed_grants {
                     self.wake();
                 }
@@ -3112,10 +3574,21 @@ impl<V: VaultStore> Engine<V> {
             }
             self.startup.end_new_chat_submit(submission_id);
             self.refresh_contacts(inner);
-            (accepted_now, resumed_provisional)
+            (
+                accepted_now,
+                resumed_provisional,
+                phase_b_extra_grants,
+                revoke_staged,
+            )
         };
         drop(guard);
-        if accepted_now {
+        if phase_b_extra_grants {
+            let _ = self.flush_pending_grants_for_peer(&peer).await;
+            if !self.is_live(vgen) {
+                return Err(StartChatError::Cancelled);
+            }
+        }
+        let replay_upgrades = if accepted_now {
             let (replay_upgrades, replay_grants) = {
                 let mut guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
@@ -3144,6 +3617,14 @@ impl<V: VaultStore> Engine<V> {
                 }
                 let _ = self.flush_pending_grants_for_peer(&gp).await;
             }
+            replay_upgrades
+        } else {
+            BTreeMap::new()
+        };
+        // R10-P1-2: Release `peer_flush_lock(&peer)` (Rank 1) strictly BEFORE calling
+        // `upgrade_to_pq_auto` or `self.flush(&peer)` (both of which acquire Rank 1).
+        drop(peer_guard);
+        if accepted_now {
             for (up_peer, conv_gen) in replay_upgrades {
                 if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
@@ -3152,7 +3633,7 @@ impl<V: VaultStore> Engine<V> {
             }
             let _ = self.flush(&peer).await;
         }
-        if (accepted_now || resumed_provisional) && self.is_live(vgen) {
+        if (accepted_now || resumed_provisional || revoked_in_phase_b) && self.is_live(vgen) {
             self.wake();
         }
         Ok(peer)
@@ -3182,6 +3663,15 @@ impl<V: VaultStore> Engine<V> {
         let peer = key_from_text(key)
             .ok_or_else(|| StartChatError::Other("that is not an identity key".into()))?;
         let name = name.trim().to_string();
+        // R10-P1-2: Serialize ALL `start_chat` lifecycle paths for `peer` (including existing-
+        // contact acceptance/resume and new-chat initiation) behind `peer_flush_lock(&peer)`
+        // (Rank 1, strictly before `publish_lock`, `grant_sync_lock`, and `Engine::inner`) so a
+        // cancelled submission #1 can never race with an immediately resubmitted submission #2.
+        let peer_lock = self.queue.peer_flush_lock(&peer);
+        let peer_guard = peer_lock.lock().await;
+        if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
+            return Err(StartChatError::Cancelled);
+        }
         let mut guard = self.lock_inner().await;
         if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
             return Err(StartChatError::Cancelled);
@@ -3203,6 +3693,7 @@ impl<V: VaultStore> Engine<V> {
                 return self
                     .finish_existing_contact_start_chat(
                         guard,
+                        peer_guard,
                         vgen,
                         submission_id,
                         peer,
@@ -3284,6 +3775,7 @@ impl<V: VaultStore> Engine<V> {
                         return self
                             .finish_existing_contact_start_chat(
                                 guard,
+                                peer_guard,
                                 vgen,
                                 submission_id,
                                 peer,
@@ -3318,17 +3810,10 @@ impl<V: VaultStore> Engine<V> {
             }
         };
 
-        // Serialize Phases 2–4 per peer via `peer_flush_lock` (acquired strictly BEFORE
-        // `self.inner`) so concurrent `retry_pending_greetings()` or `flush()` cannot send
-        // `SendInitialV2` before `RegisterWriteToken` completes or defeat cancellation rollback.
-        let peer_lock = self.queue.peer_flush_lock(&peer);
-        let peer_guard = peer_lock.lock().await;
-        if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
-            return Err(StartChatError::Cancelled);
-        }
         // Run initial `publish_full` (if brand-new vault) BEFORE creating/persisting the new
-        // contact or staging its write-token grant, so cancelling during initial publish leaves
-        // zero contact and zero grant that a concurrent `sync()` could register on the relay.
+        // contact or staging its write-token grant (still under `peer_guard`, Rank 1 -> Rank 2),
+        // so cancelling during initial publish leaves zero contact and zero grant that a
+        // concurrent `sync()` could register on the relay.
         let needs_initial_publish = {
             let guard = self.lock_inner().await;
             if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
@@ -3360,7 +3845,6 @@ impl<V: VaultStore> Engine<V> {
             inner.check_outgoing_peer(&peer)?;
             if inner.contacts.iter().any(|c| c.peer == peer) {
                 drop(claimed);
-                drop(peer_guard);
                 if allow_classical
                     && super::settings::check_classical_approval(inner.client.pq_config()).is_err()
                 {
@@ -3369,6 +3853,7 @@ impl<V: VaultStore> Engine<V> {
                 return self
                     .finish_existing_contact_start_chat(
                         guard,
+                        peer_guard,
                         vgen,
                         submission_id,
                         peer,

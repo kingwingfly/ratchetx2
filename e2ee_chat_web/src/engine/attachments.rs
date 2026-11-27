@@ -878,7 +878,7 @@ impl<V: VaultStore> Engine<V> {
                     .promote_upload_with(
                         &peer,
                         &waiting,
-                        &pending,
+                        Some(&pending),
                         &records(&peer, &changed),
                         &[(peer, kept.history_index, Some(record))],
                     )
@@ -903,13 +903,6 @@ impl<V: VaultStore> Engine<V> {
         // and its message reverts to an un-uploaded failed attachment without publishing the
         // cancelled pointer ID to the UI.
         if self.is_cancelled(&waiting) {
-            self.uploads.mark_cancelled(*upload.id());
-            self.remove_attachment_caches(&peer, &waiting);
-            self.remove_attachment_caches(&peer, upload.id());
-            let _ = inner.vault.forget_upload(&peer, upload.id()).await;
-            if !self.is_live(vgen) {
-                return Ok(());
-            }
             if let Some(Kind::Attachment(pointer)) = changed[0]
                 .1
                 .content
@@ -921,6 +914,11 @@ impl<V: VaultStore> Engine<V> {
                 pointer.expires = 0;
             }
             changed[0].1.set_delivery(Delivery::Failed);
+            // R10-P2-6: Atomically delete the newly promoted `PendingUpload`, remove the outbox
+            // item, delete the `OutgoingRecord`, and mark the `HistoryEntry` `Failed` in ONE
+            // IndexedDB transaction BEFORE cancelling the server upload allocation so a storage
+            // failure or pagehide teardown can never delete the R2 object out from under a still-
+            // persisted upload or leave an orphaned upload checkpoint without its outbox record.
             let reverted = inner
                 .with_contact_tx(&peer, async |inner| {
                     let contact = inner
@@ -931,7 +929,10 @@ impl<V: VaultStore> Engine<V> {
                         .outbox
                         .retain(|outgoing| outgoing.history_index != kept.history_index);
                     inner
-                        .save_with(
+                        .promote_upload_with(
+                            &peer,
+                            upload.id(),
+                            None,
                             &records(&peer, &changed),
                             &[(peer, kept.history_index, None)],
                         )
@@ -940,11 +941,14 @@ impl<V: VaultStore> Engine<V> {
                 })
                 .await;
             if reverted.is_ok() && self.is_live(vgen) {
+                self.uploads.mark_cancelled(*upload.id());
+                self.remove_attachment_caches(&peer, &waiting);
+                self.remove_attachment_caches(&peer, upload.id());
                 self.release(&peer, kept.history_index);
                 self.show_changes(inner, &peer, &changed);
             }
             drop(guard);
-            if self.is_live(vgen) {
+            if reverted.is_ok() && self.is_live(vgen) {
                 let _ = upload.cancel(&Fetch::client(&server)).await;
             }
             reverted?;

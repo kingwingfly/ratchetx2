@@ -2719,8 +2719,8 @@ impl Vault {
     }
 
     /// Atomically promote a waiting sign-in upload (`old_id`) into a server-started `new_upload`
-    /// together with the updated `state`, `deferred`, `entries`, and `outgoing` in a single
-    /// IndexedDB RW transaction.
+    /// (or delete `old_id` when `new_upload` is `None`) together with the updated `state`,
+    /// `deferred`, `entries`, and `outgoing` in a single IndexedDB RW transaction.
     #[allow(clippy::too_many_arguments)]
     pub async fn promote_upload<'a>(
         &self,
@@ -2728,7 +2728,7 @@ impl Vault {
         deferred: &DeferredRecord,
         peer: &PublicKey,
         old_id: &[u8],
-        new_upload: &PendingUpload,
+        new_upload: Option<&PendingUpload>,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> Result<()> {
@@ -2772,12 +2772,14 @@ impl Vault {
         }
         let mut next_checkpoints = self.upload_checkpoints.borrow().clone();
         remove_upload_checkpoint(&mut next_checkpoints, peer, old_id);
-        upsert_upload_checkpoint(
-            &mut next_checkpoints,
-            peer,
-            new_upload,
-            next_header.revision,
-        );
+        if let Some(new_upload) = new_upload {
+            upsert_upload_checkpoint(
+                &mut next_checkpoints,
+                peer,
+                new_upload,
+                next_header.revision,
+            );
+        }
 
         let sealed_state = match self.prepare_state_for_commit(
             state,
@@ -2794,27 +2796,39 @@ impl Vault {
                 return Err(e);
             }
         };
-        let sealed_upload = match self.seal_record(
-            &upload_aad(
-                peer,
-                &new_upload.id,
-                self.record_epoch,
-                next_header.revision,
-            ),
-            new_upload,
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = transaction.abort();
-                return Err(e);
-            }
+        let sealed_upload = match new_upload {
+            Some(new_upload) => match self.seal_record(
+                &upload_aad(
+                    peer,
+                    &new_upload.id,
+                    self.record_epoch,
+                    next_header.revision,
+                ),
+                new_upload,
+            ) {
+                Ok(s) => Some((
+                    opaque_upload_key(&self.keys.idb_mac_key, peer, &new_upload.id),
+                    s,
+                )),
+                Err(e) => {
+                    let _ = transaction.abort();
+                    return Err(e);
+                }
+            },
+            None => None,
         };
-        let new_key = opaque_upload_key(&self.keys.idb_mac_key, peer, &new_upload.id);
         let old_key = opaque_upload_key(&self.keys.idb_mac_key, peer, old_id);
         let write_res: Result<()> = (|| {
-            store.put(&bytes(&sealed_upload), Some(&new_key.as_str().into()))?;
-            if old_key != new_key {
-                store.delete(JsValue::from_str(&old_key))?;
+            match sealed_upload {
+                Some((ref new_key, ref sealed)) => {
+                    store.put(&bytes(sealed), Some(&new_key.as_str().into()))?;
+                    if old_key != *new_key {
+                        store.delete(JsValue::from_str(&old_key))?;
+                    }
+                }
+                None => {
+                    store.delete(JsValue::from_str(&old_key))?;
+                }
             }
             self.put_prepared_entries(&store, prepared_entries, &next_peer_storage)?;
             self.put_outgoing(&store, &outgoing_vec, next_header.revision)?;

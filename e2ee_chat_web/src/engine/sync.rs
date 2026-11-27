@@ -362,7 +362,12 @@ impl<V: VaultStore> Engine<V> {
             inner
                 .contacts
                 .iter()
-                .filter(|c| !c.state.provisional && !c.session.pending_register_grants().is_empty())
+                .filter(|c| {
+                    !c.state.provisional
+                        && !c.state.request
+                        && !c.state.quarantined
+                        && !c.session.pending_register_grants().is_empty()
+                })
                 .map(|c| c.peer)
                 .collect()
         };

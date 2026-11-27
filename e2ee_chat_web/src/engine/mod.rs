@@ -351,12 +351,30 @@ pub(super) struct Inner<V = Vault> {
     last_server_pq_opks_by_suite: Option<std::collections::BTreeMap<session::PqSuite, u32>>,
     /// Per-suite PQOPKs consumed locally since the latest publish or refill baseline.
     used_pq_by_suite: std::collections::BTreeMap<session::PqSuite, u32>,
-    /// Pre-refill classical OPK claims already deducted in the latest relay `RefillPrekeys`
-    /// response whose corresponding greetings have not yet been accepted locally (`R9-P3-1`).
-    unmatched_server_classical_claims: u32,
-    /// Pre-refill per-suite PQOPK claims already deducted in the latest relay `RefillPrekeys`
-    /// response whose corresponding greetings have not yet been accepted locally (`R9-P3-1`).
-    unmatched_server_pq_claims_by_suite: std::collections::BTreeMap<session::PqSuite, u32>,
+    /// Exact classical OPKs currently believed queued on the relay in FIFO order (front = next to
+    /// be claimed by `ClaimBundle`). `Some` after a full publish; `None` after reload, publish
+    /// reconciliation, or pool desync (`R10-P2-5`).
+    relay_classical_opk_queue: Option<std::collections::VecDeque<PublicKey>>,
+    /// Exact classical OPKs already popped from the relay FIFO queue (proven by a `RefillPrekeys`
+    /// response) whose greetings have not yet been accepted locally (`R10-P2-5`).
+    relay_claimed_classical_opks: HashSet<PublicKey>,
+    /// Classical OPKs accepted locally via `open_initial` since the latest publish/refill baseline.
+    accepted_classical_since_baseline: HashSet<PublicKey>,
+    /// Per-suite exact PQOPK IDs currently believed queued on the relay in FIFO order (`R10-P2-5`).
+    relay_pq_opk_queue_by_suite: Option<
+        std::collections::BTreeMap<
+            session::PqSuite,
+            std::collections::VecDeque<session::PqPrekeyId>,
+        >,
+    >,
+    /// Per-suite exact PQOPK IDs already popped from the relay FIFO queue whose greetings have not
+    /// yet been accepted locally (`R10-P2-5`).
+    relay_claimed_pq_opks_by_suite:
+        std::collections::BTreeMap<session::PqSuite, HashSet<session::PqPrekeyId>>,
+    /// Per-suite PQOPK IDs accepted locally via `open_initial` since the latest publish/refill
+    /// baseline.
+    accepted_pq_since_baseline:
+        std::collections::BTreeMap<session::PqSuite, HashSet<session::PqPrekeyId>>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
     /// Encrypted inbox initials retained in the separate `deferred` vault sidecar record.
@@ -2059,6 +2077,15 @@ impl<V: VaultStore> Engine<V> {
         expected_gen: Option<u64>,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
+        // R10-P1-2: Serialize request acceptance behind `peer_flush_lock(&peer)` (Rank 1, acquired
+        // strictly BEFORE `self.inner` and dropped BEFORE `upgrade_to_pq_auto` / `flush(&peer)`)
+        // so cancelling a `start_chat` for `peer` and immediately accepting the request never
+        // interleaves a stale revoke after the fresh accept grant.
+        let peer_lock = self.queue.peer_flush_lock(&peer);
+        let peer_guard = peer_lock.lock().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
@@ -2132,6 +2159,7 @@ impl<V: VaultStore> Engine<V> {
             }
             let _ = self.flush_pending_grants_for_peer(&gp).await;
         }
+        drop(peer_guard);
         for (up_peer, conv_gen) in replay_upgrades {
             if !self.is_live(vgen) {
                 return Err("locked".into());
@@ -2540,7 +2568,7 @@ pub(crate) trait VaultStore: 'static {
         deferred: &DeferredRecord,
         peer: &PublicKey,
         old_id: &[u8],
-        new_upload: &PendingUpload,
+        new_upload: Option<&PendingUpload>,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()>;
@@ -2637,7 +2665,7 @@ impl VaultStore for Vault {
         deferred: &DeferredRecord,
         peer: &PublicKey,
         old_id: &[u8],
-        new_upload: &PendingUpload,
+        new_upload: Option<&PendingUpload>,
         entries: impl IntoIterator<Item = &'a (PublicKey, u64, HistoryEntry)>,
         outgoing: impl IntoIterator<Item = &'a (PublicKey, u64, Option<OutgoingRecord>)>,
     ) -> crate::vault::Result<()> {
@@ -2676,13 +2704,13 @@ impl VaultStore for Vault {
 
 impl<V: VaultStore> Inner<V> {
     /// Atomically promote a waiting sign-in upload (`old_id`) into a server-started `new_upload`
-    /// together with the updated state, deferred record, history entries, and outbox records in
-    /// one vault transaction.
+    /// (or delete `old_id` when `new_upload` is `None`) together with the updated state, deferred
+    /// record, history entries, and outbox records in one vault transaction.
     pub(super) async fn promote_upload_with(
         &mut self,
         peer: &PublicKey,
         old_id: &[u8],
-        new_upload: &PendingUpload,
+        new_upload: Option<&PendingUpload>,
         entries: &[(PublicKey, u64, HistoryEntry)],
         outgoing: &[(PublicKey, u64, Option<OutgoingRecord>)],
     ) -> crate::vault::Result<()> {
@@ -2857,8 +2885,12 @@ impl<V: VaultStore> Inner<V> {
             last_server_classical_opks: None,
             last_server_pq_opks_by_suite: None,
             used_pq_by_suite: std::collections::BTreeMap::new(),
-            unmatched_server_classical_claims: 0,
-            unmatched_server_pq_claims_by_suite: std::collections::BTreeMap::new(),
+            relay_classical_opk_queue: None,
+            relay_claimed_classical_opks: HashSet::new(),
+            accepted_classical_since_baseline: HashSet::new(),
+            relay_pq_opk_queue_by_suite: None,
+            relay_claimed_pq_opks_by_suite: std::collections::BTreeMap::new(),
+            accepted_pq_since_baseline: std::collections::BTreeMap::new(),
             unsaved_state: false,
             deferred_acks_after_save: vec![],
             contacts_dirty_late: false,
@@ -2869,23 +2901,25 @@ impl<V: VaultStore> Inner<V> {
         }
     }
 
-    /// Reconcile any `provisional && !request` contacts left on disk after a reload/crash during
-    /// `start_chat` Phase 2–3:
-    /// - Pure abandoned outbound starts (`history_len <= 1`, `!is_known_by_peer()`, `!quarantined`)
-    ///   are rolled back cleanly (staging a `PendingRevoke`, restoring any `fallback_farewells`,
-    ///   and calling `forget_peer`; if storage fails transiently, they are neutralized into
-    ///   unaccepted requests so they never strand as bricked active chats).
-    /// - Crossed-start contacts that already received an inbound peer session/message before the
-    ///   crash are preserved as explicit unaccepted requests (`request = true, provisional = false`)
-    ///   with a `PendingRevoke` for any abandoned outbound grant so the peer's message is not lost
-    ///   and approval requires explicit user consent.
+    /// Reconcile any `provisional` contacts left on disk after a reload/crash during `start_chat`
+    /// (both outbound Phase 2–3 `provisional && !request` and existing-request acceptance Phase A
+    /// `provisional && request`, `R10-P1-1`):
+    /// - Pure abandoned outbound starts (`!request`, `history_len <= 1`, `!is_known_by_peer()`,
+    ///   `!quarantined`) are rolled back cleanly (staging a `PendingRevoke`, restoring any
+    ///   `fallback_farewells`, and calling `forget_peer`; if storage fails transiently, they are
+    ///   neutralized into unaccepted requests so they never strand as bricked active chats).
+    /// - Crossed-start contacts and interrupted existing-request acceptances (`provisional &&
+    ///   request`) are preserved as explicit unaccepted requests (`request = true, provisional =
+    ///   false`) with `pending_register_grants` cleared and a `PendingRevoke` staged for any
+    ///   abandoned grant so the peer's message is not lost and approval requires explicit consent.
     pub(super) async fn cleanup_abandoned_provisional_contacts(&mut self) -> Vec<PublicKey> {
         let targets: Vec<(PublicKey, bool)> = self
             .contacts
             .iter()
-            .filter(|c| c.state.provisional && !c.state.request)
+            .filter(|c| c.state.provisional)
             .map(|c| {
-                let pure_abandoned = c.state.history_len <= 1
+                let pure_abandoned = !c.state.request
+                    && c.state.history_len <= 1
                     && !c.session.is_known_by_peer()
                     && !c.state.quarantined;
                 (c.peer, pure_abandoned)
@@ -3006,7 +3040,9 @@ impl<V: VaultStore> Inner<V> {
                         });
                     }
                 }
-                self.unsaved_state = true;
+                if self.save_state().await.is_err() {
+                    self.unsaved_state = true;
+                }
                 cleaned.push(peer);
             }
         }

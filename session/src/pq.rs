@@ -514,7 +514,7 @@ mod v2 {
         pub(crate) prev_manifest_seq: u64,
         pub(crate) prev_prekey_generation: u64,
         pub(crate) manifest_digest: [u8; 32],
-        pub(crate) evicted_manifest_digest: Vec<(usize, [u8; 32], Option<PublicKey>)>,
+        pub(crate) evicted_manifest_digest: Vec<crate::EvictedManifestDigest>,
         pub(crate) classical: PublishedPrekeys,
         pub(crate) rollback: PrekeyRollback,
         pub(crate) was_publishing: bool,
@@ -653,17 +653,31 @@ mod v2 {
 
         /// Whether this initial message references a classical one-time prekey.
         pub fn uses_one_time_prekey(&self) -> bool {
+            self.one_time_prekey().is_some()
+        }
+
+        /// Classical one-time prekey public key referenced by this initial message, if any.
+        pub fn one_time_prekey(&self) -> Option<PublicKey> {
             match &self.kind {
-                InitialMessageKind::Classical { x3dh, .. } => x3dh.one_time_prekey.is_some(),
-                InitialMessageKind::Pq { x3dh, .. } => x3dh.one_time_prekey.is_some(),
+                InitialMessageKind::Classical { x3dh, .. } => x3dh.one_time_prekey,
+                InitialMessageKind::Pq { x3dh, .. } => x3dh.one_time_prekey,
             }
         }
 
         /// Whether this initial message references a one-time PQOPK (as opposed to last-resort).
         pub fn uses_pq_one_time_prekey(&self) -> bool {
+            self.pq_one_time_prekey_id().is_some()
+        }
+
+        /// One-time PQOPK identifier referenced by this initial message, if any (returns `None`
+        /// for classical initials or last-resort PQSPK handshakes).
+        pub fn pq_one_time_prekey_id(&self) -> Option<PqPrekeyId> {
             match &self.kind {
-                InitialMessageKind::Classical { .. } => false,
-                InitialMessageKind::Pq { x3dh, .. } => !x3dh.pq_last_resort,
+                InitialMessageKind::Classical { .. } => None,
+                InitialMessageKind::Pq { x3dh, .. } if !x3dh.pq_last_resort => {
+                    Some(x3dh.pq_prekey_id)
+                }
+                InitialMessageKind::Pq { .. } => None,
             }
         }
 
@@ -1434,9 +1448,11 @@ mod v2 {
             self.state.manifest_seq = manifest_seq;
             self.state.prekey_generation = generation;
             self.state.publishing = true;
-            let evicted_manifest_digest = self
-                .state
-                .stage_manifest_digest(own_digest, preserve_manifest_digests);
+            let evicted_manifest_digest = self.state.stage_manifest_digest(
+                own_digest,
+                Some(classical.signed_prekey),
+                preserve_manifest_digests,
+            );
 
             Ok(PreparedPublishV2 {
                 request,
@@ -1601,11 +1617,11 @@ mod v2 {
                     .filter(|d| {
                         **d != prepared.manifest_digest
                             && (preserve_manifest_digests.contains(d)
-                                || self
-                                    .state
-                                    .manifest_digest_spks
-                                    .get(*d)
-                                    .is_some_and(|spk| post_commit_spks.contains(spk)))
+                                || self.state.manifest_digest_spks.get(*d).is_some_and(
+                                    |&(spk, confirmed)| {
+                                        confirmed && post_commit_spks.contains(&spk)
+                                    },
+                                ))
                     })
                     .count();
                 if preserved_other >= crate::MAX_RETAINED_MANIFEST_DIGESTS {
@@ -1665,9 +1681,11 @@ mod v2 {
                 prepared.manifest_digest,
                 &prepared.evicted_manifest_digest,
             );
-            let evicted_manifest_digest = self
-                .state
-                .stage_manifest_digest(off_digest, preserve_manifest_digests);
+            let evicted_manifest_digest = self.state.stage_manifest_digest(
+                off_digest,
+                Some(prepared.classical.signed_prekey),
+                preserve_manifest_digests,
+            );
             self.state.manifest_seq = off_manifest_seq;
             self.state.publishing = true;
 

@@ -54,6 +54,9 @@ message SignedPrekeyManifestDigest {
   bytes digest = 1;
   // Signed prekey public key bound by that manifest (32 bytes).
   bytes signed_prekey = 2;
+  // Inverted so default/absent means confirmed stored on the relay; true for staged/ambiguous
+  // attempts that have not been confirmed by commit or GetManifest reconciliation.
+  bool unconfirmed = 3;
 }
 
 // Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
