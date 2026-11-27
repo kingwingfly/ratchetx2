@@ -28,6 +28,10 @@ impl fmt::Debug for ClientState {
             .field("mailbox_cursor", &self.mailbox_cursor)
             .field("pending_mailbox_ack", &self.pending_mailbox_ack)
             .field("next_grant_version", &self.next_grant_version)
+            .field(
+                "confirmed_manifest_digests",
+                &self.confirmed_manifest_digests.len(),
+            )
             .finish_non_exhaustive()
     }
 }

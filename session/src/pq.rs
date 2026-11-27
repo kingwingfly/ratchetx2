@@ -1488,10 +1488,13 @@ mod v2 {
                 eff_spks.push(spk);
             }
             let relay_digest = manifest_digest(m).ok();
-            if let Some(d) = relay_digest
-                && !eff_digests.contains(&d)
-            {
-                eff_digests.push(d);
+            if let Some(d) = relay_digest {
+                // Record the verified relay manifest digest as confirmed so subsequent failed
+                // publish attempts can never evict it from the rolling 16-entry window.
+                self.state.record_confirmed_manifest_digest(d);
+                if !eff_digests.contains(&d) {
+                    eff_digests.push(d);
+                }
             }
             let landed = relay_spk.is_some()
                 && relay_spk == self.state.prekeys.current_signed_prekey()
@@ -1528,11 +1531,13 @@ mod v2 {
         /// prekey generations and rolling manifest digests outside the preserved sets.
         pub fn commit_publish_v2_preserving(
             &mut self,
-            _prepared: PreparedPublishV2,
+            prepared: PreparedPublishV2,
             preserve_signed_prekeys: &[PublicKey],
             preserve_manifest_digests: &[[u8; 32]],
         ) {
             self.state.publishing = false;
+            self.state
+                .record_confirmed_manifest_digest(prepared.manifest_digest);
             self.state.prekeys.prune_to_kept(preserve_signed_prekeys);
             self.state
                 .prune_manifest_digests_preserving(preserve_manifest_digests);
@@ -1715,6 +1720,30 @@ mod v2 {
             one_time_count: usize,
             pq_one_time_count: usize,
         ) -> Result<PreparedRefillV2> {
+            let offered = self.state.pq_config.offered_suites();
+            let per_suite: Vec<(PqSuite, usize)> = if pq_one_time_count > 0 {
+                offered
+                    .iter()
+                    .copied()
+                    .map(|s| (s, pq_one_time_count))
+                    .collect()
+            } else {
+                vec![]
+            };
+            self.prepare_refill_v2_per_suite(audience, one_time_count, &per_suite)
+        }
+
+        /// Prepare a non-rotating prekey refill request with explicit per-suite PQ one-time counts
+        /// so skewed demand (e.g. every peer preferring ML-KEM-1024) replenishes depleted suites
+        /// without over-filling unused suites.
+        ///
+        /// Persist `self.state()` BEFORE calling [`Client::transmit_refill_v2`].
+        pub fn prepare_refill_v2_per_suite(
+            &mut self,
+            audience: &str,
+            one_time_count: usize,
+            pq_counts: &[(PqSuite, usize)],
+        ) -> Result<PreparedRefillV2> {
             if audience.trim().is_empty() {
                 return Err(ErrorKind::Protocol.into());
             }
@@ -1727,25 +1756,35 @@ mod v2 {
             self.state.pq_config.validate()?;
             let offered = self.state.pq_config.offered_suites();
             let pq_enabled = self.state.pq_config.pq_enabled && !offered.is_empty();
+            let active_pq: Vec<(PqSuite, usize)> = if pq_enabled {
+                pq_counts
+                    .iter()
+                    .copied()
+                    .filter(|(suite, count)| *count > 0 && offered.contains(suite))
+                    .collect()
+            } else {
+                vec![]
+            };
             let prev_last_timestamp = self.state.last_timestamp;
             let timestamp = self.next_timestamp()?;
 
             let (classical_opks, pq_opk_wire, pq_opk_ids) = {
                 #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-                let pq_branch = pq_enabled && pq_one_time_count > 0;
+                let pq_branch = !active_pq.is_empty();
                 #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
                 let pq_branch = {
-                    let _ = (pq_enabled, pq_one_time_count);
+                    let _ = &active_pq;
                     false
                 };
                 if pq_branch {
                     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
                     {
+                        let (first_suite, first_count) = active_pq[0];
                         let first = match self.state.prekeys.refill_pq_only(
                             &self.state.identity,
-                            offered[0],
+                            first_suite,
                             one_time_count,
-                            pq_one_time_count,
+                            first_count,
                         ) {
                             Ok(first) => first,
                             Err(err) => {
@@ -1760,12 +1799,12 @@ mod v2 {
                             .collect();
                         let mut pq_ids: Vec<PqPrekeyId> =
                             first.pq_one_time_prekeys.iter().map(|k| k.id).collect();
-                        for &extra_suite in &offered[1..] {
+                        for &(extra_suite, extra_count) in &active_pq[1..] {
                             match self.state.prekeys.refill_pq_only(
                                 &self.state.identity,
                                 extra_suite,
                                 0,
-                                pq_one_time_count,
+                                extra_count,
                             ) {
                                 Ok(extra) => {
                                     pq_ids.extend(extra.pq_one_time_prekeys.iter().map(|k| k.id));

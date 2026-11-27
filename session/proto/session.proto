@@ -38,6 +38,10 @@ message ClientState {
   uint64 pending_mailbox_ack = 13;
   // Identity-wide monotonic write-token grant version counter (starts at 1; 0 treated as 1).
   uint64 next_grant_version = 14;
+  // SHA-256 digests (32 bytes each) of CapabilityManifests confirmed stored on the relay
+  // (bounded <= 16); prioritized ahead of unconfirmed staged digests so repeated failed
+  // publish attempts cannot evict the last confirmed relay manifest digest.
+  repeated bytes confirmed_manifest_digests = 15;
 }
 
 // Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.

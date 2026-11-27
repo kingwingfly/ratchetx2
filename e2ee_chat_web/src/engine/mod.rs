@@ -173,6 +173,17 @@ pub struct Engine<V = Vault> {
     inbox_lock: Mutex<()>,
     /// Serializes full prekey/manifest publishes without holding `self.inner` across network RTTs.
     publish_lock: Mutex<()>,
+    /// Serializes `RevokeWriteToken` and `RegisterWriteToken` RPCs across `sync()` and interactive
+    /// flows (e.g. `accept_for_gen`) so a delayed cancellation revoke can never land after a newer
+    /// grant registration for the same peer slot. Strictly below `peer_flush_lock`, `publish_lock`,
+    /// and `inbox_lock`, and strictly above `Engine::inner`.
+    grant_sync_lock: Mutex<()>,
+    /// Whether `take_initial_messages_with_replayed` has cleanly drained the relay inbox (`has_more
+    /// == false` with zero unacked deferred items and empty `pending_inbox_acks`) since the latest
+    /// unlock or inbox list start. Conservative `false` until proven clean so manual/mandatory
+    /// publishes preserve `oldest_evictable_signed_prekey` instead of destroying a key needed by a
+    /// `listed = 1` greeting.
+    inbox_drained_clean: Cell<bool>,
     /// Monotonic vault lifecycle generation bumped on every create/unlock and synchronously inside
     /// [`Engine::teardown_on_pagehide`] so any in-flight async continuation aborts cleanly without
     /// mutating IndexedDB or repopulating `Ui` signals.
@@ -329,10 +340,17 @@ pub(super) struct Inner<V = Vault> {
     audience: String,
     /// Server PQ availability discovered via `check_server_info`.
     server_pq: ServerPqStatus,
-    /// Last known server-stored classical OPK count (from publish or `RefillPrekeysResponse`).
+    /// Monotonic epoch bumped whenever a `GetServerInfo` probe starts or a publish/refill/initial
+    /// outcome updates `server_pq`, so stale delayed `GetServerInfo` replies are discarded.
+    server_pq_epoch: u64,
+    /// Last known server-stored classical OPK count (baseline at last publish or refill response,
+    /// before subtracting `state.used_one_time_prekeys`).
     last_server_classical_opks: Option<u32>,
-    /// Last known server-stored total PQOPK count across all suites.
-    last_server_pq_opks: Option<u32>,
+    /// Last known server-stored PQOPK counts keyed by `PqSuite` (baseline at last publish or
+    /// `RefillPrekeysResponse`, before subtracting `used_pq_by_suite`).
+    last_server_pq_opks_by_suite: Option<std::collections::BTreeMap<session::PqSuite, u32>>,
+    /// Per-suite PQOPKs consumed locally since the latest publish or refill baseline.
+    used_pq_by_suite: std::collections::BTreeMap<session::PqSuite, u32>,
     /// What is saved besides the client and the contacts, which are kept below.
     state: AppState,
     /// Encrypted inbox initials retained in the separate `deferred` vault sidecar record.
@@ -428,6 +446,8 @@ impl<V: VaultStore> Engine<V> {
             mailbox_lock: Mutex::new(()),
             inbox_lock: Mutex::new(()),
             publish_lock: Mutex::new(()),
+            grant_sync_lock: Mutex::new(()),
+            inbox_drained_clean: Cell::new(false),
             vault_generation: Cell::new(0),
             shutting_down: Cell::new(false),
             ws_close: RefCell::new(None),
@@ -464,6 +484,7 @@ impl<V: VaultStore> Engine<V> {
     pub(super) fn bump_vault_generation(&self) -> u64 {
         let next = self.vault_generation.get().wrapping_add(1).max(1);
         self.vault_generation.set(next);
+        self.inbox_drained_clean.set(false);
         next
     }
 
@@ -622,8 +643,10 @@ impl<V: VaultStore> Engine<V> {
     ) -> bool {
         if outgoing_is_pq && error.is_server_refusal() && error.kind() == ErrorKind::Unimplemented {
             if inner.server_pq != ServerPqStatus::Disabled {
-                inner.server_pq = ServerPqStatus::Disabled;
+                inner.set_server_pq(ServerPqStatus::Disabled);
                 self.ui.me.set(Some(inner.me()));
+            } else {
+                inner.bump_server_pq_epoch();
             }
             return false;
         }
@@ -2824,8 +2847,10 @@ impl<V: VaultStore> Inner<V> {
             isolated_contacts,
             isolated_peers,
             server_pq: ServerPqStatus::Unknown,
+            server_pq_epoch: 0,
             last_server_classical_opks: None,
-            last_server_pq_opks: None,
+            last_server_pq_opks_by_suite: None,
+            used_pq_by_suite: std::collections::BTreeMap::new(),
             unsaved_state: false,
             deferred_acks_after_save: vec![],
             contacts_dirty_late: false,
@@ -2942,12 +2967,21 @@ impl<V: VaultStore> Inner<V> {
                 self.unsaved_state = true;
                 cleaned.push(peer);
             } else {
-                // Crossed-start inbound message arrived before the crash: convert to an explicit
-                // unaccepted request while revoking any abandoned outbound grant.
+                // Crossed-start inbound message or quarantined request arrived before the crash:
+                // convert to an explicit unaccepted request while revoking any abandoned outbound
+                // grant AND discarding our never-transmitted outbound session if it is still
+                // `active` (`!is_known_by_peer()`) so later acceptance or classical approval never
+                // wedges on the dead outbound session.
                 if let Some(contact) = self.contact(&peer) {
+                    if !contact.session.is_known_by_peer() {
+                        contact.session.discard_active();
+                    }
                     contact.session.clear_pending_grants();
                     contact.state.request = true;
                     contact.state.provisional = false;
+                    contact.state.greeting_delivery = crate::vault::GREETING_DELIVERY_CONFIRMED;
+                    contact.state.greeting_sent_at = 0;
+                    contact.state.awaiting_peer_acceptance = false;
                 }
                 if let Some((slot, min_ver)) = staged_revoke {
                     if let Some(existing) = self
@@ -2969,6 +3003,16 @@ impl<V: VaultStore> Inner<V> {
             }
         }
         cleaned
+    }
+
+    pub(super) fn bump_server_pq_epoch(&mut self) -> u64 {
+        self.server_pq_epoch = self.server_pq_epoch.wrapping_add(1).max(1);
+        self.server_pq_epoch
+    }
+
+    pub(super) fn set_server_pq(&mut self, status: ServerPqStatus) {
+        self.server_pq = status;
+        self.bump_server_pq_epoch();
     }
 
     /// Allocate the next vault-wide monotonic conversation generation for a newly created contact.

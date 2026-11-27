@@ -448,9 +448,15 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 return Ok(RegisterWriteTokenOutcome::StaleVersion);
             }
 
-            // Duplicate `token_hash` for the same `peer_slot_id`: NEVER overwrite stored
-            // `grant_version` or `created_at`; only pin `active_token_hash` (advancing
-            // `max_version`) when `pin_active && (grant_version > max_version || active is NULL)`.
+            // Duplicate `token_hash` for the same `peer_slot_id`:
+            // - For non-pinned (`!pin_active`) or lower-version retries, preserve stored
+            //   `grant_version` and `created_at` so duplicate calls never refresh eviction
+            //   priority.
+            // - When re-pinning as `active_token_hash` at a newer version (`pin_active &&
+            //   (grant_version > max_version || active_token_hash IS NULL)`), advance both
+            //   `peer_grants.max_version` AND `write_tokens.grant_version = max(grant_version, ?)`
+            //   so a delayed lower-version `RevokeWriteToken` can never delete the newly re-pinned
+            //   active grant (pinned tokens are already exempt from 4-grant eviction).
             if existing_token.is_some() {
                 if let Some(ref p) = peer
                     && record.pin_active
@@ -466,6 +472,12 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                             next_max,
                             record.peer_slot_id.as_slice()
                         ]?,
+                    )?;
+                    sql.exec(
+                        "UPDATE write_tokens \
+                         SET grant_version = max(grant_version, ?) \
+                         WHERE token_hash = ?",
+                        params![record.grant_version, record.token_hash.as_slice()]?,
                     )?;
                 }
                 return Ok(RegisterWriteTokenOutcome::Registered);
@@ -1480,6 +1492,59 @@ mod tests {
                     )
                     .unwrap(),
                 RegisterWriteTokenOutcome::StaleTimestamp
+            );
+
+            // R7-P2-1: Re-pinning an existing token at a higher version advances its stored
+            // `grant_version` so a delayed lower-version peer-wide revoke cannot delete it.
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(3),
+                            token_hash: tok(30),
+                            grant_version: 1,
+                            pin_active: true,
+                            timestamp: now_ms,
+                        },
+                        now_ms,
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::Registered
+            );
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(3),
+                            token_hash: tok(30),
+                            grant_version: 3,
+                            pin_active: true,
+                            timestamp: now_ms,
+                        },
+                        now_ms,
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::Registered
+            );
+            assert_eq!(
+                store
+                    .revoke_write_token(
+                        &RevokeWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(3),
+                            token_hash: None,
+                            min_grant_version: 2,
+                        },
+                        now_ms,
+                    )
+                    .unwrap(),
+                RevokeWriteTokenOutcome::Revoked(0)
+            );
+            assert!(
+                store.has_write_token(&tok(30)).unwrap(),
+                "re-pinned grant at v3 must survive delayed revoke at min_grant_version=2"
             );
         }
     }

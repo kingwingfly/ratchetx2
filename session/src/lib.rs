@@ -248,6 +248,17 @@ pub struct ClientState {
     /// SHA-256 digests of recent `CapabilityManifest`s signed by this client (bounded by
     /// `MAX_RECENT_MANIFEST_DIGESTS`).
     pub(crate) recent_manifest_digests: Vec<[u8; 32]>,
+    /// SHA-256 digests of `CapabilityManifest`s confirmed stored on the relay (bounded by
+    /// `MAX_RECENT_MANIFEST_DIGESTS`). Prioritized ahead of unconfirmed staged digests so repeated
+    /// failed publish attempts cannot evict the last confirmed relay manifest digest.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
+        )
+    )]
+    pub(crate) confirmed_manifest_digests: Vec<[u8; 32]>,
     /// Unified mailbox high-water sequence number last committed locally.
     pub(crate) mailbox_cursor: u64,
     /// Unified mailbox sequence number committed locally and awaiting server prefix ACK (`0` if none).
@@ -267,9 +278,37 @@ impl ClientState {
             manifest_seq: 0,
             prekey_generation: 0,
             recent_manifest_digests: vec![],
+            confirmed_manifest_digests: vec![],
             mailbox_cursor: 0,
             pending_mailbox_ack: 0,
             next_grant_version: 1,
+        }
+    }
+
+    /// Record a manifest digest that has been confirmed stored on the relay (either via a
+    /// confirmed `PublishV2` commit or a verified `GetManifest` reconciliation).
+    pub(crate) fn record_confirmed_manifest_digest(&mut self, digest: [u8; 32]) {
+        if let Some(pos) = self
+            .confirmed_manifest_digests
+            .iter()
+            .position(|d| *d == digest)
+        {
+            self.confirmed_manifest_digests.remove(pos);
+        }
+        self.confirmed_manifest_digests.push(digest);
+        while self.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
+            self.confirmed_manifest_digests.remove(0);
+        }
+        if !self.recent_manifest_digests.contains(&digest) {
+            self.recent_manifest_digests.push(digest);
+            while self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS {
+                let candidate_end = self.recent_manifest_digests.len() - 1;
+                let evict_idx = self.recent_manifest_digests[..candidate_end]
+                    .iter()
+                    .position(|d| !self.confirmed_manifest_digests.contains(d))
+                    .unwrap_or(0);
+                self.recent_manifest_digests.remove(evict_idx);
+            }
         }
     }
 
@@ -285,7 +324,8 @@ impl ClientState {
 
     /// Stage a freshly signed manifest digest WITHOUT evicting any existing rolling digest yet
     /// (allowing up to `MAX_STORED_MANIFEST_DIGESTS` while a publish is in flight). Only trims if
-    /// already at the hard `MAX_STORED_MANIFEST_DIGESTS` ceiling. Call
+    /// already at the hard `MAX_STORED_MANIFEST_DIGESTS` ceiling, preferring to evict unconfirmed
+    /// non-preserved staged digests first. Call
     /// [`prune_manifest_digests_preserving`](Self::prune_manifest_digests_preserving) on commit.
     pub(crate) fn stage_manifest_digest(
         &mut self,
@@ -305,7 +345,12 @@ impl ClientState {
             let candidate_end = self.recent_manifest_digests.len() - 1;
             let evict_idx = self.recent_manifest_digests[..candidate_end]
                 .iter()
-                .position(|d| !preserve.contains(d))
+                .position(|d| !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d))
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| !preserve.contains(d))
+                })
                 .unwrap_or(0);
             evicted.push((evict_idx, self.recent_manifest_digests.remove(evict_idx)));
         }
@@ -314,7 +359,8 @@ impl ClientState {
 
     /// Trim `recent_manifest_digests` down to at most `MAX_RECENT_MANIFEST_DIGESTS` rolling
     /// non-preserved digests PLUS preserved digests (up to `MAX_RETAINED_MANIFEST_DIGESTS` total),
-    /// never evicting the newest `last()` entry. Called once a publish is confirmed on the relay.
+    /// never evicting the newest `last()` entry and prioritizing confirmed relay digests ahead of
+    /// unconfirmed staged attempts. Called once a publish is confirmed on the relay.
     pub(crate) fn prune_manifest_digests_preserving(&mut self, preserve: &[[u8; 32]]) {
         loop {
             let candidate_end = self.recent_manifest_digests.len().saturating_sub(1);
@@ -328,7 +374,12 @@ impl ClientState {
             }
             let Some(evict_idx) = self.recent_manifest_digests[..candidate_end]
                 .iter()
-                .position(|d| !preserve.contains(d))
+                .position(|d| !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d))
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| !preserve.contains(d))
+                })
             else {
                 break;
             };
@@ -338,7 +389,12 @@ impl ClientState {
             let candidate_end = self.recent_manifest_digests.len() - 1;
             let evict_idx = self.recent_manifest_digests[..candidate_end]
                 .iter()
-                .position(|d| !preserve.contains(d))
+                .position(|d| !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d))
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| !preserve.contains(d))
+                })
                 .unwrap_or(0);
             self.recent_manifest_digests.remove(evict_idx);
         }
@@ -406,6 +462,7 @@ impl ClientState {
             || self.next_grant_version == 0
             || self.next_grant_version > protocol::MAX_SAFE_INTEGER
             || self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS
+            || self.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
             || (self.manifest_seq > 0 && self.recent_manifest_digests.is_empty())
         {
             return Err(ErrorKind::MalformedState.into());
@@ -486,6 +543,11 @@ struct RawClientState {
         deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_MANIFEST_DIGESTS>"
     )]
     recent_manifest_digests: Vec<[u8; 32]>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
+    )]
+    confirmed_manifest_digests: Vec<[u8; 32]>,
     #[serde(default)]
     mailbox_cursor: u64,
     #[serde(default)]
@@ -508,6 +570,7 @@ impl TryFrom<RawClientState> for ClientState {
             manifest_seq: raw.manifest_seq,
             prekey_generation: raw.prekey_generation,
             recent_manifest_digests: raw.recent_manifest_digests,
+            confirmed_manifest_digests: raw.confirmed_manifest_digests,
             mailbox_cursor: raw.mailbox_cursor,
             pending_mailbox_ack: raw.pending_mailbox_ack,
             next_grant_version: raw.next_grant_version.max(1),
@@ -533,6 +596,11 @@ impl From<&ClientState> for proto::ClientState {
             prekey_generation: state.prekey_generation,
             recent_manifest_digests: state
                 .recent_manifest_digests
+                .iter()
+                .map(|d| d.to_vec())
+                .collect(),
+            confirmed_manifest_digests: state
+                .confirmed_manifest_digests
                 .iter()
                 .map(|d| d.to_vec())
                 .collect(),
@@ -565,11 +633,21 @@ impl TryFrom<&proto::ClientState> for ClientState {
         if state.strict_pq && (state.pq_disabled || !has_pq) {
             return Err(ErrorKind::MalformedState.into());
         }
-        if state.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS {
+        if state.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS
+            || state.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+        {
             return Err(ErrorKind::MalformedState.into());
         }
         let recent_manifest_digests = state
             .recent_manifest_digests
+            .iter()
+            .map(|d| {
+                <[u8; 32]>::try_from(d.as_slice())
+                    .map_err(|_| Error::from(ErrorKind::MalformedState))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let confirmed_manifest_digests = state
+            .confirmed_manifest_digests
             .iter()
             .map(|d| {
                 <[u8; 32]>::try_from(d.as_slice())
@@ -596,6 +674,7 @@ impl TryFrom<&proto::ClientState> for ClientState {
             manifest_seq: state.manifest_seq,
             prekey_generation: state.prekey_generation,
             recent_manifest_digests,
+            confirmed_manifest_digests,
             mailbox_cursor: state.mailbox_cursor,
             pending_mailbox_ack: state.pending_mailbox_ack,
             next_grant_version: state.next_grant_version.max(1),
@@ -4643,6 +4722,50 @@ mod test {
             assert_eq!(
                 ClientState::try_from(&strict_raw).unwrap_err().kind(),
                 ErrorKind::MalformedState
+            );
+        }
+    }
+
+    #[test]
+    fn r7_p2_2_ambiguous_failed_publishes_never_evict_confirmed_relay_manifest_digest() {
+        let mut client = Client::new(());
+        let p1 = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let m1 = p1.request.manifest.clone().unwrap();
+        let d1 = protocol::handshake_v2::manifest_digest(&m1).unwrap();
+        client.commit_publish_v2(p1);
+        assert!(client.state.confirmed_manifest_digests.contains(&d1));
+        assert!(client.state.recent_manifest_digests.contains(&d1));
+
+        // Simulate 20 consecutive ambiguous publish attempts that fail before reaching the relay
+        // (`reconcile_interrupted_publish` observes `m1` on the relay, keeps `publishing = true`,
+        // and each attempt stages a distinct unconfirmed manifest digest).
+        for _ in 0..20 {
+            let prep = client.prepare_publish_v2("relay.example", 1, 1).unwrap();
+            drop(prep);
+            assert!(!client.reconcile_interrupted_publish(Some(&m1), &[], &[]));
+        }
+        // 21st attempt succeeds and commits: `prune_manifest_digests_preserving` trims rolling
+        // digests to 16, evicting unconfirmed staged attempts FIRST and strictly preserving `d1`!
+        let p_ok = client.prepare_publish_v2("relay.example", 1, 1).unwrap();
+        let d_ok = protocol::handshake_v2::manifest_digest(p_ok.request.manifest.as_ref().unwrap())
+            .unwrap();
+        client.commit_publish_v2(p_ok);
+        assert!(
+            client.state.recent_manifest_digests.contains(&d1),
+            "last confirmed relay manifest digest d1 must survive 20+ failed publish attempts"
+        );
+        assert!(client.state.recent_manifest_digests.contains(&d_ok));
+        assert!(client.state.confirmed_manifest_digests.contains(&d1));
+        assert!(client.state.confirmed_manifest_digests.contains(&d_ok));
+        assert!(client.state.recent_manifest_digests.len() <= MAX_RECENT_MANIFEST_DIGESTS);
+
+        #[cfg(feature = "prost")]
+        {
+            let wire = proto::ClientState::from(client.state());
+            let restored = ClientState::try_from(&wire).unwrap();
+            assert_eq!(
+                restored.confirmed_manifest_digests,
+                client.state.confirmed_manifest_digests
             );
         }
     }

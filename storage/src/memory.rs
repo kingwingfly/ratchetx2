@@ -1214,10 +1214,14 @@ impl IdempotentMailboxStore for MemoryStore {
                 return Err(ErrorKind::StaleVersion.into());
             }
 
-            // Duplicate token_hash for the same peer_slot_id: NEVER overwrite stored grant_version
-            // or created_at; only pin active_token_hash if pin_active && (grant_version > max_version
-            // || active_token_hash.is_none()), and advance max_version on pin.
-            if mailbox.write_tokens.contains_key(&record.token_hash) {
+            // Duplicate token_hash for the same peer_slot_id:
+            // - For non-pinned or lower-version retries, preserve stored grant_version and
+            //   created_at so duplicate calls never refresh eviction priority.
+            // - When re-pinning active_token_hash at a newer version (pin_active &&
+            //   (grant_version > max_version || active_token_hash.is_none())), advance both
+            //   peer.max_version and entry.grant_version so a delayed lower-version revoke can
+            //   never wipe the newly re-pinned active grant.
+            if let Some(entry) = mailbox.write_tokens.get_mut(&record.token_hash) {
                 let peer = mailbox
                     .peer_grants
                     .get_mut(&record.peer_slot_id)
@@ -1227,6 +1231,7 @@ impl IdempotentMailboxStore for MemoryStore {
                 {
                     peer.active_token_hash = Some(record.token_hash);
                     peer.max_version = peer.max_version.max(record.grant_version);
+                    entry.grant_version = entry.grant_version.max(record.grant_version);
                 }
                 return Ok(());
             }
@@ -2370,6 +2375,53 @@ mod test {
                 crate::InitialDisposition::Added(id_listed)
             );
             assert!(id_unlisted > id_listed);
+
+            // 7. R7-P2-1: Re-pinning an existing active token at a higher version advances its
+            //    stored `grant_version` so a delayed lower-version revoke cannot delete it.
+            let slot_r7 = [0x77; 32];
+            let tok_r7 = [0x78; 32];
+            let now_ms = wall_clock_ms();
+            store
+                .register_write_token(RegisterWriteTokenRecord {
+                    recipient: bob,
+                    peer_slot_id: slot_r7,
+                    token_hash: tok_r7,
+                    grant_version: 1,
+                    pin_active: true,
+                    timestamp: now_ms,
+                })
+                .await
+                .unwrap();
+            store
+                .register_write_token(RegisterWriteTokenRecord {
+                    recipient: bob,
+                    peer_slot_id: slot_r7,
+                    token_hash: tok_r7,
+                    grant_version: 3,
+                    pin_active: true,
+                    timestamp: now_ms,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .revoke_write_token(RevokeWriteTokenRecord {
+                        recipient: bob,
+                        peer_slot_id: slot_r7,
+                        token_hash: None,
+                        min_grant_version: 2,
+                    })
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert!(
+                store
+                    .append_idempotent(&bob, &tok_r7, Bytes::new(), Bytes::new(), None, None)
+                    .await
+                    .is_ok(),
+                "re-pinned grant at v3 must survive delayed revoke at min_grant_version=2"
+            );
         });
     }
 }

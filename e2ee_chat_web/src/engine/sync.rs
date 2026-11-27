@@ -187,6 +187,14 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(());
         }
+        // Flush any queued `PendingRevoke` for `peer`'s slot (serialized against background
+        // `flush_pending_revokes` under `grant_sync_lock`) BEFORE issuing any `RegisterWriteToken`
+        // for `peer`, then release `grant_sync_lock` so concurrent grant registrations remain
+        // non-blocking.
+        self.flush_pending_revoke_for_peer(vgen, peer).await?;
+        if !self.is_live(vgen) {
+            return Ok(());
+        }
         let mut first_err: Option<String> = None;
         let mut attempted: Vec<([u8; 32], u64)> = Vec::new();
         loop {
@@ -364,10 +372,91 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
+    /// Flush any pending `RevokeWriteToken` targeting `peer`'s slot under `self.grant_sync_lock`
+    /// (waiting for any in-flight `flush_pending_revokes` call to finish first). Must complete
+    /// before sending `RegisterWriteToken` for `peer` so a delayed cancellation revoke never
+    /// deletes a freshly re-registered grant.
+    async fn flush_pending_revoke_for_peer(
+        &self,
+        vgen: u64,
+        peer: &PublicKey,
+    ) -> Result<(), String> {
+        let _grant_guard = self.grant_sync_lock.lock().await;
+        loop {
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let next = {
+                let guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                let Some(inner) = guard.as_ref() else {
+                    return Ok(());
+                };
+                let slot_id = inner.client.peer_slot_id(peer);
+                let Some(revoke) = inner
+                    .state
+                    .pending_revokes
+                    .iter()
+                    .find(|r| r.peer_slot_id.as_slice() == slot_id.as_slice())
+                    .cloned()
+                else {
+                    return Ok(());
+                };
+                match inner.client.sign_revoke_write_token_v2(
+                    &inner.audience,
+                    &slot_id,
+                    None,
+                    revoke.min_grant_version,
+                ) {
+                    Ok(request) => (inner.server.clone(), revoke, request),
+                    Err(e) => {
+                        if e.kind() == ErrorKind::ClockSkew {
+                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                        }
+                        return Err(describe(&e));
+                    }
+                }
+            };
+            let (server, revoke, request) = next;
+            let rpc_res: session::Result<_> = Fetch::client(&server)
+                .revoke_write_token(request)
+                .await
+                .map_err(session::Error::from);
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            match rpc_res {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                    return Err(describe(&e));
+                }
+            }
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(());
+            };
+            if let Some(pos) = inner.state.pending_revokes.iter().position(|r| {
+                r.peer_slot_id == revoke.peer_slot_id
+                    && r.min_grant_version <= revoke.min_grant_version
+            }) {
+                inner.state.pending_revokes.remove(pos);
+                inner.save_state().await.map_err(|e| describe(&e))?;
+            }
+        }
+    }
+
     /// Flush durably staged `RevokeWriteToken` entries from `AppState.pending_revokes` without
     /// holding `self.inner` across network RPCs.
     pub(super) async fn flush_pending_revokes(&self) -> Result<(), String> {
         let vgen = self.vault_gen();
+        let _grant_guard = self.grant_sync_lock.lock().await;
         loop {
             if !self.is_live(vgen) {
                 return Ok(());
@@ -696,20 +785,20 @@ impl<V: VaultStore> Engine<V> {
     /// across the network RPC.
     pub(super) async fn refresh_server_info(&self, force: bool) {
         let vgen = self.vault_gen();
-        let probe = {
-            let guard = self.lock_inner().await;
+        let (server, audience, probe_epoch) = {
+            let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return;
             }
-            let Some(inner) = guard.as_ref() else {
+            let Some(inner) = guard.as_mut() else {
                 return;
             };
             if !force && inner.server_pq != ServerPqStatus::Unknown {
                 return;
             }
-            (inner.server.clone(), inner.audience.clone())
+            let probe_epoch = inner.bump_server_pq_epoch();
+            (inner.server.clone(), inner.audience.clone(), probe_epoch)
         };
-        let (server, audience) = probe;
         let info_res = session::check_server_info_with(&Fetch::client(&server), &audience).await;
         if !self.is_live(vgen) {
             return;
@@ -721,6 +810,11 @@ impl<V: VaultStore> Engine<V> {
         let Some(inner) = guard.as_mut() else {
             return;
         };
+        if inner.server_pq_epoch != probe_epoch {
+            // A newer `GetServerInfo` probe or authoritative publish/refill outcome already
+            // updated server capabilities while this probe was in flight: discard stale reply.
+            return;
+        }
         let status = match info_res {
             Ok(info) if info.pq_enabled => {
                 if !inner.client.clock().is_drift_exceeded() {

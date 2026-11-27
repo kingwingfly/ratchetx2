@@ -575,6 +575,22 @@ impl<V: VaultStore> Engine<V> {
                     }));
                     break;
                 }
+                // If the outbox is empty, `Events { accepted: true }` is queued (e.g. user
+                // accepted a cancelled crossed-start request whose dead outbound session was
+                // discarded), and no active session exists yet, establish a fresh session so the
+                // acceptance immediately reaches the peer instead of stalling until the next text.
+                if matches!(step, NextPush::Done)
+                    && let Some(contact) = inner.contact(peer)
+                    && contact.state.outbox.is_empty()
+                    && !contact.state.request
+                    && !contact.state.quarantined
+                    && contact.state.classical_approval_needed == CLASSICAL_APPROVAL_NONE
+                    && contact.state.security_alert == SECURITY_ALERT_NONE
+                    && contact.session.needs_new_session()
+                    && contact.state.events.as_ref().is_some_and(|e| e.accepted)
+                {
+                    step = NextPush::NeedsNewSession;
+                }
                 step
             };
 
@@ -768,6 +784,50 @@ impl<V: VaultStore> Engine<V> {
                         } else if !session_matches
                             && !(e.kind() == ErrorKind::SignInRequired && signs_in_here)
                         {
+                            // R7-P1-1: If a previously dispatched head (`!first_dispatch`) hits a
+                            // definitive refusal (`WriteTokenRejected`, foreign `SignInRequired`,
+                            // or server-refusal `LimitExceeded`) AFTER its session was already
+                            // retired or replaced (`!session_matches`), settle this head as
+                            // delivery-unknown (`Step::Unknown`, preserving `Awaiting` and
+                            // attachments) and continue draining the remaining outbox on the
+                            // current/new session without retiring any replacement session!
+                            let settle_superseded_head = !first_dispatch
+                                && (e.kind() == ErrorKind::WriteTokenRejected
+                                    || (e.kind() == ErrorKind::SignInRequired && !signs_in_here)
+                                    || (e.is_server_refusal()
+                                        && e.kind() == ErrorKind::LimitExceeded));
+                            if settle_superseded_head {
+                                match self
+                                    .commit_outbox_item(
+                                        vgen,
+                                        inner,
+                                        peer,
+                                        &outgoing,
+                                        Step::Unknown,
+                                        outgoing.clock,
+                                        false,
+                                        &mut server_deletes,
+                                    )
+                                    .await
+                                {
+                                    Ok(CommitOutcome::Committed) => {
+                                        self.release(peer, outgoing.history_index);
+                                        self.ui.log(format!(
+                                            "Delivery status unknown for message #{} to {} after session replacement/revocation ({}); advancing outbox without duplicating.",
+                                            outgoing.history_index,
+                                            short(peer),
+                                            describe(e)
+                                        ));
+                                        changed = true;
+                                        continue;
+                                    }
+                                    Ok(CommitOutcome::Aborted) => return Ok(false),
+                                    Err(err) => {
+                                        result = Err(err);
+                                        break;
+                                    }
+                                }
+                            }
                             self.check_protocol_error(ProtocolRpcScope::CoreV2, e);
                             result = Err(describe(e));
                             break;

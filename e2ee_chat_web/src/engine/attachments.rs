@@ -325,7 +325,7 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         let size = file.size();
-        let server = {
+        let (server, conv_gen) = {
             let guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
@@ -342,7 +342,7 @@ impl<V: VaultStore> Engine<V> {
             if contact.state.quarantined {
                 return Err("approve classical encryption or upgrade to post-quantum first".into());
             }
-            inner.server.clone()
+            (inner.server.clone(), contact.state.conversation_gen)
         };
         let signs_in_here = same_server(&server, &origin());
         let started = session::start_upload_with(&Fetch::client(&server), size).await;
@@ -357,7 +357,7 @@ impl<V: VaultStore> Engine<V> {
             // The server keeps attachments only for those signed in to it: its message takes its
             // place in the chat, and waits, with what is sent after it, until this browser is.
             Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
-                self.wait_for_sign_in(peer, file).await?;
+                self.wait_for_sign_in(peer, conv_gen, file).await?;
                 if self.is_live(vgen) {
                     self.ask_sign_in();
                 }
@@ -391,20 +391,29 @@ impl<V: VaultStore> Engine<V> {
             upload_state: UPLOAD_STATE_STARTED,
             sealed_chunk_hash: Vec::new(),
         };
-        if let Err(e) = self.save_upload(&peer, &pending).await {
+        if let Err(e) = self
+            .save_upload_for_gen(&peer, &pending, Some(conv_gen))
+            .await
+        {
             let _ = upload.cancel(&Fetch::client(&server)).await;
             return Err(e);
         }
         if !self.is_live(vgen) {
+            let _ = upload.cancel(&Fetch::client(&server)).await;
             return Err("locked".into());
         }
         self.uploads.insert_file(
             (peer, *upload.id(), attachment_key_hash(upload.key())),
             file.clone(),
         );
-        let pending = match self.announce(&peer, pending).await {
+        let pending = match self.announce_for_gen(&peer, pending, Some(conv_gen)).await {
             Ok(Some(pending)) => pending,
-            Ok(None) => return Ok(()),
+            Ok(None) => {
+                self.uploads.mark_cancelled(*upload.id());
+                self.remove_attachment_caches(&peer, upload.id());
+                let _ = upload.cancel(&Fetch::client(&server)).await;
+                return Ok(());
+            }
             Err(AnnounceError::NotSent(e)) => {
                 self.uploads.mark_cancelled(*upload.id());
                 self.remove_attachment_caches(&peer, upload.id());
@@ -421,9 +430,9 @@ impl<V: VaultStore> Engine<V> {
                 let keep = {
                     let guard = self.lock_inner().await;
                     self.is_live(vgen)
-                        && guard
-                            .as_ref()
-                            .is_some_and(|inner| self.may_keep(inner, &peer, upload.id()))
+                        && guard.as_ref().is_some_and(|inner| {
+                            self.may_keep_for_gen(inner, &peer, upload.id(), Some(conv_gen))
+                        })
                 };
                 if keep {
                     self.show_upload(&peer, &pending, UploadState::Paused(error.clone()));
@@ -471,6 +480,7 @@ impl<V: VaultStore> Engine<V> {
     pub(super) async fn wait_for_sign_in(
         &self,
         peer: PublicKey,
+        expected_conv_gen: u64,
         file: ChunkSource,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
@@ -482,6 +492,15 @@ impl<V: VaultStore> Engine<V> {
         }
         let inner = guard.as_mut().ok_or("locked")?;
         let contact = inner.contact(&peer).ok_or("no such chat")?;
+        if contact.state.conversation_gen != expected_conv_gen {
+            return Err("chat changed; please retry.".into());
+        }
+        if contact.state.request {
+            return Err("accept the request first".into());
+        }
+        if contact.state.quarantined {
+            return Err("approve classical encryption or upgrade to post-quantum first".into());
+        }
         let waiting = PendingUpload {
             id: id.to_vec(),
             name: file.name(),
@@ -635,7 +654,7 @@ impl<V: VaultStore> Engine<V> {
         file: ChunkSource,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let (kept, server) = {
+        let (kept, server, conv_gen) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                 return Ok(());
@@ -683,13 +702,14 @@ impl<V: VaultStore> Engine<V> {
             if !entry_exists {
                 return Err("its message is gone".into());
             }
-            if inner.contact(&peer).is_none() {
+            let Some(contact) = inner.contact(&peer) else {
                 return Err("no such chat".into());
-            }
+            };
+            let conv_gen = contact.state.conversation_gen;
             if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                 return Ok(());
             }
-            (kept, inner.server.clone())
+            (kept, inner.server.clone(), conv_gen)
         };
         let started = session::start_upload_with(&Fetch::client(&server), kept.size).await;
         let upload = match started {
@@ -729,9 +749,10 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         };
         let still_awaited = inner.contact(&peer).is_some_and(|contact| {
-            contact.state.outbox.iter().any(|outgoing| {
-                outgoing.history_index == kept.history_index && outgoing.awaits_upload
-            })
+            contact.state.conversation_gen == conv_gen
+                && contact.state.outbox.iter().any(|outgoing| {
+                    outgoing.history_index == kept.history_index && outgoing.awaits_upload
+                })
         });
         let entry_opt = if still_awaited {
             match inner.vault.entry(&peer, kept.history_index).await {
@@ -953,7 +974,16 @@ impl<V: VaultStore> Engine<V> {
     async fn announce(
         &self,
         peer: &PublicKey,
+        pending: PendingUpload,
+    ) -> Result<Option<PendingUpload>, AnnounceError> {
+        self.announce_for_gen(peer, pending, None).await
+    }
+
+    async fn announce_for_gen(
+        &self,
+        peer: &PublicKey,
         mut pending: PendingUpload,
+        expected_gen: Option<u64>,
     ) -> Result<Option<PendingUpload>, AnnounceError> {
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
@@ -983,7 +1013,13 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err(AnnounceError::NotSent("locked".into()));
             }
-            if !self.may_keep(inner, peer, &pending.id) {
+            let can_send_new = found.is_some()
+                || inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == *peer)
+                    .is_some_and(|c| !c.state.request && !c.state.quarantined);
+            if !self.may_keep_for_gen(inner, peer, &pending.id, expected_gen) || !can_send_new {
                 if let Some(id) = id_arr {
                     self.remove_attachment_caches(peer, &id);
                     self.ui
@@ -1068,7 +1104,7 @@ impl<V: VaultStore> Engine<V> {
             }
             return Ok(None);
         }
-        if !self.may_keep(inner, peer, &pending.id) {
+        if !self.may_keep_for_gen(inner, peer, &pending.id, expected_gen) {
             if let Some(id) = id_arr {
                 self.remove_attachment_caches(peer, &id);
                 self.ui
@@ -2111,10 +2147,28 @@ impl<V: VaultStore> Engine<V> {
     /// Keep `pending`, of the chat with `peer`, in the vault, unless it was cancelled or its chat
     /// deleted meanwhile, which forgot it: it must not come back.
     async fn save_upload(&self, peer: &PublicKey, pending: &PendingUpload) -> Result<(), String> {
+        self.save_upload_for_gen(peer, pending, None).await
+    }
+
+    async fn save_upload_for_gen(
+        &self,
+        peer: &PublicKey,
+        pending: &PendingUpload,
+        expected_gen: Option<u64>,
+    ) -> Result<(), String> {
         let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
-        if !self.may_keep(inner, peer, &pending.id) {
+        if !self.may_keep_for_gen(inner, peer, &pending.id, expected_gen) {
             return Err(format!("the upload of {} was cancelled", pending.name));
+        }
+        if expected_gen.is_some()
+            && inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == *peer)
+                .is_some_and(|c| c.state.request || c.state.quarantined)
+        {
+            return Err("chat changed; please retry.".into());
         }
         inner
             .vault
@@ -2124,11 +2178,26 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Whether the vault may keep what goes with the attachment `id`, in the chat with `peer`:
-    /// its upload was not cancelled, and the chat is still there. Asked under the lock, which
-    /// cancelling and deleting take to forget them, so that nothing is kept after.
+    /// its upload was not cancelled, and the chat is still there (optionally pinned to
+    /// `expected_gen`). Asked under the lock, which cancelling and deleting take to forget them,
+    /// so that nothing is kept after.
     pub(super) fn may_keep(&self, inner: &Inner<V>, peer: &PublicKey, id: &[u8]) -> bool {
+        self.may_keep_for_gen(inner, peer, id, None)
+    }
+
+    pub(super) fn may_keep_for_gen(
+        &self,
+        inner: &Inner<V>,
+        peer: &PublicKey,
+        id: &[u8],
+        expected_gen: Option<u64>,
+    ) -> bool {
         let cancelled = <[u8; 16]>::try_from(id).is_ok_and(|id| self.is_cancelled(&id));
-        !cancelled && inner.contacts.iter().any(|contact| contact.peer == *peer)
+        !cancelled
+            && inner.contacts.iter().any(|contact| {
+                contact.peer == *peer
+                    && expected_gen.is_none_or(|want| contact.state.conversation_gen == want)
+            })
     }
 
     /// Show the upload `pending`, to `peer`, as in `state`.
