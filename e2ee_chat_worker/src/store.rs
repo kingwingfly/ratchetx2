@@ -190,6 +190,7 @@ impl LocalPqHandshakeStore for Store {
             AddInitialOutcome::Added { id, .. } => Ok(Some(id)),
             AddInitialOutcome::LimitExceeded => Ok(None),
             AddInitialOutcome::NotFound => Err(ErrorKind::NotFound.into()),
+            AddInitialOutcome::StalePrekey => Err(ErrorKind::StaleVersion.into()),
             AddInitialOutcome::PayloadMismatch => Err(ErrorKind::InvalidArgument.into()),
             AddInitialOutcome::SequenceOverflow => Err(ErrorKind::LimitExceeded.into()),
         }
@@ -329,6 +330,7 @@ impl LocalIdempotentMailboxStore for Store {
 
 impl LocalAttachmentStore for Store {
     async fn add_attachment(&self, attachment: StoredAttachment) -> Result<bool> {
+        let _ = self.bucket()?;
         let id = attachment.id;
         self.attachment_call(&id, rpc::AddAttachment { attachment })
             .await

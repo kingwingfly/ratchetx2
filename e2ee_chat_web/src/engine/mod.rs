@@ -300,6 +300,15 @@ impl<V> Drop for InnerGuard<'_, V> {
     }
 }
 
+/// Outbox head currently in flight in `Engine::flush`'s lock-free `PushV2` RPC, protecting it
+/// from concurrent `requeue_sealed` unsealing until its relay outcome settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InFlightPush {
+    pub(super) conversation_gen: u64,
+    pub(super) history_index: u64,
+    pub(super) clock: u64,
+}
+
 /// The unlocked client.
 pub(super) struct Inner<V = Vault> {
     vault: V,
@@ -352,6 +361,9 @@ pub(super) struct Inner<V = Vault> {
     unsaved_outbox: Vec<(PublicKey, u64, Option<OutgoingRecord>)>,
     /// The chats whose records left unsaved a save wrote, which then show them.
     saved_late: Vec<PublicKey>,
+    /// Per-peer outbox head currently in flight in `PushV2`, deferred from `requeue_sealed`
+    /// unsealing until the push result commits or fails.
+    in_flight_push: HashMap<PublicKey, InFlightPush>,
 }
 
 /// Which server RPC surface produced a protocol error, controlling whether `Unimplemented`
@@ -589,6 +601,30 @@ impl<V: VaultStore> Engine<V> {
     pub(super) fn check_protocol_error(&self, scope: ProtocolRpcScope, error: &session::Error) {
         if should_require_update_for_rpc(scope, error) {
             self.require_update(describe(error));
+        }
+    }
+
+    /// Protocol error classification for `SendInitialV2`: a PQ v2 greeting (`version >= 2`)
+    /// legitimately receives `Unimplemented` when a relay turns PQ off, so it MUST NOT trigger
+    /// the global `update_required` banner (which terminates live WS notifications for every chat).
+    pub(super) fn check_send_initial_protocol_error(
+        &self,
+        inner: &mut Inner<V>,
+        outgoing_is_pq: bool,
+        error: &session::Error,
+    ) -> bool {
+        if outgoing_is_pq && error.is_server_refusal() && error.kind() == ErrorKind::Unimplemented {
+            if inner.server_pq != ServerPqStatus::Disabled {
+                inner.server_pq = ServerPqStatus::Disabled;
+                self.ui.me.set(Some(inner.me()));
+            }
+            return false;
+        }
+        if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, error) && !outgoing_is_pq {
+            self.require_update(describe(error));
+            true
+        } else {
+            false
         }
     }
 
@@ -1012,6 +1048,13 @@ impl Engine<Vault> {
                 self.ui.phase.set(Phase::IncompatibleVault(version));
             }
             // Offering to create one could replace a vault that is there.
+            Err(crate::vault::Error::Corrupt(msg))
+                if !crate::glue::lock_released() && !self.shutting_down.get() =>
+            {
+                self.ui
+                    .phase
+                    .set(Phase::Unavailable(UnavailableReason::CorruptVault, msg));
+            }
             Err(e) if !crate::glue::lock_released() && !self.shutting_down.get() => {
                 self.ui.phase.set(Phase::Unavailable(
                     UnavailableReason::StorageUnavailable,
@@ -1093,7 +1136,15 @@ impl Engine<Vault> {
                 other => VaultOpenError::Failed(describe(&other)),
             })?;
         drop(passphrase);
-        if !self.is_live(vgen) || cancel.is_cancelled() {
+        if !self.is_live(vgen) {
+            return Err(VaultOpenError::Cancelled);
+        }
+        if cancel.is_cancelled() {
+            // The IndexedDB transaction already committed before cancellation took effect:
+            // close the handle and switch the UI to the committed vault's actual state (`Locked`)
+            // rather than leaving the user on the Create form.
+            drop(vault);
+            self.ui.phase.set(Phase::Locked);
             return Err(VaultOpenError::Cancelled);
         }
         let state = AppState {
@@ -1163,11 +1214,22 @@ impl Engine<Vault> {
             ClientState::try_from(&client).map_err(|e| VaultOpenError::Failed(describe(&e)))?,
         )
         .with_clock(transport::clock(&address));
-        let (contacts, isolated_contacts, warnings) = restore_contacts(
+        let (mut contacts, isolated_contacts, warnings) = restore_contacts(
             std::mem::take(&mut state.contacts),
             &client.identity_key(),
             &address,
         );
+        let mut isolated_eviction_notices: Vec<String> = Vec::new();
+        for contact in &mut contacts {
+            if contact.state.evicted_while_isolated > 0 {
+                let count = contact.state.evicted_while_isolated;
+                contact.state.evicted_while_isolated = 0;
+                let label = contact.view().label();
+                isolated_eviction_notices.push(format!(
+                    "{count} message(s) from {label} exceeded the local offline buffer while this contact was unsupported."
+                ));
+            }
+        }
         let now_ms = crate::util::now();
         let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
         let (pruned_deferred, modified_deferred) =
@@ -1175,6 +1237,7 @@ impl Engine<Vault> {
         let pruned_carried_ts = handshake::prune_carried_timestamps_for_contacts(
             &mut deferred.carried_timestamps,
             contacts.iter(),
+            isolated_contacts.iter(),
         );
         let pruned_envelopes = sync::prune_deferred_envelopes(
             &mut deferred.envelopes,
@@ -1198,6 +1261,7 @@ impl Engine<Vault> {
             || modified_deferred
             || pruned_carried_ts > 0
             || pruned_envelopes > 0
+            || !isolated_eviction_notices.is_empty()
         {
             inner.unsaved_state = true;
         }
@@ -1214,6 +1278,10 @@ impl Engine<Vault> {
             self.ui.log(format!(
                 "Removed {pruned_deferred} invalid, duplicate, or excess deferred initial message(s) from the vault."
             ));
+        }
+        for notice in isolated_eviction_notices {
+            self.ui.log(notice.clone());
+            self.ui.notify(notice);
         }
         let warning_count = warnings.len();
         for warning in warnings {
@@ -1874,18 +1942,28 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        {
+        let replay_grants = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
+            let mut grants = std::collections::BTreeSet::new();
             if let Some(inner) = guard.as_mut() {
-                let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+                if let Ok((_, _, gp)) = self.replay_deferred_envelopes(inner, Some(&peer)).await {
+                    grants = gp;
+                }
                 if !self.is_live(vgen) {
                     return Err("locked".into());
                 }
                 self.refresh_contacts(inner);
             }
+            grants
+        };
+        for gp in replay_grants {
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let _ = self.flush_pending_grants_for_peer(&gp).await;
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -2545,7 +2623,26 @@ impl<V: VaultStore> Inner<V> {
             unsaved: vec![],
             unsaved_outbox: vec![],
             saved_late: vec![],
+            in_flight_push: HashMap::new(),
         }
+    }
+
+    /// Allocate the next vault-wide monotonic conversation generation for a newly created contact.
+    pub(super) fn allocate_conversation_gen(&mut self) -> u64 {
+        let max_existing = self
+            .contacts
+            .iter()
+            .map(|c| c.state.conversation_gen)
+            .chain(self.isolated_contacts.iter().map(|c| c.conversation_gen))
+            .max()
+            .unwrap_or(0);
+        let conv_gen = self
+            .state
+            .next_conversation_gen
+            .max(max_existing.saturating_add(1))
+            .max(1);
+        self.state.next_conversation_gen = conv_gen.saturating_add(1);
+        conv_gen
     }
 
     /// Stage a durable `RegisterWriteToken` grant on `peer`'s session using the next monotonic
@@ -2627,6 +2724,9 @@ impl<V: VaultStore> Inner<V> {
         handshake::prune_carried_timestamps_for_contacts(
             &mut carried_timestamps,
             self.contacts.iter().filter(|c| c.peer != *peer),
+            self.isolated_contacts
+                .iter()
+                .filter(|c| c.peer.as_slice() != peer.as_slice()),
         );
         let envelopes = self
             .deferred_envelopes

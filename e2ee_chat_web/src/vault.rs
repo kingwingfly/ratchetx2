@@ -27,7 +27,7 @@
 //! anchor (`e2ee-chat.vault.anchor.v3`, format `v3:{max_revision}:{vault_id_hex}`).
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap},
     fmt,
 };
@@ -410,6 +410,22 @@ fn read_rollback_anchor() -> Option<RollbackAnchor> {
     {
         let _ = ROLLBACK_ANCHOR_KEY;
         None
+    }
+}
+
+/// Whether `localStorage` currently retains any non-empty v3 rollback anchor entry (valid or
+/// tampered), indicating a vault previously existed in this browser.
+fn has_rollback_anchor_entry() -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        web_sys::window()
+            .and_then(|w| w.local_storage().ok().flatten())
+            .and_then(|s| s.get_item(ROLLBACK_ANCHOR_KEY).ok().flatten())
+            .is_some_and(|raw| !raw.trim().is_empty())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        false
     }
 }
 
@@ -837,6 +853,10 @@ pub struct AppState {
     /// Durable pending write-token revocations staged on chat deletion and flushed on sync.
     #[prost(message, repeated, tag = "19")]
     pub pending_revokes: Vec<PendingRevoke>,
+    /// Vault-wide monotonic conversation generation allocator (starts at 1). Allocated when
+    /// creating a new chat so forgotten peers need zero residual entries in `peer_storage`.
+    #[prost(uint64, tag = "20")]
+    pub next_conversation_gen: u64,
 }
 
 impl AppState {
@@ -1015,8 +1035,8 @@ pub struct CarriedDeferredTimestamp {
     pub deferred_at: u64,
 }
 
-/// Raw mailbox envelope buffered locally for a stalled/quarantined/rekeying peer so the server
-/// mailbox cursor advances immediately for all active peers (cross-peer stall isolation).
+/// Raw mailbox envelope buffered locally for a stalled/quarantined/rekeying/isolated peer so the
+/// server mailbox cursor advances immediately for all active peers (cross-peer stall isolation).
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct DeferredEnvelope {
     #[prost(bytes = "vec", tag = "1")]
@@ -1029,6 +1049,11 @@ pub struct DeferredEnvelope {
     pub initial_message: Option<session::protocol::handshake_v2::InitialMessageV2>,
     #[prost(uint64, tag = "5")]
     pub deferred_at: u64,
+    /// Buffered while the peer was isolated on a reduced-PQ build; uses the dedicated isolated
+    /// spool budget and is exempt from the 30-day replay window so already-ACKed envelopes survive
+    /// until a capable build unlocks and replays them.
+    #[prost(bool, tag = "6")]
+    pub pq_isolated: bool,
 }
 
 /// Separate encrypted sidecar record committed atomically with `STATE` under opaque key `("deferred",)`.
@@ -1197,6 +1222,15 @@ pub struct ContactState {
     /// manual syncs until the peer accepts or a push succeeds.
     #[prost(bool, tag = "31")]
     pub awaiting_peer_acceptance: bool,
+    /// Monotonic conversation generation assigned when this contact was created, matching its
+    /// `PeerStorageIndex.conversation_gen` and distinguishing recreated conversations with the
+    /// same peer across concurrent async flows.
+    #[prost(uint64, tag = "32")]
+    pub conversation_gen: u64,
+    /// Number of mailbox envelopes dropped after overflowing the dedicated isolated-peer spool
+    /// while this contact was unsupported on a reduced-PQ build.
+    #[prost(uint32, tag = "33")]
+    pub evicted_while_isolated: u32,
 }
 
 /// Persisted structured preview of the most recent message in a chat.
@@ -1779,6 +1813,8 @@ pub struct Vault {
     outbox_revisions: RefCell<BTreeMap<(PublicKey, u64), u64>>,
     /// Authoritative compact per-peer storage indices persisted inside `STATE`.
     peer_storage: RefCell<BTreeMap<PublicKey, PeerStorageIndex>>,
+    /// Vault-wide monotonic conversation generation allocator persisted in `AppState`.
+    next_conversation_gen: Cell<u64>,
 }
 
 impl Drop for Vault {
@@ -1837,8 +1873,30 @@ fn peer_conversation_gen(storage: &BTreeMap<PublicKey, PeerStorageIndex>, peer: 
     storage.get(peer).map_or(0, |ps| ps.conversation_gen)
 }
 
+fn allocate_peer_conversation_gen(
+    next_gen: &mut u64,
+    contacts: &[ContactState],
+    peer: &PublicKey,
+) -> u64 {
+    if let Some(conv_gen) = contacts
+        .iter()
+        .find(|c| c.peer.as_slice() == peer.as_slice())
+        .map(|c| c.conversation_gen)
+        .filter(|&g| g > 0)
+    {
+        *next_gen = (*next_gen).max(conv_gen.saturating_add(1));
+        conv_gen
+    } else {
+        let conv_gen = (*next_gen).max(1);
+        *next_gen = conv_gen.saturating_add(1);
+        conv_gen
+    }
+}
+
 fn record_peer_entry(
     storage: &mut BTreeMap<PublicKey, PeerStorageIndex>,
+    next_gen: &mut u64,
+    contacts: &[ContactState],
     peer: PublicKey,
     index: u64,
     has_file: bool,
@@ -1848,7 +1906,7 @@ fn record_peer_entry(
         max_history_len: 0,
         file_indices: Vec::new(),
         kept_chunks: Vec::new(),
-        conversation_gen: 0,
+        conversation_gen: allocate_peer_conversation_gen(next_gen, contacts, &peer),
     });
     ps.max_history_len = ps.max_history_len.max(index.saturating_add(1));
     if has_file && let Err(pos) = ps.file_indices.binary_search(&index) {
@@ -1858,6 +1916,8 @@ fn record_peer_entry(
 
 fn set_peer_chunk_bit(
     storage: &mut BTreeMap<PublicKey, PeerStorageIndex>,
+    next_gen: &mut u64,
+    contacts: &[ContactState],
     peer: PublicKey,
     id: &[u8],
     index: u32,
@@ -1867,7 +1927,7 @@ fn set_peer_chunk_bit(
         max_history_len: 0,
         file_indices: Vec::new(),
         kept_chunks: Vec::new(),
-        conversation_gen: 0,
+        conversation_gen: allocate_peer_conversation_gen(next_gen, contacts, &peer),
     });
     if let Some(existing) = ps.kept_chunks.iter_mut().find(|a| a.id.as_slice() == id) {
         existing.set_bit(index)
@@ -1885,13 +1945,37 @@ fn set_peer_chunk_bit(
 type PreparedEntry = (PublicKey, u64, HistoryEntry, Option<Zeroizing<Vec<u8>>>);
 
 impl Vault {
-    /// Inspect the stored vault header pre-KDF to distinguish absent, compatible (v3), and
-    /// incompatible/legacy vaults.
+    /// Inspect the stored vault header pre-KDF to distinguish absent, compatible (v3),
+    /// incompatible/legacy, and partially restored/corrupt vaults.
     pub async fn inspect() -> Result<VaultPresence> {
         let database = open().await?;
-        let raw = get(&database, HEADER).await;
-        database.close();
-        let Some(raw) = raw? else {
+        let close = scopeguard::guard(&database, |db| db.close());
+        let (raw, count) = {
+            let tx = database.transaction(&[STORE], TransactionMode::ReadOnly)?;
+            let store = tx.object_store(STORE)?;
+            let header = store
+                .get(JsValue::from_str(HEADER))?
+                .await?
+                .map(|v| Uint8Array::new(&v).to_vec());
+            let count = if header.is_none() {
+                store.count(None)?.await?
+            } else {
+                0
+            };
+            (header, count)
+        };
+        drop(close);
+        let Some(raw) = raw else {
+            if count > 0 {
+                return Err(Error::Corrupt(
+                    "vault header is missing while encrypted vault records remain; reset the vault explicitly to start over".into(),
+                ));
+            }
+            if has_rollback_anchor_entry() {
+                return Err(Error::Corrupt(
+                    "vault header is missing while a rollback anchor remains in browser storage; reset the vault explicitly to start over".into(),
+                ));
+            }
             return Ok(VaultPresence::None);
         };
         let header =
@@ -1906,7 +1990,10 @@ impl Vault {
         ensure_vault_lock_owned(self.lock_generation)
     }
 
-    /// A new v3 vault holding `state`, under `passphrase`, replacing any other.
+    /// Create a new v3 vault holding `state` under `passphrase` in an empty store.
+    ///
+    /// Refuses to overwrite existing records or a surviving rollback anchor (use
+    /// [`Vault::destroy`] for explicit reset) and aborts if cancelled before commit.
     pub async fn create(
         passphrase: &[u8],
         state: &AppState,
@@ -1921,11 +2008,16 @@ impl Vault {
         ensure_vault_lock_owned(lock_generation)?;
         let database = open().await?;
         let close_on_err = scopeguard::guard(&database, |db| db.close());
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         ensure_vault_lock_owned(lock_generation)?;
         let header_bytes = header.encode_to_vec();
         let record_epoch = generate_record_epoch()?;
+        let next_gen = state.next_conversation_gen.max(1);
         let mut state_to_save = state.clone();
         state_to_save.record_epoch = record_epoch;
+        state_to_save.next_conversation_gen = next_gen;
         state_to_save.upload_checkpoints.clear();
         state_to_save.outbox_revisions.clear();
         state_to_save.peer_storage.clear();
@@ -1940,16 +2032,40 @@ impl Vault {
             upload_checkpoints: RefCell::new(Vec::new()),
             outbox_revisions: RefCell::new(BTreeMap::new()),
             peer_storage: RefCell::new(BTreeMap::new()),
+            next_conversation_gen: Cell::new(next_gen),
         };
         let sealed_state = vault.seal_state(&state_v3_aad(&header_bytes), &state_to_save)?;
         state_to_save.zeroize_secrets();
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         vault.ensure_lock_owned()?;
         let transaction = vault
             .database
             .transaction(&[STORE], TransactionMode::ReadWrite)?;
         let store = transaction.object_store(STORE)?;
+        let existing_count = match store.count(None)?.await {
+            Ok(count) => count,
+            Err(e) => {
+                let _ = transaction.abort();
+                return Err(e.into());
+            }
+        };
+        if existing_count > 0 || has_rollback_anchor_entry() {
+            let _ = transaction.abort();
+            return Err(Error::Corrupt(
+                "refusing to overwrite an existing or partial vault without explicit reset".into(),
+            ));
+        }
+        if cancel.is_cancelled() {
+            let _ = transaction.abort();
+            return Err(Error::Cancelled);
+        }
+        if let Err(e) = vault.ensure_lock_owned() {
+            let _ = transaction.abort();
+            return Err(e);
+        }
         let write_res: Result<()> = (|| {
-            store.clear()?;
             store.put(&bytes(&sealed_state), Some(&STATE.into()))?;
             store.put(&bytes(&header_bytes), Some(&HEADER.into()))?;
             Ok(())
@@ -2030,6 +2146,16 @@ impl Vault {
         let checkpoints = state.upload_checkpoints.clone();
         let outbox_revs = outbox_revisions_from_proto(&state.outbox_revisions);
         let peer_storage = peer_storage_from_proto(&state.peer_storage);
+        let max_existing_gen = peer_storage
+            .values()
+            .map(|ps| ps.conversation_gen)
+            .chain(state.contacts.iter().map(|c| c.conversation_gen))
+            .max()
+            .unwrap_or(0);
+        let next_conversation_gen = state
+            .next_conversation_gen
+            .max(max_existing_gen.saturating_add(1))
+            .max(1);
         scopeguard::ScopeGuard::into_inner(close_on_err);
         let vault = Self {
             database,
@@ -2040,6 +2166,7 @@ impl Vault {
             upload_checkpoints: RefCell::new(checkpoints),
             outbox_revisions: RefCell::new(outbox_revs),
             peer_storage: RefCell::new(peer_storage),
+            next_conversation_gen: Cell::new(next_conversation_gen),
         };
         Ok((vault, state, deferred))
     }
@@ -2074,6 +2201,7 @@ impl Vault {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn prepare_state_for_commit(
         &self,
         state: &AppState,
@@ -2081,10 +2209,12 @@ impl Vault {
         checkpoints: &[UploadCheckpoint],
         outbox_revs: &BTreeMap<(PublicKey, u64), u64>,
         peer_storage: &BTreeMap<PublicKey, PeerStorageIndex>,
+        next_conversation_gen: u64,
         next_header_bytes: &[u8],
     ) -> Result<Vec<u8>> {
         let mut stamped = state.clone();
         stamped.record_epoch = self.record_epoch;
+        stamped.next_conversation_gen = stamped.next_conversation_gen.max(next_conversation_gen);
         stamped.upload_checkpoints = checkpoints.to_vec();
         stamped.outbox_revisions = outbox_revisions_to_proto(outbox_revs);
         stamped.peer_storage = peer_storage_to_proto(peer_storage);
@@ -2134,8 +2264,20 @@ impl Vault {
             })
             .collect();
         let mut next_peer_storage = self.peer_storage.borrow().clone();
+        let mut next_gen = self
+            .next_conversation_gen
+            .get()
+            .max(state.next_conversation_gen)
+            .max(1);
         for (peer, index, _, file_data) in &prepared_entries {
-            record_peer_entry(&mut next_peer_storage, *peer, *index, file_data.is_some());
+            record_peer_entry(
+                &mut next_peer_storage,
+                &mut next_gen,
+                &state.contacts,
+                *peer,
+                *index,
+                file_data.is_some(),
+            );
         }
         let checkpoints = self.upload_checkpoints.borrow().clone();
         let sealed_state = match self.prepare_state_for_commit(
@@ -2144,6 +2286,7 @@ impl Vault {
             &checkpoints,
             &next_outbox_revs,
             &next_peer_storage,
+            next_gen,
             &next_header_bytes,
         ) {
             Ok(s) => s,
@@ -2168,6 +2311,7 @@ impl Vault {
         self.ensure_lock_owned()?;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
         *self.peer_storage.borrow_mut() = next_peer_storage;
+        self.next_conversation_gen.set(next_gen);
         self.commit_header_and_anchor(next_header);
         Ok(())
     }
@@ -2419,8 +2563,21 @@ impl Vault {
                 AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
 
             let mut next_peer_storage = self.peer_storage.borrow().clone();
-            set_peer_chunk_bit(&mut next_peer_storage, *peer, id, index)?;
+            let mut next_gen = self
+                .next_conversation_gen
+                .get()
+                .max(app_state.next_conversation_gen)
+                .max(1);
+            set_peer_chunk_bit(
+                &mut next_peer_storage,
+                &mut next_gen,
+                &app_state.contacts,
+                *peer,
+                id,
+                index,
+            )?;
             app_state.record_epoch = self.record_epoch;
+            app_state.next_conversation_gen = app_state.next_conversation_gen.max(next_gen);
             app_state.upload_checkpoints = self.upload_checkpoints.borrow().clone();
             app_state.outbox_revisions = outbox_revisions_to_proto(&self.outbox_revisions.borrow());
             app_state.peer_storage = peer_storage_to_proto(&next_peer_storage);
@@ -2434,10 +2591,10 @@ impl Vault {
             store.put(&bytes(chunk), Some(&key.as_str().into()))?;
             store.put(&bytes(&sealed), Some(&STATE.into()))?;
             store.put(&bytes(&header), Some(&HEADER.into()))?;
-            Ok((next, next_peer_storage))
+            Ok((next, next_peer_storage, next_gen))
         }
         .await;
-        let (next, next_peer_storage) = match write {
+        let (next, next_peer_storage, next_gen) = match write {
             Ok(res) => res,
             Err(e) => {
                 let _ = transaction.abort();
@@ -2447,6 +2604,7 @@ impl Vault {
         commit(transaction).await?;
         self.ensure_lock_owned()?;
         *self.peer_storage.borrow_mut() = next_peer_storage;
+        self.next_conversation_gen.set(next_gen);
         self.commit_header_and_anchor(next);
         Ok(())
     }
@@ -2513,8 +2671,20 @@ impl Vault {
             })
             .collect();
         let mut next_peer_storage = self.peer_storage.borrow().clone();
+        let mut next_gen = self
+            .next_conversation_gen
+            .get()
+            .max(state.next_conversation_gen)
+            .max(1);
         for (p, index, _, file_data) in &prepared_entries {
-            record_peer_entry(&mut next_peer_storage, *p, *index, file_data.is_some());
+            record_peer_entry(
+                &mut next_peer_storage,
+                &mut next_gen,
+                &state.contacts,
+                *p,
+                *index,
+                file_data.is_some(),
+            );
         }
         let mut next_checkpoints = self.upload_checkpoints.borrow().clone();
         remove_upload_checkpoint(&mut next_checkpoints, peer, old_id);
@@ -2531,6 +2701,7 @@ impl Vault {
             &next_checkpoints,
             &next_outbox_revs,
             &next_peer_storage,
+            next_gen,
             &next_header_bytes,
         ) {
             Ok(s) => s,
@@ -2577,6 +2748,7 @@ impl Vault {
         *self.upload_checkpoints.borrow_mut() = next_checkpoints;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
         *self.peer_storage.borrow_mut() = next_peer_storage;
+        self.next_conversation_gen.set(next_gen);
         self.commit_header_and_anchor(next_header);
         Ok(())
     }
@@ -2629,6 +2801,9 @@ impl Vault {
                 }
             };
             app_state.record_epoch = self.record_epoch;
+            app_state.next_conversation_gen = app_state
+                .next_conversation_gen
+                .max(self.next_conversation_gen.get());
             app_state.upload_checkpoints = next_checkpoints.clone();
             app_state.outbox_revisions = outbox_revisions_to_proto(&self.outbox_revisions.borrow());
             app_state.peer_storage = peer_storage_to_proto(&self.peer_storage.borrow());
@@ -2763,12 +2938,18 @@ impl Vault {
             .map(|(p, index, record)| (*p, *index, record.as_ref()))
             .collect();
 
-        // Collect all opaque keys to delete for `peer` from authenticated STATE indices, and bump
-        // `conversation_gen` so deleted history/file ciphertexts can never decrypt if spliced into
-        // a recreated conversation with the same `peer`.
+        // Collect all opaque keys to delete for `peer` from authenticated STATE indices, advance
+        // the vault-wide monotonic `next_conversation_gen` so deleted history/file ciphertexts
+        // can never decrypt if spliced into a recreated conversation, and completely remove
+        // `peer` from `peer_storage` so zero deleted peer identities remain persisted in `STATE`.
         let mut keys_to_delete: Vec<String> = Vec::new();
         let mut next_peer_storage = self.peer_storage.borrow().clone();
-        let next_gen = if let Some(old_ps) = next_peer_storage.remove(peer) {
+        let mut next_gen = self
+            .next_conversation_gen
+            .get()
+            .max(state.next_conversation_gen)
+            .max(1);
+        if let Some(old_ps) = next_peer_storage.remove(peer) {
             for idx in 0..old_ps.max_history_len {
                 keys_to_delete.push(opaque_history_key(&self.keys.idb_mac_key, peer, idx));
             }
@@ -2785,20 +2966,8 @@ impl Vault {
                     ));
                 }
             }
-            old_ps.conversation_gen.saturating_add(1)
-        } else {
-            1
-        };
-        next_peer_storage.insert(
-            *peer,
-            PeerStorageIndex {
-                peer: peer.to_vec(),
-                max_history_len: 0,
-                file_indices: Vec::new(),
-                kept_chunks: Vec::new(),
-                conversation_gen: next_gen,
-            },
-        );
+            next_gen = next_gen.max(old_ps.conversation_gen.saturating_add(1));
+        }
         let mut next_outbox_revs = self.outbox_revisions.borrow().clone();
         next_outbox_revs.retain(|&(p, idx), _| {
             if p == *peer {
@@ -2833,7 +3002,14 @@ impl Vault {
             })
             .collect();
         for (p, index, _, file_data) in &prepared_entries {
-            record_peer_entry(&mut next_peer_storage, *p, *index, file_data.is_some());
+            record_peer_entry(
+                &mut next_peer_storage,
+                &mut next_gen,
+                &state.contacts,
+                *p,
+                *index,
+                file_data.is_some(),
+            );
         }
 
         let sealed_state = match self.prepare_state_for_commit(
@@ -2842,6 +3018,7 @@ impl Vault {
             &next_checkpoints,
             &next_outbox_revs,
             &next_peer_storage,
+            next_gen,
             &next_header_bytes,
         ) {
             Ok(s) => s,
@@ -2870,6 +3047,7 @@ impl Vault {
         *self.upload_checkpoints.borrow_mut() = next_checkpoints;
         *self.outbox_revisions.borrow_mut() = next_outbox_revs;
         *self.peer_storage.borrow_mut() = next_peer_storage;
+        self.next_conversation_gen.set(next_gen);
         self.commit_header_and_anchor(next_header);
         Ok(())
     }
@@ -3407,6 +3585,36 @@ mod tests {
         assert_eq!(history_bounds(10, 5), Some((5, 9)));
         assert_eq!(history_bounds(10, 500), Some((0, 9)));
     }
+
+    #[test]
+    fn allocate_peer_conversation_gen_uses_monotonic_counter_without_tombstones() {
+        let peer_a = [0x11; 32];
+        let peer_b = [0x22; 32];
+        let mut next_gen = 1u64;
+        // Unknown peer allocates from monotonic vault-wide counter without needing peer_storage tombstones.
+        assert_eq!(
+            allocate_peer_conversation_gen(&mut next_gen, &[], &peer_a),
+            1
+        );
+        assert_eq!(next_gen, 2);
+        // Existing contact with explicit conversation_gen preserves it and advances next_gen past it.
+        let contacts = vec![ContactState {
+            peer: peer_b.to_vec(),
+            conversation_gen: 7,
+            ..ContactState::default()
+        }];
+        assert_eq!(
+            allocate_peer_conversation_gen(&mut next_gen, &contacts, &peer_b),
+            7
+        );
+        assert_eq!(next_gen, 8);
+        // Recreating previously forgotten peer_a receives fresh gen 8 (never collides with gen 1).
+        assert_eq!(
+            allocate_peer_conversation_gen(&mut next_gen, &contacts, &peer_a),
+            8
+        );
+        assert_eq!(next_gen, 9);
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -3596,6 +3804,7 @@ mod wasm_tests {
                 message: None,
                 initial_message: None,
                 deferred_at: 1_700_000_000_600,
+                pq_isolated: false,
             }],
         };
         let text_entry = HistoryEntry {
@@ -3768,6 +3977,14 @@ mod wasm_tests {
         );
         assert!(keys_after_forget.contains(&HEADER.to_string()));
         assert!(keys_after_forget.contains(&STATE.to_string()));
+        assert!(
+            !reopened.peer_storage.borrow().contains_key(&peer),
+            "Vault::forget must leave zero residual peer_storage tombstone for forgotten peer"
+        );
+        assert!(
+            reopened.next_conversation_gen.get() >= 2,
+            "Vault::forget must advance vault-wide next_conversation_gen"
+        );
         assert_eq!(reopened.chunks_kept(&peer, &upload_id).await.unwrap(), 0);
         assert!(reopened.uploads(None).await.unwrap().is_empty());
 
@@ -3856,6 +4073,24 @@ mod wasm_tests {
         assert!(matches!(
             Vault::unlock(b"passphrase-rollback", &cancel).await,
             Err(Error::Corrupt(msg)) if msg.contains("vault_id does not match")
+        ));
+
+        // Partial vault with missing HEADER + surviving STATE/anchor must report Corrupt (NOT None)
+        // and Vault::create must refuse to overwrite without explicit Vault::destroy().
+        let db = open().await.expect("open idb");
+        let tx = db
+            .transaction(&[STORE], TransactionMode::ReadWrite)
+            .expect("rw tx");
+        tx.object_store(STORE)
+            .expect("store")
+            .delete(JsValue::from_str(HEADER))
+            .expect("delete header");
+        commit(tx).await.expect("commit header delete");
+        db.close();
+        assert!(matches!(Vault::inspect().await, Err(Error::Corrupt(_))));
+        assert!(matches!(
+            Vault::create(b"new-pass", &AppState::default(), &cancel).await,
+            Err(Error::Corrupt(_))
         ));
 
         clean_browser_vault().await;

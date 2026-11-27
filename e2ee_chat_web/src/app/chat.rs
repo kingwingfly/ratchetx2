@@ -111,6 +111,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
     let label = move || contact().map(|contact| contact.label()).unwrap_or_default();
     let request = move || contact().is_some_and(|contact| contact.request);
     let greeting_unsent = move || contact().is_some_and(|contact| contact.greeting_unsent);
+    let greeting_uncertain = move || contact().is_some_and(|contact| contact.greeting_uncertain);
+    let greeting_unconfirmed = move || greeting_unsent() || greeting_uncertain();
     let awaiting_acceptance = move || contact().is_some_and(|contact| contact.awaiting_acceptance);
     let quarantined = move || contact().is_some_and(|contact| contact.is_quarantined());
     let strict_pq = Memo::new(move |_| strict_pq_enabled(ui));
@@ -124,7 +126,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             }
         } else if request() {
             "Accept the request to write"
-        } else if greeting_unsent() || awaiting_acceptance() {
+        } else if greeting_unconfirmed() || awaiting_acceptance() {
             "Write a message (delivers once accepted)"
         } else {
             "Write a message"
@@ -463,6 +465,18 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                     </span>
                 </div>
             </Show>
+            <Show when=move || greeting_uncertain() && !request() && !quarantined()>
+                <div class="banner awaiting-acceptance" role="status">
+                    <span>
+                        {move || {
+                            format!(
+                                "Sending chat request to {}… Delivery hasn't been confirmed yet. Retrying automatically.",
+                                label(),
+                            )
+                        }}
+                    </span>
+                </div>
+            </Show>
             <Show when=move || awaiting_acceptance() && !request() && !quarantined()>
                 <div class="banner awaiting-acceptance" role="status">
                     <span>
@@ -478,7 +492,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             <Messages
                 peer
                 label=Signal::derive(label)
-                greeting_unsent=Signal::derive(greeting_unsent)
+                greeting_unsent=Signal::derive(greeting_unconfirmed)
                 awaiting_acceptance=Signal::derive(awaiting_acceptance)
             />
             <Uploads peer />

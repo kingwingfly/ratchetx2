@@ -298,18 +298,28 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
         }
-        {
+        let replay_grants = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
+            let mut grants = std::collections::BTreeSet::new();
             if let Some(inner) = guard.as_mut() {
-                let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+                if let Ok((_, _, gp)) = self.replay_deferred_envelopes(inner, Some(&peer)).await {
+                    grants = gp;
+                }
                 if !self.is_live(vgen) {
                     return Err("locked".into());
                 }
                 self.refresh_contacts(inner);
             }
+            grants
+        };
+        for gp in replay_grants {
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let _ = self.flush_pending_grants_for_peer(&gp).await;
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -347,9 +357,19 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            // Phase 1 under `self.inner`: validate preconditions and snapshot claim inputs without
-            // mutating live session state.
-            let (server, audience, pq_cfg, clock, peer_pq_for_claim) = {
+            // Phase 1 under `self.inner`: validate preconditions and snapshot claim inputs + exact
+            // conversation incarnation without mutating live session state.
+            let (
+                server,
+                audience,
+                pq_cfg,
+                clock,
+                peer_pq_for_claim,
+                expected_conversation_gen,
+                expected_active_id,
+                expected_request,
+                expected_quarantined,
+            ) = {
                 let guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
                     return Err("locked".into());
@@ -379,6 +399,10 @@ impl<V: VaultStore> Engine<V> {
                     pq_cfg,
                     inner.client.clock().clone(),
                     peer_pq_for_claim,
+                    contact.state.conversation_gen,
+                    contact.session.active_id().copied(),
+                    contact.state.request,
+                    contact.state.quarantined,
                 )
             };
 
@@ -396,8 +420,9 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
 
-            // Phase 3 under `self.inner`: re-validate live state, run synchronous Phase-2 key
-            // agreement, and atomically persist upgraded PQ session + Hello + requeued outbox.
+            // Phase 3 under `self.inner`: re-validate live state, exact conversation generation &
+            // expected session, run synchronous Phase-2 key agreement, and atomically persist
+            // upgraded PQ session + Hello + requeued outbox.
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
@@ -424,6 +449,22 @@ impl<V: VaultStore> Engine<V> {
             let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
                 return Err("no such chat".to_string());
             };
+            // Revalidate exact conversation generation, approval/quarantine state, and active
+            // session BEFORE applying either success or error so deleting a chat and receiving a
+            // fresh inbound request during `ClaimBundle` can NEVER accept the new request.
+            let current = &inner.contacts[index];
+            if current.state.conversation_gen != expected_conversation_gen
+                || current.state.request != expected_request
+                || current.state.quarantined != expected_quarantined
+            {
+                return Err("chat changed while upgrading; please retry.".to_string());
+            }
+            if current.session.active_id().copied() != expected_active_id {
+                if current.has_healthy_pq_session() {
+                    return Ok(());
+                }
+                return Err("chat session changed while upgrading; please retry.".to_string());
+            }
             let claimed = match claim_res {
                 Ok(claimed) => claimed,
                 Err(e) => {
@@ -598,25 +639,54 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        // Re-verify contact existence and matching session immediately before transmitting
-        // `SendInitialV2` so a concurrent delete or inbound session never emits a stale initial.
+        // Re-verify contact existence, matching session, AND confirmed active write-token grant
+        // immediately before transmitting `SendInitialV2` so a concurrent delete, inbound session,
+        // or failed `RegisterWriteToken` never emits a stale or unreplyable initial.
         let still_active = {
-            let guard = self.lock_inner().await;
+            let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            guard.as_ref().is_some_and(|inner| {
-                inner
-                    .contacts
-                    .iter()
-                    .find(|c| c.peer == peer)
-                    .is_some_and(|c| c.session.active_id() == new_session_id.as_ref())
-            })
+            let Some(inner) = guard.as_mut() else {
+                return Err("locked".into());
+            };
+            let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
+                return Ok(());
+            };
+            if contact.session.active_id() != new_session_id.as_ref() {
+                false
+            } else if contact.session.has_pending_active_grant() {
+                if let Some(contact) = inner.contact(&peer)
+                    && contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
+                {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                    let _ = inner.save_state().await;
+                    if !self.is_live(vgen) {
+                        return Err("locked".into());
+                    }
+                }
+                self.ui.log(format!(
+                    "upgraded session with {} saved locally; waiting for write-token registration before sending initial greeting",
+                    short(&peer)
+                ));
+                self.refresh_contacts(inner);
+                drop(guard);
+                if self.is_live(vgen) {
+                    self.wake();
+                }
+                return Ok(());
+            } else {
+                true
+            }
         };
         if !still_active {
             return Ok(());
         }
 
+        let outgoing_is_pq = outgoing_req
+            .message
+            .as_ref()
+            .is_some_and(|m| m.version >= 2);
         let send_res: session::Result<()> = Fetch::client(&server)
             .send_initial_v2(outgoing_req)
             .await
@@ -668,7 +738,7 @@ impl<V: VaultStore> Engine<V> {
                         }
                     }
                 }
-                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
                 self.ui.log(format!(
                     "upgraded session with {} saved locally; initial message will retry automatically: {}",
                     short(&peer),
@@ -679,7 +749,10 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+        let replay_grants = match self.replay_deferred_envelopes(inner, Some(&peer)).await {
+            Ok((_, _, gp)) => gp,
+            Err(_) => std::collections::BTreeSet::new(),
+        };
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
@@ -689,6 +762,12 @@ impl<V: VaultStore> Engine<V> {
             short(&peer)
         ));
         drop(guard);
+        for gp in replay_grants {
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let _ = self.flush_pending_grants_for_peer(&gp).await;
+        }
         if self.is_live(vgen) {
             self.wake();
         }

@@ -289,15 +289,25 @@ impl<S: SqlExec> IdentityStore<'_, S> {
 
         self.ensure_v5_tables()?;
         self.sql.transaction_sync(|sql| {
-            if sql
-                .query_opt::<ManifestSeqRow>(
-                    "SELECT manifest_seq FROM capability_manifest WHERE only = 0",
-                    vec![],
-                )?
+            let existing = sql.query_opt::<ManifestSpkRow>(
+                "SELECT manifest_seq, signed_prekey, prev_signed_prekey \
+                 FROM capability_manifest WHERE only = 0",
+                vec![],
+            )?;
+            if existing
+                .as_ref()
                 .is_some_and(|row| row.manifest_seq >= manifest.manifest_seq)
             {
                 return Ok(PublishV2Status::StaleSequence);
             }
+            let prev_signed_prekey: Option<Vec<u8>> = existing.and_then(|row| {
+                let old_spk = row.signed_prekey.into_vec();
+                if old_spk.as_slice() != manifest.signed_prekey.as_slice() {
+                    Some(old_spk)
+                } else {
+                    row.prev_signed_prekey.map(crate::objects::sql::Blob::into_vec)
+                }
+            });
 
             // Replace classical OPKs.
             sql.exec("DELETE FROM one_time_prekeys", vec![])?;
@@ -324,8 +334,8 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 "INSERT INTO capability_manifest \
                  (only, audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
                   pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
-                  signed_prekey_signature, pq_last_resort_commitments, signature) \
-                 VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                  prev_signed_prekey, signed_prekey_signature, pq_last_resort_commitments, signature) \
+                 VALUES (0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (only) DO UPDATE SET \
                   audience = excluded.audience, identity_key = excluded.identity_key, \
                   manifest_seq = excluded.manifest_seq, generation = excluded.generation, \
@@ -333,6 +343,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                   pq_enabled = excluded.pq_enabled, strict_pq = excluded.strict_pq, \
                   pq_ratchet_supported = excluded.pq_ratchet_supported, \
                   offered_suites = excluded.offered_suites, signed_prekey = excluded.signed_prekey, \
+                  prev_signed_prekey = excluded.prev_signed_prekey, \
                   signed_prekey_signature = excluded.signed_prekey_signature, \
                   pq_last_resort_commitments = excluded.pq_last_resort_commitments, \
                   signature = excluded.signature",
@@ -348,6 +359,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                     manifest.pq_ratchet_supported,
                     manifest.offered_suites.as_slice(),
                     manifest.signed_prekey.as_slice(),
+                    prev_signed_prekey.as_deref(),
                     signed_prekey_signature,
                     commitments_blob.as_slice(),
                     manifest.signature.as_slice()
@@ -575,8 +587,20 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         ]?;
 
         self.sql.transaction_sync(|sql| {
-            if !Self::has_manifest_sql(sql)? {
+            let Some(retained) = sql.query_opt::<RetainedSpkRow>(
+                "SELECT signed_prekey, prev_signed_prekey FROM capability_manifest WHERE only = 0",
+                vec![],
+            )?
+            else {
                 return Ok(AddInitialOutcome::NotFound);
+            };
+            let spk_retained = retained.signed_prekey.as_ref() == message.signed_prekey.as_slice()
+                || retained
+                    .prev_signed_prekey
+                    .as_ref()
+                    .is_some_and(|prev| prev.as_ref() == message.signed_prekey.as_slice());
+            if !spk_retained {
+                return Ok(AddInitialOutcome::StalePrekey);
             }
             // Prune expired rows BEFORE `(sender, ephemeral_key)` lookup/insert so an expired row
             // never collides with UNIQUE(sender, ephemeral_key) or occupies an inbox slot.
@@ -1143,6 +1167,102 @@ mod tests {
             let rem = store.list_initial_messages(BOB, 0, 10, 11_001).unwrap();
             assert_eq!(rem.len(), 1);
             assert_eq!(rem[0].id, id3);
+        }
+
+        #[test]
+        fn publish_v2_tracks_prev_signed_prekey_and_rejects_retired_spk() {
+            let env = TestIdentity::new(100_000);
+            let store = env.store();
+
+            let publish_spk = |seq: u64, spk: PublicKey| {
+                let mut m = mk_manifest(seq, seq, true, false);
+                m.signed_prekey = spk;
+                PublishV2Record {
+                    manifest: m,
+                    signed_prekey_signature: Some([0x77; 64]),
+                    one_time_prekeys: vec![],
+                    pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                    pq_one_time_prekeys: vec![],
+                    timestamp: 1_000 + seq,
+                }
+            };
+            let mk_spk_init = |eph: u8, spk: PublicKey| {
+                let mut msg = mk_initial(eph, 1, b"hello");
+                msg.signed_prekey = spk;
+                msg
+            };
+
+            let spk1 = [0x22; 32];
+            let spk2 = [0x33; 32];
+            let spk3 = [0x44; 32];
+
+            // Publish spk1, then republish spk1 -> accepts spk1, rejects unrelated spk2.
+            assert_eq!(
+                store.publish_v2(&publish_spk(1, spk1)).unwrap(),
+                PublishV2Status::Stored
+            );
+            assert_eq!(
+                store.publish_v2(&publish_spk(2, spk1)).unwrap(),
+                PublishV2Status::Stored
+            );
+            assert!(matches!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(1, spk1), 10, 2_000)
+                    .unwrap(),
+                AddInitialOutcome::Added { inserted: true, .. }
+            ));
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(2, spk2), 10, 2_000)
+                    .unwrap(),
+                AddInitialOutcome::StalePrekey
+            );
+
+            // Rotate spk1 -> spk2, then republish spk2: prev_signed_prekey stays spk1.
+            assert_eq!(
+                store.publish_v2(&publish_spk(3, spk2)).unwrap(),
+                PublishV2Status::Stored
+            );
+            assert_eq!(
+                store.publish_v2(&publish_spk(4, spk2)).unwrap(),
+                PublishV2Status::Stored
+            );
+            assert!(matches!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(3, spk1), 10, 2_100)
+                    .unwrap(),
+                AddInitialOutcome::Added { inserted: true, .. }
+            ));
+            assert!(matches!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(4, spk2), 10, 2_100)
+                    .unwrap(),
+                AddInitialOutcome::Added { inserted: true, .. }
+            ));
+
+            // Rotate spk2 -> spk3: spk3 & spk2 accepted, retired spk1 returns StalePrekey.
+            assert_eq!(
+                store.publish_v2(&publish_spk(5, spk3)).unwrap(),
+                PublishV2Status::Stored
+            );
+            assert!(matches!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(5, spk2), 10, 2_200)
+                    .unwrap(),
+                AddInitialOutcome::Added { inserted: true, .. }
+            ));
+            assert!(matches!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(6, spk3), 10, 2_200)
+                    .unwrap(),
+                AddInitialOutcome::Added { inserted: true, .. }
+            ));
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(7, spk1), 10, 2_200)
+                    .unwrap(),
+                AddInitialOutcome::StalePrekey
+            );
         }
     }
 }

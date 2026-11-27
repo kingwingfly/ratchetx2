@@ -123,6 +123,9 @@ pub fn App() -> impl IntoView {
                                 Phase::Unavailable(UnavailableReason::StorageUnavailable, _) => {
                                     "The browser's storage is not available."
                                 }
+                                Phase::Unavailable(UnavailableReason::CorruptVault, _) => {
+                                    "Vault data in this browser is incomplete or corrupt."
+                                }
                                 _ => "The vault is locked.",
                             }}
                         </div>
@@ -188,6 +191,7 @@ fn TopBar() -> impl IntoView {
         Phase::Unavailable(UnavailableReason::StorageUnavailable, _) => {
             "storage unavailable".to_string()
         }
+        Phase::Unavailable(UnavailableReason::CorruptVault, _) => "corrupt vault".to_string(),
         Phase::Unlocked if ui.update_required.with(Option::is_some) => {
             "update required".to_string()
         }

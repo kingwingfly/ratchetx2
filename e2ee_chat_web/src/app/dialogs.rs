@@ -707,6 +707,10 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             "Sending your chat request to {}… It hasn't reached the server yet and will retry automatically once connected.",
             c.label()
         ),
+        Some(c) if c.greeting_uncertain => format!(
+            "Sending your chat request to {}… Delivery hasn't been confirmed yet. Retrying automatically.",
+            c.label()
+        ),
         Some(c) if c.awaiting_acceptance => format!(
             "Waiting for {} to accept your chat request. Messages will deliver once they accept.",
             c.label()

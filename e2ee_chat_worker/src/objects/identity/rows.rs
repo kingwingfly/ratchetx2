@@ -131,7 +131,21 @@ pub(super) struct OldestRow {
 
 #[derive(Deserialize)]
 pub(super) struct ManifestSeqRow {
+    #[allow(dead_code)]
     pub(super) manifest_seq: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ManifestSpkRow {
+    pub(super) manifest_seq: u64,
+    pub(super) signed_prekey: Blob,
+    pub(super) prev_signed_prekey: Option<Blob>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct RetainedSpkRow {
+    pub(super) signed_prekey: Blob,
+    pub(super) prev_signed_prekey: Option<Blob>,
 }
 
 #[derive(Deserialize)]

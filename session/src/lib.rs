@@ -500,9 +500,9 @@ impl TryFrom<&proto::ClientState> for ClientState {
             })
             .collect::<Result<Vec<_>>>()?;
         let pq_config = PqConfig {
-            pq_enabled: has_pq && !state.pq_disabled,
+            pq_enabled: !state.pq_disabled,
             preferred_suite,
-            pq_ratchet_enabled: has_pq && !state.pq_ratchet_disabled,
+            pq_ratchet_enabled: !state.pq_ratchet_disabled,
             strict_pq: state.strict_pq,
         };
         let restored = Self {
@@ -1708,6 +1708,17 @@ impl<M> Session<M> {
     /// Queued write-token registrations awaiting relay confirmation.
     pub fn pending_register_grants(&self) -> &[PendingGrant] {
         &self.state.pending_register_grants
+    }
+
+    /// Whether the active session's inbound write token still has a pending registration awaiting
+    /// relay confirmation.
+    pub fn has_pending_active_grant(&self) -> bool {
+        self.active_inbound_token_hash().is_some_and(|active_hash| {
+            self.state
+                .pending_register_grants
+                .iter()
+                .any(|g| g.token_hash == active_hash)
+        })
     }
 
     /// Stage a write-token grant registration on this session, deduplicating by `token_hash` and
@@ -4480,5 +4491,38 @@ mod test {
             .kind(),
             ErrorKind::DowngradeDetected
         );
+    }
+
+    #[cfg(feature = "prost")]
+    #[test]
+    fn proto_round_trip_preserves_pq_preferences_on_reduced_builds() {
+        let client = Client::new(());
+        let mut raw = proto::ClientState::from(client.state());
+        raw.pq_disabled = false;
+        raw.pq_ratchet_disabled = false;
+        raw.strict_pq = false;
+
+        let restored = ClientState::try_from(&raw).expect("non-strict PQ state restores cleanly");
+        assert!(restored.pq_config.pq_enabled);
+        assert!(restored.pq_config.pq_ratchet_enabled);
+        let reserialized = proto::ClientState::from(&restored);
+        assert!(
+            !reserialized.pq_disabled,
+            "restoring on a classical-only build must not flip persisted pq_disabled to true"
+        );
+        assert!(
+            !reserialized.pq_ratchet_disabled,
+            "restoring on a classical-only build must not flip persisted pq_ratchet_disabled to true"
+        );
+
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        {
+            let mut strict_raw = raw;
+            strict_raw.strict_pq = true;
+            assert_eq!(
+                ClientState::try_from(&strict_raw).unwrap_err().kind(),
+                ErrorKind::MalformedState
+            );
+        }
     }
 }

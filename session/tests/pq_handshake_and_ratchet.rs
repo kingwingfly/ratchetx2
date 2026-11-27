@@ -1083,6 +1083,7 @@ mod pq_flow {
                 lose_refill_response: false,
             }));
             bob.publish_v2(AUDIENCE, 1, 1).await.unwrap();
+            let bob_spk = bob.current_signed_prekey().unwrap();
             for i in 0..preceding {
                 let mut eph = [2u8; 32];
                 eph[..8].copy_from_slice(&i.to_le_bytes());
@@ -1095,7 +1096,7 @@ mod pq_flow {
                             sender: [0; 32],
                             recipient: bob.identity_key(),
                             ephemeral_key: eph,
-                            signed_prekey: [3; 32],
+                            signed_prekey: bob_spk,
                             one_time_prekey: None,
                             header: Bytes::new(),
                             content: Bytes::new(),

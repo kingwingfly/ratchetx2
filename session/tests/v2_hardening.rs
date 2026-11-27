@@ -98,8 +98,9 @@ async fn state_validation_on_prost_restore_rejects_corruption() {
     };
     let restored_client = session::ClientState::try_from(&default_v3_client).unwrap();
     assert_eq!(restored_client.next_grant_version(), 1);
+    assert!(restored_client.pq_config().pq_enabled);
     assert_eq!(
-        restored_client.pq_config().pq_enabled,
+        !restored_client.pq_config().offered_suites().is_empty(),
         cfg!(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
     );
 

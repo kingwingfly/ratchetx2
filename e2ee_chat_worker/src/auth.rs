@@ -71,51 +71,59 @@ extern "C" {
 /// Tries `env.rate_limiter(binding)` first and falls back to direct JS FFI (`binding.limit({key})`)
 /// if `workers-rs#700` rejects the binding's JS constructor name in `workerd`.
 pub(crate) async fn check_rate_limit(env: &Env, binding: &str, key: String) -> bool {
+    let fail_open = !password_configured(env);
     if let Ok(limiter) = env.rate_limiter(binding) {
         return match limiter.limit(key).await {
             Ok(outcome) => outcome.success,
             Err(error) => {
                 console_error!("rate limiter `{binding}` failed: {error}");
-                true
+                fail_open
             }
         };
     }
 
     let Ok(val) = js_sys::Reflect::get(env.as_ref(), &JsValue::from_str(binding)) else {
         console_error!("rate limiter binding `{binding}` could not be read from env");
-        return !password_configured(env);
+        return fail_open;
     };
     if val.is_undefined() || val.is_null() {
         console_error!("rate limiter binding `{binding}` is missing from env");
-        return !password_configured(env);
+        return fail_open;
     }
     let has_limit = js_sys::Reflect::get(&val, &JsValue::from_str("limit"))
         .map(|f| f.is_function())
         .unwrap_or(false);
     if !has_limit {
         console_error!("rate limiter binding `{binding}` has no limit() method");
-        return !password_configured(env);
+        return fail_open;
     }
     let opts = js_sys::Object::new();
     if js_sys::Reflect::set(&opts, &JsValue::from_str("key"), &JsValue::from_str(&key)).is_err() {
-        return true;
+        console_error!("rate limiter `{binding}` could not build options object");
+        return fail_open;
     }
     let limiter: JsRateLimiter = val.unchecked_into();
     let promise = match limiter.limit(opts) {
         Ok(promise) => promise,
         Err(error) => {
             console_error!("rate limiter `{binding}` call threw: {error:?}");
-            return true;
+            return fail_open;
         }
     };
     match JsFuture::from(promise).await {
-        Ok(outcome) => js_sys::Reflect::get(&outcome, &JsValue::from_str("success"))
+        Ok(outcome) => match js_sys::Reflect::get(&outcome, &JsValue::from_str("success"))
             .ok()
             .and_then(|v| v.as_bool())
-            .unwrap_or(true),
+        {
+            Some(allowed) => allowed,
+            None => {
+                console_error!("rate limiter `{binding}` returned malformed outcome");
+                fail_open
+            }
+        },
         Err(error) => {
             console_error!("rate limiter `{binding}` promise rejected: {error:?}");
-            true
+            fail_open
         }
     }
 }

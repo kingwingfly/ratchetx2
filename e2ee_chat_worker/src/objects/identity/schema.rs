@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS capability_manifest (
     pq_ratchet_supported INTEGER NOT NULL,
     offered_suites BLOB NOT NULL,
     signed_prekey BLOB NOT NULL,
+    prev_signed_prekey BLOB,
     signed_prekey_signature BLOB,
     pq_last_resort_commitments BLOB NOT NULL,
     signature BLOB NOT NULL

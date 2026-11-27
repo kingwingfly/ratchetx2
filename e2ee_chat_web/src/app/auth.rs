@@ -654,6 +654,24 @@ pub(super) fn Elsewhere() -> impl IntoView {
 
 #[component]
 pub(super) fn Unavailable(reason: UnavailableReason, error: String) -> impl IntoView {
+    let progress = Progress::new();
+    let confirm_reset = ConfirmGuard::new();
+    let allow_reset = reason == UnavailableReason::CorruptVault;
+    let reset = move |_| {
+        if progress.working.get_untracked() {
+            return;
+        }
+        if !confirm_reset.confirm_or_arm() {
+            return;
+        }
+        progress.start("Deleting incomplete vault…");
+        spawn_local(async move {
+            match crate::vault::Vault::destroy().await {
+                Ok(()) => lock(),
+                Err(e) => progress.try_fail(e.to_string()),
+            }
+        });
+    };
     let (heading, copy) = match reason {
         UnavailableReason::InsecureContext => (
             "Secure context required",
@@ -670,14 +688,41 @@ pub(super) fn Unavailable(reason: UnavailableReason, error: String) -> impl Into
             "The browser would not open its storage, so whether a vault is here is unknown, and \
              nothing was changed. Private windows and blocked site data can cause this.",
         ),
+        UnavailableReason::CorruptVault => (
+            "Vault data incomplete or corrupt",
+            "The vault header is missing, but encrypted records or rollback metadata still exist \
+             in this browser. Nothing was overwritten automatically. Reset the vault explicitly \
+             if you want to discard the remaining data and start fresh.",
+        ),
     };
     view! {
         <div>
             <h2>{heading}</h2>
             <p>{copy}</p>
             <p class="error">{error}</p>
+            {progress.view()}
             <div class="actions">
-                <button class="btn primary" on:click=move |_| lock()>
+                <Show when=move || allow_reset>
+                    <button
+                        type="button"
+                        class="btn danger"
+                        disabled=move || progress.working.get()
+                        on:click=reset
+                    >
+                        {move || {
+                            if confirm_reset.is_armed() {
+                                "Delete incomplete vault, for good?"
+                            } else {
+                                "Reset vault and start over"
+                            }
+                        }}
+                    </button>
+                </Show>
+                <button
+                    class="btn primary"
+                    disabled=move || progress.working.get()
+                    on:click=move |_| lock()
+                >
                     "Reload"
                 </button>
             </div>

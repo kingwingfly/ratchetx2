@@ -8,7 +8,7 @@ use std::{
 use bytes::Bytes;
 use parking_lot::Mutex;
 use subtle::ConstantTimeEq;
-use web_time::Instant;
+use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     AttachmentId, AttachmentStore, ClaimOutcome, ClaimedPqBundle, ErrorKind,
@@ -32,6 +32,16 @@ pub const DEFAULT_INITIAL_MESSAGE_TTL: Duration = Duration::from_secs(30 * 24 * 
 /// `verify_recent` bidirectional skew window plus a 1-minute safety margin (11 minutes) so a
 /// pre-revocation registration signed by a fast client clock can never outlive the floor.
 pub const DEFAULT_REVOCATION_TOMBSTONE_TTL: Duration = Duration::from_secs(11 * 60);
+/// Maximum allowed wall-clock skew between a signed write-token registration timestamp and the
+/// store's clock at commit time (5 minutes, matching `protocol::MAX_CLOCK_SKEW`).
+const MAX_CLOCK_SKEW_MS: u64 = 5 * 60 * 1000;
+
+fn wall_clock_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 const DEDUP_SWEEP_BUDGET: usize = 8;
 
@@ -125,6 +135,8 @@ impl MemoryStore {
 struct PublishedManifest {
     manifest: StoredCapabilityManifest,
     signed_prekey_signature: Option<Signature>,
+    /// Previous distinct signed prekey retained for the 2-generation rotation grace window.
+    prev_signed_prekey: Option<PublicKey>,
 }
 
 #[derive(Debug, Default)]
@@ -408,11 +420,20 @@ impl PqHandshakeStore for MemoryStore {
             inner.pq_one_time.remove(&id);
         }
 
+        let prev_signed_prekey = inner.manifests.get(&id).and_then(|existing| {
+            if existing.manifest.signed_prekey != record.manifest.signed_prekey {
+                Some(existing.manifest.signed_prekey)
+            } else {
+                existing.prev_signed_prekey
+            }
+        });
+
         inner.manifests.insert(
             id,
             PublishedManifest {
                 manifest: record.manifest,
                 signed_prekey_signature,
+                prev_signed_prekey,
             },
         );
         Ok(PublishV2Status::Stored)
@@ -619,8 +640,15 @@ impl PqHandshakeStore for MemoryStore {
     ) -> Result<Option<u64>> {
         let now = Instant::now();
         let mut inner = self.inner.lock();
-        if !inner.manifests.contains_key(&initial_message.recipient) {
+        let Some(published) = inner.manifests.get(&initial_message.recipient) else {
             return Err(ErrorKind::NotFound.into());
+        };
+        let spk_retained = initial_message.signed_prekey == published.manifest.signed_prekey
+            || published
+                .prev_signed_prekey
+                .is_some_and(|prev| initial_message.signed_prekey == prev);
+        if !spk_retained {
+            return Err(ErrorKind::StaleVersion.into());
         }
         let inbox = inner.inboxes.entry(initial_message.recipient).or_default();
         // Prune expired rows BEFORE (sender, ephemeral_key) lookup/insert so an expired entry
@@ -934,11 +962,17 @@ impl IdempotentMailboxStore for MemoryStore {
 
     async fn register_write_token(&self, record: RegisterWriteTokenRecord) -> Result<()> {
         check_positive_safe_int(record.grant_version)?;
-        let now = Instant::now();
         let mut inner = self.inner.lock();
+        let now = Instant::now();
+        let wall_now_ms = wall_clock_ms();
         // Requires an existing published manifest (zero mailbox allocation for unknown identities).
         if !inner.manifests.contains_key(&record.recipient) {
             return Err(ErrorKind::NotFound.into());
+        }
+        // Re-verify signed request freshness at commit time before pruning or mutation so a
+        // delayed registration can never outlive `revocation_tombstone_ttl`.
+        if record.timestamp > 0 && wall_now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW_MS {
+            return Err(ErrorKind::StaleTimestamp.into());
         }
 
         // Prune expired empty revocation tombstones before enforcing version/peer invariants.
@@ -1097,8 +1131,9 @@ impl IdempotentMailboxStore for MemoryStore {
         peer.max_version = peer.max_version.max(record.min_grant_version);
         peer.revoked_at = Some(now);
         peer.live_tokens = remaining_count;
-        if let Some(active) = peer.active_token_hash
-            && !mailbox.write_tokens.contains_key(&active)
+        if !peer
+            .active_token_hash
+            .is_some_and(|active| mailbox.write_tokens.contains_key(&active))
         {
             peer.active_token_hash = highest_remaining;
         }
@@ -1714,6 +1749,192 @@ mod test {
                 append_id(&bounded, &bob, &tok, Some(1)).await;
             }
             assert!(bounded.inner.lock().mailbox_dedup.len() <= 2);
+        });
+    }
+
+    #[test]
+    fn write_token_freshness_revoke_promotion_and_retired_spk_enforced() {
+        futures::executor::block_on(async {
+            let store = MemoryStore::default();
+            let bob = [0x41; 32];
+            let alice = [0x42; 32];
+            let slot = [0x51; 32];
+            register_identity(&store, bob).await;
+
+            // 1. Stale wall-clock timestamp on register_write_token is rejected (`StaleTimestamp`).
+            let now_ms = wall_clock_ms();
+            let stale_ts = now_ms.saturating_sub(MAX_CLOCK_SKEW_MS + 10_000).max(1);
+            assert_eq!(
+                store
+                    .register_write_token(RegisterWriteTokenRecord {
+                        recipient: bob,
+                        peer_slot_id: slot,
+                        token_hash: [0xA1; 32],
+                        grant_version: 1,
+                        pin_active: false,
+                        timestamp: stale_ts,
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
+            let future_ts = now_ms.saturating_add(MAX_CLOCK_SKEW_MS + 10_000);
+            assert_eq!(
+                store
+                    .register_write_token(RegisterWriteTokenRecord {
+                        recipient: bob,
+                        peer_slot_id: slot,
+                        token_hash: [0xA1; 32],
+                        grant_version: 1,
+                        pin_active: false,
+                        timestamp: future_ts,
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
+
+            // 2. Register two non-pinned grants (v1 and v2) with fresh timestamps so
+            //    `active_token_hash` starts as `None`; revoking v1 promotes highest remaining (v2).
+            store
+                .register_write_token(RegisterWriteTokenRecord {
+                    recipient: bob,
+                    peer_slot_id: slot,
+                    token_hash: [0xA1; 32],
+                    grant_version: 1,
+                    pin_active: false,
+                    timestamp: now_ms,
+                })
+                .await
+                .unwrap();
+            store
+                .register_write_token(RegisterWriteTokenRecord {
+                    recipient: bob,
+                    peer_slot_id: slot,
+                    token_hash: [0xA2; 32],
+                    grant_version: 2,
+                    pin_active: false,
+                    timestamp: now_ms,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .revoke_write_token(RevokeWriteTokenRecord {
+                        recipient: bob,
+                        peer_slot_id: slot,
+                        token_hash: Some([0xA1; 32]),
+                        min_grant_version: 1,
+                    })
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                store.inner.lock().mailboxes[&bob].peer_grants[&slot].active_token_hash,
+                Some([0xA2; 32])
+            );
+
+            // 3. Retired SPK detection: current + immediate previous SPK are accepted, while a
+            //    2-rotation-old SPK is rejected with `StaleVersion`. Same-SPK republish keeps prev.
+            let publish_spk = |seq: u64, spk: PublicKey| {
+                let mut manifest = test_manifest(bob, seq);
+                manifest.signed_prekey = spk;
+                let pq_key = StoredPqPrekey {
+                    suite: 1,
+                    id: [0xA1; 32],
+                    encapsulation_key: Bytes::from(vec![0xA1; 1568]),
+                    signature: [0xA1; 64],
+                };
+                PublishV2Record {
+                    manifest,
+                    signed_prekey_signature: Some([0x44; 64]),
+                    one_time_prekeys: vec![],
+                    pq_last_resort: vec![pq_key],
+                    pq_one_time_prekeys: vec![],
+                    timestamp: 1000 + seq,
+                }
+            };
+            let mk_init = |eph: u8, spk: PublicKey| StoredInitialMessageV2 {
+                id: 0,
+                version: 1,
+                sender: alice,
+                recipient: bob,
+                ephemeral_key: [eph; 32],
+                signed_prekey: spk,
+                one_time_prekey: None,
+                header: Bytes::from_static(b"h"),
+                content: Bytes::from_static(b"c"),
+                pq_suite: None,
+                pq_last_resort: false,
+                pq_prekey_id: None,
+                pq_ciphertext: None,
+                manifest_digest: None,
+            };
+
+            let spk1 = [0x20; 32];
+            let spk2 = [0x21; 32];
+            let spk3 = [0x22; 32];
+            // Rotate spk1 -> spk2: both spk2 and spk1 accepted.
+            assert_eq!(
+                store.publish_v2(publish_spk(2, spk2)).await.unwrap(),
+                PublishV2Status::Stored
+            );
+            assert!(
+                store
+                    .add_initial_message_v2(mk_init(1, spk1), 10)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                store
+                    .add_initial_message_v2(mk_init(2, spk2), 10)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            // Republish same spk2 (seq 3): prev_signed_prekey remains spk1.
+            assert_eq!(
+                store.publish_v2(publish_spk(3, spk2)).await.unwrap(),
+                PublishV2Status::Stored
+            );
+            assert!(
+                store
+                    .add_initial_message_v2(mk_init(3, spk1), 10)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            // Rotate spk2 -> spk3: spk3 & spk2 accepted, retired spk1 rejected (`StaleVersion`).
+            assert_eq!(
+                store.publish_v2(publish_spk(4, spk3)).await.unwrap(),
+                PublishV2Status::Stored
+            );
+            assert!(
+                store
+                    .add_initial_message_v2(mk_init(4, spk2), 10)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert!(
+                store
+                    .add_initial_message_v2(mk_init(5, spk3), 10)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                store
+                    .add_initial_message_v2(mk_init(6, spk1), 10)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleVersion
+            );
         });
     }
 }

@@ -37,12 +37,14 @@ const MAX_DEFERRED_INITIALS: usize = 100;
 pub(super) const DEFERRED_REPLAY_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// Result of [`Engine::join_carried`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct JoinCarriedOutcome {
     /// Whether an accepted session's `Hello` triggered an automatic PQ upgrade recommendation.
     pub(super) recommend_upgrade: bool,
     /// Whether at least one carried initial for this contact remains deferred on this build.
     pub(super) has_deferred: bool,
+    /// Peers whose newly joined sessions staged write-token grants to flush outside `self.inner`.
+    pub(super) grant_peers: BTreeSet<PublicKey>,
 }
 
 fn initial_payload(kind: &InitialMessageKind) -> WireInitial {
@@ -225,17 +227,23 @@ pub(super) fn record_carried_timestamps(
 }
 
 /// Prune `carried_deferred_timestamps` entries whose signed prekeys are no longer referenced by
-/// any contact's `pending_carried_initials`. Returns how many entries were removed.
+/// any active or isolated contact's `pending_carried_initials`. Returns how many entries were
+/// removed.
 pub(super) fn prune_carried_timestamps_for_contacts<'a>(
     timestamps: &mut Vec<CarriedDeferredTimestamp>,
     contacts: impl IntoIterator<Item = &'a Contact>,
+    isolated_contacts: impl IntoIterator<Item = &'a ContactState>,
 ) -> usize {
     if timestamps.is_empty() {
         return 0;
     }
     let mut active_spks = std::collections::HashSet::new();
-    for contact in contacts {
-        for bytes in &contact.state.pending_carried_initials {
+    for state in contacts
+        .into_iter()
+        .map(|contact| &contact.state)
+        .chain(isolated_contacts)
+    {
+        for bytes in &state.pending_carried_initials {
             if let Some(initial) = Incoming::decode_carried(bytes) {
                 active_spks.insert(initial_spk_and_digest(&initial).0);
             }
@@ -249,8 +257,9 @@ pub(super) fn prune_carried_timestamps_for_contacts<'a>(
     before - timestamps.len()
 }
 
-/// Collect signed prekeys and manifest digests referenced by deferred inbox or carried initials
-/// still within [`DEFERRED_REPLAY_WINDOW_MS`] so scheduled prekey rotations do not evict them.
+/// Collect signed prekeys and manifest digests referenced by deferred inbox initials, carried
+/// initials (active or isolated contacts), and buffered `DeferredEnvelope`s so scheduled prekey
+/// rotations do not evict prekeys needed to replay them.
 pub(super) fn preserved_deferred_prekeys<V>(
     inner: &Inner<V>,
     now_ms: u64,
@@ -296,6 +305,42 @@ pub(super) fn preserved_deferred_prekeys<V>(
             if within_window {
                 record(&initial);
             }
+        }
+    }
+    let me = inner.client.identity_key();
+    for iso in &inner.isolated_contacts {
+        let is_pq_iso = super::contact::is_pq_incompatible_isolated(iso, &me);
+        for bytes in &iso.pending_carried_initials {
+            let Some(initial) = Incoming::decode_carried(bytes) else {
+                continue;
+            };
+            let (spk, _) = initial_spk_and_digest(&initial);
+            let deferred_at = inner
+                .carried_deferred_timestamps
+                .iter()
+                .find(|t| t.signed_prekey.as_slice() == spk.as_slice())
+                .map_or(0, |t| t.deferred_at);
+            let within_window = is_pq_iso
+                || deferred_at == 0
+                || now_ms.saturating_sub(deferred_at) <= DEFERRED_REPLAY_WINDOW_MS;
+            if within_window {
+                record(&initial);
+            }
+        }
+    }
+    for env in &inner.deferred_envelopes {
+        let Some(wire) = &env.initial_message else {
+            continue;
+        };
+        let is_isolated = env.pq_isolated
+            || inner.isolated_contacts.iter().any(|iso| {
+                iso.peer == env.peer && super::contact::is_pq_incompatible_isolated(iso, &me)
+            });
+        let within_window = is_isolated
+            || env.deferred_at == 0
+            || now_ms.saturating_sub(env.deferred_at) <= DEFERRED_REPLAY_WINDOW_MS;
+        if within_window && let Ok(initial) = Incoming::try_from(wire) {
+            record(&initial);
         }
     }
     (spks, digests)
@@ -441,6 +486,7 @@ impl<V: VaultStore> Inner<V> {
         Ok(opened)
     }
 
+    #[cfg(test)]
     pub(super) async fn ack_persisted_inbox(
         &mut self,
         mut acknowledge: impl AsyncFnMut(
@@ -577,19 +623,80 @@ enum RefillV2Outcome {
 }
 
 impl<V: VaultStore> Engine<V> {
-    async fn ack_pending_inbox_v2(&self, inner: &mut Inner<V>) -> Result<(), String> {
-        inner
-            .ack_persisted_inbox(async |client, audience, ids| {
-                client
-                    .ack_initial_messages_v2(audience, ids)
-                    .await
-                    .map(drop)
-                    .map_err(|e| {
+    /// Acknowledge persisted v2 inbox IDs without holding `self.inner` across network RPCs.
+    async fn ack_pending_inbox_v2(&self, vgen: u64) -> Result<(), String> {
+        loop {
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let next = {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                let Some(inner) = guard.as_mut() else {
+                    return Ok(());
+                };
+                if prune_invalid_inbox_acks(&mut inner.state.pending_inbox_acks) > 0 {
+                    inner.save_state().await.map_err(|e| describe(&e))?;
+                    if !self.is_live(vgen) {
+                        return Ok(());
+                    }
+                }
+                if inner.needs_save() || inner.state.pending_inbox_acks.is_empty() {
+                    return Ok(());
+                }
+                let count = inner.state.pending_inbox_acks.len().min(100);
+                let ids = inner.state.pending_inbox_acks[..count].to_vec();
+                match inner
+                    .client
+                    .sign_ack_initial_messages_v2(&inner.audience, &ids)
+                {
+                    Ok(reqs) => (inner.server.clone(), ids, reqs),
+                    Err(e) => {
+                        if e.kind() == ErrorKind::ClockSkew {
+                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                        }
                         self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-                        describe(&e)
-                    })
-            })
-            .await
+                        return Err(describe(&e));
+                    }
+                }
+            };
+            let (server, ids, reqs) = next;
+            for req in reqs {
+                let res: session::Result<_> = Fetch::client(&server)
+                    .ack_initial_messages(req)
+                    .await
+                    .map_err(session::Error::from);
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                if let Err(e) = res {
+                    self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                    return Err(describe(&e));
+                }
+            }
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Ok(());
+            }
+            let Some(inner) = guard.as_mut() else {
+                return Ok(());
+            };
+            let before = inner.state.pending_inbox_acks.len();
+            inner
+                .state
+                .pending_inbox_acks
+                .retain(|id| !ids.contains(id));
+            if before != inner.state.pending_inbox_acks.len()
+                && let Err(e) = inner.save_state().await
+            {
+                return Err(format!(
+                    "failed to save acknowledged inbox IDs (will retry): {}",
+                    describe(&e)
+                ));
+            }
+        }
     }
 
     pub(super) fn process_inbox_messages(
@@ -650,30 +757,56 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok((false, BTreeSet::new()));
             }
-            let mut guard = self.lock_inner().await;
-            if !self.is_live(vgen) {
-                return Ok((false, BTreeSet::new()));
-            }
-            let Some(inner) = guard.as_mut() else {
-                break;
-            };
-            if inner.needs_save() {
-                inner.save(&[]).await.map_err(|e| describe(&e))?;
-            }
-            if !self.is_live(vgen) {
-                return Ok((false, BTreeSet::new()));
-            }
-            self.ack_pending_inbox_v2(inner).await?;
-            if !self.is_live(vgen) {
-                return Ok((false, BTreeSet::new()));
-            }
-            let inbox = match inner
-                .client
-                .list_initial_messages_v2(&inner.audience, after_id, 100)
-                .await
             {
-                _ if !self.is_live(vgen) => return Ok((false, BTreeSet::new())),
-                Ok(inbox) => inbox,
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok((false, BTreeSet::new()));
+                }
+                let Some(inner) = guard.as_mut() else {
+                    break;
+                };
+                if inner.needs_save() {
+                    inner.save(&[]).await.map_err(|e| describe(&e))?;
+                }
+                if !self.is_live(vgen) {
+                    return Ok((false, BTreeSet::new()));
+                }
+            }
+            self.ack_pending_inbox_v2(vgen).await?;
+            if !self.is_live(vgen) {
+                return Ok((false, BTreeSet::new()));
+            }
+            let (server, list_req) = {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok((false, BTreeSet::new()));
+                }
+                let Some(inner) = guard.as_mut() else {
+                    break;
+                };
+                match inner
+                    .client
+                    .sign_list_initial_messages_v2(&inner.audience, after_id, 100)
+                {
+                    Ok(req) => (inner.server.clone(), req),
+                    Err(e) => {
+                        if e.kind() == ErrorKind::ClockSkew {
+                            self.warn_clock_skew(inner.client.clock().offset_ms());
+                        }
+                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
+                        return Err(describe(&e));
+                    }
+                }
+            };
+            let raw_inbox: session::Result<_> = Fetch::client(&server)
+                .list_initial_messages(list_req)
+                .await
+                .map_err(session::Error::from);
+            if !self.is_live(vgen) {
+                return Ok((false, BTreeSet::new()));
+            }
+            let inbox = match raw_inbox {
+                Ok(resp) => session::parse_listed_initial_messages(&resp),
                 Err(e) => {
                     self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                     return Err(describe(&e));
@@ -681,44 +814,44 @@ impl<V: VaultStore> Engine<V> {
             };
             let has_more = inbox.has_more;
             let next_after_id = inbox.next_after_id;
-            let mut batch = InitialBatch::default();
-            // Defer read receipts until `save_initial_batch` confirms the chat is still open and
-            // visible after persistence.
-            self.process_inbox_messages(inner, inbox, &mut batch);
-            if batch.dirty {
-                any_progress = true;
-                let grant_peers = std::mem::take(&mut batch.grant_peers);
-                let touched_peers = std::mem::take(&mut batch.touched_peers);
-                let upgrades = self.save_initial_batch(inner, batch).await?;
+            let (dirty, grant_peers) = {
+                let mut guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
                     return Ok((false, BTreeSet::new()));
                 }
-                all_upgrades.extend(upgrades);
-                inbox_peers.extend(touched_peers);
-                if !grant_peers.is_empty() {
-                    drop(guard);
-                    for peer in grant_peers {
-                        if !self.is_live(vgen) {
-                            return Ok((false, BTreeSet::new()));
-                        }
-                        let _ = self.flush_pending_grants_for_peer(&peer).await;
-                    }
+                let Some(inner) = guard.as_mut() else {
+                    break;
+                };
+                let mut batch = InitialBatch::default();
+                // Defer read receipts until `save_initial_batch` confirms the chat is still open and
+                // visible after persistence.
+                self.process_inbox_messages(inner, inbox, &mut batch);
+                if batch.dirty {
+                    any_progress = true;
+                    let grant_peers = std::mem::take(&mut batch.grant_peers);
+                    let touched_peers = std::mem::take(&mut batch.touched_peers);
+                    let upgrades = self.save_initial_batch(inner, batch).await?;
                     if !self.is_live(vgen) {
                         return Ok((false, BTreeSet::new()));
                     }
-                    let mut ack_guard = self.lock_inner().await;
-                    if !self.is_live(vgen) {
-                        return Ok((false, BTreeSet::new()));
-                    }
-                    if let Some(inner) = ack_guard.as_mut() {
-                        self.ack_pending_inbox_v2(inner).await?;
-                    }
+                    all_upgrades.extend(upgrades);
+                    inbox_peers.extend(touched_peers);
+                    (true, grant_peers)
                 } else {
-                    self.ack_pending_inbox_v2(inner).await?;
-                    drop(guard);
+                    (false, BTreeSet::new())
                 }
-            } else {
-                drop(guard);
+            };
+            if dirty {
+                for peer in grant_peers {
+                    if !self.is_live(vgen) {
+                        return Ok((false, BTreeSet::new()));
+                    }
+                    let _ = self.flush_pending_grants_for_peer(&peer).await;
+                }
+                if !self.is_live(vgen) {
+                    return Ok((false, BTreeSet::new()));
+                }
+                self.ack_pending_inbox_v2(vgen).await?;
             }
             if !has_more {
                 break;
@@ -731,6 +864,7 @@ impl<V: VaultStore> Engine<V> {
         // Replay buffered envelopes only AFTER draining inbox pages, and scoped strictly to peers
         // whose session state advanced in this pass so unrelated peers (whose carried or
         // later-page initials haven't been joined yet) are never prematurely dropped.
+        let mut replay_grants = BTreeSet::new();
         if !inbox_peers.is_empty() && self.is_live(vgen) {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
@@ -743,7 +877,7 @@ impl<V: VaultStore> Engine<V> {
                     if !self.is_live(vgen) {
                         return Ok((false, BTreeSet::new()));
                     }
-                    if let Ok((replayed_peers, replay_upgrades)) =
+                    if let Ok((replayed_peers, replay_upgrades, grants)) =
                         self.replay_deferred_envelopes(inner, Some(&peer)).await
                     {
                         for replayed in &replayed_peers {
@@ -751,9 +885,16 @@ impl<V: VaultStore> Engine<V> {
                         }
                         all_replayed.extend(replayed_peers);
                         all_upgrades.extend(replay_upgrades);
+                        replay_grants.extend(grants);
                     }
                 }
             }
+        }
+        for peer in replay_grants {
+            if !self.is_live(vgen) {
+                return Ok((false, BTreeSet::new()));
+            }
+            let _ = self.flush_pending_grants_for_peer(&peer).await;
         }
         for peer in all_upgrades {
             if !self.is_live(vgen) {
@@ -764,12 +905,13 @@ impl<V: VaultStore> Engine<V> {
         Ok((any_progress, all_replayed))
     }
 
-    /// Commit replayed initials with their history and consumed prekeys. Return the peers to
-    /// upgrade after releasing the lock, or `None` if the queue made no progress.
+    /// Commit replayed initials with their history and consumed prekeys. Return `(upgrades,
+    /// grant_peers)` to execute after releasing `self.inner`, or `None` if the queue made no
+    /// progress.
     pub(super) async fn replay_deferred_initials(
         &self,
         inner: &mut Inner<impl VaultStore>,
-    ) -> Result<Option<BTreeSet<PublicKey>>, String> {
+    ) -> Result<Option<(BTreeSet<PublicKey>, BTreeSet<PublicKey>)>, String> {
         let mut batch = InitialBatch::default();
         let (pruned, modified) = sanitize_deferred_initials(&mut inner.deferred_initials, now());
         if pruned > 0 {
@@ -823,16 +965,15 @@ impl<V: VaultStore> Engine<V> {
         if batch.dirty {
             let grant_peers = std::mem::take(&mut batch.grant_peers);
             let upgrades = self.save_initial_batch(inner, batch).await?;
-            for peer in grant_peers {
-                let _ = self.flush_pending_grants_for(inner, &peer).await;
-            }
-            Ok(Some(upgrades))
+            Ok(Some((upgrades, grant_peers)))
         } else {
             Ok(None)
         }
     }
 
-    /// Join the peer's pending carried initials. Each removal commits with its prekeys, session and history.
+    /// Join the peer's pending carried initials. Each removal commits with its prekeys, session
+    /// and history, returning any staged `grant_peers` for lock-free registration outside
+    /// `self.inner`.
     pub(super) async fn join_carried(
         &self,
         inner: &mut Inner<impl VaultStore>,
@@ -850,6 +991,7 @@ impl<V: VaultStore> Engine<V> {
             inner.save(&[]).await.map_err(|e| describe(&e))?;
         }
         let mut recommend_upgrade = false;
+        let mut grant_peers = BTreeSet::new();
         loop {
             let contact = &inner.contacts[index];
             let next = contact.deferred_carried;
@@ -878,13 +1020,12 @@ impl<V: VaultStore> Engine<V> {
             prune_carried_timestamps_for_contacts(
                 &mut inner.carried_deferred_timestamps,
                 inner.contacts.iter(),
+                inner.isolated_contacts.iter(),
             );
             if batch.dirty {
-                let grant_peers = std::mem::take(&mut batch.grant_peers);
+                let staged = std::mem::take(&mut batch.grant_peers);
                 recommend_upgrade |= self.save_initial_batch(inner, batch).await?.contains(peer);
-                for gp in grant_peers {
-                    let _ = self.flush_pending_grants_for(inner, &gp).await;
-                }
+                grant_peers.extend(staged);
             } else if let Err(e) = inner.save(&[]).await {
                 // Nothing consumed a prekey. Retry the original entry if storage recovers.
                 inner.contacts[index]
@@ -898,6 +1039,7 @@ impl<V: VaultStore> Engine<V> {
         Ok(JoinCarriedOutcome {
             recommend_upgrade,
             has_deferred: inner.contacts[index].deferred_carried > 0,
+            grant_peers,
         })
     }
 
@@ -1070,6 +1212,7 @@ impl<V: VaultStore> Engine<V> {
                 &mut inner.contacts[index]
             }
             None => {
+                let conversation_gen = inner.allocate_conversation_gen();
                 let mut contact = Contact {
                     peer: *peer,
                     session,
@@ -1078,6 +1221,7 @@ impl<V: VaultStore> Engine<V> {
                         peer: peer.to_vec(),
                         request: true,
                         greeting_delivery: GREETING_DELIVERY_CONFIRMED,
+                        conversation_gen,
                         ..Default::default()
                     },
                 };
@@ -1296,7 +1440,7 @@ impl<V: VaultStore> Engine<V> {
                     }
                     PublishV2Outcome::V2ClassicalOff => {
                         inner.last_server_pq_opks = Some(0);
-                        if inner.client.pq_config().pq_enabled {
+                        if inner.local_pq_enabled() {
                             inner.server_pq = ServerPqStatus::Disabled;
                             "published classical prekeys and signed PQ-off capability manifest (server PQ disabled)"
                         } else {
@@ -1761,18 +1905,29 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
-            {
+            let replay_grants = {
                 let mut guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
                 }
+                let mut grants = BTreeSet::new();
                 if let Some(inner) = guard.as_mut() {
-                    let _ = self.replay_deferred_envelopes(inner, Some(&peer)).await;
+                    if let Ok((_, _, gp)) = self.replay_deferred_envelopes(inner, Some(&peer)).await
+                    {
+                        grants = gp;
+                    }
                     if !self.is_live(vgen) {
                         return Err(StartChatError::Cancelled);
                     }
                     self.refresh_contacts(inner);
                 }
+                grants
+            };
+            for gp in replay_grants {
+                if !self.is_live(vgen) {
+                    return Err(StartChatError::Cancelled);
+                }
+                let _ = self.flush_pending_grants_for_peer(&gp).await;
             }
             let _ = self.flush(&peer).await;
             if self.is_live(vgen) {
@@ -1853,7 +2008,7 @@ impl<V: VaultStore> Engine<V> {
 
         // Phase 1: Lock-free `ClaimBundle` (retrying cleanly if PQ settings change mid-flight).
         const MAX_PQ_CONFIG_RETRIES: usize = 2;
-        let (mut guard, claimed, server_url, clock, signs_in_here) = {
+        let (claimed, server_url, clock, signs_in_here, claimed_pq_config) = {
             let mut attempt = 0usize;
             loop {
                 let (server_url, audience, pq_config, clock, signs_in_here) = {
@@ -1937,9 +2092,55 @@ impl<V: VaultStore> Engine<V> {
                         ));
                     }
                 }
-                break (guard, claimed, server_url, clock, signs_in_here);
+                drop(guard);
+                break (claimed, server_url, clock, signs_in_here, pq_config);
             }
         };
+
+        // Serialize Phases 2–4 per peer via `peer_flush_lock` (acquired strictly BEFORE
+        // `self.inner`) so concurrent `retry_pending_greetings()` or `flush()` cannot send
+        // `SendInitialV2` before `RegisterWriteToken` completes or defeat cancellation rollback.
+        let peer_lock = self.queue.peer_flush_lock(&peer);
+        let peer_guard = peer_lock.lock().await;
+        if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
+            return Err(StartChatError::Cancelled);
+        }
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
+            return Err(StartChatError::Cancelled);
+        }
+        {
+            let inner = guard
+                .as_mut()
+                .ok_or_else(|| StartChatError::Other("locked".into()))?;
+            inner.check_outgoing_peer(&peer)?;
+            if inner.contacts.iter().any(|c| c.peer == peer) {
+                drop(claimed);
+                drop(peer_guard);
+                if allow_classical
+                    && super::settings::check_classical_approval(inner.client.pq_config()).is_err()
+                {
+                    return Err(StartChatError::PqRequired);
+                }
+                return self
+                    .finish_existing_contact_start_chat(
+                        guard,
+                        vgen,
+                        submission_id,
+                        peer,
+                        name,
+                        pin_pq,
+                        allow_classical,
+                    )
+                    .await;
+            }
+            if *inner.client.pq_config() != claimed_pq_config {
+                return Err(StartChatError::Other(
+                    "Post-quantum settings changed while starting this chat. Try again."
+                        .to_string(),
+                ));
+            }
+        }
 
         // Phase 2: Synchronous handshake completion and H-2 durable persistence under `self.inner`.
         let (created_session_id, outgoing_request, retained_farewells, ready_to_send) = {
@@ -2014,6 +2215,7 @@ impl<V: VaultStore> Engine<V> {
                 ..HistoryEntry::default()
             };
             let last_message = Some(super::contact::preview_for_entry(&entry));
+            let conversation_gen = inner.allocate_conversation_gen();
             inner.contacts.push(Contact {
                 peer,
                 session,
@@ -2028,6 +2230,7 @@ impl<V: VaultStore> Engine<V> {
                     greeting_delivery: GREETING_DELIVERY_UNSENT,
                     acked_ranges: vec![IndexRange { start: 0, end: 1 }],
                     fallback_farewells: retained_farewells.clone(),
+                    conversation_gen,
                     ..ContactState::default()
                 },
             });
@@ -2107,6 +2310,18 @@ impl<V: VaultStore> Engine<V> {
                 if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
                 }
+                if self.is_submission_cancelled(submission_id) {
+                    self.startup.end_new_chat_submit(submission_id);
+                    self.rollback_cancelled_start_chat(
+                        inner,
+                        &peer,
+                        &retained_farewells,
+                        ready_to_send,
+                        false,
+                    )
+                    .await;
+                    return Err(StartChatError::Cancelled);
+                }
             }
 
             // The chat is now durably persisted; mark `in_flight_start_chat` as greeting-only so a
@@ -2167,29 +2382,45 @@ impl<V: VaultStore> Engine<V> {
             }
             return Err(StartChatError::Cancelled);
         }
-        // Re-verify contact existence and matching session immediately before transmitting
-        // `SendInitialV2` so a concurrent delete or inbound session during grant registration
-        // never emits a phantom or superseded initial request.
+        // Re-verify contact existence, matching session, AND confirmed active write-token grant
+        // immediately before transmitting `SendInitialV2` so a concurrent delete, inbound session,
+        // or failed `RegisterWriteToken` never emits a phantom or unreplyable initial request.
         {
-            let guard = self.lock_inner().await;
+            let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err(StartChatError::Cancelled);
             }
-            let Some(inner) = guard.as_ref() else {
+            let Some(inner) = guard.as_mut() else {
                 return Err(StartChatError::Cancelled);
             };
-            let still_matches = inner
-                .contacts
-                .iter()
-                .find(|c| c.peer == peer)
-                .is_some_and(|c| c.session.active_id() == created_session_id.as_ref());
-            if !still_matches {
+            let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
                 self.startup.end_new_chat_submit(submission_id);
-                return if inner.contacts.iter().any(|c| c.peer == peer) {
-                    Ok(peer)
-                } else {
-                    Err(StartChatError::Cancelled)
-                };
+                return Err(StartChatError::Cancelled);
+            };
+            if contact.session.active_id() != created_session_id.as_ref() {
+                self.startup.end_new_chat_submit(submission_id);
+                return Ok(peer);
+            }
+            if contact.session.has_pending_active_grant() {
+                if let Some(contact) = inner.contact(&peer)
+                    && contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
+                {
+                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                    let _ = inner.save_state().await;
+                    if !self.is_live(vgen) {
+                        return Err(StartChatError::Cancelled);
+                    }
+                }
+                self.startup.end_new_chat_submit(submission_id);
+                self.ui.log(format!(
+                    "saved chat with {}; waiting to confirm write-token registration before sending initial greeting",
+                    short(&peer)
+                ));
+                self.refresh_contacts(inner);
+                drop(guard);
+                drop(peer_guard);
+                self.wake();
+                return Ok(peer);
             }
         }
 
@@ -2284,9 +2515,7 @@ impl<V: VaultStore> Engine<V> {
                     .message
                     .as_ref()
                     .is_some_and(|m| m.version >= 2);
-                if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &e) && !outgoing_is_pq {
-                    self.require_update(describe(&e));
-                }
+                self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
                 self.ui.log(format!(
                     "saved chat with {}, but could not send its initial greeting yet (it will carry on the first message): {}",
                     short(&peer),
@@ -2314,6 +2543,7 @@ impl<V: VaultStore> Engine<V> {
         }
         self.refresh_contacts(inner);
         drop(guard);
+        drop(peer_guard);
         self.wake();
         Ok(peer)
     }

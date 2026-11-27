@@ -72,6 +72,8 @@ pub enum AddInitialOutcome {
     LimitExceeded,
     /// Recipient has no published capability manifest (no DO tables allocated).
     NotFound,
+    /// The initial message's `signed_prekey` is no longer in the recipient's retained generations.
+    StalePrekey,
     /// Existing unexpired row for `(sender, ephemeral_key)` had a different payload.
     PayloadMismatch,
     /// Monotonic inbox ID exceeded `MAX_SAFE_INTEGER`.

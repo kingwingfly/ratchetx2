@@ -312,9 +312,10 @@ mod v2 {
         handshake_v2::{
             self, AckInitialMessagesRequest, CapabilityManifest, ClaimBundleRequest,
             ClaimBundleResponse, GetManifestRequest, GetServerInfoRequest, GetServerInfoResponse,
-            ListInitialMessagesRequest, LocalHandshakeV2, PqLastResortCommitment, PqPrekey,
-            PublishV2Request, RefillPrekeysRequest, RefillPrekeysResponse, SendInitialV2Request,
-            check_manifest_window_bounded, manifest_digest, sign_manifest, verify_manifest,
+            ListInitialMessagesRequest, ListInitialMessagesResponse, LocalHandshakeV2,
+            PqLastResortCommitment, PqPrekey, PublishV2Request, RefillPrekeysRequest,
+            RefillPrekeysResponse, SendInitialV2Request, check_manifest_window_bounded,
+            manifest_digest, sign_manifest, verify_manifest,
         },
         mailbox_v2::{
             AckMessagesRequest, CLIENT_MESSAGE_ID_LENGTH, EnvelopeV2, FetchSignedRequest,
@@ -2625,6 +2626,33 @@ mod v2 {
             }
         }
 
+        /// Sign one or more [`AckInitialMessagesRequest`] batches (chunked to `MAX_ACK_BATCH`)
+        /// without holding the client across network RPCs.
+        pub fn sign_ack_initial_messages_v2(
+            &mut self,
+            audience: &str,
+            ids: &[u64],
+        ) -> Result<Vec<AckInitialMessagesRequest>> {
+            if audience.trim().is_empty() {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let ids: Vec<u64> = ids.iter().copied().filter(|&id| id != 0).collect();
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut requests = Vec::with_capacity(ids.len().div_ceil(MAX_ACK_BATCH));
+            for chunk in ids.chunks(MAX_ACK_BATCH) {
+                let timestamp = self.current_timestamp()?;
+                requests.push(AckInitialMessagesRequest::sign(
+                    &self.state.identity,
+                    audience,
+                    chunk.to_vec(),
+                    timestamp,
+                )?);
+            }
+            Ok(requests)
+        }
+
         /// Explicitly acknowledge and delete pending inbox initial messages by their stable
         /// server-assigned IDs (call ONLY after persisting accepted sessions locally).
         pub async fn ack_initial_messages_v2(
@@ -2632,29 +2660,13 @@ mod v2 {
             audience: &str,
             ids: Vec<u64>,
         ) -> Result<u32> {
-            if audience.trim().is_empty() {
-                return Err(ErrorKind::Protocol.into());
-            }
-            let ids: Vec<u64> = ids.into_iter().filter(|&id| id != 0).collect();
-            if ids.is_empty() {
-                return Ok(0);
-            }
+            let requests = self.sign_ack_initial_messages_v2(audience, &ids)?;
             let mut total = 0u32;
-            for chunk in ids.chunks(MAX_ACK_BATCH) {
-                total = total.saturating_add(self.ack_initial_chunk(audience, chunk).await?);
+            for request in requests {
+                total = total
+                    .saturating_add(self.handshake.ack_initial_messages(request).await?.deleted);
             }
             Ok(total)
-        }
-
-        async fn ack_initial_chunk(&mut self, audience: &str, ids: &[u64]) -> Result<u32> {
-            let timestamp = self.current_timestamp()?;
-            let request = AckInitialMessagesRequest::sign(
-                &self.state.identity,
-                audience,
-                ids.to_vec(),
-                timestamp,
-            )?;
-            Ok(self.handshake.ack_initial_messages(request).await?.deleted)
         }
 
         /// Claim `peer`'s bundle via [`claim_peer_bundle_v2`] and build a [`PreparedInitiateV2`]
@@ -2767,6 +2779,27 @@ mod v2 {
             self.send_prepared_initiate_v2(&outgoing).await
         }
 
+        /// Sign a [`ListInitialMessagesRequest`] so callers can dispatch the RPC outside a lock
+        /// and decode the response via [`parse_listed_initial_messages`].
+        pub fn sign_list_initial_messages_v2(
+            &mut self,
+            audience: &str,
+            after_id: u64,
+            limit: u32,
+        ) -> Result<ListInitialMessagesRequest> {
+            if audience.trim().is_empty() {
+                return Err(ErrorKind::Protocol.into());
+            }
+            let timestamp = self.current_timestamp()?;
+            Ok(ListInitialMessagesRequest::sign(
+                &self.state.identity,
+                audience,
+                after_id,
+                limit,
+                timestamp,
+            )?)
+        }
+
         /// Phase 1 of cursor-paginated two-phase inbox receive: non-destructively list pending
         /// v1 and v2 initial messages strictly after `after_id` using
         /// `HandshakeV2::list_initial_messages`.
@@ -2779,37 +2812,34 @@ mod v2 {
             after_id: u64,
             limit: u32,
         ) -> Result<ListedInitialMessages> {
-            if audience.trim().is_empty() {
-                return Err(ErrorKind::Protocol.into());
-            }
-            let timestamp = self.current_timestamp()?;
-            let request = ListInitialMessagesRequest::sign(
-                &self.state.identity,
-                audience,
-                after_id,
-                limit,
-                timestamp,
-            )?;
+            let request = self.sign_list_initial_messages_v2(audience, after_id, limit)?;
             let response = self.handshake.list_initial_messages(request).await?;
-            let mut messages = Vec::with_capacity(response.messages.len());
-            let mut malformed_ids = vec![];
-            let mut next_after_id: Option<u64> = None;
-            for wire in &response.messages {
-                if wire.id == 0 || wire.id > protocol::MAX_SAFE_INTEGER {
-                    continue;
-                }
-                next_after_id = Some(next_after_id.map_or(wire.id, |prev| prev.max(wire.id)));
-                match InitialMessageV2::try_from(wire) {
-                    Ok(msg) => messages.push(msg),
-                    Err(_) => malformed_ids.push(wire.id),
-                }
+            Ok(parse_listed_initial_messages(&response))
+        }
+    }
+
+    /// Decode a wire [`ListInitialMessagesResponse`] into a [`ListedInitialMessages`] page.
+    pub fn parse_listed_initial_messages(
+        response: &ListInitialMessagesResponse,
+    ) -> ListedInitialMessages {
+        let mut messages = Vec::with_capacity(response.messages.len());
+        let mut malformed_ids = vec![];
+        let mut next_after_id: Option<u64> = None;
+        for wire in &response.messages {
+            if wire.id == 0 || wire.id > protocol::MAX_SAFE_INTEGER {
+                continue;
             }
-            Ok(ListedInitialMessages {
-                messages,
-                malformed_ids,
-                next_after_id,
-                has_more: response.has_more,
-            })
+            next_after_id = Some(next_after_id.map_or(wire.id, |prev| prev.max(wire.id)));
+            match InitialMessageV2::try_from(wire) {
+                Ok(msg) => messages.push(msg),
+                Err(_) => malformed_ids.push(wire.id),
+            }
+        }
+        ListedInitialMessages {
+            messages,
+            malformed_ids,
+            next_after_id,
+            has_more: response.has_more,
         }
     }
 

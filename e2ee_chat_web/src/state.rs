@@ -22,6 +22,8 @@ pub enum UnavailableReason {
     LocksUnavailable,
     /// Browser storage (IndexedDB) could not be opened.
     StorageUnavailable,
+    /// Vault header is missing while encrypted records or a rollback anchor survive.
+    CorruptVault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,9 +179,12 @@ pub struct ContactView {
     pub name: String,
     /// The peer started the chat, and it is not accepted yet.
     pub request: bool,
-    /// This client started the chat (or restarted it after peer deletion), but its initial
-    /// greeting has not yet been confirmed delivered to the server (will retry automatically).
+    /// This client started the chat (or restarted it after peer deletion), and its initial
+    /// greeting has not yet reached the server (will retry automatically once connected).
     pub greeting_unsent: bool,
+    /// This client transmitted its initial greeting, but delivery has not yet been confirmed
+    /// (e.g. connection dropped before receiving the response); retrying automatically.
+    pub greeting_uncertain: bool,
     /// This client started the chat (or restarted it after peer deletion), its initial request
     /// reached the server, and the peer has not yet accepted it; outgoing messages stay queued
     /// locally until the peer accepts.

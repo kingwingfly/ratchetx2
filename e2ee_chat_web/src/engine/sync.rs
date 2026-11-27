@@ -5,7 +5,7 @@ use super::contact::{Contact, pq_incompatible_isolated_token_hashes};
 use super::handshake::{
     DEFERRED_REPLAY_WINDOW_MS, Incoming, record_carried_timestamps, stage_carried_initials,
 };
-use super::outbox::{RequeueOutcome, needs_new_session};
+use super::outbox::{RekeyOutcome, RequeueOutcome, needs_new_session};
 use super::{
     AWAY_CHECK, Engine, HIDDEN_GRACE, Inner, POLL_AWAY, POLL_FAST, POLL_LIVE, POLL_SLOW, POLL_STEP,
     ProtocolRpcScope, RESUBSCRIBE_MAX, RESUBSCRIBE_MIN, UNFOCUSED_GRACE, VaultStore, origin,
@@ -17,9 +17,9 @@ use crate::state::{Link, ServerPqStatus};
 use crate::transport::Fetch;
 use crate::util::{describe, monotonic_now_ms, now, short, sleep};
 use crate::vault::{
-    ContactState, DeferredEnvelope, Farewell, GREETING_DELIVERY_CONFIRMED,
+    CLASSICAL_APPROVAL_NONE, ContactState, DeferredEnvelope, Farewell, GREETING_DELIVERY_CONFIRMED,
     GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, OutgoingRecord,
-    SECURITY_ALERT_DOWNGRADE,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE,
 };
 use futures_util::future::{Either, select};
 use leptos::prelude::*;
@@ -32,16 +32,23 @@ use session::{ClientState, ErrorKind, PqSuite, PublicKey, proto};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
-/// Maximum raw mailbox envelopes buffered per peer in `DeferredRecord.envelopes`.
+/// Maximum raw mailbox envelopes buffered per active/quarantined/rekeying peer.
 pub(super) const MAX_DEFERRED_ENVELOPES_PER_PEER: usize = 64;
-/// Maximum raw mailbox envelopes buffered across all peers in `DeferredRecord.envelopes`.
+/// Maximum raw mailbox envelopes buffered across all active/quarantined/rekeying peers.
 pub(super) const MAX_TOTAL_DEFERRED_ENVELOPES: usize = 256;
+/// Maximum raw mailbox envelopes buffered per PQ-incompatible isolated peer (exceeds the relay's
+/// 2,000-message queue cap so isolated peers can be drained without stalling healthy contacts).
+pub(super) const MAX_ISOLATED_DEFERRED_ENVELOPES_PER_PEER: usize = 2048;
+/// Maximum raw mailbox envelopes buffered across all PQ-incompatible isolated peers.
+pub(super) const MAX_TOTAL_ISOLATED_DEFERRED_ENVELOPES: usize = 4096;
 /// Safety bound on unified mailbox pages drained in a single `receive_mailbox` call.
 const MAX_MAILBOX_PAGES: usize = 20;
 
 /// Prune expired (`> DEFERRED_REPLAY_WINDOW_MS`), malformed, or unknown-peer `DeferredEnvelope`s
 /// on unlock or before replay, preserving envelopes belonging to PQ-incompatible isolated contacts
-/// so they decrypt once a capable build unlocks the vault. Returns how many entries were removed.
+/// (and envelopes flagged `pq_isolated` that were ACKed while isolated and await replay after a
+/// capable build unlocks) in their own dedicated spool budget without 30-day silent expiry.
+/// Returns how many entries were removed.
 pub(super) fn prune_deferred_envelopes(
     envelopes: &mut Vec<DeferredEnvelope>,
     contacts: &[Contact],
@@ -55,15 +62,24 @@ pub(super) fn prune_deferred_envelopes(
         .filter_map(|state| pq_incompatible_isolated_token_hashes(state, me).map(|(p, _)| p))
         .collect();
     let mut seen: BTreeSet<(PublicKey, u64)> = BTreeSet::new();
-    let mut per_peer: HashMap<PublicKey, usize> = HashMap::new();
-    envelopes.retain(|env| {
+    let mut active_per_peer: HashMap<PublicKey, usize> = HashMap::new();
+    let mut active_total: usize = 0;
+    let mut isolated_per_peer: HashMap<PublicKey, usize> = HashMap::new();
+    let mut isolated_total: usize = 0;
+    envelopes.retain_mut(|env| {
         let Ok(peer) = PublicKey::try_from(env.peer.as_slice()) else {
             return false;
         };
-        if !contacts.iter().any(|c| c.peer == peer) && !pq_isolated_peers.contains(&peer) {
+        let peer_is_isolated = pq_isolated_peers.contains(&peer);
+        if !contacts.iter().any(|c| c.peer == peer) && !peer_is_isolated {
             return false;
         }
-        if env.deferred_at != 0
+        if peer_is_isolated {
+            env.pq_isolated = true;
+        }
+        let is_isolated = env.pq_isolated;
+        if !is_isolated
+            && env.deferred_at != 0
             && now_ms.saturating_sub(env.deferred_at) > DEFERRED_REPLAY_WINDOW_MS
         {
             return false;
@@ -71,22 +87,34 @@ pub(super) fn prune_deferred_envelopes(
         if !seen.insert((peer, env.sequence)) {
             return false;
         }
-        let count = per_peer.entry(peer).or_insert(0);
-        if *count >= MAX_DEFERRED_ENVELOPES_PER_PEER {
-            return false;
+        if is_isolated {
+            let count = isolated_per_peer.entry(peer).or_insert(0);
+            if *count >= MAX_ISOLATED_DEFERRED_ENVELOPES_PER_PEER
+                || isolated_total >= MAX_TOTAL_ISOLATED_DEFERRED_ENVELOPES
+            {
+                return false;
+            }
+            *count += 1;
+            isolated_total += 1;
+        } else {
+            let count = active_per_peer.entry(peer).or_insert(0);
+            if *count >= MAX_DEFERRED_ENVELOPES_PER_PEER
+                || active_total >= MAX_TOTAL_DEFERRED_ENVELOPES
+            {
+                return false;
+            }
+            *count += 1;
+            active_total += 1;
         }
-        *count += 1;
         true
     });
-    if envelopes.len() > MAX_TOTAL_DEFERRED_ENVELOPES {
-        envelopes.truncate(MAX_TOTAL_DEFERRED_ENVELOPES);
-    }
     before - envelopes.len()
 }
 
-/// Buffer one raw mailbox envelope for `peer` into `envelopes`, enforcing per-peer (64) and total
-/// (256) caps. Returns `true` if the envelope was stored or already present, or `false` if dropped
-/// due to cap overflow (caller must append `contact.add_evicted()` in the same atomic tx!).
+/// Buffer one raw mailbox envelope for `peer` into `envelopes`, enforcing separate per-peer and
+/// total caps for active (`64`/`256`) vs PQ-isolated (`2048`/`4096`) spools so isolated contacts
+/// never steal active-peer budget. Returns `true` if the envelope was stored or already present,
+/// or `false` if dropped due to cap overflow (caller must record eviction in the same atomic tx).
 pub(super) fn push_deferred_envelope(
     envelopes: &mut Vec<DeferredEnvelope>,
     peer: &PublicKey,
@@ -94,6 +122,7 @@ pub(super) fn push_deferred_envelope(
     message: Option<party::EncryptedMessage>,
     initial_message: Option<WireInitialMessageV2>,
     now_ms: u64,
+    pq_isolated: bool,
 ) -> bool {
     if envelopes
         .iter()
@@ -101,13 +130,26 @@ pub(super) fn push_deferred_envelope(
     {
         return true;
     }
+    let (peer_cap, total_cap) = if pq_isolated {
+        (
+            MAX_ISOLATED_DEFERRED_ENVELOPES_PER_PEER,
+            MAX_TOTAL_ISOLATED_DEFERRED_ENVELOPES,
+        )
+    } else {
+        (
+            MAX_DEFERRED_ENVELOPES_PER_PEER,
+            MAX_TOTAL_DEFERRED_ENVELOPES,
+        )
+    };
     let peer_count = envelopes
         .iter()
-        .filter(|e| e.peer.as_slice() == peer.as_slice())
+        .filter(|e| e.pq_isolated == pq_isolated && e.peer.as_slice() == peer.as_slice())
         .count();
-    if peer_count >= MAX_DEFERRED_ENVELOPES_PER_PEER
-        || envelopes.len() >= MAX_TOTAL_DEFERRED_ENVELOPES
-    {
+    let total_count = envelopes
+        .iter()
+        .filter(|e| e.pq_isolated == pq_isolated)
+        .count();
+    if peer_count >= peer_cap || total_count >= total_cap {
         return false;
     }
     envelopes.push(DeferredEnvelope {
@@ -116,89 +158,12 @@ pub(super) fn push_deferred_envelope(
         message,
         initial_message,
         deferred_at: now_ms,
+        pq_isolated,
     });
     true
 }
 
-impl<V: VaultStore> Inner<V> {
-    /// Flush any durably staged `RegisterWriteToken` grants on `peer`'s session to our own DO.
-    pub(super) async fn flush_pending_grants_for(
-        &mut self,
-        peer: &PublicKey,
-    ) -> Result<(), session::Error> {
-        let grants = match self.contact(peer) {
-            Some(c) => c.session.pending_register_grants().to_vec(),
-            None => return Ok(()),
-        };
-        if grants.is_empty() {
-            return Ok(());
-        }
-        let mailbox = Fetch::client(&self.server);
-        let mut removed_any = false;
-        let mut first_err: Option<session::Error> = None;
-        for grant in grants {
-            match self
-                .client
-                .register_write_token_v2(
-                    &mailbox,
-                    &self.audience,
-                    peer,
-                    &grant.token_hash,
-                    grant.grant_version,
-                    grant.pin_active,
-                )
-                .await
-            {
-                Ok(()) => {
-                    if let Some(contact) = self.contact(peer) {
-                        removed_any |= contact
-                            .session
-                            .remove_pending_grant(&grant.token_hash, grant.grant_version);
-                    }
-                }
-                // Stale/superseded grant version (`grant_version <= revoked_below_version`):
-                // drop ONLY on explicit `StaleVersion` so later grants proceed; preserve on
-                // transient `StaleTimestamp`/`Protocol` or `LimitExceeded` so grants retry!
-                Err(e) if e.kind() == ErrorKind::StaleVersion => {
-                    if let Some(contact) = self.contact(peer) {
-                        removed_any |= contact
-                            .session
-                            .remove_pending_grant(&grant.token_hash, grant.grant_version);
-                    }
-                }
-                Err(e) => {
-                    first_err = Some(e);
-                    break;
-                }
-            }
-        }
-        if removed_any {
-            let _ = self.save_state().await;
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-}
-
 impl<V: VaultStore> Engine<V> {
-    /// Flush staged `RegisterWriteToken` grants for `peer` while holding `inner` (used by callers
-    /// that already hold `self.inner` across a local recovery step or settings flow).
-    pub(super) async fn flush_pending_grants_for(
-        &self,
-        inner: &mut Inner<impl VaultStore>,
-        peer: &PublicKey,
-    ) -> Result<(), String> {
-        match inner.flush_pending_grants_for(peer).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-                Err(describe(&e))
-            }
-        }
-    }
-
     /// Lock-free flush of staged `RegisterWriteToken` grants for `peer`: signs each request under
     /// `self.inner`, drops `self.inner` across the network RPC, then re-acquires `self.inner`,
     /// validates `is_live(vgen)`, and removes the confirmed grant.
@@ -263,12 +228,16 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            let remove = match rpc_res {
-                Ok(()) => true,
+            let (remove, reconcile_active_stale) = match rpc_res {
+                Ok(()) => (true, false),
                 // Stale/superseded grant version (`grant_version <= revoked_below_version`):
-                // drop ONLY on explicit `StaleVersion` so newer grants proceed. Never discard on
-                // transient clock-skew `StaleTimestamp`/`Protocol` or `LimitExceeded`.
-                Err(e) if e.kind() == ErrorKind::StaleVersion => true,
+                // drop non-active archived grants cleanly, but if the ACTIVE session's grant hit
+                // `StaleVersion`, re-stage it with a freshly allocated higher grant version and
+                // keep outbound traffic gated until registration succeeds.
+                Err(e) if e.kind() == ErrorKind::StaleVersion => {
+                    first_err = Some(describe(&e));
+                    (true, true)
+                }
                 Err(e) if e.kind() == ErrorKind::LimitExceeded => {
                     let msg = format!(
                         "Could not register write token for {}: active server grant limit reached ({})",
@@ -291,13 +260,37 @@ impl<V: VaultStore> Engine<V> {
                 if !self.is_live(vgen) {
                     return Ok(());
                 }
-                if let Some(inner) = guard.as_mut()
-                    && let Some(contact) = inner.contact(peer)
-                    && contact
-                        .session
-                        .remove_pending_grant(&grant.token_hash, grant.grant_version)
-                {
-                    let _ = inner.save_state().await;
+                let mut active_restaged = false;
+                if let Some(inner) = guard.as_mut() {
+                    let is_active = reconcile_active_stale
+                        && inner
+                            .contacts
+                            .iter()
+                            .find(|c| c.peer == *peer)
+                            .and_then(|c| c.session.active_inbound_token_hash())
+                            == Some(grant.token_hash);
+                    let removed = inner.contact(peer).is_some_and(|contact| {
+                        contact
+                            .session
+                            .remove_pending_grant(&grant.token_hash, grant.grant_version)
+                    });
+                    if is_active {
+                        if inner
+                            .stage_write_token_grant(peer, grant.token_hash, true)
+                            .is_ok()
+                        {
+                            active_restaged = true;
+                        }
+                    } else if reconcile_active_stale {
+                        // Archived non-active grant superseded cleanly; do not treat as fatal error.
+                        first_err = None;
+                    }
+                    if removed || active_restaged {
+                        let _ = inner.save_state().await;
+                    }
+                }
+                if active_restaged {
+                    break;
                 }
             }
         }
@@ -855,7 +848,14 @@ impl<V: VaultStore> Engine<V> {
             }
             self.refresh_contacts(inner);
         }
-        let replayed = self.replay_deferred_initials(inner).await?;
+        let mut grant_peers: BTreeSet<PublicKey> = BTreeSet::new();
+        let mut upgrades: BTreeSet<PublicKey> = BTreeSet::new();
+        if let Some((replayed_upgrades, replayed_grants)) =
+            self.replay_deferred_initials(inner).await?
+        {
+            upgrades.extend(replayed_upgrades);
+            grant_peers.extend(replayed_grants);
+        }
         if !self.is_live(vgen) {
             return Ok(false);
         }
@@ -868,22 +868,31 @@ impl<V: VaultStore> Engine<V> {
             })
             .map(|c| c.peer)
             .collect();
-        let mut upgrades = replayed.unwrap_or_default();
         for peer in &pending {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            if self.join_carried(inner, peer).await?.recommend_upgrade {
+            let join = self.join_carried(inner, peer).await?;
+            if join.recommend_upgrade {
                 upgrades.insert(*peer);
             }
+            grant_peers.extend(join.grant_peers);
         }
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        let (replayed_peers, replay_upgrades) = self.replay_deferred_envelopes(inner, None).await?;
+        let (replayed_peers, replay_upgrades, replay_grants) =
+            self.replay_deferred_envelopes(inner, None).await?;
         upgrades.extend(replay_upgrades);
+        grant_peers.extend(replay_grants);
         let recovered = !pending.is_empty() || !replayed_peers.is_empty();
         drop(guard);
+        for peer in grant_peers {
+            if !self.is_live(vgen) {
+                return Ok(false);
+            }
+            let _ = self.flush_pending_grants_for_peer(&peer).await;
+        }
         for peer in upgrades {
             if !self.is_live(vgen) {
                 return Ok(false);
@@ -994,10 +1003,14 @@ impl<V: VaultStore> Engine<V> {
                 .filter(|c| {
                     !c.state.request
                         && !c.state.quarantined
-                        && !c.session.needs_new_session()
                         && !c.session.is_known_by_peer()
                         && c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
-                        && c.session.pending_initial_request().is_some()
+                        && !c.session.has_pending_active_grant()
+                        && ((!c.session.needs_new_session()
+                            && c.session.pending_initial_request().is_some())
+                            || (c.session.needs_new_session()
+                                && c.state.classical_approval_needed == CLASSICAL_APPROVAL_NONE
+                                && c.state.security_alert == SECURITY_ALERT_NONE))
                 })
                 .map(|c| c.peer)
                 .collect()
@@ -1008,7 +1021,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            if self.queue.waits_for_sign_in(&peer) {
+            if self.queue.waits_for_sign_in(&peer) || self.queue.is_approval_backed_off(&peer) {
                 continue;
             }
             let peer_lock = self.queue.peer_flush_lock(&peer);
@@ -1016,10 +1029,21 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            if self.queue.waits_for_sign_in(&peer) {
+            if self.queue.waits_for_sign_in(&peer) || self.queue.is_approval_backed_off(&peer) {
                 continue;
             }
-            let prepared = {
+            enum GreetingRetryAction {
+                Skip,
+                ReclaimRetired,
+                Send {
+                    server: String,
+                    signs_in_here: bool,
+                    session_id: Option<[u8; 32]>,
+                    req: Box<session::protocol::handshake_v2::SendInitialV2Request>,
+                    promoted_from_unsent: bool,
+                },
+            }
+            let action = {
                 let mut guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
                     return Ok(false);
@@ -1032,44 +1056,92 @@ impl<V: VaultStore> Engine<V> {
                 };
                 if contact.state.request
                     || contact.state.quarantined
-                    || contact.session.needs_new_session()
                     || contact.session.is_known_by_peer()
                     || contact.state.greeting_delivery == GREETING_DELIVERY_CONFIRMED
+                    || contact.session.has_pending_active_grant()
                 {
-                    continue;
+                    GreetingRetryAction::Skip
+                } else if contact.session.needs_new_session() {
+                    if contact.state.classical_approval_needed == CLASSICAL_APPROVAL_NONE
+                        && contact.state.security_alert == SECURITY_ALERT_NONE
+                    {
+                        GreetingRetryAction::ReclaimRetired
+                    } else {
+                        GreetingRetryAction::Skip
+                    }
+                } else if let Some(req) = contact.session.pending_initial_request() {
+                    let session_id = contact.session.active_id().copied();
+                    let promoted_from_unsent =
+                        contact.state.greeting_delivery == GREETING_DELIVERY_UNSENT;
+                    if promoted_from_unsent {
+                        if let Err(e) = inner
+                            .with_contact_tx(&peer, async |inner| {
+                                if let Some(c) = inner.contact(&peer) {
+                                    c.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                                }
+                                inner.save(&[]).await.map_err(|e| describe(&e))
+                            })
+                            .await
+                        {
+                            first_err.get_or_insert(e);
+                            continue;
+                        }
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
+                    }
+                    GreetingRetryAction::Send {
+                        server: inner.server.clone(),
+                        signs_in_here: same_server(&inner.server, &origin()),
+                        session_id,
+                        req: Box::new(req),
+                        promoted_from_unsent,
+                    }
+                } else {
+                    GreetingRetryAction::Skip
                 }
-                let Some(req) = contact.session.pending_initial_request() else {
-                    continue;
-                };
-                let session_id = contact.session.active_id().copied();
-                let promoted_from_unsent =
-                    contact.state.greeting_delivery == GREETING_DELIVERY_UNSENT;
-                if promoted_from_unsent {
-                    if let Err(e) = inner
-                        .with_contact_tx(&peer, async |inner| {
-                            if let Some(c) = inner.contact(&peer) {
-                                c.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-                            }
-                            inner.save(&[]).await.map_err(|e| describe(&e))
-                        })
+            };
+            let (server, signs_in_here, session_id, req, promoted_from_unsent) = match action {
+                GreetingRetryAction::Skip => continue,
+                GreetingRetryAction::ReclaimRetired => {
+                    let mut server_deletes = Vec::new();
+                    match self
+                        .ensure_session_for_outbox(vgen, &peer, &mut server_deletes)
                         .await
                     {
-                        first_err.get_or_insert(e);
-                        continue;
+                        Ok(RekeyOutcome::Aborted) => return Ok(false),
+                        Ok(RekeyOutcome::Ready) => retried_any = true,
+                        Ok(RekeyOutcome::UpdateRequired(reason)) => {
+                            self.require_update(reason.clone());
+                            first_err.get_or_insert(reason);
+                        }
+                        Ok(
+                            RekeyOutcome::Paused | RekeyOutcome::Failed | RekeyOutcome::ContactGone,
+                        ) => {}
+                        Err(e) => {
+                            first_err.get_or_insert(e);
+                        }
                     }
-                    if !self.is_live(vgen) {
-                        return Ok(false);
+                    if !server_deletes.is_empty() && self.is_live(vgen) {
+                        self.finish_server_deletes(&peer, server_deletes).await;
                     }
+                    continue;
                 }
-                (
-                    inner.server.clone(),
-                    same_server(&inner.server, &origin()),
+                GreetingRetryAction::Send {
+                    server,
+                    signs_in_here,
                     session_id,
                     req,
                     promoted_from_unsent,
-                )
+                } => (
+                    server,
+                    signs_in_here,
+                    session_id,
+                    *req,
+                    promoted_from_unsent,
+                ),
             };
-            let (server, signs_in_here, session_id, req, promoted_from_unsent) = prepared;
+            let outgoing_is_pq = req.message.as_ref().is_some_and(|m| m.version >= 2);
             let send_res: session::Result<()> = Fetch::client(&server)
                 .send_initial_v2(req)
                 .await
@@ -1078,59 +1150,111 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            let mut guard = self.lock_inner().await;
-            if !self.is_live(vgen) {
-                return Ok(false);
-            }
-            let Some(inner) = guard.as_mut() else {
-                return Ok(false);
-            };
-            let matches_session = inner
-                .contacts
-                .iter()
-                .find(|c| c.peer == peer)
-                .is_some_and(|c| c.session.active_id() == session_id.as_ref());
-            match send_res {
-                Ok(()) if matches_session => {
-                    if inner
-                        .contact(&peer)
-                        .is_some_and(Contact::mark_greeting_confirmed)
-                    {
-                        let _ = inner.save_state().await;
-                        if !self.is_live(vgen) {
-                            return Ok(false);
-                        }
-                    }
-                    self.refresh_contacts(inner);
-                    retried_any = true;
+            let mut reclaim_retired = false;
+            {
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(false);
                 }
-                Ok(()) => {}
-                Err(e) => {
-                    if e.is_server_refusal() && promoted_from_unsent && matches_session {
-                        let reverted = inner.contact(&peer).is_some_and(|c| {
-                            if c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
-                                c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                                true
-                            } else {
-                                false
-                            }
-                        });
-                        if reverted {
+                let Some(inner) = guard.as_mut() else {
+                    return Ok(false);
+                };
+                let matches_session = inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer)
+                    .is_some_and(|c| c.session.active_id() == session_id.as_ref());
+                match send_res {
+                    Ok(()) if matches_session => {
+                        self.clear_approval_backoff(&peer);
+                        if inner
+                            .contact(&peer)
+                            .is_some_and(Contact::mark_greeting_confirmed)
+                        {
                             let _ = inner.save_state().await;
                             if !self.is_live(vgen) {
                                 return Ok(false);
                             }
                         }
-                    }
-                    if e.kind() == ErrorKind::SignInRequired && signs_in_here {
-                        self.queue.mark_waits_sign_in(peer);
-                        self.ask_sign_in();
                         self.refresh_contacts(inner);
-                    } else {
-                        self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
-                        self.refresh_contacts(inner);
-                        first_err.get_or_insert(describe(&e));
+                        retried_any = true;
                     }
+                    Ok(()) => {}
+                    Err(e)
+                        if e.is_server_refusal()
+                            && e.kind() == ErrorKind::StaleVersion
+                            && matches_session =>
+                    {
+                        // Recipient retired the signed prekey generation targeted by this cached
+                        // greeting: retire the unaccepted session locally and immediately claim a
+                        // fresh bundle while preserving queued messages.
+                        if let Some(c) = inner.contact(&peer) {
+                            c.session.retire();
+                            c.state.needs_requeue_sealed = true;
+                            c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                        }
+                        let _ = inner.save_state().await;
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
+                        self.refresh_contacts(inner);
+                        reclaim_retired = true;
+                    }
+                    Err(e) => {
+                        if e.is_server_refusal() && promoted_from_unsent && matches_session {
+                            let reverted = inner.contact(&peer).is_some_and(|c| {
+                                if c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                                    c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if reverted {
+                                let _ = inner.save_state().await;
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
+                            }
+                        }
+                        if e.kind() == ErrorKind::SignInRequired && signs_in_here {
+                            self.queue.mark_waits_sign_in(peer);
+                            self.ask_sign_in();
+                            self.refresh_contacts(inner);
+                        } else {
+                            self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
+                            if e.is_server_refusal() {
+                                self.queue.record_approval_backoff(&peer);
+                            }
+                            self.refresh_contacts(inner);
+                            first_err.get_or_insert(describe(&e));
+                        }
+                    }
+                }
+            }
+            if reclaim_retired {
+                let mut server_deletes = Vec::new();
+                match self
+                    .ensure_session_for_outbox(vgen, &peer, &mut server_deletes)
+                    .await
+                {
+                    Ok(RekeyOutcome::Aborted) => return Ok(false),
+                    Ok(RekeyOutcome::Ready) => {
+                        self.clear_approval_backoff(&peer);
+                        retried_any = true;
+                    }
+                    Ok(RekeyOutcome::UpdateRequired(reason)) => {
+                        self.require_update(reason.clone());
+                        first_err.get_or_insert(reason);
+                    }
+                    Ok(RekeyOutcome::Paused | RekeyOutcome::Failed | RekeyOutcome::ContactGone) => {
+                    }
+                    Err(e) => {
+                        first_err.get_or_insert(e);
+                    }
+                }
+                if !server_deletes.is_empty() && self.is_live(vgen) {
+                    self.finish_server_deletes(&peer, server_deletes).await;
                 }
             }
         }
@@ -1281,6 +1405,7 @@ impl<V: VaultStore> Engine<V> {
                 let client_snapshot = proto::ClientState::from(inner.client.state());
                 let saved_envelopes = inner.deferred_envelopes.clone();
                 let saved_carried_ts = inner.carried_deferred_timestamps.clone();
+                let saved_isolated_contacts = inner.isolated_contacts.clone();
                 let mut contact_snapshots: HashMap<PublicKey, (proto::SessionState, ContactState)> =
                     HashMap::new();
 
@@ -1292,6 +1417,7 @@ impl<V: VaultStore> Engine<V> {
                 let mut per_peer_carried: BTreeMap<PublicKey, Vec<Incoming>> = BTreeMap::new();
                 let mut peer_deleted: BTreeSet<PublicKey> = BTreeSet::new();
                 let mut peer_evicted_counts: HashMap<PublicKey, usize> = HashMap::new();
+                let mut isolated_evicted_counts: HashMap<PublicKey, usize> = HashMap::new();
                 let now_ms = now();
 
                 let mut process_err: Option<String> = None;
@@ -1308,13 +1434,21 @@ impl<V: VaultStore> Engine<V> {
                                 env.message,
                                 env.initial_message,
                                 now_ms,
+                                true,
                             );
                             if !buffered {
-                                process_err = Some(format!(
-                                    "Deferred envelope buffer full for isolated contact {}; pausing mailbox sync to prevent message loss.",
-                                    short(&iso_peer)
-                                ));
-                                break;
+                                // Dedicated isolated spool overflowed: record durable eviction
+                                // on the isolated contact and continue so healthy contacts in
+                                // this mailbox page still commit and advance.
+                                if let Some(iso) = inner
+                                    .isolated_contacts
+                                    .iter_mut()
+                                    .find(|c| c.peer.as_slice() == iso_peer.as_slice())
+                                {
+                                    iso.evicted_while_isolated =
+                                        iso.evicted_while_isolated.saturating_add(1);
+                                }
+                                *isolated_evicted_counts.entry(iso_peer).or_insert(0) += 1;
                             }
                         }
                         // Unknown/revoked token hash: drop silently.
@@ -1347,6 +1481,7 @@ impl<V: VaultStore> Engine<V> {
                             env.message,
                             env.initial_message,
                             now_ms,
+                            false,
                         );
                         if !buffered {
                             match inner.contacts[contact_idx].add_evicted() {
@@ -1454,6 +1589,7 @@ impl<V: VaultStore> Engine<V> {
                                 env.message,
                                 deferred_init,
                                 now_ms,
+                                false,
                             );
                             if !buffered {
                                 match inner.contacts[contact_idx].add_evicted() {
@@ -1479,6 +1615,7 @@ impl<V: VaultStore> Engine<V> {
                         contact_snapshots,
                         saved_envelopes,
                         saved_carried_ts,
+                        Some(saved_isolated_contacts),
                     )?;
                     return Err(err);
                 }
@@ -1504,6 +1641,7 @@ impl<V: VaultStore> Engine<V> {
                                 contact_snapshots,
                                 saved_envelopes,
                                 saved_carried_ts,
+                                Some(saved_isolated_contacts),
                             )?;
                             return Err(err);
                         }
@@ -1528,6 +1666,7 @@ impl<V: VaultStore> Engine<V> {
                             contact_snapshots,
                             saved_envelopes,
                             saved_carried_ts,
+                            Some(saved_isolated_contacts),
                         )?;
                         return Err(describe(&e));
                     }
@@ -1570,6 +1709,7 @@ impl<V: VaultStore> Engine<V> {
                                     contact_snapshots,
                                     saved_envelopes,
                                     saved_carried_ts,
+                                    Some(saved_isolated_contacts),
                                 )?;
                                 return Err(e);
                             }
@@ -1595,6 +1735,7 @@ impl<V: VaultStore> Engine<V> {
                         contact_snapshots,
                         saved_envelopes,
                         saved_carried_ts,
+                        Some(saved_isolated_contacts),
                     )?;
                     return Err(describe(&e));
                 }
@@ -1606,6 +1747,7 @@ impl<V: VaultStore> Engine<V> {
                         contact_snapshots,
                         saved_envelopes,
                         saved_carried_ts,
+                        Some(saved_isolated_contacts),
                     )?;
                     return Err(describe(&e));
                 }
@@ -1621,6 +1763,15 @@ impl<V: VaultStore> Engine<V> {
                     self.ui.log(format!(
                         "{evicted_count} message(s) from {label} could not be decrypted or exceeded the deferred buffer cap"
                     ));
+                }
+                if !isolated_evicted_counts.is_empty() {
+                    for (peer, evicted_count) in isolated_evicted_counts {
+                        self.ui.log(format!(
+                            "{evicted_count} message(s) from unsupported contact {} exceeded the isolated offline buffer",
+                            short(&peer)
+                        ));
+                    }
+                    self.ui.isolated_contacts.set(inner.isolated_views());
                 }
                 for (peer, outcome) in requeued_outcomes {
                     outcome.log_missing(&self.ui, &peer);
@@ -1708,9 +1859,14 @@ impl<V: VaultStore> Engine<V> {
                 break;
             }
         }
+        // Release `mailbox_lock` immediately after finishing `FetchSigned`/`AckMessages` pagination
+        // so incoming WebSocket mailbox notifications for other peers never stall behind inbox
+        // listing, grant flushes, or multi-RPC PQ upgrades.
+        drop(_mailbox_guard);
 
         // If any carried initials or buffered envelopes arrived, pull inbox initials, join carried
         // initials, and locally replay buffered envelopes with zero server re-fetch.
+        let mut grant_peers: BTreeSet<PublicKey> = BTreeSet::new();
         if !peers_needing_replay.is_empty() {
             if !self.is_live(vgen) {
                 return Ok(Vec::new());
@@ -1731,24 +1887,32 @@ impl<V: VaultStore> Engine<V> {
                     if !self.is_live(vgen) {
                         return Ok(Vec::new());
                     }
-                    if let Ok(join) = self.join_carried(inner, peer).await
-                        && join.recommend_upgrade
-                    {
-                        upgrades.insert(*peer);
+                    if let Ok(join) = self.join_carried(inner, peer).await {
+                        if join.recommend_upgrade {
+                            upgrades.insert(*peer);
+                        }
+                        grant_peers.extend(join.grant_peers);
                     }
                 }
                 if !self.is_live(vgen) {
                     return Ok(Vec::new());
                 }
-                if let Ok((replayed, replay_upgrades)) =
+                if let Ok((replayed, replay_upgrades, replay_grants)) =
                     self.replay_deferred_envelopes(inner, None).await
                 {
                     affected_peers.extend(replayed);
                     upgrades.extend(replay_upgrades);
+                    grant_peers.extend(replay_grants);
                 }
             }
         }
 
+        for peer in grant_peers {
+            if !self.is_live(vgen) {
+                return Ok(Vec::new());
+            }
+            let _ = self.flush_pending_grants_for_peer(&peer).await;
+        }
         for peer in upgrades {
             if !self.is_live(vgen) {
                 return Ok(Vec::new());
@@ -1760,14 +1924,23 @@ impl<V: VaultStore> Engine<V> {
 
     /// Locally replay buffered `DeferredEnvelope`s (optionally restricted to `only_peer`) for
     /// contacts that are no longer quarantined and have no pending unsupported-suite initials.
-    /// Requires zero server re-fetch and commits all replayed messages atomically.
+    /// Requires zero server re-fetch and commits all replayed messages atomically, returning
+    /// `(replayed_peers, upgrades, grant_peers)` so callers flush grants and run upgrades outside
+    /// `self.inner`.
     pub(super) async fn replay_deferred_envelopes(
         &self,
         inner: &mut Inner<V>,
         only_peer: Option<&PublicKey>,
-    ) -> Result<(BTreeSet<PublicKey>, BTreeSet<PublicKey>), String> {
+    ) -> Result<
+        (
+            BTreeSet<PublicKey>,
+            BTreeSet<PublicKey>,
+            BTreeSet<PublicKey>,
+        ),
+        String,
+    > {
         if inner.deferred_envelopes.is_empty() {
-            return Ok((BTreeSet::new(), BTreeSet::new()));
+            return Ok((BTreeSet::new(), BTreeSet::new(), BTreeSet::new()));
         }
         let local_pq = inner.local_pq_enabled();
         let now_ms = now();
@@ -1797,7 +1970,7 @@ impl<V: VaultStore> Engine<V> {
 
         let initial_eligible = collect_eligible(inner);
         if initial_eligible.is_empty() {
-            return Ok((BTreeSet::new(), BTreeSet::new()));
+            return Ok((BTreeSet::new(), BTreeSet::new(), BTreeSet::new()));
         }
 
         // Phase A (pre-pass): while ALL `DeferredEnvelope`s remain intact in
@@ -1808,13 +1981,15 @@ impl<V: VaultStore> Engine<V> {
         // 3. Any peer quarantined or deferred by `join_carried` is excluded on recomputation below
         //    so its buffered envelopes are preserved rather than dropped.
         let mut upgrades: BTreeSet<PublicKey> = BTreeSet::new();
+        let mut grant_peers: BTreeSet<PublicKey> = BTreeSet::new();
         let mut carried_indices: Vec<(u64, usize, PublicKey)> = inner
             .deferred_envelopes
             .iter()
             .enumerate()
             .filter_map(|(idx, env)| {
                 env.initial_message.as_ref()?;
-                if env.deferred_at != 0
+                if !env.pq_isolated
+                    && env.deferred_at != 0
                     && now_ms.saturating_sub(env.deferred_at) > DEFERRED_REPLAY_WINDOW_MS
                 {
                     return None;
@@ -1903,13 +2078,14 @@ impl<V: VaultStore> Engine<V> {
             if outcome.recommend_upgrade {
                 upgrades.insert(peer);
             }
+            grant_peers.extend(outcome.grant_peers);
         }
 
         // Recompute eligibility after `join_carried`: exclude any peer that became quarantined or
         // deferred an unsupported suite so its buffered envelopes remain safely preserved.
         let eligible_peers = collect_eligible(inner);
         if eligible_peers.is_empty() {
-            return Ok((BTreeSet::new(), upgrades));
+            return Ok((BTreeSet::new(), upgrades, grant_peers));
         }
 
         // Phase B (pure in-memory decrypt + single atomic `inner.save_with`): snapshot the clean
@@ -1948,7 +2124,8 @@ impl<V: VaultStore> Engine<V> {
             let Ok(peer) = PublicKey::try_from(env.peer.as_slice()) else {
                 continue;
             };
-            if env.deferred_at != 0
+            if !env.pq_isolated
+                && env.deferred_at != 0
                 && now_ms.saturating_sub(env.deferred_at) > DEFERRED_REPLAY_WINDOW_MS
             {
                 continue;
@@ -2037,6 +2214,7 @@ impl<V: VaultStore> Engine<V> {
                     contact_snapshots,
                     saved_envelopes,
                     saved_carried_ts,
+                    None,
                 )?;
                 return Err(describe(&e));
             }
@@ -2079,6 +2257,7 @@ impl<V: VaultStore> Engine<V> {
                             contact_snapshots,
                             saved_envelopes,
                             saved_carried_ts,
+                            None,
                         )?;
                         return Err(e);
                     }
@@ -2101,11 +2280,12 @@ impl<V: VaultStore> Engine<V> {
                 contact_snapshots,
                 saved_envelopes,
                 saved_carried_ts,
+                None,
             )?;
             return Err(describe(&e));
         }
         if self.shutting_down.get() || crate::glue::lock_released() {
-            return Ok((BTreeSet::new(), BTreeSet::new()));
+            return Ok((BTreeSet::new(), BTreeSet::new(), BTreeSet::new()));
         }
 
         for (peer, count) in skipped_counts {
@@ -2153,7 +2333,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.shutting_down.get() && !crate::glue::lock_released() {
             self.refresh_contacts(inner);
         }
-        Ok((replayed_peers, upgrades))
+        Ok((replayed_peers, upgrades, grant_peers))
     }
 }
 
@@ -2163,6 +2343,7 @@ fn rollback_mailbox_page<V: VaultStore>(
     contact_snapshots: HashMap<PublicKey, (proto::SessionState, ContactState)>,
     saved_envelopes: Vec<DeferredEnvelope>,
     saved_carried_ts: Vec<crate::vault::CarriedDeferredTimestamp>,
+    saved_isolated_contacts: Option<Vec<ContactState>>,
 ) -> Result<(), String> {
     if let Ok(restored_client) = ClientState::try_from(&client_snapshot) {
         let clock = inner.client.clock().clone();
@@ -2174,6 +2355,9 @@ fn rollback_mailbox_page<V: VaultStore>(
     }
     inner.deferred_envelopes = saved_envelopes;
     inner.carried_deferred_timestamps = saved_carried_ts;
+    if let Some(saved_isolated) = saved_isolated_contacts {
+        inner.isolated_contacts = saved_isolated;
+    }
     Ok(())
 }
 

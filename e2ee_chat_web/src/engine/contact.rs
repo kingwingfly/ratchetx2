@@ -402,8 +402,10 @@ impl Contact {
                 || (self.state.peer_last == 0 && self.state.awaiting.is_empty())
                 || approval_backed_off);
         let greeting_unsent =
-            pending_peer && self.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED;
-        let awaiting_acceptance = pending_peer && !greeting_unsent;
+            pending_peer && self.state.greeting_delivery == GREETING_DELIVERY_UNSENT;
+        let greeting_uncertain =
+            pending_peer && self.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN;
+        let awaiting_acceptance = pending_peer && !greeting_unsent && !greeting_uncertain;
         let alert = match self.state.security_alert {
             SECURITY_ALERT_DOWNGRADE => SecurityAlert::DowngradeDetected,
             SECURITY_ALERT_MANIFEST_EXPIRED => SecurityAlert::ManifestExpired,
@@ -426,6 +428,7 @@ impl Contact {
             name: self.state.name.clone(),
             request: self.state.request,
             greeting_unsent,
+            greeting_uncertain,
             awaiting_acceptance,
             hello_name: self.state.hello_name.clone(),
             unread: self.state.unread,
@@ -994,9 +997,15 @@ pub(super) fn isolated_contact_views(
             .as_ref()
             .and_then(|s| s.peer_pq.as_ref())
             .is_some_and(|pq| pq.pq_pinned);
-        let reason = validate_contact_state(state, me)
+        let mut reason = validate_contact_state(state, me)
             .err()
             .unwrap_or_else(|| "corrupt contact record".to_string());
+        if state.evicted_while_isolated > 0 {
+            reason.push_str(&format!(
+                " ({} message(s) exceeded the local offline buffer while unsupported)",
+                state.evicted_while_isolated
+            ));
+        }
         if let Some(existing) = views.iter_mut().find(|v| v.raw_peer == state.peer) {
             existing.pq_pinned |= pq_pinned;
             existing.records += 1;

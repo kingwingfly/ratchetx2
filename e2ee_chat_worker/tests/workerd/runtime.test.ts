@@ -1151,6 +1151,7 @@ describe("workerd runtime twins", () => {
       const ctx = createExecutionContext();
       const minimalEnv = Object.assign(Object.create(Object.getPrototypeOf(env)), env, {
         PASSWORD: undefined,
+        BUCKET: undefined,
         ATTACHMENTS: undefined,
       });
       const worker = new WorkerEntrypoint(ctx, minimalEnv);
@@ -1194,6 +1195,78 @@ describe("workerd runtime twins", () => {
         }),
       );
       expect(res.status).toBe(429);
+      await waitOnExecutionContext(ctx);
+    }
+
+    // 8c. Throwing, rejecting, or malformed AUTH_RATE_LIMITER fails closed (429) when PASSWORD is set.
+    for (const [idx, badLimiter] of [
+      {
+        limit() {
+          throw new Error("boom sync");
+        },
+      },
+      {
+        limit() {
+          return Promise.reject(new Error("boom async"));
+        },
+      },
+      {
+        limit() {
+          return Promise.resolve({ success: "not-a-bool" });
+        },
+      },
+    ].entries()) {
+      const ctx = createExecutionContext();
+      const badEnv = Object.assign(Object.create(Object.getPrototypeOf(env)), env, {
+        AUTH_RATE_LIMITER: badLimiter,
+      });
+      const worker = new WorkerEntrypoint(ctx, badEnv);
+      const res = await worker.fetch(
+        new Request(`${ORIGIN}/auth/password`, {
+          method: "POST",
+          headers: {
+            "Sec-Fetch-Site": "same-origin",
+            "CF-Connecting-IP": `198.51.100.${212 + idx}`,
+          },
+          body: env.PASSWORD,
+        }),
+      );
+      expect(res.status).toBe(429);
+      await waitOnExecutionContext(ctx);
+    }
+
+    // 8d. StartUpload checks BUCKET R2 binding upfront and rejects cleanly without allocating DOs.
+    {
+      const cookie = await signInCookie(env.PASSWORD, "198.51.100.220");
+      const ctx = createExecutionContext();
+      let doIdFromNameCalls = 0;
+      const spyAttachmentNs = {
+        idFromName(name: string) {
+          doIdFromNameCalls++;
+          return env.ATTACHMENTS.idFromName(name);
+        },
+        get: env.ATTACHMENTS.get.bind(env.ATTACHMENTS),
+      };
+      const noR2Env = Object.assign(Object.create(Object.getPrototypeOf(env)), env, {
+        BUCKET: undefined,
+        ATTACHMENTS: spyAttachmentNs,
+      });
+      const worker = new WorkerEntrypoint(ctx, noR2Env);
+      const deleteHash = await sha256(utf8("no-r2-delete-token"));
+      const res = await worker.fetch(
+        new Request(`${ORIGIN}/attachment.v1.AttachmentService/StartUpload`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/proto",
+            "connect-protocol-version": "1",
+            "CF-Connecting-IP": "198.51.100.220",
+            Cookie: cookie,
+          },
+          body: encodeStartUploadRequest(1, deleteHash),
+        }),
+      );
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      expect(doIdFromNameCalls).toBe(0);
       await waitOnExecutionContext(ctx);
     }
   });

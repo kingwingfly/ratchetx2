@@ -316,10 +316,10 @@ impl IdentityV2 {
                 if !self.with_store(|store| store.has_manifest())? {
                     return answer_rpc::<rpc::AddInitialMessageV2>(Ok(AddInitialOutcome::NotFound));
                 }
-                self.schedule_message_expiry(false).await?;
-                let added = self.with_store(|store| {
-                    store.add_initial_message_v2(&req.message, req.limit, Date::now().as_millis())
-                });
+                let now = Date::now().as_millis();
+                self.schedule_message_expiry(now, false).await?;
+                let added = self
+                    .with_store(|store| store.add_initial_message_v2(&req.message, req.limit, now));
                 if matches!(added, Ok(AddInitialOutcome::Added { inserted: true, .. })) {
                     self.notify(&Notification::initial_message());
                 }
@@ -347,7 +347,8 @@ impl IdentityV2 {
                         AppendOutcome::WriteTokenRejected,
                     ));
                 }
-                self.schedule_message_expiry(req.client_message_id.is_some())
+                let now = Date::now().as_millis();
+                self.schedule_message_expiry(now, req.client_message_id.is_some())
                     .await?;
                 let appended = self.with_store(|store| {
                     store.append_idempotent(
@@ -356,7 +357,7 @@ impl IdentityV2 {
                         &req.content,
                         req.initial_message.as_deref(),
                         req.client_message_id.as_ref(),
-                        Date::now().as_millis(),
+                        now,
                     )
                 });
                 if matches!(appended, Ok(AppendOutcome::Appended(_))) {
@@ -400,10 +401,9 @@ impl IdentityV2 {
         }
     }
 
-    /// Arm the alarm before inserting a message or inbox row. A new tombstone can introduce
-    /// an earlier deadline even when the mailbox already has a retention alarm.
-    async fn schedule_message_expiry(&self, with_tombstone: bool) -> Result<()> {
-        let now = Date::now().as_millis();
+    /// Arm the alarm before inserting a message or inbox row, using the exact `now` timestamp that
+    /// will be written to `created_at` so the alarm never wakes 1 ms before expiry across an await.
+    async fn schedule_message_expiry(&self, now: u64, with_tombstone: bool) -> Result<()> {
         // `expire_messages_and_initials` deletes strictly older rows (`created_at < now - retention`),
         // so add +1 ms matching `compute_earliest_deadline` to avoid firing 1 ms early.
         let mut at = now
