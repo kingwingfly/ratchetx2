@@ -48,13 +48,21 @@ pub(super) fn upgrade_disabled_tip(ui: Ui) -> Option<&'static str> {
 }
 
 #[component]
-pub(super) fn AllowClassical(peer: PublicKey, busy: RwSignal<bool>) -> impl IntoView {
+pub(super) fn AllowClassical(
+    peer: PublicKey,
+    conversation_gen: u64,
+    busy: RwSignal<bool>,
+) -> impl IntoView {
     view! {
         <button
             type="button"
             class="btn small"
             disabled=move || busy.get()
-            on:click=move |_| act_while(busy, async move { engine().approve_classical(peer).await })
+            on:click=move |_| {
+                act_while(busy, async move {
+                    engine().approve_classical_for_gen(peer, conversation_gen).await
+                })
+            }
         >
             "Allow classical"
         </button>

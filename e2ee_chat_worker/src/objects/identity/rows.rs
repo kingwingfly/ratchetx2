@@ -138,6 +138,25 @@ pub(super) struct AckedInitialRow {
 }
 
 #[derive(Deserialize)]
+pub(super) struct EvictedInitialRow {
+    pub(super) id: u64,
+    pub(super) sender: Blob,
+    pub(super) ephemeral_key: Blob,
+    pub(super) payload_hash: Blob,
+    pub(super) listed: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ExpiresAtRow {
+    pub(super) expires_at: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct EvictedUntilRow {
+    pub(super) acked_initial_evicted_until: u64,
+}
+
+#[derive(Deserialize)]
 pub(super) struct ManifestSeqRow {
     #[allow(dead_code)]
     pub(super) manifest_seq: u64,

@@ -1017,10 +1017,12 @@ impl<V: VaultStore> Engine<V> {
     }
 }
 
-/// Window (14 days, matching server inbox TTL and strictly shorter than the server's 30-day
-/// `acked_initial_messages` delivery-tombstone TTL) during which a sender may probe a `CONFIRMED`
-/// greeting after two peer SPK rotations (`manifest.generation >= target_generation + 2`).
-pub(super) const CONFIRMED_PROBE_WINDOW_MS: u64 = 14 * 24 * 60 * 60 * 1000;
+/// Window (28 days, matching the shipped 30-day server inbox retention and strictly shorter than
+/// the server's 35-day `acked_initial_messages` delivery-tombstone TTL with a 7-day margin)
+/// during which a sender may retry an `UNCERTAIN` greeting or probe a `CONFIRMED` greeting after
+/// two peer SPK rotations (`manifest.generation >= target_generation + 2`) and auto-reclaim on
+/// `StaleVersion` without risking resurrecting a declined chat request after tombstones expire.
+pub(super) const GREETING_AUTO_RECLAIM_WINDOW_MS: u64 = 28 * 24 * 60 * 60 * 1000;
 
 /// Whether a `CONFIRMED` greeting is eligible for a post-2-rotation SPK-eviction probe.
 pub(super) fn confirmed_greeting_probe_eligible(state: &ContactState, now_ms: u64) -> bool {
@@ -1028,7 +1030,15 @@ pub(super) fn confirmed_greeting_probe_eligible(state: &ContactState, now_ms: u6
         && !state.greeting_delivery_verified
         && state.greeting_target_generation > 0
         && state.greeting_sent_at > 0
-        && now_ms.saturating_sub(state.greeting_sent_at) <= CONFIRMED_PROBE_WINDOW_MS
+        && now_ms.saturating_sub(state.greeting_sent_at) <= GREETING_AUTO_RECLAIM_WINDOW_MS
+}
+
+/// Whether an `UNCERTAIN` greeting is still within the server's delivery-tombstone TTL window and
+/// therefore safe to retry and auto-reclaim on `StaleVersion`.
+pub(super) fn uncertain_greeting_reclaim_eligible(state: &ContactState, now_ms: u64) -> bool {
+    !state.provisional
+        && state.greeting_sent_at > 0
+        && now_ms.saturating_sub(state.greeting_sent_at) <= GREETING_AUTO_RECLAIM_WINDOW_MS
 }
 
 impl<V: VaultStore> Engine<V> {
@@ -1095,6 +1105,8 @@ impl<V: VaultStore> Engine<V> {
                         && !c.session.has_pending_active_grant()
                         && ((c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
                             && ((!c.session.needs_new_session()
+                                && (c.state.greeting_delivery == GREETING_DELIVERY_UNSENT
+                                    || uncertain_greeting_reclaim_eligible(&c.state, now_ms))
                                 && c.session.pending_initial_request().is_some())
                                 || (c.session.needs_new_session()
                                     && c.state.classical_approval_needed
@@ -1195,33 +1207,42 @@ impl<V: VaultStore> Engine<V> {
                     let session_id = contact.session.active_id().copied();
                     let promoted_from_unsent =
                         contact.state.greeting_delivery == GREETING_DELIVERY_UNSENT;
-                    if promoted_from_unsent {
-                        if let Err(e) = inner
-                            .with_contact_tx(&peer, async |inner| {
-                                if let Some(c) = inner.contact(&peer) {
-                                    c.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
-                                }
-                                inner.save(&[]).await.map_err(|e| describe(&e))
-                            })
-                            .await
-                        {
-                            first_err.get_or_insert(e);
-                            continue;
+                    if !promoted_from_unsent
+                        && !uncertain_greeting_reclaim_eligible(&contact.state, now())
+                    {
+                        GreetingRetryAction::Skip
+                    } else {
+                        if promoted_from_unsent {
+                            if let Err(e) = inner
+                                .with_contact_tx(&peer, async |inner| {
+                                    if let Some(c) = inner.contact(&peer) {
+                                        c.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                                        if c.state.greeting_sent_at == 0 {
+                                            c.state.greeting_sent_at = now();
+                                        }
+                                    }
+                                    inner.save(&[]).await.map_err(|e| describe(&e))
+                                })
+                                .await
+                            {
+                                first_err.get_or_insert(e);
+                                continue;
+                            }
+                            if !self.is_live(vgen) {
+                                return Ok(false);
+                            }
                         }
-                        if !self.is_live(vgen) {
-                            return Ok(false);
+                        GreetingRetryAction::Send {
+                            server: inner.server.clone(),
+                            signs_in_here: same_server(&inner.server, &origin()),
+                            conversation_gen,
+                            session_id,
+                            req: Box::new(req),
+                            promoted_from_unsent,
+                            was_confirmed_probe: false,
+                            target_generation: 0,
+                            audience: inner.audience.clone(),
                         }
-                    }
-                    GreetingRetryAction::Send {
-                        server: inner.server.clone(),
-                        signs_in_here: same_server(&inner.server, &origin()),
-                        conversation_gen,
-                        session_id,
-                        req: Box::new(req),
-                        promoted_from_unsent,
-                        was_confirmed_probe: false,
-                        target_generation: 0,
-                        audience: inner.audience.clone(),
                     }
                 } else {
                     GreetingRetryAction::Skip
@@ -1412,20 +1433,37 @@ impl<V: VaultStore> Engine<V> {
                             && e.kind() == ErrorKind::StaleVersion
                             && matches_session =>
                     {
-                        // Recipient retired the signed prekey generation targeted by this cached
-                        // greeting: retire the unaccepted session locally and immediately claim a
-                        // fresh bundle while preserving queued messages.
-                        if let Some(c) = inner.contact(&peer) {
-                            c.session.retire();
-                            c.state.needs_requeue_sealed = true;
-                            c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                        let allow_reclaim = inner.contact(&peer).is_some_and(|c| {
+                            promoted_from_unsent
+                                || (was_confirmed_probe
+                                    && confirmed_greeting_probe_eligible(&c.state, now()))
+                                || (!was_confirmed_probe
+                                    && uncertain_greeting_reclaim_eligible(&c.state, now()))
+                        });
+                        if allow_reclaim {
+                            // Recipient retired the signed prekey generation targeted by this
+                            // cached greeting while still inside the delivery-tombstone window:
+                            // retire the unaccepted session locally and immediately claim a fresh
+                            // bundle while preserving queued messages.
+                            if let Some(c) = inner.contact(&peer) {
+                                c.session.retire();
+                                c.state.needs_requeue_sealed = true;
+                                c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                                c.state.greeting_sent_at = 0;
+                                c.state.greeting_target_generation = 0;
+                                c.state.greeting_delivery_verified = false;
+                            }
+                            let _ = inner.save_state().await;
+                            if !self.is_live(vgen) {
+                                return Ok(false);
+                            }
+                            self.refresh_contacts(inner);
+                            reclaim_retired = true;
+                        } else if was_confirmed_probe {
+                            self.queue.record_confirmed_probe_backoff(&peer);
+                        } else {
+                            self.queue.record_approval_backoff(&peer);
                         }
-                        let _ = inner.save_state().await;
-                        if !self.is_live(vgen) {
-                            return Ok(false);
-                        }
-                        self.refresh_contacts(inner);
-                        reclaim_retired = true;
                     }
                     Err(e) => {
                         if e.is_server_refusal()
@@ -1436,6 +1474,7 @@ impl<V: VaultStore> Engine<V> {
                             let reverted = inner.contact(&peer).is_some_and(|c| {
                                 if c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
                                     c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                                    c.state.greeting_sent_at = 0;
                                     true
                                 } else {
                                     false

@@ -264,7 +264,15 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         }}
                                     </span>
                                     <div class="banner-actions">
-                                        {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
+                                        {show_allow.then(|| {
+                                            view! {
+                                                <AllowClassical
+                                                    peer
+                                                    conversation_gen=c.conversation_gen
+                                                    busy=sec_busy
+                                                />
+                                            }
+                                        })}
                                         <Show when=move || pq_available(ui)>
                                             <button
                                                 type="button"
@@ -304,10 +312,19 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                 </span>
                                 {move || {
                                     let show_retry = pq_retry_ready(ui);
+                                    let conv_gen = c.conversation_gen;
                                     (show_allow || show_retry).then(|| {
                                         view! {
                                             <div class="banner-actions">
-                                                {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
+                                                {show_allow.then(|| {
+                                                    view! {
+                                                        <AllowClassical
+                                                            peer
+                                                            conversation_gen=conv_gen
+                                                            busy=sec_busy
+                                                        />
+                                                    }
+                                                })}
                                                 {show_retry.then(|| {
                                                     view! {
                                                         <button
@@ -316,7 +333,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                             disabled=move || sec_busy.get()
                                                             on:click=move |_| {
                                                                 act_while(sec_busy, async move {
-                                                                    engine().retry_pq(peer).await
+                                                                    engine()
+                                                                        .retry_pq_for_gen(peer, conv_gen)
+                                                                        .await
                                                                 });
                                                             }
                                                         >
@@ -350,6 +369,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                     view! {
                                         <div class="banner-actions">
                                             {show_retry.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -357,7 +377,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().retry_pq(peer).await
+                                                                engine()
+                                                                    .retry_pq_for_gen(peer, conv_gen)
+                                                                    .await
                                                             });
                                                         }
                                                     >
@@ -402,6 +424,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                     view! {
                                         <div class="banner-actions">
                                             {show_retry.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -409,7 +432,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().retry_pq(peer).await
+                                                                engine()
+                                                                    .retry_pq_for_gen(peer, conv_gen)
+                                                                    .await
                                                             });
                                                         }
                                                     >

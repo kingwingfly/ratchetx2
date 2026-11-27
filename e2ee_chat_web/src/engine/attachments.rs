@@ -1175,13 +1175,22 @@ impl<V: VaultStore> Engine<V> {
     /// has, so the peer finds the attachment gone; if it cannot be reached, what it has expires.
     pub async fn cancel_upload(&self, peer: PublicKey, id: [u8; 16]) -> Result<(), String> {
         let vgen = self.vault_gen();
-        // For good, running or not: what is on its way stops, and keeps nothing of it again.
+        // For good, running or not: what is on its way stops immediately, even if a peer flush is
+        // currently awaiting a `PushV2` RTT before we serialize outbox settlement below.
         self.uploads.mark_cancelled(id);
         self.remove_attachment_caches(&peer, &id);
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != id));
-        let (delete_jobs, settled_outbox) = {
+        // Serialize outbox/announcement settlement behind any in-flight `Engine::flush(&peer)`
+        // (preserving `peer_flush_lock -> self.inner`) so an already-accepted announcement whose
+        // `PushV2` response is in flight is settled as `Step::Pushed` instead of `Step::Refused`.
+        let peer_lock = self.queue.peer_flush_lock(&peer);
+        let peer_guard = peer_lock.lock().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
+        let (delete_jobs, should_flush) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
@@ -1215,6 +1224,7 @@ impl<V: VaultStore> Engine<V> {
                     .await
                     .map_err(|e| describe(&e))?;
                 drop(guard);
+                drop(peer_guard);
                 if still_awaits && let Err(e) = self.flush(&peer).await {
                     self.ui.link.set(Link::Offline(e));
                 }
@@ -1231,7 +1241,7 @@ impl<V: VaultStore> Engine<V> {
             {
                 announced_index = Some(idx);
             }
-            let mut settled_outbox = false;
+            let mut should_flush = false;
             let mut extra_server_deletes = Vec::new();
             if let Some(idx) = announced_index {
                 let relayed_commit = inner
@@ -1279,22 +1289,34 @@ impl<V: VaultStore> Engine<V> {
                             inner.in_flight_push.remove(&peer);
                             self.clear_approval_backoff(&peer);
                             self.release(&peer, head.history_index);
-                            settled_outbox = true;
+                            should_flush = true;
                         }
                         Ok(super::outbox::CommitOutcome::Aborted) => return Err("locked".into()),
                         Err(e) => return Err(e),
                     }
                 } else {
-                    let in_outbox = inner.contact(&peer).is_some_and(|contact| {
+                    let outbox_state = inner.contact(&peer).and_then(|contact| {
                         contact
                             .state
                             .outbox
                             .iter()
-                            .any(|outgoing| outgoing.history_index == idx)
+                            .find(|outgoing| outgoing.history_index == idx)
+                            .map(|outgoing| outgoing.dispatched)
                     });
-                    if in_outbox {
-                        self.fail_waiting(inner, &peer, idx).await?;
-                        settled_outbox = true;
+                    match outbox_state {
+                        Some(false) => {
+                            // Never transmitted on the wire: safe to fail and drop from outbox.
+                            self.fail_waiting(inner, &peer, idx).await?;
+                            should_flush = true;
+                        }
+                        Some(true) => {
+                            // Previously dispatched with an ambiguous outcome (e.g. lost response
+                            // or reload): keep the sealed head in the outbox so the subsequent
+                            // `flush` reconciles its exact `client_message_id` idempotently rather
+                            // than falsely marking an already-delivered announcement as `Refused`.
+                            should_flush = true;
+                        }
+                        None => {}
                     }
                 }
             }
@@ -1311,11 +1333,13 @@ impl<V: VaultStore> Engine<V> {
                 kind: ServerDeleteKind::CancelUpload(upload),
             };
             extra_server_deletes.push(job);
-            (extra_server_deletes, settled_outbox)
+            (extra_server_deletes, should_flush)
         };
-        // Perform the HTTP cancel outside `self.inner.lock()` so slow deletes never block the UI.
+        drop(peer_guard);
+        // Perform the HTTP cancel outside `self.inner.lock()` and `peer_flush_lock` so slow
+        // deletes never block the UI and `self.flush(&peer)` can re-acquire cleanly.
         self.finish_server_deletes(&peer, delete_jobs).await;
-        if settled_outbox && self.is_live(vgen) {
+        if should_flush && self.is_live(vgen) {
             if let Err(e) = self.flush(&peer).await
                 && self.is_live(vgen)
             {
@@ -1369,28 +1393,96 @@ impl<V: VaultStore> Engine<V> {
         if let Some(id) = waiting {
             return self.cancel_upload(peer, id).await;
         }
+        let peer_lock = self.queue.peer_flush_lock(&peer);
+        let peer_guard = peer_lock.lock().await;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let server_deletes = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
             let inner = guard.as_mut().ok_or("locked")?;
-            // Gone meanwhile, e.g. pushed as the sign-in came.
-            let waits = inner.contact(&peer).is_some_and(|contact| {
-                contact
-                    .state
-                    .outbox
-                    .iter()
-                    .any(|outgoing| outgoing.history_index == index)
-            });
-            if !waits {
-                self.release(&peer, index);
-                return Ok(());
+            let relayed_commit = inner
+                .in_flight_push
+                .get(&peer)
+                .copied()
+                .filter(|f| f.relayed && f.history_index == index)
+                .and_then(|relayed| {
+                    let c = inner.contacts.iter().find(|c| c.peer == peer)?;
+                    if c.state.conversation_gen != relayed.conversation_gen {
+                        return None;
+                    }
+                    let head = c.state.outbox.first()?;
+                    if head.history_index == relayed.history_index
+                        && head.sealed
+                        && head.clock == relayed.clock
+                    {
+                        let confirm_session = !c.session.needs_new_session()
+                            && !c.state.needs_requeue_sealed
+                            && (relayed.session_id.is_none()
+                                || c.session.active_id() == relayed.session_id.as_ref());
+                        Some((head.clone(), confirm_session))
+                    } else {
+                        None
+                    }
+                });
+            if let Some((head, confirm_session)) = relayed_commit {
+                let mut extra_deletes = Vec::new();
+                match self
+                    .commit_outbox_item(
+                        vgen,
+                        inner,
+                        &peer,
+                        &head,
+                        Step::Pushed,
+                        head.clock,
+                        confirm_session,
+                        &mut extra_deletes,
+                    )
+                    .await
+                {
+                    Ok(super::outbox::CommitOutcome::Committed) => {
+                        inner.in_flight_push.remove(&peer);
+                        self.clear_approval_backoff(&peer);
+                        self.release(&peer, head.history_index);
+                        extra_deletes
+                    }
+                    Ok(super::outbox::CommitOutcome::Aborted) => return Err("locked".into()),
+                    Err(e) => return Err(e),
+                }
+            } else {
+                // Gone meanwhile, e.g. pushed as the sign-in came.
+                let outbox_state = inner.contact(&peer).and_then(|contact| {
+                    contact
+                        .state
+                        .outbox
+                        .iter()
+                        .find(|outgoing| outgoing.history_index == index)
+                        .map(|outgoing| outgoing.dispatched)
+                });
+                match outbox_state {
+                    None => {
+                        self.release(&peer, index);
+                        return Ok(());
+                    }
+                    Some(true) => {
+                        return Err(
+                            "This message was already sent to the server before sign-in expired; \
+                             sign in to confirm delivery rather than cancelling it."
+                                .into(),
+                        );
+                    }
+                    Some(false) => {
+                        self.fail_waiting(inner, &peer, index).await?;
+                        self.prepare_cancel_uploads_for_failed(inner, &peer, &[index])
+                            .await
+                    }
+                }
             }
-            self.fail_waiting(inner, &peer, index).await?;
-            self.prepare_cancel_uploads_for_failed(inner, &peer, &[index])
-                .await
         };
+        drop(peer_guard);
         if !self.is_live(vgen) {
             return Err("locked".into());
         }

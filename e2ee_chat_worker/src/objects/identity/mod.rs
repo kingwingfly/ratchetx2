@@ -310,7 +310,17 @@ impl IdentityV2 {
     async fn serve(&self, call: IdentityCall) -> Result<Response> {
         match call {
             IdentityCall::PublishV2(req) => {
-                answer_rpc::<rpc::PublishV2>(self.with_store(|store| store.publish_v2(&req.record)))
+                let now = Date::now().as_millis();
+                let res = self.with_store(|store| store.publish_v2(&req.record, now));
+                if let Ok((_, true)) = &res {
+                    let prune_at = now
+                        .saturating_add(handshake::ACKED_INITIAL_TOMBSTONE_TTL_MS)
+                        .min(MAX_SAFE_INTEGER);
+                    if let Err(e) = self.update_alarm(AlarmUpdate::PullEarlier(prune_at)).await {
+                        console_error!("cannot schedule acked_initial_messages prune alarm: {e}");
+                    }
+                }
+                answer_rpc::<rpc::PublishV2>(res.map(|(status, _)| status))
             }
             IdentityCall::RefillPrekeys(req) => answer_rpc::<rpc::RefillPrekeys>(
                 self.with_store(|store| store.refill_prekeys(&req.record)),
@@ -332,9 +342,12 @@ impl IdentityV2 {
                     return answer_rpc::<rpc::AddInitialMessageV2>(Ok(AddInitialOutcome::NotFound));
                 }
                 let now = Date::now().as_millis();
-                self.schedule_message_expiry(now, false).await?;
-                let added = self
-                    .with_store(|store| store.add_initial_message_v2(&req.message, req.limit, now));
+                if req.allow_insert {
+                    self.schedule_message_expiry(now, false).await?;
+                }
+                let added = self.with_store(|store| {
+                    store.add_initial_message_v2(&req.message, req.limit, req.allow_insert, now)
+                });
                 if matches!(added, Ok(AddInitialOutcome::Added { inserted: true, .. })) {
                     self.notify(&Notification::initial_message());
                 }
@@ -342,7 +355,7 @@ impl IdentityV2 {
             }
             IdentityCall::ListInitialMessages(req) => {
                 answer_rpc::<rpc::ListInitialMessages>(self.with_store(|store| {
-                    store.list_initial_messages(
+                    store.list_initial_messages_page(
                         req.recipient,
                         req.after_id,
                         req.limit,
@@ -555,29 +568,33 @@ mod tests {
             let bob = [0x11; 32];
             assert_eq!(
                 store
-                    .publish_v2(&PublishV2Record {
-                        manifest: StoredCapabilityManifest {
-                            audience: "relay.example".into(),
-                            identity_key: bob,
-                            manifest_seq: 1,
-                            generation: 1,
-                            issued_at: 1_000,
-                            expires_at: 100_000,
-                            pq_enabled: false,
-                            strict_pq: false,
-                            pq_ratchet_supported: false,
-                            offered_suites: vec![],
-                            signed_prekey: [0x22; 32],
+                    .publish_v2(
+                        &PublishV2Record {
+                            manifest: StoredCapabilityManifest {
+                                audience: "relay.example".into(),
+                                identity_key: bob,
+                                manifest_seq: 1,
+                                generation: 1,
+                                issued_at: 1_000,
+                                expires_at: 100_000,
+                                pq_enabled: false,
+                                strict_pq: false,
+                                pq_ratchet_supported: false,
+                                offered_suites: vec![],
+                                signed_prekey: [0x22; 32],
+                                pq_last_resort: vec![],
+                                signature: [0x33; 64],
+                            },
+                            signed_prekey_signature: Some([0x44; 64]),
+                            one_time_prekeys: vec![],
                             pq_last_resort: vec![],
-                            signature: [0x33; 64],
+                            pq_one_time_prekeys: vec![],
+                            timestamp: 1_000,
                         },
-                        signed_prekey_signature: Some([0x44; 64]),
-                        one_time_prekeys: vec![],
-                        pq_last_resort: vec![],
-                        pq_one_time_prekeys: vec![],
-                        timestamp: 1_000,
-                    })
-                    .unwrap(),
+                        1_000,
+                    )
+                    .unwrap()
+                    .0,
                 PublishV2Status::Stored
             );
 

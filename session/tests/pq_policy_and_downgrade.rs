@@ -2089,14 +2089,18 @@ async fn fast_clock_does_not_poison_v2_rpcs_and_refused_rotation_rolls_back_gene
 
     let spk1 = bob.current_signed_prekey().unwrap();
     bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+    let spk2 = bob.current_signed_prekey().unwrap();
     assert_eq!(bob.prekey_generation(), 2);
     assert_eq!(bob.oldest_evictable_signed_prekey(), Some(spk1));
 
     let gen3 = bob.prepare_publish_v2(AUDIENCE, 2, 2).unwrap();
     assert_eq!(bob.prekey_generation(), 3);
-    assert_ne!(bob.oldest_evictable_signed_prekey(), Some(spk1));
+    assert_ne!(bob.current_signed_prekey(), Some(spk2));
+    // Deferred eviction (R5-P1-1): `spk1` stays retained until `commit_publish_v2` confirms gen3.
+    assert_eq!(bob.oldest_evictable_signed_prekey(), Some(spk1));
     bob.rollback_publish_v2_on_refusal(gen3);
     assert_eq!(bob.prekey_generation(), 2);
+    assert_eq!(bob.current_signed_prekey(), Some(spk2));
     assert_eq!(bob.oldest_evictable_signed_prekey(), Some(spk1));
     bob.refill_prekeys_v2(AUDIENCE, 1, 1).await.unwrap();
 }

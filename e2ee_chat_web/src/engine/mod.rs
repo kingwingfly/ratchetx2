@@ -349,9 +349,6 @@ pub(super) struct Inner<V = Vault> {
     isolated_contacts: Vec<ContactState>,
     /// History namespaces reserved by unreadable contacts with no healthy active record.
     isolated_peers: HashSet<PublicKey>,
-    /// Oldest signed prekey tentatively evicted from `x3dh` while a lock-free rotating `PublishV2`
-    /// is in flight; inbound greetings targeting it are left un-ACKed until commit or rollback.
-    tentatively_displaced_spk: Option<PublicKey>,
     /// A non-rollbackable state change still needs a successful transaction.
     unsaved_state: bool,
     /// Inbox IDs to commit with their deferred ciphertext before they become eligible for ack.
@@ -1281,11 +1278,21 @@ impl Engine<Vault> {
         {
             inner.unsaved_state = true;
         }
+        let cleaned_provisional = inner.cleanup_abandoned_provisional_contacts().await;
+        if !self.is_live(vgen) || cancel.is_cancelled() {
+            return Err(VaultOpenError::Cancelled);
+        }
         if !self.unlocked(vgen, inner, Some(&cancel)).await {
             return Err(VaultOpenError::Cancelled);
         }
         if !self.is_live(vgen) {
             return Err(VaultOpenError::Cancelled);
+        }
+        if !cleaned_provisional.is_empty() {
+            self.ui.log(format!(
+                "Cleaned up {} unfinished provisional chat(s) from a previous interrupted session.",
+                cleaned_provisional.len()
+            ));
         }
         if pruned > 0 {
             self.ui.log(format!(
@@ -2611,13 +2618,18 @@ impl<V: VaultStore> Inner<V> {
     pub(super) async fn forget_peer(
         &mut self,
         peer: &PublicKey,
-        state: AppState,
+        mut state: AppState,
         deferred: DeferredRecord,
     ) -> crate::vault::Result<()> {
         if !crate::glue::owns_lock() || crate::glue::lock_generation() != self.lock_generation {
             return Err(crate::vault::Error::Storage(
                 "page is closing; tab lock released".into(),
             ));
+        }
+        if let Some(rollback) = &mut state.pending_pq_rollback {
+            rollback
+                .contact_flags
+                .retain(|flag| flag.peer.as_slice() != peer.as_slice());
         }
         let unsaved = self
             .unsaved
@@ -2742,7 +2754,6 @@ impl<V: VaultStore> Inner<V> {
             contacts,
             isolated_contacts,
             isolated_peers,
-            tentatively_displaced_spk: None,
             server_pq: ServerPqStatus::Unknown,
             last_server_classical_opks: None,
             last_server_pq_opks: None,
@@ -2754,6 +2765,141 @@ impl<V: VaultStore> Inner<V> {
             saved_late: vec![],
             in_flight_push: HashMap::new(),
         }
+    }
+
+    /// Reconcile any `provisional && !request` contacts left on disk after a reload/crash during
+    /// `start_chat` Phase 2–3:
+    /// - Pure abandoned outbound starts (`history_len <= 1`, `!is_known_by_peer()`, `!quarantined`)
+    ///   are rolled back cleanly (staging a `PendingRevoke`, restoring any `fallback_farewells`,
+    ///   and calling `forget_peer`; if storage fails transiently, they are neutralized into
+    ///   unaccepted requests so they never strand as bricked active chats).
+    /// - Crossed-start contacts that already received an inbound peer session/message before the
+    ///   crash are preserved as explicit unaccepted requests (`request = true, provisional = false`)
+    ///   with a `PendingRevoke` for any abandoned outbound grant so the peer's message is not lost
+    ///   and approval requires explicit user consent.
+    pub(super) async fn cleanup_abandoned_provisional_contacts(&mut self) -> Vec<PublicKey> {
+        let targets: Vec<(PublicKey, bool)> = self
+            .contacts
+            .iter()
+            .filter(|c| c.state.provisional && !c.state.request)
+            .map(|c| {
+                let pure_abandoned = c.state.history_len <= 1
+                    && !c.session.is_known_by_peer()
+                    && !c.state.quarantined;
+                (c.peer, pure_abandoned)
+            })
+            .collect();
+        let mut cleaned = Vec::new();
+        for (peer, pure_abandoned) in targets {
+            let peer_slot_id = self.client.peer_slot_id(&peer);
+            let staged_revoke = self
+                .client
+                .allocate_grant_version()
+                .ok()
+                .map(|min_grant_version| (peer_slot_id, min_grant_version));
+            if pure_abandoned {
+                let retained_farewells = self
+                    .contact(&peer)
+                    .map(|c| c.state.fallback_farewells.clone())
+                    .unwrap_or_default();
+                let mut state = self.app_state();
+                state
+                    .contacts
+                    .retain(|c| c.peer.as_slice() != peer.as_slice());
+                if let Some((slot, min_ver)) = staged_revoke {
+                    if let Some(existing) = state
+                        .pending_revokes
+                        .iter_mut()
+                        .find(|r| r.peer_slot_id.as_slice() == slot.as_slice())
+                    {
+                        existing.min_grant_version = existing.min_grant_version.max(min_ver);
+                    } else {
+                        state.pending_revokes.push(PendingRevoke {
+                            peer_slot_id: slot.to_vec(),
+                            min_grant_version: min_ver,
+                        });
+                    }
+                }
+                for farewell in &retained_farewells {
+                    if !state
+                        .farewells
+                        .iter()
+                        .any(|existing| existing.push_v2 == farewell.push_v2)
+                    {
+                        state.farewells.push(farewell.clone());
+                    }
+                }
+                let deferred = self.deferred_record_without_peer(&peer);
+                if self.forget_peer(&peer, state, deferred).await.is_ok() {
+                    cleaned.push(peer);
+                    continue;
+                }
+                // Storage failed transiently: neutralize into an unaccepted request so the
+                // abandoned start never shows as a bricked active chat or transmits a greeting.
+                if let Some(contact) = self.contact(&peer) {
+                    contact.session.discard_active();
+                    contact.session.clear_pending_grants();
+                    contact.state.request = true;
+                    contact.state.provisional = false;
+                    contact.state.greeting_delivery = crate::vault::GREETING_DELIVERY_CONFIRMED;
+                    contact.state.awaiting_peer_acceptance = false;
+                    contact.state.fallback_farewells.clear();
+                }
+                if let Some((slot, min_ver)) = staged_revoke {
+                    if let Some(existing) = self
+                        .state
+                        .pending_revokes
+                        .iter_mut()
+                        .find(|r| r.peer_slot_id.as_slice() == slot.as_slice())
+                    {
+                        existing.min_grant_version = existing.min_grant_version.max(min_ver);
+                    } else {
+                        self.state.pending_revokes.push(PendingRevoke {
+                            peer_slot_id: slot.to_vec(),
+                            min_grant_version: min_ver,
+                        });
+                    }
+                }
+                for farewell in &retained_farewells {
+                    if !self
+                        .state
+                        .farewells
+                        .iter()
+                        .any(|existing| existing.push_v2 == farewell.push_v2)
+                    {
+                        self.state.farewells.push(farewell.clone());
+                    }
+                }
+                self.unsaved_state = true;
+                cleaned.push(peer);
+            } else {
+                // Crossed-start inbound message arrived before the crash: convert to an explicit
+                // unaccepted request while revoking any abandoned outbound grant.
+                if let Some(contact) = self.contact(&peer) {
+                    contact.session.clear_pending_grants();
+                    contact.state.request = true;
+                    contact.state.provisional = false;
+                }
+                if let Some((slot, min_ver)) = staged_revoke {
+                    if let Some(existing) = self
+                        .state
+                        .pending_revokes
+                        .iter_mut()
+                        .find(|r| r.peer_slot_id.as_slice() == slot.as_slice())
+                    {
+                        existing.min_grant_version = existing.min_grant_version.max(min_ver);
+                    } else {
+                        self.state.pending_revokes.push(PendingRevoke {
+                            peer_slot_id: slot.to_vec(),
+                            min_grant_version: min_ver,
+                        });
+                    }
+                }
+                self.unsaved_state = true;
+                cleaned.push(peer);
+            }
+        }
+        cleaned
     }
 
     /// Allocate the next vault-wide monotonic conversation generation for a newly created contact.

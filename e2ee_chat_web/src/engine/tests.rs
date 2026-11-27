@@ -6,9 +6,10 @@ use super::contact::{
     record_quarantined_initial_state, restore_contacts, stored_contacts,
 };
 use super::handshake::{
-    DEFERRED_REPLAY_WINDOW_MS, Incoming, InitialBatch, PublishError, preserved_deferred_prekeys,
-    prune_invalid_inbox_acks, refill_batch_counts, sanitize_deferred_initials,
-    stage_carried_initials, stage_inbox_ack, validate_start_chat_server,
+    DEFERRED_REPLAY_WINDOW_MS, DeferInboxOutcome, Incoming, InitialBatch, PublishError,
+    preserved_deferred_prekeys, prune_invalid_inbox_acks, refill_batch_counts,
+    sanitize_deferred_initials, stage_carried_initials, stage_inbox_ack,
+    validate_start_chat_server,
 };
 use super::outbox::CorruptOutboxRecovery;
 use super::settings::{
@@ -2660,7 +2661,10 @@ fn pq_build_replays_deferred_inbox_ciphertext_once_after_reload() {
             .unwrap();
         let mut inner = load_contacts(&client, vec![]);
         // Save the same encrypted wire record and ack as the build lacking this suite.
-        assert!(inner.defer_inbox_initial(&message));
+        assert_eq!(
+            inner.defer_inbox_initial(&message),
+            DeferInboxOutcome::Stored { dirty: true }
+        );
         inner.save(&[]).await.unwrap();
         assert_eq!(inner.vault.deferred.borrow().entries.len(), 1);
         inner
@@ -6027,6 +6031,7 @@ fn human_approved_grants_backoff_revokes_and_farewell_write_token_rejected() {
             let contact = inner.contact(&bob_peer).unwrap();
             assert!(!contact.session.is_known_by_peer());
             contact.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNCERTAIN;
+            contact.state.greeting_sent_at = crate::util::now();
             inner
                 .add(&bob_peer, Kind::Text("waiting for approval".into()), false)
                 .await
@@ -12631,8 +12636,9 @@ fn r3_p2_3_late_greeting_retry_never_retires_working_session_or_marks_recreated_
         {
             let mut guard = engine2.inner.lock().await;
             let inner = guard.as_mut().unwrap();
-            inner.contact(&peer2).unwrap().state.greeting_delivery =
-                crate::vault::GREETING_DELIVERY_UNCERTAIN;
+            let c2 = inner.contact(&peer2).unwrap();
+            c2.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNCERTAIN;
+            c2.state.greeting_sent_at = crate::util::now();
             inner
                 .add(&peer2, Kind::Text("msg".into()), false)
                 .await
@@ -13424,18 +13430,19 @@ fn r4_p1_2_replay_deferred_preserves_unlisted_and_concurrent_envelopes() {
 
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
-fn r4_p1_3_refused_rotating_publish_leaves_displaced_spk_greeting_unacked() {
+fn r4_p1_3_r5_p1_1_in_flight_and_interrupted_rotating_publish_retains_displaced_spk() {
     use futures::executor::LocalPool;
     use futures::task::LocalSpawnExt as _;
-    use protocol::handshake_v2::ClaimBundleResponse;
+    use protocol::handshake_v2::{ClaimBundleResponse, GetManifestResponse, PublishV2Response};
     use std::rc::Rc;
 
     let mut pool = LocalPool::new();
     let spawner = pool.spawner();
     pool.run_until(async {
         let (mut inner, _) = unlocked_client();
-        // Publish generation 1 (`spk1`) and generation 2 (`spk2`); a 3rd publish will tentatively
-        // displace `spk1`.
+        // Publish generation 1 (`spk1`) and generation 2 (`spk2`); a 3rd publish keeps `spk1`
+        // live in `ClientState` (`MAX_STORED_GENERATIONS = 3`) across prepare/persist/transmit
+        // until confirmed commit or `GetManifest` reconciliation!
         let pub1 = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
         let manifest1 = pub1.request.manifest.clone().unwrap();
         let bundle1 = ClaimBundleResponse {
@@ -13446,53 +13453,67 @@ fn r4_p1_3_refused_rotating_publish_leaves_displaced_spk_greeting_unacked() {
             pq_last_resort: pub1.request.pq_last_resort.first().cloned(),
             pq_one_time_prekey: pub1.request.pq_one_time_prekeys.first().cloned(),
         };
-        let spk1 = <[u8; 32]>::try_from(manifest1.signed_prekey.as_ref()).unwrap();
         inner.client.commit_publish_v2(pub1);
 
         let pub2 = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let manifest2 = pub2.request.manifest.clone().unwrap();
         inner.client.commit_publish_v2(pub2);
         let alice_id = inner.client.identity_key();
 
-        // Carol builds a valid greeting targeting `spk1`.
-        let carol = Client::new(Fetch::client(TEST_SERVER));
-        let carol_id = carol.identity_key();
-        let claimed = {
-            let b = bundle1.clone();
-            let _mock = crate::transport::mock_fetch(move |_s, path, _body| {
-                assert!(path.ends_with("/ClaimBundle"), "{path}");
-                Ok((200, b.encode_to_vec()))
-            });
-            session::claim_peer_bundle_v2(
-                &Fetch::client(TEST_SERVER),
-                "localhost",
-                &alice_id,
-                &session::PeerPqState::default(),
-                carol.pq_config(),
-                carol.clock(),
-            )
-            .await
-            .unwrap()
-        };
-        let hello = Kind::Hello(carol.make_hello("Carol", 1)).to_bytes();
-        let prepared_init = carol
-            .finish_prepare_initiate_v2(
-                claimed,
-                &session::PeerPqState::default(),
-                &hello,
-                Fetch::client(TEST_SERVER),
-            )
-            .unwrap();
-        let mut wire_msg = prepared_init.request.message.unwrap();
-        wire_msg.id = 77;
-        let incoming = Incoming::try_from(&wire_msg).unwrap();
+        // Carol builds two valid greetings targeting `spk1`: one arrives while PublishV2 is in
+        // flight, the second arrives after an ambiguous network drop + vault reload!
+        let carol1 = Client::new(Fetch::client(TEST_SERVER));
+        let carol1_id = carol1.identity_key();
+        let carol2 = Client::new(Fetch::client(TEST_SERVER));
+        let carol2_id = carol2.identity_key();
+        async fn mk_greeting(
+            sender: &Client<Connect>,
+            b: protocol::handshake_v2::ClaimBundleResponse,
+            s_id: PublicKey,
+            label: &str,
+            id: u64,
+        ) -> Incoming {
+            let cfg = sender.pq_config().clone();
+            let clk = sender.clock().clone();
+            let claimed = {
+                let _mock = crate::transport::mock_fetch(move |_s, path, _body| {
+                    assert!(path.ends_with("/ClaimBundle"), "{path}");
+                    Ok((200, b.encode_to_vec()))
+                });
+                session::claim_peer_bundle_v2(
+                    &Fetch::client(TEST_SERVER),
+                    "localhost",
+                    &s_id,
+                    &session::PeerPqState::default(),
+                    &cfg,
+                    &clk,
+                )
+                .await
+                .unwrap()
+            };
+            let hello = Kind::Hello(sender.make_hello(label, 1)).to_bytes();
+            let prepared_init = sender
+                .finish_prepare_initiate_v2(
+                    claimed,
+                    &session::PeerPqState::default(),
+                    &hello,
+                    Fetch::client(TEST_SERVER),
+                )
+                .unwrap();
+            let mut wire_msg = prepared_init.request.message.unwrap();
+            wire_msg.id = id;
+            Incoming::try_from(&wire_msg).unwrap()
+        }
+        let incoming1 = mk_greeting(&carol1, bundle1.clone(), alice_id, "Carol1", 77).await;
+        let incoming2 = mk_greeting(&carol2, bundle1, alice_id, "Carol2", 78).await;
 
         inner.server = TEST_SERVER.to_string();
         inner.audience = "localhost".to_string();
         let engine = Engine::with_inner(Ui::new(), inner);
 
-        // Start a rotating 3rd publish that tentatively displaces `spk1`, pause inside `/PublishV2`,
-        // verify the `spk1` greeting yields `deferred_retry_later` (un-ACKed!), then fail
-        // `/PublishV2` with `SignInRequired` (definitive refusal -> rolls back `spk1`!).
+        // Start a rotating 3rd publish, pause inside `/PublishV2`, and verify `incoming1`
+        // targeting `spk1` decrypts and accepts IMMEDIATELY (no `RetryLater`, no wedging!) while
+        // the 3rd publish is still in flight; then return an ambiguous 502 transport failure.
         let (entered_tx, entered_rx) = futures::channel::oneshot::channel::<()>();
         let entered_cell = Rc::new(RefCell::new(Some(entered_tx)));
         let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
@@ -13511,11 +13532,7 @@ fn r4_p1_3_refused_rotating_publish_leaves_displaced_spk_greeting_unacked() {
                 if let Some(rx) = rx {
                     let _ = rx.await;
                 }
-                let err = protocol::connect::error(
-                    protocol::ErrorKind::SignInRequired,
-                    "sign in required",
-                );
-                Ok((err.status, err.body))
+                Ok((502, b"bad gateway".to_vec()))
             }
         });
         let e_pub = engine.clone();
@@ -13531,53 +13548,97 @@ fn r4_p1_3_refused_rotating_publish_leaves_displaced_spk_greeting_unacked() {
         {
             let mut guard = engine.inner.lock().await;
             let inner = guard.as_mut().unwrap();
-            assert_eq!(inner.tentatively_displaced_spk, Some(spk1));
+            assert!(inner.client.has_unreconciled_publish());
             let mut batch = InitialBatch::default();
             engine.process_inbox_messages(
                 inner,
                 ListedInitialMessages {
-                    messages: vec![incoming.clone()],
+                    messages: vec![incoming1],
                     has_more: false,
                     malformed_ids: vec![],
                     next_after_id: None,
                 },
                 &mut batch,
             );
+            assert!(!batch.has_unacked_deferred);
+            assert!(inner.state.pending_inbox_acks.contains(&77));
             assert!(
-                batch.deferred_retry_later,
-                "greeting targeting tentatively displaced SPK must return RetryLater"
-            );
-            assert!(
-                !inner.state.pending_inbox_acks.contains(&77),
-                "RetryLater greeting must NEVER be staged for server ACK"
+                inner.contact(&carol1_id).is_some(),
+                "displaced SPK must remain live for immediate decryption during in-flight publish"
             );
         }
 
         let _ = release_tx.send(());
         let _ = done_rx.await;
 
-        // After refusal rollback restores `spk1`, the exact same greeting decrypts and accepts!
-        {
+        // Simulate full vault reload after the interrupted 502 publish! The persisted vault keeps
+        // all 3 generations `[spk1, spk2, spk3]` AND `has_unreconciled_publish() == true`.
+        let reloaded_engine = {
             let mut guard = engine.inner.lock().await;
+            let vault = guard.take().unwrap().vault;
+            let mut r_inner = reload(vault);
+            r_inner.server = TEST_SERVER.to_string();
+            r_inner.audience = "localhost".to_string();
+            assert!(r_inner.client.has_unreconciled_publish());
+            Engine::with_inner(Ui::new(), r_inner)
+        };
+
+        // Even AFTER reload (before reconciliation), `incoming2` targeting `spk1` still decrypts!
+        {
+            let mut guard = reloaded_engine.inner.lock().await;
             let inner = guard.as_mut().unwrap();
-            assert_eq!(inner.tentatively_displaced_spk, None);
             let mut batch = InitialBatch::default();
-            engine.process_inbox_messages(
+            reloaded_engine.process_inbox_messages(
                 inner,
                 ListedInitialMessages {
-                    messages: vec![incoming],
+                    messages: vec![incoming2],
                     has_more: false,
                     malformed_ids: vec![],
                     next_after_id: None,
                 },
                 &mut batch,
             );
-            assert!(!batch.deferred_retry_later);
-            assert!(inner.state.pending_inbox_acks.contains(&77));
             assert!(
-                inner.contact(&carol_id).is_some(),
-                "greeting must decrypt and create chat cleanly after publish rollback"
+                inner.contact(&carol2_id).is_some(),
+                "displaced SPK must survive vault reload after ambiguous publish failure"
             );
+        }
+
+        // Next `publish_full(true)` reconciles via own `GetManifest` (relay still holds `manifest2`),
+        // rolls back the unlanded `spk3`, then publishes a fresh `PublishV2` cleanly!
+        let saw_get_manifest = Rc::new(Cell::new(false));
+        let saw_publish = Rc::new(Cell::new(false));
+        {
+            let m2 = manifest2.clone();
+            let gm = saw_get_manifest.clone();
+            let pv = saw_publish.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/GetManifest") {
+                    gm.set(true);
+                    Ok((
+                        200,
+                        GetManifestResponse {
+                            manifest: Some(m2.clone()),
+                        }
+                        .encode_to_vec(),
+                    ))
+                } else if path.ends_with("/PublishV2") {
+                    pv.set(true);
+                    Ok((200, PublishV2Response {}.encode_to_vec()))
+                } else {
+                    panic!("unexpected RPC {path}");
+                }
+            });
+            reloaded_engine
+                .publish_full(reloaded_engine.vault_gen(), true)
+                .await
+                .unwrap();
+        }
+        assert!(saw_get_manifest.get());
+        assert!(saw_publish.get());
+        {
+            let guard = reloaded_engine.inner.lock().await;
+            assert!(!guard.as_ref().unwrap().client.has_unreconciled_publish());
         }
     });
 }
@@ -14377,10 +14438,12 @@ fn r4_p2_9_p2_10_p2_12_p2_13_p2_14_provisional_publish_lock_deltas_and_persisted
             crate::vault::SECURITY_ALERT_PQ_REQUIRED;
         inner3.contact(&peer3).unwrap().state.classical_approval_needed =
             crate::vault::CLASSICAL_APPROVAL_SIGNED_OFF;
+        let conv_gen3 = inner3.contact(&peer3).unwrap().state.conversation_gen;
         let orig_cfg = inner3.client.pq_config().clone();
         let mut rollback = crate::vault::PendingPqRollback::from_config(&orig_cfg, false);
         rollback.record_contact_flag(
             &peer3,
+            conv_gen3,
             Some(crate::vault::SECURITY_ALERT_PQ_REQUIRED),
             Some(crate::vault::CLASSICAL_APPROVAL_SIGNED_OFF),
         );
@@ -14566,6 +14629,881 @@ fn r4_p2_15_accept_request_dispatches_replay_pq_upgrades() {
             claim_calls.get(),
             1,
             "approve_classical must dispatch PQ upgrade recommended during deferred replay"
+        );
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r5_p1_2_in_place_publish_defers_manifest_digest_eviction_until_commit() {
+    use protocol::handshake_v2::ClaimBundleResponse;
+
+    futures::executor::block_on(async {
+        let mut bob = Client::new(Fetch::client(TEST_SERVER));
+        // Publish 16 times (1st rotating, then pinning SPK so subsequent publishes extend in place
+        // and fill all 16 rolling manifest-digest slots).
+        let pub1 = bob.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let m1 = pub1.request.manifest.clone().unwrap();
+        let spk1 = <[u8; 32]>::try_from(m1.signed_prekey.as_ref()).unwrap();
+        let bundle1 = ClaimBundleResponse {
+            signed_prekey: m1.signed_prekey.clone(),
+            signed_prekey_signature: pub1.request.signed_prekey_signature.clone(),
+            one_time_prekey: pub1.request.one_time_prekeys.first().cloned(),
+            manifest: Some(m1.clone()),
+            pq_last_resort: pub1.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: pub1.request.pq_one_time_prekeys.first().cloned(),
+        };
+        bob.commit_publish_v2(pub1);
+        for _ in 1..16 {
+            let p = bob
+                .prepare_publish_v2_preserving("localhost", 1, 1, &[spk1], &[])
+                .unwrap();
+            bob.commit_publish_v2_preserving(p, &[spk1], &[]);
+        }
+
+        // Alice prepares two valid PQ greetings bound to oldest digest #1 (`m1`).
+        let mk_pq_greeting = |label: String| {
+            let b = bundle1.clone();
+            let bob_id = bob.identity_key();
+            async move {
+                let alice = Client::new(Fetch::client(TEST_SERVER));
+                let alice_id = alice.identity_key();
+                let claimed = {
+                    let _mock = crate::transport::mock_fetch(move |_s, _p, _b| {
+                        Ok((200, b.encode_to_vec()))
+                    });
+                    session::claim_peer_bundle_v2(
+                        &Fetch::client(TEST_SERVER),
+                        "localhost",
+                        &bob_id,
+                        &session::PeerPqState::default(),
+                        alice.pq_config(),
+                        alice.clock(),
+                    )
+                    .await
+                    .unwrap()
+                };
+                let hello = Kind::Hello(alice.make_hello(label, 1)).to_bytes();
+                let init = alice
+                    .finish_prepare_initiate_v2(
+                        claimed,
+                        &session::PeerPqState::default(),
+                        &hello,
+                        Fetch::client(TEST_SERVER),
+                    )
+                    .unwrap();
+                (
+                    alice_id,
+                    Incoming::try_from(init.request.message.as_ref().unwrap()).unwrap(),
+                )
+            }
+        };
+        let (a1_id, g1) = mk_pq_greeting("A1".into()).await;
+        let (a2_id, g2) = mk_pq_greeting("A2".into()).await;
+
+        // Prepare a 17th in-place publish (pending): digest #1 MUST remain live during the
+        // in-flight publish AND across ClientState round-trip, and after refusal rollback!
+        let pub17 = bob
+            .prepare_publish_v2_preserving("localhost", 1, 1, &[spk1], &[])
+            .unwrap();
+        let proto_pending: session::proto::ClientState = bob.state().into();
+        let mut reloaded_pending = Client::restore(
+            Fetch::client(TEST_SERVER),
+            session::ClientState::try_from(&proto_pending).unwrap(),
+        );
+        assert!(
+            reloaded_pending
+                .accept_initial_v2(
+                    &a1_id,
+                    &session::PeerPqState::default(),
+                    &g1,
+                    Fetch::client(TEST_SERVER),
+                )
+                .is_ok(),
+            "oldest rolling manifest digest must remain valid while 17th publish is in flight"
+        );
+        // Rolling back pub17 keeps digest #1 valid; committing pub17 prunes digest #1.
+        bob.rollback_publish_v2_on_refusal(pub17);
+        assert!(
+            bob.accept_initial_v2(
+                &a2_id,
+                &session::PeerPqState::default(),
+                &g2,
+                Fetch::client(TEST_SERVER),
+            )
+            .is_ok(),
+            "oldest rolling manifest digest must still decrypt after refusal rollback"
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r5_p1_5_approve_classical_and_retry_pq_pin_conversation_gen() {
+    futures::executor::block_on(async {
+        let (mut inner, peer) = unlocked_client();
+        {
+            let c = inner.contact(&peer).unwrap();
+            c.state.conversation_gen = 5;
+            c.state.request = true;
+            c.state.quarantined = true;
+            c.state.classical_approval_needed = crate::vault::CLASSICAL_APPROVAL_SIGNED_OFF;
+            c.state.security_alert = crate::vault::SECURITY_ALERT_PQ_REQUIRED;
+        }
+        let engine = Engine::with_inner(Ui::new(), inner);
+
+        // Stale UI clicks pinned to conversation_gen = 4 MUST be rejected without mutating gen 5.
+        assert!(engine.approve_classical_for_gen(peer, 4).await.is_err());
+        assert!(engine.retry_pq_for_gen(peer, 4).await.is_err());
+
+        let guard = engine.inner.lock().await;
+        let c = guard
+            .as_ref()
+            .unwrap()
+            .contacts
+            .iter()
+            .find(|c| c.peer == peer)
+            .unwrap();
+        assert_eq!(c.state.conversation_gen, 5);
+        assert!(c.state.request);
+        assert!(c.state.quarantined);
+        assert_eq!(
+            c.state.classical_approval_needed,
+            crate::vault::CLASSICAL_APPROVAL_SIGNED_OFF
+        );
+        assert_eq!(
+            c.state.security_alert,
+            crate::vault::SECURITY_ALERT_PQ_REQUIRED
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r5_p2_1_p2_2_dispatched_pre_dedup_refusal_and_corrupt_outbox_never_duplicate() {
+    futures::executor::block_on(async {
+        // R5-P2-1: Retry of a previously `dispatched == true` outbox head hitting `SignInRequired`
+        // (pre-dedup refusal) MUST preserve `dispatched = true` even when `needs_requeue_sealed`
+        // is set so subsequent sync reconciles the original `client_message_id` instead of unsealing.
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let idx = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let view = inner
+                .add(&peer, Kind::Text("once only".into()), false)
+                .await
+                .unwrap();
+            inner.seal_head_on_active_session(&peer).await.unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.state.outbox[0].dispatched = true;
+            c.state.needs_requeue_sealed = true;
+            inner.save_state().await.unwrap();
+            view.index
+        };
+        {
+            let _mock = crate::transport::mock_fetch(|_s, path, _b| {
+                assert!(path.ends_with("/PushV2"), "{path}");
+                let err = protocol::connect::error(
+                    protocol::ErrorKind::SignInRequired,
+                    "sign in required",
+                );
+                Ok((err.status, err.body))
+            });
+            let _ = engine.flush(&peer).await;
+        }
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .unwrap();
+            assert_eq!(c.state.outbox.len(), 1);
+            assert!(
+                c.state.outbox[0].dispatched,
+                "pre-dedup SignInRequired on retry must NOT clear Outgoing.dispatched"
+            );
+            assert!(
+                c.state.outbox[0].sealed,
+                "already-dispatched outbox head must NOT be unsealed/re-encrypted"
+            );
+        }
+
+        // R5-P2-2: Corrupt ciphertext record for a `dispatched == true` outbox entry MUST drop
+        // cleanly (never rebuild plaintext and re-encrypt under a fresh `client_message_id`).
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let outcome = inner.recover_corrupt_outbox(&peer, idx).await.unwrap();
+            assert!(
+                matches!(outcome, CorruptOutboxRecovery::Dropped { .. }),
+                "recover_corrupt_outbox must NEVER rebuild plaintext for dispatched == true"
+            );
+            assert!(inner.contact(&peer).unwrap().state.outbox.is_empty());
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r5_p2_3_cancel_upload_serializes_with_in_flight_push_and_preserves_dispatched() {
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt as _;
+    use protocol::mailbox_v2::PushV2Response;
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let att_id = [0x66u8; 16];
+        let idx = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let pointer = crate::content::AttachmentPointer {
+                id: att_id.to_vec(),
+                key: vec![0x77; 32],
+                size: 16,
+                name: "demo.bin".into(),
+                mime: "application/octet-stream".into(),
+                expires: crate::util::now() + 60_000,
+            };
+            let view = inner
+                .add(&peer, Kind::Attachment(pointer), false)
+                .await
+                .unwrap();
+            let mut pending = crate::vault::PendingUpload::default();
+            pending.id = att_id.to_vec();
+            pending.key = vec![0x77; 32];
+            pending.token = vec![0x88; 32];
+            pending.size = 16;
+            pending.name = "demo.bin".into();
+            pending.mime = "application/octet-stream".into();
+            pending.expires = crate::util::now() + 60_000;
+            pending.announced = true;
+            pending.history_index = view.index;
+            pending.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+            inner.vault.save_upload(&peer, &pending).await.unwrap();
+            view.index
+        };
+
+        let (entered_tx, entered_rx) = futures::channel::oneshot::channel::<()>();
+        let entered_cell = Rc::new(RefCell::new(Some(entered_tx)));
+        let (release_tx, release_rx) = futures::channel::oneshot::channel::<()>();
+        let release_cell = Rc::new(RefCell::new(Some(release_rx)));
+        let (flush_done_tx, flush_done_rx) = futures::channel::oneshot::channel::<()>();
+        let (cancel_done_tx, cancel_done_rx) = futures::channel::oneshot::channel::<()>();
+
+        let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+            let entered_cell = entered_cell.clone();
+            let release_cell = release_cell.clone();
+            async move {
+                if path.ends_with("/PushV2") {
+                    if let Some(tx) = entered_cell.borrow_mut().take() {
+                        let _ = tx.send(());
+                    }
+                    let rx = release_cell.borrow_mut().take();
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                    Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+                } else {
+                    Ok((200, vec![]))
+                }
+            }
+        });
+
+        let e_flush = engine.clone();
+        spawner
+            .spawn_local(async move {
+                let _ = e_flush.flush(&peer).await;
+                let _ = flush_done_tx.send(());
+            })
+            .unwrap();
+        let _ = entered_rx.await;
+
+        // Invoke `cancel_upload` WHILE `PushV2` is suspended on the wire: `cancel_upload` must
+        // serialize behind `peer_flush_lock` so the delivered announcement commits `Delivery::Sent`,
+        // NOT `Delivery::Failed`!
+        let e_cancel = engine.clone();
+        spawner
+            .spawn_local(async move {
+                let _ = e_cancel.cancel_upload(peer, att_id).await;
+                let _ = cancel_done_tx.send(());
+            })
+            .unwrap();
+
+        let _ = release_tx.send(());
+        let _ = flush_done_rx.await;
+        let _ = cancel_done_rx.await;
+
+        let guard = engine.inner.lock().await;
+        let entry = guard
+            .as_ref()
+            .unwrap()
+            .vault
+            .entry(&peer, idx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            entry.delivery(),
+            Delivery::Sent,
+            "delivered announcement racing cancel_upload must stay Delivery::Sent, never Failed"
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r5_p2_6_p2_7_uncertain_greeting_window_and_first_dispatch_timestamp() {
+    use protocol::handshake_v2::SendInitialV2Response;
+    use std::rc::Rc;
+
+    futures::executor::block_on(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let now_ms = crate::util::now();
+
+        // 1. An `UNCERTAIN` greeting older than 28 days (`GREETING_AUTO_RECLAIM_WINDOW_MS`) MUST
+        //    NOT be retried or auto-reclaimed on `StaleVersion` (tombstone may have expired).
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNCERTAIN;
+            c.state.greeting_sent_at =
+                now_ms.saturating_sub(super::sync::GREETING_AUTO_RECLAIM_WINDOW_MS + 60_000);
+            assert!(!super::sync::uncertain_greeting_reclaim_eligible(
+                &c.state, now_ms
+            ));
+        }
+        let calls = Rc::new(Cell::new(0usize));
+        {
+            let c_ref = calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, _p, _b| {
+                c_ref.set(c_ref.get() + 1);
+                Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+            });
+            let retried = engine.retry_pending_greetings().await.unwrap();
+            assert!(!retried);
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "expired UNCERTAIN greeting past 28d window must not retry or auto-reclaim"
+        );
+
+        // 2. An `UNSENT` greeting has `greeting_sent_at == 0`; definitive refusal reverts
+        //    `greeting_sent_at` back to `0`, and eventual first success stamps `greeting_sent_at > 0`
+        //    giving a full 28-day recovery window from actual transmission!
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNSENT;
+            c.state.greeting_sent_at = 0;
+        }
+        {
+            let _mock = crate::transport::mock_fetch(|_s, path, _b| {
+                assert!(path.ends_with("/SendInitialV2"), "{path}");
+                let err = protocol::connect::error(protocol::ErrorKind::LimitExceeded, "full");
+                Ok((err.status, err.body))
+            });
+            let _ = engine.retry_pending_greetings().await;
+        }
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .unwrap();
+            assert_eq!(
+                c.state.greeting_delivery,
+                crate::vault::GREETING_DELIVERY_UNSENT
+            );
+            assert_eq!(
+                c.state.greeting_sent_at, 0,
+                "definitive refusal of UNSENT greeting must reset greeting_sent_at back to 0"
+            );
+        }
+        engine.clear_approval_backoff(&peer);
+        {
+            let _mock = crate::transport::mock_fetch(|_s, path, _b| {
+                assert!(path.ends_with("/SendInitialV2"), "{path}");
+                Ok((200, SendInitialV2Response { id: 7 }.encode_to_vec()))
+            });
+            assert!(engine.retry_pending_greetings().await.unwrap());
+        }
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .unwrap();
+            assert_eq!(
+                c.state.greeting_delivery,
+                crate::vault::GREETING_DELIVERY_CONFIRMED
+            );
+            assert!(
+                c.state.greeting_sent_at >= now_ms,
+                "first successful transmission must stamp greeting_sent_at"
+            );
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r5_p2_9_p2_10_provisional_cleanup_resume_and_crossed_start_grant() {
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt as _;
+    use protocol::handshake_v2::ClaimBundleResponse;
+    use protocol::mailbox_v2::RegisterWriteTokenResponse;
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+    let spawner = pool.spawner();
+    pool.run_until(async {
+        // 1. `accept_contact_request_state` and `finalize_upgrade_to_pq_request_state` both clear
+        //    `provisional = false`.
+        let mut st = ContactState {
+            request: true,
+            provisional: true,
+            ..Default::default()
+        };
+        super::contact::accept_contact_request_state(&mut st, "Alice").unwrap();
+        assert!(!st.request && !st.provisional);
+
+        let mut st2 = ContactState {
+            request: true,
+            provisional: true,
+            ..Default::default()
+        };
+        let hello = Kind::Hello(Hello {
+            name: "Me".into(),
+            ..Default::default()
+        });
+        super::settings::finalize_upgrade_to_pq_request_state(&mut st2, hello, 1, 1_000);
+        assert!(!st2.request && !st2.provisional);
+
+        // 2. `cleanup_abandoned_provisional_contacts` rolls back pure abandoned provisional chats
+        //    and stages a `PendingRevoke`, while converting crossed-start provisional contacts to
+        //    explicit unaccepted requests (`request = true, provisional = false`).
+        let (mut inner, pure_peer) = unlocked_client();
+        {
+            let c = inner.contact(&pure_peer).unwrap();
+            c.state.provisional = true;
+            c.state.request = false;
+            c.state.history_len = 1;
+        }
+        let cleaned = inner.cleanup_abandoned_provisional_contacts().await;
+        assert_eq!(cleaned, vec![pure_peer]);
+        assert!(inner.contact(&pure_peer).is_none());
+        assert!(!inner.state.pending_revokes.is_empty());
+
+        let (mut inner2, crossed_peer) = unlocked_client();
+        {
+            let c = inner2.contact(&crossed_peer).unwrap();
+            c.state.provisional = true;
+            c.state.request = false;
+            c.state.history_len = 2;
+        }
+        let cleaned2 = inner2.cleanup_abandoned_provisional_contacts().await;
+        assert_eq!(cleaned2, vec![crossed_peer]);
+        let c2 = inner2.contact(&crossed_peer).unwrap();
+        assert!(c2.state.request && !c2.state.provisional);
+
+        // 3. R5-P2-10: Simultaneous crossed-start during `start_chat` Phase 3 (`RegisterWriteToken`)
+        //    where Bob's inbound session wins tie-break -> `start_chat` stages + flushes the
+        //    winning session's write-token grant and clears `provisional = false`!
+        let (mut alice_inner, _) = unlocked_client();
+        alice_inner.server = TEST_SERVER.to_string();
+        alice_inner.audience = "localhost".to_string();
+        let a_pub = alice_inner
+            .client
+            .prepare_publish_v2("localhost", 2, 2)
+            .unwrap();
+        let a_m = a_pub.request.manifest.clone().unwrap();
+        let alice_bundle = ClaimBundleResponse {
+            signed_prekey: a_m.signed_prekey.clone(),
+            signed_prekey_signature: a_pub.request.signed_prekey_signature.clone(),
+            one_time_prekey: a_pub.request.one_time_prekeys.first().cloned(),
+            manifest: Some(a_m),
+            pq_last_resort: a_pub.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: a_pub.request.pq_one_time_prekeys.first().cloned(),
+        };
+        alice_inner.client.commit_publish_v2(a_pub);
+        alice_inner.state.published_at = crate::util::now();
+        let alice_id = alice_inner.client.identity_key();
+
+        let mut bob = Client::new(Fetch::client(TEST_SERVER));
+        let b_pub = bob.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let b_m = b_pub.request.manifest.clone().unwrap();
+        let bob_bundle = ClaimBundleResponse {
+            signed_prekey: b_m.signed_prekey.clone(),
+            signed_prekey_signature: b_pub.request.signed_prekey_signature.clone(),
+            one_time_prekey: b_pub.request.one_time_prekeys.first().cloned(),
+            manifest: Some(b_m),
+            pq_last_resort: b_pub.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: b_pub.request.pq_one_time_prekeys.first().cloned(),
+        };
+        bob.commit_publish_v2(b_pub);
+        let bob_id = bob.identity_key();
+
+        let engine = Engine::with_inner(Ui::new(), alice_inner);
+        let (reg_entered_tx, reg_entered_rx) = futures::channel::oneshot::channel::<()>();
+        let reg_entered = Rc::new(RefCell::new(Some(reg_entered_tx)));
+        let (reg_release_tx, reg_release_rx) = futures::channel::oneshot::channel::<()>();
+        let reg_release = Rc::new(RefCell::new(Some(reg_release_rx)));
+        let registered_tokens = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+        let (start_done_tx, start_done_rx) =
+            futures::channel::oneshot::channel::<Result<PublicKey, StartChatError>>();
+
+        let _mock = {
+            let b_resp = bob_bundle.clone();
+            let a_resp = alice_bundle.clone();
+            let entered = reg_entered.clone();
+            let release = reg_release.clone();
+            let tokens = registered_tokens.clone();
+            crate::transport::mock_fetch_async(move |_s, path, body| {
+                let b_resp = b_resp.clone();
+                let a_resp = a_resp.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                let tokens = tokens.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        let req =
+                            protocol::handshake_v2::ClaimBundleRequest::decode(body.as_slice())
+                                .unwrap();
+                        if req.identity_key.as_ref() == alice_id.as_slice() {
+                            Ok((200, a_resp.encode_to_vec()))
+                        } else {
+                            Ok((200, b_resp.encode_to_vec()))
+                        }
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        let req = protocol::mailbox_v2::RegisterWriteTokenRequest::decode(
+                            body.as_slice(),
+                        )
+                        .unwrap();
+                        tokens.borrow_mut().push(req.token_hash.to_vec());
+                        if let Some(tx) = entered.borrow_mut().take() {
+                            let _ = tx.send(());
+                        }
+                        let rx = release.borrow_mut().take();
+                        if let Some(rx) = rx {
+                            let _ = rx.await;
+                        }
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else {
+                        panic!("unexpected RPC {path}");
+                    }
+                }
+            })
+        };
+
+        let e_start = engine.clone();
+        let bob_key_text = crate::util::key_to_text(&bob_id);
+        spawner
+            .spawn_local(async move {
+                let res = e_start
+                    .start_chat(1, &bob_key_text, "Bob".into(), None, false, false)
+                    .await;
+                let _ = start_done_tx.send(res);
+            })
+            .unwrap();
+
+        let _ = reg_entered_rx.await;
+        // Read Alice's provisional session ID + token so we construct a Bob crossed-start greeting
+        // whose ephemeral `id > alice_id` (deterministically winning `Session::keep` tie-break!).
+        let (alice_orig_id, alice_orig_tok) = {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let c = inner.contacts.iter().find(|c| c.peer == bob_id).unwrap();
+            assert!(c.state.provisional);
+            (
+                session::proto::SessionState::from(c.session.state())
+                    .id
+                    .clone(),
+                c.session.active_inbound_token_hash().unwrap(),
+            )
+        };
+        let bob_incoming = loop {
+            let claimed = session::claim_peer_bundle_v2(
+                &Fetch::client(TEST_SERVER),
+                "localhost",
+                &alice_id,
+                &session::PeerPqState::default(),
+                bob.pq_config(),
+                bob.clock(),
+            )
+            .await
+            .unwrap();
+            let hello = Kind::Hello(bob.make_hello("Bob", 1)).to_bytes();
+            let init = bob
+                .finish_prepare_initiate_v2(
+                    claimed,
+                    &session::PeerPqState::default(),
+                    &hello,
+                    Fetch::client(TEST_SERVER),
+                )
+                .unwrap();
+            let mut wire = init.request.message.unwrap();
+            if wire.ephemeral_key.as_ref() > alice_orig_id.as_slice() {
+                wire.id = 91;
+                break Incoming::try_from(&wire).unwrap();
+            }
+        };
+
+        // Deliver Bob's winning inbound greeting while Alice's `start_chat` is suspended in
+        // Phase 3 `RegisterWriteToken` (so `provisional == true` suppresses `process_initial`'s
+        // grant staging).
+        let winning_token = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            assert!(inner.contact(&bob_id).unwrap().state.provisional);
+            let mut batch = InitialBatch::default();
+            engine.process_inbox_messages(
+                inner,
+                ListedInitialMessages {
+                    messages: vec![bob_incoming],
+                    has_more: false,
+                    malformed_ids: vec![],
+                    next_after_id: None,
+                },
+                &mut batch,
+            );
+            let winning_tok = inner
+                .contact(&bob_id)
+                .unwrap()
+                .session
+                .active_inbound_token_hash()
+                .unwrap();
+            assert_ne!(
+                winning_tok, alice_orig_tok,
+                "Bob's higher-ID crossed-start session must win tie-break"
+            );
+            assert!(
+                !inner
+                    .contact(&bob_id)
+                    .unwrap()
+                    .session
+                    .pending_register_grants()
+                    .iter()
+                    .any(|g| g.token_hash == winning_tok),
+                "provisional contact must suppress grant staging inside process_initial"
+            );
+            winning_tok.to_vec()
+        };
+
+        let _ = reg_release_tx.send(());
+        let started = start_done_rx.await.unwrap();
+        assert_eq!(started, Ok(bob_id));
+        assert!(
+            registered_tokens.borrow().contains(&winning_token),
+            "start_chat must stage and flush the winning crossed-start session's write token"
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == bob_id)
+                .unwrap();
+            assert!(!c.state.provisional);
+            assert!(!c.session.has_pending_active_grant());
+        }
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r5_p2_11_full_deferred_initials_cap_sets_unacked_deferred_flag() {
+    use protocol::handshake_v2::InitialMessageV2 as WireInitial;
+
+    let (mut inner, _) = unlocked_client();
+    let engine = Engine::new(Ui::new());
+    // Fill all 100 `deferred_initials` slots with distinct valid classical wire payloads.
+    for i in 0..100u32 {
+        let mut sender = [0x11u8; 32];
+        sender[..4].copy_from_slice(&i.to_be_bytes());
+        let wire = WireInitial {
+            id: 0,
+            version: 1,
+            identity_key: bytes::Bytes::copy_from_slice(&sender),
+            ephemeral_key: bytes::Bytes::copy_from_slice(&[0x22; 32]),
+            signed_prekey: bytes::Bytes::copy_from_slice(&[0x33; 32]),
+            one_time_prekey: None,
+            first_message: Some(party::EncryptedMessage {
+                header: bytes::Bytes::from_static(b"h"),
+                content: bytes::Bytes::from_static(b"c"),
+            }),
+            pq_suite: 0,
+            pq_last_resort: false,
+            pq_prekey_id: bytes::Bytes::new(),
+            pq_ciphertext: bytes::Bytes::new(),
+            manifest_digest: bytes::Bytes::new(),
+        };
+        inner.deferred_initials.push(crate::vault::DeferredInitial {
+            initial: Some(wire),
+            deferred_at: 1_000,
+        });
+    }
+    // 101st distinct initial must return `CapFull` (not `Stored { dirty: false }`), and when
+    // processed through `process_inbox_messages` for a deferred suite / isolated peer it MUST set
+    // `batch.has_unacked_deferred = true` without staging an ACK for its server inbox ID.
+    let iso_peer = [0x99u8; 32];
+    let wire_extra = WireInitial {
+        id: 501,
+        version: 1,
+        identity_key: bytes::Bytes::copy_from_slice(&iso_peer),
+        ephemeral_key: bytes::Bytes::copy_from_slice(&[0x44; 32]),
+        signed_prekey: bytes::Bytes::copy_from_slice(&[0x55; 32]),
+        one_time_prekey: None,
+        first_message: Some(party::EncryptedMessage {
+            header: bytes::Bytes::from_static(b"h"),
+            content: bytes::Bytes::from_static(b"c"),
+        }),
+        pq_suite: 0,
+        pq_last_resort: false,
+        pq_prekey_id: bytes::Bytes::new(),
+        pq_ciphertext: bytes::Bytes::new(),
+        manifest_digest: bytes::Bytes::new(),
+    };
+    let extra = Incoming::try_from(&wire_extra).unwrap();
+    assert_eq!(
+        inner.defer_inbox_initial(&extra),
+        DeferInboxOutcome::CapFull
+    );
+    assert!(!inner.deferred_acks_after_save.contains(&501));
+
+    // Duplicate of an already-stored payload (entry 0) still succeeds with `Stored` even at cap.
+    let mut dup_wire = inner.deferred_initials[0].initial.clone().unwrap();
+    dup_wire.id = 502;
+    let dup = Incoming::try_from(&dup_wire).unwrap();
+    assert_eq!(
+        inner.defer_inbox_initial(&dup),
+        DeferInboxOutcome::Stored { dirty: true }
+    );
+    assert_eq!(
+        inner.defer_inbox_initial(&dup),
+        DeferInboxOutcome::Stored { dirty: false }
+    );
+
+    // When this build omits at least one known ML-KEM suite, also exercise the full
+    // `process_inbox_messages` -> `batch.has_unacked_deferred == true` path.
+    #[cfg(not(all(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+    {
+        let unsupported_suite = if cfg!(feature = "ml-kem-1024") {
+            u32::from(session::PqSuite::MlKem768.as_u8())
+        } else {
+            u32::from(session::PqSuite::MlKem1024.as_u8())
+        };
+        let mut raw_session = session::proto::SessionState::default();
+        raw_session.me = inner.client.identity_key().to_vec();
+        raw_session.peer = iso_peer.to_vec();
+        raw_session.active_security = Some(session::proto::SessionSecurity {
+            is_pq: true,
+            suite: unsupported_suite,
+            ..Default::default()
+        });
+        inner.isolated_peers.insert(iso_peer);
+        inner.isolated_contacts.push(ContactState {
+            peer: iso_peer.to_vec(),
+            session: Some(raw_session),
+            ..Default::default()
+        });
+        assert!(inner.is_pq_incompatible_isolated_peer(&iso_peer));
+        let mut batch = InitialBatch::default();
+        engine.process_inbox_messages(
+            &mut inner,
+            ListedInitialMessages {
+                messages: vec![extra],
+                has_more: false,
+                malformed_ids: vec![],
+                next_after_id: None,
+            },
+            &mut batch,
+        );
+        assert!(batch.has_unacked_deferred);
+        assert!(!inner.state.pending_inbox_acks.contains(&501));
+        assert!(!inner.deferred_acks_after_save.contains(&501));
+    }
+    let _ = engine;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r5_p3_1_deleted_peer_pq_rollback_flags_pruned_on_disk_and_gen_pinned() {
+    futures::executor::block_on(async {
+        let (mut inner, peer) = unlocked_client();
+        let gen1 = inner.contact(&peer).unwrap().state.conversation_gen;
+        let orig_cfg = inner.client.pq_config().clone();
+        let mut rollback = crate::vault::PendingPqRollback::from_config(&orig_cfg, false);
+        rollback.record_contact_flag(
+            &peer,
+            gen1,
+            Some(crate::vault::SECURITY_ALERT_PQ_REQUIRED),
+            Some(crate::vault::CLASSICAL_APPROVAL_SIGNED_OFF),
+        );
+        inner.state.pending_pq_rollback = Some(rollback);
+
+        // 1. `forget_peer` MUST prune `peer`'s rollback flag from the persisted `AppState` on disk!
+        let mut state = inner.app_state();
+        state
+            .contacts
+            .retain(|c| c.peer.as_slice() != peer.as_slice());
+        let deferred = inner.deferred_record_without_peer(&peer);
+        inner.forget_peer(&peer, state, deferred).await.unwrap();
+        let persisted = inner.vault.state.borrow().clone();
+        assert!(
+            persisted
+                .pending_pq_rollback
+                .as_ref()
+                .unwrap()
+                .contact_flags
+                .is_empty(),
+            "forget_peer must prune deleted peer from persisted pending_pq_rollback.contact_flags"
+        );
+
+        // 2. Even if a stale flag for `(peer, gen1)` existed, `finish_publish_rollback` MUST NOT
+        //    re-attach it to a recreated conversation with `conversation_gen = gen1 + 1`!
+        let (mut inner2, peer2) = unlocked_client();
+        let gen2 = inner2.contact(&peer2).unwrap().state.conversation_gen;
+        let mut stale_rb =
+            crate::vault::PendingPqRollback::from_config(inner2.client.pq_config(), false);
+        stale_rb.record_contact_flag(
+            &peer2,
+            gen2.saturating_add(99),
+            Some(crate::vault::SECURITY_ALERT_PQ_REQUIRED),
+            Some(crate::vault::CLASSICAL_APPROVAL_SIGNED_OFF),
+        );
+        inner2.state.pending_pq_rollback = Some(stale_rb);
+        let engine2 = Engine::with_inner(Ui::new(), inner2);
+        let mut guard = engine2.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
+        let err = PublishError::transmitted(session::Error::from(protocol::Error::from(
+            protocol::ErrorKind::Malformed,
+        )));
+        let _ = engine2.finish_publish_rollback(inner, err, true).await;
+        let c = inner.contact(&peer2).unwrap();
+        assert_eq!(c.state.security_alert, crate::vault::SECURITY_ALERT_NONE);
+        assert_eq!(
+            c.state.classical_approval_needed,
+            crate::vault::CLASSICAL_APPROVAL_NONE
         );
     });
 }

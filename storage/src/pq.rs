@@ -232,6 +232,31 @@ pub enum ClaimOutcome {
     Claimed(Box<ClaimedPqBundle>),
 }
 
+/// Outcome of [`LocalPqHandshakeStore::add_initial_message_v2_checked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum InitialDisposition {
+    /// Stored or matched idempotently (live inbox row or unexpired delivery tombstone) at `id`.
+    Added(u64),
+    /// Rejected because the inbox is full or an unexpired ACK tombstone was capacity-evicted and
+    /// stale-prekey proof is temporarily unavailable.
+    InboxFull,
+    /// Not found as a live row or tombstone and `allow_insert` was `false` (e.g., PQ disabled on
+    /// the relay while probing an existing PQ greeting).
+    InsertDisallowed,
+}
+
+/// A bounded page of pending initial messages returned by
+/// [`LocalPqHandshakeStore::list_initial_messages_page`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct InitialMessagePage {
+    /// Pending initial messages returned on this page (marked as `listed` in storage).
+    pub messages: Vec<StoredInitialMessageV2>,
+    /// Whether additional pending initial messages exist strictly after the last returned ID.
+    pub has_more: bool,
+}
+
 /// Write-token registration payload passed to [`LocalIdempotentMailboxStore::register_write_token`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -339,6 +364,26 @@ pub trait LocalPqHandshakeStore {
         limit: usize,
     ) -> Result<Option<u64>>;
 
+    /// Like [`add_initial_message_v2`](Self::add_initial_message_v2), with explicit control over
+    /// whether a brand-new row may be inserted (`allow_insert == false` performs a read-only
+    /// duplicate / ACK-tombstone / SPK-retention disposition check when `PQ_ENABLED="false"`).
+    async fn add_initial_message_v2_checked(
+        &self,
+        initial_message: StoredInitialMessageV2,
+        limit: usize,
+        allow_insert: bool,
+    ) -> Result<InitialDisposition> {
+        if !allow_insert {
+            return Ok(InitialDisposition::InsertDisallowed);
+        }
+        Ok(
+            match self.add_initial_message_v2(initial_message, limit).await? {
+                Some(id) => InitialDisposition::Added(id),
+                None => InitialDisposition::InboxFull,
+            },
+        )
+    }
+
     /// Non-destructively list up to `limit` pending initial messages for `recipient` with
     /// `id > after_id`, oldest first. Must not allocate persistent storage for unknown identities.
     async fn list_initial_messages(
@@ -347,6 +392,22 @@ pub trait LocalPqHandshakeStore {
         after_id: u64,
         limit: usize,
     ) -> Result<Vec<StoredInitialMessageV2>>;
+
+    /// Like [`list_initial_messages`](Self::list_initial_messages), returning an exact `has_more`
+    /// flag while marking **only** the returned messages as `listed`.
+    async fn list_initial_messages_page(
+        &self,
+        recipient: &PublicKey,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<InitialMessagePage> {
+        let mut messages = self
+            .list_initial_messages(recipient, after_id, limit.saturating_add(1))
+            .await?;
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        Ok(InitialMessagePage { messages, has_more })
+    }
 
     /// Explicitly delete only the inbox initial messages with IDs in `ids` for `recipient`.
     /// Returns the number of messages deleted. Must not allocate persistent storage for unknown
@@ -401,6 +462,15 @@ pub trait PqHandshakeStore: Send {
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Option<u64>>> + Send;
 
+    /// Like [`add_initial_message_v2`](Self::add_initial_message_v2), supporting read-only
+    /// disposition lookup when `allow_insert == false`.
+    fn add_initial_message_v2_checked(
+        &self,
+        initial_message: StoredInitialMessageV2,
+        limit: usize,
+        allow_insert: bool,
+    ) -> impl std::future::Future<Output = Result<InitialDisposition>> + Send;
+
     /// Non-destructively list up to `limit` pending initial messages with `id > after_id`.
     fn list_initial_messages(
         &self,
@@ -408,6 +478,15 @@ pub trait PqHandshakeStore: Send {
         after_id: u64,
         limit: usize,
     ) -> impl std::future::Future<Output = Result<Vec<StoredInitialMessageV2>>> + Send;
+
+    /// Like [`list_initial_messages`](Self::list_initial_messages), returning an exact `has_more`
+    /// flag while marking only the returned messages as `listed`.
+    fn list_initial_messages_page(
+        &self,
+        recipient: &PublicKey,
+        after_id: u64,
+        limit: usize,
+    ) -> impl std::future::Future<Output = Result<InitialMessagePage>> + Send;
 
     /// Explicitly delete only the inbox initial messages with IDs in `ids` for `recipient`.
     fn ack_initial_messages(
@@ -470,6 +549,16 @@ impl<T: PqHandshakeStore> LocalPqHandshakeStore for T {
         PqHandshakeStore::add_initial_message_v2(self, initial_message, limit).await
     }
 
+    async fn add_initial_message_v2_checked(
+        &self,
+        initial_message: StoredInitialMessageV2,
+        limit: usize,
+        allow_insert: bool,
+    ) -> Result<InitialDisposition> {
+        PqHandshakeStore::add_initial_message_v2_checked(self, initial_message, limit, allow_insert)
+            .await
+    }
+
     async fn list_initial_messages(
         &self,
         recipient: &PublicKey,
@@ -477,6 +566,15 @@ impl<T: PqHandshakeStore> LocalPqHandshakeStore for T {
         limit: usize,
     ) -> Result<Vec<StoredInitialMessageV2>> {
         PqHandshakeStore::list_initial_messages(self, recipient, after_id, limit).await
+    }
+
+    async fn list_initial_messages_page(
+        &self,
+        recipient: &PublicKey,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<InitialMessagePage> {
+        PqHandshakeStore::list_initial_messages_page(self, recipient, after_id, limit).await
     }
 
     async fn ack_initial_messages(&self, recipient: &PublicKey, ids: &[u64]) -> Result<usize> {

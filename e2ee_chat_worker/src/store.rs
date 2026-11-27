@@ -6,11 +6,11 @@
 //! object, served atomically.
 
 use storage::{
-    AttachmentId, Bytes, ClaimOutcome, ClaimedPqBundle, Error, ErrorKind, LocalAttachmentStore,
-    LocalIdempotentMailboxStore, LocalPqHandshakeStore, MAX_SAFE_INTEGER, MailboxPage,
-    PqStorageSnapshot, PublicKey, PublishV2Record, PublishV2Status, RefillPrekeysRecord,
-    RefillStatus, RegisterWriteTokenRecord, Result, RevokeWriteTokenRecord, StoredAttachment,
-    StoredCapabilityManifest, StoredInitialMessageV2, WriteTokenHash,
+    AttachmentId, Bytes, ClaimOutcome, ClaimedPqBundle, Error, ErrorKind, InitialDisposition,
+    InitialMessagePage, LocalAttachmentStore, LocalIdempotentMailboxStore, LocalPqHandshakeStore,
+    MAX_SAFE_INTEGER, MailboxPage, PqStorageSnapshot, PublicKey, PublishV2Record, PublishV2Status,
+    RefillPrekeysRecord, RefillStatus, RegisterWriteTokenRecord, Result, RevokeWriteTokenRecord,
+    StoredAttachment, StoredCapabilityManifest, StoredInitialMessageV2, WriteTokenHash,
 };
 use worker::{Bucket, Conditional, Env, console_error};
 
@@ -176,6 +176,21 @@ impl LocalPqHandshakeStore for Store {
         initial_message: StoredInitialMessageV2,
         limit: usize,
     ) -> Result<Option<u64>> {
+        match self
+            .add_initial_message_v2_checked(initial_message, limit, true)
+            .await?
+        {
+            InitialDisposition::Added(id) => Ok(Some(id)),
+            InitialDisposition::InboxFull | InitialDisposition::InsertDisallowed => Ok(None),
+        }
+    }
+
+    async fn add_initial_message_v2_checked(
+        &self,
+        initial_message: StoredInitialMessageV2,
+        limit: usize,
+        allow_insert: bool,
+    ) -> Result<InitialDisposition> {
         let recipient = initial_message.recipient;
         match self
             .identity(
@@ -183,12 +198,14 @@ impl LocalPqHandshakeStore for Store {
                 rpc::AddInitialMessageV2 {
                     message: initial_message,
                     limit: limit as u64,
+                    allow_insert,
                 },
             )
             .await?
         {
-            AddInitialOutcome::Added { id, .. } => Ok(Some(id)),
-            AddInitialOutcome::LimitExceeded => Ok(None),
+            AddInitialOutcome::Added { id, .. } => Ok(InitialDisposition::Added(id)),
+            AddInitialOutcome::LimitExceeded => Ok(InitialDisposition::InboxFull),
+            AddInitialOutcome::InsertDisallowed => Ok(InitialDisposition::InsertDisallowed),
             AddInitialOutcome::NotFound => Err(ErrorKind::NotFound.into()),
             AddInitialOutcome::StalePrekey => Err(ErrorKind::StaleVersion.into()),
             AddInitialOutcome::PayloadMismatch => Err(ErrorKind::InvalidArgument.into()),
@@ -202,6 +219,18 @@ impl LocalPqHandshakeStore for Store {
         after_id: u64,
         limit: usize,
     ) -> Result<Vec<StoredInitialMessageV2>> {
+        Ok(self
+            .list_initial_messages_page(recipient, after_id, limit)
+            .await?
+            .messages)
+    }
+
+    async fn list_initial_messages_page(
+        &self,
+        recipient: &PublicKey,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<InitialMessagePage> {
         check_safe(after_id)?;
         self.identity(
             recipient,

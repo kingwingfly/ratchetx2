@@ -50,9 +50,13 @@ const HASH_LENGTH: usize = <Sha256 as OutputSizeUser>::OutputSize::USIZE;
 /// The info of the KDF deriving the shared secret key.
 const INFO: &[u8] = b"x3dh.v1";
 
-/// How many generations of prekeys [`LocalPrekeys`] keeps: the latest, and the one before it
-/// for initial messages that were on their way when the latest was published.
+/// How many generations of prekeys [`LocalPrekeys`] keeps in steady state: the latest, and the
+/// one before it for initial messages that were on their way when the latest was published.
 pub const KEPT_GENERATIONS: usize = 2;
+/// Maximum generations stored transiently while a rotating publish is in flight (`KEPT_GENERATIONS`
+/// retained generations + 1 newly prepared generation awaiting relay confirmation), so neither an
+/// in-flight publish nor a mid-publish crash can evict a signed prekey the relay still accepts.
+pub const MAX_STORED_GENERATIONS: usize = KEPT_GENERATIONS + 1;
 /// Maximum number of unused classical or PQ one-time prekeys allowed in one generation.
 pub const MAX_ONE_TIME_PER_GENERATION: usize = 1024;
 /// Maximum number of confirmed ephemeral keys retained per generation against replay.
@@ -311,7 +315,7 @@ where
 #[derive(serde::Deserialize)]
 #[serde(rename = "LocalPrekeys")]
 struct RawLocalPrekeys {
-    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, KEPT_GENERATIONS>")]
+    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_GENERATIONS>")]
     generations: Vec<RawGeneration>,
 }
 
@@ -412,7 +416,7 @@ impl TryFrom<RawLocalPrekeys> for LocalPrekeys {
     type Error = Error;
 
     fn try_from(raw: RawLocalPrekeys) -> Result<Self> {
-        if raw.generations.len() > KEPT_GENERATIONS {
+        if raw.generations.len() > MAX_STORED_GENERATIONS {
             return Err(ErrorKind::MalformedState.into());
         }
         let mut seen_spks = BTreeSet::new();
@@ -532,7 +536,9 @@ impl LocalPrekeys {
         let Some(generation) = self.generations.back_mut() else {
             return self.generate(identity, one_time_count);
         };
-        let one_time_prekeys = (0..one_time_count)
+        let count = one_time_count
+            .min(MAX_ONE_TIME_PER_GENERATION.saturating_sub(generation.one_time.len()));
+        let one_time_prekeys = (0..count)
             .map(|_| {
                 let (public_key, secret) = generate_key_pair();
                 generation.one_time.insert(public_key, secret);
@@ -612,10 +618,32 @@ impl LocalPrekeys {
         identity: &XEdDSAPrivateKey,
         one_time_count: usize,
     ) -> (PublishedPrekeys, Option<EvictedGeneration>) {
+        self.generate_inner(identity, one_time_count, KEPT_GENERATIONS)
+    }
+
+    /// Generate a new prekey generation WITHOUT evicting the oldest of [`KEPT_GENERATIONS`] yet
+    /// (allowing up to [`MAX_STORED_GENERATIONS`] while the publish is in flight on the relay),
+    /// returning any overflow eviction only if already at [`MAX_STORED_GENERATIONS`]. Call
+    /// [`prune_to_kept`](Self::prune_to_kept) once the relay confirms the publish.
+    pub fn generate_pending(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        one_time_count: usize,
+    ) -> (PublishedPrekeys, Option<EvictedGeneration>) {
+        self.generate_inner(identity, one_time_count, MAX_STORED_GENERATIONS)
+    }
+
+    fn generate_inner(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        one_time_count: usize,
+        max_generations: usize,
+    ) -> (PublishedPrekeys, Option<EvictedGeneration>) {
+        let count = one_time_count.min(MAX_ONE_TIME_PER_GENERATION);
         let (signed_prekey, signed_secret) = generate_key_pair();
         let signed_prekey_signature = identity.sign(signed_prekey);
         let mut one_time = BTreeMap::new();
-        let one_time_prekeys = (0..one_time_count)
+        let one_time_prekeys = (0..count)
             .map(|_| {
                 let (public_key, secret) = generate_key_pair();
                 one_time.insert(public_key, secret);
@@ -623,7 +651,7 @@ impl LocalPrekeys {
             })
             .collect();
         let mut evicted = None;
-        while self.generations.len() >= KEPT_GENERATIONS {
+        while self.generations.len() >= max_generations {
             evicted = self
                 .generations
                 .pop_front()
@@ -676,14 +704,55 @@ impl LocalPrekeys {
         one_time_count: usize,
         pq_one_time_count: usize,
     ) -> Result<(PublishedPqPrekeys, Option<EvictedGeneration>)> {
+        self.generate_pq_inner(
+            identity,
+            suite,
+            one_time_count,
+            pq_one_time_count,
+            KEPT_GENERATIONS,
+        )
+    }
+
+    /// Like [`generate_pq_with_rollback`](Self::generate_pq_with_rollback), but retains up to
+    /// [`MAX_STORED_GENERATIONS`] while a rotating publish is in flight so the displaced oldest
+    /// generation remains live on disk and in memory until [`prune_to_kept`](Self::prune_to_kept)
+    /// confirms relay storage.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    pub fn generate_pq_pending(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        suite: PqSuite,
+        one_time_count: usize,
+        pq_one_time_count: usize,
+    ) -> Result<(PublishedPqPrekeys, Option<EvictedGeneration>)> {
+        self.generate_pq_inner(
+            identity,
+            suite,
+            one_time_count,
+            pq_one_time_count,
+            MAX_STORED_GENERATIONS,
+        )
+    }
+
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    fn generate_pq_inner(
+        &mut self,
+        identity: &XEdDSAPrivateKey,
+        suite: PqSuite,
+        one_time_count: usize,
+        pq_one_time_count: usize,
+        max_generations: usize,
+    ) -> Result<(PublishedPqPrekeys, Option<EvictedGeneration>)> {
         if !suite.is_supported() {
             return Err(ErrorKind::UnsupportedSuite.into());
         }
+        let classical_count = one_time_count.min(MAX_ONE_TIME_PER_GENERATION);
+        let pq_count = pq_one_time_count.min(MAX_ONE_TIME_PER_GENERATION);
         let (signed_prekey, signed_secret) = try_generate_key_pair()?;
         let signed_prekey_signature = identity.try_sign(signed_prekey)?;
         let mut one_time = BTreeMap::new();
-        let mut one_time_prekeys = Vec::with_capacity(one_time_count);
-        for _ in 0..one_time_count {
+        let mut one_time_prekeys = Vec::with_capacity(classical_count);
+        for _ in 0..classical_count {
             let (public_key, secret) = try_generate_key_pair()?;
             one_time.insert(public_key, secret);
             one_time_prekeys.push(public_key);
@@ -709,8 +778,8 @@ impl LocalPrekeys {
         );
 
         let mut pq_one_time = BTreeMap::new();
-        let mut pq_one_time_prekeys = Vec::with_capacity(pq_one_time_count);
-        for _ in 0..pq_one_time_count {
+        let mut pq_one_time_prekeys = Vec::with_capacity(pq_count);
+        for _ in 0..pq_count {
             let (ek, seed) = kem::generate_keypair(suite)?;
             let id = pq_prekey_id(suite.as_u8(), &ek);
             let signature = sign_pq_opk(identity, suite, &ek)?;
@@ -724,7 +793,7 @@ impl LocalPrekeys {
         }
 
         let mut evicted = None;
-        while self.generations.len() >= KEPT_GENERATIONS {
+        while self.generations.len() >= max_generations {
             evicted = self
                 .generations
                 .pop_front()
@@ -753,6 +822,36 @@ impl LocalPrekeys {
         ))
     }
 
+    /// Prune excess generations older than [`KEPT_GENERATIONS`] once a rotating publish has been
+    /// confirmed on the relay, preserving any generation whose signed prekey appears in
+    /// `preserve_signed_prekeys`.
+    pub fn prune_to_kept(&mut self, preserve_signed_prekeys: &[PublicKey]) {
+        while self.generations.len() > KEPT_GENERATIONS {
+            let Some(front) = self.generations.front() else {
+                break;
+            };
+            if preserve_signed_prekeys.contains(&front.signed_prekey) {
+                break;
+            }
+            self.generations.pop_front();
+        }
+    }
+
+    /// Pop an unconfirmed latest generation whose signed prekey does not match the relay's live
+    /// signed prekey (used when reconciling an interrupted publish that never reached the relay).
+    pub fn pop_unconfirmed_latest_if_not(&mut self, keep_signed_prekey: &PublicKey) -> bool {
+        if self
+            .generations
+            .back()
+            .is_some_and(|g| g.signed_prekey != *keep_signed_prekey && g.confirmed.is_empty())
+        {
+            self.generations.pop_back();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Roll back an unpublished latest generation matching `signed_prekey` (provided no initial
     /// message has been confirmed against it), restoring `evicted` to the front if present.
     pub fn rollback_generation(
@@ -769,7 +868,7 @@ impl LocalPrekeys {
         }
         self.generations.pop_back();
         if let Some(evicted) = evicted
-            && self.generations.len() < KEPT_GENERATIONS
+            && self.generations.len() < MAX_STORED_GENERATIONS
             && !self
                 .generations
                 .iter()
@@ -842,9 +941,13 @@ impl LocalPrekeys {
         let generation = self.generations.back().ok_or(ErrorKind::PrekeyNotFound)?;
         let signed_prekey = generation.signed_prekey;
         let signed_prekey_signature = identity.try_sign(signed_prekey)?;
+        let classical_count = one_time_count
+            .min(MAX_ONE_TIME_PER_GENERATION.saturating_sub(generation.one_time.len()));
+        let pq_count = pq_one_time_count
+            .min(MAX_ONE_TIME_PER_GENERATION.saturating_sub(generation.pq_one_time.len()));
 
-        let mut new_classical = Vec::with_capacity(one_time_count);
-        for _ in 0..one_time_count {
+        let mut new_classical = Vec::with_capacity(classical_count);
+        for _ in 0..classical_count {
             new_classical.push(try_generate_key_pair()?);
         }
 
@@ -882,9 +985,9 @@ impl LocalPrekeys {
                 return Err(ErrorKind::PqPrekeyNotFound.into());
             };
 
-        let mut new_pq_opks = Vec::with_capacity(pq_one_time_count);
-        let mut pq_one_time_prekeys = Vec::with_capacity(pq_one_time_count);
-        for _ in 0..pq_one_time_count {
+        let mut new_pq_opks = Vec::with_capacity(pq_count);
+        let mut pq_one_time_prekeys = Vec::with_capacity(pq_count);
+        for _ in 0..pq_count {
             let (ek, seed) = kem::generate_keypair(suite)?;
             let id = pq_prekey_id(suite.as_u8(), &ek);
             let signature = sign_pq_opk(identity, suite, &ek)?;
@@ -1296,7 +1399,7 @@ impl TryFrom<&proto::LocalPrekeys> for LocalPrekeys {
             ))
         }
 
-        if prekeys.generations.len() > KEPT_GENERATIONS {
+        if prekeys.generations.len() > MAX_STORED_GENERATIONS {
             return Err(ErrorKind::MalformedState.into());
         }
 
@@ -2157,14 +2260,31 @@ mod test {
         prekeys.generate(&bob, 2);
         prekeys.generate(&bob, 1);
 
-        // 1. Too many generations (> KEPT_GENERATIONS).
-        let mut p = proto::LocalPrekeys::from(&prekeys);
+        // 1. Too many generations (> MAX_STORED_GENERATIONS).
+        let mut prekeys3 = LocalPrekeys::new();
+        prekeys3.generate(&bob, 1);
+        prekeys3.generate(&bob, 1);
+        prekeys3.generate_pending(&bob, 1);
+        assert_eq!(prekeys3.generation_count(), MAX_STORED_GENERATIONS);
+        let mut p = proto::LocalPrekeys::from(&prekeys3);
+        assert!(LocalPrekeys::try_from(&p).is_ok());
         let extra = p.generations[0].clone();
         p.generations.push(extra);
         assert_eq!(
             LocalPrekeys::try_from(&p).unwrap_err().kind(),
             ErrorKind::MalformedState
         );
+
+        // R5-P1-4: Extending a pinned generation past MAX_ONE_TIME_PER_GENERATION clamps to cap
+        // so serialized state always decodes cleanly on unlock.
+        let mut capped = LocalPrekeys::new();
+        capped.generate(&bob, 0);
+        for _ in 0..60 {
+            let _ = capped.extend(&bob, 20);
+        }
+        assert_eq!(capped.current_one_time_count(), MAX_ONE_TIME_PER_GENERATION);
+        let capped_proto = proto::LocalPrekeys::from(&capped);
+        assert!(LocalPrekeys::try_from(&capped_proto).is_ok());
 
         // 2. Duplicate signed_prekey across generations.
         let mut p = proto::LocalPrekeys::from(&prekeys);
@@ -2229,8 +2349,13 @@ mod test {
         let legacy_loaded: LocalPrekeys = serde_json::from_value(val.clone()).unwrap();
         assert_eq!(legacy_loaded.generation_count(), 2);
 
-        // > KEPT_GENERATIONS fails.
-        let mut too_many = val.clone();
+        // > MAX_STORED_GENERATIONS fails (while MAX_STORED_GENERATIONS with distinct SPKs succeeds).
+        let mut prekeys3 = LocalPrekeys::new();
+        prekeys3.generate(&bob, 1);
+        prekeys3.generate(&bob, 1);
+        prekeys3.generate_pending(&bob, 1);
+        let mut too_many: serde_json::Value = serde_json::to_value(&prekeys3).unwrap();
+        assert!(serde_json::from_value::<LocalPrekeys>(too_many.clone()).is_ok());
         let extra = too_many["generations"][0].clone();
         too_many["generations"].as_array_mut().unwrap().push(extra);
         assert!(serde_json::from_value::<LocalPrekeys>(too_many).is_err());

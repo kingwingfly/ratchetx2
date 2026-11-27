@@ -749,7 +749,15 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                             {(show_allow || show_upgrade || show_dismiss).then(|| {
                                 view! {
                                     <div class="banner-actions">
-                                        {show_allow.then(|| view! { <AllowClassical peer busy /> })}
+                                        {show_allow.then(|| {
+                                            view! {
+                                                <AllowClassical
+                                                    peer
+                                                    conversation_gen=conv_gen
+                                                    busy
+                                                />
+                                            }
+                                        })}
                                         {show_upgrade.then(|| {
                                             view! {
                                                 <button

@@ -782,9 +782,10 @@ mod server {
     use bon::Builder;
     use party::EncryptedMessage;
     use storage::{
-        ClaimOutcome, LocalPqHandshakeStore, PqLastResortCommitment as StorageCommitment,
-        PublishV2Record, PublishV2Status, RefillPrekeysRecord, RefillStatus,
-        StoredCapabilityManifest, StoredInitialMessageV2, StoredPqPrekey,
+        ClaimOutcome, InitialDisposition, LocalPqHandshakeStore,
+        PqLastResortCommitment as StorageCommitment, PublishV2Record, PublishV2Status,
+        RefillPrekeysRecord, RefillStatus, StoredCapabilityManifest, StoredInitialMessageV2,
+        StoredPqPrekey,
     };
 
     use super::*;
@@ -1221,9 +1222,7 @@ mod server {
             let recipient: PublicKey = fixed(&request.recipient)?;
             check_canonical_key(&recipient)?;
             let message = request.message.as_ref().ok_or(ErrorKind::Malformed)?;
-            if !self.info.pq_enabled && message.version == PQXDH_VERSION {
-                return Err(ErrorKind::Unimplemented.into());
-            }
+            let allow_insert = self.info.pq_enabled || message.version != PQXDH_VERSION;
             let first_message = message.first_message.clone().ok_or(ErrorKind::Malformed)?;
             if first_message.header.len() > MAX_HEADER_SIZE
                 || first_message
@@ -1240,7 +1239,10 @@ mod server {
             } else {
                 &[]
             };
-            let validated = validate_initial_message_v2(message, supported_suites, false)?;
+            // When `PQ_ENABLED="false"` (`!allow_insert`), still validate known PQ suites so an
+            // existing PQ greeting retry can probe live-inbox / ACK-tombstone / SPK-eviction
+            // disposition without ever inserting a brand-new PQ row.
+            let validated = validate_initial_message_v2(message, supported_suites, !allow_insert)?;
 
             let stored = StoredInitialMessageV2 {
                 id: 0,
@@ -1258,11 +1260,21 @@ mod server {
                 pq_ciphertext: validated.pq_ciphertext,
                 manifest_digest: validated.manifest_digest,
             };
-            let id = self
+            let id = match self
                 .store
-                .add_initial_message_v2(stored, self.limits.max_initial_messages)
+                .add_initial_message_v2_checked(
+                    stored,
+                    self.limits.max_initial_messages,
+                    allow_insert,
+                )
                 .await?
-                .ok_or(ErrorKind::LimitExceeded)?;
+            {
+                InitialDisposition::Added(id) => id,
+                InitialDisposition::InboxFull => return Err(ErrorKind::LimitExceeded.into()),
+                InitialDisposition::InsertDisallowed => {
+                    return Err(ErrorKind::Unimplemented.into());
+                }
+            };
             Ok(SendInitialV2Response { id })
         }
 
@@ -1277,12 +1289,12 @@ mod server {
                 n => (n as usize).min(self.limits.max_list_limit),
             };
             drop(request);
-            let mut stored = self
+            let page = self
                 .store
-                .list_initial_messages(&identity_key, after_id, limit.saturating_add(1))
+                .list_initial_messages_page(&identity_key, after_id, limit)
                 .await?;
-            let has_more = stored.len() > limit;
-            stored.truncate(limit);
+            let has_more = page.has_more;
+            let stored = page.messages;
             let messages = stored
                 .into_iter()
                 .map(|m| InitialMessageV2 {
@@ -1388,6 +1400,20 @@ mod server {
             ) -> storage::Result<Option<u64>> {
                 PqHandshakeStore::add_initial_message_v2(&*self.0, initial_message, limit).await
             }
+            async fn add_initial_message_v2_checked(
+                &self,
+                initial_message: StoredInitialMessageV2,
+                limit: usize,
+                allow_insert: bool,
+            ) -> storage::Result<InitialDisposition> {
+                PqHandshakeStore::add_initial_message_v2_checked(
+                    &*self.0,
+                    initial_message,
+                    limit,
+                    allow_insert,
+                )
+                .await
+            }
             async fn list_initial_messages(
                 &self,
                 recipient: &PublicKey,
@@ -1395,6 +1421,15 @@ mod server {
                 limit: usize,
             ) -> storage::Result<Vec<StoredInitialMessageV2>> {
                 PqHandshakeStore::list_initial_messages(&*self.0, recipient, after_id, limit).await
+            }
+            async fn list_initial_messages_page(
+                &self,
+                recipient: &PublicKey,
+                after_id: u64,
+                limit: usize,
+            ) -> storage::Result<storage::InitialMessagePage> {
+                PqHandshakeStore::list_initial_messages_page(&*self.0, recipient, after_id, limit)
+                    .await
             }
             async fn ack_initial_messages(
                 &self,
@@ -2200,11 +2235,26 @@ mod server {
                     .manifest
                     .is_some()
             );
+            // Read-only disposition lookup for an already-queued PQ initial returns its existing ID
+            // without writing, whereas a brand-new PQ initial is rejected with `Unimplemented`.
             assert_eq!(
                 v2_off
                     .send_initial_v2(SendInitialV2Request {
                         recipient: Bytes::copy_from_slice(&bob_pk),
                         message: Some(pq_init.clone()),
+                    })
+                    .await
+                    .unwrap()
+                    .id,
+                1
+            );
+            let mut new_pq_init = pq_init.clone();
+            new_pq_init.ephemeral_key = Bytes::copy_from_slice(&crate::test_public_key(0x5E));
+            assert_eq!(
+                v2_off
+                    .send_initial_v2(SendInitialV2Request {
+                        recipient: Bytes::copy_from_slice(&bob_pk),
+                        message: Some(new_pq_init),
                     })
                     .await
                     .unwrap_err()
@@ -2534,6 +2584,150 @@ mod server {
                     .unwrap_err()
                     .kind(),
                 ErrorKind::StaleTimestamp
+            );
+        }
+
+        #[tokio::test]
+        async fn r5_p2_8_send_initial_v2_allows_read_only_pq_disposition_when_pq_disabled() {
+            let store = Arc::new(MemoryStore::default());
+            let shared = SharedStore(store.clone());
+            let v2_on =
+                HandshakeV2Server::new(shared.clone(), ServerInfoConfig::new("relay.example"));
+            let v2_off = HandshakeV2Server::new(
+                shared.clone(),
+                ServerInfoConfig {
+                    pq_enabled: false,
+                    supported_suites: vec![],
+                    pq_ratchet_supported: false,
+                    server_id: "relay.example".into(),
+                },
+            );
+
+            let bob = XEdDSAPrivateKey::generate();
+            let bob_pk = bob.compute_public_key().to_bytes();
+            let alice = XEdDSAPrivateKey::generate();
+            let alice_pk = alice.compute_public_key().to_bytes();
+            let now = now_millis();
+
+            let spk1 = crate::test_public_key(0x61);
+            let spk2 = crate::test_public_key(0x62);
+            let spk3 = crate::test_public_key(0x63);
+            let lr1 = make_pq_prekey(&bob, PqSuite::MlKem1024, 0x11, true);
+            let m1 = signed_manifest(
+                &bob,
+                "relay.example",
+                1,
+                1,
+                true,
+                false,
+                spk1,
+                std::slice::from_ref(&lr1),
+                now,
+            );
+            v2_on
+                .publish_v2(
+                    PublishV2Request::sign(
+                        &bob,
+                        m1,
+                        Some(bob.sign(spk1)),
+                        &[],
+                        vec![lr1],
+                        vec![],
+                        now,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            let mk_pq_req = |eph_tag: u8, spk: PublicKey| SendInitialV2Request {
+                recipient: Bytes::copy_from_slice(&bob_pk),
+                message: Some(InitialMessageV2 {
+                    id: 0,
+                    version: PQXDH_VERSION,
+                    identity_key: Bytes::copy_from_slice(&alice_pk),
+                    ephemeral_key: Bytes::copy_from_slice(&crate::test_public_key(eph_tag)),
+                    signed_prekey: Bytes::copy_from_slice(&spk),
+                    one_time_prekey: None,
+                    first_message: Some(EncryptedMessage {
+                        header: Bytes::from_static(b"hdr"),
+                        content: Bytes::from_static(b"ct"),
+                    }),
+                    pq_suite: u32::from(PqSuite::MlKem1024.as_u8()),
+                    pq_last_resort: true,
+                    pq_prekey_id: Bytes::copy_from_slice(&[0xAA; PQ_PREKEY_ID_LENGTH]),
+                    pq_ciphertext: Bytes::from(vec![0x55; PqSuite::MlKem1024.ct_len()]),
+                    manifest_digest: Bytes::copy_from_slice(&[0xDD; 32]),
+                }),
+            };
+
+            // While PQ is enabled: Alice sends two PQ greetings (one ACKed, one left unread).
+            let acked_req = mk_pq_req(0x71, spk1);
+            let unread_req = mk_pq_req(0x72, spk1);
+            let acked_id = v2_on.send_initial_v2(acked_req.clone()).await.unwrap().id;
+            let _unread_id = v2_on.send_initial_v2(unread_req.clone()).await.unwrap().id;
+            v2_on
+                .ack_initial_messages(
+                    AckInitialMessagesRequest::sign(&bob, "relay.example", vec![acked_id], now)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            // Operator flips relay to `PQ_ENABLED="false"` (`v2_off`):
+            // - Probing the already-ACKed PQ greeting returns `200 OK` (tombstone hit)!
+            // - Brand-new PQ greeting on retained `spk1` still fails with `Unimplemented`!
+            assert_eq!(
+                v2_off.send_initial_v2(acked_req.clone()).await.unwrap().id,
+                acked_id
+            );
+            assert_eq!(
+                v2_off
+                    .send_initial_v2(mk_pq_req(0x73, spk1))
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::Unimplemented
+            );
+
+            // Bob publishes two classical OFF manifests rotating spk1 -> spk2 -> spk3 on `v2_off`:
+            for (seq, spk) in [(2u64, spk2), (3u64, spk3)] {
+                let m = signed_manifest(
+                    &bob,
+                    "relay.example",
+                    seq,
+                    seq,
+                    false,
+                    false,
+                    spk,
+                    &[],
+                    now + seq,
+                );
+                v2_off
+                    .publish_v2(
+                        PublishV2Request::sign(
+                            &bob,
+                            m,
+                            Some(bob.sign(spk)),
+                            &[],
+                            vec![],
+                            vec![],
+                            now + seq,
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // - Already-ACKed PQ greeting STILL returns `200 OK` (tombstone survives rotation)!
+            assert_eq!(
+                v2_off.send_initial_v2(acked_req).await.unwrap().id,
+                acked_id
+            );
+            // - Unread SPK-evicted PQ greeting returns `StaleVersion` even with `PQ_ENABLED="false"`!
+            assert_eq!(
+                v2_off.send_initial_v2(unread_req).await.unwrap_err().kind(),
+                ErrorKind::StaleVersion
             );
         }
     }

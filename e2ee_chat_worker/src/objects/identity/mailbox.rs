@@ -863,15 +863,19 @@ mod tests {
             };
             assert_eq!(
                 env.store()
-                    .publish_v2(&PublishV2Record {
-                        manifest,
-                        signed_prekey_signature: Some([0x55; 64]),
-                        one_time_prekeys: vec![],
-                        pq_last_resort: vec![],
-                        pq_one_time_prekeys: vec![],
-                        timestamp: 1_000,
-                    })
-                    .unwrap(),
+                    .publish_v2(
+                        &PublishV2Record {
+                            manifest,
+                            signed_prekey_signature: Some([0x55; 64]),
+                            one_time_prekeys: vec![],
+                            pq_last_resort: vec![],
+                            pq_one_time_prekeys: vec![],
+                            timestamp: 1_000,
+                        },
+                        1_000,
+                    )
+                    .unwrap()
+                    .0,
                 PublishV2Status::Stored
             );
         }

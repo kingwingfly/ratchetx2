@@ -180,6 +180,7 @@ pub(super) fn accept_contact_request_state(
         );
     }
     state.request = false;
+    state.provisional = false;
     state.name = name.trim().to_string();
     Ok(())
 }
@@ -556,9 +557,13 @@ impl Contact {
     /// Mark the active session's greeting as confirmed delivered and drop any superseded fallback
     /// farewells from prior/deleted sessions. Returns `true` if contact state changed.
     pub(super) fn mark_greeting_confirmed(&mut self) -> bool {
-        let changed = self.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
+        let mut changed = self.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
             || !self.state.fallback_farewells.is_empty();
         self.state.greeting_delivery = GREETING_DELIVERY_CONFIRMED;
+        if self.state.greeting_sent_at == 0 {
+            self.state.greeting_sent_at = now();
+            changed = true;
+        }
         self.state.fallback_farewells.clear();
         changed
     }

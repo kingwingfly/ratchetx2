@@ -1109,6 +1109,10 @@ pub struct PendingPqContactFlag {
     pub prev_security_alert: Option<u32>,
     #[prost(uint32, optional, tag = "3")]
     pub prev_classical_approval: Option<u32>,
+    /// Conversation generation of `peer` when the flag was cleared, preventing rollback from
+    /// re-attaching a deleted chat's alerts to a newly recreated conversation.
+    #[prost(uint64, tag = "4")]
+    pub conversation_gen: u64,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -1142,13 +1146,16 @@ impl PendingPqRollback {
     pub fn record_contact_flag(
         &mut self,
         peer: &[u8],
+        conversation_gen: u64,
         prev_alert: Option<u32>,
         prev_approval: Option<u32>,
     ) {
+        self.contact_flags
+            .retain(|f| f.peer.as_slice() != peer || f.conversation_gen == conversation_gen);
         if let Some(existing) = self
             .contact_flags
             .iter_mut()
-            .find(|f| f.peer.as_slice() == peer)
+            .find(|f| f.peer.as_slice() == peer && f.conversation_gen == conversation_gen)
         {
             if let Some(a) = prev_alert {
                 existing.prev_security_alert.get_or_insert(a);
@@ -1161,6 +1168,7 @@ impl PendingPqRollback {
                 peer: peer.to_vec(),
                 prev_security_alert: prev_alert,
                 prev_classical_approval: prev_approval,
+                conversation_gen,
             });
         }
     }
@@ -1292,8 +1300,9 @@ pub struct ContactState {
     /// rotated at least twice (`manifest.generation >= greeting_target_generation + 2`).
     #[prost(uint64, tag = "35")]
     pub greeting_target_generation: u64,
-    /// Local wall-clock Unix ms when the current active greeting was prepared/sent (`0` if
-    /// unknown), bounding `CONFIRMED` SPK-eviction probes to the server's inbox TTL window.
+    /// Local wall-clock Unix ms when the current active greeting was first transmitted or
+    /// confirmed (`0` while `UNSENT`), bounding `UNCERTAIN` and `CONFIRMED` SPK-eviction reclaim
+    /// strictly within the server's delivery-tombstone TTL window.
     #[prost(uint64, tag = "36")]
     pub greeting_sent_at: u64,
     /// Set once a post-2-rotation `CONFIRMED` greeting probe succeeded (`Added { inserted: false }`),

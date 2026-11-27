@@ -78,6 +78,8 @@ pub enum AddInitialOutcome {
     PayloadMismatch,
     /// Monotonic inbox ID exceeded `MAX_SAFE_INTEGER`.
     SequenceOverflow,
+    /// Not found as a live row or tombstone and `allow_insert` was `false` (PQ disabled on relay).
+    InsertDisallowed,
 }
 
 /// Outcome of an [`IdentityCall::RefillPrekeys`].
@@ -156,9 +158,9 @@ pub enum RevokeWriteTokenOutcome {
 pub mod rpc {
     use serde::{Deserialize, Serialize};
     use storage::{
-        Bytes, ClaimOutcome, PqStorageSnapshot, PublicKey, PublishV2Record, PublishV2Status,
-        RefillPrekeysRecord, RegisterWriteTokenRecord, RevokeWriteTokenRecord, StoredAttachment,
-        StoredCapabilityManifest, StoredInitialMessageV2, WriteTokenHash,
+        Bytes, ClaimOutcome, InitialMessagePage, PqStorageSnapshot, PublicKey, PublishV2Record,
+        PublishV2Status, RefillPrekeysRecord, RegisterWriteTokenRecord, RevokeWriteTokenRecord,
+        StoredAttachment, StoredCapabilityManifest, StoredInitialMessageV2, WriteTokenHash,
     };
     use worker::{Error, Result};
 
@@ -227,6 +229,7 @@ pub mod rpc {
     pub struct AddInitialMessageV2 {
         pub message: StoredInitialMessageV2,
         pub limit: u64,
+        pub allow_insert: bool,
     }
     impl_identity_rpc!(AddInitialMessageV2 => AddInitialMessageV2, Reply = AddInitialOutcome);
 
@@ -236,7 +239,7 @@ pub mod rpc {
         pub after_id: u64,
         pub limit: u64,
     }
-    impl_identity_rpc!(ListInitialMessages => ListInitialMessages, Reply = Vec<StoredInitialMessageV2>);
+    impl_identity_rpc!(ListInitialMessages => ListInitialMessages, Reply = InitialMessagePage);
 
     #[derive(Debug, Serialize, Deserialize)]
     pub struct AckInitialMessages {
@@ -525,6 +528,7 @@ mod tests {
                 rpc::AddInitialMessageV2 {
                     message: dummy_initial(),
                     limit: 10,
+                    allow_insert: true,
                 }
                 .encode()
                 .unwrap(),

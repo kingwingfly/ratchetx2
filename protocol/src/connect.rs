@@ -879,6 +879,20 @@ mod test {
             ) -> storage::Result<Option<u64>> {
                 storage::PqHandshakeStore::add_initial_message_v2(&*self.0, m, limit).await
             }
+            async fn add_initial_message_v2_checked(
+                &self,
+                m: storage::StoredInitialMessageV2,
+                limit: usize,
+                allow_insert: bool,
+            ) -> storage::Result<storage::InitialDisposition> {
+                storage::PqHandshakeStore::add_initial_message_v2_checked(
+                    &*self.0,
+                    m,
+                    limit,
+                    allow_insert,
+                )
+                .await
+            }
             async fn list_initial_messages(
                 &self,
                 id: &x3dh::PublicKey,
@@ -886,6 +900,15 @@ mod test {
                 limit: usize,
             ) -> storage::Result<Vec<storage::StoredInitialMessageV2>> {
                 storage::PqHandshakeStore::list_initial_messages(&*self.0, id, after_id, limit)
+                    .await
+            }
+            async fn list_initial_messages_page(
+                &self,
+                id: &x3dh::PublicKey,
+                after_id: u64,
+                limit: usize,
+            ) -> storage::Result<storage::InitialMessagePage> {
+                storage::PqHandshakeStore::list_initial_messages_page(&*self.0, id, after_id, limit)
                     .await
             }
             async fn ack_initial_messages(

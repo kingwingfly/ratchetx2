@@ -179,7 +179,7 @@ struct RecipientMailbox {
     messages: Vec<QueuedMessage>,
 }
 
-const ACKED_INITIAL_TOMBSTONE_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const ACKED_INITIAL_TOMBSTONE_TTL: Duration = Duration::from_secs(35 * 24 * 60 * 60);
 const MAX_ACKED_INITIAL_TOMBSTONES: usize = 4096;
 
 #[derive(Debug, Default)]
@@ -187,6 +187,10 @@ struct Inbox {
     next_id: u64,
     initial_messages: Vec<InboxEntry>,
     acked_initials: HashMap<(PublicKey, PublicKey), AckedInitialEntry>,
+    /// Highest `expires_at` of any unexpired tombstone evicted by the `MAX_ACKED_INITIAL_TOMBSTONES`
+    /// cap; while `> now`, a missing `(sender, ephemeral_key)` against an evicted SPK returns
+    /// `InboxFull` instead of `StaleVersion` so automatic reclaim never resurrects a declined chat.
+    acked_initial_evicted_until: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,7 +203,30 @@ struct AckedInitialEntry {
 #[derive(Debug, Clone)]
 struct InboxEntry {
     created_at: Instant,
+    listed: bool,
     message: StoredInitialMessageV2,
+}
+
+fn enforce_acked_initial_cap(inbox: &mut Inbox, now: Instant) {
+    while inbox.acked_initials.len() > MAX_ACKED_INITIAL_TOMBSTONES {
+        if let Some((oldest_key, oldest_expires)) = inbox
+            .acked_initials
+            .iter()
+            .min_by_key(|(_, entry)| (entry.expires_at, entry.id))
+            .map(|(k, e)| (*k, e.expires_at))
+        {
+            inbox.acked_initials.remove(&oldest_key);
+            if oldest_expires > now {
+                inbox.acked_initial_evicted_until = Some(
+                    inbox
+                        .acked_initial_evicted_until
+                        .map_or(oldest_expires, |prev| prev.max(oldest_expires)),
+                );
+            }
+        } else {
+            break;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -448,14 +475,38 @@ impl PqHandshakeStore for MemoryStore {
                 prev_signed_prekey,
             },
         );
-        // Purge unread inbox initials whose target SPK is no longer retained (without tombstoning)
-        // so post-2-rotation sender probes distinguish unread SPK eviction (`StaleVersion`) from
-        // already-read/declined requests (`acked_initials` tombstone).
+        // Purge inbox initials whose target SPK is no longer retained:
+        // - Unlisted rows (`listed == false`) are deleted WITHOUT tombstoning so post-2-rotation
+        //   probes detect unread eviction (`StaleVersion`).
+        // - Already-listed rows (`listed == true`) whose `AckInitialMessages` has not yet landed
+        //   are promoted into `acked_initials` tombstones so a rotation racing between list and
+        //   ACK never resurrects a declined chat request.
         if let Some(inbox) = inner.inboxes.get_mut(&id) {
+            let now = Instant::now();
+            let expires_at = now + ACKED_INITIAL_TOMBSTONE_TTL;
+            inbox
+                .acked_initials
+                .retain(|_, acked| acked.expires_at > now);
+            let mut promoted = false;
             inbox.initial_messages.retain(|entry| {
-                entry.message.signed_prekey == new_spk
-                    || prev_signed_prekey.is_some_and(|prev| entry.message.signed_prekey == prev)
+                let retained = entry.message.signed_prekey == new_spk
+                    || prev_signed_prekey.is_some_and(|prev| entry.message.signed_prekey == prev);
+                if !retained && entry.listed {
+                    inbox.acked_initials.insert(
+                        (entry.message.sender, entry.message.ephemeral_key),
+                        AckedInitialEntry {
+                            id: entry.message.id,
+                            message: entry.message.clone(),
+                            expires_at,
+                        },
+                    );
+                    promoted = true;
+                }
+                retained
             });
+            if promoted {
+                enforce_acked_initial_cap(inbox, now);
+            }
         }
         Ok(PublishV2Status::Stored)
     }
@@ -656,9 +707,26 @@ impl PqHandshakeStore for MemoryStore {
 
     async fn add_initial_message_v2(
         &self,
-        mut initial_message: StoredInitialMessageV2,
+        initial_message: StoredInitialMessageV2,
         limit: usize,
     ) -> Result<Option<u64>> {
+        match self
+            .add_initial_message_v2_checked(initial_message, limit, true)
+            .await?
+        {
+            crate::InitialDisposition::Added(id) => Ok(Some(id)),
+            crate::InitialDisposition::InboxFull | crate::InitialDisposition::InsertDisallowed => {
+                Ok(None)
+            }
+        }
+    }
+
+    async fn add_initial_message_v2_checked(
+        &self,
+        mut initial_message: StoredInitialMessageV2,
+        limit: usize,
+        allow_insert: bool,
+    ) -> Result<crate::InitialDisposition> {
         let now = Instant::now();
         let mut inner = self.inner.lock();
         let Some(published) = inner.manifests.get(&initial_message.recipient) else {
@@ -683,7 +751,7 @@ impl PqHandshakeStore for MemoryStore {
                 && entry.message.ephemeral_key == initial_message.ephemeral_key
         }) {
             if same_initial_payload(&existing.message, &initial_message) {
-                return Ok(Some(existing.message.id));
+                return Ok(crate::InitialDisposition::Added(existing.message.id));
             }
             return Err(ErrorKind::InvalidArgument.into());
         }
@@ -692,17 +760,27 @@ impl PqHandshakeStore for MemoryStore {
             .get(&(initial_message.sender, initial_message.ephemeral_key))
         {
             if same_initial_payload(&acked.message, &initial_message) {
-                return Ok(Some(acked.id));
+                return Ok(crate::InitialDisposition::Added(acked.id));
             }
             return Err(ErrorKind::InvalidArgument.into());
         }
 
         if !spk_retained {
+            if inbox
+                .acked_initial_evicted_until
+                .is_some_and(|until| until > now)
+            {
+                return Ok(crate::InitialDisposition::InboxFull);
+            }
             return Err(ErrorKind::StaleVersion.into());
         }
 
+        if !allow_insert {
+            return Ok(crate::InitialDisposition::InsertDisallowed);
+        }
+
         if inbox.initial_messages.len() >= limit {
-            return Ok(None);
+            return Ok(crate::InitialDisposition::InboxFull);
         }
         let next_id = inbox
             .next_id
@@ -713,9 +791,10 @@ impl PqHandshakeStore for MemoryStore {
         initial_message.id = next_id;
         inbox.initial_messages.push(InboxEntry {
             created_at: now,
+            listed: false,
             message: initial_message,
         });
-        Ok(Some(next_id))
+        Ok(crate::InitialDisposition::Added(next_id))
     }
 
     async fn list_initial_messages(
@@ -724,21 +803,39 @@ impl PqHandshakeStore for MemoryStore {
         after_id: u64,
         limit: usize,
     ) -> Result<Vec<StoredInitialMessageV2>> {
+        Ok(self
+            .list_initial_messages_page(recipient, after_id, limit)
+            .await?
+            .messages)
+    }
+
+    async fn list_initial_messages_page(
+        &self,
+        recipient: &PublicKey,
+        after_id: u64,
+        limit: usize,
+    ) -> Result<crate::InitialMessagePage> {
         check_safe_int(after_id)?;
         let now = Instant::now();
         let mut inner = self.inner.lock();
         let Some(inbox) = inner.inboxes.get_mut(recipient) else {
-            return Ok(vec![]);
+            return Ok(crate::InitialMessagePage {
+                messages: vec![],
+                has_more: false,
+            });
         };
         prune_expired_initials(inbox, now, self.initial_ttl);
         let start = inbox
             .initial_messages
             .partition_point(|entry| entry.message.id <= after_id);
-        Ok(inbox.initial_messages[start..]
-            .iter()
-            .take(limit)
-            .map(|entry| entry.message.clone())
-            .collect())
+        let remaining = &mut inbox.initial_messages[start..];
+        let has_more = remaining.len() > limit;
+        let mut messages = Vec::with_capacity(remaining.len().min(limit));
+        for entry in remaining.iter_mut().take(limit) {
+            entry.listed = true;
+            messages.push(entry.message.clone());
+        }
+        Ok(crate::InitialMessagePage { messages, has_more })
     }
 
     async fn ack_initial_messages(&self, recipient: &PublicKey, ids: &[u64]) -> Result<usize> {
@@ -779,18 +876,7 @@ impl PqHandshakeStore for MemoryStore {
                 true
             }
         });
-        while inbox.acked_initials.len() > MAX_ACKED_INITIAL_TOMBSTONES {
-            if let Some((oldest_key, _)) = inbox
-                .acked_initials
-                .iter()
-                .min_by_key(|(_, entry)| (entry.expires_at, entry.id))
-                .map(|(k, e)| (*k, e.id))
-            {
-                inbox.acked_initials.remove(&oldest_key);
-            } else {
-                break;
-            }
-        }
+        enforce_acked_initial_cap(inbox, now);
         Ok(acked_count)
     }
 
@@ -2094,6 +2180,59 @@ mod test {
                     .kind(),
                 ErrorKind::StaleTimestamp
             );
+
+            // 6. R5-P2-4 & R5-P2-8: Listing only marks returned page rows `listed = true`;
+            //    rotating SPK twice promotes `listed == true` rows to ACK tombstones while
+            //    leaving unreturned rows unlisted (`StaleVersion`); `allow_insert = false`
+            //    performs read-only disposition lookup without inserting new rows.
+            let spk4 = [0x44; 32];
+            let spk5 = [0x55; 32];
+            let m_listed = mk_init(70, spk3);
+            let m_unlisted = mk_init(71, spk3);
+            let id_listed = store
+                .add_initial_message_v2(m_listed.clone(), 10)
+                .await
+                .unwrap()
+                .unwrap();
+            let id_unlisted = store
+                .add_initial_message_v2(m_unlisted.clone(), 10)
+                .await
+                .unwrap()
+                .unwrap();
+            // Paginate strictly 1 item: only `id_listed` is returned (`has_more == true`).
+            let page = store
+                .list_initial_messages_page(&bob, id_listed.saturating_sub(1), 1)
+                .await
+                .unwrap();
+            assert_eq!(page.messages.len(), 1);
+            assert!(page.has_more);
+            assert_eq!(page.messages[0].id, id_listed);
+            assert_eq!(
+                store
+                    .add_initial_message_v2_checked(mk_init(72, spk3), 10, false)
+                    .await
+                    .unwrap(),
+                crate::InitialDisposition::InsertDisallowed
+            );
+            // Rotate spk3 -> spk4 -> spk5 without ACKing either row.
+            store.publish_v2(publish_spk(6, spk4)).await.unwrap();
+            store.publish_v2(publish_spk(7, spk5)).await.unwrap();
+            assert_eq!(
+                store
+                    .add_initial_message_v2_checked(m_listed, 10, false)
+                    .await
+                    .unwrap(),
+                crate::InitialDisposition::Added(id_listed)
+            );
+            assert_eq!(
+                store
+                    .add_initial_message_v2_checked(m_unlisted, 10, false)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleVersion
+            );
+            assert!(id_unlisted > id_listed);
         });
     }
 }

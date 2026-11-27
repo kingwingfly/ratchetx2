@@ -508,6 +508,8 @@ mod v2 {
         pub(crate) classical: PublishedPrekeys,
         pub(crate) rollback: PrekeyRollback,
         pub(crate) was_publishing: bool,
+        pub(crate) preserve_signed_prekeys: Vec<PublicKey>,
+        pub(crate) preserve_manifest_digests: Vec<[u8; 32]>,
     }
 
     impl PreparedPublishV2 {
@@ -1207,6 +1209,12 @@ mod v2 {
                 .is_some_and(|spk| preserve_signed_prekeys.contains(&spk));
             let extended =
                 (was_publishing || preserve_oldest) && self.state.prekeys.generation_count() > 0;
+            // If a prior confirmed publish left an extra generation pinned only because of a
+            // deferred initial that has now cleared, prune it before staging a new generation so
+            // total stored generations remain <= MAX_STORED_GENERATIONS without evicting `G`.
+            if !extended && !was_publishing {
+                self.state.prekeys.prune_to_kept(preserve_signed_prekeys);
+            }
             let generation = if extended {
                 self.state.prekey_generation.max(1)
             } else {
@@ -1244,7 +1252,7 @@ mod v2 {
                             )
                         } else {
                             new_lr_suites.push(first_suite);
-                            self.state.prekeys.generate_pq_with_rollback(
+                            self.state.prekeys.generate_pq_pending(
                                 &self.state.identity,
                                 first_suite,
                                 one_time_count,
@@ -1329,7 +1337,7 @@ mod v2 {
                     } else {
                         self.state
                             .prekeys
-                            .generate_with_rollback(&self.state.identity, one_time_count)
+                            .generate_pending(&self.state.identity, one_time_count)
                     };
                     let rollback = if extended {
                         PrekeyRollback::Extended {
@@ -1412,7 +1420,7 @@ mod v2 {
             self.state.publishing = true;
             let evicted_manifest_digest = self
                 .state
-                .record_manifest_digest_preserving(own_digest, preserve_manifest_digests);
+                .stage_manifest_digest(own_digest, preserve_manifest_digests);
 
             Ok(PreparedPublishV2 {
                 request,
@@ -1425,12 +1433,107 @@ mod v2 {
                 classical,
                 rollback,
                 was_publishing,
+                preserve_signed_prekeys: preserve_signed_prekeys.to_vec(),
+                preserve_manifest_digests: preserve_manifest_digests.to_vec(),
             })
         }
 
-        /// Mark a prepared v2 publish as confirmed by the server.
-        pub fn commit_publish_v2(&mut self, _prepared: PreparedPublishV2) {
+        /// Whether a previously prepared publish was persisted without confirmation or left
+        /// transient extra generation/digest slots awaiting relay reconciliation.
+        pub fn has_unreconciled_publish(&self) -> bool {
+            self.state.publishing
+                || self.state.prekeys.generation_count() > x3dh::KEPT_GENERATIONS
+                || self.state.recent_manifest_digests.len() > crate::MAX_RETAINED_MANIFEST_DIGESTS
+        }
+
+        /// Reconcile an interrupted or ambiguous publish against the relay's current verified
+        /// `CapabilityManifest` (returned by read-only `GetManifest`).
+        ///
+        /// Returns `true` when the relay already holds this client's latest `manifest_seq` and
+        /// current signed prekey (meaning the interrupted publish landed and can be committed),
+        /// or `false` when the relay still holds an older (or absent) manifest so any unlanded
+        /// local generation/digest is rolled back while preserving every generation the relay
+        /// still accepts.
+        pub fn reconcile_interrupted_publish(
+            &mut self,
+            relay_manifest: Option<&CapabilityManifest>,
+            preserve_signed_prekeys: &[PublicKey],
+            preserve_manifest_digests: &[[u8; 32]],
+        ) -> bool {
+            let mut eff_spks = preserve_signed_prekeys.to_vec();
+            let mut eff_digests = preserve_manifest_digests.to_vec();
+            let Some(m) = relay_manifest else {
+                if self.state.prekeys.generation_count() > x3dh::KEPT_GENERATIONS {
+                    self.state.prekeys.pop_unconfirmed_latest_if_not(&[0u8; 32]);
+                }
+                self.state.publishing = false;
+                self.state.prune_manifest_digests_preserving(&eff_digests);
+                return false;
+            };
+            let relay_spk = <[u8; 32]>::try_from(m.signed_prekey.as_ref()).ok();
+            if let Some(spk) = relay_spk
+                && !eff_spks.contains(&spk)
+            {
+                eff_spks.push(spk);
+            }
+            let relay_digest = manifest_digest(m).ok();
+            if let Some(d) = relay_digest
+                && !eff_digests.contains(&d)
+            {
+                eff_digests.push(d);
+            }
+            let landed = relay_spk.is_some()
+                && relay_spk == self.state.prekeys.current_signed_prekey()
+                && m.manifest_seq >= self.state.manifest_seq;
+            if landed {
+                self.state.manifest_seq = m.manifest_seq;
+                self.state.prekey_generation = m.generation;
+                self.state.publishing = false;
+                self.state.prekeys.prune_to_kept(&eff_spks);
+                self.state.prune_manifest_digests_preserving(&eff_digests);
+                true
+            } else {
+                if let Some(spk) = relay_spk
+                    && self.state.prekeys.generation_count() > x3dh::KEPT_GENERATIONS
+                {
+                    self.state.prekeys.pop_unconfirmed_latest_if_not(&spk);
+                }
+                if m.manifest_seq < self.state.manifest_seq {
+                    if let Some(&last_d) = self.state.recent_manifest_digests.last()
+                        && Some(last_d) != relay_digest
+                        && self.state.recent_manifest_digests.len() > 1
+                    {
+                        self.state.recent_manifest_digests.pop();
+                    }
+                    self.state.manifest_seq = m.manifest_seq;
+                    self.state.prekey_generation = m.generation;
+                }
+                self.state.publishing = false;
+                self.state.prune_manifest_digests_preserving(&eff_digests);
+                false
+            }
+        }
+
+        /// Mark a prepared v2 publish as confirmed by the server, now safely pruning superseded
+        /// prekey generations and rolling manifest digests outside the preserved sets.
+        pub fn commit_publish_v2_preserving(
+            &mut self,
+            _prepared: PreparedPublishV2,
+            preserve_signed_prekeys: &[PublicKey],
+            preserve_manifest_digests: &[[u8; 32]],
+        ) {
             self.state.publishing = false;
+            self.state.prekeys.prune_to_kept(preserve_signed_prekeys);
+            self.state
+                .prune_manifest_digests_preserving(preserve_manifest_digests);
+        }
+
+        /// Mark a prepared v2 publish as confirmed by the server, preserving any signed prekeys
+        /// and manifest digests requested when preparing it.
+        pub fn commit_publish_v2(&mut self, prepared: PreparedPublishV2) {
+            let preserve_spks = prepared.preserve_signed_prekeys.clone();
+            let preserve_digests = prepared.preserve_manifest_digests.clone();
+            self.commit_publish_v2_preserving(prepared, &preserve_spks, &preserve_digests);
         }
 
         /// Transition a prepared PQ-ON publish into a signed classical `PQ-OFF` publish after
@@ -1520,7 +1623,7 @@ mod v2 {
             );
             let evicted_manifest_digest = self
                 .state
-                .record_manifest_digest_preserving(off_digest, preserve_manifest_digests);
+                .stage_manifest_digest(off_digest, preserve_manifest_digests);
             self.state.manifest_seq = off_manifest_seq;
             self.state.publishing = true;
 
@@ -1535,6 +1638,8 @@ mod v2 {
                 classical: prepared.classical,
                 rollback: prepared.rollback,
                 was_publishing: prepared.was_publishing,
+                preserve_signed_prekeys: prepared.preserve_signed_prekeys,
+                preserve_manifest_digests: preserve_manifest_digests.to_vec(),
             })
         }
 

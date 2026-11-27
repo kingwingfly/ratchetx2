@@ -401,12 +401,12 @@ impl SendQueue {
         self.confirmed_probe_backoff.borrow_mut().remove(peer);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(super) fn clear_approval_backoff_only(&self, peer: &PublicKey) {
         self.approval_backoff.borrow_mut().remove(peer);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub(super) fn clear_confirmed_probe_backoff(&self, peer: &PublicKey) {
         self.confirmed_probe_backoff.borrow_mut().remove(peer);
     }

@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS initial_messages (
     manifest_digest BLOB,
     payload_hash BLOB NOT NULL,
     created_at INTEGER NOT NULL,
+    listed INTEGER NOT NULL DEFAULT 0,
     UNIQUE (sender, ephemeral_key)
 );
 CREATE INDEX IF NOT EXISTS initial_messages_by_age ON initial_messages (created_at);
@@ -98,7 +99,8 @@ CREATE TABLE IF NOT EXISTS recipient_stats (
     last_sequence INTEGER NOT NULL DEFAULT 0,
     message_count INTEGER NOT NULL DEFAULT 0,
     total_bytes INTEGER NOT NULL DEFAULT 0,
-    authorized_peer_count INTEGER NOT NULL DEFAULT 0
+    authorized_peer_count INTEGER NOT NULL DEFAULT 0,
+    acked_initial_evicted_until INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS peer_grants (
     peer_slot_id BLOB PRIMARY KEY,
@@ -168,8 +170,9 @@ fn version_mismatch_error(found: u64) -> Error {
     ))
 }
 
-/// Idempotently apply additive `SCHEMA_V5` compatibility migrations (`prev_signed_prekey` column
-/// and `acked_initial_messages` delivery-tombstone table) when opening an earlier `SCHEMA_V5` DO.
+/// Idempotently apply additive `SCHEMA_V5` compatibility migrations (`prev_signed_prekey`,
+/// `initial_messages.listed`, `recipient_stats.acked_initial_evicted_until`, and
+/// `acked_initial_messages`) when opening an earlier `SCHEMA_V5` DO.
 fn ensure_v5_compat_migrations<S: SqlExec>(sql: &S) -> Result<()> {
     let col: CountRow = sql.query_one(
         "SELECT count(*) AS count FROM pragma_table_info('capability_manifest') \
@@ -179,6 +182,28 @@ fn ensure_v5_compat_migrations<S: SqlExec>(sql: &S) -> Result<()> {
     if col.count == 0 {
         sql.exec(
             "ALTER TABLE capability_manifest ADD COLUMN prev_signed_prekey BLOB",
+            vec![],
+        )?;
+    }
+    let listed_col: CountRow = sql.query_one(
+        "SELECT count(*) AS count FROM pragma_table_info('initial_messages') \
+         WHERE name = 'listed'",
+        vec![],
+    )?;
+    if listed_col.count == 0 {
+        sql.exec(
+            "ALTER TABLE initial_messages ADD COLUMN listed INTEGER NOT NULL DEFAULT 0",
+            vec![],
+        )?;
+    }
+    let evicted_col: CountRow = sql.query_one(
+        "SELECT count(*) AS count FROM pragma_table_info('recipient_stats') \
+         WHERE name = 'acked_initial_evicted_until'",
+        vec![],
+    )?;
+    if evicted_col.count == 0 {
+        sql.exec(
+            "ALTER TABLE recipient_stats ADD COLUMN acked_initial_evicted_until INTEGER NOT NULL DEFAULT 0",
             vec![],
         )?;
     }
@@ -569,28 +594,36 @@ mod tests {
         };
         assert_eq!(
             store
-                .publish_v2(&PublishV2Record {
-                    manifest: mk_manifest(1, [0x31; 32]),
-                    signed_prekey_signature: Some([0x55; 64]),
-                    one_time_prekeys: vec![],
-                    pq_last_resort: vec![],
-                    pq_one_time_prekeys: vec![],
-                    timestamp: 1_000,
-                })
-                .unwrap(),
+                .publish_v2(
+                    &PublishV2Record {
+                        manifest: mk_manifest(1, [0x31; 32]),
+                        signed_prekey_signature: Some([0x55; 64]),
+                        one_time_prekeys: vec![],
+                        pq_last_resort: vec![],
+                        pq_one_time_prekeys: vec![],
+                        timestamp: 1_000,
+                    },
+                    1_000,
+                )
+                .unwrap()
+                .0,
             PublishV2Status::Stored
         );
         assert_eq!(
             store
-                .publish_v2(&PublishV2Record {
-                    manifest: mk_manifest(2, [0x32; 32]),
-                    signed_prekey_signature: Some([0x55; 64]),
-                    one_time_prekeys: vec![],
-                    pq_last_resort: vec![],
-                    pq_one_time_prekeys: vec![],
-                    timestamp: 2_000,
-                })
-                .unwrap(),
+                .publish_v2(
+                    &PublishV2Record {
+                        manifest: mk_manifest(2, [0x32; 32]),
+                        signed_prekey_signature: Some([0x55; 64]),
+                        one_time_prekeys: vec![],
+                        pq_last_resort: vec![],
+                        pq_one_time_prekeys: vec![],
+                        timestamp: 2_000,
+                    },
+                    2_000,
+                )
+                .unwrap()
+                .0,
             PublishV2Status::Stored
         );
         assert!(matches!(
@@ -613,6 +646,7 @@ mod tests {
                         manifest_digest: None,
                     },
                     10,
+                    true,
                     2_100,
                 )
                 .unwrap(),

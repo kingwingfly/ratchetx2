@@ -5,8 +5,8 @@ use std::collections::HashSet;
 
 use sha2::{Digest, Sha256};
 use storage::{
-    ClaimOutcome, ClaimedPqBundle, MAX_SAFE_INTEGER, PqLastResortCommitment, PqStorageSnapshot,
-    PublicKey, PublishV2Record, PublishV2Status, RefillPrekeysRecord, Signature,
+    ClaimOutcome, ClaimedPqBundle, InitialMessagePage, MAX_SAFE_INTEGER, PqLastResortCommitment,
+    PqStorageSnapshot, PublicKey, PublishV2Record, PublishV2Status, RefillPrekeysRecord, Signature,
     StoredCapabilityManifest, StoredInitialMessageV2, StoredPqPrekey,
 };
 use worker::{Error, Result};
@@ -22,10 +22,11 @@ const OPK_BUDGET_WINDOW_MS: u64 = 60 * 60 * 1000;
 /// Maximum OPK-consuming `ClaimBundle` calls per identity within [`OPK_BUDGET_WINDOW_MS`].
 /// Past this cap, bundles are still returned (with SPK and PQ last-resort) without popping OPKs.
 const MAX_OPK_CLAIMS_PER_HOUR: u64 = 32;
-/// Retention TTL for `(sender, ephemeral_key)` tombstones written on `AckInitialMessages` (30 days,
-/// strictly exceeding the 14-day inbox TTL and sender `CONFIRMED` probe window so ACKed/declined
-/// chat requests are never resurrected after two SPK rotations).
-pub(super) const ACKED_INITIAL_TOMBSTONE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Retention TTL for `(sender, ephemeral_key)` tombstones written on `AckInitialMessages` or
+/// promoted from already-listed rows on SPK eviction (35 days, strictly exceeding the 30-day
+/// default inbox retention and 28-day sender auto-reclaim window so ACKed/declined chat requests
+/// are never resurrected after two SPK rotations).
+pub(super) const ACKED_INITIAL_TOMBSTONE_TTL_MS: u64 = 35 * 24 * 60 * 60 * 1000;
 /// Maximum `(sender, ephemeral_key)` ACK tombstones retained per identity DO.
 const MAX_ACKED_INITIAL_TOMBSTONES: u64 = 4096;
 
@@ -250,10 +251,52 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         Ok(rows.into_iter().map(|r| (r.suite as u8, r.count)).collect())
     }
 
-    pub(super) fn publish_v2(&self, record: &PublishV2Record) -> Result<PublishV2Status> {
+    fn enforce_acked_initial_cap_sql(sql: &S, now_ms: u64) -> Result<()> {
+        let total: CountRow = sql.query_one(
+            "SELECT count(*) AS count FROM acked_initial_messages",
+            vec![],
+        )?;
+        if total.count > MAX_ACKED_INITIAL_TOMBSTONES {
+            let excess = total.count - MAX_ACKED_INITIAL_TOMBSTONES;
+            let evicted: Vec<ExpiresAtRow> = sql.query(
+                "DELETE FROM acked_initial_messages \
+                 WHERE rowid IN ( \
+                   SELECT rowid FROM acked_initial_messages \
+                   ORDER BY expires_at ASC, id ASC LIMIT ? \
+                 ) \
+                 RETURNING expires_at",
+                params![excess]?,
+            )?;
+            if let Some(max_unexpired) = evicted
+                .into_iter()
+                .map(|row| row.expires_at)
+                .filter(|&exp| exp > now_ms)
+                .max()
+            {
+                sql.exec(
+                    "INSERT INTO recipient_stats (only, acked_initial_evicted_until) \
+                     VALUES (0, ?) \
+                     ON CONFLICT (only) DO UPDATE SET \
+                      acked_initial_evicted_until = max( \
+                        recipient_stats.acked_initial_evicted_until, \
+                        excluded.acked_initial_evicted_until \
+                      )",
+                    params![max_unexpired]?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn publish_v2(
+        &self,
+        record: &PublishV2Record,
+        now_ms: u64,
+    ) -> Result<(PublishV2Status, bool)> {
         // Validate and prepare ALL fallible values BEFORE executing any mutating SQL statement so
         // no partial wipe can occur on a validation or serialization failure.
         let manifest = &record.manifest;
+        let _ = checked_integer(now_ms)?;
         let _ = checked_integer(record.timestamp)?;
         let _ = checked_integer(manifest.manifest_seq)?;
         let _ = checked_integer(manifest.generation)?;
@@ -264,7 +307,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         let mut seen_opks = HashSet::with_capacity(record.one_time_prekeys.len());
         for (pos, opk) in record.one_time_prekeys.iter().enumerate() {
             if !seen_opks.insert(opk.as_slice()) {
-                return Ok(PublishV2Status::DuplicatePrekey);
+                return Ok((PublishV2Status::DuplicatePrekey, false));
             }
             let _ = checked_integer(pos as u64)?;
         }
@@ -273,12 +316,12 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             HashSet::with_capacity(record.pq_last_resort.len() + record.pq_one_time_prekeys.len());
         for lr in &record.pq_last_resort {
             if !seen_lr_suites.insert(lr.suite) || !seen_pq.insert(lr.id.as_slice()) {
-                return Ok(PublishV2Status::DuplicatePrekey);
+                return Ok((PublishV2Status::DuplicatePrekey, false));
             }
         }
         for opk in &record.pq_one_time_prekeys {
             if !seen_pq.insert(opk.id.as_slice()) {
-                return Ok(PublishV2Status::DuplicatePrekey);
+                return Ok((PublishV2Status::DuplicatePrekey, false));
             }
         }
 
@@ -292,6 +335,9 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 .as_ref()
                 .map(|s| s.as_slice())
         };
+        let tombstone_expires_at = now_ms
+            .saturating_add(ACKED_INITIAL_TOMBSTONE_TTL_MS)
+            .min(MAX_SAFE_INTEGER);
 
         self.ensure_v5_tables()?;
         self.sql.transaction_sync(|sql| {
@@ -304,7 +350,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 .as_ref()
                 .is_some_and(|row| row.manifest_seq >= manifest.manifest_seq)
             {
-                return Ok(PublishV2Status::StaleSequence);
+                return Ok((PublishV2Status::StaleSequence, false));
             }
             let prev_signed_prekey: Option<Vec<u8>> = existing.and_then(|row| {
                 let old_spk = row.signed_prekey.into_vec();
@@ -371,24 +417,55 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                     manifest.signature.as_slice()
                 ]?,
             )?;
-            // Purge any un-ACKed inbox initials whose target SPK is no longer retained (evicted
-            // after 2 SPK rotations) WITHOUT writing a delivered tombstone: the recipient already
-            // evicted that private SPK and can never decrypt them, so purging here lets the
-            // sender's post-2-rotation probe distinguish evicted-unread (`StalePrekey`) from
-            // already-read/declined (`acked_initial_messages` tombstone).
-            if let Some(ref prev_spk) = prev_signed_prekey {
-                sql.exec(
+            // Purge inbox initials whose target SPK is no longer retained:
+            // - Unlisted rows (`listed == 0`) are deleted WITHOUT writing a tombstone so the
+            //   sender's probe distinguishes unread SPK eviction (`StalePrekey`).
+            // - Already-listed rows (`listed != 0`) whose `AckInitialMessages` has not landed yet
+            //   are promoted into `acked_initial_messages` tombstones so a rotation racing
+            //   between list and ACK can never resurrect a declined chat request.
+            let evicted: Vec<EvictedInitialRow> = if let Some(ref prev_spk) = prev_signed_prekey {
+                sql.query(
                     "DELETE FROM initial_messages \
-                     WHERE signed_prekey != ? AND signed_prekey != ?",
+                     WHERE signed_prekey != ? AND signed_prekey != ? \
+                     RETURNING id, sender, ephemeral_key, payload_hash, listed",
                     params![manifest.signed_prekey.as_slice(), prev_spk.as_slice()]?,
-                )?;
+                )?
             } else {
-                sql.exec(
-                    "DELETE FROM initial_messages WHERE signed_prekey != ?",
+                sql.query(
+                    "DELETE FROM initial_messages WHERE signed_prekey != ? \
+                     RETURNING id, sender, ephemeral_key, payload_hash, listed",
                     params![manifest.signed_prekey.as_slice()]?,
+                )?
+            };
+            let mut promoted_tombstone = false;
+            for row in evicted.into_iter().filter(|r| r.listed != 0) {
+                if !promoted_tombstone {
+                    sql.exec(
+                        "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
+                        params![now_ms]?,
+                    )?;
+                    promoted_tombstone = true;
+                }
+                sql.exec(
+                    "INSERT INTO acked_initial_messages \
+                     (sender, ephemeral_key, id, payload_hash, expires_at) \
+                     VALUES (?, ?, ?, ?, ?) \
+                     ON CONFLICT (sender, ephemeral_key) DO UPDATE SET \
+                      id = excluded.id, payload_hash = excluded.payload_hash, \
+                      expires_at = excluded.expires_at",
+                    params![
+                        row.sender.as_ref(),
+                        row.ephemeral_key.as_ref(),
+                        row.id,
+                        row.payload_hash.as_ref(),
+                        tombstone_expires_at
+                    ]?,
                 )?;
             }
-            Ok(PublishV2Status::Stored)
+            if promoted_tombstone {
+                Self::enforce_acked_initial_cap_sql(sql, now_ms)?;
+            }
+            Ok((PublishV2Status::Stored, promoted_tombstone))
         })
     }
 
@@ -585,6 +662,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         &self,
         message: &StoredInitialMessageV2,
         limit: u64,
+        allow_insert: bool,
         now_ms: u64,
     ) -> Result<AddInitialOutcome> {
         if !self.has_tables()? {
@@ -592,22 +670,26 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         }
         let payload_hash = initial_message_payload_hash(message);
         let cutoff = now_ms.saturating_sub(self.retention_ms);
-        let bindings = params![
-            message.version,
-            message.sender.as_slice(),
-            message.ephemeral_key.as_slice(),
-            message.signed_prekey.as_slice(),
-            message.one_time_prekey.as_ref().map(|k| k.as_slice()),
-            message.header.as_ref(),
-            message.content.as_ref(),
-            message.pq_suite,
-            message.pq_last_resort,
-            message.pq_prekey_id.as_ref().map(|id| id.as_slice()),
-            message.pq_ciphertext.as_deref(),
-            message.manifest_digest.as_ref().map(|d| d.as_slice()),
-            payload_hash.as_slice(),
-            now_ms
-        ]?;
+        let bindings = if allow_insert {
+            Some(params![
+                message.version,
+                message.sender.as_slice(),
+                message.ephemeral_key.as_slice(),
+                message.signed_prekey.as_slice(),
+                message.one_time_prekey.as_ref().map(|k| k.as_slice()),
+                message.header.as_ref(),
+                message.content.as_ref(),
+                message.pq_suite,
+                message.pq_last_resort,
+                message.pq_prekey_id.as_ref().map(|id| id.as_slice()),
+                message.pq_ciphertext.as_deref(),
+                message.manifest_digest.as_ref().map(|d| d.as_slice()),
+                payload_hash.as_slice(),
+                now_ms
+            ]?)
+        } else {
+            None
+        };
 
         self.sql.transaction_sync(|sql| {
             let Some(retained) = sql.query_opt::<RetainedSpkRow>(
@@ -617,24 +699,30 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             else {
                 return Ok(AddInitialOutcome::NotFound);
             };
-            // Prune expired rows & expired ACK tombstones BEFORE `(sender, ephemeral_key)` lookup
-            // so expired entries never collide with fresh inserts or occupy inbox slots.
-            sql.exec(
-                "DELETE FROM initial_messages WHERE created_at < ?",
-                params![cutoff]?,
-            )?;
-            sql.exec(
-                "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
-                params![now_ms]?,
-            )?;
+            if allow_insert {
+                // Prune expired rows & expired ACK tombstones BEFORE `(sender, ephemeral_key)`
+                // lookup so expired entries never collide with fresh inserts or occupy inbox slots.
+                sql.exec(
+                    "DELETE FROM initial_messages WHERE created_at < ?",
+                    params![cutoff]?,
+                )?;
+                sql.exec(
+                    "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
+                    params![now_ms]?,
+                )?;
+            }
 
             // Check `(sender, ephemeral_key)` idempotency against live inbox rows AND delivered
             // ACK tombstones BEFORE SPK retention so retrying an already-accepted or already-read
             // (including declined) initial never re-inserts or spuriously triggers `StalePrekey`.
             if let Some(existing) = sql.query_opt::<InitialPayloadRow>(
                 "SELECT id, payload_hash FROM initial_messages \
-                 WHERE sender = ? AND ephemeral_key = ?",
-                params![message.sender.as_slice(), message.ephemeral_key.as_slice()]?,
+                 WHERE sender = ? AND ephemeral_key = ? AND created_at >= ?",
+                params![
+                    message.sender.as_slice(),
+                    message.ephemeral_key.as_slice(),
+                    cutoff
+                ]?,
             )? {
                 if existing.payload_hash.as_ref() == payload_hash.as_slice() {
                     return Ok(AddInitialOutcome::Added {
@@ -646,8 +734,12 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             }
             if let Some(acked) = sql.query_opt::<InitialPayloadRow>(
                 "SELECT id, payload_hash FROM acked_initial_messages \
-                 WHERE sender = ? AND ephemeral_key = ?",
-                params![message.sender.as_slice(), message.ephemeral_key.as_slice()]?,
+                 WHERE sender = ? AND ephemeral_key = ? AND expires_at > ?",
+                params![
+                    message.sender.as_slice(),
+                    message.ephemeral_key.as_slice(),
+                    now_ms
+                ]?,
             )? {
                 if acked.payload_hash.as_ref() == payload_hash.as_slice() {
                     return Ok(AddInitialOutcome::Added {
@@ -664,8 +756,21 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                     .as_ref()
                     .is_some_and(|prev| prev.as_ref() == message.signed_prekey.as_slice());
             if !spk_retained {
+                let evicted_until = sql
+                    .query_opt::<EvictedUntilRow>(
+                        "SELECT acked_initial_evicted_until FROM recipient_stats WHERE only = 0",
+                        vec![],
+                    )?
+                    .map_or(0, |row| row.acked_initial_evicted_until);
+                if evicted_until > now_ms {
+                    return Ok(AddInitialOutcome::LimitExceeded);
+                }
                 return Ok(AddInitialOutcome::StalePrekey);
             }
+
+            let Some(bindings) = bindings else {
+                return Ok(AddInitialOutcome::InsertDisallowed);
+            };
 
             let count: CountRow =
                 sql.query_one("SELECT count(*) AS count FROM initial_messages", vec![])?;
@@ -696,30 +801,52 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         })
     }
 
-    pub(super) fn list_initial_messages(
+    pub(super) fn list_initial_messages_page(
         &self,
         recipient: PublicKey,
         after_id: u64,
         limit: u64,
         now_ms: u64,
-    ) -> Result<Vec<StoredInitialMessageV2>> {
+    ) -> Result<InitialMessagePage> {
         let _ = checked_integer(after_id)?;
+        let _ = checked_integer(limit)?;
         if !self.has_tables()? || limit == 0 {
-            return Ok(vec![]);
+            return Ok(InitialMessagePage {
+                messages: vec![],
+                has_more: false,
+            });
         }
         let cutoff = now_ms.saturating_sub(self.retention_ms);
-        let rows: Vec<InitialMessageRow> = self.sql.query(
-            "SELECT id, version, sender, ephemeral_key, signed_prekey, one_time_prekey, \
-             header, content, pq_suite, pq_last_resort, pq_prekey_id, pq_ciphertext, \
-             manifest_digest \
-             FROM initial_messages \
-             WHERE id > ? AND created_at >= ? \
-             ORDER BY id LIMIT ?",
-            params![after_id, cutoff, limit]?,
-        )?;
-        rows.into_iter()
+        let fetch_limit = limit.saturating_add(1).min(MAX_SAFE_INTEGER);
+        let (rows, has_more) = self.sql.transaction_sync(|sql| {
+            let mut rows: Vec<InitialMessageRow> = sql.query(
+                "SELECT id, version, sender, ephemeral_key, signed_prekey, one_time_prekey, \
+                 header, content, pq_suite, pq_last_resort, pq_prekey_id, pq_ciphertext, \
+                 manifest_digest \
+                 FROM initial_messages \
+                 WHERE id > ? AND created_at >= ? \
+                 ORDER BY id LIMIT ?",
+                params![after_id, cutoff, fetch_limit]?,
+            )?;
+            let has_more = rows.len() as u64 > limit;
+            rows.truncate(limit as usize);
+            if !rows.is_empty() {
+                let ids: Vec<u64> = rows.iter().map(|r| r.id).collect();
+                let ids_json =
+                    serde_json::to_string(&ids).map_err(|e| Error::RustError(e.to_string()))?;
+                sql.exec(
+                    "UPDATE initial_messages SET listed = 1 \
+                     WHERE id IN (SELECT value FROM json_each(?))",
+                    params![ids_json.as_str()]?,
+                )?;
+            }
+            Ok((rows, has_more))
+        })?;
+        let messages = rows
+            .into_iter()
             .map(|row| row.into_stored(recipient))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        Ok(InitialMessagePage { messages, has_more })
     }
 
     pub(super) fn ack_initial_messages(&self, ids: &[u64], now_ms: u64) -> Result<u64> {
@@ -763,21 +890,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 )?;
             }
             if !deleted.is_empty() {
-                let total: CountRow = sql.query_one(
-                    "SELECT count(*) AS count FROM acked_initial_messages",
-                    vec![],
-                )?;
-                if total.count > MAX_ACKED_INITIAL_TOMBSTONES {
-                    let excess = total.count - MAX_ACKED_INITIAL_TOMBSTONES;
-                    sql.exec(
-                        "DELETE FROM acked_initial_messages \
-                         WHERE rowid IN ( \
-                           SELECT rowid FROM acked_initial_messages \
-                           ORDER BY expires_at ASC, id ASC LIMIT ? \
-                         )",
-                        params![excess]?,
-                    )?;
-                }
+                Self::enforce_acked_initial_cap_sql(sql, now_ms)?;
             }
             Ok(deleted.len() as u64)
         })
@@ -967,15 +1080,19 @@ mod tests {
             let m1 = mk_manifest(1, 1, true, false);
             assert_eq!(
                 store
-                    .publish_v2(&PublishV2Record {
-                        manifest: m1.clone(),
-                        signed_prekey_signature: Some([0xAA; 64]),
-                        one_time_prekeys: vec![mk_opk(1), mk_opk(1)],
-                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
-                        pq_one_time_prekeys: vec![],
-                        timestamp: 1_000,
-                    })
-                    .unwrap(),
+                    .publish_v2(
+                        &PublishV2Record {
+                            manifest: m1.clone(),
+                            signed_prekey_signature: Some([0xAA; 64]),
+                            one_time_prekeys: vec![mk_opk(1), mk_opk(1)],
+                            pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                            pq_one_time_prekeys: vec![],
+                            timestamp: 1_000,
+                        },
+                        1_000,
+                    )
+                    .unwrap()
+                    .0,
                 PublishV2Status::DuplicatePrekey
             );
             assert!(!store.has_tables().unwrap());
@@ -983,15 +1100,19 @@ mod tests {
             // Valid publish stores folded signed_prekey_signature on capability_manifest.
             assert_eq!(
                 store
-                    .publish_v2(&PublishV2Record {
-                        manifest: m1.clone(),
-                        signed_prekey_signature: Some([0xAA; 64]),
-                        one_time_prekeys: vec![mk_opk(1), mk_opk(2)],
-                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
-                        pq_one_time_prekeys: vec![mk_pq_key(1, 0xB1)],
-                        timestamp: 1_000,
-                    })
-                    .unwrap(),
+                    .publish_v2(
+                        &PublishV2Record {
+                            manifest: m1.clone(),
+                            signed_prekey_signature: Some([0xAA; 64]),
+                            one_time_prekeys: vec![mk_opk(1), mk_opk(2)],
+                            pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                            pq_one_time_prekeys: vec![mk_pq_key(1, 0xB1)],
+                            timestamp: 1_000,
+                        },
+                        1_000,
+                    )
+                    .unwrap()
+                    .0,
                 PublishV2Status::Stored
             );
             assert_eq!(store.get_manifest().unwrap(), Some(m1));
@@ -999,15 +1120,19 @@ mod tests {
             // Stale manifest_seq rejected.
             assert_eq!(
                 store
-                    .publish_v2(&PublishV2Record {
-                        manifest: mk_manifest(1, 2, true, false),
-                        signed_prekey_signature: Some([0xAA; 64]),
-                        one_time_prekeys: vec![],
-                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
-                        pq_one_time_prekeys: vec![],
-                        timestamp: 2_000,
-                    })
-                    .unwrap(),
+                    .publish_v2(
+                        &PublishV2Record {
+                            manifest: mk_manifest(1, 2, true, false),
+                            signed_prekey_signature: Some([0xAA; 64]),
+                            one_time_prekeys: vec![],
+                            pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                            pq_one_time_prekeys: vec![],
+                            timestamp: 2_000,
+                        },
+                        2_000,
+                    )
+                    .unwrap()
+                    .0,
                 PublishV2Status::StaleSequence
             );
 
@@ -1101,15 +1226,19 @@ mod tests {
             let opks: Vec<PublicKey> = (0..40).map(mk_opk).collect();
             assert_eq!(
                 store
-                    .publish_v2(&PublishV2Record {
-                        manifest: mk_manifest(1, 1, true, false),
-                        signed_prekey_signature: Some([0x77; 64]),
-                        one_time_prekeys: opks,
-                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
-                        pq_one_time_prekeys: vec![mk_pq_key(1, 0xB1)],
-                        timestamp: 1_000,
-                    })
-                    .unwrap(),
+                    .publish_v2(
+                        &PublishV2Record {
+                            manifest: mk_manifest(1, 1, true, false),
+                            signed_prekey_signature: Some([0x77; 64]),
+                            one_time_prekeys: opks,
+                            pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                            pq_one_time_prekeys: vec![mk_pq_key(1, 0xB1)],
+                            timestamp: 1_000,
+                        },
+                        1_000,
+                    )
+                    .unwrap()
+                    .0,
                 PublishV2Status::Stored
             );
 
@@ -1160,7 +1289,7 @@ mod tests {
             // Unregistered recipient returns NotFound without creating tables.
             assert_eq!(
                 store
-                    .add_initial_message_v2(&mk_initial(1, 1, b"hi"), 10, 1_000)
+                    .add_initial_message_v2(&mk_initial(1, 1, b"hi"), 10, true, 1_000)
                     .unwrap(),
                 AddInitialOutcome::NotFound
             );
@@ -1169,15 +1298,19 @@ mod tests {
             // Publish manifest.
             assert_eq!(
                 store
-                    .publish_v2(&PublishV2Record {
-                        manifest: mk_manifest(1, 1, true, false),
-                        signed_prekey_signature: Some([0x77; 64]),
-                        one_time_prekeys: vec![],
-                        pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
-                        pq_one_time_prekeys: vec![],
-                        timestamp: 1_000,
-                    })
-                    .unwrap(),
+                    .publish_v2(
+                        &PublishV2Record {
+                            manifest: mk_manifest(1, 1, true, false),
+                            signed_prekey_signature: Some([0x77; 64]),
+                            one_time_prekeys: vec![],
+                            pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                            pq_one_time_prekeys: vec![],
+                            timestamp: 1_000,
+                        },
+                        1_000,
+                    )
+                    .unwrap()
+                    .0,
                 PublishV2Status::Stored
             );
 
@@ -1186,12 +1319,12 @@ mod tests {
             let AddInitialOutcome::Added {
                 id: id1,
                 inserted: true,
-            } = store.add_initial_message_v2(&m1, 2, 1_000).unwrap()
+            } = store.add_initial_message_v2(&m1, 2, true, 1_000).unwrap()
             else {
                 panic!("expected fresh insert");
             };
             assert_eq!(
-                store.add_initial_message_v2(&m1, 2, 1_100).unwrap(),
+                store.add_initial_message_v2(&m1, 2, true, 1_100).unwrap(),
                 AddInitialOutcome::Added {
                     id: id1,
                     inserted: false
@@ -1200,7 +1333,7 @@ mod tests {
             // Mismatched payload on same (sender, ephemeral_key) -> PayloadMismatch.
             assert_eq!(
                 store
-                    .add_initial_message_v2(&mk_initial(1, 1, b"tampered"), 2, 1_200)
+                    .add_initial_message_v2(&mk_initial(1, 1, b"tampered"), 2, true, 1_200)
                     .unwrap(),
                 AddInitialOutcome::PayloadMismatch
             );
@@ -1210,7 +1343,7 @@ mod tests {
             let AddInitialOutcome::Added {
                 id: id2,
                 inserted: true,
-            } = store.add_initial_message_v2(&m2, 2, 5_000).unwrap()
+            } = store.add_initial_message_v2(&m2, 2, true, 5_000).unwrap()
             else {
                 panic!("expected fresh insert");
             };
@@ -1218,23 +1351,30 @@ mod tests {
             // Distinct 3rd message hits cap while both unexpired.
             assert_eq!(
                 store
-                    .add_initial_message_v2(&mk_initial(3, 1, b"third"), 2, 6_000)
+                    .add_initial_message_v2(&mk_initial(3, 1, b"third"), 2, true, 6_000)
                     .unwrap(),
                 AddInitialOutcome::LimitExceeded
             );
 
-            // Cursor pagination via after_id.
-            let p1 = store.list_initial_messages(BOB, 0, 1, 6_000).unwrap();
-            assert_eq!(p1.len(), 1);
-            assert_eq!(p1[0].id, id1);
-            let p2 = store.list_initial_messages(BOB, id1, 10, 6_000).unwrap();
-            assert_eq!(p2.len(), 1);
-            assert_eq!(p2[0].id, id2);
-            assert_eq!(p2[0].pq_suite, Some(1));
-            assert_eq!(p2[0].pq_ciphertext, Some(Bytes::from_static(b"pq-ct")));
+            // Cursor pagination via after_id (`has_more` accurate without marking unreturned rows).
+            let p1 = store.list_initial_messages_page(BOB, 0, 1, 6_000).unwrap();
+            assert_eq!(p1.messages.len(), 1);
+            assert!(p1.has_more);
+            assert_eq!(p1.messages[0].id, id1);
+            let p2 = store
+                .list_initial_messages_page(BOB, id1, 10, 6_000)
+                .unwrap();
+            assert_eq!(p2.messages.len(), 1);
+            assert!(!p2.has_more);
+            assert_eq!(p2.messages[0].id, id2);
+            assert_eq!(p2.messages[0].pq_suite, Some(1));
+            assert_eq!(
+                p2.messages[0].pq_ciphertext,
+                Some(Bytes::from_static(b"pq-ct"))
+            );
             assert!(
                 store
-                    .list_initial_messages(BOB, MAX_SAFE_INTEGER + 1, 10, 6_000)
+                    .list_initial_messages_page(BOB, MAX_SAFE_INTEGER + 1, 10, 6_000)
                     .is_err()
             );
 
@@ -1244,7 +1384,7 @@ mod tests {
                 id: id3,
                 inserted: true,
             } = store
-                .add_initial_message_v2(&mk_initial(1, 1, b"fresh-after-expiry"), 2, 11_001)
+                .add_initial_message_v2(&mk_initial(1, 1, b"fresh-after-expiry"), 2, true, 11_001)
                 .unwrap()
             else {
                 panic!("expected fresh insert after expiry prune");
@@ -1253,9 +1393,12 @@ mod tests {
 
             // Ack deletes only specified IDs.
             assert_eq!(store.ack_initial_messages(&[id2], 11_001).unwrap(), 1);
-            let rem = store.list_initial_messages(BOB, 0, 10, 11_001).unwrap();
-            assert_eq!(rem.len(), 1);
-            assert_eq!(rem[0].id, id3);
+            let rem = store
+                .list_initial_messages_page(BOB, 0, 10, 11_001)
+                .unwrap();
+            assert_eq!(rem.messages.len(), 1);
+            assert!(!rem.has_more);
+            assert_eq!(rem.messages[0].id, id3);
         }
 
         #[test]
@@ -1287,40 +1430,40 @@ mod tests {
 
             // Publish spk1, then republish spk1 -> accepts spk1, rejects unrelated spk2.
             assert_eq!(
-                store.publish_v2(&publish_spk(1, spk1)).unwrap(),
-                PublishV2Status::Stored
+                store.publish_v2(&publish_spk(1, spk1), 1_001).unwrap(),
+                (PublishV2Status::Stored, false)
             );
             assert_eq!(
-                store.publish_v2(&publish_spk(2, spk1)).unwrap(),
-                PublishV2Status::Stored
+                store.publish_v2(&publish_spk(2, spk1), 1_002).unwrap(),
+                (PublishV2Status::Stored, false)
             );
             assert!(matches!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(1, spk1), 10, 2_000)
+                    .add_initial_message_v2(&mk_spk_init(1, spk1), 10, true, 2_000)
                     .unwrap(),
                 AddInitialOutcome::Added { inserted: true, .. }
             ));
             assert_eq!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(2, spk2), 10, 2_000)
+                    .add_initial_message_v2(&mk_spk_init(2, spk2), 10, true, 2_000)
                     .unwrap(),
                 AddInitialOutcome::StalePrekey
             );
 
             // Rotate spk1 -> spk2, then republish spk2: prev_signed_prekey stays spk1.
             assert_eq!(
-                store.publish_v2(&publish_spk(3, spk2)).unwrap(),
-                PublishV2Status::Stored
+                store.publish_v2(&publish_spk(3, spk2), 2_050).unwrap(),
+                (PublishV2Status::Stored, false)
             );
             assert_eq!(
-                store.publish_v2(&publish_spk(4, spk2)).unwrap(),
-                PublishV2Status::Stored
+                store.publish_v2(&publish_spk(4, spk2), 2_060).unwrap(),
+                (PublishV2Status::Stored, false)
             );
             let AddInitialOutcome::Added {
                 id: acked_id,
                 inserted: true,
             } = store
-                .add_initial_message_v2(&mk_spk_init(3, spk1), 10, 2_100)
+                .add_initial_message_v2(&mk_spk_init(3, spk1), 10, true, 2_100)
                 .unwrap()
             else {
                 panic!("expected insert for spk1");
@@ -1330,7 +1473,7 @@ mod tests {
             assert_eq!(store.ack_initial_messages(&[acked_id], 2_110).unwrap(), 1);
             assert!(matches!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(4, spk2), 10, 2_100)
+                    .add_initial_message_v2(&mk_spk_init(4, spk2), 10, true, 2_100)
                     .unwrap(),
                 AddInitialOutcome::Added { inserted: true, .. }
             ));
@@ -1343,18 +1486,18 @@ mod tests {
             // - Unread `mk_spk_init(4, spk2)` stays live & idempotent (`inserted: false`).
             // - Brand-new retired `mk_spk_init(7, spk1)` returns `StalePrekey`.
             assert_eq!(
-                store.publish_v2(&publish_spk(5, spk3)).unwrap(),
-                PublishV2Status::Stored
+                store.publish_v2(&publish_spk(5, spk3), 2_140).unwrap(),
+                (PublishV2Status::Stored, false)
             );
             assert_eq!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(1, spk1), 10, 2_150)
+                    .add_initial_message_v2(&mk_spk_init(1, spk1), 10, true, 2_150)
                     .unwrap(),
                 AddInitialOutcome::StalePrekey
             );
             assert_eq!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(3, spk1), 10, 2_150)
+                    .add_initial_message_v2(&mk_spk_init(3, spk1), 10, true, 2_150)
                     .unwrap(),
                 AddInitialOutcome::Added {
                     id: acked_id,
@@ -1363,7 +1506,7 @@ mod tests {
             );
             assert!(matches!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(4, spk2), 10, 2_150)
+                    .add_initial_message_v2(&mk_spk_init(4, spk2), 10, true, 2_150)
                     .unwrap(),
                 AddInitialOutcome::Added {
                     inserted: false,
@@ -1372,19 +1515,184 @@ mod tests {
             ));
             assert!(matches!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(5, spk2), 10, 2_200)
+                    .add_initial_message_v2(&mk_spk_init(5, spk2), 10, true, 2_200)
                     .unwrap(),
                 AddInitialOutcome::Added { inserted: true, .. }
             ));
             assert!(matches!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(6, spk3), 10, 2_200)
+                    .add_initial_message_v2(&mk_spk_init(6, spk3), 10, true, 2_200)
                     .unwrap(),
                 AddInitialOutcome::Added { inserted: true, .. }
             ));
             assert_eq!(
                 store
-                    .add_initial_message_v2(&mk_spk_init(7, spk1), 10, 2_200)
+                    .add_initial_message_v2(&mk_spk_init(7, spk1), 10, true, 2_200)
+                    .unwrap(),
+                AddInitialOutcome::StalePrekey
+            );
+        }
+
+        #[test]
+        fn r5_p2_4_p2_5_p2_8_listed_promotion_tombstone_cap_watermark_and_read_only_probe() {
+            let env = TestIdentity::new(100_000);
+            let store = env.store();
+
+            let publish_spk = |seq: u64, spk: PublicKey| {
+                let mut m = mk_manifest(seq, seq, true, false);
+                m.signed_prekey = spk;
+                PublishV2Record {
+                    manifest: m,
+                    signed_prekey_signature: Some([0x77; 64]),
+                    one_time_prekeys: vec![],
+                    pq_last_resort: vec![mk_pq_key(1, 0xA1), mk_pq_key(2, 0xA2)],
+                    pq_one_time_prekeys: vec![],
+                    timestamp: 1_000 + seq,
+                }
+            };
+            let spk1 = [0x22; 32];
+            let spk2 = [0x33; 32];
+            let spk3 = [0x44; 32];
+            store.publish_v2(&publish_spk(1, spk1), 1_000).unwrap();
+
+            // Insert two spk1 initials: m_listed (returned on page 1) and m_unlisted (only
+            // checked for `has_more`, NOT returned on page 1!).
+            let mut m_listed = mk_initial(10, 2, b"listed-but-unacked");
+            m_listed.signed_prekey = spk1;
+            let mut m_unlisted = mk_initial(11, 2, b"never-listed");
+            m_unlisted.signed_prekey = spk1;
+            let AddInitialOutcome::Added {
+                id: id_listed,
+                inserted: true,
+            } = store
+                .add_initial_message_v2(&m_listed, 10, true, 1_100)
+                .unwrap()
+            else {
+                panic!("expected insert");
+            };
+            let AddInitialOutcome::Added {
+                id: id_unlisted,
+                inserted: true,
+            } = store
+                .add_initial_message_v2(&m_unlisted, 10, true, 1_101)
+                .unwrap()
+            else {
+                panic!("expected insert");
+            };
+
+            // List with limit=1: only `m_listed` is returned (`has_more == true`) and marked
+            // `listed = 1`; `m_unlisted` stays `listed = 0`.
+            let page = store.list_initial_messages_page(BOB, 0, 1, 1_200).unwrap();
+            assert_eq!(page.messages.len(), 1);
+            assert!(page.has_more);
+            assert_eq!(page.messages[0].id, id_listed);
+
+            // R5-P2-8: Read-only probe (`allow_insert = false`) while PQ is disabled sees live
+            // rows, returns `InsertDisallowed` for brand-new PQ rows on a retained SPK, and
+            // returns `StalePrekey` for an unknown retired SPK.
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&m_listed, 10, false, 1_250)
+                    .unwrap(),
+                AddInitialOutcome::Added {
+                    id: id_listed,
+                    inserted: false
+                }
+            );
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&m_unlisted, 10, false, 1_250)
+                    .unwrap(),
+                AddInitialOutcome::Added {
+                    id: id_unlisted,
+                    inserted: false
+                }
+            );
+            let mut brand_new_pq = mk_initial(12, 2, b"new-while-pq-off");
+            brand_new_pq.signed_prekey = spk1;
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&brand_new_pq, 10, false, 1_250)
+                    .unwrap(),
+                AddInitialOutcome::InsertDisallowed
+            );
+
+            // Rotate twice (spk1 -> spk2 -> spk3) WITHOUT calling `ack_initial_messages`:
+            // - `m_listed` (listed == 1) is promoted to `acked_initial_messages` (returns promoted=true)
+            //   so probing it (even with `allow_insert = false`) returns `Added { id: id_listed, inserted: false }`!
+            // - `m_unlisted` (listed == 0) is deleted WITHOUT tombstoning -> returns `StalePrekey`!
+            assert_eq!(
+                store.publish_v2(&publish_spk(2, spk2), 1_300).unwrap(),
+                (PublishV2Status::Stored, false)
+            );
+            assert_eq!(
+                store.publish_v2(&publish_spk(3, spk3), 1_400).unwrap(),
+                (PublishV2Status::Stored, true)
+            );
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&m_listed, 10, false, 1_450)
+                    .unwrap(),
+                AddInitialOutcome::Added {
+                    id: id_listed,
+                    inserted: false
+                }
+            );
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&m_unlisted, 10, false, 1_450)
+                    .unwrap(),
+                AddInitialOutcome::StalePrekey
+            );
+
+            // R5-P2-5: Simulate capacity eviction of an unexpired tombstone by inserting
+            // `MAX_ACKED_INITIAL_TOMBSTONES` extra rows and ACKing one more: the watermark
+            // `acked_initial_evicted_until` suppresses `StalePrekey` -> `LimitExceeded` until
+            // the evicted tombstone's TTL passes!
+            let evicted_exp = 1_400 + ACKED_INITIAL_TOMBSTONE_TTL_MS;
+            for i in 0..(MAX_ACKED_INITIAL_TOMBSTONES - 1) {
+                let mut eph = [0u8; 32];
+                eph[..8].copy_from_slice(&i.to_be_bytes());
+                eph[31] = 0xEE;
+                env.sql
+                    .exec(
+                        "INSERT INTO acked_initial_messages \
+                         (sender, ephemeral_key, id, payload_hash, expires_at) \
+                         VALUES (?, ?, ?, ?, ?)",
+                        params![
+                            ALICE.as_slice(),
+                            eph.as_slice(),
+                            10_000 + i,
+                            [0x55u8; 32].as_slice(),
+                            evicted_exp + 100
+                        ]
+                        .unwrap(),
+                    )
+                    .unwrap();
+            }
+            // Insert + ACK one spk3 row to trigger `enforce_acked_initial_cap_sql` and evict ONLY
+            // the oldest tombstone (`id_listed` at `expires_at = evicted_exp`).
+            let mut m_trigger = mk_initial(99, 1, b"trigger-evict");
+            m_trigger.signed_prekey = spk3;
+            let AddInitialOutcome::Added { id: trig_id, .. } = store
+                .add_initial_message_v2(&m_trigger, 10, true, 1_500)
+                .unwrap()
+            else {
+                panic!("expected insert");
+            };
+            assert_eq!(store.ack_initial_messages(&[trig_id], 1_500).unwrap(), 1);
+            // Strictly before `evicted_exp`: probing retired `m_listed` returns `LimitExceeded`
+            // (suppressing false auto-reclaim) instead of `StalePrekey`!
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&m_listed, 10, false, evicted_exp - 1)
+                    .unwrap(),
+                AddInitialOutcome::LimitExceeded
+            );
+            // At `now_ms == evicted_exp`, watermark no longer blocks `StalePrekey`.
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&m_listed, 10, false, evicted_exp)
                     .unwrap(),
                 AddInitialOutcome::StalePrekey
             );

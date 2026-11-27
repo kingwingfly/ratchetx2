@@ -96,9 +96,30 @@ impl<V: VaultStore> Engine<V> {
         outcome
     }
 
-    /// Explicitly approve a classical fallback exception for `peer`, releasing any quarantined
-    /// inbound classical initial message and/or resuming paused outbound messages.
+    /// Explicitly approve a classical fallback exception for `peer` (host tests only; production
+    /// callers must pin `conversation_gen` via [`Self::approve_classical_for_gen`]).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub async fn approve_classical(&self, peer: PublicKey) -> Result<(), String> {
+        self.approve_classical_inner(peer, None).await
+    }
+
+    /// Explicitly approve a classical fallback exception for `peer`, pinned to the UI-selected
+    /// `expected_conversation_gen` so a concurrent delete + fresh inbound request can never be
+    /// approved by a stale click.
+    pub async fn approve_classical_for_gen(
+        &self,
+        peer: PublicKey,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
+        self.approve_classical_inner(peer, Some(expected_conversation_gen))
+            .await
+    }
+
+    async fn approve_classical_inner(
+        &self,
+        peer: PublicKey,
+        expected_gen: Option<u64>,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
         let should_stage_grant = {
             let mut guard = self.lock_inner().await;
@@ -110,6 +131,9 @@ impl<V: VaultStore> Engine<V> {
             let local_pq = inner.local_pq_enabled();
             let server = inner.server.clone();
             let contact = inner.contact(&peer).ok_or("no such chat")?;
+            if expected_gen.is_some_and(|want_gen| contact.state.conversation_gen != want_gen) {
+                return Err("chat changed; please retry.".to_string());
+            }
             let snapshot = contact.snapshot();
             contact
                 .session
@@ -364,7 +388,7 @@ impl<V: VaultStore> Engine<V> {
     ///
     /// Captures the target conversation generation BEFORE awaiting `peer_flush_lock` so a queued
     /// manual upgrade can never adopt and auto-accept a deleted-and-recreated chat request.
-    #[cfg(test)]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub async fn upgrade_to_pq(&self, peer: PublicKey) -> Result<(), String> {
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
@@ -763,6 +787,7 @@ impl<V: VaultStore> Engine<V> {
                     && contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
                 {
                     contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                    contact.state.greeting_sent_at = 0;
                     let _ = inner.save_state().await;
                     if !self.is_live(vgen) {
                         return Err("locked".into());
@@ -829,6 +854,7 @@ impl<V: VaultStore> Engine<V> {
                     let reverted = inner.contact(&peer).is_some_and(|contact| {
                         if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
                             contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                            contact.state.greeting_sent_at = 0;
                             true
                         } else {
                             false
@@ -957,8 +983,13 @@ impl<V: VaultStore> Engine<V> {
         Ok(())
     }
 
-    /// Clear transient security/approval alerts for `peer` and retry PQ session setup / flushing.
-    pub async fn retry_pq(&self, peer: PublicKey) -> Result<(), String> {
+    /// Clear transient security/approval alerts for `peer` and retry PQ session setup / flushing,
+    /// pinned to the UI-selected `expected_conversation_gen`.
+    pub async fn retry_pq_for_gen(
+        &self,
+        peer: PublicKey,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
         let waits_sign_in = self.queue.waits_for_sign_in(&peer);
         let (use_flush, conv_gen) = {
@@ -970,6 +1001,9 @@ impl<V: VaultStore> Engine<V> {
             let pq_ready = inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled;
             let contact = inner.contact(&peer).ok_or("no such chat")?;
             let conv_gen = contact.state.conversation_gen;
+            if conv_gen != expected_conversation_gen {
+                return Err("chat changed; please retry.".to_string());
+            }
             let use_flush = pq_ready
                 && !waits_sign_in
                 && !contact.state.quarantined
@@ -1087,6 +1121,7 @@ pub(super) fn finalize_upgrade_to_pq_request_state(
     at: u64,
 ) -> Option<(u64, HistoryEntry)> {
     state.request = false;
+    state.provisional = false;
     if state.history_len == 0 {
         let entry = HistoryEntry {
             outgoing: true,
@@ -1170,7 +1205,7 @@ impl<V: VaultStore> Inner<V> {
             if clear_pq_required || clear_classical_approval {
                 let rollback = self.state.pending_pq_rollback.as_mut();
                 let mut cleared = Vec::new();
-                let mut recorded: Vec<(PublicKey, Option<u32>, Option<u32>)> = Vec::new();
+                let mut recorded: Vec<(PublicKey, u64, Option<u32>, Option<u32>)> = Vec::new();
                 for (idx, contact) in self.contacts.iter_mut().enumerate() {
                     let prev_alert = contact.state.security_alert;
                     let prev_approval = contact.state.classical_approval_needed;
@@ -1185,13 +1220,18 @@ impl<V: VaultStore> Inner<V> {
                         saved_approval = Some(prev_approval);
                     }
                     if saved_alert.is_some() || saved_approval.is_some() {
-                        recorded.push((contact.peer, saved_alert, saved_approval));
+                        recorded.push((
+                            contact.peer,
+                            contact.state.conversation_gen,
+                            saved_alert,
+                            saved_approval,
+                        ));
                         cleared.push((idx, prev_alert, prev_approval));
                     }
                 }
                 if let Some(rollback) = rollback {
-                    for (peer, saved_alert, saved_approval) in recorded {
-                        rollback.record_contact_flag(&peer, saved_alert, saved_approval);
+                    for (peer, conv_gen, saved_alert, saved_approval) in recorded {
+                        rollback.record_contact_flag(&peer, conv_gen, saved_alert, saved_approval);
                     }
                 }
                 cleared
