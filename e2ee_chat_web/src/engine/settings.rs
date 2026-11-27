@@ -69,7 +69,7 @@ impl<V: VaultStore> Engine<V> {
         }
         self.startup.set_publish_waits_settings(false);
         self.ui.me.set(Some(inner.me()));
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
 
         // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.
         let outcome = classify_set_pq_publish_result(self.publish_full(inner, true).await);
@@ -297,7 +297,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -429,7 +429,7 @@ impl<V: VaultStore> Engine<V> {
                     }
                 }
                 if self.is_live(vgen) {
-                    self.ui.contacts.set(inner.views());
+                    self.refresh_contacts(inner);
                 }
                 return Err(describe_upgrade_pq_error(
                     kind,
@@ -451,7 +451,7 @@ impl<V: VaultStore> Engine<V> {
             inner.state.next_session_seq = prev_next_session_seq;
             inner.roll_back(&peer, snapshot)?;
             if self.is_live(vgen) {
-                self.ui.contacts.set(inner.views());
+                self.refresh_contacts(inner);
             }
             return Err(
                 "Could not establish a post-quantum session with this peer (peer or server \
@@ -579,7 +579,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         self.ui.log(format!(
             "upgraded chat with {} to post-quantum encryption",
             short(&peer)
@@ -649,7 +649,7 @@ impl<V: VaultStore> Engine<V> {
                 if !self.is_live(vgen) {
                     return Err("locked".into());
                 }
-                self.ui.contacts.set(inner.views());
+                self.refresh_contacts(inner);
             }
             use_flush
         };

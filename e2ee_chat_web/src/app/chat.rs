@@ -110,6 +110,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
     let contact = move || ui.contact(&peer);
     let label = move || contact().map(|contact| contact.label()).unwrap_or_default();
     let request = move || contact().is_some_and(|contact| contact.request);
+    let awaiting_acceptance = move || contact().is_some_and(|contact| contact.awaiting_acceptance);
     let quarantined = move || contact().is_some_and(|contact| contact.is_quarantined());
     let strict_pq = Memo::new(move |_| strict_pq_enabled(ui));
     let composer_disabled = move || request() || quarantined();
@@ -122,6 +123,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             }
         } else if request() {
             "Accept the request to write"
+        } else if awaiting_acceptance() {
+            "Write a message (delivers once accepted)"
         } else {
             "Write a message"
         }
@@ -447,7 +450,23 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                     </button>
                 </div>
             </Show>
-            <Messages peer label=Signal::derive(label) />
+            <Show when=move || awaiting_acceptance() && !request() && !quarantined()>
+                <div class="banner awaiting-acceptance" role="status">
+                    <span>
+                        {move || {
+                            format!(
+                                "Waiting for {} to accept your chat request. Messages you send stay queued here and will deliver automatically once they accept.",
+                                label(),
+                            )
+                        }}
+                    </span>
+                </div>
+            </Show>
+            <Messages
+                peer
+                label=Signal::derive(label)
+                awaiting_acceptance=Signal::derive(awaiting_acceptance)
+            />
             <Uploads peer />
             <Composer
                 peer
@@ -499,7 +518,11 @@ fn restore_visible_anchor(list: &web_sys::Element, anchor: &(String, f64)) {
 }
 
 #[component]
-fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
+fn Messages(
+    peer: PublicKey,
+    label: Signal<String>,
+    awaiting_acceptance: Signal<bool>,
+) -> impl IntoView {
     let ui = ui();
     let list = NodeRef::<html::Div>::new();
     let loading_earlier = RwSignal::new(false);
@@ -613,7 +636,7 @@ fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
             <For
                 each=move || ui.messages.get()
                 key=|message| message.index
-                children=move |message| message_item(peer, message, label)
+                children=move |message| message_item(peer, message, label, awaiting_acceptance)
             />
         </div>
     }
@@ -623,7 +646,12 @@ fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
 /// The notes name the peer by `label`, which changes once a request is accepted.
 /// Delivery ticks and held-attachment pointer upgrades update via per-row reactive signals in O(1)
 /// without rescanning `ui.messages` or remounting active `<InlineMedia>` players.
-fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>) -> AnyView {
+fn message_item(
+    chat_peer: PublicKey,
+    message: MessageRow,
+    label: Signal<String>,
+    awaiting_acceptance: Signal<bool>,
+) -> AnyView {
     let ui = ui();
     let index = message.index;
     let outgoing = message.outgoing;
@@ -709,7 +737,15 @@ fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>
     // it.
     let status = move || match delivery() {
         Delivery::Received => None,
-        Delivery::Pending => Some((Icon::Pending, "waiting to be sent", false)),
+        Delivery::Pending => Some((
+            Icon::Pending,
+            if awaiting_acceptance.get() {
+                "waiting for peer to accept"
+            } else {
+                "waiting to be sent"
+            },
+            false,
+        )),
         Delivery::Failed => Some((Icon::Failed, "could not be sent", false)),
         Delivery::Sent => Some((Icon::Sent, "sent", false)),
         Delivery::Read => Some((Icon::Read, "read", true)),

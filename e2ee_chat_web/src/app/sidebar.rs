@@ -256,6 +256,8 @@ pub(super) fn chat_item_meta(contact: &ContactView) -> ChatItemMeta {
         ChatItemSubtitle::Status("PQ required (paused)".to_string())
     } else if contact.request {
         ChatItemSubtitle::Status("wants to chat".to_string())
+    } else if contact.awaiting_acceptance {
+        ChatItemSubtitle::Status("waiting for acceptance".to_string())
     } else if let Some(msg) = &contact.last_message {
         ChatItemSubtitle::Message(msg.clone())
     } else {

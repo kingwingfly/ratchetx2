@@ -386,8 +386,19 @@ impl Contact {
     }
 
     pub(super) fn view(&self) -> ContactView {
+        self.view_with(false)
+    }
+
+    pub(super) fn view_with(&self, approval_backed_off: bool) -> ContactView {
         let peer_pq = self.session.peer_pq_state();
         let active_security = self.session.security();
+        let has_active_session = active_security.is_some();
+        let awaiting_acceptance = !self.state.request
+            && !self.state.quarantined
+            && has_active_session
+            && !self.session.is_known_by_peer()
+            && ((self.state.peer_last == 0 && self.state.awaiting.is_empty())
+                || approval_backed_off);
         let alert = match self.state.security_alert {
             SECURITY_ALERT_DOWNGRADE => SecurityAlert::DowngradeDetected,
             SECURITY_ALERT_MANIFEST_EXPIRED => SecurityAlert::ManifestExpired,
@@ -409,6 +420,7 @@ impl Contact {
             peer: self.peer,
             name: self.state.name.clone(),
             request: self.state.request,
+            awaiting_acceptance,
             hello_name: self.state.hello_name.clone(),
             unread: self.state.unread,
             last_activity: self.state.last_activity,
@@ -418,7 +430,7 @@ impl Contact {
                 .as_ref()
                 .and_then(LastMessageRecord::to_view),
             security: SecurityView::from_session(active_security.unwrap_or_default()),
-            has_active_session: active_security.is_some(),
+            has_active_session,
             pq_pinned: peer_pq.pq_pinned,
             peer_pq_capable: peer_pq.peer_pq_capable,
             allow_classical_exception: peer_pq.allow_classical_exception,

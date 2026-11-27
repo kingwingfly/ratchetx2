@@ -267,7 +267,7 @@ fn chat_item_meta_shows_typed_last_message_and_prevents_text_spoofing() {
         ChatItemSubtitle::Status("peer PQ manifest expired".to_string())
     );
 
-    let mut downgrade = chat;
+    let mut downgrade = chat.clone();
     downgrade.downgrade_detected = true;
     assert_eq!(
         chat_item_meta(&downgrade),
@@ -276,6 +276,37 @@ fn chat_item_meta_shows_typed_last_message_and_prevents_text_spoofing() {
             warn: false,
             downgrade: true,
             subtitle: ChatItemSubtitle::Status("downgrade detected".to_string()),
+        }
+    );
+
+    // Outbound chat awaiting peer acceptance shows "waiting for acceptance" even with a queued
+    // last_message, while incoming requests and security warnings still take precedence.
+    let mut awaiting = chat.clone();
+    awaiting.awaiting_acceptance = true;
+    assert_eq!(
+        chat_item_meta(&awaiting),
+        ChatItemMeta {
+            request_accent: false,
+            warn: false,
+            downgrade: false,
+            subtitle: ChatItemSubtitle::Status("waiting for acceptance".to_string()),
+        }
+    );
+    let mut awaiting_and_request = awaiting.clone();
+    awaiting_and_request.request = true;
+    assert_eq!(
+        chat_item_meta(&awaiting_and_request).subtitle,
+        ChatItemSubtitle::Status("wants to chat".to_string())
+    );
+    let mut awaiting_and_outbound_prompt = awaiting;
+    awaiting_and_outbound_prompt.classical_prompt = ClassicalPrompt::Outbound;
+    assert_eq!(
+        chat_item_meta(&awaiting_and_outbound_prompt),
+        ChatItemMeta {
+            request_accent: false,
+            warn: true,
+            downgrade: false,
+            subtitle: ChatItemSubtitle::Status("classical approval needed".to_string()),
         }
     );
 }

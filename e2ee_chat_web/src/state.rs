@@ -177,6 +177,9 @@ pub struct ContactView {
     pub name: String,
     /// The peer started the chat, and it is not accepted yet.
     pub request: bool,
+    /// This client started the chat (or restarted it after peer deletion) and the peer has not yet
+    /// accepted it; outgoing messages stay queued locally until the peer accepts.
+    pub awaiting_acceptance: bool,
     /// The name the peer gave in its greeting.
     pub hello_name: String,
     pub unread: u32,

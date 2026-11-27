@@ -130,6 +130,17 @@ export async function establishChat(
 
   await expect(alicePage.locator('.pane')).toBeVisible();
   await expect(alicePage.locator('.pane-title strong')).toHaveText(bobName);
+  await expect(alicePage.locator('.banner.awaiting-acceptance')).toBeVisible();
+  await expect(alicePage.locator('.banner.awaiting-acceptance')).toContainText(
+    `Waiting for ${bobName} to accept your chat request`,
+  );
+  await expect(alicePage.locator('.chat-item .chat-sub').first()).toHaveText(
+    'waiting for acceptance',
+  );
+  await expect(alicePage.locator('.composer textarea')).toHaveAttribute(
+    'placeholder',
+    'Write a message (delivers once accepted)',
+  );
 
   // Bob receives Alice's chat request over the live Worker DO + WebSocket notification.
   const bobChatItem = bobPage.locator('.chat-item').first();
@@ -145,6 +156,13 @@ export async function establishChat(
   await expect(bobDialog.getByRole('heading', { name: 'Chat request' })).toBeVisible();
   await bobDialog.getByRole('button', { name: 'Accept', exact: true }).click();
   await expect(bobDialog).not.toHaveAttribute('open', '');
+
+  // Acceptance clears Alice's awaiting-acceptance notice automatically via live WS sync.
+  await expect(alicePage.locator('.banner.awaiting-acceptance')).toBeHidden();
+  await expect(alicePage.locator('.composer textarea')).toHaveAttribute(
+    'placeholder',
+    'Write a message',
+  );
 
   // Both composers should now be enabled and ready to exchange messages/files.
   await expect(alicePage.locator('.composer textarea')).toBeEnabled();

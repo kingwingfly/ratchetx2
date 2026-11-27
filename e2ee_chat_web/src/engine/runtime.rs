@@ -401,6 +401,10 @@ impl SendQueue {
         self.approval_backoff.borrow_mut().clear();
     }
 
+    pub(super) fn has_approval_backoff(&self, peer: &PublicKey) -> bool {
+        self.approval_backoff.borrow().contains_key(peer)
+    }
+
     pub(super) fn is_approval_backed_off(&self, peer: &PublicKey) -> bool {
         self.approval_backoff
             .borrow()

@@ -1,7 +1,9 @@
 import { expect, test } from '@playwright/test';
 import {
+  createVault,
   establishChat,
   fixturePath,
+  readIdentityInfo,
   sendFiles,
   sendTextMessage,
 } from './helpers.ts';
@@ -309,6 +311,97 @@ test.describe('chat handshake, encrypted exchange, and compiled preview workers'
       await expect(rsCode.locator('span[class^="hl-"]').first()).toBeVisible();
       await expect(viewer.locator('pre.code')).not.toHaveAttribute('data-error');
       expect(loaderRequests).toBeGreaterThanOrEqual(3);
+    } finally {
+      await aliceCtx.close();
+      await bobCtx.close();
+    }
+  });
+
+  test('sender sees awaiting-acceptance notice and queued messages deliver automatically once peer accepts', async ({
+    browser,
+  }) => {
+    const aliceCtx = await browser.newContext();
+    const bobCtx = await browser.newContext();
+    const alicePage = await aliceCtx.newPage();
+    const bobPage = await bobCtx.newPage();
+
+    const pageErrors: string[] = [];
+    alicePage.on('pageerror', (err) => pageErrors.push(`alice: ${err.message}`));
+    bobPage.on('pageerror', (err) => pageErrors.push(`bob: ${err.message}`));
+
+    try {
+      await createVault(alicePage, 'AlicePending');
+      await createVault(bobPage, 'BobPending');
+      const bobIdentity = await readIdentityInfo(bobPage);
+
+      // Alice starts a chat with Bob; New Chat dialog explains acceptance before delivery.
+      await alicePage.locator('.sidebar').getByRole('button', { name: 'New chat' }).click();
+      const aliceDialog = alicePage.locator('dialog.modal');
+      await expect(aliceDialog.getByRole('heading', { name: 'New chat' })).toBeVisible();
+      await expect(aliceDialog).toContainText(/messages you send deliver once they accept/i);
+      await aliceDialog.locator('#peer-key').fill(bobIdentity.key);
+      await aliceDialog.locator('#peer-name').fill('BobPending');
+      await aliceDialog.getByRole('button', { name: 'Start', exact: true }).click();
+
+      // Alice immediately sees the awaiting-acceptance notice in the banner, sidebar, composer,
+      // and Contact Info dialog.
+      await expect(alicePage.locator('.banner.awaiting-acceptance')).toBeVisible();
+      await expect(alicePage.locator('.banner.awaiting-acceptance')).toContainText(
+        /Waiting for BobPending to accept your chat request/i,
+      );
+      await expect(alicePage.locator('.chat-item .chat-sub').first()).toHaveText(
+        'waiting for acceptance',
+      );
+      await expect(alicePage.locator('.composer textarea')).toHaveAttribute(
+        'placeholder',
+        'Write a message (delivers once accepted)',
+      );
+
+      await alicePage.getByRole('button', { name: 'About this chat' }).click();
+      await expect(aliceDialog.getByRole('heading', { name: 'Chat', exact: true })).toBeVisible();
+      await expect(aliceDialog).toContainText(
+        /Waiting for BobPending to accept your chat request\. Messages will deliver once they accept\./,
+      );
+      await aliceDialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+      await expect(aliceDialog).not.toHaveAttribute('open', '');
+
+      // Alice queues a message before Bob accepts: stays pending with explicit tooltip, and does
+      // not appear on Bob's side until Bob clicks Accept.
+      const queuedMsg = 'Queued before Bob accepts!';
+      await sendTextMessage(alicePage, queuedMsg);
+      const pendingStatus = alicePage
+        .locator('.message.me', { hasText: queuedMsg })
+        .locator('.meta .status');
+      await expect(pendingStatus).toHaveAttribute('aria-label', 'waiting for peer to accept');
+      await expect(alicePage.locator('.banner.awaiting-acceptance')).toBeVisible();
+      await expect(alicePage.locator('.chat-item .chat-sub').first()).toHaveText(
+        'waiting for acceptance',
+      );
+
+      const bobChatItem = bobPage.locator('.chat-item').first();
+      await expect(bobChatItem).toBeVisible();
+      await bobChatItem.click();
+      await expect(bobPage.locator('.pane')).toBeVisible();
+      await expect(bobPage.locator('.messages .bubble', { hasText: queuedMsg })).toHaveCount(0);
+
+      // Bob accepts the chat request: Alice's banner disappears and the queued message delivers
+      // automatically without Alice resending anything.
+      await bobPage.getByRole('button', { name: /accept or delete/i }).click();
+      const bobDialog = bobPage.locator('dialog.modal');
+      await expect(bobDialog.getByRole('heading', { name: 'Chat request' })).toBeVisible();
+      await bobDialog.getByRole('button', { name: 'Accept', exact: true }).click();
+      await expect(bobDialog).not.toHaveAttribute('open', '');
+
+      await expect(bobPage.locator('.messages .bubble', { hasText: queuedMsg })).toBeVisible();
+      await expect(alicePage.locator('.banner.awaiting-acceptance')).toBeHidden();
+      await expect(alicePage.locator('.composer textarea')).toHaveAttribute(
+        'placeholder',
+        'Write a message',
+      );
+      await expect(pendingStatus).not.toHaveAttribute('aria-label', 'waiting for peer to accept');
+      await expect(alicePage.locator('.chat-item .chat-sub').first()).toContainText(queuedMsg);
+
+      expect(pageErrors).toEqual([]);
     } finally {
       await aliceCtx.close();
       await bobCtx.close();

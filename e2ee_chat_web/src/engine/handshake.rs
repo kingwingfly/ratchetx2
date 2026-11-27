@@ -1215,7 +1215,7 @@ impl<V: VaultStore> Engine<V> {
             }
         }
         if !self.shutting_down.get() && !crate::glue::lock_released() {
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
         }
         Ok(batch.upgrades)
     }
@@ -1376,7 +1376,7 @@ impl<V: VaultStore> Engine<V> {
                         }
                         if live {
                             self.ui.me.set(Some(inner.me()));
-                            self.ui.contacts.set(inner.views());
+                            self.refresh_contacts(inner);
                             self.ui.log("The server refused the pending post-quantum settings. Restored the previous settings.");
                         }
                     }
@@ -1749,10 +1749,10 @@ impl<V: VaultStore> Engine<V> {
                         short(&peer)
                     ));
                 }
-                self.ui.contacts.set(inner.views());
+                self.refresh_contacts(inner);
                 return Err(StartChatError::Cancelled);
             }
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
             accepted_now
         };
         drop(guard);
@@ -1771,7 +1771,7 @@ impl<V: VaultStore> Engine<V> {
                     if !self.is_live(vgen) {
                         return Err(StartChatError::Cancelled);
                     }
-                    self.ui.contacts.set(inner.views());
+                    self.refresh_contacts(inner);
                 }
             }
             let _ = self.flush(&peer).await;
@@ -2114,7 +2114,7 @@ impl<V: VaultStore> Engine<V> {
             self.startup.set_in_flight_start_chat(submission_id, true);
             if !ready_to_send {
                 self.startup.end_new_chat_submit(submission_id);
-                self.ui.contacts.set(inner.views());
+                self.refresh_contacts(inner);
             }
             (
                 created_session_id,
@@ -2269,7 +2269,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err(StartChatError::Cancelled);
         }
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         drop(guard);
         self.wake();
         Ok(peer)
@@ -2308,7 +2308,7 @@ impl<V: VaultStore> Engine<V> {
             match inner.forget_peer(peer, state, deferred).await {
                 Ok(()) => {
                     if !self.shutting_down.get() && !crate::glue::lock_released() {
-                        self.ui.contacts.set(inner.views());
+                        self.refresh_contacts(inner);
                     }
                     return;
                 }
@@ -2324,7 +2324,7 @@ impl<V: VaultStore> Engine<V> {
         if self.shutting_down.get() || crate::glue::lock_released() {
             return;
         }
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         if let Some(err) = last_err {
             let detail = describe(&err);
             self.ui.log(format!(

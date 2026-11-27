@@ -431,8 +431,8 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
         <form on:submit=submit>
             <h2>"New chat"</h2>
             <p>
-                "Paste their identity key. Their prekeys come from the server, and a greeting "
-                "with your name starts the session."
+                "Paste their identity key. Their prekeys come from the server, and a chat request "
+                "with your name starts the session; messages you send deliver once they accept."
             </p>
             {move || {
                 let (_, eff_pq_pinned) = effective.get();
@@ -703,6 +703,10 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                 format!("{} wants to chat, and goes by “{hello}”.", short(&peer))
             }
         }
+        Some(c) if c.awaiting_acceptance => format!(
+            "Waiting for {} to accept your chat request. Messages will deliver once they accept.",
+            c.label()
+        ),
         Some(c) => format!("Your chat with {}.", c.label()),
         None => String::new(),
     };

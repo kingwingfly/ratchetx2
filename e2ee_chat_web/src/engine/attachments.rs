@@ -520,7 +520,7 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         self.show_new(inner, &peer, vec![view]);
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         drop(guard);
         self.uploads
             .insert_file((peer, id, attachment_key_hash(&[])), file);
@@ -969,7 +969,7 @@ impl<V: VaultStore> Engine<V> {
                     }
                     let index = view.index;
                     self.show_new(inner, peer, vec![view]);
-                    self.ui.contacts.set(inner.views());
+                    self.refresh_contacts(inner);
                     (index, true)
                 }
             }

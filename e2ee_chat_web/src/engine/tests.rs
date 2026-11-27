@@ -9184,3 +9184,137 @@ fn greeting_delivery_never_downgrades_from_confirmed_and_stays_uncertain_on_writ
         );
     });
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn awaiting_acceptance_tracks_pending_requests_and_clears_on_accept_or_push() {
+    use prost::Message as _;
+
+    futures::executor::block_on(async {
+        let (alice_engine, bob_peer, _bob) = established_engine_on_localhost().await;
+
+        // 1. Freshly initiated chat: awaiting acceptance immediately before any message is sent.
+        {
+            let mut guard = alice_engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            alice_engine.refresh_contacts(inner);
+            assert!(
+                alice_engine
+                    .ui
+                    .contact(&bob_peer)
+                    .unwrap()
+                    .awaiting_acceptance,
+                "newly initiated chat must surface awaiting_acceptance before peer accepts"
+            );
+            inner.contact(&bob_peer).unwrap().state.greeting_delivery =
+                crate::vault::GREETING_DELIVERY_CONFIRMED;
+            inner
+                .add(&bob_peer, Kind::Text("hello before accept".into()), false)
+                .await
+                .unwrap();
+            alice_engine.refresh_contacts(inner);
+        }
+
+        // 2. WriteTokenRejected on `!known_by_peer` keeps awaiting_acceptance active under backoff.
+        {
+            let _mock = crate::transport::mock_fetch(|_server, path, _body| {
+                assert!(path.ends_with("/PushV2"), "unexpected path {path}");
+                let err = protocol::connect::error(
+                    protocol::ErrorKind::WriteTokenRejected,
+                    "write token rejected",
+                );
+                Ok((err.status, err.body))
+            });
+            assert_eq!(alice_engine.flush(&bob_peer).await, Ok(false));
+            assert!(alice_engine.queue.has_approval_backoff(&bob_peer));
+            assert!(
+                alice_engine
+                    .ui
+                    .contact(&bob_peer)
+                    .unwrap()
+                    .awaiting_acceptance
+            );
+        }
+
+        // 3. Rekeyed existing chat (`peer_last > 0`, `!known_by_peer`): not flagged until
+        //    PushV2 actually hits WriteTokenRejected (e.g. after peer deleted the chat).
+        alice_engine.clear_approval_backoff(&bob_peer);
+        {
+            let mut guard = alice_engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contact(&bob_peer).unwrap().state.peer_last = 5;
+            alice_engine.refresh_contacts(inner);
+            assert!(
+                !alice_engine
+                    .ui
+                    .contact(&bob_peer)
+                    .unwrap()
+                    .awaiting_acceptance,
+                "existing chat rekey must not show awaiting_acceptance without WriteTokenRejected"
+            );
+        }
+        {
+            let _mock = crate::transport::mock_fetch(|_server, path, _body| {
+                assert!(path.ends_with("/PushV2"), "unexpected path {path}");
+                let err = protocol::connect::error(
+                    protocol::ErrorKind::WriteTokenRejected,
+                    "write token rejected",
+                );
+                Ok((err.status, err.body))
+            });
+            assert_eq!(alice_engine.flush(&bob_peer).await, Ok(false));
+            assert!(
+                alice_engine
+                    .ui
+                    .contact(&bob_peer)
+                    .unwrap()
+                    .awaiting_acceptance,
+                "WriteTokenRejected on rekeyed !known_by_peer chat must surface awaiting_acceptance"
+            );
+        }
+
+        // 4. Once PushV2 succeeds (even before Events { accepted: true } arrives), backoff clears
+        //    and awaiting_acceptance flips false immediately.
+        alice_engine.clear_approval_backoff(&bob_peer);
+        {
+            let _mock = crate::transport::mock_fetch(|_server, path, _body| {
+                assert!(path.ends_with("/PushV2"), "unexpected path {path}");
+                Ok((
+                    200,
+                    protocol::mailbox_v2::PushV2Response { sequence: 1 }.encode_to_vec(),
+                ))
+            });
+            assert_eq!(alice_engine.flush(&bob_peer).await, Ok(true));
+            assert!(!alice_engine.queue.has_approval_backoff(&bob_peer));
+            assert!(
+                !alice_engine
+                    .ui
+                    .contact(&bob_peer)
+                    .unwrap()
+                    .awaiting_acceptance,
+                "successful PushV2 must clear awaiting_acceptance"
+            );
+        }
+
+        // 5. Once peer is known (e.g. Events { accepted: true } / peer reply), awaiting_acceptance
+        //    is false even with peer_last == 0 and empty awaiting.
+        {
+            let mut guard = alice_engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let contact = inner.contact(&bob_peer).unwrap();
+            contact.state.peer_last = 0;
+            contact.state.awaiting.clear();
+            change_session(&mut contact.session, |s| {
+                s.known_by_peer = true;
+            });
+            alice_engine.refresh_contacts(inner);
+            assert!(
+                !alice_engine
+                    .ui
+                    .contact(&bob_peer)
+                    .unwrap()
+                    .awaiting_acceptance
+            );
+        }
+    });
+}

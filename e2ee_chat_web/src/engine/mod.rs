@@ -393,7 +393,7 @@ impl<V: VaultStore> Engine<V> {
             .startup
             .set_can_sign_in_here(same_server(&inner.server, &origin()));
         engine.ui.me.set(Some(inner.me()));
-        engine.ui.contacts.set(inner.views());
+        engine.refresh_contacts(&inner);
         engine.ui.isolated_contacts.set(inner.isolated_views());
         engine.ui.phase.set(Phase::Unlocked);
         *engine.inner.try_lock().expect("fresh engine mutex") = Some(inner);
@@ -1231,7 +1231,7 @@ impl Engine<Vault> {
         let can_sign_in_here = same_server(&inner.server, &origin());
         self.startup.set_can_sign_in_here(can_sign_in_here);
         self.ui.me.set(Some(inner.me()));
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(&inner);
         self.ui.isolated_contacts.set(inner.isolated_views());
         // Uploads the page left: their files are gone with it.
         match inner.vault.uploads(None).await {
@@ -1363,7 +1363,7 @@ impl<V: VaultStore> Engine<V> {
             }
             let index = view.index;
             self.show_new(inner, &peer, vec![view]);
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
             index
         };
         if !self.is_live(vgen) {
@@ -1563,7 +1563,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return OpenOutcome::Ignored;
         }
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         drop(guard);
         // The peer learns what was read.
         if read
@@ -1742,7 +1742,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(false);
         }
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         drop(guard);
         // Schedule receipt delivery asynchronously via the sync loop so local history paging never
         // blocks on a slow or stalled relay.
@@ -1818,7 +1818,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.reconcile_open_chat_read(inner, &peer, false).await || !self.is_live(vgen) {
             return;
         }
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         drop(guard);
         if let Err(e) = self.flush(&peer).await
             && self.is_live(vgen)
@@ -1858,7 +1858,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
         }
         // Register write token outside `self.inner` BEFORE pushing `Events { accepted: true }` so
         // the peer's follow-up messages are immediately accepted on our DO without stalling UI.
@@ -1876,7 +1876,7 @@ impl<V: VaultStore> Engine<V> {
                 if !self.is_live(vgen) {
                     return Err("locked".into());
                 }
-                self.ui.contacts.set(inner.views());
+                self.refresh_contacts(inner);
             }
         }
         if !self.is_live(vgen) {
@@ -1918,7 +1918,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         Ok(())
     }
 
@@ -2094,7 +2094,7 @@ impl<V: VaultStore> Engine<V> {
         // Only invalidate a queued open targeting the deleted peer; preserve queued navigation to
         // a different peer started while the vault deletion was committing.
         self.open_chat.on_peer_deleted(peer, &self.ui);
-        self.ui.contacts.set(inner.views());
+        self.refresh_contacts(inner);
         self.ui.isolated_contacts.set(inner.isolated_views());
         if was_isolated {
             self.ui.log(format!(
@@ -2838,8 +2838,12 @@ impl<V: VaultStore> Inner<V> {
     }
 
     /// The contacts, as shown: requests first, then the latest chats.
-    fn views(&self) -> Vec<ContactView> {
-        let mut views: Vec<_> = self.contacts.iter().map(Contact::view).collect();
+    fn views_with(&self, approval_backed_off: impl Fn(&PublicKey) -> bool) -> Vec<ContactView> {
+        let mut views: Vec<_> = self
+            .contacts
+            .iter()
+            .map(|contact| contact.view_with(approval_backed_off(&contact.peer)))
+            .collect();
         views.sort_by_key(|view| (!view.request, u64::MAX - view.last_activity));
         views
     }
@@ -2856,6 +2860,12 @@ impl<V: VaultStore> Inner<V> {
 }
 
 impl<V: VaultStore> Engine<V> {
+    pub(super) fn refresh_contacts(&self, inner: &Inner<impl VaultStore>) {
+        self.ui
+            .contacts
+            .set(inner.views_with(|peer| self.queue.has_approval_backoff(peer)));
+    }
+
     /// Show `views`, new in the chat with `peer`, if it is on screen, in its order.
     fn show_new(&self, inner: &Inner<impl VaultStore>, peer: &PublicKey, views: Vec<MessageView>) {
         if self.shutting_down.get()

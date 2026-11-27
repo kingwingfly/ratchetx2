@@ -831,7 +831,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(false);
             }
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
         }
         let replayed = self.replay_deferred_initials(inner).await?;
         if !self.is_live(vgen) {
@@ -1379,7 +1379,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(Vec::new());
             }
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
 
             // Unconditionally ACK server mailbox prefix on the final page (earlier pages piggyback).
             if !has_more {
@@ -1839,7 +1839,7 @@ impl<V: VaultStore> Engine<V> {
             }
         }
         if !self.shutting_down.get() && !crate::glue::lock_released() {
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
         }
         Ok((replayed_peers, upgrades))
     }

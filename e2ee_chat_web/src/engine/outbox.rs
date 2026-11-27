@@ -579,7 +579,7 @@ impl<V: VaultStore> Engine<V> {
                                 }
                                 let _ = inner.save_state().await;
                                 if self.is_live(vgen) {
-                                    self.ui.contacts.set(inner.views());
+                                    self.refresh_contacts(inner);
                                 }
                                 break;
                             }
@@ -691,6 +691,7 @@ impl<V: VaultStore> Engine<V> {
                                 && inner.contact(peer).is_some()
                             {
                                 let delay_ms = self.queue.record_approval_backoff(peer);
+                                self.refresh_contacts(inner);
                                 let label = inner
                                     .contact(peer)
                                     .map_or_else(|| short(peer), |c| c.view().label());
@@ -862,6 +863,9 @@ impl<V: VaultStore> Engine<V> {
             return Ok(CommitOutcome::Aborted);
         }
         self.show_changes(inner, peer, &entries);
+        if step == Step::Pushed {
+            self.refresh_contacts(inner);
+        }
         let refused_indices: Vec<u64> = entries
             .iter()
             .filter(|(_, entry)| entry.delivery() == Delivery::Failed)
@@ -956,7 +960,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(RekeyOutcome::Aborted);
             }
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
             return Ok(RekeyOutcome::Paused);
         }
         if kind == ErrorKind::ClockSkew {
@@ -1142,7 +1146,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(RekeyOutcome::Aborted);
             }
-            self.ui.contacts.set(inner.views());
+            self.refresh_contacts(inner);
             break (server, new_session_id, outgoing_req);
         };
 
@@ -1400,8 +1404,12 @@ impl<V: VaultStore> Engine<V> {
                         contact.session.retire();
                     }
                     let _ = inner.save_state().await;
+                    if self.is_live(vgen) {
+                        self.refresh_contacts(inner);
+                    }
                 } else {
                     self.queue.record_approval_backoff(peer);
+                    self.refresh_contacts(inner);
                 }
                 return Ok(false);
             }
