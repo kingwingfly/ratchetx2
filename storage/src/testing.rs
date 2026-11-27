@@ -487,8 +487,23 @@ pub async fn pq_handshake_store<S: LocalPqHandshakeStore>(store: &S) {
 
 /// Conformance suite for [`LocalIdempotentMailboxStore`] (paired with [`LocalPqHandshakeStore`]
 /// so recipients can register manifests before registering write tokens).
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotentMailboxStore>(
     store: &S,
+) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u128::from(MAX_SAFE_INTEGER)) as u64;
+    idempotent_mailbox_store_at(store, now_ms).await;
+}
+
+/// Conformance suite for [`LocalIdempotentMailboxStore`] using an explicit wall-clock `now_ms`
+/// (required on `wasm32` targets where `std::time::SystemTime` is unavailable).
+pub async fn idempotent_mailbox_store_at<S: LocalPqHandshakeStore + LocalIdempotentMailboxStore>(
+    store: &S,
+    now_ms: u64,
 ) {
     let bob = [22; 32];
     let peer_a = [0xA0; 32];
@@ -510,7 +525,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: tok_a1,
                 grant_version: 1,
                 pin_active: true,
-                timestamp: 0,
+                timestamp: now_ms,
             })
             .await
             .unwrap_err()
@@ -572,6 +587,23 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
         PublishV2Status::Stored
     );
 
+    // 1b. Zero/stale timestamp on register_write_token is unconditionally rejected.
+    assert_eq!(
+        store
+            .register_write_token(RegisterWriteTokenRecord {
+                recipient: bob,
+                peer_slot_id: peer_a,
+                token_hash: tok_a1,
+                grant_version: 1,
+                pin_active: true,
+                timestamp: 0,
+            })
+            .await
+            .unwrap_err()
+            .kind(),
+        ErrorKind::StaleTimestamp
+    );
+
     // 2. Grant registration invariants: pinned active preserved across 5th grant eviction,
     //    duplicate token never refreshes eviction priority, cross-peer token_hash rejected.
     store
@@ -581,7 +613,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_a1,
             grant_version: 1,
             pin_active: true,
-            timestamp: 0,
+            timestamp: now_ms,
         })
         .await
         .unwrap();
@@ -594,7 +626,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: tok_a1,
                 grant_version: 1,
                 pin_active: true,
-                timestamp: 0,
+                timestamp: now_ms,
             })
             .await
             .unwrap_err()
@@ -610,7 +642,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: tok,
                 grant_version: ver,
                 pin_active: false,
-                timestamp: 0,
+                timestamp: now_ms,
             })
             .await
             .unwrap();
@@ -623,7 +655,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_a2,
             grant_version: 99,
             pin_active: false,
-            timestamp: 0,
+            timestamp: now_ms,
         })
         .await
         .unwrap();
@@ -635,7 +667,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_a5,
             grant_version: 5,
             pin_active: false,
-            timestamp: 0,
+            timestamp: now_ms,
         })
         .await
         .unwrap();
@@ -686,7 +718,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: tok_b1,
             grant_version: 1,
             pin_active: true,
-            timestamp: 0,
+            timestamp: now_ms,
         })
         .await
         .unwrap();
@@ -840,7 +872,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
                 token_hash: [0xA9; 32],
                 grant_version: 10,
                 pin_active: true,
-                timestamp: 0,
+                timestamp: now_ms,
             })
             .await
             .unwrap_err()
@@ -855,7 +887,7 @@ pub async fn idempotent_mailbox_store<S: LocalPqHandshakeStore + LocalIdempotent
             token_hash: [0xA9; 32],
             grant_version: 11,
             pin_active: true,
-            timestamp: 0,
+            timestamp: now_ms,
         })
         .await
         .unwrap();

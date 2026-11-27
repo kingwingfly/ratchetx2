@@ -292,7 +292,8 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
         let store = Store::new(&env, MailboxLimits::default().max_fetch_bytes)?;
         storage::testing::attachment_store(&store).await;
         storage::testing::pq_handshake_store(&store).await;
-        storage::testing::idempotent_mailbox_store(&store).await;
+        storage::testing::idempotent_mailbox_store_at(&store, worker::Date::now().as_millis())
+            .await;
         return with_security_headers(Response::ok("the storage conformance suites passed")?);
     }
     if request.path() == NOTIFICATIONS_PATH {

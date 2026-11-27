@@ -825,6 +825,65 @@ mod v2 {
         Ok(())
     }
 
+    /// Lock-free transmission of a previously prepared v2 publish request (after persisting
+    /// `Client::state()`).
+    ///
+    /// Performs zero local state mutation. If `prepared` carried a PQ-enabled manifest and a
+    /// v2 server rolled back to runtime `PQ_ENABLED="false"` refuses PQ-ON with confirmed
+    /// `Unimplemented`:
+    /// - returns `Err(ErrorKind::PqRequired)` when `strict_pq` is `true`, or
+    /// - returns `Ok(PublishV2Outcome::ServerPqDisabled)` when `strict_pq` is `false` without
+    ///   transmitting an OFF manifest. Callers should then run
+    ///   [`Client::prepare_publish_v2_classical_off`], persist [`Client::state`], and transmit
+    ///   the resulting classical-OFF [`PreparedPublishV2`].
+    pub async fn transmit_publish_v2_with(
+        handshake: &impl LocalHandshakeV2,
+        prepared: &PreparedPublishV2,
+        strict_pq: bool,
+    ) -> Result<PublishV2Outcome> {
+        let prepared_pq = prepared
+            .request
+            .manifest
+            .as_ref()
+            .is_some_and(|m| m.pq_enabled);
+        match handshake.publish_v2(prepared.request.clone()).await {
+            Ok(_) => Ok(if prepared_pq {
+                PublishV2Outcome::V2Pq
+            } else {
+                PublishV2Outcome::V2ClassicalOff
+            }),
+            Err(e) if unimplemented_refusal(&e) => {
+                if prepared_pq && let Some(orig_manifest) = prepared.request.manifest.as_ref() {
+                    match check_server_info_with(handshake, &orig_manifest.audience).await {
+                        Ok(info) if !info.pq_enabled => {
+                            if strict_pq {
+                                return Err(Error::from_protocol_with_kind(
+                                    ErrorKind::PqRequired,
+                                    e,
+                                ));
+                            }
+                            return Ok(PublishV2Outcome::ServerPqDisabled);
+                        }
+                        Ok(_) => return Err(e.into()),
+                        Err(info_err) if info_err.kind() == ErrorKind::DowngradeDetected => {
+                            return Err(info_err);
+                        }
+                        Err(info_err)
+                            if info_err.is_connect_error()
+                                && info_err.is_server_refusal()
+                                && info_err.kind() == ErrorKind::Unimplemented =>
+                        {
+                            return Err(e.into());
+                        }
+                        Err(info_err) => return Err(info_err),
+                    }
+                }
+                Err(e.into())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Lock-free Phase 1 of session initiation: claim `peer`'s bundle via
     /// `HandshakeV2::claim_bundle` (with `GetServerInfo` verification on `PQ_ENABLED="false"`
     /// relay rollback), verify `peer`'s signed [`CapabilityManifest`] against `audience`,
@@ -2504,47 +2563,8 @@ mod v2 {
             &self,
             prepared: &PreparedPublishV2,
         ) -> Result<PublishV2Outcome> {
-            let prepared_pq = prepared
-                .request
-                .manifest
-                .as_ref()
-                .is_some_and(|m| m.pq_enabled);
-            match self.handshake.publish_v2(prepared.request.clone()).await {
-                Ok(_) => Ok(if prepared_pq {
-                    PublishV2Outcome::V2Pq
-                } else {
-                    PublishV2Outcome::V2ClassicalOff
-                }),
-                Err(e) if unimplemented_refusal(&e) => {
-                    if prepared_pq && let Some(orig_manifest) = prepared.request.manifest.as_ref() {
-                        match self.check_server_info(&orig_manifest.audience).await {
-                            Ok(info) if !info.pq_enabled => {
-                                if self.state.pq_config.strict_pq {
-                                    return Err(Error::from_protocol_with_kind(
-                                        ErrorKind::PqRequired,
-                                        e,
-                                    ));
-                                }
-                                return Ok(PublishV2Outcome::ServerPqDisabled);
-                            }
-                            Ok(_) => return Err(e.into()),
-                            Err(info_err) if info_err.kind() == ErrorKind::DowngradeDetected => {
-                                return Err(info_err);
-                            }
-                            Err(info_err)
-                                if info_err.is_connect_error()
-                                    && info_err.is_server_refusal()
-                                    && info_err.kind() == ErrorKind::Unimplemented =>
-                            {
-                                return Err(e.into());
-                            }
-                            Err(info_err) => return Err(info_err),
-                        }
-                    }
-                    Err(e.into())
-                }
-                Err(e) => Err(e.into()),
-            }
+            transmit_publish_v2_with(&self.handshake, prepared, self.state.pq_config.strict_pq)
+                .await
         }
 
         /// Generate and publish prekeys + signed [`CapabilityManifest`] via `HandshakeV2`.

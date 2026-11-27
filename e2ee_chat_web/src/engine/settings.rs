@@ -53,30 +53,44 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
 
-        let mut guard = self.lock_inner().await;
+        // Serialize against any in-flight scheduled `publish_full` under `publish_lock` BEFORE
+        // mutating `PqConfig` / `pending_pq_rollback`, preserving the lock order
+        // `publish_lock -> self.inner` while releasing `self.inner` across the publish RPC.
+        let _publish_guard = self.publish_lock.lock().await;
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        let inner = guard.as_mut().ok_or("locked")?;
-        if *inner.client.pq_config() == config
-            && !inner.state.needs_publish
-            && !self.startup.publish_waits_settings()
-        {
-            return Ok(PqSaveOutcome::Unchanged);
-        }
-        let changed = *inner.client.pq_config() != config;
-        inner.save_pq_config(config).await?;
-        if !self.is_live(vgen) {
-            return Err("locked".into());
-        }
-        self.startup.set_publish_waits_settings(false);
-        self.ui.me.set(Some(inner.me()));
-        self.refresh_contacts(inner);
+        let changed = {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let inner = guard.as_mut().ok_or("locked")?;
+            if *inner.client.pq_config() == config
+                && !inner.state.needs_publish
+                && !self.startup.publish_waits_settings()
+            {
+                return Ok(PqSaveOutcome::Unchanged);
+            }
+            let changed = *inner.client.pq_config() != config;
+            inner.save_pq_config(config).await?;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            self.startup.set_publish_waits_settings(false);
+            self.ui.me.set(Some(inner.me()));
+            self.refresh_contacts(inner);
+            changed
+        };
 
-        // Publish immediately so ON<->OFF transitions and suite changes take effect on the server.
-        let outcome = classify_set_pq_publish_result(self.publish_full(inner, true).await);
-        drop(guard);
-        if changed && outcome.is_ok() && self.is_live(vgen) {
+        // Publish immediately outside `self.inner` so ON<->OFF transitions and suite changes take
+        // effect on the server without stalling UI or mailbox commits.
+        let outcome = classify_set_pq_publish_result(self.publish_full_locked(vgen, true).await);
+        drop(_publish_guard);
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
+        if changed && outcome.is_ok() {
             self.wake();
         }
         outcome
@@ -305,7 +319,10 @@ impl<V: VaultStore> Engine<V> {
             }
             let mut grants = std::collections::BTreeSet::new();
             if let Some(inner) = guard.as_mut() {
-                if let Ok((_, _, gp)) = self.replay_deferred_envelopes(inner, Some(&peer)).await {
+                if let Ok((_, _, gp)) = self
+                    .replay_deferred_envelopes(inner, Some(&peer), true)
+                    .await
+                {
                     grants = gp;
                 }
                 if !self.is_live(vgen) {
@@ -338,6 +355,27 @@ impl<V: VaultStore> Engine<V> {
     /// Serialized per peer via `peer_flush_locks` while releasing `self.inner` across all network
     /// RPCs (`ClaimBundle`, `RegisterWriteToken`, `SendInitialV2`).
     pub async fn upgrade_to_pq(&self, peer: PublicKey) -> Result<(), String> {
+        self.upgrade_to_pq_inner(peer, None).await
+    }
+
+    /// Automatic background PQ upgrade pinned strictly to `expected_conversation_gen` and
+    /// requiring the contact to remain an approved, unquarantined chat so deleting a chat and
+    /// receiving a fresh inbound request before the queued upgrade executes can NEVER accept the
+    /// replacement request.
+    pub(super) async fn upgrade_to_pq_auto(
+        &self,
+        peer: PublicKey,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
+        self.upgrade_to_pq_inner(peer, Some(expected_conversation_gen))
+            .await
+    }
+
+    async fn upgrade_to_pq_inner(
+        &self,
+        peer: PublicKey,
+        auto_expected_gen: Option<u64>,
+    ) -> Result<(), String> {
         const MAX_CONFIG_RETRIES: usize = 2;
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
@@ -352,24 +390,40 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
 
+        // Capture the target conversation incarnation ONCE before the `pq_config` retry loop so
+        // config retries can never adopt a recreated conversation or auto-accept a fresh request.
+        let (expected_conversation_gen, expected_active_id, expected_request, expected_quarantined) = {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let inner = guard.as_ref().ok_or("locked")?;
+            let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
+                return Err("no such chat".to_string());
+            };
+            if let Some(want_gen) = auto_expected_gen
+                && (contact.state.conversation_gen != want_gen
+                    || contact.state.request
+                    || contact.state.quarantined)
+            {
+                return Err("chat changed while upgrading; please retry.".to_string());
+            }
+            (
+                contact.state.conversation_gen,
+                contact.session.active_id().copied(),
+                contact.state.request,
+                contact.state.quarantined,
+            )
+        };
+
         let mut attempt = 0usize;
         let (server, new_session_id, outgoing_req) = loop {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            // Phase 1 under `self.inner`: validate preconditions and snapshot claim inputs + exact
-            // conversation incarnation without mutating live session state.
-            let (
-                server,
-                audience,
-                pq_cfg,
-                clock,
-                peer_pq_for_claim,
-                expected_conversation_gen,
-                expected_active_id,
-                expected_request,
-                expected_quarantined,
-            ) = {
+            // Phase 1 under `self.inner`: re-verify preconditions and snapshot claim inputs
+            // without mutating live session state.
+            let (server, audience, pq_cfg, clock, peer_pq_for_claim) = {
                 let guard = self.lock_inner().await;
                 if !self.is_live(vgen) {
                     return Err("locked".into());
@@ -389,6 +443,18 @@ impl<V: VaultStore> Engine<V> {
                 let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
                     return Err("no such chat".to_string());
                 };
+                if contact.state.conversation_gen != expected_conversation_gen
+                    || contact.state.request != expected_request
+                    || contact.state.quarantined != expected_quarantined
+                {
+                    return Err("chat changed while upgrading; please retry.".to_string());
+                }
+                if contact.session.active_id().copied() != expected_active_id {
+                    if contact.has_healthy_pq_session() {
+                        return Ok(());
+                    }
+                    return Err("chat session changed while upgrading; please retry.".to_string());
+                }
                 // Clear any prior classical exception on the local clone used for bundle claim so
                 // `claim_peer_bundle_v2` cannot silently negotiate another classical session.
                 let mut peer_pq_for_claim = contact.session.peer_pq_state().clone();
@@ -399,10 +465,6 @@ impl<V: VaultStore> Engine<V> {
                     pq_cfg,
                     inner.client.clock().clone(),
                     peer_pq_for_claim,
-                    contact.state.conversation_gen,
-                    contact.session.active_id().copied(),
-                    contact.state.request,
-                    contact.state.quarantined,
                 )
             };
 
@@ -420,14 +482,34 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
 
-            // Phase 3 under `self.inner`: re-validate live state, exact conversation generation &
-            // expected session, run synchronous Phase-2 key agreement, and atomically persist
-            // upgraded PQ session + Hello + requeued outbox.
+            // Phase 3 under `self.inner`: re-validate exact conversation incarnation & expected
+            // session FIRST (before any `pq_config` retry), then run synchronous Phase-2 key
+            // agreement and atomically persist upgraded PQ session + Hello + requeued outbox.
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
             let inner = guard.as_mut().ok_or("locked")?;
+            let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
+                return Err("no such chat".to_string());
+            };
+            // Revalidate exact conversation generation, approval/quarantine state, and active
+            // session BEFORE checking `pq_config` retry or applying either success or error so
+            // deleting a chat and receiving a fresh inbound request during `ClaimBundle` can NEVER
+            // accept the new request.
+            let current = &inner.contacts[index];
+            if current.state.conversation_gen != expected_conversation_gen
+                || current.state.request != expected_request
+                || current.state.quarantined != expected_quarantined
+            {
+                return Err("chat changed while upgrading; please retry.".to_string());
+            }
+            if current.session.active_id().copied() != expected_active_id {
+                if current.has_healthy_pq_session() {
+                    return Ok(());
+                }
+                return Err("chat session changed while upgrading; please retry.".to_string());
+            }
             if *inner.client.pq_config() != pq_cfg {
                 drop(claim_res);
                 if attempt < MAX_CONFIG_RETRIES {
@@ -445,25 +527,6 @@ impl<V: VaultStore> Engine<V> {
                     &inner.server_pq,
                     String::new(),
                 ));
-            }
-            let Some(index) = inner.contacts.iter().position(|c| c.peer == peer) else {
-                return Err("no such chat".to_string());
-            };
-            // Revalidate exact conversation generation, approval/quarantine state, and active
-            // session BEFORE applying either success or error so deleting a chat and receiving a
-            // fresh inbound request during `ClaimBundle` can NEVER accept the new request.
-            let current = &inner.contacts[index];
-            if current.state.conversation_gen != expected_conversation_gen
-                || current.state.request != expected_request
-                || current.state.quarantined != expected_quarantined
-            {
-                return Err("chat changed while upgrading; please retry.".to_string());
-            }
-            if current.session.active_id().copied() != expected_active_id {
-                if current.has_healthy_pq_session() {
-                    return Ok(());
-                }
-                return Err("chat session changed while upgrading; please retry.".to_string());
             }
             let claimed = match claim_res {
                 Ok(claimed) => claimed,
@@ -749,7 +812,10 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        let replay_grants = match self.replay_deferred_envelopes(inner, Some(&peer)).await {
+        let replay_grants = match self
+            .replay_deferred_envelopes(inner, Some(&peer), false)
+            .await
+        {
             Ok((_, _, gp)) => gp,
             Err(_) => std::collections::BTreeSet::new(),
         };

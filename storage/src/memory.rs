@@ -647,14 +647,13 @@ impl PqHandshakeStore for MemoryStore {
             || published
                 .prev_signed_prekey
                 .is_some_and(|prev| initial_message.signed_prekey == prev);
-        if !spk_retained {
-            return Err(ErrorKind::StaleVersion.into());
-        }
         let inbox = inner.inboxes.entry(initial_message.recipient).or_default();
         // Prune expired rows BEFORE (sender, ephemeral_key) lookup/insert so an expired entry
         // never collides with a new initial or blocks the cap.
         prune_expired_initials(inbox, now, self.initial_ttl);
 
+        // Check `(sender, ephemeral_key)` idempotency BEFORE SPK retention so retrying an
+        // already-accepted initial after subsequent SPK rotations still succeeds idempotently.
         if let Some(existing) = inbox.initial_messages.iter().find(|entry| {
             entry.message.sender == initial_message.sender
                 && entry.message.ephemeral_key == initial_message.ephemeral_key
@@ -663,6 +662,10 @@ impl PqHandshakeStore for MemoryStore {
                 return Ok(Some(existing.message.id));
             }
             return Err(ErrorKind::InvalidArgument.into());
+        }
+
+        if !spk_retained {
+            return Err(ErrorKind::StaleVersion.into());
         }
 
         if inbox.initial_messages.len() >= limit {
@@ -971,7 +974,7 @@ impl IdempotentMailboxStore for MemoryStore {
         }
         // Re-verify signed request freshness at commit time before pruning or mutation so a
         // delayed registration can never outlive `revocation_tombstone_ttl`.
-        if record.timestamp > 0 && wall_now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW_MS {
+        if wall_now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW_MS {
             return Err(ErrorKind::StaleTimestamp.into());
         }
 
@@ -1071,6 +1074,12 @@ impl IdempotentMailboxStore for MemoryStore {
             }
             if let Some(peer) = mailbox.peer_grants.get_mut(&record.peer_slot_id) {
                 peer.live_tokens = peer.live_tokens.saturating_sub(evicted);
+            }
+            // If the just-inserted token itself was immediately evicted (delayed lower-version
+            // grant against a full peer slot with a newer pinned token), fail with `StaleVersion`
+            // so callers never clear a pending active grant when the token did not stick.
+            if !mailbox.write_tokens.contains_key(&record.token_hash) {
+                return Err(ErrorKind::StaleVersion.into());
             }
         }
 
@@ -1250,7 +1259,7 @@ mod test {
                 token_hash,
                 grant_version,
                 pin_active,
-                timestamp: 0,
+                timestamp: wall_clock_ms(),
             })
             .await
             .unwrap();
@@ -1627,7 +1636,7 @@ mod test {
                         token_hash: [33; 32],
                         grant_version: 1,
                         pin_active: true,
-                        timestamp: 0,
+                        timestamp: wall_clock_ms(),
                     })
                     .await
                     .unwrap_err()
@@ -1659,7 +1668,7 @@ mod test {
                         token_hash: [23; 32],
                         grant_version: 5,
                         pin_active: true,
-                        timestamp: 0,
+                        timestamp: wall_clock_ms(),
                     })
                     .await
                     .unwrap_err()
@@ -1761,8 +1770,23 @@ mod test {
             let slot = [0x51; 32];
             register_identity(&store, bob).await;
 
-            // 1. Stale wall-clock timestamp on register_write_token is rejected (`StaleTimestamp`).
+            // 1. Zero and stale wall-clock timestamps on register_write_token are rejected (`StaleTimestamp`).
             let now_ms = wall_clock_ms();
+            assert_eq!(
+                store
+                    .register_write_token(RegisterWriteTokenRecord {
+                        recipient: bob,
+                        peer_slot_id: slot,
+                        token_hash: [0xA1; 32],
+                        grant_version: 1,
+                        pin_active: false,
+                        timestamp: 0,
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleTimestamp
+            );
             let stale_ts = now_ms.saturating_sub(MAX_CLOCK_SKEW_MS + 10_000).max(1);
             assert_eq!(
                 store
@@ -1908,10 +1932,19 @@ mod test {
                     .unwrap()
                     .is_some()
             );
-            // Rotate spk2 -> spk3: spk3 & spk2 accepted, retired spk1 rejected (`StaleVersion`).
+            // Rotate spk2 -> spk3: spk3 & spk2 accepted, brand-new retired spk1 rejected
+            // (`StaleVersion`), while retrying ALREADY-ACCEPTED `mk_init(1, spk1)` preserves
+            // strict `(sender, ephemeral_key)` idempotency (`R3-P3-1`).
             assert_eq!(
                 store.publish_v2(publish_spk(4, spk3)).await.unwrap(),
                 PublishV2Status::Stored
+            );
+            assert!(
+                store
+                    .add_initial_message_v2(mk_init(1, spk1), 10)
+                    .await
+                    .unwrap()
+                    .is_some()
             );
             assert!(
                 store
@@ -1930,6 +1963,29 @@ mod test {
             assert_eq!(
                 store
                     .add_initial_message_v2(mk_init(6, spk1), 10)
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::StaleVersion
+            );
+
+            // 4. R3-P2-2: Delayed lower-version `pin_active: true` grant against a full 4-token
+            //    slot with a newer pinned token is immediately evicted -> returns `StaleVersion`.
+            let full_slot = [0x52; 32];
+            register_grant(&store, bob, full_slot, [0xD0; 32], 10, true).await;
+            register_grant(&store, bob, full_slot, [0xD6; 32], 6, false).await;
+            register_grant(&store, bob, full_slot, [0xD7; 32], 7, false).await;
+            register_grant(&store, bob, full_slot, [0xD8; 32], 8, false).await;
+            assert_eq!(
+                store
+                    .register_write_token(RegisterWriteTokenRecord {
+                        recipient: bob,
+                        peer_slot_id: full_slot,
+                        token_hash: [0xD5; 32],
+                        grant_version: 5,
+                        pin_active: true,
+                        timestamp: wall_clock_ms(),
+                    })
                     .await
                     .unwrap_err()
                     .kind(),

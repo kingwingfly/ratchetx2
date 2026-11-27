@@ -492,7 +492,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             <Messages
                 peer
                 label=Signal::derive(label)
-                greeting_unsent=Signal::derive(greeting_unconfirmed)
+                greeting_unsent=Signal::derive(greeting_unsent)
+                greeting_uncertain=Signal::derive(greeting_uncertain)
                 awaiting_acceptance=Signal::derive(awaiting_acceptance)
             />
             <Uploads peer />
@@ -550,6 +551,7 @@ fn Messages(
     peer: PublicKey,
     label: Signal<String>,
     greeting_unsent: Signal<bool>,
+    greeting_uncertain: Signal<bool>,
     awaiting_acceptance: Signal<bool>,
 ) -> impl IntoView {
     let ui = ui();
@@ -666,7 +668,14 @@ fn Messages(
                 each=move || ui.messages.get()
                 key=|message| message.index
                 children=move |message| {
-                    message_item(peer, message, label, greeting_unsent, awaiting_acceptance)
+                    message_item(
+                        peer,
+                        message,
+                        label,
+                        greeting_unsent,
+                        greeting_uncertain,
+                        awaiting_acceptance,
+                    )
                 }
             />
         </div>
@@ -682,6 +691,7 @@ fn message_item(
     message: MessageRow,
     label: Signal<String>,
     greeting_unsent: Signal<bool>,
+    greeting_uncertain: Signal<bool>,
     awaiting_acceptance: Signal<bool>,
 ) -> AnyView {
     let ui = ui();
@@ -775,6 +785,8 @@ fn message_item(
                 "waiting for server sign-in"
             } else if greeting_unsent.get() {
                 "waiting to send chat request"
+            } else if greeting_uncertain.get() {
+                "confirming chat request delivery"
             } else if awaiting_acceptance.get() {
                 "waiting for peer to accept"
             } else {

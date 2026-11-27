@@ -168,6 +168,11 @@ pub struct Engine<V = Vault> {
     inner: Mutex<Option<Inner<V>>>,
     /// Serializes unified `mailbox.v2` fetch/ack passes without holding `self.inner` across RTTs.
     mailbox_lock: Mutex<()>,
+    /// Serializes `handshake.v2` inbox `list`/`process`/`ack` pagination without holding
+    /// `self.inner` across network RTTs (preventing concurrent resurrection of deleted requests).
+    inbox_lock: Mutex<()>,
+    /// Serializes full prekey/manifest publishes without holding `self.inner` across network RTTs.
+    publish_lock: Mutex<()>,
     /// Monotonic vault lifecycle generation bumped on every create/unlock and synchronously inside
     /// [`Engine::teardown_on_pagehide`] so any in-flight async continuation aborts cleanly without
     /// mutating IndexedDB or repopulating `Ui` signals.
@@ -300,13 +305,16 @@ impl<V> Drop for InnerGuard<'_, V> {
     }
 }
 
-/// Outbox head currently in flight in `Engine::flush`'s lock-free `PushV2` RPC, protecting it
-/// from concurrent `requeue_sealed` unsealing until its relay outcome settles.
+/// Outbox head currently in flight in `Engine::flush`'s lock-free `PushV2` RPC (or already
+/// accepted by the relay and awaiting local `commit_outbox_item` persistence), protecting it
+/// from concurrent `requeue_sealed` unsealing until its local commit settles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct InFlightPush {
     pub(super) conversation_gen: u64,
     pub(super) history_index: u64,
     pub(super) clock: u64,
+    pub(super) session_id: Option<[u8; 32]>,
+    pub(super) relayed: bool,
 }
 
 /// The unlocked client.
@@ -421,6 +429,8 @@ impl<V: VaultStore> Engine<V> {
             ui,
             inner: Mutex::new(None),
             mailbox_lock: Mutex::new(()),
+            inbox_lock: Mutex::new(()),
+            publish_lock: Mutex::new(()),
             vault_generation: Cell::new(0),
             shutting_down: Cell::new(false),
             ws_close: RefCell::new(None),
@@ -1127,6 +1137,7 @@ impl Engine<Vault> {
             client: Some(client.state().into()),
             server,
             name: checked_name(&name).map_err(VaultOpenError::Failed)?,
+            next_conversation_gen: 1,
             ..AppState::default()
         };
         let vault = Vault::create(passphrase.as_bytes(), &state, &cancel)
@@ -1151,20 +1162,25 @@ impl Engine<Vault> {
             client: None,
             ..state
         };
-        self.unlocked(
-            vgen,
-            Inner::new(
-                vault,
-                address,
-                audience,
-                state,
-                client,
-                vec![],
-                vec![],
-                DeferredRecord::default(),
-            ),
-        )
-        .await;
+        if !self
+            .unlocked(
+                vgen,
+                Inner::new(
+                    vault,
+                    address,
+                    audience,
+                    state,
+                    client,
+                    vec![],
+                    vec![],
+                    DeferredRecord::default(),
+                ),
+                Some(&cancel),
+            )
+            .await
+        {
+            return Err(VaultOpenError::Cancelled);
+        }
         Ok(())
     }
 
@@ -1214,10 +1230,26 @@ impl Engine<Vault> {
             ClientState::try_from(&client).map_err(|e| VaultOpenError::Failed(describe(&e)))?,
         )
         .with_clock(transport::clock(&address));
-        let (mut contacts, isolated_contacts, warnings) = restore_contacts(
+        let (mut contacts, mut isolated_contacts, warnings) = restore_contacts(
             std::mem::take(&mut state.contacts),
             &client.identity_key(),
             &address,
+        );
+        let now_ms = crate::util::now();
+        let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
+        let (pruned_deferred, modified_deferred) =
+            handshake::sanitize_deferred_initials(&mut deferred.entries, now_ms);
+        let pruned_carried_ts = handshake::prune_carried_timestamps_for_contacts(
+            &mut deferred.carried_timestamps,
+            contacts.iter(),
+            isolated_contacts.iter(),
+        );
+        let pruned_envelopes = sync::prune_deferred_envelopes(
+            &mut deferred.envelopes,
+            &mut contacts,
+            &mut isolated_contacts,
+            &client.identity_key(),
+            now_ms,
         );
         let mut isolated_eviction_notices: Vec<String> = Vec::new();
         for contact in &mut contacts {
@@ -1230,22 +1262,6 @@ impl Engine<Vault> {
                 ));
             }
         }
-        let now_ms = crate::util::now();
-        let pruned = handshake::prune_invalid_inbox_acks(&mut state.pending_inbox_acks);
-        let (pruned_deferred, modified_deferred) =
-            handshake::sanitize_deferred_initials(&mut deferred.entries, now_ms);
-        let pruned_carried_ts = handshake::prune_carried_timestamps_for_contacts(
-            &mut deferred.carried_timestamps,
-            contacts.iter(),
-            isolated_contacts.iter(),
-        );
-        let pruned_envelopes = sync::prune_deferred_envelopes(
-            &mut deferred.envelopes,
-            &contacts,
-            &isolated_contacts,
-            &client.identity_key(),
-            now_ms,
-        );
         let mut inner = Inner::new(
             vault,
             address,
@@ -1265,7 +1281,9 @@ impl Engine<Vault> {
         {
             inner.unsaved_state = true;
         }
-        self.unlocked(vgen, inner).await;
+        if !self.unlocked(vgen, inner, Some(&cancel)).await {
+            return Err(VaultOpenError::Cancelled);
+        }
         if !self.is_live(vgen) {
             return Err(VaultOpenError::Cancelled);
         }
@@ -1300,9 +1318,37 @@ impl Engine<Vault> {
         Ok(())
     }
 
-    async fn unlocked(self: &Rc<Self>, vgen: u64, inner: Inner) {
+    async fn abort_cancelled_unlock(&self, vgen: u64) {
+        {
+            let mut slot = self.lock_inner().await;
+            let _ = slot.take();
+        }
         if !self.is_live(vgen) {
             return;
+        }
+        self.ui.me.set(None);
+        self.ui.contacts.set(vec![]);
+        self.ui.isolated_contacts.set(vec![]);
+        self.ui.uploads.set(vec![]);
+        self.ui.held.set(HashSet::new());
+        self.ui.dialog.set(None);
+        self.ui.phase.set(Phase::Locked);
+    }
+
+    async fn unlocked(
+        self: &Rc<Self>,
+        vgen: u64,
+        inner: Inner,
+        cancel: Option<&KdfCancelToken>,
+    ) -> bool {
+        let cancelled = || cancel.is_some_and(KdfCancelToken::is_cancelled);
+        if !self.is_live(vgen) {
+            return false;
+        }
+        if cancelled() {
+            drop(inner);
+            self.abort_cancelled_unlock(vgen).await;
+            return false;
         }
         let can_sign_in_here = same_server(&inner.server, &origin());
         self.startup.set_can_sign_in_here(can_sign_in_here);
@@ -1314,7 +1360,12 @@ impl Engine<Vault> {
             Ok(uploads) => {
                 for (peer, pending) in uploads {
                     if !self.is_live(vgen) {
-                        return;
+                        return false;
+                    }
+                    if cancelled() {
+                        drop(inner);
+                        self.abort_cancelled_unlock(vgen).await;
+                        return false;
                     }
                     // Done, but left behind, as forgetting it failed (or tab closed after
                     // keeping the final chunk before `forget_upload` committed).
@@ -1330,7 +1381,12 @@ impl Engine<Vault> {
                             ) >= chunks)
                     {
                         if !self.is_live(vgen) {
-                            return;
+                            return false;
+                        }
+                        if cancelled() {
+                            drop(inner);
+                            self.abort_cancelled_unlock(vgen).await;
+                            return false;
                         }
                         let _ = inner.vault.forget_upload(&peer, &pending.id).await;
                         continue;
@@ -1346,13 +1402,23 @@ impl Engine<Vault> {
                         })
                     {
                         if !self.is_live(vgen) {
-                            return;
+                            return false;
+                        }
+                        if cancelled() {
+                            drop(inner);
+                            self.abort_cancelled_unlock(vgen).await;
+                            return false;
                         }
                         let _ = inner.vault.forget_upload(&peer, &pending.id).await;
                         continue;
                     }
                     if !self.is_live(vgen) {
-                        return;
+                        return false;
+                    }
+                    if cancelled() {
+                        drop(inner);
+                        self.abort_cancelled_unlock(vgen).await;
+                        return false;
                     }
                     let reason = if pending.started() {
                         "choose the file again to go on"
@@ -1363,24 +1429,41 @@ impl Engine<Vault> {
                     self.show_upload(&peer, &pending, UploadState::Paused(reason.to_string()));
                 }
             }
-            Err(e) if self.is_live(vgen) => self.ui.notify(describe(&e)),
-            Err(_) => return,
+            Err(e) if self.is_live(vgen) && !cancelled() => self.ui.notify(describe(&e)),
+            Err(_) => {
+                if cancelled() {
+                    drop(inner);
+                    self.abort_cancelled_unlock(vgen).await;
+                }
+                return false;
+            }
         }
         if !self.is_live(vgen) {
-            return;
+            return false;
+        }
+        if cancelled() {
+            drop(inner);
+            self.abort_cancelled_unlock(vgen).await;
+            return false;
         }
         {
             let mut slot = self.lock_inner().await;
             if !self.is_live(vgen) || slot.is_some() {
-                return;
+                return false;
+            }
+            if cancelled() {
+                drop(slot);
+                drop(inner);
+                self.abort_cancelled_unlock(vgen).await;
+                return false;
             }
             *slot = Some(inner);
         }
         if let Some(dialog) = invitation() {
-            forget_invitation();
             // Proactively check `/auth` (bounded by a short timeout so offline unlock never hangs)
             // so first-time invitees see SignInDialog directly without flashing NewChat or losing
-            // the invitation link.
+            // the invitation link. Defer clearing the URL hash until we confirm unlock isn't
+            // cancelled so cancelling during `/auth` leaves the invitation intact.
             let signed_in = if can_sign_in_here {
                 match select(
                     Box::pin(self.signed_in()),
@@ -1396,15 +1479,24 @@ impl Engine<Vault> {
                 None
             };
             if !self.is_live(vgen) {
-                return;
+                return false;
             }
+            if cancelled() {
+                self.abort_cancelled_unlock(vgen).await;
+                return false;
+            }
+            forget_invitation();
             let initial =
                 self.startup
                     .on_unlock_with_invitation(dialog, can_sign_in_here, signed_in);
             self.ui.dialog.set(Some(initial));
         }
         if !self.is_live(vgen) {
-            return;
+            return false;
+        }
+        if cancelled() {
+            self.abort_cancelled_unlock(vgen).await;
+            return false;
         }
         self.ui.phase.set(Phase::Unlocked);
         self.ui.log("vault unlocked");
@@ -1415,6 +1507,7 @@ impl Engine<Vault> {
             let engine = engine.clone();
             spawn_local(async move { engine.serve_media(request, vgen).await });
         });
+        true
     }
 }
 
@@ -1949,7 +2042,10 @@ impl<V: VaultStore> Engine<V> {
             }
             let mut grants = std::collections::BTreeSet::new();
             if let Some(inner) = guard.as_mut() {
-                if let Ok((_, _, gp)) = self.replay_deferred_envelopes(inner, Some(&peer)).await {
+                if let Ok((_, _, gp)) = self
+                    .replay_deferred_envelopes(inner, Some(&peer), false)
+                    .await
+                {
                     grants = gp;
                 }
                 if !self.is_live(vgen) {
@@ -2526,9 +2622,30 @@ impl<V: VaultStore> Inner<V> {
         self.vault
             .forget(&state, &deferred, peer, unsaved, unsaved_outbox)
             .await?;
+        let forgotten_gen = self
+            .contacts
+            .iter()
+            .find(|c| c.peer == *peer)
+            .map(|c| c.state.conversation_gen)
+            .into_iter()
+            .chain(
+                self.isolated_contacts
+                    .iter()
+                    .filter(|c| c.peer.as_slice() == peer.as_slice())
+                    .map(|c| c.conversation_gen),
+            )
+            .max()
+            .unwrap_or(0);
+        self.state.next_conversation_gen = self
+            .state
+            .next_conversation_gen
+            .max(state.next_conversation_gen)
+            .max(forgotten_gen.saturating_add(1))
+            .max(1);
         self.state.next_session_seq = state.next_session_seq;
         self.state.farewells = state.farewells;
         self.state.pending_revokes = state.pending_revokes;
+        self.in_flight_push.remove(peer);
         self.contacts.retain(|contact| contact.peer != *peer);
         self.forget_isolated_peer(peer);
         self.pending_pq_contact_flags.remove(peer);

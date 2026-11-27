@@ -594,14 +594,6 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             else {
                 return Ok(AddInitialOutcome::NotFound);
             };
-            let spk_retained = retained.signed_prekey.as_ref() == message.signed_prekey.as_slice()
-                || retained
-                    .prev_signed_prekey
-                    .as_ref()
-                    .is_some_and(|prev| prev.as_ref() == message.signed_prekey.as_slice());
-            if !spk_retained {
-                return Ok(AddInitialOutcome::StalePrekey);
-            }
             // Prune expired rows BEFORE `(sender, ephemeral_key)` lookup/insert so an expired row
             // never collides with UNIQUE(sender, ephemeral_key) or occupies an inbox slot.
             sql.exec(
@@ -609,6 +601,8 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 params![cutoff]?,
             )?;
 
+            // Check `(sender, ephemeral_key)` idempotency BEFORE SPK retention so retrying an
+            // already-accepted row after subsequent SPK rotations preserves idempotent delivery.
             if let Some(existing) = sql.query_opt::<InitialPayloadRow>(
                 "SELECT id, payload_hash FROM initial_messages \
                  WHERE sender = ? AND ephemeral_key = ?",
@@ -621,6 +615,15 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                     });
                 }
                 return Ok(AddInitialOutcome::PayloadMismatch);
+            }
+
+            let spk_retained = retained.signed_prekey.as_ref() == message.signed_prekey.as_slice()
+                || retained
+                    .prev_signed_prekey
+                    .as_ref()
+                    .is_some_and(|prev| prev.as_ref() == message.signed_prekey.as_slice());
+            if !spk_retained {
+                return Ok(AddInitialOutcome::StalePrekey);
             }
 
             let count: CountRow =
@@ -1240,11 +1243,22 @@ mod tests {
                 AddInitialOutcome::Added { inserted: true, .. }
             ));
 
-            // Rotate spk2 -> spk3: spk3 & spk2 accepted, retired spk1 returns StalePrekey.
+            // Rotate spk2 -> spk3: spk3 & spk2 accepted, brand-new retired spk1 returns
+            // StalePrekey, while retrying ALREADY-ACCEPTED `mk_spk_init(1, spk1)` preserves
+            // strict `(sender, ephemeral_key)` idempotency (`Added { inserted: false }`)!
             assert_eq!(
                 store.publish_v2(&publish_spk(5, spk3)).unwrap(),
                 PublishV2Status::Stored
             );
+            assert!(matches!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(1, spk1), 10, 2_150)
+                    .unwrap(),
+                AddInitialOutcome::Added {
+                    inserted: false,
+                    ..
+                }
+            ));
             assert!(matches!(
                 store
                     .add_initial_message_v2(&mk_spk_init(5, spk2), 10, 2_200)

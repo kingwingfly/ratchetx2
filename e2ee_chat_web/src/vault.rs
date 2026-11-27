@@ -413,18 +413,27 @@ fn read_rollback_anchor() -> Option<RollbackAnchor> {
     }
 }
 
-/// Whether `localStorage` currently retains any non-empty v3 rollback anchor entry (valid or
-/// tampered), indicating a vault previously existed in this browser.
+/// Whether `localStorage` currently retains any non-empty v3 or legacy v1/v2 rollback anchor
+/// entry (valid or tampered), indicating a vault previously existed in this browser.
 fn has_rollback_anchor_entry() -> bool {
     #[cfg(target_arch = "wasm32")]
     {
-        web_sys::window()
-            .and_then(|w| w.local_storage().ok().flatten())
-            .and_then(|s| s.get_item(ROLLBACK_ANCHOR_KEY).ok().flatten())
-            .is_some_and(|raw| !raw.trim().is_empty())
+        let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) else {
+            return false;
+        };
+        [ROLLBACK_ANCHOR_KEY, LEGACY_ROLLBACK_ANCHOR_KEY]
+            .into_iter()
+            .any(|key| {
+                storage
+                    .get_item(key)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|raw| !raw.trim().is_empty())
+            })
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
+        let _ = (ROLLBACK_ANCHOR_KEY, LEGACY_ROLLBACK_ANCHOR_KEY);
         false
     }
 }
@@ -2124,7 +2133,7 @@ impl Vault {
         ensure_vault_lock_owned(lock_generation)?;
         let plain = open_bytes(&keys.state_key, &state_v3_aad(&header_bytes), &sealed_state)
             .ok_or_else(|| Error::Corrupt("vault state failed authentication".into()))?;
-        let state =
+        let mut state =
             AppState::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))?;
         if state.record_epoch == 0 {
             return Err(Error::Corrupt("vault state missing record_epoch".into()));
@@ -2156,6 +2165,7 @@ impl Vault {
             .next_conversation_gen
             .max(max_existing_gen.saturating_add(1))
             .max(1);
+        state.next_conversation_gen = next_conversation_gen;
         scopeguard::ScopeGuard::into_inner(close_on_err);
         let vault = Self {
             database,

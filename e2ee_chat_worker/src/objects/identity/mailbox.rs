@@ -420,7 +420,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             }
             // Enforce signed timestamp freshness at DO commit time so a delayed registration can
             // never outlive `REVOCATION_TOMBSTONE_TTL_MS` (2 * MAX_CLOCK_SKEW + 60s).
-            if record.timestamp > 0 && now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW {
+            if now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW {
                 return Ok(RegisterWriteTokenOutcome::StaleTimestamp);
             }
             prune_expired_peer_grants_sql(sql, now_ms)?;
@@ -556,6 +556,19 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                         to_evict
                     ]?,
                 )?;
+                // If the just-inserted token itself was immediately evicted (e.g., delayed
+                // lower-version grant against a full peer slot with a newer pinned token),
+                // return `StaleVersion` instead of `Registered` so the client keeps sends gated
+                // and re-stages at a higher version.
+                let survived = sql
+                    .query_opt::<WriteTokenRow>(
+                        "SELECT peer_slot_id FROM write_tokens WHERE token_hash = ?",
+                        params![record.token_hash.as_slice()]?,
+                    )?
+                    .is_some();
+                if !survived {
+                    return Ok(RegisterWriteTokenOutcome::StaleVersion);
+                }
             }
 
             Ok(RegisterWriteTokenOutcome::Registered)
@@ -965,7 +978,7 @@ mod tests {
                             token_hash: tok(1),
                             grant_version: 1,
                             pin_active: true,
-                            timestamp: 0,
+                            timestamp: 1_000,
                         },
                         1_000
                     )
@@ -982,7 +995,7 @@ mod tests {
                             token_hash: tok(1),
                             grant_version: 1,
                             pin_active: true,
-                            timestamp: 0,
+                            timestamp: 1_000,
                         },
                         1_000
                     )
@@ -1000,7 +1013,7 @@ mod tests {
                                 token_hash: tok(ver),
                                 grant_version: u64::from(ver),
                                 pin_active: false,
-                                timestamp: 0,
+                                timestamp: 1_000 + u64::from(ver),
                             },
                             1_000 + u64::from(ver)
                         )
@@ -1018,7 +1031,7 @@ mod tests {
                             token_hash: tok(2),
                             grant_version: 99,
                             pin_active: false,
-                            timestamp: 0,
+                            timestamp: 2_000,
                         },
                         2_000
                     )
@@ -1035,7 +1048,7 @@ mod tests {
                             token_hash: tok(5),
                             grant_version: 5,
                             pin_active: false,
-                            timestamp: 0,
+                            timestamp: 2_001,
                         },
                         2_001
                     )
@@ -1242,7 +1255,7 @@ mod tests {
                             token_hash: tok(10),
                             grant_version: 1,
                             pin_active: true,
-                            timestamp: 0,
+                            timestamp: 5_000,
                         },
                         5_000,
                         1
@@ -1259,7 +1272,7 @@ mod tests {
                             token_hash: tok(11),
                             grant_version: 1,
                             pin_active: true,
-                            timestamp: 0,
+                            timestamp: 5_000,
                         },
                         5_000,
                         1
@@ -1285,7 +1298,7 @@ mod tests {
                                 token_hash: tok(token_id),
                                 grant_version: 1,
                                 pin_active: true,
-                                timestamp: 0,
+                                timestamp: 1_000,
                             },
                             1_000
                         )
@@ -1364,6 +1377,89 @@ mod tests {
                 .query_one("SELECT count(*) AS count FROM dedup_counts", vec![])
                 .unwrap();
             assert_eq!(dedup_counts_left.count, 0);
+        }
+
+        #[test]
+        fn r3_p2_2_and_r3_p3_2_self_evicted_grant_returns_stale_version_and_zero_ts_rejected() {
+            let env = TestIdentity::new(100_000);
+            publish_bob(&env);
+            let store = env.store();
+            let now_ms = 500_000;
+
+            // R3-P3-2: timestamp == 0 is unconditionally rejected with StaleTimestamp.
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(1),
+                            token_hash: tok(1),
+                            grant_version: 1,
+                            pin_active: true,
+                            timestamp: 0,
+                        },
+                        now_ms,
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::StaleTimestamp
+            );
+
+            // R3-P2-2: Fill peer slot with 4 tokens (pinned v10 + non-pinned v6, v7, v8).
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(1),
+                            token_hash: tok(10),
+                            grant_version: 10,
+                            pin_active: true,
+                            timestamp: now_ms,
+                        },
+                        now_ms,
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::Registered
+            );
+            for ver in 6..=8u32 {
+                assert_eq!(
+                    store
+                        .register_write_token(
+                            &RegisterWriteTokenRecord {
+                                recipient: BOB,
+                                peer_slot_id: slot(1),
+                                token_hash: tok(ver),
+                                grant_version: u64::from(ver),
+                                pin_active: false,
+                                timestamp: now_ms,
+                            },
+                            now_ms,
+                        )
+                        .unwrap(),
+                    RegisterWriteTokenOutcome::Registered
+                );
+            }
+
+            // A delayed `pin_active: true` grant at lower version v5 is immediately evicted and
+            // MUST return `StaleVersion` (NOT `Registered`).
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(1),
+                            token_hash: tok(5),
+                            grant_version: 5,
+                            pin_active: true,
+                            timestamp: now_ms,
+                        },
+                        now_ms,
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::StaleVersion
+            );
+            assert!(!store.has_write_token(&tok(5)).unwrap());
+            assert!(store.has_write_token(&tok(10)).unwrap());
         }
     }
 }

@@ -312,6 +312,9 @@ pub(super) struct SendQueue {
     /// Per-peer exponential backoff after `WriteTokenRejected` while awaiting peer approval:
     /// maps `peer -> (next_try_monotonic_ms, current_delay_ms)`.
     approval_backoff: RefCell<HashMap<PublicKey, (u64, u64)>>,
+    /// Per-peer exponential backoff for empty-outbox `CONFIRMED`-greeting manifest SPK-rotation
+    /// probes so polling stays bounded without delaying outbound `flush()` when the user writes.
+    confirmed_probe_backoff: RefCell<HashMap<PublicKey, (u64, u64)>>,
     /// Per-peer serialization mutexes for outbox flushes (`ClaimBundle`, `RegisterWriteToken`,
     /// `SendInitialV2`, `PushV2`, `push_events`), stored as `Weak` handles so an in-flight flush's
     /// mutex remains uniquely shared across concurrent delete+recreate cycles and is pruned cleanly
@@ -395,10 +398,12 @@ impl SendQueue {
 
     pub(super) fn clear_approval_backoff(&self, peer: &PublicKey) {
         self.approval_backoff.borrow_mut().remove(peer);
+        self.confirmed_probe_backoff.borrow_mut().remove(peer);
     }
 
     pub(super) fn clear_all_approval_backoffs(&self) {
         self.approval_backoff.borrow_mut().clear();
+        self.confirmed_probe_backoff.borrow_mut().clear();
     }
 
     pub(super) fn has_approval_backoff(&self, peer: &PublicKey) -> bool {
@@ -425,11 +430,33 @@ impl SendQueue {
         delay
     }
 
+    pub(super) fn is_confirmed_probe_backed_off(&self, peer: &PublicKey) -> bool {
+        self.confirmed_probe_backoff
+            .borrow()
+            .get(peer)
+            .is_some_and(|&(next_try, _)| monotonic_now_ms() < next_try)
+    }
+
+    /// Record or advance per-peer backoff for empty-outbox `CONFIRMED` greeting SPK-rotation
+    /// probes (`15s -> 30s -> 60s -> 5m`) independently of `approval_backoff`.
+    pub(super) fn record_confirmed_probe_backoff(&self, peer: &PublicKey) -> u64 {
+        let mut map = self.confirmed_probe_backoff.borrow_mut();
+        let delay = match map.get(peer).map(|&(_, prev)| prev) {
+            None => 15_000,
+            Some(15_000) => 30_000,
+            Some(30_000) => 60_000,
+            Some(_) => 300_000,
+        };
+        map.insert(*peer, (monotonic_now_ms().saturating_add(delay), delay));
+        delay
+    }
+
     pub(super) fn clear_on_teardown(&self) {
         self.wake.set(false);
         self.sending.borrow_mut().clear();
         self.waits_sign_in.borrow_mut().clear();
         self.approval_backoff.borrow_mut().clear();
+        self.confirmed_probe_backoff.borrow_mut().clear();
         self.peer_flush_locks.borrow_mut().clear();
     }
 

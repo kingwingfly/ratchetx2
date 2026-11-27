@@ -238,6 +238,16 @@ impl ClientState {
         }
     }
 
+    /// Whether recording another manifest digest can fit within `MAX_RECENT_MANIFEST_DIGESTS`
+    /// without evicting any digest listed in `preserve`.
+    pub fn has_spare_manifest_digest_slot(&self, preserve: &[[u8; 32]]) -> bool {
+        self.recent_manifest_digests.len() < MAX_RECENT_MANIFEST_DIGESTS
+            || self
+                .recent_manifest_digests
+                .iter()
+                .any(|d| !preserve.contains(d))
+    }
+
     /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`
     /// while preferring to keep any digests listed in `preserve` (e.g. deferred unsupported-suite
     /// initials waiting for replay) and NEVER evicting the newly pushed digest. Returns the
@@ -595,6 +605,12 @@ impl<H> Client<H> {
     /// Monotonic `CapabilityManifest.manifest_seq` last prepared/published by this client.
     pub fn manifest_seq(&self) -> u64 {
         self.state.manifest_seq
+    }
+
+    /// Whether recording another manifest digest can fit within `MAX_RECENT_MANIFEST_DIGESTS`
+    /// without evicting any digest listed in `preserve`.
+    pub fn has_spare_manifest_digest_slot(&self, preserve: &[[u8; 32]]) -> bool {
+        self.state.has_spare_manifest_digest_slot(preserve)
     }
 
     /// Prekey generation number last prepared/published via v2 by this client.

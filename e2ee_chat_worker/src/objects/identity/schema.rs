@@ -9,7 +9,11 @@
 use storage::MAX_SAFE_INTEGER;
 use worker::{Error, Result};
 
-use super::{IdentityStore, mailbox::DEDUP_TTL_MS, rows::SchemaVersionRow};
+use super::{
+    IdentityStore,
+    mailbox::DEDUP_TTL_MS,
+    rows::{CountRow, SchemaVersionRow},
+};
 use crate::objects::{
     has_table,
     sql::{SqlExec, params},
@@ -155,6 +159,24 @@ fn version_mismatch_error(found: u64) -> Error {
     ))
 }
 
+/// Idempotently add `capability_manifest.prev_signed_prekey` when opening an earlier `SCHEMA_V5`
+/// database created prior to retired-SPK tracking so neither reads nor writes fail with
+/// `"no such column: prev_signed_prekey"`.
+fn ensure_v5_prev_spk_column<S: SqlExec>(sql: &S) -> Result<()> {
+    let col: CountRow = sql.query_one(
+        "SELECT count(*) AS count FROM pragma_table_info('capability_manifest') \
+         WHERE name = 'prev_signed_prekey'",
+        vec![],
+    )?;
+    if col.count == 0 {
+        sql.exec(
+            "ALTER TABLE capability_manifest ADD COLUMN prev_signed_prekey BLOB",
+            vec![],
+        )?;
+    }
+    Ok(())
+}
+
 impl<S: SqlExec> IdentityStore<'_, S> {
     /// Whether canonical `SCHEMA_V5` tables exist, leaving unknown-identity DOs unallocated and
     /// failing closed if `meta.schema_version != 5`.
@@ -170,6 +192,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             vec![],
         )? {
             Some(row) if row.schema_version == CURRENT_SCHEMA_VERSION => {
+                ensure_v5_prev_spk_column(self.sql)?;
                 self.cache.schema_ready.set(true);
                 Ok(true)
             }
@@ -194,7 +217,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
     /// `meta.schema_version != 5`.
     ///
     /// Fast path: zero SQL statements after the first check in this DO instance, and zero DDL
-    /// statements on cold start when `meta.schema_version == 5`.
+    /// statements on cold start when `meta.schema_version == 5` and `prev_signed_prekey` exists.
     pub(super) fn ensure_v5_tables(&self) -> Result<()> {
         if self.has_tables()? {
             return Ok(());
@@ -207,6 +230,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 )?
             {
                 if row.schema_version == CURRENT_SCHEMA_VERSION {
+                    ensure_v5_prev_spk_column(sql)?;
                     return Ok(());
                 }
                 return Err(version_mismatch_error(row.schema_version));
@@ -465,5 +489,113 @@ mod tests {
             .query_one("SELECT schema_version FROM meta WHERE only = 0", vec![])
             .unwrap();
         assert_eq!(ver.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn r3_p2_10_existing_v5_schema_without_prev_spk_column_auto_migrates() {
+        use storage::{
+            Bytes, PublishV2Record, PublishV2Status, StoredCapabilityManifest,
+            StoredInitialMessageV2,
+        };
+
+        let env = TestIdentity::new(30_000);
+        // Create a pre-4f88786 SCHEMA_V5 table layout lacking `prev_signed_prekey`.
+        let legacy_v5 = SCHEMA_V5.replace("prev_signed_prekey BLOB,\n", "");
+        assert!(!legacy_v5.contains("prev_signed_prekey"));
+        env.sql.exec_batch(&legacy_v5).unwrap();
+        env.sql
+            .exec(
+                "INSERT INTO meta (only, schema_version) VALUES (0, ?)",
+                params![CURRENT_SCHEMA_VERSION].unwrap(),
+            )
+            .unwrap();
+
+        // Cold-start `has_tables()` detects the missing column and runs idempotent ALTER TABLE.
+        assert!(env.store().has_tables().unwrap());
+        assert!(env.cache.schema_ready.get());
+        let col: CountRow = env
+            .sql
+            .query_one(
+                "SELECT count(*) AS count FROM pragma_table_info('capability_manifest') \
+                 WHERE name = 'prev_signed_prekey'",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(col.count, 1);
+
+        // Cold-start `ensure_v5_tables()` on a fresh cache is also idempotent and publish + initial
+        // insert work end-to-end with `prev_signed_prekey` tracking.
+        let fresh_cache = SchemaCache::default();
+        let store = env.store_with_cache(&fresh_cache);
+        store.ensure_v5_tables().unwrap();
+
+        let bob = [0x22; 32];
+        let alice = [0x11; 32];
+        let mk_manifest = |seq: u64, spk: [u8; 32]| StoredCapabilityManifest {
+            audience: "relay.example".into(),
+            identity_key: bob,
+            manifest_seq: seq,
+            generation: seq,
+            issued_at: 1_000,
+            expires_at: 100_000,
+            pq_enabled: false,
+            strict_pq: false,
+            pq_ratchet_supported: false,
+            offered_suites: vec![],
+            signed_prekey: spk,
+            pq_last_resort: vec![],
+            signature: [0x44; 64],
+        };
+        assert_eq!(
+            store
+                .publish_v2(&PublishV2Record {
+                    manifest: mk_manifest(1, [0x31; 32]),
+                    signed_prekey_signature: Some([0x55; 64]),
+                    one_time_prekeys: vec![],
+                    pq_last_resort: vec![],
+                    pq_one_time_prekeys: vec![],
+                    timestamp: 1_000,
+                })
+                .unwrap(),
+            PublishV2Status::Stored
+        );
+        assert_eq!(
+            store
+                .publish_v2(&PublishV2Record {
+                    manifest: mk_manifest(2, [0x32; 32]),
+                    signed_prekey_signature: Some([0x55; 64]),
+                    one_time_prekeys: vec![],
+                    pq_last_resort: vec![],
+                    pq_one_time_prekeys: vec![],
+                    timestamp: 2_000,
+                })
+                .unwrap(),
+            PublishV2Status::Stored
+        );
+        assert!(matches!(
+            store
+                .add_initial_message_v2(
+                    &StoredInitialMessageV2 {
+                        id: 0,
+                        version: 1,
+                        sender: alice,
+                        recipient: bob,
+                        ephemeral_key: [0x77; 32],
+                        signed_prekey: [0x31; 32],
+                        one_time_prekey: None,
+                        header: Bytes::from_static(b"h"),
+                        content: Bytes::from_static(b"c"),
+                        pq_suite: None,
+                        pq_last_resort: false,
+                        pq_prekey_id: None,
+                        pq_ciphertext: None,
+                        manifest_digest: None,
+                    },
+                    10,
+                    2_100,
+                )
+                .unwrap(),
+            crate::objects::identity::AddInitialOutcome::Added { inserted: true, .. }
+        ));
     }
 }
