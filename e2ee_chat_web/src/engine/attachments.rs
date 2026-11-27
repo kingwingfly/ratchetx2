@@ -1184,6 +1184,26 @@ impl<V: VaultStore> Engine<V> {
                         });
                     }
                     let index = view.index;
+                    // R13-P2-1: Mark `PendingUpload` announced with its exact `history_index`
+                    // BEFORE releasing `self.inner` to invoke `self.flush(peer)` so a reload or
+                    // `pagehide` during flush never strands it in `UPLOAD_STATE_STARTED` (`history_index == 0`).
+                    pending.announced = true;
+                    pending.upload_state = UPLOAD_STATE_ANNOUNCED;
+                    pending.history_index = index;
+                    if let Err(e) = inner.vault.save_upload(peer, &pending).await {
+                        self.show_new(inner, peer, vec![view]);
+                        self.refresh_contacts(inner);
+                        return Err(AnnounceError::SaveAfterSend {
+                            error: describe(&e),
+                            pending: Box::new(pending),
+                        });
+                    }
+                    if !self.is_live(vgen) {
+                        return Err(AnnounceError::SaveAfterSend {
+                            error: "locked".into(),
+                            pending: Box::new(pending),
+                        });
+                    }
                     self.show_new(inner, peer, vec![view]);
                     self.refresh_contacts(inner);
                     (index, true)
@@ -1202,6 +1222,7 @@ impl<V: VaultStore> Engine<V> {
         // Hold one lock across checking delivery failure, concurrent cancellation/chat deletion,
         // and persisting `announced = true` so a concurrent cancel cannot race into a spurious
         // `"the upload of ... was cancelled"` error toast or mark an offline cancel gone early.
+        let needs_announce_save = !added_new;
         pending.announced = true;
         pending.upload_state = UPLOAD_STATE_ANNOUNCED;
         pending.history_index = index;
@@ -1250,7 +1271,7 @@ impl<V: VaultStore> Engine<V> {
             }
             return Ok(None);
         }
-        if let Err(e) = inner.vault.save_upload(peer, &pending).await {
+        if needs_announce_save && let Err(e) = inner.vault.save_upload(peer, &pending).await {
             return Err(AnnounceError::SaveAfterSend {
                 error: describe(&e),
                 pending: Box::new(pending),
@@ -1377,11 +1398,11 @@ impl<V: VaultStore> Engine<V> {
                 return Err(msg);
             }
         };
-        // R12-P1-4: If this upload was already announced on disk with 0 chunks uploaded before a
-        // reload, `Engine::flush` held its outbox announcement until the file was re-attached above.
-        // Flush now that `self.uploads` holds the file handle before chunk upload begins.
-        if before_announce.is_announced()
-            && before_announce.uploaded == 0
+        // R12-P1-4 + R13-P2-1: If this upload had 0 chunks uploaded before a reload (whether
+        // saved as `UPLOAD_STATE_ANNOUNCED` or interrupted in `UPLOAD_STATE_STARTED` after
+        // `inner.add`), `Engine::flush` held its outbox announcement until the file was re-attached
+        // above. Flush now that `self.uploads` holds the file handle before chunk upload begins.
+        if before_announce.uploaded == 0
             && self.is_live(vgen)
             && !self.is_cancelled(&id)
             && let Err(e) = self.flush(&peer).await

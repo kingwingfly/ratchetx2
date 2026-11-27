@@ -348,30 +348,38 @@ impl<V: VaultStore> Engine<V> {
                     let pause_sealing = contact.state.quarantined
                         || contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
                         || contact.state.security_alert != SECURITY_ALERT_NONE;
-                    // R12-P1-4: Never seal or announce an un-dispatched attachment whose upload
-                    // has 0 chunks uploaded to the server and no live file handle in memory (e.g.
-                    // after a reload/teardown following a failed cancel-after-promote rollback, or
-                    // a paused 0-chunk upload waiting for the user to re-select or cancel the file).
+                    // R12-P1-4 + R13-P2-1 + R13-P1-3: Never seal or announce an un-dispatched
+                    // attachment whose upload has 0 chunks uploaded to the server (whether
+                    // `UPLOAD_STATE_STARTED` or `UPLOAD_STATE_ANNOUNCED`, and even if its separate
+                    // upload record is missing/corrupt) without a live, non-cancelled file handle
+                    // in memory.
+                    let mut zero_chunk_att_id: Option<[u8; 16]> = None;
                     if !outgoing.dispatched {
-                        match inner.vault.uploads(Some(peer)).await {
-                            _ if !self.is_live(vgen) => return Ok(false),
-                            Ok(uploads) => {
-                                let blocks_announcement = uploads.iter().any(|(_, p)| {
-                                    p.is_announced()
-                                        && p.history_index == outgoing.history_index
-                                        && p.uploaded == 0
-                                        && !<[u8; 16]>::try_from(p.id.as_slice())
-                                            .is_ok_and(|id| self.uploads.has_file(peer, &id))
-                                });
-                                if blocks_announcement {
+                        let unuploaded = inner.vault.unuploaded_started_upload_ids(peer);
+                        if !unuploaded.is_empty() {
+                            match inner.vault.entry(peer, outgoing.history_index).await {
+                                _ if !self.is_live(vgen) => return Ok(false),
+                                Ok(Some(entry)) => {
+                                    if let Some(Kind::Attachment(ptr)) =
+                                        entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                                        && let Ok(att_id) = <[u8; 16]>::try_from(ptr.id.as_slice())
+                                        && unuploaded.contains(&att_id)
+                                    {
+                                        if self.is_cancelled(&att_id)
+                                            || !self.uploads.has_file(peer, &att_id)
+                                        {
+                                            step = NextPush::Done;
+                                            break;
+                                        }
+                                        zero_chunk_att_id = Some(att_id);
+                                    }
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    result = Err(describe(&e));
                                     step = NextPush::Done;
                                     break;
                                 }
-                            }
-                            Err(e) => {
-                                result = Err(describe(&e));
-                                step = NextPush::Done;
-                                break;
                             }
                         }
                     }
@@ -579,6 +587,16 @@ impl<V: VaultStore> Engine<V> {
                     // carries an initial for the CURRENT active session (never when retrying old
                     // ciphertext from a superseded session `S1` while `S2` is still `UNSENT`).
                     let first_dispatch = !outgoing.dispatched;
+                    // R13-P1-3: Re-check synchronously right before persisting `dispatched = true`
+                    // so a `cancel_upload` that arrived during `vault.outgoing(...)` / sealing
+                    // never marks the cancelled attachment dispatched or discloses its pointer.
+                    if first_dispatch
+                        && let Some(att_id) = zero_chunk_att_id
+                        && (self.is_cancelled(&att_id) || !self.uploads.has_file(peer, &att_id))
+                    {
+                        step = NextPush::Done;
+                        break;
+                    }
                     let promoted_from_unsent = !record.carried_initial.is_empty()
                         && inner.contacts.iter().any(|c| {
                             c.peer == *peer
@@ -588,6 +606,45 @@ impl<V: VaultStore> Engine<V> {
                                         id.as_slice() == record.session_id.as_slice()
                                     }))
                         });
+                    // R13-P1-2: Never promote and first transmit an `UNSENT` classical carried
+                    // initial after `strict_pq` (or local PQ without classical exception) was
+                    // enabled.
+                    if promoted_from_unsent
+                        && session::protocol::mailbox_v2::decode_carried_initial(
+                            &record.carried_initial,
+                        )
+                        .is_some_and(|w| w.version < 2)
+                    {
+                        let strict_pq = inner.client.pq_config().strict_pq;
+                        let local_pq = inner.local_pq_enabled();
+                        let blocked = strict_pq
+                            || inner.contacts.iter().any(|c| {
+                                c.peer == *peer
+                                    && (c.session.peer_pq_state().pq_pinned
+                                        || (local_pq
+                                            && !c
+                                                .session
+                                                .peer_pq_state()
+                                                .allow_classical_exception))
+                            });
+                        if blocked {
+                            if strict_pq
+                                && let Some(c) = inner.contact(peer)
+                                && c.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                            {
+                                c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                                if inner.save_state().await.is_err() {
+                                    inner.unsaved_state = true;
+                                }
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
+                                self.refresh_contacts(inner);
+                            }
+                            step = NextPush::Done;
+                            break;
+                        }
+                    }
                     if first_dispatch || promoted_from_unsent {
                         let target_index = outgoing.history_index;
                         let target_clock = outgoing.clock;
@@ -622,6 +679,37 @@ impl<V: VaultStore> Engine<V> {
                         }
                         if !self.is_live(vgen) {
                             return Ok(false);
+                        }
+                        // R13-P1-3: If `cancel_upload` arrived during the `dispatched = true` IDB
+                        // save (still strictly BEFORE `PushV2` has ever been transmitted on the
+                        // wire), revert `dispatched = false` and abort without sending `PushV2`.
+                        if first_dispatch
+                            && let Some(att_id) = zero_chunk_att_id
+                            && (self.is_cancelled(&att_id) || !self.uploads.has_file(peer, &att_id))
+                        {
+                            let _ = inner
+                                .with_contact_tx(peer, async |inner| {
+                                    if let Some(contact) = inner.contact(peer) {
+                                        if let Some(head) = contact.state.outbox.first_mut()
+                                            && head.history_index == target_index
+                                            && head.clock == target_clock
+                                        {
+                                            head.dispatched = false;
+                                        }
+                                        if promoted_from_unsent
+                                            && contact.state.greeting_delivery
+                                                == GREETING_DELIVERY_UNCERTAIN
+                                        {
+                                            contact.state.greeting_delivery =
+                                                GREETING_DELIVERY_UNSENT;
+                                            contact.state.greeting_sent_at = 0;
+                                        }
+                                    }
+                                    inner.save(&[]).await.map_err(|e| describe(&e))
+                                })
+                                .await;
+                            step = NextPush::Done;
+                            break;
                         }
                         outgoing.dispatched = true;
                     }

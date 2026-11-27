@@ -191,17 +191,29 @@ pub(super) fn VaultDialog() -> impl IntoView {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassicalApprovalReason {
+    PeerSignedOff,
+    ExistingRequest,
+}
+
 fn apply_start_chat_error(
     err: StartChatError,
-    classical_needed: RwSignal<bool>,
+    classical_needed: RwSignal<Option<ClassicalApprovalReason>>,
     progress: Progress,
 ) {
     match err {
         StartChatError::SignInRequired | StartChatError::Cancelled => progress.clear(),
         StartChatError::ClassicalApprovalRequired => {
-            let _ = classical_needed.try_set(true);
+            let _ = classical_needed.try_set(Some(ClassicalApprovalReason::PeerSignedOff));
             progress.try_fail(
                 "This peer published a signed manifest disabling post-quantum encryption.",
+            );
+        }
+        StartChatError::ExistingClassicalRequestApprovalRequired => {
+            let _ = classical_needed.try_set(Some(ClassicalApprovalReason::ExistingRequest));
+            progress.try_fail(
+                "This pending chat request uses classical (non-post-quantum) encryption.",
             );
         }
         StartChatError::DowngradeDetected => {
@@ -276,7 +288,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
     let key = RwSignal::new(key);
     let name = RwSignal::new(initial_name);
     let progress = Progress::new();
-    let classical_needed = RwSignal::new(false);
+    let classical_needed = RwSignal::new(None::<ClassicalApprovalReason>);
     if let Some(feedback) = engine().take_new_chat_feedback() {
         apply_start_chat_error(feedback, classical_needed, progress);
     }
@@ -302,7 +314,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
         let key_changed = last_key.with_value(|prev| *prev != current_key);
         if key_changed {
             last_key.set_value(current_key.clone());
-            classical_needed.set(false);
+            classical_needed.set(None);
             if !progress.working.get_untracked() {
                 progress.clear();
             }
@@ -334,7 +346,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
             ));
             return;
         }
-        classical_needed.set(false);
+        classical_needed.set(None);
         let raw_key = key.get_untracked();
         // Validate locally before reserving browser history so mistyped keys never push a history
         // entry or discard browser Forward history.
@@ -485,7 +497,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 })
             }}
             {move || {
-                classical_needed.get().then(|| {
+                classical_needed.get().map(|reason| {
                     let strict_pq = strict_pq_enabled(ui);
                     view! {
                         <div class="classical-box" role="alert">
@@ -493,7 +505,14 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                                 {if strict_pq {
                                     "Require post-quantum (strict mode) blocks classical exceptions. To allow a classical chat, disable strict mode in Settings first."
                                 } else {
-                                    "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
+                                    match reason {
+                                        ClassicalApprovalReason::PeerSignedOff => {
+                                            "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
+                                        }
+                                        ClassicalApprovalReason::ExistingRequest => {
+                                            "This pending chat request was received without post-quantum encryption. Allow classical encryption to accept it, or open the request to upgrade to post-quantum encryption."
+                                        }
+                                    }
                                 }}
                             </p>
                             {(!strict_pq).then(|| view! {

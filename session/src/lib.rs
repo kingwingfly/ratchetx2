@@ -306,9 +306,15 @@ impl ClientState {
     }
 
     fn is_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
+        self.confirmed_digest_retained_spk(digest).is_some()
+    }
+
+    fn confirmed_digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
         self.manifest_digest_spks
             .get(digest)
-            .is_some_and(|&(spk, confirmed)| confirmed && self.prekeys.contains_signed_prekey(&spk))
+            .and_then(|&(spk, confirmed)| {
+                (confirmed && self.prekeys.contains_signed_prekey(&spk)).then_some(spk)
+            })
     }
 
     fn is_unconfirmed_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
@@ -1160,6 +1166,11 @@ impl<H> Client<H> {
     /// (`R10-P2-2`).
     pub fn is_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
         self.state.is_digest_for_retained_spk(digest)
+    }
+
+    /// The retained signed prekey bound to confirmed manifest `digest`, if any (`R13-P2-3`).
+    pub fn confirmed_digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
+        self.state.confirmed_digest_retained_spk(digest)
     }
 
     /// Whether `digest` is an unconfirmed/ambiguous staged manifest digest bound to a currently
@@ -2358,6 +2369,39 @@ impl<M> Session<M> {
             .others
             .iter()
             .any(|e| e.party.associated_data().len() != x3dh::PQXDH_ASSOCIATED_DATA_LENGTH)
+    }
+
+    /// Drop all archived classical (non-PQXDH) earlier sessions from `others` and return their
+    /// inbound write-token hashes so accepting/finalizing a PQ contact under `strict_pq` or
+    /// without a classical exception never authorizes or decrypts an unapproved classical session
+    /// (`R13-P1-1`).
+    pub fn prune_classical_earlier(&mut self) -> Vec<[u8; WRITE_TOKEN_HASH_LENGTH]> {
+        let mut dropped = Vec::new();
+        self.state.others.retain(|e| {
+            let is_pq = e.party.associated_data().len() == x3dh::PQXDH_ASSOCIATED_DATA_LENGTH;
+            if !is_pq {
+                dropped.push(e.inbound_token_hash);
+            }
+            is_pq
+        });
+        dropped
+    }
+
+    /// Inbound write-token hashes of archived earlier sessions, excluding classical (non-PQXDH)
+    /// sessions when `allow_classical` is `false` (`R13-P1-1`).
+    pub fn earlier_inbound_token_hashes_for_policy(
+        &self,
+        allow_classical: bool,
+    ) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.state.others.iter().filter_map(move |e| {
+            if allow_classical
+                || e.party.associated_data().len() == x3dh::PQXDH_ASSOCIATED_DATA_LENGTH
+            {
+                Some(e.inbound_token_hash)
+            } else {
+                None
+            }
+        })
     }
 
     /// Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.

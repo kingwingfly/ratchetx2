@@ -95,7 +95,12 @@ pub enum VaultOpenError {
 pub enum StartChatError {
     /// The server requires sign-in on this page's origin before fetching prekeys / starting a chat.
     SignInRequired,
+    /// The peer's verified manifest explicitly disabled PQ encryption.
     ClassicalApprovalRequired,
+    /// An existing unpinned classical chat request requires explicit classical approval before
+    /// accepting under current local PQ settings (without asserting anything about the peer's
+    /// current manifest, `R13-P2-6`).
+    ExistingClassicalRequestApprovalRequired,
     DowngradeDetected,
     PeerManifestExpired,
     PqRequired,
@@ -2150,12 +2155,24 @@ impl<V: VaultStore> Engine<V> {
                                 );
                             }
                         }
+                        // R13-P1-1: If accepting a PQ request under `strict_pq` or without an
+                        // explicit classical exception while local PQ is enabled, drop any
+                        // archived unapproved classical sessions from `others` BEFORE collecting
+                        // write-token hashes so they can neither be registered on the relay nor
+                        // decrypt classical follow-ups.
+                        let allow_earlier_classical = !strict_pq
+                            && !contact.session.peer_pq_state().pq_pinned
+                            && (!local_pq_enabled
+                                || contact.session.peer_pq_state().allow_classical_exception);
+                        if !allow_earlier_classical {
+                            contact.session.prune_classical_earlier();
+                        }
                         contact.accept_request(&name)?;
                         contact.state.events.get_or_insert_default().accepted = true;
                         let active = contact.session.active_inbound_token_hash();
                         let earlier: Vec<[u8; 32]> = contact
                             .session
-                            .earlier_inbound_token_hashes()
+                            .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
                             .filter(|h| Some(*h) != active)
                             .collect();
                         (active, earlier)
@@ -2632,6 +2649,7 @@ pub(crate) trait VaultStore: 'static {
         &self,
         peer: Option<&PublicKey>,
     ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>>;
+    fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]>;
     async fn forget<'a>(
         &self,
         state: &AppState,
@@ -2739,6 +2757,9 @@ impl VaultStore for Vault {
         peer: Option<&PublicKey>,
     ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>> {
         Vault::uploads(self, peer).await
+    }
+    fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
+        Vault::unuploaded_started_upload_ids(self, peer)
     }
     async fn forget<'a>(
         &self,
@@ -2917,6 +2938,28 @@ impl<V: VaultStore> Inner<V> {
             .iter()
             .filter_map(|c| PublicKey::try_from(c.peer.as_slice()).ok())
             .collect();
+        let classical_fallback_probe_pending = state.classical_fallback_probe_pending;
+        let classical_fallback_probe_cooldown_until = state.classical_fallback_probe_cooldown_until;
+        let pq_fallback_probe_pending: std::collections::BTreeSet<session::PqSuite> = state
+            .pq_fallback_probe_pending
+            .iter()
+            .filter_map(|&s| u8::try_from(s).ok().and_then(session::PqSuite::from_u8))
+            .collect();
+        let pq_fallback_probe_cooldown_until: std::collections::BTreeMap<session::PqSuite, u64> =
+            state
+                .pq_fallback_probe_cooldowns
+                .iter()
+                .filter_map(|entry| {
+                    u8::try_from(entry.suite)
+                        .ok()
+                        .and_then(session::PqSuite::from_u8)
+                        .map(|suite| (suite, entry.until))
+                })
+                .collect();
+        let mut used_pq_by_suite = std::collections::BTreeMap::new();
+        for &suite in &pq_fallback_probe_pending {
+            used_pq_by_suite.insert(suite, REFILL_USED);
+        }
         Self {
             vault,
             lock_generation: crate::glue::lock_generation(),
@@ -2936,17 +2979,17 @@ impl<V: VaultStore> Inner<V> {
             last_server_pq_opks_by_suite: None,
             confirmed_relay_pq_suites: None,
             deferred_refill_rejected_pq_suites: std::collections::BTreeSet::new(),
-            used_pq_by_suite: std::collections::BTreeMap::new(),
+            used_pq_by_suite,
             relay_classical_opk_queue: None,
             relay_claimed_classical_opks: HashSet::new(),
             accepted_classical_since_baseline: HashSet::new(),
             relay_pq_opk_queue_by_suite: None,
             relay_claimed_pq_opks_by_suite: std::collections::BTreeMap::new(),
             accepted_pq_since_baseline: std::collections::BTreeMap::new(),
-            classical_fallback_probe_pending: false,
-            classical_fallback_probe_cooldown_until: 0,
-            pq_fallback_probe_pending: std::collections::BTreeSet::new(),
-            pq_fallback_probe_cooldown_until: std::collections::BTreeMap::new(),
+            classical_fallback_probe_pending,
+            classical_fallback_probe_cooldown_until,
+            pq_fallback_probe_pending,
+            pq_fallback_probe_cooldown_until,
             unsaved_state: false,
             deferred_acks_after_save: vec![],
             contacts_dirty_late: false,
@@ -3180,6 +3223,22 @@ impl<V: VaultStore> Inner<V> {
         let mut state = AppState {
             client: Some(self.client.state().into()),
             contacts: stored_contacts(&self.contacts, &self.isolated_contacts),
+            classical_fallback_probe_pending: self.classical_fallback_probe_pending,
+            classical_fallback_probe_cooldown_until: self.classical_fallback_probe_cooldown_until,
+            pq_fallback_probe_pending: self
+                .pq_fallback_probe_pending
+                .iter()
+                .map(|s| u32::from(s.as_u8()))
+                .collect(),
+            pq_fallback_probe_cooldowns: self
+                .pq_fallback_probe_cooldown_until
+                .iter()
+                .filter(|&(_, &until)| until > 0)
+                .map(|(&suite, &until)| crate::vault::PqSuiteCooldown {
+                    suite: u32::from(suite.as_u8()),
+                    until,
+                })
+                .collect(),
             ..self.state.clone()
         };
         for &id in &self.deferred_acks_after_save {

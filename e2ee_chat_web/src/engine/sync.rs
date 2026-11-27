@@ -19,7 +19,7 @@ use crate::util::{describe, monotonic_now_ms, now, short, sleep};
 use crate::vault::{
     CLASSICAL_APPROVAL_NONE, ContactState, DeferredEnvelope, Farewell, GREETING_DELIVERY_CONFIRMED,
     GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, OutgoingRecord,
-    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE,
+    SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
 };
 use futures_util::future::{Either, select};
 use leptos::prelude::*;
@@ -1307,6 +1307,11 @@ impl<V: VaultStore> Engine<V> {
                         && confirmed_greeting_probe_eligible(&contact.state, now())
                         && !self.queue.is_confirmed_probe_backed_off(&peer)
                         && let Some(req) = contact.session.pending_initial_request()
+                        && (req.message.as_ref().is_some_and(|m| m.version >= 2)
+                            || (!inner.client.pq_config().strict_pq
+                                && !contact.session.peer_pq_state().pq_pinned
+                                && (!inner.local_pq_enabled()
+                                    || contact.session.peer_pq_state().allow_classical_exception)))
                     {
                         GreetingRetryAction::Send {
                             server: inner.server.clone(),
@@ -1337,7 +1342,31 @@ impl<V: VaultStore> Engine<V> {
                     let session_id = contact.session.active_id().copied();
                     let promoted_from_unsent =
                         contact.state.greeting_delivery == GREETING_DELIVERY_UNSENT;
-                    if !promoted_from_unsent
+                    let req_is_pq = req.message.as_ref().is_some_and(|m| m.version >= 2);
+                    let strict_pq = inner.client.pq_config().strict_pq;
+                    let local_pq = inner.local_pq_enabled();
+                    let allow_classical_exc =
+                        contact.session.peer_pq_state().allow_classical_exception;
+                    let pq_pinned = contact.session.peer_pq_state().pq_pinned;
+                    let blocked_by_pq_policy = !req_is_pq
+                        && (strict_pq || pq_pinned || (local_pq && !allow_classical_exc));
+                    if blocked_by_pq_policy {
+                        // R13-P1-2: Never first transmit or retry a classical greeting once
+                        // `strict_pq` (or local PQ without a classical exception) is enabled.
+                        if strict_pq && contact.state.security_alert != SECURITY_ALERT_PQ_REQUIRED {
+                            if let Some(c) = inner.contact(&peer) {
+                                c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                            }
+                            if inner.save_state().await.is_err() {
+                                inner.unsaved_state = true;
+                            }
+                            if !self.is_live(vgen) {
+                                return Ok(false);
+                            }
+                            self.refresh_contacts(inner);
+                        }
+                        GreetingRetryAction::Skip
+                    } else if !promoted_from_unsent
                         && !uncertain_greeting_reclaim_eligible(&contact.state, now())
                     {
                         GreetingRetryAction::Skip
@@ -1471,7 +1500,10 @@ impl<V: VaultStore> Engine<V> {
                     if !self.is_live(vgen) {
                         return Ok(false);
                     }
+                    let outgoing_is_pq_check = req.message.as_ref().is_some_and(|m| m.version >= 2);
                     guard.as_ref().is_some_and(|inner| {
+                        let strict_pq = inner.client.pq_config().strict_pq;
+                        let local_pq = inner.local_pq_enabled();
                         inner
                             .contacts
                             .iter()
@@ -1485,6 +1517,13 @@ impl<V: VaultStore> Engine<V> {
                                     && c.session.active_id() == session_id.as_ref()
                                     && !c.session.is_known_by_peer()
                                     && !c.session.has_pending_active_grant()
+                                    && (outgoing_is_pq_check
+                                        || (!strict_pq
+                                            && !c.session.peer_pq_state().pq_pinned
+                                            && (!local_pq
+                                                || c.session
+                                                    .peer_pq_state()
+                                                    .allow_classical_exception)))
                                     && confirmed_greeting_probe_eligible(&c.state, now())
                             })
                     })

@@ -866,6 +866,29 @@ pub struct AppState {
     /// creating a new chat so forgotten peers need zero residual entries in `peer_storage`.
     #[prost(uint64, tag = "20")]
     pub next_conversation_gen: u64,
+    /// Durable flag indicating an empty-OPK greeting on `current_signed_prekey` requested a
+    /// bounded classical refill probe (`R12-P2-4`, `R13-P2-4`).
+    #[prost(bool, tag = "21")]
+    pub classical_fallback_probe_pending: bool,
+    /// Durable Unix ms deadline before which classical empty-OPK greetings skip probing (`R13-P2-4`).
+    #[prost(uint64, tag = "22")]
+    pub classical_fallback_probe_cooldown_until: u64,
+    /// Durable PQ suite IDs (`PqSuite::as_u8()`) with pending last-resort fallback refill probes
+    /// (`R13-P2-4`).
+    #[prost(uint32, repeated, tag = "23")]
+    pub pq_fallback_probe_pending: Vec<u32>,
+    /// Durable per-suite Unix ms probe cooldown deadlines after stocked relay responses (`R13-P2-4`).
+    #[prost(message, repeated, tag = "24")]
+    pub pq_fallback_probe_cooldowns: Vec<PqSuiteCooldown>,
+}
+
+/// Persisted per-suite fallback OPK probe cooldown deadline (`R13-P2-4`).
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct PqSuiteCooldown {
+    #[prost(uint32, tag = "1")]
+    pub suite: u32,
+    #[prost(uint64, tag = "2")]
+    pub until: u64,
 }
 
 impl AppState {
@@ -2962,6 +2985,29 @@ impl Vault {
             Error::Corrupt("upload record failed decryption or checkpoint check".into())
         })?;
         Ok(Some(upload))
+    }
+
+    /// IDs of started uploads (`UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED`) for `peer` whose
+    /// authenticated checkpoint still records `uploaded == 0`, even if the separate upload record
+    /// is missing or failed authentication (`R13-P2-1`, `R13-P1-3`).
+    pub fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
+        self.upload_checkpoints
+            .borrow()
+            .iter()
+            .filter_map(|cp| {
+                if cp.peer.as_slice() == peer.as_slice()
+                    && cp.uploaded == 0
+                    && matches!(
+                        cp.upload_state,
+                        UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED
+                    )
+                {
+                    <[u8; 16]>::try_from(cp.id.as_slice()).ok()
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// The uploads kept, those not done, with the peers of their chats: those of the chat with
