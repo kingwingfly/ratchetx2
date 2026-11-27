@@ -2,6 +2,7 @@
 
 use super::attachments::ServerDeleteJob;
 use super::contact::{Contact, forget_told, keep_last};
+use super::sync::confirmed_greeting_probe_eligible;
 use super::{
     Engine, Inner, NOT_SIGNED_IN_HERE, ProtocolRpcScope, VaultStore, origin, records, same_server,
     should_require_update_for_rpc,
@@ -33,6 +34,7 @@ struct PreparedPush {
     audience: String,
     retry_initial: Option<SendInitialV2Request>,
     promoted_from_unsent: bool,
+    known_at_dispatch: bool,
 }
 
 /// Next action prepared under `self.inner` during [`Engine::flush`] before dropping the lock.
@@ -44,7 +46,7 @@ enum NextPush {
 }
 
 /// Outcome of committing one completed outbox item under `self.inner`.
-enum CommitOutcome {
+pub(super) enum CommitOutcome {
     Committed,
     Aborted,
 }
@@ -249,7 +251,7 @@ impl<V: VaultStore> Engine<V> {
                 // Loop locally while sealing/recovering without network RPCs.
                 let mut step = NextPush::Done;
                 while let Some(contact) = inner.contact(peer)
-                    && let Some(outgoing) = contact.state.outbox.first().cloned()
+                    && let Some(mut outgoing) = contact.state.outbox.first().cloned()
                 {
                     if !self.is_live(vgen) {
                         return Ok(false);
@@ -373,9 +375,13 @@ impl<V: VaultStore> Engine<V> {
                         }
                     };
 
-                    // If this sealed record belongs to an older session than `active_id`, requeue
-                    // sealed outbox items on the current active session before transmitting.
-                    let stale_session = !record.session_id.is_empty()
+                    // If this sealed record belongs to an older session than `active_id` and has
+                    // NOT been dispatched on the wire yet, requeue sealed outbox items on the
+                    // current active session before transmitting. Already-dispatched records must
+                    // be reconciled with the relay using their original `client_message_id` first
+                    // so a reload or lost response never duplicates a delivered message.
+                    let stale_session = !outgoing.dispatched
+                        && !record.session_id.is_empty()
                         && inner.contact(peer).is_some_and(|c| {
                             c.session
                                 .active_id()
@@ -443,16 +449,33 @@ impl<V: VaultStore> Engine<V> {
                         }
                     };
 
-                    // Persist `GREETING_DELIVERY_UNCERTAIN` BEFORE dropping `guard` and
-                    // transmitting a message that can carry a previously unsent initial greeting.
+                    // Persist `Outgoing.dispatched = true` (and `GREETING_DELIVERY_UNCERTAIN` when
+                    // promoted from `UNSENT`) BEFORE dropping `guard` and transmitting `PushV2` so
+                    // a reload or lost response never lets `requeue_sealed` unseal and duplicate an
+                    // already-dispatched message.
                     let promoted_from_unsent = inner.contacts.iter().any(|c| {
                         c.peer == *peer && c.state.greeting_delivery == GREETING_DELIVERY_UNSENT
                     });
-                    if promoted_from_unsent {
+                    if !outgoing.dispatched || promoted_from_unsent {
+                        let target_index = outgoing.history_index;
+                        let target_clock = outgoing.clock;
                         if let Err(e) = inner
                             .with_contact_tx(peer, async |inner| {
                                 if let Some(contact) = inner.contact(peer) {
-                                    contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                                    if let Some(head) = contact.state.outbox.first_mut()
+                                        && head.history_index == target_index
+                                        && head.sealed
+                                        && head.clock == target_clock
+                                    {
+                                        head.dispatched = true;
+                                    }
+                                    if promoted_from_unsent
+                                        && contact.state.greeting_delivery
+                                            == GREETING_DELIVERY_UNSENT
+                                    {
+                                        contact.state.greeting_delivery =
+                                            GREETING_DELIVERY_UNCERTAIN;
+                                    }
                                 }
                                 inner.save(&[]).await.map_err(|e| describe(&e))
                             })
@@ -465,18 +488,20 @@ impl<V: VaultStore> Engine<V> {
                         if !self.is_live(vgen) {
                             return Ok(false);
                         }
+                        outgoing.dispatched = true;
                     }
 
-                    let (conversation_gen, session_id) = {
-                        let c = inner.contact(peer);
-                        let conv_gen = c.as_ref().map_or(0, |c| c.state.conversation_gen);
+                    let (conversation_gen, session_id, known_at_dispatch) = {
+                        let c = inner.contacts.iter().find(|c| c.peer == *peer);
+                        let conv_gen = c.map_or(0, |c| c.state.conversation_gen);
                         let sid = if !record.session_id.is_empty() {
                             record.session_id.clone()
                         } else {
                             c.and_then(|c| c.session.active_id().map(|id| id.to_vec()))
                                 .unwrap_or_default()
                         };
-                        (conv_gen, sid)
+                        let known = c.is_some_and(|c| c.session.is_known_by_peer());
+                        (conv_gen, sid, known)
                     };
                     // Protect this exact in-flight outbox head from concurrent `requeue_sealed`
                     // unsealing while `PushV2` is suspended outside `self.inner` and across local
@@ -512,6 +537,7 @@ impl<V: VaultStore> Engine<V> {
                         audience: inner.audience.clone(),
                         retry_initial,
                         promoted_from_unsent,
+                        known_at_dispatch,
                     }));
                     break;
                 }
@@ -566,6 +592,7 @@ impl<V: VaultStore> Engine<V> {
                         audience,
                         retry_initial,
                         promoted_from_unsent,
+                        known_at_dispatch,
                     } = *prepared;
                     let push_res: session::Result<()> = Fetch::client(&server)
                         .push_v2(push_req)
@@ -668,11 +695,42 @@ impl<V: VaultStore> Engine<V> {
                     // If `PushV2` already succeeded on the relay, commit `Step::Pushed` even if a
                     // concurrent inbound session rotated `active_id` or set `needs_requeue_sealed`
                     // (otherwise looping to requeue would re-encrypt and duplicate a delivered
-                    // message). Only retry/requeue on failure when the session rotated.
-                    if push_res.is_err() {
+                    // message). On a definitive server refusal (`is_server_refusal()`), clear
+                    // `Outgoing.dispatched` so subsequent requeues may safely unseal and re-encrypt;
+                    // on an ambiguous network/5xx error, preserve `dispatched = true` so the next
+                    // sync reconciles the exact same `client_message_id` idempotently.
+                    if let Err(ref e) = push_res {
                         inner.in_flight_push.remove(peer);
-                        if !session_matches {
-                            continue;
+                        if e.is_server_refusal() {
+                            let cleared = inner.contact(peer).is_some_and(|c| {
+                                if let Some(head) = c.state.outbox.first_mut()
+                                    && head.history_index == outgoing.history_index
+                                    && head.sealed
+                                    && head.clock == outgoing.clock
+                                    && head.dispatched
+                                {
+                                    head.dispatched = false;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                            if cleared {
+                                if let Err(save_err) = inner.save_state().await {
+                                    result = Err(describe(&save_err));
+                                    break;
+                                }
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
+                            }
+                            if !session_matches {
+                                continue;
+                            }
+                        } else if !session_matches {
+                            self.check_protocol_error(ProtocolRpcScope::CoreV2, e);
+                            result = Err(describe(e));
+                            break;
                         }
                     }
 
@@ -714,10 +772,18 @@ impl<V: VaultStore> Engine<V> {
                             let known = inner
                                 .contact(peer)
                                 .is_some_and(|c| c.session.is_known_by_peer());
+                            if known && !known_at_dispatch {
+                                // Pre-approval `PushV2` raced with peer acceptance on this exact
+                                // session (`is_known_by_peer` flipped true while `PushV2` was in
+                                // flight): clear approval backoff and retry on the working session
+                                // instead of retiring it.
+                                self.clear_approval_backoff(peer);
+                                continue;
+                            }
                             if known {
-                                // Peer previously accepted us and has since revoked/deleted the
-                                // chat: retire active session and requeue so the next sync starts
-                                // fresh.
+                                // Peer previously accepted us BEFORE dispatch and has since
+                                // revoked/deleted the chat: retire active session and requeue so
+                                // the next sync starts fresh.
                                 if let Some(contact) = inner.contact(peer) {
                                     contact.state.needs_requeue_sealed = true;
                                     contact.session.retire();
@@ -731,17 +797,33 @@ impl<V: VaultStore> Engine<V> {
                             // Peer has not yet accepted our chat request:
                             // - If greeting delivery wasn't confirmed, retry idempotent
                             //   `SendInitialV2` (persisting `GREETING_DELIVERY_UNCERTAIN` first).
-                            // - If greeting delivery WAS `CONFIRMED` (e.g. targeting `prev_signed_prekey`
-                            //   that the recipient subsequently evicted before reading its inbox),
-                            //   probe `GetManifest` first; only if the peer rotated its SPK do we
-                            //   probe idempotent `SendInitialV2` so a `StaleVersion` refusal
-                            //   reclaims a fresh bundle without re-inserting declined requests.
-                            let can_retry_or_probe = inner
-                                .contact(peer)
-                                .is_some_and(|c| !c.session.has_pending_active_grant());
-                            let greeting_unconfirmed = inner.contact(peer).is_some_and(|c| {
-                                c.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
-                            });
+                            // - If greeting delivery WAS `CONFIRMED` and eligible for a post-2-
+                            //   rotation SPK-eviction probe (within the 14-day window, not yet
+                            //   delivery-verified, and not backed off), probe signed `GetManifest`
+                            //   first; only if `manifest.generation >= target_generation + 2` AND
+                            //   revalidation under `self.inner` still holds do we probe idempotent
+                            //   `SendInitialV2` (`Ok(())` marks `greeting_delivery_verified = true`
+                            //   via live row or 30d ACK tombstone; `StaleVersion` reclaims fresh).
+                            let (can_retry_or_probe, greeting_unconfirmed, target_generation) =
+                                inner
+                                    .contact(peer)
+                                    .map(|c| {
+                                        let unconfirmed = c.state.greeting_delivery
+                                            != GREETING_DELIVERY_CONFIRMED;
+                                        let eligible = !c.state.provisional
+                                            && !c.state.request
+                                            && !c.state.quarantined
+                                            && !c.session.has_pending_active_grant()
+                                            && (unconfirmed
+                                                || (confirmed_greeting_probe_eligible(
+                                                    &c.state,
+                                                    now(),
+                                                ) && !self
+                                                    .queue
+                                                    .is_confirmed_probe_backed_off(peer)));
+                                        (eligible, unconfirmed, c.state.greeting_target_generation)
+                                    })
+                                    .unwrap_or((false, false, 0));
                             let mut retry_failed = false;
                             let mut retry_retired_spk = false;
                             let mut stale_aborted = false;
@@ -789,14 +871,59 @@ impl<V: VaultStore> Engine<V> {
                                             .as_ref()
                                             .map(|m| m.signed_prekey.as_ref())
                                             .unwrap_or(&[]);
-                                        self.probe_confirmed_greeting_spk_rotated(
-                                            &server,
-                                            &audience,
-                                            peer,
-                                            greeting_spk,
-                                        )
-                                        .await
-                                            == Some(true)
+                                        let rotated = self
+                                            .probe_confirmed_greeting_spk_rotated(
+                                                &server,
+                                                &audience,
+                                                peer,
+                                                greeting_spk,
+                                                target_generation,
+                                            )
+                                            .await;
+                                        if !self.is_live(vgen) {
+                                            return Ok(false);
+                                        }
+                                        if rotated != Some(true) {
+                                            self.queue.record_confirmed_probe_backoff(peer);
+                                            false
+                                        } else {
+                                            // Revalidate contact incarnation, session identity,
+                                            // peer knowledge, and grant state right before
+                                            // transmitting `SendInitialV2` so a concurrent delete
+                                            // or session swap during `GetManifest` never emits a
+                                            // stale greeting.
+                                            let guard_check = self.lock_inner().await;
+                                            if !self.is_live(vgen) {
+                                                return Ok(false);
+                                            }
+                                            guard_check.as_ref().is_some_and(|inner| {
+                                                inner
+                                                    .contacts
+                                                    .iter()
+                                                    .find(|c| c.peer == *peer)
+                                                    .is_some_and(|c| {
+                                                        !c.state.provisional
+                                                            && !c.state.request
+                                                            && !c.state.quarantined
+                                                            && c.state.conversation_gen
+                                                                == conversation_gen
+                                                            && !c.session.needs_new_session()
+                                                            && !c.session.is_known_by_peer()
+                                                            && !c.session.has_pending_active_grant()
+                                                            && (session_id.is_empty()
+                                                                || c.session
+                                                                    .active_id()
+                                                                    .is_some_and(|id| {
+                                                                        id.as_slice()
+                                                                            == session_id.as_slice()
+                                                                    }))
+                                                            && confirmed_greeting_probe_eligible(
+                                                                &c.state,
+                                                                now(),
+                                                            )
+                                                    })
+                                            })
+                                        }
                                     };
                                     if !self.is_live(vgen) {
                                         return Ok(false);
@@ -849,12 +976,17 @@ impl<V: VaultStore> Engine<V> {
                                             Ok(()) => {
                                                 if let Some(contact) = inner.contact(peer) {
                                                     contact.mark_greeting_confirmed();
+                                                    if !greeting_unconfirmed {
+                                                        contact.state.greeting_delivery_verified =
+                                                            true;
+                                                    }
                                                     contact.state.awaiting_peer_acceptance = true;
                                                 }
                                                 let _ = inner.save_state().await;
                                                 if !self.is_live(vgen) {
                                                     return Ok(false);
                                                 }
+                                                self.queue.record_confirmed_probe_backoff(peer);
                                             }
                                             Err(retry_err)
                                                 if retry_err.is_server_refusal()
@@ -881,6 +1013,9 @@ impl<V: VaultStore> Engine<V> {
                                             }
                                             Err(retry_err) => {
                                                 retry_failed = true;
+                                                if !greeting_unconfirmed {
+                                                    self.queue.record_confirmed_probe_backoff(peer);
+                                                }
                                                 if retry_err.is_server_refusal()
                                                     && greeting_unconfirmed
                                                     && retry_promoted
@@ -1061,9 +1196,10 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Commit one pushed or permanently refused outbox head entry immediately to the vault,
-    /// preserving M-18 outbox retention if reading the history entry fails.
+    /// preserving M-18 outbox retention if reading the history entry fails transiently while
+    /// isolating permanently corrupt history entries so subsequent outbox items never stall.
     #[allow(clippy::too_many_arguments)]
-    async fn commit_outbox_item(
+    pub(super) async fn commit_outbox_item(
         &self,
         vgen: u64,
         inner: &mut Inner<V>,
@@ -1077,7 +1213,14 @@ impl<V: VaultStore> Engine<V> {
         let index = outgoing.history_index;
         let entry_opt = match inner.vault.entry(peer, index).await {
             _ if !self.is_live(vgen) => return Ok(CommitOutcome::Aborted),
-            // M-18: Do NOT delete the outbox entry when reading its history entry fails!
+            Err(crate::vault::Error::Corrupt(reason)) => {
+                self.ui.log(format!(
+                    "History entry #{index} for {} is corrupt ({reason}); settling outbox head without updating history",
+                    short(peer)
+                ));
+                None
+            }
+            // M-18: Do NOT delete the outbox entry when reading its history entry fails transiently!
             Err(e) => return Err(describe(&e)),
             Ok(entry) => entry,
         };
@@ -1384,6 +1527,7 @@ impl<V: VaultStore> Engine<V> {
             let mut hello = greeting.to_bytes();
             stamp(&mut hello, inner.contacts[index].state.clock);
 
+            let target_prekey_generation = claimed.manifest().generation;
             let prepared = {
                 let client = &inner.client;
                 let contact = &mut inner.contacts[index];
@@ -1406,6 +1550,9 @@ impl<V: VaultStore> Engine<V> {
                     contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                     contact.state.security_alert = SECURITY_ALERT_NONE;
                     contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                    contact.state.greeting_target_generation = target_prekey_generation;
+                    contact.state.greeting_sent_at = now();
+                    contact.state.greeting_delivery_verified = false;
                     (
                         contact.session.active_id().copied(),
                         contact.session.active_inbound_token_hash(),
@@ -1681,10 +1828,19 @@ impl<V: VaultStore> Engine<V> {
                     return Ok(false);
                 }
             }
+            let known_at_dispatch = inner
+                .contact(peer)
+                .is_some_and(|c| c.session.is_known_by_peer());
             let push_req = message.push_v2_request(peer);
-            (inner.server.clone(), sealed, push_req, promoted_from_unsent)
+            (
+                inner.server.clone(),
+                sealed,
+                push_req,
+                promoted_from_unsent,
+                known_at_dispatch,
+            )
         };
-        let (server, sealed, push_req, promoted_from_unsent) = prepared;
+        let (server, sealed, push_req, promoted_from_unsent, known_at_dispatch) = prepared;
 
         // Phase 2 outside `self.inner`: await `PushV2` RPC.
         let push_res: session::Result<_> = Fetch::client(&server)
@@ -1754,6 +1910,14 @@ impl<V: VaultStore> Engine<V> {
                 let known = inner
                     .contact(peer)
                     .is_some_and(|c| c.session.is_known_by_peer());
+                if known && !known_at_dispatch {
+                    // Pre-approval `push_events` raced with peer acceptance on this exact session:
+                    // keep `sealed_events` intact, clear approval backoff, and wake sync to retry
+                    // on the working session rather than retiring it.
+                    self.clear_approval_backoff(peer);
+                    self.wake();
+                    return Ok(false);
+                }
                 if known {
                     if let Some(contact) = inner.contact(peer) {
                         contact.state.sealed_events = None;
@@ -1910,6 +2074,7 @@ impl<V: VaultStore> Inner<V> {
                 clock: 0,
                 awaits_upload,
                 content_digest,
+                dispatched: false,
             });
             let entry = HistoryEntry {
                 outgoing: true,
@@ -1985,7 +2150,7 @@ impl<V: VaultStore> Inner<V> {
                 .map_err(|e| describe(&e))?;
             contact.state.clock = clock;
             let outgoing = &mut contact.state.outbox[next];
-            (outgoing.sealed, outgoing.clock) = (true, clock);
+            (outgoing.sealed, outgoing.clock, outgoing.dispatched) = (true, clock, false);
             let record = OutgoingRecord::sealed(sealed, &session_id);
             inner
                 .save_with(&[], &[(*peer, index, Some(record))])
@@ -2047,6 +2212,7 @@ impl<V: VaultStore> Inner<V> {
                     {
                         outgoing.sealed = false;
                         outgoing.clock = 0;
+                        outgoing.dispatched = false;
                     }
                     inner
                         .save_with(&[], &[(*peer, index, Some(rebuilt))])
@@ -2237,14 +2403,17 @@ impl<V: VaultStore> Inner<V> {
         let mut deferred_in_flight = false;
         for o in &contact.state.outbox {
             if all_sealed && o.sealed {
-                // Defer unsealing an outbox head currently in flight in `PushV2` so a successful
-                // relay push still commits `Step::Pushed` without re-encrypting a duplicate.
+                // Defer unsealing an outbox head that is either in flight in `PushV2` right now
+                // OR durably marked `dispatched` (e.g. reload or ambiguous transport error before
+                // local commit) so `flush` reconciles the exact `client_message_id` with the relay
+                // first and never re-encrypts a delivered message into a duplicate.
                 if !again.contains(&o.history_index)
-                    && in_flight.is_some_and(|f| {
-                        f.conversation_gen == conversation_gen
-                            && f.history_index == o.history_index
-                            && f.clock == o.clock
-                    })
+                    && (o.dispatched
+                        || in_flight.is_some_and(|f| {
+                            f.conversation_gen == conversation_gen
+                                && f.history_index == o.history_index
+                                && f.clock == o.clock
+                        }))
                 {
                     deferred_in_flight = true;
                     continue;
@@ -2361,6 +2530,7 @@ impl RequeueOutcome {
             if sealed.contains(&index) {
                 outgoing.sealed = false;
                 outgoing.clock = 0;
+                outgoing.dispatched = false;
             }
             !self.dropped_missing.contains(&index) && !again.contains(&index)
         });

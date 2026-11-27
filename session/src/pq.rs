@@ -504,10 +504,27 @@ mod v2 {
         pub(crate) prev_manifest_seq: u64,
         pub(crate) prev_prekey_generation: u64,
         pub(crate) manifest_digest: [u8; 32],
-        pub(crate) evicted_manifest_digest: Option<(usize, [u8; 32])>,
+        pub(crate) evicted_manifest_digest: Vec<(usize, [u8; 32])>,
         pub(crate) classical: PublishedPrekeys,
         pub(crate) rollback: PrekeyRollback,
         pub(crate) was_publishing: bool,
+    }
+
+    impl PreparedPublishV2 {
+        /// Public signed prekey of the oldest generation tentatively evicted from local `x3dh`
+        /// storage by this rotating publish, if any.
+        ///
+        /// Callers releasing locks across `transmit_publish_v2_with` should defer (rather than
+        /// ACK-and-drop) inbound greetings targeting this signed prekey until the publish commits
+        /// or rolls back, so a refused publish never permanently deletes a valid greeting.
+        pub fn evicted_signed_prekey(&self) -> Option<PublicKey> {
+            match &self.rollback {
+                PrekeyRollback::Rotated {
+                    evicted: Some(ev), ..
+                } => Some(ev.signed_prekey()),
+                _ => None,
+            }
+        }
     }
 
     /// A prepared v2 non-rotating prekey refill request.
@@ -1499,7 +1516,7 @@ mod v2 {
             prepared.rollback.clear_pq();
             self.state.rollback_manifest_digest(
                 prepared.manifest_digest,
-                prepared.evicted_manifest_digest,
+                &prepared.evicted_manifest_digest,
             );
             let evicted_manifest_digest = self
                 .state
@@ -1545,7 +1562,7 @@ mod v2 {
                         self.state.manifest_seq = prepared.prev_manifest_seq;
                         self.state.rollback_manifest_digest(
                             prepared.manifest_digest,
-                            prepared.evicted_manifest_digest,
+                            &prepared.evicted_manifest_digest,
                         );
                     }
                 }
@@ -1565,7 +1582,7 @@ mod v2 {
                         self.state.manifest_seq = prepared.prev_manifest_seq;
                         self.state.rollback_manifest_digest(
                             prepared.manifest_digest,
-                            prepared.evicted_manifest_digest,
+                            &prepared.evicted_manifest_digest,
                         );
                     }
                 }

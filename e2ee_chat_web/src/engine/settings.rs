@@ -312,17 +312,21 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
         }
-        let replay_grants = {
+        let (replay_upgrades, replay_grants) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
+            let mut upgrades = std::collections::BTreeMap::new();
             let mut grants = std::collections::BTreeSet::new();
             if let Some(inner) = guard.as_mut() {
-                if let Ok((_, _, gp)) = self
-                    .replay_deferred_envelopes(inner, Some(&peer), true)
+                // `approve_classical` does not fetch the server inbox, so never drop undecryptable
+                // buffered envelopes here; `self.wake()` triggers the next inbox pull + replay.
+                if let Ok((_, up, gp)) = self
+                    .replay_deferred_envelopes(inner, Some(&peer), None, None)
                     .await
                 {
+                    upgrades = up;
                     grants = gp;
                 }
                 if !self.is_live(vgen) {
@@ -330,13 +334,19 @@ impl<V: VaultStore> Engine<V> {
                 }
                 self.refresh_contacts(inner);
             }
-            grants
+            (upgrades, grants)
         };
         for gp in replay_grants {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
             let _ = self.flush_pending_grants_for_peer(&gp).await;
+        }
+        for (up_peer, conv_gen) in replay_upgrades {
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let _ = self.upgrade_to_pq_auto(up_peer, conv_gen).await;
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -352,10 +362,37 @@ impl<V: VaultStore> Engine<V> {
     /// `finish_prepare_start_again_v2`) with `peer`, persisting before transmitting (H-2), to
     /// upgrade from a classical session or recover from a downgrade.
     ///
-    /// Serialized per peer via `peer_flush_locks` while releasing `self.inner` across all network
-    /// RPCs (`ClaimBundle`, `RegisterWriteToken`, `SendInitialV2`).
+    /// Captures the target conversation generation BEFORE awaiting `peer_flush_lock` so a queued
+    /// manual upgrade can never adopt and auto-accept a deleted-and-recreated chat request.
+    #[cfg(test)]
     pub async fn upgrade_to_pq(&self, peer: PublicKey) -> Result<(), String> {
-        self.upgrade_to_pq_inner(peer, None).await
+        let vgen = self.vault_gen();
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
+        let expected_gen = {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let inner = guard.as_ref().ok_or("locked")?;
+            let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
+                return Err("no such chat".to_string());
+            };
+            contact.state.conversation_gen
+        };
+        self.upgrade_to_pq_inner(peer, Some(expected_gen), false)
+            .await
+    }
+
+    /// Manual PQ upgrade pinned to the UI-selected `expected_conversation_gen`.
+    pub async fn upgrade_to_pq_for_gen(
+        &self,
+        peer: PublicKey,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
+        self.upgrade_to_pq_inner(peer, Some(expected_conversation_gen), false)
+            .await
     }
 
     /// Automatic background PQ upgrade pinned strictly to `expected_conversation_gen` and
@@ -367,14 +404,15 @@ impl<V: VaultStore> Engine<V> {
         peer: PublicKey,
         expected_conversation_gen: u64,
     ) -> Result<(), String> {
-        self.upgrade_to_pq_inner(peer, Some(expected_conversation_gen))
+        self.upgrade_to_pq_inner(peer, Some(expected_conversation_gen), true)
             .await
     }
 
     async fn upgrade_to_pq_inner(
         &self,
         peer: PublicKey,
-        auto_expected_gen: Option<u64>,
+        expected_gen: Option<u64>,
+        require_approved: bool,
     ) -> Result<(), String> {
         const MAX_CONFIG_RETRIES: usize = 2;
         let vgen = self.vault_gen();
@@ -401,10 +439,8 @@ impl<V: VaultStore> Engine<V> {
             let Some(contact) = inner.contacts.iter().find(|c| c.peer == peer) else {
                 return Err("no such chat".to_string());
             };
-            if let Some(want_gen) = auto_expected_gen
-                && (contact.state.conversation_gen != want_gen
-                    || contact.state.request
-                    || contact.state.quarantined)
+            if expected_gen.is_some_and(|want_gen| contact.state.conversation_gen != want_gen)
+                || (require_approved && (contact.state.request || contact.state.quarantined))
             {
                 return Err("chat changed while upgrading; please retry.".to_string());
             }
@@ -559,6 +595,7 @@ impl<V: VaultStore> Engine<V> {
             let mut greeting = hello.to_bytes();
             stamp(&mut greeting, clock_val);
 
+            let target_prekey_generation = claimed.manifest().generation;
             let prepared = {
                 let client = &inner.client;
                 let contact = &mut inner.contacts[index];
@@ -620,6 +657,9 @@ impl<V: VaultStore> Engine<V> {
                 // Persist `GREETING_DELIVERY_UNCERTAIN` directly in the single atomic commit below
                 // so we transmit immediately after without a redundant second full-state save.
                 contact.state.greeting_delivery = GREETING_DELIVERY_UNCERTAIN;
+                contact.state.greeting_target_generation = target_prekey_generation;
+                contact.state.greeting_sent_at = now();
+                contact.state.greeting_delivery_verified = false;
                 contact.state.sealed_events = None;
                 if old_was_request_or_quarantined {
                     contact.state.fallback_farewells.clear();
@@ -813,7 +853,7 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         let replay_grants = match self
-            .replay_deferred_envelopes(inner, Some(&peer), false)
+            .replay_deferred_envelopes(inner, Some(&peer), None, None)
             .await
         {
             Ok((_, _, gp)) => gp,
@@ -921,7 +961,7 @@ impl<V: VaultStore> Engine<V> {
     pub async fn retry_pq(&self, peer: PublicKey) -> Result<(), String> {
         let vgen = self.vault_gen();
         let waits_sign_in = self.queue.waits_for_sign_in(&peer);
-        let use_flush = {
+        let (use_flush, conv_gen) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
@@ -929,6 +969,7 @@ impl<V: VaultStore> Engine<V> {
             let inner = guard.as_mut().ok_or("locked")?;
             let pq_ready = inner.local_pq_enabled() && inner.server_pq != ServerPqStatus::Disabled;
             let contact = inner.contact(&peer).ok_or("no such chat")?;
+            let conv_gen = contact.state.conversation_gen;
             let use_flush = pq_ready
                 && !waits_sign_in
                 && !contact.state.quarantined
@@ -958,7 +999,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 self.refresh_contacts(inner);
             }
-            use_flush
+            (use_flush, conv_gen)
         };
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -966,7 +1007,7 @@ impl<V: VaultStore> Engine<V> {
         if use_flush {
             self.flush(&peer).await.map(drop)
         } else {
-            self.upgrade_to_pq(peer).await
+            self.upgrade_to_pq_for_gen(peer, conv_gen).await
         }
     }
 }
@@ -1114,51 +1155,49 @@ impl<V: VaultStore> Inner<V> {
         let changed = previous != config;
         let previous_needs_publish = self.state.needs_publish;
         let previous_rollback = self.state.pending_pq_rollback.clone();
-        let previous_pending_flags = self.pending_pq_contact_flags.clone();
         validate_pq_config_for_server(&config, &self.server_pq)?;
         let clear_pq_required = previous.strict_pq && !config.strict_pq;
         let clear_classical_approval = previous.pq_enabled && !config.pq_enabled;
         self.client
             .set_pq_config(config)
             .map_err(|e| describe(&e))?;
-        let previous_contact_flags: Vec<(usize, u32, u32)> =
-            if clear_pq_required || clear_classical_approval {
-                self.contacts
-                    .iter_mut()
-                    .enumerate()
-                    .filter_map(|(idx, contact)| {
-                        let prev_alert = contact.state.security_alert;
-                        let prev_approval = contact.state.classical_approval_needed;
-                        let mut modified = false;
-                        if clear_pq_required && prev_alert == SECURITY_ALERT_PQ_REQUIRED {
-                            contact.state.security_alert = SECURITY_ALERT_NONE;
-                            self.pending_pq_contact_flags
-                                .entry(contact.peer)
-                                .or_default()
-                                .0
-                                .get_or_insert(prev_alert);
-                            modified = true;
-                        }
-                        if clear_classical_approval && prev_approval != CLASSICAL_APPROVAL_NONE {
-                            contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
-                            self.pending_pq_contact_flags
-                                .entry(contact.peer)
-                                .or_default()
-                                .1
-                                .get_or_insert(prev_approval);
-                            modified = true;
-                        }
-                        modified.then_some((idx, prev_alert, prev_approval))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
         if changed {
             self.state.pending_pq_rollback.get_or_insert_with(|| {
                 PendingPqRollback::from_config(&previous, previous_needs_publish)
             });
         }
+        let previous_contact_flags: Vec<(usize, u32, u32)> =
+            if clear_pq_required || clear_classical_approval {
+                let rollback = self.state.pending_pq_rollback.as_mut();
+                let mut cleared = Vec::new();
+                let mut recorded: Vec<(PublicKey, Option<u32>, Option<u32>)> = Vec::new();
+                for (idx, contact) in self.contacts.iter_mut().enumerate() {
+                    let prev_alert = contact.state.security_alert;
+                    let prev_approval = contact.state.classical_approval_needed;
+                    let mut saved_alert = None;
+                    let mut saved_approval = None;
+                    if clear_pq_required && prev_alert == SECURITY_ALERT_PQ_REQUIRED {
+                        contact.state.security_alert = SECURITY_ALERT_NONE;
+                        saved_alert = Some(prev_alert);
+                    }
+                    if clear_classical_approval && prev_approval != CLASSICAL_APPROVAL_NONE {
+                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                        saved_approval = Some(prev_approval);
+                    }
+                    if saved_alert.is_some() || saved_approval.is_some() {
+                        recorded.push((contact.peer, saved_alert, saved_approval));
+                        cleared.push((idx, prev_alert, prev_approval));
+                    }
+                }
+                if let Some(rollback) = rollback {
+                    for (peer, saved_alert, saved_approval) in recorded {
+                        rollback.record_contact_flag(&peer, saved_alert, saved_approval);
+                    }
+                }
+                cleared
+            } else {
+                Vec::new()
+            };
         self.state.needs_publish = true;
         if let Err(e) = self.save(&[]).await {
             self.client
@@ -1166,7 +1205,6 @@ impl<V: VaultStore> Inner<V> {
                 .map_err(|e| describe(&e))?;
             self.state.needs_publish = previous_needs_publish;
             self.state.pending_pq_rollback = previous_rollback;
-            self.pending_pq_contact_flags = previous_pending_flags;
             for (idx, prev_alert, prev_approval) in previous_contact_flags {
                 if let Some(contact) = self.contacts.get_mut(idx) {
                     contact.state.security_alert = prev_alert;

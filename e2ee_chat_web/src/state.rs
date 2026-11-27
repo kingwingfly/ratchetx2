@@ -176,6 +176,7 @@ pub struct LastMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContactView {
     pub peer: PublicKey,
+    pub conversation_gen: u64,
     pub name: String,
     /// The peer started the chat, and it is not accepted yet.
     pub request: bool,

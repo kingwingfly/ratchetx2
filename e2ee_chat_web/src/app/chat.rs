@@ -188,6 +188,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                 // Suppress standalone downgrade banner when the merged quarantine banner is active
                 // so the user never sees two stacked "Upgrade to PQ" primary buttons.
                 if c.has_downgrade() && !c.is_quarantined() {
+                    let conv_gen = c.conversation_gen;
                     Some(
                         view! {
                             <div class="banner danger" role="alert">
@@ -203,7 +204,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                             disabled=move || sec_busy.get() || server_pq_disabled(ui)
                                             on:click=move |_| {
                                                 act_while(sec_busy, async move {
-                                                    engine().upgrade_to_pq(peer).await
+                                                    engine()
+                                                        .upgrade_to_pq_for_gen(peer, conv_gen)
+                                                        .await
                                                 });
                                             }
                                         >
@@ -271,8 +274,11 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                     sec_busy.get() || server_pq_disabled(ui)
                                                 }
                                                 on:click=move |_| {
+                                                    let conv_gen = c.conversation_gen;
                                                     act_while(sec_busy, async move {
-                                                        engine().upgrade_to_pq(peer).await
+                                                        engine()
+                                                            .upgrade_to_pq_for_gen(peer, conv_gen)
+                                                            .await
                                                     });
                                                 }
                                             >

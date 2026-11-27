@@ -1157,9 +1157,6 @@ mod server {
         }
 
         async fn get_manifest(&self, request: GetManifestRequest) -> Result<GetManifestResponse> {
-            if !self.info.pq_enabled {
-                return Err(ErrorKind::Unimplemented.into());
-            }
             let identity_key: PublicKey = fixed(&request.identity_key)?;
             check_canonical_key(&identity_key)?;
             let manifest = self
@@ -1991,15 +1988,17 @@ mod server {
             assert!(info.supported_suites.is_empty());
             assert!(!info.pq_ratchet_supported);
 
+            // Read-only `GetManifest` remains served when PQ_ENABLED="false" so classical-only
+            // v2 relays support SPK-rotation verification; unpublished identities return `None`.
             let bob = XEdDSAPrivateKey::generate();
-            assert_eq!(
+            assert!(
                 v2.get_manifest(GetManifestRequest {
                     identity_key: Bytes::copy_from_slice(&bob.compute_public_key().to_bytes()),
                 })
                 .await
-                .unwrap_err()
-                .kind(),
-                ErrorKind::Unimplemented
+                .unwrap()
+                .manifest
+                .is_none()
             );
         }
 
@@ -2189,16 +2188,17 @@ mod server {
             assert!(info.supported_suites.is_empty());
             assert!(!info.pq_ratchet_supported);
 
-            // PQ-only operations are rejected with Unimplemented.
-            assert_eq!(
+            // Read-only `GetManifest` remains available for SPK-rotation probes when
+            // `PQ_ENABLED="false"`, while PQ-only operations are rejected with `Unimplemented`.
+            assert!(
                 v2_off
                     .get_manifest(GetManifestRequest {
                         identity_key: Bytes::copy_from_slice(&bob_pk),
                     })
                     .await
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::Unimplemented
+                    .unwrap()
+                    .manifest
+                    .is_some()
             );
             assert_eq!(
                 v2_off

@@ -420,7 +420,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             }
             // Enforce signed timestamp freshness at DO commit time so a delayed registration can
             // never outlive `REVOCATION_TOMBSTONE_TTL_MS` (2 * MAX_CLOCK_SKEW + 60s).
-            if now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW {
+            if record.timestamp == 0 || now_ms.abs_diff(record.timestamp) > MAX_CLOCK_SKEW {
                 return Ok(RegisterWriteTokenOutcome::StaleTimestamp);
             }
             prune_expired_peer_grants_sql(sql, now_ms)?;
@@ -1460,6 +1460,24 @@ mod tests {
             );
             assert!(!store.has_write_token(&tok(5)).unwrap());
             assert!(store.has_write_token(&tok(10)).unwrap());
+
+            // R4-P3-1: Zero registration timestamp MUST be rejected even when `now_ms <= MAX_CLOCK_SKEW`.
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: BOB,
+                            peer_slot_id: slot(2),
+                            token_hash: tok(99),
+                            grant_version: 1,
+                            pin_active: true,
+                            timestamp: 0,
+                        },
+                        1_000,
+                    )
+                    .unwrap(),
+                RegisterWriteTokenOutcome::StaleTimestamp
+            );
         }
     }
 }

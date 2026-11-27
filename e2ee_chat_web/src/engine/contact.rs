@@ -425,6 +425,7 @@ impl Contact {
         };
         ContactView {
             peer: self.peer,
+            conversation_gen: self.state.conversation_gen,
             name: self.state.name.clone(),
             request: self.state.request,
             greeting_unsent,

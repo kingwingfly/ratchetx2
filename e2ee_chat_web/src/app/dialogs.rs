@@ -730,6 +730,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             {move || {
                 live_contact().map(|c| {
                     let strict_pq = strict_pq.get();
+                    let conv_gen = c.conversation_gen;
                     let show_allow = can_allow_classical(c.classical_prompt, strict_pq);
                     let show_upgrade = pq_available(ui) && contact_can_upgrade_to_pq(&c);
                     let show_dismiss = c.has_downgrade() && !c.is_quarantined();
@@ -760,7 +761,9 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                                                     }
                                                     on:click=move |_| {
                                                         act_while(busy, async move {
-                                                            engine().upgrade_to_pq(peer).await
+                                                            engine()
+                                                                .upgrade_to_pq_for_gen(peer, conv_gen)
+                                                                .await
                                                         });
                                                     }
                                                 >

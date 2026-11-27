@@ -8,7 +8,9 @@ use super::{
 use crate::content::{AttachmentPointer, Content, Kind};
 use crate::preview;
 use crate::preview::Sort;
-use crate::state::{Attachment, Body, Delivery, FileView, Link, Opening, UploadState, UploadView};
+use crate::state::{
+    Attachment, Body, Delivery, FileView, Link, Opening, Step, UploadState, UploadView,
+};
 use crate::transport::{Connect, Fetch, Progress};
 use crate::util::{describe, js_error, size_u64, sleep};
 use crate::vault::{
@@ -1179,7 +1181,7 @@ impl<V: VaultStore> Engine<V> {
         self.ui
             .uploads
             .update(|uploads| uploads.retain(|upload| upload.id != id));
-        let (delete_job, failed_outbox) = {
+        let (delete_jobs, settled_outbox) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
@@ -1229,18 +1231,71 @@ impl<V: VaultStore> Engine<V> {
             {
                 announced_index = Some(idx);
             }
-            let mut failed_outbox = false;
+            let mut settled_outbox = false;
+            let mut extra_server_deletes = Vec::new();
             if let Some(idx) = announced_index {
-                let in_outbox = inner.contact(&peer).is_some_and(|contact| {
-                    contact
-                        .state
-                        .outbox
-                        .iter()
-                        .any(|outgoing| outgoing.history_index == idx)
-                });
-                if in_outbox {
-                    self.fail_waiting(inner, &peer, idx).await?;
-                    failed_outbox = true;
+                let relayed_commit = inner
+                    .in_flight_push
+                    .get(&peer)
+                    .copied()
+                    .filter(|f| f.relayed && f.history_index == idx)
+                    .and_then(|relayed| {
+                        let c = inner.contacts.iter().find(|c| c.peer == peer)?;
+                        if c.state.conversation_gen != relayed.conversation_gen {
+                            return None;
+                        }
+                        let head = c.state.outbox.first()?;
+                        if head.history_index == relayed.history_index
+                            && head.sealed
+                            && head.clock == relayed.clock
+                        {
+                            let confirm_session = !c.session.needs_new_session()
+                                && !c.state.needs_requeue_sealed
+                                && (relayed.session_id.is_none()
+                                    || c.session.active_id() == relayed.session_id.as_ref());
+                            Some((head.clone(), confirm_session))
+                        } else {
+                            None
+                        }
+                    });
+                if let Some((head, confirm_session)) = relayed_commit {
+                    // The announcement already reached the relay (`relayed == true`) and only
+                    // lacked local commit: settle it as `Step::Pushed` (retaining receipt tracking
+                    // and releasing the send slot) rather than rewriting it to `Step::Refused`.
+                    match self
+                        .commit_outbox_item(
+                            vgen,
+                            inner,
+                            &peer,
+                            &head,
+                            Step::Pushed,
+                            head.clock,
+                            confirm_session,
+                            &mut extra_server_deletes,
+                        )
+                        .await
+                    {
+                        Ok(super::outbox::CommitOutcome::Committed) => {
+                            inner.in_flight_push.remove(&peer);
+                            self.clear_approval_backoff(&peer);
+                            self.release(&peer, head.history_index);
+                            settled_outbox = true;
+                        }
+                        Ok(super::outbox::CommitOutcome::Aborted) => return Err("locked".into()),
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    let in_outbox = inner.contact(&peer).is_some_and(|contact| {
+                        contact
+                            .state
+                            .outbox
+                            .iter()
+                            .any(|outgoing| outgoing.history_index == idx)
+                    });
+                    if in_outbox {
+                        self.fail_waiting(inner, &peer, idx).await?;
+                        settled_outbox = true;
+                    }
                 }
             }
             inner
@@ -1255,11 +1310,12 @@ impl<V: VaultStore> Engine<V> {
                 name: pending.name.clone(),
                 kind: ServerDeleteKind::CancelUpload(upload),
             };
-            (job, failed_outbox)
+            extra_server_deletes.push(job);
+            (extra_server_deletes, settled_outbox)
         };
         // Perform the HTTP cancel outside `self.inner.lock()` so slow deletes never block the UI.
-        self.finish_server_deletes(&peer, vec![delete_job]).await;
-        if failed_outbox && self.is_live(vgen) {
+        self.finish_server_deletes(&peer, delete_jobs).await;
+        if settled_outbox && self.is_live(vgen) {
             if let Err(e) = self.flush(&peer).await
                 && self.is_live(vgen)
             {

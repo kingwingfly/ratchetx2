@@ -401,6 +401,16 @@ impl SendQueue {
         self.confirmed_probe_backoff.borrow_mut().remove(peer);
     }
 
+    #[cfg(test)]
+    pub(super) fn clear_approval_backoff_only(&self, peer: &PublicKey) {
+        self.approval_backoff.borrow_mut().remove(peer);
+    }
+
+    #[cfg(test)]
+    pub(super) fn clear_confirmed_probe_backoff(&self, peer: &PublicKey) {
+        self.confirmed_probe_backoff.borrow_mut().remove(peer);
+    }
+
     pub(super) fn clear_all_approval_backoffs(&self) {
         self.approval_backoff.borrow_mut().clear();
         self.confirmed_probe_backoff.borrow_mut().clear();

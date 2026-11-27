@@ -166,6 +166,13 @@ pub struct EvictedGeneration {
     generation: Generation,
 }
 
+impl EvictedGeneration {
+    /// Public signed prekey of the evicted generation.
+    pub fn signed_prekey(&self) -> PublicKey {
+        self.generation.signed_prekey
+    }
+}
+
 impl core::fmt::Debug for EvictedGeneration {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EvictedGeneration")

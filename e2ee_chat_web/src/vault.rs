@@ -1099,6 +1099,18 @@ pub fn open_deferred(record_key: &[u8; 32], epoch: u64, sealed: &[u8]) -> Result
     DeferredRecord::decode(plain.as_slice()).map_err(|e| Error::Corrupt(e.to_string()))
 }
 
+/// Saved per-contact security/approval flags cleared during a pending `PqConfig` edit so a
+/// definitive server refusal restores them even across a page reload.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct PendingPqContactFlag {
+    #[prost(bytes = "vec", tag = "1")]
+    pub peer: Vec<u8>,
+    #[prost(uint32, optional, tag = "2")]
+    pub prev_security_alert: Option<u32>,
+    #[prost(uint32, optional, tag = "3")]
+    pub prev_classical_approval: Option<u32>,
+}
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct PendingPqRollback {
     #[prost(bool, tag = "1")]
@@ -1111,6 +1123,8 @@ pub struct PendingPqRollback {
     pub strict_pq: bool,
     #[prost(bool, tag = "5")]
     pub previous_needs_publish: bool,
+    #[prost(message, repeated, tag = "6")]
+    pub contact_flags: Vec<PendingPqContactFlag>,
 }
 
 impl PendingPqRollback {
@@ -1121,6 +1135,33 @@ impl PendingPqRollback {
             pq_ratchet_enabled: config.pq_ratchet_enabled,
             strict_pq: config.strict_pq,
             previous_needs_publish,
+            contact_flags: Vec::new(),
+        }
+    }
+
+    pub fn record_contact_flag(
+        &mut self,
+        peer: &[u8],
+        prev_alert: Option<u32>,
+        prev_approval: Option<u32>,
+    ) {
+        if let Some(existing) = self
+            .contact_flags
+            .iter_mut()
+            .find(|f| f.peer.as_slice() == peer)
+        {
+            if let Some(a) = prev_alert {
+                existing.prev_security_alert.get_or_insert(a);
+            }
+            if let Some(p) = prev_approval {
+                existing.prev_classical_approval.get_or_insert(p);
+            }
+        } else {
+            self.contact_flags.push(PendingPqContactFlag {
+                peer: peer.to_vec(),
+                prev_security_alert: prev_alert,
+                prev_classical_approval: prev_approval,
+            });
         }
     }
 
@@ -1240,6 +1281,25 @@ pub struct ContactState {
     /// while this contact was unsupported on a reduced-PQ build.
     #[prost(uint32, tag = "33")]
     pub evicted_while_isolated: u32,
+    /// Provisional outbound contact created by `start_chat` before final submission confirmation;
+    /// gated out of background greeting retries, background grant flushes, and inbound
+    /// auto-approval so even total storage failure during cancellation never grants approval or
+    /// transmits a cancelled chat's greeting after reload.
+    #[prost(bool, tag = "34")]
+    pub provisional: bool,
+    /// Peer signed `CapabilityManifest.generation` targeted by the current active greeting
+    /// (`0` if unknown), used to restrict `CONFIRMED` SPK-eviction probes until the peer has
+    /// rotated at least twice (`manifest.generation >= greeting_target_generation + 2`).
+    #[prost(uint64, tag = "35")]
+    pub greeting_target_generation: u64,
+    /// Local wall-clock Unix ms when the current active greeting was prepared/sent (`0` if
+    /// unknown), bounding `CONFIRMED` SPK-eviction probes to the server's inbox TTL window.
+    #[prost(uint64, tag = "36")]
+    pub greeting_sent_at: u64,
+    /// Set once a post-2-rotation `CONFIRMED` greeting probe succeeded (`Added { inserted: false }`),
+    /// proving the server retained a live row or ACK tombstone so no further probes are needed.
+    #[prost(bool, tag = "37")]
+    pub greeting_delivery_verified: bool,
 }
 
 /// Persisted structured preview of the most recent message in a chat.
@@ -1443,6 +1503,11 @@ pub struct Outgoing {
     /// reconstructing a missing/corrupt or requeued [`OutgoingRecord`].
     #[prost(bytes = "vec", tag = "7")]
     pub content_digest: Vec<u8>,
+    /// Persisted before transmitting `PushV2` so a reload or lost response after a concurrent
+    /// rekey reconciles the exact same `client_message_id` idempotently instead of unsealing and
+    /// duplicating delivery; cleared only on definitive relay non-delivery.
+    #[prost(bool, tag = "8")]
+    pub dispatched: bool,
 }
 
 /// What a message not pushed yet is: its content, encrypted just before it goes.

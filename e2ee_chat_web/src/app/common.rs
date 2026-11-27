@@ -659,6 +659,7 @@ pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
 
     ContactView {
         peer: [byte; 32],
+        conversation_gen: 1,
         name: name.to_string(),
         request: false,
         greeting_unsent: false,

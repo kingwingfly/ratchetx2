@@ -203,11 +203,12 @@ impl Procedure for ProcedureV2 {
     }
 
     /// V2 procedures completely disabled when `PQ_ENABLED="false"` without inspecting the request
-    /// body. Other v2 procedures enforce fine-grained rollback rules inside `HandshakeV2Server` /
-    /// `MailboxV2Server` so existing PQ users can drain in-flight handshakes and publish signed
-    /// OFF manifests.
+    /// body. All v2 procedures remain active (including read-only `GetManifest` returning signed
+    /// classical/PQ-off manifests) while `HandshakeV2Server` / `MailboxV2Server` enforce
+    /// fine-grained PQ-disabled rules so clients can drain in-flight handshakes, publish signed
+    /// OFF manifests, and verify peer SPK rotations without consuming one-time prekeys.
     fn disabled_without_pq(self) -> bool {
-        matches!(self, ProcedureV2::GetManifest)
+        false
     }
 
     async fn dispatch(
@@ -938,11 +939,8 @@ pub(crate) mod tests {
         assert!(off.supported_suites.is_empty());
         assert!(!off.pq_ratchet_supported);
 
-        assert!(ProcedureV2::GetManifest.disabled_without_pq());
         for proc in ProcedureV2::ALL {
-            if proc != ProcedureV2::GetManifest {
-                assert!(!proc.disabled_without_pq());
-            }
+            assert!(!proc.disabled_without_pq());
         }
     }
 

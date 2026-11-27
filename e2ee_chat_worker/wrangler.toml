@@ -78,11 +78,11 @@ SESSION_DAYS = "30"
 # the request URL origin if omitted; set explicitly in production:
 # SERVER_ID = "chat.example.com"
 # Runtime post-quantum toggle:
-# - PQ_ENABLED = "false" disables GetManifest and advertises pq_enabled: false, x-e2ee-pq: 0,
-#   and empty supported_suites. PublishV2 accepts signed OFF manifests and ClaimBundle offers
-#   classical fallback. ListInitialMessages, AckInitialMessages, PushV2, FetchSigned, AckMessages,
-#   RegisterWriteToken, and RevokeWriteToken stay active so clients can drain in-flight handshakes
-#   and messages and continue signed reads.
+# - PQ_ENABLED = "false" advertises pq_enabled: false, x-e2ee-pq: 0, and empty supported_suites.
+#   PublishV2 accepts signed OFF manifests (refusing PQ-ON publishes), ClaimBundle offers classical
+#   fallback, and GetManifest serves read-only signed manifests. ListInitialMessages,
+#   AckInitialMessages, PushV2, FetchSigned, AckMessages, RegisterWriteToken, and RevokeWriteToken
+#   stay active so clients can drain in-flight handshakes and messages and continue signed reads.
 PQ_ENABLED = "true"
 
 # The secrets PASSWORD, which clients sign in with (use >= 128 bits of entropy, e.g.

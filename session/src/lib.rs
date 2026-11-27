@@ -46,8 +46,15 @@ use zeroize::Zeroizing;
 /// Request at most the default mailbox fetch limit per page when `limit == 0`.
 pub(crate) const MAX_RECEIVE_PAGE: u32 = 100;
 
-/// Maximum number of recent locally signed `CapabilityManifest` digests retained in `ClientState`.
+/// Maximum number of rolling non-preserved locally signed `CapabilityManifest` digests retained in
+/// `ClientState`.
 pub(crate) const MAX_RECENT_MANIFEST_DIGESTS: usize = 16;
+
+/// Hard upper bound on `recent_manifest_digests` including digests explicitly preserved for
+/// deferred unsupported-suite initial messages (16 rolling + up to 128 deferred-initial pins).
+/// Maximum manifest digests retained by a client across scheduled rotations (16 rolling
+/// non-preserved slots + up to 128 preserved deferred-initial digests).
+pub const MAX_RETAINED_MANIFEST_DIGESTS: usize = 144;
 
 /// Maximum pending write-token registrations retained per session (matches relay per-peer grant
 /// cap).
@@ -238,25 +245,26 @@ impl ClientState {
         }
     }
 
-    /// Whether recording another manifest digest can fit within `MAX_RECENT_MANIFEST_DIGESTS`
+    /// Whether recording another manifest digest can fit within `MAX_RETAINED_MANIFEST_DIGESTS`
     /// without evicting any digest listed in `preserve`.
     pub fn has_spare_manifest_digest_slot(&self, preserve: &[[u8; 32]]) -> bool {
-        self.recent_manifest_digests.len() < MAX_RECENT_MANIFEST_DIGESTS
+        self.recent_manifest_digests.len() < MAX_RETAINED_MANIFEST_DIGESTS
             || self
                 .recent_manifest_digests
                 .iter()
                 .any(|d| !preserve.contains(d))
     }
 
-    /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`
-    /// while preferring to keep any digests listed in `preserve` (e.g. deferred unsupported-suite
-    /// initials waiting for replay) and NEVER evicting the newly pushed digest. Returns the
-    /// evicted `(index, digest)` so a refused publish can restore FIFO order.
+    /// Record a freshly signed manifest digest, retaining up to `MAX_RECENT_MANIFEST_DIGESTS`
+    /// rolling non-preserved digests PLUS any digests listed in `preserve` (up to
+    /// `MAX_RETAINED_MANIFEST_DIGESTS` total) and NEVER evicting the newly pushed digest. Returns
+    /// all evicted `(index, digest)` entries in eviction order so a refused publish can restore
+    /// exact FIFO order.
     pub(crate) fn record_manifest_digest_preserving(
         &mut self,
         digest: [u8; 32],
         preserve: &[[u8; 32]],
-    ) -> Option<(usize, [u8; 32])> {
+    ) -> Vec<(usize, [u8; 32])> {
         if let Some(pos) = self
             .recent_manifest_digests
             .iter()
@@ -265,35 +273,57 @@ impl ClientState {
             self.recent_manifest_digests.remove(pos);
         }
         self.recent_manifest_digests.push(digest);
-        let mut evicted = None;
-        while self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
-            // Only consider entries strictly older than the newly appended `last()` slot.
+        let mut evicted = Vec::new();
+        // Trim oldest non-preserved entries while more than `MAX_RECENT_MANIFEST_DIGESTS`
+        // non-preserved digests are retained (never evicting the newly pushed `last()` slot).
+        loop {
+            let candidate_end = self.recent_manifest_digests.len().saturating_sub(1);
+            let non_preserved_count = self
+                .recent_manifest_digests
+                .iter()
+                .filter(|d| !preserve.contains(d))
+                .count();
+            if non_preserved_count <= MAX_RECENT_MANIFEST_DIGESTS {
+                break;
+            }
+            let Some(evict_idx) = self.recent_manifest_digests[..candidate_end]
+                .iter()
+                .position(|d| !preserve.contains(d))
+            else {
+                break;
+            };
+            evicted.push((evict_idx, self.recent_manifest_digests.remove(evict_idx)));
+        }
+        // Enforce the hard total cap (`MAX_RETAINED_MANIFEST_DIGESTS`), preferring non-preserved
+        // entries first and never evicting the newly pushed `last()` slot.
+        while self.recent_manifest_digests.len() > MAX_RETAINED_MANIFEST_DIGESTS {
             let candidate_end = self.recent_manifest_digests.len() - 1;
             let evict_idx = self.recent_manifest_digests[..candidate_end]
                 .iter()
                 .position(|d| !preserve.contains(d))
                 .unwrap_or(0);
-            evicted = Some((evict_idx, self.recent_manifest_digests.remove(evict_idx)));
+            evicted.push((evict_idx, self.recent_manifest_digests.remove(evict_idx)));
         }
         evicted
     }
 
-    /// Pop a previously appended manifest digest and restore any digest it evicted at its original
-    /// FIFO position.
+    /// Pop a previously appended manifest digest and restore any digests it evicted at their
+    /// original FIFO positions.
     pub(crate) fn rollback_manifest_digest(
         &mut self,
         added: [u8; 32],
-        evicted: Option<(usize, [u8; 32])>,
+        evicted: &[(usize, [u8; 32])],
     ) {
         if self.recent_manifest_digests.last() == Some(&added) {
             self.recent_manifest_digests.pop();
         }
-        if let Some((pos, restored)) = evicted
-            && self.recent_manifest_digests.len() < MAX_RECENT_MANIFEST_DIGESTS
-            && !self.recent_manifest_digests.contains(&restored)
-        {
-            let idx = pos.min(self.recent_manifest_digests.len());
-            self.recent_manifest_digests.insert(idx, restored);
+        for &(pos, restored) in evicted.iter().rev() {
+            if self.recent_manifest_digests.len() < MAX_RETAINED_MANIFEST_DIGESTS
+                && !self.recent_manifest_digests.contains(&restored)
+            {
+                let idx = pos.min(self.recent_manifest_digests.len());
+                self.recent_manifest_digests.insert(idx, restored);
+            }
         }
     }
 
@@ -338,7 +368,7 @@ impl ClientState {
             || self.pending_mailbox_ack > self.mailbox_cursor
             || self.next_grant_version == 0
             || self.next_grant_version > protocol::MAX_SAFE_INTEGER
-            || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            || self.recent_manifest_digests.len() > MAX_RETAINED_MANIFEST_DIGESTS
             || (self.manifest_seq > 0 && self.recent_manifest_digests.is_empty())
         {
             return Err(ErrorKind::MalformedState.into());
@@ -416,7 +446,7 @@ struct RawClientState {
     prekey_generation: u64,
     #[serde(
         default,
-        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RETAINED_MANIFEST_DIGESTS>"
     )]
     recent_manifest_digests: Vec<[u8; 32]>,
     #[serde(default)]
@@ -498,7 +528,7 @@ impl TryFrom<&proto::ClientState> for ClientState {
         if state.strict_pq && (state.pq_disabled || !has_pq) {
             return Err(ErrorKind::MalformedState.into());
         }
-        if state.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
+        if state.recent_manifest_digests.len() > MAX_RETAINED_MANIFEST_DIGESTS {
             return Err(ErrorKind::MalformedState.into());
         }
         let recent_manifest_digests = state

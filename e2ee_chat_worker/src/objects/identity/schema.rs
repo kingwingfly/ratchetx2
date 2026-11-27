@@ -142,6 +142,15 @@ CREATE TABLE IF NOT EXISTS dedup_counts (
     token_hash BLOB PRIMARY KEY,
     count INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS acked_initial_messages (
+    sender BLOB NOT NULL,
+    ephemeral_key BLOB NOT NULL,
+    id INTEGER NOT NULL,
+    payload_hash BLOB NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (sender, ephemeral_key)
+);
+CREATE INDEX IF NOT EXISTS acked_initial_messages_by_expiry ON acked_initial_messages (expires_at);
 ";
 
 /// Tracks verified audience- and nonce-bound v2 subscriptions for replay protection (lazy table).
@@ -159,10 +168,9 @@ fn version_mismatch_error(found: u64) -> Error {
     ))
 }
 
-/// Idempotently add `capability_manifest.prev_signed_prekey` when opening an earlier `SCHEMA_V5`
-/// database created prior to retired-SPK tracking so neither reads nor writes fail with
-/// `"no such column: prev_signed_prekey"`.
-fn ensure_v5_prev_spk_column<S: SqlExec>(sql: &S) -> Result<()> {
+/// Idempotently apply additive `SCHEMA_V5` compatibility migrations (`prev_signed_prekey` column
+/// and `acked_initial_messages` delivery-tombstone table) when opening an earlier `SCHEMA_V5` DO.
+fn ensure_v5_compat_migrations<S: SqlExec>(sql: &S) -> Result<()> {
     let col: CountRow = sql.query_one(
         "SELECT count(*) AS count FROM pragma_table_info('capability_manifest') \
          WHERE name = 'prev_signed_prekey'",
@@ -174,6 +182,18 @@ fn ensure_v5_prev_spk_column<S: SqlExec>(sql: &S) -> Result<()> {
             vec![],
         )?;
     }
+    sql.exec_batch(
+        "CREATE TABLE IF NOT EXISTS acked_initial_messages (
+            sender BLOB NOT NULL,
+            ephemeral_key BLOB NOT NULL,
+            id INTEGER NOT NULL,
+            payload_hash BLOB NOT NULL,
+            expires_at INTEGER NOT NULL,
+            PRIMARY KEY (sender, ephemeral_key)
+        );
+        CREATE INDEX IF NOT EXISTS acked_initial_messages_by_expiry
+            ON acked_initial_messages (expires_at);",
+    )?;
     Ok(())
 }
 
@@ -192,7 +212,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             vec![],
         )? {
             Some(row) if row.schema_version == CURRENT_SCHEMA_VERSION => {
-                ensure_v5_prev_spk_column(self.sql)?;
+                ensure_v5_compat_migrations(self.sql)?;
                 self.cache.schema_ready.set(true);
                 Ok(true)
             }
@@ -230,7 +250,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 )?
             {
                 if row.schema_version == CURRENT_SCHEMA_VERSION {
-                    ensure_v5_prev_spk_column(sql)?;
+                    ensure_v5_compat_migrations(sql)?;
                     return Ok(());
                 }
                 return Err(version_mismatch_error(row.schema_version));
@@ -295,6 +315,7 @@ mod tests {
             "messages",
             "mailbox_dedup",
             "dedup_counts",
+            "acked_initial_messages",
         ] {
             assert!(
                 has_table(&env.sql, table).unwrap(),

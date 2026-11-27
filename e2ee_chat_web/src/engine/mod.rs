@@ -349,9 +349,9 @@ pub(super) struct Inner<V = Vault> {
     isolated_contacts: Vec<ContactState>,
     /// History namespaces reserved by unreadable contacts with no healthy active record.
     isolated_peers: HashSet<PublicKey>,
-    /// Per-contact `(security_alert, classical_approval_needed)` flags cleared during a pending
-    /// `PqConfig` edit so a definitive server refusal restores them alongside `pending_pq_rollback`.
-    pending_pq_contact_flags: HashMap<PublicKey, (Option<u32>, Option<u32>)>,
+    /// Oldest signed prekey tentatively evicted from `x3dh` while a lock-free rotating `PublishV2`
+    /// is in flight; inbound greetings targeting it are left un-ACKed until commit or rollback.
+    tentatively_displaced_spk: Option<PublicKey>,
     /// A non-rollbackable state change still needs a successful transaction.
     unsaved_state: bool,
     /// Inbox IDs to commit with their deferred ciphertext before they become eligible for ack.
@@ -2035,17 +2035,19 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        let replay_grants = {
+        let (replay_upgrades, replay_grants) = {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
+            let mut upgrades = std::collections::BTreeMap::new();
             let mut grants = std::collections::BTreeSet::new();
             if let Some(inner) = guard.as_mut() {
-                if let Ok((_, _, gp)) = self
-                    .replay_deferred_envelopes(inner, Some(&peer), false)
+                if let Ok((_, up, gp)) = self
+                    .replay_deferred_envelopes(inner, Some(&peer), None, None)
                     .await
                 {
+                    upgrades = up;
                     grants = gp;
                 }
                 if !self.is_live(vgen) {
@@ -2053,13 +2055,19 @@ impl<V: VaultStore> Engine<V> {
                 }
                 self.refresh_contacts(inner);
             }
-            grants
+            (upgrades, grants)
         };
         for gp in replay_grants {
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
             let _ = self.flush_pending_grants_for_peer(&gp).await;
+        }
+        for (up_peer, conv_gen) in replay_upgrades {
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
+            let _ = self.upgrade_to_pq_auto(up_peer, conv_gen).await;
         }
         if !self.is_live(vgen) {
             return Err("locked".into());
@@ -2648,7 +2656,11 @@ impl<V: VaultStore> Inner<V> {
         self.in_flight_push.remove(peer);
         self.contacts.retain(|contact| contact.peer != *peer);
         self.forget_isolated_peer(peer);
-        self.pending_pq_contact_flags.remove(peer);
+        if let Some(rollback) = &mut self.state.pending_pq_rollback {
+            rollback
+                .contact_flags
+                .retain(|flag| flag.peer.as_slice() != peer.as_slice());
+        }
         self.deferred_initials = deferred.entries;
         self.carried_deferred_timestamps = deferred.carried_timestamps;
         self.deferred_envelopes = deferred.envelopes;
@@ -2730,7 +2742,7 @@ impl<V: VaultStore> Inner<V> {
             contacts,
             isolated_contacts,
             isolated_peers,
-            pending_pq_contact_flags: HashMap::new(),
+            tentatively_displaced_spk: None,
             server_pq: ServerPqStatus::Unknown,
             last_server_classical_opks: None,
             last_server_pq_opks: None,

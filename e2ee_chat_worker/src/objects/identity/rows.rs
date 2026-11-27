@@ -130,6 +130,14 @@ pub(super) struct OldestRow {
 }
 
 #[derive(Deserialize)]
+pub(super) struct AckedInitialRow {
+    pub(super) id: u64,
+    pub(super) sender: Blob,
+    pub(super) ephemeral_key: Blob,
+    pub(super) payload_hash: Blob,
+}
+
+#[derive(Deserialize)]
 pub(super) struct ManifestSeqRow {
     #[allow(dead_code)]
     pub(super) manifest_seq: u64,

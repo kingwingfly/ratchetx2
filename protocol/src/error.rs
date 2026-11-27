@@ -68,6 +68,7 @@ impl Error {
                 self.kind,
                 ErrorKind::SignInRequired
                     | ErrorKind::LimitExceeded
+                    | ErrorKind::MailboxFull
                     | ErrorKind::Unimplemented
                     | ErrorKind::NotFound
                     | ErrorKind::Malformed

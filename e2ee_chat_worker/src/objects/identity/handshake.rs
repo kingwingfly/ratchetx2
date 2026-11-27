@@ -22,6 +22,12 @@ const OPK_BUDGET_WINDOW_MS: u64 = 60 * 60 * 1000;
 /// Maximum OPK-consuming `ClaimBundle` calls per identity within [`OPK_BUDGET_WINDOW_MS`].
 /// Past this cap, bundles are still returned (with SPK and PQ last-resort) without popping OPKs.
 const MAX_OPK_CLAIMS_PER_HOUR: u64 = 32;
+/// Retention TTL for `(sender, ephemeral_key)` tombstones written on `AckInitialMessages` (30 days,
+/// strictly exceeding the 14-day inbox TTL and sender `CONFIRMED` probe window so ACKed/declined
+/// chat requests are never resurrected after two SPK rotations).
+pub(super) const ACKED_INITIAL_TOMBSTONE_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+/// Maximum `(sender, ephemeral_key)` ACK tombstones retained per identity DO.
+const MAX_ACKED_INITIAL_TOMBSTONES: u64 = 4096;
 
 #[derive(Clone, Copy)]
 enum PqPrekeyTable {
@@ -365,6 +371,23 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                     manifest.signature.as_slice()
                 ]?,
             )?;
+            // Purge any un-ACKed inbox initials whose target SPK is no longer retained (evicted
+            // after 2 SPK rotations) WITHOUT writing a delivered tombstone: the recipient already
+            // evicted that private SPK and can never decrypt them, so purging here lets the
+            // sender's post-2-rotation probe distinguish evicted-unread (`StalePrekey`) from
+            // already-read/declined (`acked_initial_messages` tombstone).
+            if let Some(ref prev_spk) = prev_signed_prekey {
+                sql.exec(
+                    "DELETE FROM initial_messages \
+                     WHERE signed_prekey != ? AND signed_prekey != ?",
+                    params![manifest.signed_prekey.as_slice(), prev_spk.as_slice()]?,
+                )?;
+            } else {
+                sql.exec(
+                    "DELETE FROM initial_messages WHERE signed_prekey != ?",
+                    params![manifest.signed_prekey.as_slice()]?,
+                )?;
+            }
             Ok(PublishV2Status::Stored)
         })
     }
@@ -594,15 +617,20 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             else {
                 return Ok(AddInitialOutcome::NotFound);
             };
-            // Prune expired rows BEFORE `(sender, ephemeral_key)` lookup/insert so an expired row
-            // never collides with UNIQUE(sender, ephemeral_key) or occupies an inbox slot.
+            // Prune expired rows & expired ACK tombstones BEFORE `(sender, ephemeral_key)` lookup
+            // so expired entries never collide with fresh inserts or occupy inbox slots.
             sql.exec(
                 "DELETE FROM initial_messages WHERE created_at < ?",
                 params![cutoff]?,
             )?;
+            sql.exec(
+                "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
+                params![now_ms]?,
+            )?;
 
-            // Check `(sender, ephemeral_key)` idempotency BEFORE SPK retention so retrying an
-            // already-accepted row after subsequent SPK rotations preserves idempotent delivery.
+            // Check `(sender, ephemeral_key)` idempotency against live inbox rows AND delivered
+            // ACK tombstones BEFORE SPK retention so retrying an already-accepted or already-read
+            // (including declined) initial never re-inserts or spuriously triggers `StalePrekey`.
             if let Some(existing) = sql.query_opt::<InitialPayloadRow>(
                 "SELECT id, payload_hash FROM initial_messages \
                  WHERE sender = ? AND ephemeral_key = ?",
@@ -611,6 +639,19 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 if existing.payload_hash.as_ref() == payload_hash.as_slice() {
                     return Ok(AddInitialOutcome::Added {
                         id: existing.id,
+                        inserted: false,
+                    });
+                }
+                return Ok(AddInitialOutcome::PayloadMismatch);
+            }
+            if let Some(acked) = sql.query_opt::<InitialPayloadRow>(
+                "SELECT id, payload_hash FROM acked_initial_messages \
+                 WHERE sender = ? AND ephemeral_key = ?",
+                params![message.sender.as_slice(), message.ephemeral_key.as_slice()]?,
+            )? {
+                if acked.payload_hash.as_ref() == payload_hash.as_slice() {
+                    return Ok(AddInitialOutcome::Added {
+                        id: acked.id,
                         inserted: false,
                     });
                 }
@@ -681,20 +722,65 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             .collect()
     }
 
-    pub(super) fn ack_initial_messages(&self, ids: &[u64]) -> Result<u64> {
+    pub(super) fn ack_initial_messages(&self, ids: &[u64], now_ms: u64) -> Result<u64> {
         for &id in ids {
             let _ = checked_integer(id)?;
         }
+        let _ = checked_integer(now_ms)?;
         if !self.has_tables()? || ids.is_empty() {
             return Ok(0);
         }
         let ids_json = serde_json::to_string(ids).map_err(|e| Error::RustError(e.to_string()))?;
-        let deleted: Vec<IdRow> = self.sql.query(
-            "DELETE FROM initial_messages \
-             WHERE id IN (SELECT value FROM json_each(?)) RETURNING id",
-            params![ids_json.as_str()]?,
-        )?;
-        Ok(deleted.len() as u64)
+        let expires_at = now_ms
+            .saturating_add(ACKED_INITIAL_TOMBSTONE_TTL_MS)
+            .min(MAX_SAFE_INTEGER);
+        self.sql.transaction_sync(|sql| {
+            sql.exec(
+                "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
+                params![now_ms]?,
+            )?;
+            let deleted: Vec<AckedInitialRow> = sql.query(
+                "DELETE FROM initial_messages \
+                 WHERE id IN (SELECT value FROM json_each(?)) \
+                 RETURNING id, sender, ephemeral_key, payload_hash",
+                params![ids_json.as_str()]?,
+            )?;
+            for row in &deleted {
+                sql.exec(
+                    "INSERT INTO acked_initial_messages \
+                     (sender, ephemeral_key, id, payload_hash, expires_at) \
+                     VALUES (?, ?, ?, ?, ?) \
+                     ON CONFLICT (sender, ephemeral_key) DO UPDATE SET \
+                      id = excluded.id, payload_hash = excluded.payload_hash, \
+                      expires_at = excluded.expires_at",
+                    params![
+                        row.sender.as_ref(),
+                        row.ephemeral_key.as_ref(),
+                        row.id,
+                        row.payload_hash.as_ref(),
+                        expires_at
+                    ]?,
+                )?;
+            }
+            if !deleted.is_empty() {
+                let total: CountRow = sql.query_one(
+                    "SELECT count(*) AS count FROM acked_initial_messages",
+                    vec![],
+                )?;
+                if total.count > MAX_ACKED_INITIAL_TOMBSTONES {
+                    let excess = total.count - MAX_ACKED_INITIAL_TOMBSTONES;
+                    sql.exec(
+                        "DELETE FROM acked_initial_messages \
+                         WHERE rowid IN ( \
+                           SELECT rowid FROM acked_initial_messages \
+                           ORDER BY expires_at ASC, id ASC LIMIT ? \
+                         )",
+                        params![excess]?,
+                    )?;
+                }
+            }
+            Ok(deleted.len() as u64)
+        })
     }
 
     pub(super) fn pq_snapshot(&self, now_ms: u64) -> Result<PqStorageSnapshot> {
@@ -1166,7 +1252,7 @@ mod tests {
             assert!(id3 > id2);
 
             // Ack deletes only specified IDs.
-            assert_eq!(store.ack_initial_messages(&[id2]).unwrap(), 1);
+            assert_eq!(store.ack_initial_messages(&[id2], 11_001).unwrap(), 1);
             let rem = store.list_initial_messages(BOB, 0, 10, 11_001).unwrap();
             assert_eq!(rem.len(), 1);
             assert_eq!(rem[0].id, id3);
@@ -1230,12 +1316,18 @@ mod tests {
                 store.publish_v2(&publish_spk(4, spk2)).unwrap(),
                 PublishV2Status::Stored
             );
-            assert!(matches!(
-                store
-                    .add_initial_message_v2(&mk_spk_init(3, spk1), 10, 2_100)
-                    .unwrap(),
-                AddInitialOutcome::Added { inserted: true, .. }
-            ));
+            let AddInitialOutcome::Added {
+                id: acked_id,
+                inserted: true,
+            } = store
+                .add_initial_message_v2(&mk_spk_init(3, spk1), 10, 2_100)
+                .unwrap()
+            else {
+                panic!("expected insert for spk1");
+            };
+            // Recipient reads & ACKs `mk_spk_init(3, spk1)` (writing an ACK tombstone), while
+            // leaving `mk_spk_init(1, spk1)` unread in inbox.
+            assert_eq!(store.ack_initial_messages(&[acked_id], 2_110).unwrap(), 1);
             assert!(matches!(
                 store
                     .add_initial_message_v2(&mk_spk_init(4, spk2), 10, 2_100)
@@ -1243,16 +1335,35 @@ mod tests {
                 AddInitialOutcome::Added { inserted: true, .. }
             ));
 
-            // Rotate spk2 -> spk3: spk3 & spk2 accepted, brand-new retired spk1 returns
-            // StalePrekey, while retrying ALREADY-ACCEPTED `mk_spk_init(1, spk1)` preserves
-            // strict `(sender, ephemeral_key)` idempotency (`Added { inserted: false }`)!
+            // Rotate spk2 -> spk3:
+            // - Unread `mk_spk_init(1, spk1)` is purged without tombstoning -> returns StalePrekey
+            //   so sender detects unread SPK eviction.
+            // - Already-ACKed `mk_spk_init(3, spk1)` hits `acked_initial_messages` tombstone ->
+            //   returns `Added { id: acked_id, inserted: false }` (never resurrects declined req).
+            // - Unread `mk_spk_init(4, spk2)` stays live & idempotent (`inserted: false`).
+            // - Brand-new retired `mk_spk_init(7, spk1)` returns `StalePrekey`.
             assert_eq!(
                 store.publish_v2(&publish_spk(5, spk3)).unwrap(),
                 PublishV2Status::Stored
             );
-            assert!(matches!(
+            assert_eq!(
                 store
                     .add_initial_message_v2(&mk_spk_init(1, spk1), 10, 2_150)
+                    .unwrap(),
+                AddInitialOutcome::StalePrekey
+            );
+            assert_eq!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(3, spk1), 10, 2_150)
+                    .unwrap(),
+                AddInitialOutcome::Added {
+                    id: acked_id,
+                    inserted: false,
+                }
+            );
+            assert!(matches!(
+                store
+                    .add_initial_message_v2(&mk_spk_init(4, spk2), 10, 2_150)
                     .unwrap(),
                 AddInitialOutcome::Added {
                     inserted: false,

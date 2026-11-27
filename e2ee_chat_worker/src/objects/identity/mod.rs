@@ -58,8 +58,9 @@ impl<'a, S: SqlExec> IdentityStore<'a, S> {
         }
     }
 
-    /// Expires inline mailbox messages and inbox initial messages atomically while updating O(1)
-    /// `peer_grants` and `recipient_stats` counters (preserving `last_sequence`).
+    /// Expires inline mailbox messages, inbox initial messages, and ACKed-initial tombstones
+    /// atomically while updating O(1) `peer_grants` and `recipient_stats` counters (preserving
+    /// `last_sequence`).
     fn expire_messages_and_initials(&self, now_ms: u64) -> Result<()> {
         let before = now_ms.saturating_sub(self.retention_ms);
         self.sql.transaction_sync(|sql| {
@@ -71,6 +72,10 @@ impl<'a, S: SqlExec> IdentityStore<'a, S> {
             sql.exec(
                 "DELETE FROM initial_messages WHERE created_at < ?",
                 params![before]?,
+            )?;
+            sql.exec(
+                "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
+                params![now_ms]?,
             )
         })
     }
@@ -80,7 +85,8 @@ impl<'a, S: SqlExec> IdentityStore<'a, S> {
         let has_core = self.has_tables()?;
         let retention = self.retention_ms;
 
-        let (message_at, initial_at, dedup_at, revoke_tombstone_at) = if has_core {
+        let (message_at, initial_at, acked_initial_at, dedup_at, revoke_tombstone_at) = if has_core
+        {
             let msg = self
                 .sql
                 .query_opt::<OldestRow>("SELECT min(created_at) AS oldest FROM messages", vec![])?
@@ -95,6 +101,14 @@ impl<'a, S: SqlExec> IdentityStore<'a, S> {
                 )?
                 .and_then(|row| row.oldest)
                 .map(|ts| ts.saturating_add(retention).saturating_add(1));
+
+            let acked_initial = self
+                .sql
+                .query_opt::<OldestRow>(
+                    "SELECT min(expires_at) AS oldest FROM acked_initial_messages",
+                    vec![],
+                )?
+                .and_then(|row| row.oldest);
 
             let dedup = self
                 .sql
@@ -120,9 +134,9 @@ impl<'a, S: SqlExec> IdentityStore<'a, S> {
                         .saturating_add(1)
                 });
 
-            (msg, initial, dedup, tombstone)
+            (msg, initial, acked_initial, dedup, tombstone)
         } else {
-            (None, None, None, None)
+            (None, None, None, None, None)
         };
 
         let subscribe_at = if self.has_seen_subscribes()? {
@@ -140,6 +154,7 @@ impl<'a, S: SqlExec> IdentityStore<'a, S> {
         Ok([
             message_at,
             initial_at,
+            acked_initial_at,
             dedup_at,
             revoke_tombstone_at,
             subscribe_at,
@@ -335,9 +350,19 @@ impl IdentityV2 {
                     )
                 }))
             }
-            IdentityCall::AckInitialMessages(req) => answer_rpc::<rpc::AckInitialMessages>(
-                self.with_store(|store| store.ack_initial_messages(&req.ids)),
-            ),
+            IdentityCall::AckInitialMessages(req) => {
+                let now = Date::now().as_millis();
+                let acked = self.with_store(|store| store.ack_initial_messages(&req.ids, now));
+                if matches!(acked, Ok(n) if n > 0) {
+                    let prune_at = now
+                        .saturating_add(handshake::ACKED_INITIAL_TOMBSTONE_TTL_MS)
+                        .min(MAX_SAFE_INTEGER);
+                    if let Err(e) = self.update_alarm(AlarmUpdate::PullEarlier(prune_at)).await {
+                        console_error!("cannot schedule acked_initial_messages prune alarm: {e}");
+                    }
+                }
+                answer_rpc::<rpc::AckInitialMessages>(acked)
+            }
             IdentityCall::PqSnapshot(_) => answer_rpc::<rpc::PqSnapshot>(
                 self.with_store(|store| store.pq_snapshot(Date::now().as_millis())),
             ),
@@ -558,19 +583,22 @@ mod tests {
 
             let slot = [0xA0; 32];
             let token_hash = [0xA1; 32];
-            store
-                .register_write_token(
-                    &RegisterWriteTokenRecord {
-                        recipient: bob,
-                        peer_slot_id: slot,
-                        token_hash,
-                        grant_version: 1,
-                        pin_active: true,
-                        timestamp: 0,
-                    },
-                    1_000,
-                )
-                .unwrap();
+            assert_eq!(
+                store
+                    .register_write_token(
+                        &RegisterWriteTokenRecord {
+                            recipient: bob,
+                            peer_slot_id: slot,
+                            token_hash,
+                            grant_version: 1,
+                            pin_active: true,
+                            timestamp: 1_000,
+                        },
+                        1_000,
+                    )
+                    .unwrap(),
+                crate::objects::RegisterWriteTokenOutcome::Registered
+            );
 
             // Inline message at t = 10_000 -> deadline 110_001.
             assert_eq!(

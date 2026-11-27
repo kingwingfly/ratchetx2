@@ -1094,7 +1094,7 @@ describe("workerd runtime twins", () => {
   // -------------------------------------------------------------------------
   // 7. PQ_ENABLED="false" runtime gating
   // -------------------------------------------------------------------------
-  it('gates GetManifest and advertises x-e2ee-pq: 0 when PQ_ENABLED="false"', async () => {
+  it('serves signed GetManifest and advertises x-e2ee-pq: 0 when PQ_ENABLED="false"', async () => {
     const ctx = createExecutionContext();
     const pqOffEnv = Object.assign(Object.create(Object.getPrototypeOf(env)), env, {
       PQ_ENABLED: "false",
@@ -1130,12 +1130,9 @@ describe("workerd runtime twins", () => {
         body: pbBytes(1, bob.publicKey),
       }),
     );
-    expect(manifestRes.status).toBe(501);
+    expect(manifestRes.status).toBe(200);
     expect(manifestRes.headers.get("x-e2ee-pq")).toBe("0");
-    expect(await manifestRes.json()).toEqual({
-      code: "unimplemented",
-      message: "post-quantum routes are disabled",
-    });
+    expect(new Uint8Array(await manifestRes.arrayBuffer()).length).toBe(0);
 
     await waitOnExecutionContext(ctx);
   });
