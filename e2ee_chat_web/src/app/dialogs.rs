@@ -642,6 +642,13 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         }
     });
     let confirm_delete = ConfirmGuard::new();
+    let initial_conv_gen = contact.conversation_gen;
+    // Disarm delete confirmation if this peer's conversation incarnation changes while open.
+    Effect::new(move |_| {
+        if live_contact().map(|c| c.conversation_gen) != Some(initial_conv_gen) {
+            confirm_delete.disarm();
+        }
+    });
     // Saving, accepting or deleting, which its buttons wait for.
     let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
@@ -660,9 +667,13 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         let next_name = name.get_untracked();
         act_while(busy, async move {
             if req {
-                engine.accept(peer, next_name).await?;
+                engine
+                    .accept_for_gen(peer, next_name, initial_conv_gen)
+                    .await?;
             } else {
-                engine.rename(peer, next_name).await?;
+                engine
+                    .rename_for_gen(peer, next_name, initial_conv_gen)
+                    .await?;
             }
             if !busy.is_disposed()
                 && engine
@@ -681,7 +692,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         }
         let engine = engine();
         act_while(busy, async move {
-            engine.delete(peer).await?;
+            engine.delete_for_gen(peer, initial_conv_gen).await?;
             history::forget_peer(peer);
             if !busy.is_disposed()
                 && engine
@@ -787,7 +798,11 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                                                     disabled=move || busy.get()
                                                     on:click=move |_| {
                                                         act_while(busy, async move {
-                                                            engine().dismiss_downgrade(peer).await
+                                                            engine()
+                                                                .dismiss_downgrade_for_gen(
+                                                                    peer, conv_gen,
+                                                                )
+                                                                .await
                                                         });
                                                     }
                                                 >

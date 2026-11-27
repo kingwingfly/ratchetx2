@@ -7,6 +7,7 @@ use std::{
 
 use bytes::Bytes;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use web_time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -193,10 +194,61 @@ struct Inbox {
     acked_initial_evicted_until: Option<Instant>,
 }
 
+/// Canonical SHA-256 payload digest of a [`StoredInitialMessageV2`] (excluding `id`) for
+/// bounded-memory idempotency checking on `(sender, ephemeral_key)`.
+fn initial_message_payload_hash(msg: &StoredInitialMessageV2) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"initial_v2/payload_hash\0");
+    h.update(msg.version.to_be_bytes());
+    h.update(msg.sender);
+    h.update(msg.recipient);
+    h.update(msg.ephemeral_key);
+    h.update(msg.signed_prekey);
+    match &msg.one_time_prekey {
+        Some(opk) => {
+            h.update([1]);
+            h.update(opk);
+        }
+        None => h.update([0]),
+    }
+    h.update((msg.header.len() as u32).to_be_bytes());
+    h.update(&msg.header);
+    h.update((msg.content.len() as u32).to_be_bytes());
+    h.update(&msg.content);
+    match msg.pq_suite {
+        Some(suite) => h.update([1, suite]),
+        None => h.update([0]),
+    }
+    h.update([u8::from(msg.pq_last_resort)]);
+    match &msg.pq_prekey_id {
+        Some(id) => {
+            h.update([1]);
+            h.update(id);
+        }
+        None => h.update([0]),
+    }
+    match &msg.pq_ciphertext {
+        Some(ct) => {
+            h.update([1]);
+            h.update((ct.len() as u32).to_be_bytes());
+            h.update(ct);
+        }
+        None => h.update([0]),
+    }
+    match &msg.manifest_digest {
+        Some(digest) => {
+            h.update([1]);
+            h.update(digest);
+        }
+        None => h.update([0]),
+    }
+    h.finalize().into()
+}
+
 #[derive(Debug, Clone)]
 struct AckedInitialEntry {
     id: u64,
-    message: StoredInitialMessageV2,
+    payload_hash: [u8; 32],
     expires_at: Instant,
 }
 
@@ -475,38 +527,17 @@ impl PqHandshakeStore for MemoryStore {
                 prev_signed_prekey,
             },
         );
-        // Purge inbox initials whose target SPK is no longer retained:
-        // - Unlisted rows (`listed == false`) are deleted WITHOUT tombstoning so post-2-rotation
-        //   probes detect unread eviction (`StaleVersion`).
-        // - Already-listed rows (`listed == true`) whose `AckInitialMessages` has not yet landed
-        //   are promoted into `acked_initials` tombstones so a rotation racing between list and
-        //   ACK never resurrects a declined chat request.
+        // Purge ONLY unlisted (`listed == false`) inbox initials whose target SPK is no longer
+        // retained. Already-listed rows (`listed == true`) whose `AckInitialMessages` has not yet
+        // landed are retained in `initial_messages` until explicit ACK or ordinary expiry so a
+        // lost `ListInitialMessages` response or `CapFull` deferral never synthesizes a false ACK
+        // tombstone while a racing ACK for a declined request still succeeds cleanly.
         if let Some(inbox) = inner.inboxes.get_mut(&id) {
-            let now = Instant::now();
-            let expires_at = now + ACKED_INITIAL_TOMBSTONE_TTL;
-            inbox
-                .acked_initials
-                .retain(|_, acked| acked.expires_at > now);
-            let mut promoted = false;
             inbox.initial_messages.retain(|entry| {
-                let retained = entry.message.signed_prekey == new_spk
-                    || prev_signed_prekey.is_some_and(|prev| entry.message.signed_prekey == prev);
-                if !retained && entry.listed {
-                    inbox.acked_initials.insert(
-                        (entry.message.sender, entry.message.ephemeral_key),
-                        AckedInitialEntry {
-                            id: entry.message.id,
-                            message: entry.message.clone(),
-                            expires_at,
-                        },
-                    );
-                    promoted = true;
-                }
-                retained
+                entry.listed
+                    || entry.message.signed_prekey == new_spk
+                    || prev_signed_prekey.is_some_and(|prev| entry.message.signed_prekey == prev)
             });
-            if promoted {
-                enforce_acked_initial_cap(inbox, now);
-            }
         }
         Ok(PublishV2Status::Stored)
     }
@@ -736,6 +767,45 @@ impl PqHandshakeStore for MemoryStore {
             || published
                 .prev_signed_prekey
                 .is_some_and(|prev| initial_message.signed_prekey == prev);
+        let payload_hash = initial_message_payload_hash(&initial_message);
+        if !allow_insert {
+            // Strictly read-only disposition check: never allocate an inbox entry or mutate
+            // existing inbox/tombstone maps.
+            if let Some(inbox) = inner.inboxes.get(&initial_message.recipient) {
+                if let Some(existing) = inbox.initial_messages.iter().find(|entry| {
+                    now.saturating_duration_since(entry.created_at) < self.initial_ttl
+                        && entry.message.sender == initial_message.sender
+                        && entry.message.ephemeral_key == initial_message.ephemeral_key
+                }) {
+                    if same_initial_payload(&existing.message, &initial_message) {
+                        return Ok(crate::InitialDisposition::Added(existing.message.id));
+                    }
+                    return Err(ErrorKind::InvalidArgument.into());
+                }
+                if let Some(acked) = inbox
+                    .acked_initials
+                    .get(&(initial_message.sender, initial_message.ephemeral_key))
+                    .filter(|acked| acked.expires_at > now)
+                {
+                    if acked.payload_hash == payload_hash {
+                        return Ok(crate::InitialDisposition::Added(acked.id));
+                    }
+                    return Err(ErrorKind::InvalidArgument.into());
+                }
+                if !spk_retained
+                    && inbox
+                        .acked_initial_evicted_until
+                        .is_some_and(|until| until > now)
+                {
+                    return Ok(crate::InitialDisposition::InboxFull);
+                }
+            }
+            if !spk_retained {
+                return Err(ErrorKind::StaleVersion.into());
+            }
+            return Ok(crate::InitialDisposition::InsertDisallowed);
+        }
+
         let inbox = inner.inboxes.entry(initial_message.recipient).or_default();
         // Prune expired rows & expired ACK tombstones BEFORE `(sender, ephemeral_key)` lookup.
         prune_expired_initials(inbox, now, self.initial_ttl);
@@ -759,7 +829,7 @@ impl PqHandshakeStore for MemoryStore {
             .acked_initials
             .get(&(initial_message.sender, initial_message.ephemeral_key))
         {
-            if same_initial_payload(&acked.message, &initial_message) {
+            if acked.payload_hash == payload_hash {
                 return Ok(crate::InitialDisposition::Added(acked.id));
             }
             return Err(ErrorKind::InvalidArgument.into());
@@ -773,10 +843,6 @@ impl PqHandshakeStore for MemoryStore {
                 return Ok(crate::InitialDisposition::InboxFull);
             }
             return Err(ErrorKind::StaleVersion.into());
-        }
-
-        if !allow_insert {
-            return Ok(crate::InitialDisposition::InsertDisallowed);
         }
 
         if inbox.initial_messages.len() >= limit {
@@ -867,7 +933,7 @@ impl PqHandshakeStore for MemoryStore {
                     (entry.message.sender, entry.message.ephemeral_key),
                     AckedInitialEntry {
                         id: entry.message.id,
-                        message: entry.message.clone(),
+                        payload_hash: initial_message_payload_hash(&entry.message),
                         expires_at,
                     },
                 );
@@ -2181,14 +2247,57 @@ mod test {
                 ErrorKind::StaleTimestamp
             );
 
-            // 6. R5-P2-4 & R5-P2-8: Listing only marks returned page rows `listed = true`;
-            //    rotating SPK twice promotes `listed == true` rows to ACK tombstones while
-            //    leaving unreturned rows unlisted (`StaleVersion`); `allow_insert = false`
-            //    performs read-only disposition lookup without inserting new rows.
+            // 6. R5-P2-4, R5-P2-8, R6-P1-3, R6-P2-7 & R6-P3-1/2: Listing only marks returned page
+            //    rows `listed = true`; `limit == 0` reports `has_more = true` without marking any
+            //    rows; rotating SPK twice retains `listed == true` rows in `initial_messages`
+            //    (NEVER synthesizing fake ACK tombstones) while deleting unlisted rows
+            //    (`StaleVersion`); `allow_insert = false` performs strictly read-only lookup
+            //    without allocating an inbox entry or mutating state.
             let spk4 = [0x44; 32];
             let spk5 = [0x55; 32];
             let m_listed = mk_init(70, spk3);
             let m_unlisted = mk_init(71, spk3);
+            // Zero-inbox identity: read-only probe must NOT allocate an `inboxes` entry.
+            let fresh_bob = [0x89; 32];
+            store
+                .publish_v2(PublishV2Record {
+                    manifest: StoredCapabilityManifest {
+                        audience: "relay.example".into(),
+                        identity_key: fresh_bob,
+                        manifest_seq: 1,
+                        generation: 1,
+                        issued_at: 1_000,
+                        expires_at: 9_999_999_999_000,
+                        pq_enabled: false,
+                        strict_pq: false,
+                        pq_ratchet_supported: false,
+                        offered_suites: vec![],
+                        signed_prekey: spk3,
+                        pq_last_resort: vec![],
+                        signature: [0x22; 64],
+                    },
+                    signed_prekey_signature: Some([0x33; 64]),
+                    one_time_prekeys: vec![],
+                    pq_last_resort: vec![],
+                    pq_one_time_prekeys: vec![],
+                    timestamp: 1_000,
+                })
+                .await
+                .unwrap();
+            let mut probe_fresh = mk_init(79, spk3);
+            probe_fresh.recipient = fresh_bob;
+            assert_eq!(
+                store
+                    .add_initial_message_v2_checked(probe_fresh, 10, false)
+                    .await
+                    .unwrap(),
+                crate::InitialDisposition::InsertDisallowed
+            );
+            assert!(
+                !store.inner.lock().inboxes.contains_key(&fresh_bob),
+                "allow_insert == false must not allocate an inbox entry in MemoryStore"
+            );
+
             let id_listed = store
                 .add_initial_message_v2(m_listed.clone(), 10)
                 .await
@@ -2199,6 +2308,13 @@ mod test {
                 .await
                 .unwrap()
                 .unwrap();
+            // Zero-limit page reports has_more == true and marks 0 rows.
+            let zero_page = store
+                .list_initial_messages_page(&bob, id_listed.saturating_sub(1), 0)
+                .await
+                .unwrap();
+            assert!(zero_page.messages.is_empty());
+            assert!(zero_page.has_more);
             // Paginate strictly 1 item: only `id_listed` is returned (`has_more == true`).
             let page = store
                 .list_initial_messages_page(&bob, id_listed.saturating_sub(1), 1)
@@ -2217,9 +2333,15 @@ mod test {
             // Rotate spk3 -> spk4 -> spk5 without ACKing either row.
             store.publish_v2(publish_spk(6, spk4)).await.unwrap();
             store.publish_v2(publish_spk(7, spk5)).await.unwrap();
+            assert!(
+                !store.inner.lock().inboxes[&bob]
+                    .acked_initials
+                    .contains_key(&(m_listed.sender, m_listed.ephemeral_key)),
+                "publish_v2 must not synthesize fake ACK tombstones for unacked listed rows"
+            );
             assert_eq!(
                 store
-                    .add_initial_message_v2_checked(m_listed, 10, false)
+                    .add_initial_message_v2_checked(m_listed.clone(), 10, false)
                     .await
                     .unwrap(),
                 crate::InitialDisposition::Added(id_listed)
@@ -2231,6 +2353,21 @@ mod test {
                     .unwrap_err()
                     .kind(),
                 ErrorKind::StaleVersion
+            );
+            // Explicit ACK removes `id_listed` and records a hash-only tombstone.
+            assert_eq!(
+                store
+                    .ack_initial_messages(&bob, &[id_listed])
+                    .await
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                store
+                    .add_initial_message_v2_checked(m_listed, 10, false)
+                    .await
+                    .unwrap(),
+                crate::InitialDisposition::Added(id_listed)
             );
             assert!(id_unlisted > id_listed);
         });

@@ -138,12 +138,8 @@ pub(super) struct AckedInitialRow {
 }
 
 #[derive(Deserialize)]
-pub(super) struct EvictedInitialRow {
-    pub(super) id: u64,
-    pub(super) sender: Blob,
-    pub(super) ephemeral_key: Blob,
-    pub(super) payload_hash: Blob,
-    pub(super) listed: u64,
+pub(super) struct SpkOnlyRow {
+    pub(super) signed_prekey: Blob,
 }
 
 #[derive(Deserialize)]

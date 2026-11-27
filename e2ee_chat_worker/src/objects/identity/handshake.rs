@@ -292,7 +292,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         &self,
         record: &PublishV2Record,
         now_ms: u64,
-    ) -> Result<(PublishV2Status, bool)> {
+    ) -> Result<PublishV2Status> {
         // Validate and prepare ALL fallible values BEFORE executing any mutating SQL statement so
         // no partial wipe can occur on a validation or serialization failure.
         let manifest = &record.manifest;
@@ -307,7 +307,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         let mut seen_opks = HashSet::with_capacity(record.one_time_prekeys.len());
         for (pos, opk) in record.one_time_prekeys.iter().enumerate() {
             if !seen_opks.insert(opk.as_slice()) {
-                return Ok((PublishV2Status::DuplicatePrekey, false));
+                return Ok(PublishV2Status::DuplicatePrekey);
             }
             let _ = checked_integer(pos as u64)?;
         }
@@ -316,12 +316,12 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             HashSet::with_capacity(record.pq_last_resort.len() + record.pq_one_time_prekeys.len());
         for lr in &record.pq_last_resort {
             if !seen_lr_suites.insert(lr.suite) || !seen_pq.insert(lr.id.as_slice()) {
-                return Ok((PublishV2Status::DuplicatePrekey, false));
+                return Ok(PublishV2Status::DuplicatePrekey);
             }
         }
         for opk in &record.pq_one_time_prekeys {
             if !seen_pq.insert(opk.id.as_slice()) {
-                return Ok((PublishV2Status::DuplicatePrekey, false));
+                return Ok(PublishV2Status::DuplicatePrekey);
             }
         }
 
@@ -335,9 +335,6 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 .as_ref()
                 .map(|s| s.as_slice())
         };
-        let tombstone_expires_at = now_ms
-            .saturating_add(ACKED_INITIAL_TOMBSTONE_TTL_MS)
-            .min(MAX_SAFE_INTEGER);
 
         self.ensure_v5_tables()?;
         self.sql.transaction_sync(|sql| {
@@ -350,7 +347,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 .as_ref()
                 .is_some_and(|row| row.manifest_seq >= manifest.manifest_seq)
             {
-                return Ok((PublishV2Status::StaleSequence, false));
+                return Ok(PublishV2Status::StaleSequence);
             }
             let prev_signed_prekey: Option<Vec<u8>> = existing.and_then(|row| {
                 let old_spk = row.signed_prekey.into_vec();
@@ -417,55 +414,25 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                     manifest.signature.as_slice()
                 ]?,
             )?;
-            // Purge inbox initials whose target SPK is no longer retained:
-            // - Unlisted rows (`listed == 0`) are deleted WITHOUT writing a tombstone so the
-            //   sender's probe distinguishes unread SPK eviction (`StalePrekey`).
-            // - Already-listed rows (`listed != 0`) whose `AckInitialMessages` has not landed yet
-            //   are promoted into `acked_initial_messages` tombstones so a rotation racing
-            //   between list and ACK can never resurrect a declined chat request.
-            let evicted: Vec<EvictedInitialRow> = if let Some(ref prev_spk) = prev_signed_prekey {
-                sql.query(
-                    "DELETE FROM initial_messages \
-                     WHERE signed_prekey != ? AND signed_prekey != ? \
-                     RETURNING id, sender, ephemeral_key, payload_hash, listed",
-                    params![manifest.signed_prekey.as_slice(), prev_spk.as_slice()]?,
-                )?
-            } else {
-                sql.query(
-                    "DELETE FROM initial_messages WHERE signed_prekey != ? \
-                     RETURNING id, sender, ephemeral_key, payload_hash, listed",
-                    params![manifest.signed_prekey.as_slice()]?,
-                )?
-            };
-            let mut promoted_tombstone = false;
-            for row in evicted.into_iter().filter(|r| r.listed != 0) {
-                if !promoted_tombstone {
-                    sql.exec(
-                        "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
-                        params![now_ms]?,
-                    )?;
-                    promoted_tombstone = true;
-                }
+            // Purge ONLY unlisted (`listed = 0`) inbox initials whose target SPK is no longer
+            // retained so a sender's probe detects unread SPK eviction (`StalePrekey`).
+            // Already-listed rows (`listed != 0`) whose `AckInitialMessages` has not landed yet
+            // are retained in `initial_messages` until explicit ACK or ordinary expiry so a lost
+            // `ListInitialMessages` response or `CapFull` deferral never synthesizes a false ACK
+            // tombstone while a racing ACK for a declined request still succeeds cleanly.
+            if let Some(ref prev_spk) = prev_signed_prekey {
                 sql.exec(
-                    "INSERT INTO acked_initial_messages \
-                     (sender, ephemeral_key, id, payload_hash, expires_at) \
-                     VALUES (?, ?, ?, ?, ?) \
-                     ON CONFLICT (sender, ephemeral_key) DO UPDATE SET \
-                      id = excluded.id, payload_hash = excluded.payload_hash, \
-                      expires_at = excluded.expires_at",
-                    params![
-                        row.sender.as_ref(),
-                        row.ephemeral_key.as_ref(),
-                        row.id,
-                        row.payload_hash.as_ref(),
-                        tombstone_expires_at
-                    ]?,
+                    "DELETE FROM initial_messages \
+                     WHERE listed = 0 AND signed_prekey != ? AND signed_prekey != ?",
+                    params![manifest.signed_prekey.as_slice(), prev_spk.as_slice()]?,
+                )?;
+            } else {
+                sql.exec(
+                    "DELETE FROM initial_messages WHERE listed = 0 AND signed_prekey != ?",
+                    params![manifest.signed_prekey.as_slice()]?,
                 )?;
             }
-            if promoted_tombstone {
-                Self::enforce_acked_initial_cap_sql(sql, now_ms)?;
-            }
-            Ok((PublishV2Status::Stored, promoted_tombstone))
+            Ok(PublishV2Status::Stored)
         })
     }
 
@@ -665,31 +632,125 @@ impl<S: SqlExec> IdentityStore<'_, S> {
         allow_insert: bool,
         now_ms: u64,
     ) -> Result<AddInitialOutcome> {
+        let payload_hash = initial_message_payload_hash(message);
+        let cutoff = now_ms.saturating_sub(self.retention_ms);
+        if !allow_insert {
+            // Strictly read-only disposition probe (zero DDL migrations, zero DML writes).
+            if !self.has_tables_readonly()? {
+                return Ok(AddInitialOutcome::NotFound);
+            }
+            let has_prev_spk: CountRow = self.sql.query_one(
+                "SELECT count(*) AS count FROM pragma_table_info('capability_manifest') \
+                 WHERE name = 'prev_signed_prekey'",
+                vec![],
+            )?;
+            let (curr_spk, prev_spk) = if has_prev_spk.count > 0 {
+                let Some(retained) = self.sql.query_opt::<RetainedSpkRow>(
+                    "SELECT signed_prekey, prev_signed_prekey FROM capability_manifest WHERE only = 0",
+                    vec![],
+                )?
+                else {
+                    return Ok(AddInitialOutcome::NotFound);
+                };
+                (retained.signed_prekey, retained.prev_signed_prekey)
+            } else {
+                let Some(only) = self.sql.query_opt::<SpkOnlyRow>(
+                    "SELECT signed_prekey FROM capability_manifest WHERE only = 0",
+                    vec![],
+                )?
+                else {
+                    return Ok(AddInitialOutcome::NotFound);
+                };
+                (only.signed_prekey, None)
+            };
+            if let Some(existing) = self.sql.query_opt::<InitialPayloadRow>(
+                "SELECT id, payload_hash FROM initial_messages \
+                 WHERE sender = ? AND ephemeral_key = ? AND created_at >= ?",
+                params![
+                    message.sender.as_slice(),
+                    message.ephemeral_key.as_slice(),
+                    cutoff
+                ]?,
+            )? {
+                if existing.payload_hash.as_ref() == payload_hash.as_slice() {
+                    return Ok(AddInitialOutcome::Added {
+                        id: existing.id,
+                        inserted: false,
+                    });
+                }
+                return Ok(AddInitialOutcome::PayloadMismatch);
+            }
+            let has_acked_table: CountRow = self.sql.query_one(
+                "SELECT count(*) AS count FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'acked_initial_messages'",
+                vec![],
+            )?;
+            if has_acked_table.count > 0
+                && let Some(acked) = self.sql.query_opt::<InitialPayloadRow>(
+                    "SELECT id, payload_hash FROM acked_initial_messages \
+                     WHERE sender = ? AND ephemeral_key = ? AND expires_at > ?",
+                    params![
+                        message.sender.as_slice(),
+                        message.ephemeral_key.as_slice(),
+                        now_ms
+                    ]?,
+                )?
+            {
+                if acked.payload_hash.as_ref() == payload_hash.as_slice() {
+                    return Ok(AddInitialOutcome::Added {
+                        id: acked.id,
+                        inserted: false,
+                    });
+                }
+                return Ok(AddInitialOutcome::PayloadMismatch);
+            }
+            let spk_retained = curr_spk.as_ref() == message.signed_prekey.as_slice()
+                || prev_spk
+                    .as_ref()
+                    .is_some_and(|prev| prev.as_ref() == message.signed_prekey.as_slice());
+            if !spk_retained {
+                let has_evicted_col: CountRow = self.sql.query_one(
+                    "SELECT count(*) AS count FROM pragma_table_info('recipient_stats') \
+                     WHERE name = 'acked_initial_evicted_until'",
+                    vec![],
+                )?;
+                let evicted_until = if has_evicted_col.count > 0 {
+                    self.sql
+                        .query_opt::<EvictedUntilRow>(
+                            "SELECT acked_initial_evicted_until FROM recipient_stats WHERE only = 0",
+                            vec![],
+                        )?
+                        .map_or(0, |row| row.acked_initial_evicted_until)
+                } else {
+                    0
+                };
+                if evicted_until > now_ms {
+                    return Ok(AddInitialOutcome::LimitExceeded);
+                }
+                return Ok(AddInitialOutcome::StalePrekey);
+            }
+            return Ok(AddInitialOutcome::InsertDisallowed);
+        }
+
         if !self.has_tables()? {
             return Ok(AddInitialOutcome::NotFound);
         }
-        let payload_hash = initial_message_payload_hash(message);
-        let cutoff = now_ms.saturating_sub(self.retention_ms);
-        let bindings = if allow_insert {
-            Some(params![
-                message.version,
-                message.sender.as_slice(),
-                message.ephemeral_key.as_slice(),
-                message.signed_prekey.as_slice(),
-                message.one_time_prekey.as_ref().map(|k| k.as_slice()),
-                message.header.as_ref(),
-                message.content.as_ref(),
-                message.pq_suite,
-                message.pq_last_resort,
-                message.pq_prekey_id.as_ref().map(|id| id.as_slice()),
-                message.pq_ciphertext.as_deref(),
-                message.manifest_digest.as_ref().map(|d| d.as_slice()),
-                payload_hash.as_slice(),
-                now_ms
-            ]?)
-        } else {
-            None
-        };
+        let bindings = params![
+            message.version,
+            message.sender.as_slice(),
+            message.ephemeral_key.as_slice(),
+            message.signed_prekey.as_slice(),
+            message.one_time_prekey.as_ref().map(|k| k.as_slice()),
+            message.header.as_ref(),
+            message.content.as_ref(),
+            message.pq_suite,
+            message.pq_last_resort,
+            message.pq_prekey_id.as_ref().map(|id| id.as_slice()),
+            message.pq_ciphertext.as_deref(),
+            message.manifest_digest.as_ref().map(|d| d.as_slice()),
+            payload_hash.as_slice(),
+            now_ms
+        ]?;
 
         self.sql.transaction_sync(|sql| {
             let Some(retained) = sql.query_opt::<RetainedSpkRow>(
@@ -699,18 +760,16 @@ impl<S: SqlExec> IdentityStore<'_, S> {
             else {
                 return Ok(AddInitialOutcome::NotFound);
             };
-            if allow_insert {
-                // Prune expired rows & expired ACK tombstones BEFORE `(sender, ephemeral_key)`
-                // lookup so expired entries never collide with fresh inserts or occupy inbox slots.
-                sql.exec(
-                    "DELETE FROM initial_messages WHERE created_at < ?",
-                    params![cutoff]?,
-                )?;
-                sql.exec(
-                    "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
-                    params![now_ms]?,
-                )?;
-            }
+            // Prune expired rows & expired ACK tombstones BEFORE `(sender, ephemeral_key)`
+            // lookup so expired entries never collide with fresh inserts or occupy inbox slots.
+            sql.exec(
+                "DELETE FROM initial_messages WHERE created_at < ?",
+                params![cutoff]?,
+            )?;
+            sql.exec(
+                "DELETE FROM acked_initial_messages WHERE expires_at <= ?",
+                params![now_ms]?,
+            )?;
 
             // Check `(sender, ephemeral_key)` idempotency against live inbox rows AND delivered
             // ACK tombstones BEFORE SPK retention so retrying an already-accepted or already-read
@@ -768,10 +827,6 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 return Ok(AddInitialOutcome::StalePrekey);
             }
 
-            let Some(bindings) = bindings else {
-                return Ok(AddInitialOutcome::InsertDisallowed);
-            };
-
             let count: CountRow =
                 sql.query_one("SELECT count(*) AS count FROM initial_messages", vec![])?;
             if count.count >= limit {
@@ -782,8 +837,8 @@ impl<S: SqlExec> IdentityStore<'_, S> {
                 "INSERT INTO initial_messages \
                  (version, sender, ephemeral_key, signed_prekey, one_time_prekey, header, content, \
                   pq_suite, pq_last_resort, pq_prekey_id, pq_ciphertext, manifest_digest, \
-                  payload_hash, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                  payload_hash, created_at, listed) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) \
                  RETURNING id",
                 bindings,
             )?;
@@ -810,7 +865,7 @@ impl<S: SqlExec> IdentityStore<'_, S> {
     ) -> Result<InitialMessagePage> {
         let _ = checked_integer(after_id)?;
         let _ = checked_integer(limit)?;
-        if !self.has_tables()? || limit == 0 {
+        if !self.has_tables()? {
             return Ok(InitialMessagePage {
                 messages: vec![],
                 has_more: false,
@@ -1091,8 +1146,7 @@ mod tests {
                         },
                         1_000,
                     )
-                    .unwrap()
-                    .0,
+                    .unwrap(),
                 PublishV2Status::DuplicatePrekey
             );
             assert!(!store.has_tables().unwrap());
@@ -1111,8 +1165,7 @@ mod tests {
                         },
                         1_000,
                     )
-                    .unwrap()
-                    .0,
+                    .unwrap(),
                 PublishV2Status::Stored
             );
             assert_eq!(store.get_manifest().unwrap(), Some(m1));
@@ -1131,8 +1184,7 @@ mod tests {
                         },
                         2_000,
                     )
-                    .unwrap()
-                    .0,
+                    .unwrap(),
                 PublishV2Status::StaleSequence
             );
 
@@ -1237,8 +1289,7 @@ mod tests {
                         },
                         1_000,
                     )
-                    .unwrap()
-                    .0,
+                    .unwrap(),
                 PublishV2Status::Stored
             );
 
@@ -1309,8 +1360,7 @@ mod tests {
                         },
                         1_000,
                     )
-                    .unwrap()
-                    .0,
+                    .unwrap(),
                 PublishV2Status::Stored
             );
 
@@ -1431,11 +1481,11 @@ mod tests {
             // Publish spk1, then republish spk1 -> accepts spk1, rejects unrelated spk2.
             assert_eq!(
                 store.publish_v2(&publish_spk(1, spk1), 1_001).unwrap(),
-                (PublishV2Status::Stored, false)
+                PublishV2Status::Stored
             );
             assert_eq!(
                 store.publish_v2(&publish_spk(2, spk1), 1_002).unwrap(),
-                (PublishV2Status::Stored, false)
+                PublishV2Status::Stored
             );
             assert!(matches!(
                 store
@@ -1453,11 +1503,11 @@ mod tests {
             // Rotate spk1 -> spk2, then republish spk2: prev_signed_prekey stays spk1.
             assert_eq!(
                 store.publish_v2(&publish_spk(3, spk2), 2_050).unwrap(),
-                (PublishV2Status::Stored, false)
+                PublishV2Status::Stored
             );
             assert_eq!(
                 store.publish_v2(&publish_spk(4, spk2), 2_060).unwrap(),
-                (PublishV2Status::Stored, false)
+                PublishV2Status::Stored
             );
             let AddInitialOutcome::Added {
                 id: acked_id,
@@ -1487,7 +1537,7 @@ mod tests {
             // - Brand-new retired `mk_spk_init(7, spk1)` returns `StalePrekey`.
             assert_eq!(
                 store.publish_v2(&publish_spk(5, spk3), 2_140).unwrap(),
-                (PublishV2Status::Stored, false)
+                PublishV2Status::Stored
             );
             assert_eq!(
                 store
@@ -1580,6 +1630,11 @@ mod tests {
                 panic!("expected insert");
             };
 
+            // R6-P3-2: limit == 0 reports `has_more = true` when live rows exist and marks 0 rows.
+            let zero_page = store.list_initial_messages_page(BOB, 0, 0, 1_150).unwrap();
+            assert!(zero_page.messages.is_empty());
+            assert!(zero_page.has_more);
+
             // List with limit=1: only `m_listed` is returned (`has_more == true`) and marked
             // `listed = 1`; `m_unlisted` stays `listed = 0`.
             let page = store.list_initial_messages_page(BOB, 0, 1, 1_200).unwrap();
@@ -1618,16 +1673,28 @@ mod tests {
             );
 
             // Rotate twice (spk1 -> spk2 -> spk3) WITHOUT calling `ack_initial_messages`:
-            // - `m_listed` (listed == 1) is promoted to `acked_initial_messages` (returns promoted=true)
-            //   so probing it (even with `allow_insert = false`) returns `Added { id: id_listed, inserted: false }`!
-            // - `m_unlisted` (listed == 0) is deleted WITHOUT tombstoning -> returns `StalePrekey`!
+            // - R6-P1-3: `m_listed` (`listed == 1`) is RETAINED in `initial_messages` (NOT deleted
+            //   and NO fake ACK tombstone written) so a lost response / CapFull deferral is never
+            //   falsely acknowledged while a racing ACK still deletes & tombstones it!
+            // - `m_unlisted` (`listed == 0`) is deleted WITHOUT tombstoning -> returns `StalePrekey`!
             assert_eq!(
                 store.publish_v2(&publish_spk(2, spk2), 1_300).unwrap(),
-                (PublishV2Status::Stored, false)
+                PublishV2Status::Stored
             );
             assert_eq!(
                 store.publish_v2(&publish_spk(3, spk3), 1_400).unwrap(),
-                (PublishV2Status::Stored, true)
+                PublishV2Status::Stored
+            );
+            let acked_count_before_ack: CountRow = env
+                .sql
+                .query_one(
+                    "SELECT count(*) AS count FROM acked_initial_messages",
+                    vec![],
+                )
+                .unwrap();
+            assert_eq!(
+                acked_count_before_ack.count, 0,
+                "publish_v2 must never synthesize ACK tombstones for unacked listed rows"
             );
             assert_eq!(
                 store
@@ -1644,6 +1711,9 @@ mod tests {
                     .unwrap(),
                 AddInitialOutcome::StalePrekey
             );
+            // Explicit ACK now removes `id_listed` from `initial_messages` and writes the real
+            // 35-day `acked_initial_messages` tombstone.
+            assert_eq!(store.ack_initial_messages(&[id_listed], 1_400).unwrap(), 1);
 
             // R5-P2-5: Simulate capacity eviction of an unexpired tombstone by inserting
             // `MAX_ACKED_INITIAL_TOMBSTONES` extra rows and ACKing one more: the watermark

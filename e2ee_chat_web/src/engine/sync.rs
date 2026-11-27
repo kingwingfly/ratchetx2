@@ -692,9 +692,28 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Query `GetServerInfo` verifying `server_id` against the client's locally derived expected
-    /// audience (never blindly trusting server-supplied audience strings).
+    /// audience (never blindly trusting server-supplied audience strings), releasing `self.inner`
+    /// across the network RPC.
     pub(super) async fn refresh_server_info(&self, force: bool) {
         let vgen = self.vault_gen();
+        let probe = {
+            let guard = self.lock_inner().await;
+            if !self.is_live(vgen) {
+                return;
+            }
+            let Some(inner) = guard.as_ref() else {
+                return;
+            };
+            if !force && inner.server_pq != ServerPqStatus::Unknown {
+                return;
+            }
+            (inner.server.clone(), inner.audience.clone())
+        };
+        let (server, audience) = probe;
+        let info_res = session::check_server_info_with(&Fetch::client(&server), &audience).await;
+        if !self.is_live(vgen) {
+            return;
+        }
         let mut guard = self.lock_inner().await;
         if !self.is_live(vgen) {
             return;
@@ -702,11 +721,7 @@ impl<V: VaultStore> Engine<V> {
         let Some(inner) = guard.as_mut() else {
             return;
         };
-        if !force && inner.server_pq != ServerPqStatus::Unknown {
-            return;
-        }
-        let status = match inner.client.check_server_info(&inner.audience).await {
-            _ if !self.is_live(vgen) => return,
+        let status = match info_res {
             Ok(info) if info.pq_enabled => {
                 if !inner.client.clock().is_drift_exceeded() {
                     self.startup.clear_clock_skew_warned();
@@ -778,20 +793,24 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return false;
         }
-        let reached = match self.take_initial_messages().await {
-            Ok(taken) => {
+        let (reached, inbox_drained_all) = match self.take_initial_messages_with_replayed().await {
+            Ok((taken, _, drained_all)) => {
                 active |= taken;
-                true
+                (true, drained_all)
             }
             Err(e) => {
                 failure.get_or_insert(e);
-                false
+                (false, false)
             }
         };
         if !self.is_live(vgen) {
             return false;
         }
-        if reached && let Err(e) = self.publish(false).await {
+        if reached
+            && let Err(e) = self
+                .publish_with_rotation_gate(false, inbox_drained_all)
+                .await
+        {
             failure.get_or_insert(e);
         }
         if !self.is_live(vgen) {

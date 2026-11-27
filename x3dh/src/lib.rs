@@ -507,6 +507,19 @@ impl LocalPrekeys {
         self.generations.back().map_or(0, |g| g.one_time.len())
     }
 
+    /// Remaining classical one-time prekey capacity in the latest generation before hitting
+    /// [`MAX_ONE_TIME_PER_GENERATION`].
+    pub fn remaining_one_time_headroom(&self) -> usize {
+        MAX_ONE_TIME_PER_GENERATION.saturating_sub(self.current_one_time_count())
+    }
+
+    /// Remaining total post-quantum one-time prekey capacity in the latest generation before
+    /// hitting [`MAX_ONE_TIME_PER_GENERATION`] (shared across all suites in the generation).
+    pub fn remaining_pq_one_time_headroom(&self) -> usize {
+        let used = self.generations.back().map_or(0, |g| g.pq_one_time.len());
+        MAX_ONE_TIME_PER_GENERATION.saturating_sub(used)
+    }
+
     /// Number of unused post-quantum one-time prekeys for `suite` in the latest generation.
     pub fn current_pq_one_time_count(&self, suite: PqSuite) -> usize {
         self.generations.back().map_or(0, |g| {

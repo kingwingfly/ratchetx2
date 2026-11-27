@@ -4472,6 +4472,7 @@ dependencies = [
  "serde",
  "serde-big-array",
  "serde_json",
+ "sha2 0.11.2",
  "subtle",
  "thiserror 2.0.21",
  "trait-variant",

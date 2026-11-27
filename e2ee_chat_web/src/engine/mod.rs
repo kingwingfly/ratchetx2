@@ -2003,11 +2003,32 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
+    /// Accept the request of `peer` (host tests only; production callers must pin
+    /// `conversation_gen` via [`Self::accept_for_gen`]).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub async fn accept(&self, peer: PublicKey, name: String) -> Result<(), String> {
+        self.accept_inner(peer, name, None).await
+    }
+
     /// Accept the request of `peer`, naming the peer `name`, registering the peer's write token
     /// grant, replaying any buffered envelopes, and sending `Events { accepted: true }` to wake
-    /// the peer immediately. Refuses while the contact is quarantined pending explicit classical
-    /// approval or post-quantum upgrade.
-    pub async fn accept(&self, peer: PublicKey, name: String) -> Result<(), String> {
+    /// the peer immediately, pinned to `expected_conversation_gen`.
+    pub async fn accept_for_gen(
+        &self,
+        peer: PublicKey,
+        name: String,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
+        self.accept_inner(peer, name, Some(expected_conversation_gen))
+            .await
+    }
+
+    async fn accept_inner(
+        &self,
+        peer: PublicKey,
+        name: String,
+        expected_gen: Option<u64>,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
         {
             let mut guard = self.lock_inner().await;
@@ -2017,16 +2038,28 @@ impl<V: VaultStore> Engine<V> {
             let inner = guard.as_mut().ok_or("locked")?;
             inner
                 .with_contact_tx(&peer, async |inner| {
-                    let token_hash = {
+                    let (token_hash, earlier_tokens) = {
                         let contact = inner
                             .contact(&peer)
                             .ok_or_else(|| "no such chat".to_string())?;
+                        if expected_gen.is_some_and(|want| contact.state.conversation_gen != want) {
+                            return Err("chat changed; please retry.".to_string());
+                        }
                         contact.accept_request(&name)?;
                         contact.state.events.get_or_insert_default().accepted = true;
-                        contact.session.active_inbound_token_hash()
+                        let active = contact.session.active_inbound_token_hash();
+                        let earlier: Vec<[u8; 32]> = contact
+                            .session
+                            .earlier_inbound_token_hashes()
+                            .filter(|h| Some(*h) != active)
+                            .collect();
+                        (active, earlier)
                     };
                     if let Some(token_hash) = token_hash {
                         inner.stage_write_token_grant(&peer, token_hash, true)?;
+                    }
+                    for earlier_hash in earlier_tokens {
+                        inner.stage_write_token_grant(&peer, earlier_hash, false)?;
                     }
                     inner.save(&[]).await.map_err(|e| describe(&e))
                 })
@@ -2098,14 +2131,22 @@ impl<V: VaultStore> Engine<V> {
         Ok(())
     }
 
-    pub async fn rename(&self, peer: PublicKey, name: String) -> Result<(), String> {
-        self.change_contact(peer, |contact| contact.state.name = name.trim().to_string())
-            .await
-    }
-
-    async fn change_contact(
+    pub async fn rename_for_gen(
         &self,
         peer: PublicKey,
+        name: String,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
+        self.change_contact_checked(peer, Some(expected_conversation_gen), |contact| {
+            contact.state.name = name.trim().to_string();
+        })
+        .await
+    }
+
+    async fn change_contact_checked(
+        &self,
+        peer: PublicKey,
+        expected_gen: Option<u64>,
         change: impl FnOnce(&mut Contact),
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
@@ -2119,6 +2160,9 @@ impl<V: VaultStore> Engine<V> {
                 let contact = inner
                     .contact(&peer)
                     .ok_or_else(|| "no such chat".to_string())?;
+                if expected_gen.is_some_and(|want| contact.state.conversation_gen != want) {
+                    return Err("chat changed; please retry.".to_string());
+                }
                 change(contact);
                 inner.save(&[]).await.map_err(|e| describe(&e))
             })
@@ -2142,14 +2186,29 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    /// Delete the chat with `peer` and its history. The server knows nothing of it: what it keeps
-    /// of the chat goes as it is delivered, or expires; but for its uploads that went up and
-    /// have not finished, which it deletes, as they never can now.
+    /// Delete the chat with `peer` (host tests only; production UI callers must pin
+    /// `conversation_gen` via [`Self::delete_for_gen`]).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub async fn delete(&self, peer: PublicKey) -> Result<(), String> {
-        self.delete_inner(peer, false).await
+        self.delete_inner(peer, false, None).await
     }
 
-    async fn delete_inner(&self, peer: PublicKey, require_isolated: bool) -> Result<(), String> {
+    /// Delete the chat with `peer` and its history, pinned to `expected_conversation_gen`.
+    pub async fn delete_for_gen(
+        &self,
+        peer: PublicKey,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
+        self.delete_inner(peer, false, Some(expected_conversation_gen))
+            .await
+    }
+
+    async fn delete_inner(
+        &self,
+        peer: PublicKey,
+        require_isolated: bool,
+        expected_gen: Option<u64>,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
         if !crate::glue::owns_lock() || !self.is_live(vgen) {
             return Err("page is closing; tab lock released".into());
@@ -2161,6 +2220,16 @@ impl<V: VaultStore> Engine<V> {
         let inner = guard.as_mut().ok_or("locked")?;
         if require_isolated && !inner.is_isolated_peer(&peer) {
             return Err("That contact is no longer isolated.".to_string());
+        }
+        if let Some(want_gen) = expected_gen {
+            let current_gen = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .map(|c| c.state.conversation_gen);
+            if current_gen != Some(want_gen) {
+                return Err("chat changed; please retry.".to_string());
+            }
         }
         // Read before anything changes, as the vault forgets them with the chat: cancel any
         // started upload that is still shown, running, or unannounced (leaving already-finished
@@ -2344,7 +2413,7 @@ impl<V: VaultStore> Engine<V> {
     /// that peer key) after explicit user confirmation. Refuses to delete an active healthy chat.
     pub async fn delete_isolated(&self, raw_peer: Vec<u8>) -> Result<(), String> {
         if let Ok(peer) = PublicKey::try_from(raw_peer.as_slice()) {
-            return self.delete_inner(peer, true).await;
+            return self.delete_inner(peer, true, None).await;
         }
         let vgen = self.vault_gen();
         let mut guard = self.lock_inner().await;

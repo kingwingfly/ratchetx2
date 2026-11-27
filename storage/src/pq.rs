@@ -372,17 +372,7 @@ pub trait LocalPqHandshakeStore {
         initial_message: StoredInitialMessageV2,
         limit: usize,
         allow_insert: bool,
-    ) -> Result<InitialDisposition> {
-        if !allow_insert {
-            return Ok(InitialDisposition::InsertDisallowed);
-        }
-        Ok(
-            match self.add_initial_message_v2(initial_message, limit).await? {
-                Some(id) => InitialDisposition::Added(id),
-                None => InitialDisposition::InboxFull,
-            },
-        )
-    }
+    ) -> Result<InitialDisposition>;
 
     /// Non-destructively list up to `limit` pending initial messages for `recipient` with
     /// `id > after_id`, oldest first. Must not allocate persistent storage for unknown identities.
@@ -400,14 +390,7 @@ pub trait LocalPqHandshakeStore {
         recipient: &PublicKey,
         after_id: u64,
         limit: usize,
-    ) -> Result<InitialMessagePage> {
-        let mut messages = self
-            .list_initial_messages(recipient, after_id, limit.saturating_add(1))
-            .await?;
-        let has_more = messages.len() > limit;
-        messages.truncate(limit);
-        Ok(InitialMessagePage { messages, has_more })
-    }
+    ) -> Result<InitialMessagePage>;
 
     /// Explicitly delete only the inbox initial messages with IDs in `ids` for `recipient`.
     /// Returns the number of messages deleted. Must not allocate persistent storage for unknown

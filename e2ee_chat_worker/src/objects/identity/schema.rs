@@ -191,8 +191,11 @@ fn ensure_v5_compat_migrations<S: SqlExec>(sql: &S) -> Result<()> {
         vec![],
     )?;
     if listed_col.count == 0 {
+        // Pre-migration rows have unknown delivery status (a recipient may already have fetched
+        // them before ACK landed); default existing rows to `listed = 1` so `publish_v2` retains
+        // them until explicit ACK or ordinary expiry, while fresh inserts explicitly write `0`.
         sql.exec(
-            "ALTER TABLE initial_messages ADD COLUMN listed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE initial_messages ADD COLUMN listed INTEGER NOT NULL DEFAULT 1",
             vec![],
         )?;
     }
@@ -223,6 +226,25 @@ fn ensure_v5_compat_migrations<S: SqlExec>(sql: &S) -> Result<()> {
 }
 
 impl<S: SqlExec> IdentityStore<'_, S> {
+    /// Whether canonical `SCHEMA_V5` tables exist WITHOUT running DDL migrations (for strictly
+    /// read-only probes such as `allow_insert == false` when `PQ_ENABLED="false"`).
+    pub(super) fn has_tables_readonly(&self) -> Result<bool> {
+        if self.cache.schema_ready.get() {
+            return Ok(true);
+        }
+        if !has_table(self.sql, "meta")? {
+            return Ok(false);
+        }
+        match self.sql.query_opt::<SchemaVersionRow>(
+            "SELECT schema_version FROM meta WHERE only = 0",
+            vec![],
+        )? {
+            Some(row) if row.schema_version == CURRENT_SCHEMA_VERSION => Ok(true),
+            Some(row) => Err(version_mismatch_error(row.schema_version)),
+            None => Ok(false),
+        }
+    }
+
     /// Whether canonical `SCHEMA_V5` tables exist, leaving unknown-identity DOs unallocated and
     /// failing closed if `meta.schema_version != 5`.
     pub(super) fn has_tables(&self) -> Result<bool> {
@@ -605,8 +627,7 @@ mod tests {
                     },
                     1_000,
                 )
-                .unwrap()
-                .0,
+                .unwrap(),
             PublishV2Status::Stored
         );
         assert_eq!(
@@ -622,8 +643,7 @@ mod tests {
                     },
                     2_000,
                 )
-                .unwrap()
-                .0,
+                .unwrap(),
             PublishV2Status::Stored
         );
         assert!(matches!(
@@ -652,5 +672,180 @@ mod tests {
                 .unwrap(),
             crate::objects::identity::AddInitialOutcome::Added { inserted: true, .. }
         ));
+    }
+
+    #[test]
+    fn r6_p2_6_p2_7_cold_v5_read_only_probe_skips_ddl_and_migration_defaults_listed_to_1() {
+        use storage::{
+            Bytes, PublishV2Record, PublishV2Status, StoredCapabilityManifest,
+            StoredInitialMessageV2,
+        };
+
+        let env = TestIdentity::new(30_000);
+        // Simulate a cold pre-migration SCHEMA_V5 DO missing `prev_signed_prekey`,
+        // `initial_messages.listed`, `recipient_stats.acked_initial_evicted_until`, and
+        // `acked_initial_messages`, containing a published manifest and an existing initial row.
+        let old_v5 = SCHEMA_V5
+            .replace("prev_signed_prekey BLOB,\n", "")
+            .replace("    listed INTEGER NOT NULL DEFAULT 0,\n", "")
+            .replace(
+                "    authorized_peer_count INTEGER NOT NULL DEFAULT 0,\n    acked_initial_evicted_until INTEGER NOT NULL DEFAULT 0\n",
+                "    authorized_peer_count INTEGER NOT NULL DEFAULT 0\n",
+            );
+        let old_v5 = old_v5
+            .split("CREATE TABLE IF NOT EXISTS acked_initial_messages")
+            .next()
+            .unwrap();
+        env.sql.exec_batch(old_v5).unwrap();
+        env.sql
+            .exec(
+                "INSERT INTO meta (only, schema_version) VALUES (0, ?)",
+                params![CURRENT_SCHEMA_VERSION].unwrap(),
+            )
+            .unwrap();
+        let bob = [0x22; 32];
+        let alice = [0x11; 32];
+        let spk1 = [0x31; 32];
+        env.sql
+            .exec(
+                "INSERT INTO capability_manifest \
+                 (only, audience, identity_key, manifest_seq, generation, issued_at, expires_at, \
+                  pq_enabled, strict_pq, pq_ratchet_supported, offered_suites, signed_prekey, \
+                  signed_prekey_signature, pq_last_resort_commitments, signature) \
+                 VALUES (0, 'relay.example', ?, 1, 1, 1000, 100000, 0, 0, 0, ?, ?, ?, ?, ?)",
+                params![
+                    bob.as_slice(),
+                    [].as_slice(),
+                    spk1.as_slice(),
+                    Some([0x55u8; 64].as_slice()),
+                    [0u8; 1].as_slice(),
+                    [0x44u8; 64].as_slice()
+                ]
+                .unwrap(),
+            )
+            .unwrap();
+        let existing_msg = StoredInitialMessageV2 {
+            id: 0,
+            version: 1,
+            sender: alice,
+            recipient: bob,
+            ephemeral_key: [0x61; 32],
+            signed_prekey: spk1,
+            one_time_prekey: None,
+            header: Bytes::from_static(b"h"),
+            content: Bytes::from_static(b"c"),
+            pq_suite: None,
+            pq_last_resort: false,
+            pq_prekey_id: None,
+            pq_ciphertext: None,
+            manifest_digest: None,
+        };
+        env.sql
+            .exec(
+                "INSERT INTO initial_messages \
+                 (version, sender, ephemeral_key, signed_prekey, header, content, pq_last_resort, \
+                  payload_hash, created_at) \
+                 VALUES (1, ?, ?, ?, ?, ?, 0, ?, 1500)",
+                params![
+                    alice.as_slice(),
+                    existing_msg.ephemeral_key.as_slice(),
+                    spk1.as_slice(),
+                    b"h".as_slice(),
+                    b"c".as_slice(),
+                    // Match `initial_message_payload_hash` indirectly via a fresh write later, or
+                    // test InsertDisallowed + StalePrekey on read-only probe first!
+                    [0x99u8; 32].as_slice()
+                ]
+                .unwrap(),
+            )
+            .unwrap();
+
+        // R6-P2-7: `allow_insert == false` probe MUST NOT run `ALTER TABLE` or `CREATE TABLE`!
+        let probe_new = StoredInitialMessageV2 {
+            ephemeral_key: [0x62; 32],
+            ..existing_msg.clone()
+        };
+        assert_eq!(
+            env.store()
+                .add_initial_message_v2(&probe_new, 10, false, 2_000)
+                .unwrap(),
+            crate::objects::identity::AddInitialOutcome::InsertDisallowed
+        );
+        let probe_stale = StoredInitialMessageV2 {
+            ephemeral_key: [0x63; 32],
+            signed_prekey: [0x99; 32],
+            ..existing_msg.clone()
+        };
+        assert_eq!(
+            env.store()
+                .add_initial_message_v2(&probe_stale, 10, false, 2_000)
+                .unwrap(),
+            crate::objects::identity::AddInitialOutcome::StalePrekey
+        );
+        assert!(
+            !env.cache.schema_ready.get(),
+            "read-only probe must not run migrations or set schema_ready"
+        );
+        let listed_col_before: CountRow = env
+            .sql
+            .query_one(
+                "SELECT count(*) AS count FROM pragma_table_info('initial_messages') WHERE name = 'listed'",
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(listed_col_before.count, 0);
+
+        // R6-P2-6: Running migration on write path defaults pre-migration rows to `listed = 1`,
+        // retaining them across 2 SPK rotations while fresh inserts write `listed = 0`!
+        let mk_m = |seq: u64, spk: [u8; 32]| PublishV2Record {
+            manifest: StoredCapabilityManifest {
+                audience: "relay.example".into(),
+                identity_key: bob,
+                manifest_seq: seq,
+                generation: seq,
+                issued_at: 2_000,
+                expires_at: 200_000,
+                pq_enabled: false,
+                strict_pq: false,
+                pq_ratchet_supported: false,
+                offered_suites: vec![],
+                signed_prekey: spk,
+                pq_last_resort: vec![],
+                signature: [0x44; 64],
+            },
+            signed_prekey_signature: Some([0x55; 64]),
+            one_time_prekeys: vec![],
+            pq_last_resort: vec![],
+            pq_one_time_prekeys: vec![],
+            timestamp: seq * 1_000,
+        };
+        assert_eq!(
+            env.store().publish_v2(&mk_m(2, [0x32; 32]), 2_000).unwrap(),
+            PublishV2Status::Stored
+        );
+        // Fresh insert on spk1 (prev_signed_prekey) gets `listed = 0`.
+        assert!(matches!(
+            env.store()
+                .add_initial_message_v2(&probe_new, 10, true, 2_100)
+                .unwrap(),
+            crate::objects::identity::AddInitialOutcome::Added { inserted: true, .. }
+        ));
+        assert_eq!(
+            env.store().publish_v2(&mk_m(3, [0x33; 32]), 3_000).unwrap(),
+            PublishV2Status::Stored
+        );
+        // Pre-migration row (`ephemeral_key = [0x61; 32]`, `listed = 1`) survives rotation, while
+        // the fresh unlisted row (`ephemeral_key = [0x62; 32]`, `listed = 0`) was evicted!
+        let surviving: CountRow = env
+            .sql
+            .query_one("SELECT count(*) AS count FROM initial_messages", vec![])
+            .unwrap();
+        assert_eq!(surviving.count, 1);
+        assert_eq!(
+            env.store()
+                .add_initial_message_v2(&probe_new, 10, false, 3_100)
+                .unwrap(),
+            crate::objects::identity::AddInitialOutcome::StalePrekey
+        );
     }
 }

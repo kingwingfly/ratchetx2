@@ -350,6 +350,10 @@ pub enum Step {
     Pushed,
     /// The server refused it for good, or there is no session to send it on.
     Refused,
+    /// A previously dispatched item hit an ambiguous post-dispatch refusal or corrupt outbox
+    /// record: settle outbox without duplicating or deleting attachments, leaving `Pending` so a
+    /// later peer receipt can still mark it `Read`/`Downloaded`.
+    Unknown,
     /// The peer says it read it, ...
     Read,
     /// ... or downloaded its attachment.
@@ -366,6 +370,7 @@ impl Delivery {
         match (self, step) {
             (Self::Pending, Step::Pushed) => Self::Sent,
             (Self::Pending, Step::Refused) => Self::Failed,
+            (Self::Pending, Step::Unknown) => Self::Pending,
             // Pushed already, though its reply was lost.
             (Self::Pending | Self::Sent, Step::Read) => Self::Read,
             (Self::Pending | Self::Sent | Self::Read, Step::Downloaded) => Self::Downloaded,

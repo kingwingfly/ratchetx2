@@ -343,22 +343,27 @@ impl<V: VaultStore> Engine<V> {
                                     changed = true;
                                     continue;
                                 }
-                                Ok(CorruptOutboxRecovery::Dropped { history }) => {
+                                Ok(CorruptOutboxRecovery::Dropped {
+                                    history,
+                                    was_dispatched,
+                                }) => {
                                     self.release(peer, outgoing.history_index);
-                                    server_deletes.extend(
-                                        self.prepare_cancel_uploads_for_failed(
-                                            inner,
-                                            peer,
-                                            &[outgoing.history_index],
-                                        )
-                                        .await,
-                                    );
-                                    if !self.is_live(vgen) {
-                                        return Ok(false);
+                                    if !was_dispatched {
+                                        server_deletes.extend(
+                                            self.prepare_cancel_uploads_for_failed(
+                                                inner,
+                                                peer,
+                                                &[outgoing.history_index],
+                                            )
+                                            .await,
+                                        );
+                                        if !self.is_live(vgen) {
+                                            return Ok(false);
+                                        }
                                     }
-                                    self.ui.log(if outgoing.dispatched {
+                                    self.ui.log(if was_dispatched {
                                         format!(
-                                            "Dropped corrupt already-dispatched outbox record #{} for {} (delivery status unknown; refused to re-encrypt and duplicate: {reason})",
+                                            "Dropped corrupt already-dispatched outbox record #{} for {} (delivery status unknown; preserved attachment and refused to re-encrypt and duplicate: {reason})",
                                             outgoing.history_index,
                                             short(peer)
                                         )
@@ -436,22 +441,27 @@ impl<V: VaultStore> Engine<V> {
                                 changed = true;
                                 continue;
                             }
-                            Ok(CorruptOutboxRecovery::Dropped { history }) => {
+                            Ok(CorruptOutboxRecovery::Dropped {
+                                history,
+                                was_dispatched,
+                            }) => {
                                 self.release(peer, outgoing.history_index);
-                                server_deletes.extend(
-                                    self.prepare_cancel_uploads_for_failed(
-                                        inner,
-                                        peer,
-                                        &[outgoing.history_index],
-                                    )
-                                    .await,
-                                );
-                                if !self.is_live(vgen) {
-                                    return Ok(false);
+                                if !was_dispatched {
+                                    server_deletes.extend(
+                                        self.prepare_cancel_uploads_for_failed(
+                                            inner,
+                                            peer,
+                                            &[outgoing.history_index],
+                                        )
+                                        .await,
+                                    );
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
                                 }
-                                if outgoing.dispatched {
+                                if was_dispatched {
                                     self.ui.log(format!(
-                                        "Dropped incomplete already-dispatched outbox record #{} for {} (delivery status unknown; refused to re-encrypt and duplicate)",
+                                        "Dropped incomplete already-dispatched outbox record #{} for {} (delivery status unknown; preserved attachment and refused to re-encrypt and duplicate)",
                                         outgoing.history_index,
                                         short(peer)
                                     ));
@@ -721,20 +731,14 @@ impl<V: VaultStore> Engine<V> {
                     // If `PushV2` already succeeded on the relay, commit `Step::Pushed` even if a
                     // concurrent inbound session rotated `active_id` or set `needs_requeue_sealed`
                     // (otherwise looping to requeue would re-encrypt and duplicate a delivered
-                    // message). Only clear `Outgoing.dispatched` when this error proves no prior
-                    // attempt could have committed on the relay:
-                    // - On the first dispatch (`first_dispatch == true`), any definitive server
-                    //   refusal proves the sealed record never committed.
-                    // - On a retry after a lost response/reload (`first_dispatch == false`),
-                    //   pre-dedup refusals (`SignInRequired`, `LimitExceeded`, `MailboxFull`) can
-                    //   occur even after an earlier attempt succeeded; preserve `dispatched = true`
-                    //   so subsequent syncs reconcile the exact original `client_message_id` rather
-                    //   than unsealing and duplicating under a fresh ID. Only `WriteTokenRejected`
-                    //   authorizes clearing `dispatched` on a retry.
+                    // message). Only clear `Outgoing.dispatched` on the VERY FIRST wire attempt
+                    // (`first_dispatch == true`) after a definitive server refusal, because on a
+                    // retry after a lost response/reload (`first_dispatch == false`) even
+                    // `WriteTokenRejected`, `SignInRequired`, `LimitExceeded`, or `MailboxFull`
+                    // run before dedup and can occur AFTER an earlier attempt committed!
                     if let Err(ref e) = push_res {
                         inner.in_flight_push.remove(peer);
-                        let can_clear_dispatched = e.is_server_refusal()
-                            && (first_dispatch || e.kind() == ErrorKind::WriteTokenRejected);
+                        let can_clear_dispatched = e.is_server_refusal() && first_dispatch;
                         if can_clear_dispatched {
                             let cleared = inner.contact(peer).is_some_and(|c| {
                                 if let Some(head) = c.state.outbox.first_mut()
@@ -818,8 +822,43 @@ impl<V: VaultStore> Engine<V> {
                             }
                             if known {
                                 // Peer previously accepted us BEFORE dispatch and has since
-                                // revoked/deleted the chat: retire active session and requeue so
-                                // the next sync starts fresh.
+                                // revoked/deleted the chat.
+                                if !first_dispatch {
+                                    // An earlier dispatch lost its response before the token was
+                                    // revoked: settle this head as delivery-unknown (preserving
+                                    // attachments and allowing a late receipt to settle history)
+                                    // so retiring the session NEVER reseals & duplicates it!
+                                    match self
+                                        .commit_outbox_item(
+                                            vgen,
+                                            inner,
+                                            peer,
+                                            &outgoing,
+                                            Step::Unknown,
+                                            outgoing.clock,
+                                            false,
+                                            &mut server_deletes,
+                                        )
+                                        .await
+                                    {
+                                        Ok(CommitOutcome::Committed) => {
+                                            self.release(peer, outgoing.history_index);
+                                            self.ui.log(format!(
+                                                "Delivery status unknown for message #{} to {} after write-token revocation; refused to re-encrypt and duplicate.",
+                                                outgoing.history_index,
+                                                short(peer)
+                                            ));
+                                            changed = true;
+                                        }
+                                        Ok(CommitOutcome::Aborted) => return Ok(false),
+                                        Err(err) => {
+                                            result = Err(err);
+                                            break;
+                                        }
+                                    }
+                                }
+                                // Retire the revoked session and mark remaining undispatched
+                                // sealed outbox items for requeue on the next sync.
                                 if let Some(contact) = inner.contact(peer) {
                                     contact.state.needs_requeue_sealed = true;
                                     contact.session.retire();
@@ -1160,19 +1199,32 @@ impl<V: VaultStore> Engine<V> {
                             break;
                         }
                         // The same, but this page cannot sign in to the server: it never will go.
+                        // If a prior attempt was already dispatched (response lost), settle as
+                        // delivery-unknown rather than `Refused` so we never delete an attachment
+                        // whose announcement the recipient may already hold!
                         Err(e) if e.kind() == ErrorKind::SignInRequired => {
                             self.release(peer, outgoing.history_index);
-                            self.ui.notify(format!(
-                                "a message could not be sent: {NOT_SIGNED_IN_HERE}"
-                            ));
+                            let (step, commit_clock) = if first_dispatch {
+                                self.ui.notify(format!(
+                                    "a message could not be sent: {NOT_SIGNED_IN_HERE}"
+                                ));
+                                (Step::Refused, 0)
+                            } else {
+                                self.ui.log(format!(
+                                    "Delivery status unknown for message #{} to {} ({NOT_SIGNED_IN_HERE}); preserving attachment and awaiting receipt.",
+                                    outgoing.history_index,
+                                    short(peer)
+                                ));
+                                (Step::Unknown, outgoing.clock)
+                            };
                             match self
                                 .commit_outbox_item(
                                     vgen,
                                     inner,
                                     peer,
                                     &outgoing,
-                                    Step::Refused,
-                                    0,
+                                    step,
+                                    commit_clock,
                                     session_matches,
                                     &mut server_deletes,
                                 )
@@ -1186,19 +1238,33 @@ impl<V: VaultStore> Engine<V> {
                                 }
                             }
                         }
-                        // Too large for the server: it never will go.
+                        // Too large for the server: it never will go (unless an earlier attempt
+                        // committed before a limit change, in which case settle as unknown).
                         Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::LimitExceeded => {
                             self.release(peer, outgoing.history_index);
-                            self.ui
-                                .notify(format!("a message could not be sent: {}", describe(&e)));
+                            let (step, commit_clock) = if first_dispatch {
+                                self.ui.notify(format!(
+                                    "a message could not be sent: {}",
+                                    describe(&e)
+                                ));
+                                (Step::Refused, 0)
+                            } else {
+                                self.ui.log(format!(
+                                    "Delivery status unknown for message #{} to {} ({}); preserving attachment and awaiting receipt.",
+                                    outgoing.history_index,
+                                    short(peer),
+                                    describe(&e)
+                                ));
+                                (Step::Unknown, outgoing.clock)
+                            };
                             match self
                                 .commit_outbox_item(
                                     vgen,
                                     inner,
                                     peer,
                                     &outgoing,
-                                    Step::Refused,
-                                    0,
+                                    step,
+                                    commit_clock,
                                     session_matches,
                                     &mut server_deletes,
                                 )
@@ -1273,20 +1339,28 @@ impl<V: VaultStore> Engine<V> {
         let mut entries = vec![];
         let mut new_awaiting = None;
         if let Some(mut entry) = entry_opt {
+            let was_pending = entry.delivery() == Delivery::Pending;
             entry.set_delivery(entry.delivery().after(step));
-            // Pushed, it has its place, and waits for the peer to read it.
-            if step == Step::Pushed {
-                entry.place = clock;
+            // Pushed (or delivery-unknown after a prior wire dispatch): record its clock and await
+            // a peer receipt so history settles if the peer receives/reads it.
+            if step == Step::Pushed || (step == Step::Unknown && clock > 0) {
+                if entry.place == 0 {
+                    entry.place = clock;
+                }
                 let content = entry.content.get_or_insert_default();
-                content.clock = clock;
-                let attachment = matches!(content.kind, Some(Kind::Attachment(_)));
-                new_awaiting = Some(Awaiting {
-                    place: clock,
-                    history_index: index,
-                    read: false,
-                    attachment,
-                    content_digest: outgoing.content_digest.clone(),
-                });
+                if content.clock == 0 {
+                    content.clock = clock;
+                }
+                if step == Step::Pushed || was_pending {
+                    let attachment = matches!(content.kind, Some(Kind::Attachment(_)));
+                    new_awaiting = Some(Awaiting {
+                        place: clock,
+                        history_index: index,
+                        read: false,
+                        attachment,
+                        content_digest: outgoing.content_digest.clone(),
+                    });
+                }
             }
             entries.push((index, entry));
         }
@@ -2078,9 +2152,13 @@ impl<V: VaultStore> Engine<V> {
 pub(super) enum CorruptOutboxRecovery {
     /// Rebuilt unsealed content bytes from `history`/`file` and reset the outbox item to unsealed.
     Rebuilt(Vec<u8>),
-    /// Original history content was missing or corrupt too: dropped the outbox item and marked its
-    /// history entry `Failed` so subsequent sends are unblocked.
-    Dropped { history: Vec<(u64, HistoryEntry)> },
+    /// Original history content was missing/corrupt or record was already dispatched on the wire:
+    /// dropped the outbox item without duplicating (`was_dispatched == true` leaves `Pending` +
+    /// `Awaiting` and preserves attachments; `was_dispatched == false` marks `Failed`).
+    Dropped {
+        history: Vec<(u64, HistoryEntry)>,
+        was_dispatched: bool,
+    },
 }
 
 impl<V: VaultStore> Inner<V> {
@@ -2170,7 +2248,7 @@ impl<V: VaultStore> Inner<V> {
             Err(crate::vault::Error::Corrupt(_)) => {
                 match self.recover_corrupt_outbox(peer, index).await? {
                     CorruptOutboxRecovery::Rebuilt(bytes) => bytes,
-                    CorruptOutboxRecovery::Dropped { history } => {
+                    CorruptOutboxRecovery::Dropped { history, .. } => {
                         return Ok(LocalSealOutcome::CorruptDropped(index, history));
                     }
                 }
@@ -2224,10 +2302,10 @@ impl<V: VaultStore> Inner<V> {
         peer: &PublicKey,
         index: u64,
     ) -> Result<CorruptOutboxRecovery, String> {
-        let (expected_digest, was_dispatched) = self
+        let (expected_digest, was_dispatched, outgoing_clock) = self
             .contact(peer)
             .and_then(|c| c.state.outbox.iter().find(|o| o.history_index == index))
-            .map(|o| (o.content_digest.clone(), o.dispatched))
+            .map(|o| (o.content_digest.clone(), o.dispatched, o.clock))
             .unwrap_or_default();
         let entry = match self.vault.entry(peer, index).await {
             Ok(entry) => entry,
@@ -2283,9 +2361,37 @@ impl<V: VaultStore> Inner<V> {
                 Ok(CorruptOutboxRecovery::Rebuilt(bytes))
             }
             None => {
+                let mut new_awaiting = None;
                 let history = match entry {
                     Some(mut entry) => {
-                        entry.set_delivery(Delivery::Failed);
+                        if was_dispatched {
+                            // Delivery status is unknown: keep `Delivery::Pending` (never mark
+                            // `Failed` or delete attachments) and record `Awaiting` if `clock > 0`
+                            // so a late peer receipt can still settle history.
+                            let was_pending = entry.delivery() == Delivery::Pending;
+                            if outgoing_clock > 0 {
+                                if entry.place == 0 {
+                                    entry.place = outgoing_clock;
+                                }
+                                let content = entry.content.get_or_insert_default();
+                                if content.clock == 0 {
+                                    content.clock = outgoing_clock;
+                                }
+                                if was_pending {
+                                    let attachment =
+                                        matches!(content.kind, Some(Kind::Attachment(_)));
+                                    new_awaiting = Some(Awaiting {
+                                        place: outgoing_clock,
+                                        history_index: index,
+                                        read: false,
+                                        attachment,
+                                        content_digest: expected_digest.clone(),
+                                    });
+                                }
+                            }
+                        } else {
+                            entry.set_delivery(Delivery::Failed);
+                        }
                         vec![(index, entry)]
                     }
                     None => vec![],
@@ -2295,13 +2401,20 @@ impl<V: VaultStore> Inner<V> {
                         .contact(peer)
                         .ok_or_else(|| "no such chat".to_string())?;
                     contact.state.outbox.retain(|o| o.history_index != index);
+                    if let Some(awaiting) = new_awaiting.clone() {
+                        contact.state.awaiting.push(awaiting);
+                        keep_last(&mut contact.state.awaiting);
+                    }
                     inner
                         .save_with(&records(peer, &history), &[(*peer, index, None)])
                         .await
                         .map_err(|e| describe(&e))
                 })
                 .await?;
-                Ok(CorruptOutboxRecovery::Dropped { history })
+                Ok(CorruptOutboxRecovery::Dropped {
+                    history,
+                    was_dispatched,
+                })
             }
         }
     }

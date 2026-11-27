@@ -964,11 +964,16 @@ impl<V: VaultStore> Engine<V> {
         describe_upgrade_pq_error(kind, &inner.server_pq, describe(&e))
     }
 
-    /// Dismiss the active downgrade/security banner for `peer` without removing `pq_pinned`.
-    /// Refuses to clear downgrade alerts while an inbound classical session is still quarantined.
-    pub async fn dismiss_downgrade(&self, peer: PublicKey) -> Result<(), String> {
+    /// Dismiss the active downgrade/security banner for `peer` without removing `pq_pinned`,
+    /// pinned to `expected_conversation_gen`. Refuses to clear downgrade alerts while an inbound
+    /// classical session is still quarantined.
+    pub async fn dismiss_downgrade_for_gen(
+        &self,
+        peer: PublicKey,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
         let mut cleared = false;
-        self.change_contact(peer, |contact| {
+        self.change_contact_checked(peer, Some(expected_conversation_gen), |contact| {
             if contact.state.quarantined {
                 return;
             }

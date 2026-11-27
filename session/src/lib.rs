@@ -70,6 +70,30 @@ const PEER_SLOT_DOMAIN: &[u8] = b"session.v2/peer-slot\0";
 /// Domain-separation prefix for directional deniable write-capability tokens (`HKDF-SHA256`).
 const WRITE_TOKEN_INFO_PREFIX: &[u8] = b"session.v2/write-token\0";
 
+/// Lock-free attachment upload initiation (equivalent to [`Client::start_upload`] without
+/// borrowing [`Client`]).
+pub async fn start_upload_with(
+    attachments: &impl LocalAttachments,
+    size: u64,
+) -> Result<attachment::Upload> {
+    let chunks = u32::try_from(attachment::chunk_count(size))
+        .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
+    let key = attachment::try_generate_key()?;
+    let response = attachments
+        .start_upload(StartUploadRequest {
+            chunks,
+            delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
+        })
+        .await?;
+    Ok(attachment::Upload::new(
+        protocol::fixed(&response.id)?,
+        Zeroizing::new(protocol::fixed(&response.upload_token)?),
+        key,
+        chunks,
+        (response.expires != 0).then_some(response.expires),
+    ))
+}
+
 /// Zeroizes the backing buffer of `bytes` in place when uniquely owned; static or shared handles
 /// are detached without panicking.
 pub(crate) fn zeroize_bytes(bytes: &mut Bytes) {
@@ -738,6 +762,18 @@ impl<H> Client<H> {
         self.state.prekeys.current_one_time_count()
     }
 
+    /// Remaining classical one-time prekey capacity in the latest local generation before hitting
+    /// [`x3dh::MAX_ONE_TIME_PER_GENERATION`].
+    pub fn remaining_one_time_headroom(&self) -> usize {
+        self.state.prekeys.remaining_one_time_headroom()
+    }
+
+    /// Remaining total post-quantum one-time prekey capacity in the latest local generation before
+    /// hitting [`x3dh::MAX_ONE_TIME_PER_GENERATION`].
+    pub fn remaining_pq_one_time_headroom(&self) -> usize {
+        self.state.prekeys.remaining_pq_one_time_headroom()
+    }
+
     /// Number of unused post-quantum one-time prekeys for `suite` in the latest local generation.
     pub fn current_pq_one_time_count(&self, suite: PqSuite) -> usize {
         self.state.prekeys.current_pq_one_time_count(suite)
@@ -769,22 +805,7 @@ impl<H> Client<H> {
         attachments: &impl LocalAttachments,
         size: u64,
     ) -> Result<attachment::Upload> {
-        let chunks = u32::try_from(attachment::chunk_count(size))
-            .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
-        let key = attachment::try_generate_key()?;
-        let response = attachments
-            .start_upload(StartUploadRequest {
-                chunks,
-                delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
-            })
-            .await?;
-        Ok(attachment::Upload::new(
-            protocol::fixed(&response.id)?,
-            Zeroizing::new(protocol::fixed(&response.upload_token)?),
-            key,
-            chunks,
-            (response.expires != 0).then_some(response.expires),
-        ))
+        start_upload_with(attachments, size).await
     }
 
     /// Sign a notification subscription for a configured relay URL or host using its clock.
@@ -1281,6 +1302,14 @@ impl SessionState {
             .chain(self.others.iter().map(|earlier| earlier.inbound_token_hash))
     }
 
+    /// Inbound write-token hashes (`SHA-256(t_{peer->me})`) of all kept earlier (archived)
+    /// sessions.
+    pub fn earlier_inbound_token_hashes(
+        &self,
+    ) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.others.iter().map(|earlier| earlier.inbound_token_hash)
+    }
+
     /// Queued write-token registrations awaiting relay confirmation.
     pub fn pending_register_grants(&self) -> &[PendingGrant] {
         &self.pending_register_grants
@@ -1762,6 +1791,14 @@ impl<M> Session<M> {
     /// kept earlier sessions, for O(1) `EnvelopeV2.token_hash -> peer` dispatch.
     pub fn inbound_token_hashes(&self) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
         self.state.inbound_token_hashes()
+    }
+
+    /// Inbound write-token hashes (`SHA-256(t_{peer->me})`) of all kept earlier (archived)
+    /// sessions.
+    pub fn earlier_inbound_token_hashes(
+        &self,
+    ) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.state.earlier_inbound_token_hashes()
     }
 
     /// Queued write-token registrations awaiting relay confirmation.
@@ -2290,6 +2327,20 @@ mod test {
             storage::PqHandshakeStore::add_initial_message_v2(&*self.0, initial_message, limit)
                 .await
         }
+        async fn add_initial_message_v2_checked(
+            &self,
+            initial_message: storage::StoredInitialMessageV2,
+            limit: usize,
+            allow_insert: bool,
+        ) -> storage::Result<storage::InitialDisposition> {
+            storage::PqHandshakeStore::add_initial_message_v2_checked(
+                &*self.0,
+                initial_message,
+                limit,
+                allow_insert,
+            )
+            .await
+        }
         async fn list_initial_messages(
             &self,
             recipient: &PublicKey,
@@ -2298,6 +2349,17 @@ mod test {
         ) -> storage::Result<Vec<storage::StoredInitialMessageV2>> {
             storage::PqHandshakeStore::list_initial_messages(&*self.0, recipient, after_id, limit)
                 .await
+        }
+        async fn list_initial_messages_page(
+            &self,
+            recipient: &PublicKey,
+            after_id: u64,
+            limit: usize,
+        ) -> storage::Result<storage::InitialMessagePage> {
+            storage::PqHandshakeStore::list_initial_messages_page(
+                &*self.0, recipient, after_id, limit,
+            )
+            .await
         }
         async fn ack_initial_messages(
             &self,

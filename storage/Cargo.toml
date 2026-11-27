@@ -13,6 +13,7 @@ bytes.workspace = true
 parking_lot = { version = "0.13", optional = true }
 serde = { workspace = true, optional = true }
 serde-big-array = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
 thiserror.workspace = true
 trait-variant.workspace = true
@@ -29,7 +30,7 @@ xeddsa = { path = "../xeddsa" }
 [features]
 default = ["memory"]
 # In-memory backend, for tests and development servers.
-memory = ["dep:parking_lot", "dep:subtle", "dep:web-time"]
+memory = ["dep:parking_lot", "dep:sha2", "dep:subtle", "dep:web-time"]
 # Derive `serde::Serialize` and `serde::Deserialize` on storage records for RPC/DO serialization.
 serde = ["dep:serde", "dep:serde-big-array", "bytes/serde"]
 # Conformance suites every backend should pass.

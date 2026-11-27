@@ -325,26 +325,27 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         let size = file.size();
-        let (started, signs_in_here, server) = {
-            let mut guard = self.lock_inner().await;
+        let server = {
+            let guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Err("locked".into());
             }
-            let inner = guard.as_mut().ok_or("locked")?;
-            let contact = inner.contact(&peer).ok_or("no such chat")?;
+            let inner = guard.as_ref().ok_or("locked")?;
+            let contact = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .ok_or("no such chat")?;
             if contact.state.request {
                 return Err("accept the request first".into());
             }
             if contact.state.quarantined {
                 return Err("approve classical encryption or upgrade to post-quantum first".into());
             }
-            let server = inner.server.clone();
-            let started = inner
-                .client
-                .start_upload(&Fetch::client(&server), size)
-                .await;
-            (started, same_server(&server, &origin()), server)
+            inner.server.clone()
         };
+        let signs_in_here = same_server(&server, &origin());
+        let started = session::start_upload_with(&Fetch::client(&server), size).await;
         if !self.is_live(vgen) {
             if let Ok(upload) = started {
                 let _ = upload.cancel(&Fetch::client(&server)).await;
@@ -634,64 +635,66 @@ impl<V: VaultStore> Engine<V> {
         file: ChunkSource,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
-        let mut guard = self.lock_inner().await;
-        if !self.is_live(vgen) || self.is_cancelled(&waiting) {
-            return Ok(());
-        }
-        let inner = guard.as_mut().ok_or("locked")?;
-        let Some(kept) = inner
-            .vault
-            .upload(&peer, &waiting)
-            .await
-            .map_err(|e| describe(&e))?
-            .filter(|pending| !pending.started())
-        else {
-            return Ok(());
-        };
-        if file.size() != kept.size {
-            return Err(format!("that is not {}, or it changed", kept.name));
-        }
-        // Its message still waits for it, unless this record outlived its start, as forgetting
-        // it failed: that message has its attachment, and a second upload must not replace it.
-        let awaited = inner.contact(&peer).is_some_and(|contact| {
-            contact.state.outbox.iter().any(|outgoing| {
-                outgoing.history_index == kept.history_index && outgoing.awaits_upload
-            })
-        });
-        if !awaited {
-            self.release(&peer, kept.history_index);
-            self.remove_attachment_caches(&peer, &waiting);
-            self.ui
-                .uploads
-                .update(|uploads| uploads.retain(|upload| upload.id != waiting));
-            return inner
+        let (kept, server) = {
+            let mut guard = self.lock_inner().await;
+            if !self.is_live(vgen) || self.is_cancelled(&waiting) {
+                return Ok(());
+            }
+            let inner = guard.as_mut().ok_or("locked")?;
+            let Some(kept) = inner
                 .vault
-                .forget_upload(&peer, &waiting)
+                .upload(&peer, &waiting)
                 .await
-                .map_err(|e| describe(&e));
-        }
-        // Validate the waiting message and contact BEFORE allocating a server upload so a missing
-        // history entry cannot orphan a server upload or a `started = true` vault record.
-        let mut entry = inner
-            .vault
-            .entry(&peer, kept.history_index)
-            .await
-            .map_err(|e| describe(&e))?
-            .ok_or("its message is gone")?;
-        if inner.contact(&peer).is_none() {
-            return Err("no such chat".into());
-        }
-        if self.is_cancelled(&waiting) {
-            return Ok(());
-        }
-        let started = inner
-            .client
-            .start_upload(&Fetch::client(&inner.server), kept.size)
-            .await;
+                .map_err(|e| describe(&e))?
+                .filter(|pending| !pending.started())
+            else {
+                return Ok(());
+            };
+            if file.size() != kept.size {
+                return Err(format!("that is not {}, or it changed", kept.name));
+            }
+            // Its message still waits for it, unless this record outlived its start, as forgetting
+            // it failed: that message has its attachment, and a second upload must not replace it.
+            let awaited = inner.contact(&peer).is_some_and(|contact| {
+                contact.state.outbox.iter().any(|outgoing| {
+                    outgoing.history_index == kept.history_index && outgoing.awaits_upload
+                })
+            });
+            if !awaited {
+                self.release(&peer, kept.history_index);
+                self.remove_attachment_caches(&peer, &waiting);
+                self.ui
+                    .uploads
+                    .update(|uploads| uploads.retain(|upload| upload.id != waiting));
+                return inner
+                    .vault
+                    .forget_upload(&peer, &waiting)
+                    .await
+                    .map_err(|e| describe(&e));
+            }
+            // Validate the waiting message and contact BEFORE allocating a server upload so a
+            // missing history entry cannot orphan a server upload or a `started = true` record.
+            let entry_exists = inner
+                .vault
+                .entry(&peer, kept.history_index)
+                .await
+                .map_err(|e| describe(&e))?
+                .is_some();
+            if !entry_exists {
+                return Err("its message is gone".into());
+            }
+            if inner.contact(&peer).is_none() {
+                return Err("no such chat".into());
+            }
+            if !self.is_live(vgen) || self.is_cancelled(&waiting) {
+                return Ok(());
+            }
+            (kept, inner.server.clone())
+        };
+        let started = session::start_upload_with(&Fetch::client(&server), kept.size).await;
         let upload = match started {
             Ok(upload) => upload,
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
-                drop(guard);
                 if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                     return Ok(());
                 }
@@ -709,9 +712,44 @@ impl<V: VaultStore> Engine<V> {
                 return Err(describe(&e));
             }
         };
-        let server = inner.server.clone();
-        // Cancelled meanwhile: the server forgets it too (outside the lock), and cancelling fails
-        // its message.
+        // Cancelled or locked meanwhile: cancel on server outside `self.inner`.
+        if !self.is_live(vgen) || self.is_cancelled(&waiting) {
+            let _ = upload.cancel(&Fetch::client(&server)).await;
+            return Ok(());
+        }
+        let mut guard = self.lock_inner().await;
+        if !self.is_live(vgen) || self.is_cancelled(&waiting) {
+            drop(guard);
+            let _ = upload.cancel(&Fetch::client(&server)).await;
+            return Ok(());
+        }
+        let Some(inner) = guard.as_mut() else {
+            drop(guard);
+            let _ = upload.cancel(&Fetch::client(&server)).await;
+            return Err("locked".into());
+        };
+        let still_awaited = inner.contact(&peer).is_some_and(|contact| {
+            contact.state.outbox.iter().any(|outgoing| {
+                outgoing.history_index == kept.history_index && outgoing.awaits_upload
+            })
+        });
+        let entry_opt = if still_awaited {
+            match inner.vault.entry(&peer, kept.history_index).await {
+                Ok(entry) => entry,
+                Err(e) => {
+                    drop(guard);
+                    let _ = upload.cancel(&Fetch::client(&server)).await;
+                    return Err(describe(&e));
+                }
+            }
+        } else {
+            None
+        };
+        let Some(mut entry) = entry_opt else {
+            drop(guard);
+            let _ = upload.cancel(&Fetch::client(&server)).await;
+            return Ok(());
+        };
         if !self.is_live(vgen) || self.is_cancelled(&waiting) {
             drop(guard);
             let _ = upload.cancel(&Fetch::client(&server)).await;
@@ -1352,8 +1390,14 @@ impl<V: VaultStore> Engine<V> {
 
     /// Cancel the message at `index`, to `peer`, held until this browser signs in to the server:
     /// it fails, and what waited for it goes, unless it too needs the sign-in. One whose
-    /// attachment's upload has not started goes with its upload.
-    pub async fn cancel_held(&self, peer: PublicKey, index: u64) -> Result<(), String> {
+    /// Cancel a message held for sign-in, pinned to `expected_conversation_gen` so a stale click
+    /// cannot fail a message at the same reused `history_index` in a recreated conversation.
+    pub async fn cancel_held_for_gen(
+        &self,
+        peer: PublicKey,
+        index: u64,
+        expected_conversation_gen: u64,
+    ) -> Result<(), String> {
         let vgen = self.vault_gen();
         let waiting = {
             let guard = self.lock_inner().await;
@@ -1361,6 +1405,14 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
             let inner = guard.as_ref().ok_or("locked")?;
+            let current_gen = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .map(|c| c.state.conversation_gen);
+            if current_gen != Some(expected_conversation_gen) {
+                return Err("chat changed; please retry.".to_string());
+            }
             let still_awaits = inner.contacts.iter().any(|c| {
                 c.peer == peer
                     && c.state
@@ -1404,6 +1456,14 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
             let inner = guard.as_mut().ok_or("locked")?;
+            let current_gen = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer)
+                .map(|c| c.state.conversation_gen);
+            if current_gen != Some(expected_conversation_gen) {
+                return Err("chat changed; please retry.".to_string());
+            }
             let relayed_commit = inner
                 .in_flight_push
                 .get(&peer)

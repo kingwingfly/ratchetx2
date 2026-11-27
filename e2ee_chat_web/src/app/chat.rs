@@ -219,7 +219,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         disabled=move || sec_busy.get()
                                         on:click=move |_| {
                                             act_while(sec_busy, async move {
-                                                engine().dismiss_downgrade(peer).await
+                                                engine()
+                                                    .dismiss_downgrade_for_gen(peer, conv_gen)
+                                                    .await
                                             });
                                         }
                                     >
@@ -388,6 +390,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                 }
                                             })}
                                             {can_dismiss.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -395,7 +398,11 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().dismiss_downgrade(peer).await
+                                                                engine()
+                                                                    .dismiss_downgrade_for_gen(
+                                                                        peer, conv_gen,
+                                                                    )
+                                                                    .await
                                                             });
                                                         }
                                                     >
@@ -443,6 +450,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                 }
                                             })}
                                             {can_dismiss.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -450,7 +458,11 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().dismiss_downgrade(peer).await
+                                                                engine()
+                                                                    .dismiss_downgrade_for_gen(
+                                                                        peer, conv_gen,
+                                                                    )
+                                                                    .await
                                                             });
                                                         }
                                                     >
@@ -834,6 +846,7 @@ fn message_item(
     // can be cancelled, which lets what was sent after it go.
     let held = outgoing.then(|| {
         let cancelling = RwSignal::new(false);
+        let row_gen = ui.contact(&chat_peer).map_or(0, |c| c.conversation_gen);
         move || {
             ui.held
                 .with(|held| held.contains(&(chat_peer, index)))
@@ -848,7 +861,11 @@ fn message_item(
                             on:click=move |_| {
                                 act_while(
                                     cancelling,
-                                    async move { engine().cancel_held(chat_peer, index).await },
+                                    async move {
+                                        engine()
+                                            .cancel_held_for_gen(chat_peer, index, row_gen)
+                                            .await
+                                    },
                                 )
                             }
                         >

@@ -874,8 +874,7 @@ mod tests {
                         },
                         1_000,
                     )
-                    .unwrap()
-                    .0,
+                    .unwrap(),
                 PublishV2Status::Stored
             );
         }

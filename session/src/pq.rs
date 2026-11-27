@@ -353,7 +353,8 @@ mod v2 {
             && error.kind() == protocol::ErrorKind::Unimplemented
     }
 
-    async fn check_server_info_with(
+    /// Lock-free `GetServerInfo` capability probe verifying `server_id == expected_audience`.
+    pub async fn check_server_info_with(
         handshake: &impl LocalHandshakeV2,
         expected_audience: &str,
     ) -> Result<GetServerInfoResponse> {
@@ -365,6 +366,15 @@ mod v2 {
             return Err(ErrorKind::DowngradeDetected.into());
         }
         Ok(info)
+    }
+
+    /// Lock-free transmission of a previously prepared non-rotating prekey refill request
+    /// (after persisting [`Client::state`]). Performs zero local state mutation.
+    pub async fn transmit_refill_v2_with(
+        handshake: &impl LocalHandshakeV2,
+        prepared: &PreparedRefillV2,
+    ) -> Result<RefillPrekeysResponse> {
+        Ok(handshake.refill_prekeys(prepared.request.clone()).await?)
     }
 
     /// Which v2 manifest outcome resulted from [`Client::transmit_publish_v2`].
@@ -1438,22 +1448,25 @@ mod v2 {
             })
         }
 
-        /// Whether a previously prepared publish was persisted without confirmation or left
-        /// transient extra generation/digest slots awaiting relay reconciliation.
+        /// Whether a previously prepared publish was persisted without confirmation and awaits
+        /// reconciliation against the relay's signed manifest before rotating or refilling.
         pub fn has_unreconciled_publish(&self) -> bool {
             self.state.publishing
-                || self.state.prekeys.generation_count() > x3dh::KEPT_GENERATIONS
-                || self.state.recent_manifest_digests.len() > crate::MAX_RETAINED_MANIFEST_DIGESTS
         }
 
         /// Reconcile an interrupted or ambiguous publish against the relay's current verified
         /// `CapabilityManifest` (returned by read-only `GetManifest`).
         ///
         /// Returns `true` when the relay already holds this client's latest `manifest_seq` and
-        /// current signed prekey (meaning the interrupted publish landed and can be committed),
-        /// or `false` when the relay still holds an older (or absent) manifest so any unlanded
-        /// local generation/digest is rolled back while preserving every generation the relay
-        /// still accepts.
+        /// current signed prekey (meaning the interrupted publish landed and is now committed),
+        /// or `false` when the relay still holds an older (or absent) manifest.
+        ///
+        /// When the publish has NOT landed on the relay yet, this NEVER pops the prepared latest
+        /// generation, NEVER deletes its manifest digest, and NEVER rewinds `manifest_seq`:
+        /// keeping `publishing == true` ensures a delayed in-flight publish from a prior tab
+        /// remains decryptable if it arrives late, while the caller's retry reuses the exact same
+        /// prepared generation at `manifest_seq + 1` (preventing relay `prev_signed_prekey`
+        /// desync and blocking `RefillPrekeys` until confirmed commit).
         pub fn reconcile_interrupted_publish(
             &mut self,
             relay_manifest: Option<&CapabilityManifest>,
@@ -1463,11 +1476,9 @@ mod v2 {
             let mut eff_spks = preserve_signed_prekeys.to_vec();
             let mut eff_digests = preserve_manifest_digests.to_vec();
             let Some(m) = relay_manifest else {
-                if self.state.prekeys.generation_count() > x3dh::KEPT_GENERATIONS {
-                    self.state.prekeys.pop_unconfirmed_latest_if_not(&[0u8; 32]);
-                }
-                self.state.publishing = false;
-                self.state.prune_manifest_digests_preserving(&eff_digests);
+                // First-ever publish hasn't landed on the relay (or is still in flight): keep
+                // prepared generation, digest, durable `manifest_seq`, and `publishing = true`
+                // so the retry reuses the prepared generation at a strictly higher `manifest_seq`.
                 return false;
             };
             let relay_spk = <[u8; 32]>::try_from(m.signed_prekey.as_ref()).ok();
@@ -1493,23 +1504,22 @@ mod v2 {
                 self.state.prune_manifest_digests_preserving(&eff_digests);
                 true
             } else {
-                if let Some(spk) = relay_spk
-                    && self.state.prekeys.generation_count() > x3dh::KEPT_GENERATIONS
-                {
-                    self.state.prekeys.pop_unconfirmed_latest_if_not(&spk);
-                }
-                if m.manifest_seq < self.state.manifest_seq {
-                    if let Some(&last_d) = self.state.recent_manifest_digests.last()
-                        && Some(last_d) != relay_digest
-                        && self.state.recent_manifest_digests.len() > 1
-                    {
-                        self.state.recent_manifest_digests.pop();
-                    }
+                // Keep the prepared generation, digest, durable `manifest_seq` high-water mark,
+                // and `publishing = true` so a delayed in-flight publish cannot lose keys or
+                // collide with a reused sequence number; advance only if the relay is ahead.
+                if m.manifest_seq > self.state.manifest_seq {
                     self.state.manifest_seq = m.manifest_seq;
-                    self.state.prekey_generation = m.generation;
                 }
-                self.state.publishing = false;
-                self.state.prune_manifest_digests_preserving(&eff_digests);
+                if m.generation >= self.state.prekey_generation {
+                    if relay_spk != self.state.prekeys.current_signed_prekey() {
+                        self.state.prekey_generation = m
+                            .generation
+                            .saturating_add(1)
+                            .min(protocol::MAX_SAFE_INTEGER);
+                    } else {
+                        self.state.prekey_generation = m.generation;
+                    }
+                }
                 false
             }
         }

@@ -311,16 +311,9 @@ impl IdentityV2 {
         match call {
             IdentityCall::PublishV2(req) => {
                 let now = Date::now().as_millis();
-                let res = self.with_store(|store| store.publish_v2(&req.record, now));
-                if let Ok((_, true)) = &res {
-                    let prune_at = now
-                        .saturating_add(handshake::ACKED_INITIAL_TOMBSTONE_TTL_MS)
-                        .min(MAX_SAFE_INTEGER);
-                    if let Err(e) = self.update_alarm(AlarmUpdate::PullEarlier(prune_at)).await {
-                        console_error!("cannot schedule acked_initial_messages prune alarm: {e}");
-                    }
-                }
-                answer_rpc::<rpc::PublishV2>(res.map(|(status, _)| status))
+                answer_rpc::<rpc::PublishV2>(
+                    self.with_store(|store| store.publish_v2(&req.record, now)),
+                )
             }
             IdentityCall::RefillPrekeys(req) => answer_rpc::<rpc::RefillPrekeys>(
                 self.with_store(|store| store.refill_prekeys(&req.record)),
@@ -338,11 +331,13 @@ impl IdentityV2 {
                 }))
             }
             IdentityCall::AddInitialMessageV2(req) => {
-                if !self.with_store(|store| store.has_manifest())? {
-                    return answer_rpc::<rpc::AddInitialMessageV2>(Ok(AddInitialOutcome::NotFound));
-                }
                 let now = Date::now().as_millis();
                 if req.allow_insert {
+                    if !self.with_store(|store| store.has_manifest())? {
+                        return answer_rpc::<rpc::AddInitialMessageV2>(Ok(
+                            AddInitialOutcome::NotFound,
+                        ));
+                    }
                     self.schedule_message_expiry(now, false).await?;
                 }
                 let added = self.with_store(|store| {
@@ -593,8 +588,7 @@ mod tests {
                         },
                         1_000,
                     )
-                    .unwrap()
-                    .0,
+                    .unwrap(),
                 PublishV2Status::Stored
             );
 
