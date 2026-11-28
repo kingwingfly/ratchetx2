@@ -2326,16 +2326,25 @@ mod v2 {
                     self.state.prekeys.confirm(x3dh)?;
 
                     let security = SessionSecurity::classical();
+                    let active_pq_pin = peer_state.pq_pinned
+                        && (peer_state.peer_pq_capable || peer_state.pinned_manifest_seq == 0);
+                    let signed_pq_off_approved = peer_state.pq_pinned
+                        && !peer_state.peer_pq_capable
+                        && peer_state.allow_classical_exception;
                     let quarantined = local_pq_enabled
-                        && (peer_state.pq_pinned || !peer_state.allow_classical_exception);
+                        && (active_pq_pin
+                            || peer_state.downgrade_detected
+                            || !peer_state.allow_classical_exception);
 
                     let mut updated_peer_pq = peer_state.clone();
                     if quarantined {
                         updated_peer_pq.downgrade_detected =
                             hello.as_ref().is_some_and(|h| h.pq_capable)
+                                || (peer_state.downgrade_detected && !signed_pq_off_approved)
                                 || (peer_state.pq_pinned
                                     && (peer_state.peer_pq_capable
-                                        || !peer_state.allow_classical_exception));
+                                        || (peer_state.pinned_manifest_seq == 0
+                                            && !peer_state.allow_classical_exception)));
                     } else if let Some(ref h) = hello {
                         let _ =
                             check_peer_hello(&mut updated_peer_pq, security, h, local_pq_enabled);
@@ -2360,7 +2369,7 @@ mod v2 {
                         Ok(AcceptedInitial::Quarantined {
                             session,
                             first_message: content,
-                            peer_was_pq_pinned: peer_state.pq_pinned,
+                            peer_was_pq_pinned: active_pq_pin && !signed_pq_off_approved,
                         })
                     } else {
                         Ok(AcceptedInitial::Accepted {

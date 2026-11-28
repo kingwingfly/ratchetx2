@@ -692,6 +692,9 @@ impl VaultStore for MemoryVault {
                 uploads.insert((*peer, new_upload.id.clone()), new_upload.clone());
             }
         }
+        self.orphan_checkpoints
+            .borrow_mut()
+            .retain(|cp| cp.peer.as_slice() != peer.as_slice() || cp.id.as_slice() != old_id);
         self.last_saved_dispatched.set(
             state
                 .contacts
@@ -13459,6 +13462,11 @@ fn r4_p1_2_replay_deferred_preserves_unlisted_and_concurrent_envelopes() {
             let mut guard = engine.inner.lock().await;
             let inner = guard.as_mut().unwrap();
             let c = inner.contact(&peer).unwrap();
+            // Clear PQ pin so this synthetic non-pinned quarantine fixture tests deferred replay.
+            let ppq = c.session.peer_pq_state_mut();
+            ppq.pq_pinned = false;
+            ppq.peer_pq_capable = false;
+            ppq.downgrade_detected = false;
             c.state.quarantined = true;
             inner
                 .deferred_envelopes
@@ -21663,6 +21671,11 @@ fn r11_p1_1_p1_2_p1_3_approval_lock_pq_gate_and_provisional_send_guard() {
             let held: session::proto::SessionState = opened.session.state().into();
             let c = inner.contact(&peer).unwrap();
             let active_tok = c.session.active_inbound_token_hash().unwrap();
+            // Clear PQ pin so this synthetic non-pinned quarantine fixture tests approval locking.
+            let ppq = c.session.peer_pq_state_mut();
+            ppq.pq_pinned = false;
+            ppq.peer_pq_capable = false;
+            ppq.downgrade_detected = false;
             c.state.provisional = true;
             c.state.quarantined = true;
             c.state.quarantined_session = Some(held);
@@ -22673,6 +22686,7 @@ fn r12_p1_1_p1_2_p1_3_p1_4_archived_classical_policy_and_reload_cancel_guard() {
             c.state.request = true;
             c.state.quarantined = false;
             c.state.provisional = false;
+            c.state.security_alert = crate::vault::SECURITY_ALERT_NONE;
             c.session.peer_pq_state_mut().pq_pinned = false;
             c.session.peer_pq_state_mut().peer_pq_capable = false;
             c.session.peer_pq_state_mut().downgrade_detected = false;
@@ -27322,10 +27336,31 @@ fn r17_p1_1_to_p1_4_server_pq_disabled_provisional_hard_pin_and_cancel_multi_chu
                 Err(StartChatError::DowngradeDetected)
             );
         }
-        engine.approve_classical_for_gen(bob_id, 9).await.unwrap();
+        // R18-P1-2: `approve_classical_for_gen` itself MUST reject hard-blocked PQ-pinned /
+        // downgraded contacts and preserve `downgrade_detected` + `SECURITY_ALERT_DOWNGRADE`!
+        assert!(
+            engine.approve_classical_for_gen(bob_id, 9).await.is_err(),
+            "R18-P1-2: approve_classical_for_gen must reject downgraded PQ-pinned request"
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == bob_id)
+                .unwrap();
+            assert!(c.session.peer_pq_state().downgrade_detected);
+            assert_eq!(
+                c.state.security_alert,
+                crate::vault::SECURITY_ALERT_DOWNGRADE
+            );
+            assert!(c.view().classical_hard_blocked);
+        }
         {
             let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
-                panic!("R17-P1-3: accept must block downgraded PQ-pinned request even after approve_classical: {path}");
+                panic!("R17-P1-3: accept must block downgraded PQ-pinned request: {path}");
             });
             assert!(engine.accept(bob_id, "Bob".into()).await.is_err());
         }
@@ -27839,6 +27874,1047 @@ fn r17_p2_1_to_p2_7_conv_gen_cancel_windows_1chunk_delete_corrupt_page_and_waiti
         assert!(
             deleted_on_chat_del.get(),
             "R17-P2-4: delete_for_gen must cancel hidden announced uploads tracked in pending_cancellations"
+        );
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r18_p1_1_p1_2_p1_3_p2_1_downgrade_approve_hard_block_and_delete_attachment_outbox() {
+    use futures::executor::LocalPool;
+    use protocol::handshake_v2::{
+        AckInitialMessagesResponse, ClaimBundleResponse, ListInitialMessagesResponse,
+    };
+    use protocol::mailbox_v2::{PushV2Response, RegisterWriteTokenResponse};
+    use std::rc::Rc;
+
+    let mut pool = LocalPool::new();
+
+    // Part 1 (R18-P1-1 + R18-P1-2 + R18-P2-1):
+    //   - Unpinned peer with prior `allow_classical_exception` + `downgrade_detected = true`
+    //     MUST quarantine inbound classical rekey (never replace active session or register write
+    //     token), and `Session::accept_replacement_with_policy` MUST also reject it.
+    //   - Accepted PQ-pinned chat with quarantined classical rekey MUST reject
+    //     `approve_classical_for_gen` while preserving PQ session, quarantine, and downgrade alert
+    //     (`ContactView::classical_hard_blocked == true`).
+    //   - Unpinned downgraded unquarantined request with stale `CLASSICAL_APPROVAL_SERVER_PQ_DISABLED`
+    //     prompt MUST reject `approve_classical_for_gen` and preserve `downgrade_detected`!
+    //   - Verified signed PQ-OFF peer (`pq_pinned && pinned_manifest_seq > 0 && !peer_pq_capable`)
+    //     receiving inbound classical initial MUST quarantine WITHOUT false downgrade flag and
+    //     allow `approve_classical_for_gen` cleanly.
+    pool.run_until(async {
+        let (engine, peer, mut bob) = established_engine_on_localhost().await;
+        let (alice_id, alice_bundle) = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let pub_a = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+            let m = pub_a.request.manifest.clone().unwrap();
+            let b = ClaimBundleResponse {
+                signed_prekey: m.signed_prekey.clone(),
+                signed_prekey_signature: pub_a.request.signed_prekey_signature.clone(),
+                one_time_prekey: None,
+                manifest: Some(m),
+                pq_last_resort: None,
+                pq_one_time_prekey: None,
+            };
+            inner.client.commit_publish_v2(pub_a);
+            (inner.client.identity_key(), b)
+        };
+        let mut bob_cls = bob.pq_config().clone();
+        bob_cls.pq_enabled = false;
+        bob_cls.strict_pq = false;
+        bob.set_pq_config(bob_cls).unwrap();
+
+        async fn make_classical_req(
+            bob: &mut Client<Connect>,
+            alice_id: &PublicKey,
+            alice_bundle: &ClaimBundleResponse,
+            seq: u64,
+        ) -> protocol::handshake_v2::InitialMessageV2 {
+            let b = alice_bundle.clone();
+            let pps = session::PeerPqState::default();
+            let hello = Kind::Hello(bob.make_hello("Bob", seq)).to_bytes();
+            let claimed = {
+                let _mock = crate::transport::mock_fetch(move |_s, _p, _body| {
+                    Ok((200, b.encode_to_vec()))
+                });
+                session::claim_peer_bundle_v2(
+                    &Fetch::client(LOCAL_SERVER),
+                    "localhost",
+                    alice_id,
+                    &pps,
+                    bob.pq_config(),
+                    bob.clock(),
+                )
+                .await
+                .unwrap()
+            };
+            bob.finish_prepare_initiate_v2(claimed, &pps, &hello, Fetch::client(LOCAL_SERVER))
+                .unwrap()
+                .request
+                .message
+                .unwrap()
+        }
+
+        // (a) R18-P1-1: Unpinned peer with `allow_classical_exception = true` AND
+        // `downgrade_detected = true` receives an inbound classical rekey -> MUST quarantine and
+        // issue ZERO `RegisterWriteToken` RPCs!
+        let msg_rekey = make_classical_req(&mut bob, &alice_id, &alice_bundle, 10).await;
+        let inc_rekey = Incoming::try_from(&msg_rekey).unwrap();
+        let (orig_active_id, direct_reject) = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            let orig = c.session.active_id().copied();
+            let ppq = c.session.peer_pq_state_mut();
+            ppq.pq_pinned = false;
+            ppq.peer_pq_capable = false;
+            ppq.approve_classical_exception();
+            ppq.downgrade_detected = true;
+            assert!(ppq.allow_classical_exception && ppq.downgrade_detected);
+            let ppq_snap = ppq.clone();
+            // Verify `accept_initial_v2` quarantines and preserves `downgrade_detected`.
+            let accepted = inner
+                .client
+                .accept_initial_v2(&peer, &ppq_snap, &inc_rekey, Fetch::client(LOCAL_SERVER))
+                .unwrap();
+            let rejected_replace = match accepted {
+                AcceptedInitial::Quarantined { session, .. } => {
+                    assert!(session.peer_pq_state().downgrade_detected);
+                    // Also check defense-in-depth `accept_replacement_with_policy`.
+                    inner
+                        .contact(&peer)
+                        .unwrap()
+                        .session
+                        .accept_replacement_with_policy(session, true)
+                        .is_err()
+                }
+                AcceptedInitial::Accepted { .. } => {
+                    panic!(
+                        "R18-P1-1: inbound classical rekey under downgrade_detected must quarantine"
+                    );
+                }
+            };
+            (orig, rejected_replace)
+        };
+        assert!(
+            direct_reject,
+            "R18-P1-1: accept_replacement_with_policy must reject classical takeover under downgrade_detected"
+        );
+        // Also test `take_initial_messages` end-to-end with `ListInitialMessages`!
+        let mut msg_rekey_2 = make_classical_req(&mut bob, &alice_id, &alice_bundle, 11).await;
+        msg_rekey_2.id = 1;
+        let reg_calls = Rc::new(Cell::new(0usize));
+        {
+            let r = reg_calls.clone();
+            let list_resp = ListInitialMessagesResponse {
+                messages: vec![msg_rekey_2],
+                has_more: false,
+            };
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let r = r.clone();
+                let list_resp = list_resp.clone();
+                async move {
+                    if path.ends_with("/ListInitialMessages") {
+                        Ok((200, list_resp.encode_to_vec()))
+                    } else if path.ends_with("/AckInitialMessages") {
+                        Ok((
+                            200,
+                            AckInitialMessagesResponse { deleted: 1 }.encode_to_vec(),
+                        ))
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        r.set(r.get() + 1);
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else {
+                        panic!("unexpected path in R18-P1-1: {path}");
+                    }
+                }
+            });
+            engine.take_initial_messages().await.unwrap();
+        }
+        assert_eq!(
+            reg_calls.get(),
+            0,
+            "R18-P1-1: quarantined downgrade rekey must not register a write token"
+        );
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard.as_ref().unwrap().contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert_eq!(c.session.active_id().copied(), orig_active_id);
+            assert!(c.state.quarantined);
+            assert!(c.session.peer_pq_state().downgrade_detected);
+            assert_eq!(c.state.security_alert, crate::vault::SECURITY_ALERT_DOWNGRADE);
+            assert!(c.view().classical_hard_blocked);
+        }
+
+        // (b) R18-P1-2 + R18-P2-1: Accepted PQ-pinned chat with quarantined classical rekey MUST
+        // reject `approve_classical_for_gen` and preserve PQ session + downgrade alert!
+        let conv_gen = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.session.pin_peer_pq();
+            c.state.quarantined = true;
+            c.state.quarantined_was_pq_pinned = true;
+            c.state.security_alert = crate::vault::SECURITY_ALERT_DOWNGRADE;
+            assert!(c.view().classical_hard_blocked);
+            c.state.conversation_gen
+        };
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!("R18-P1-2: hard-blocked approve_classical must not issue RPC: {path}");
+            });
+            assert!(engine.approve_classical_for_gen(peer, conv_gen).await.is_err());
+        }
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard.as_ref().unwrap().contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(c.state.quarantined);
+            assert!(c.state.quarantined_was_pq_pinned);
+            assert_eq!(c.state.security_alert, crate::vault::SECURITY_ALERT_DOWNGRADE);
+            assert_eq!(c.session.active_id().copied(), orig_active_id);
+        }
+
+        // (c) R18-P1-2 (Codex #2): Unpinned downgraded unquarantined request with stale prompt MUST
+        // reject `approve_classical_for_gen` and preserve `downgrade_detected`!
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.state.request = true;
+            c.state.quarantined = false;
+            c.state.quarantined_was_pq_pinned = false;
+            c.state.classical_approval_needed = crate::vault::CLASSICAL_APPROVAL_SERVER_PQ_DISABLED;
+            let ppq = c.session.peer_pq_state_mut();
+            ppq.pq_pinned = false;
+            ppq.peer_pq_capable = false;
+            ppq.clear_classical_exception();
+            ppq.downgrade_detected = true;
+            c.state.security_alert = crate::vault::SECURITY_ALERT_DOWNGRADE;
+            assert!(c.view().classical_hard_blocked);
+        }
+        assert!(engine.approve_classical_for_gen(peer, conv_gen).await.is_err());
+        {
+            let guard = engine.inner.lock().await;
+            let c = guard.as_ref().unwrap().contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(c.session.peer_pq_state().downgrade_detected);
+            assert_eq!(c.state.security_alert, crate::vault::SECURITY_ALERT_DOWNGRADE);
+        }
+
+        // (d) Verified signed PQ-OFF peer (`pq_pinned && pinned_manifest_seq > 0 &&
+        // !peer_pq_capable && !downgrade_detected`) receiving an inbound classical initial MUST
+        // quarantine WITHOUT setting `downgrade_detected` or `peer_was_pq_pinned`, and
+        // `approve_classical_for_gen` MUST succeed cleanly!
+        let msg_signed_off = make_classical_req(&mut bob, &alice_id, &alice_bundle, 20).await;
+        let inc_signed_off = Incoming::try_from(&msg_signed_off).unwrap();
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.state.request = false;
+            c.state.security_alert = crate::vault::SECURITY_ALERT_NONE;
+            c.state.classical_approval_needed = crate::vault::CLASSICAL_APPROVAL_NONE;
+            let ppq = c.session.peer_pq_state_mut();
+            ppq.pq_pinned = true;
+            ppq.pinned_manifest_seq = 2;
+            ppq.peer_pq_capable = false;
+            ppq.downgrade_detected = false;
+            ppq.clear_classical_exception();
+            let ppq_snap = ppq.clone();
+            match inner
+                .client
+                .accept_initial_v2(
+                    &peer,
+                    &ppq_snap,
+                    &inc_signed_off,
+                    Fetch::client(LOCAL_SERVER),
+                )
+                .unwrap()
+            {
+                AcceptedInitial::Quarantined {
+                    session,
+                    peer_was_pq_pinned,
+                    ..
+                } => {
+                    assert!(
+                        !peer_was_pq_pinned,
+                        "verified signed PQ-OFF peer must not set peer_was_pq_pinned"
+                    );
+                    assert!(
+                        !session.peer_pq_state().downgrade_detected,
+                        "verified signed PQ-OFF peer must not falsely flag downgrade_detected"
+                    );
+                    inner
+                        .contact(&peer)
+                        .unwrap()
+                        .record_quarantined_initial(
+                            Some(session.state().into()),
+                            Kind::Hello(bob.make_hello("Bob", 20)).to_bytes(),
+                            peer_was_pq_pinned,
+                            false,
+                            crate::util::now(),
+                        );
+                }
+                AcceptedInitial::Accepted { .. } => {
+                    panic!("unapproved signed PQ-OFF inbound classical must still quarantine first");
+                }
+            }
+            assert!(!inner.contact(&peer).unwrap().view().classical_hard_blocked);
+        }
+        {
+            let _mock = crate::transport::mock_fetch_async(|_s, path, _b| {
+                let path = path.to_string();
+                async move {
+                    if path.ends_with("/RegisterWriteToken") {
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/PushV2") {
+                        Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            engine
+                .approve_classical_for_gen(peer, conv_gen)
+                .await
+                .unwrap();
+        }
+    });
+
+    // Part 2 (R18-P1-3):
+    //   - `delete_attachment` on an un-dispatched attachment at outbox head 0 with a text message
+    //     queued behind it at index 1 MUST settle head 0 atomically (never wedging `Engine::flush`)
+    //     and let text message 1 deliver via `PushV2`!
+    //   - Unread requeue (`requeue(..., deleted = true, ...)`) MUST NOT re-enqueue an attachment
+    //     durably marked `entry.gone = true`!
+    pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let att_id = [0x61u8; 16];
+        let ptr = crate::content::AttachmentPointer {
+            id: att_id.to_vec(),
+            key: vec![0x77u8; 32],
+            size: 128,
+            name: "gone.bin".into(),
+            mime: "application/octet-stream".into(),
+            expires: 0,
+        };
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut pending = crate::vault::PendingUpload::default();
+            pending.id = att_id.to_vec();
+            pending.token = vec![0x44u8; 16];
+            pending.key = vec![0x77u8; 32];
+            pending.name = "gone.bin".into();
+            pending.mime = "application/octet-stream".into();
+            pending.size = 128;
+            pending.expires = u64::MAX;
+            pending.announced = true;
+            pending.history_index = 0;
+            pending.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+            inner.vault.save_upload(&peer, &pending).await.unwrap();
+            let idx0 = inner
+                .add(&peer, Kind::Attachment(ptr.clone()), false)
+                .await
+                .unwrap()
+                .index;
+            assert_eq!(idx0, 0);
+            let idx1 = inner
+                .add(
+                    &peer,
+                    Kind::Text("queued behind deleted file".into()),
+                    false,
+                )
+                .await
+                .unwrap()
+                .index;
+            assert_eq!(idx1, 1);
+            if let Some(o0) = inner.contact(&peer).unwrap().state.outbox.get_mut(0) {
+                o0.attachment_id = att_id.to_vec();
+            }
+            inner.save_state().await.unwrap();
+        }
+        let del_calls = Rc::new(Cell::new(0usize));
+        let push_calls = Rc::new(Cell::new(0usize));
+        {
+            let d = del_calls.clone();
+            let p = push_calls.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let d = d.clone();
+                let p = p.clone();
+                async move {
+                    if path.ends_with("/DeleteAttachment") {
+                        d.set(d.get() + 1);
+                        Ok((
+                            200,
+                            protocol::attachment::DeleteAttachmentResponse {}.encode_to_vec(),
+                        ))
+                    } else if path.ends_with("/PushV2") {
+                        p.set(p.get() + 1);
+                        Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+                    } else {
+                        panic!("unexpected path in R18-P1-3: {path}");
+                    }
+                }
+            });
+            engine.delete_attachment(peer, 0, &ptr).await.unwrap();
+            engine.flush(&peer).await.unwrap();
+        }
+        assert_eq!(del_calls.get(), 1);
+        assert_eq!(
+            push_calls.get(),
+            1,
+            "R18-P1-3: text queued behind deleted attachment must deliver cleanly via PushV2"
+        );
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            assert!(inner.contact(&peer).unwrap().state.outbox.is_empty());
+            let e0 = inner.vault.entry(&peer, 0).await.unwrap().unwrap();
+            assert!(e0.gone);
+            assert_eq!(e0.delivery(), crate::state::Delivery::Failed);
+            assert!(inner.vault.upload(&peer, &att_id).await.unwrap().is_none());
+
+            // Also verify unread requeue (`deleted = true`) excludes a `gone = true` attachment!
+            let digest =
+                crate::vault::content_kind_digest(&Kind::Attachment(ptr.clone()).to_bytes());
+            inner
+                .contact(&peer)
+                .unwrap()
+                .state
+                .awaiting
+                .push(crate::vault::Awaiting {
+                    history_index: 0,
+                    place: 99,
+                    read: false,
+                    content_digest: digest.to_vec(),
+                    attachment: true,
+                });
+            let outcome = inner
+                .requeue(&peer, true, &std::collections::BTreeMap::new())
+                .await
+                .unwrap();
+            let outbox = &inner.contact(&peer).unwrap().state.outbox;
+            assert!(
+                !outbox.iter().any(|o| o.history_index == 0),
+                "R18-P1-3: unread requeue must NOT re-enqueue a gone attachment"
+            );
+            assert!(
+                outbox.iter().any(|o| o.history_index == 1),
+                "R18-P1-3: healthy unread text message must still requeue cleanly"
+            );
+            assert!(
+                outcome
+                    .outbox
+                    .iter()
+                    .find(|(_, idx, _)| *idx == 0)
+                    .is_some_and(|(_, _, rec)| rec.is_none()),
+                "R18-P1-3: gone attachment must not emit a new OutgoingRecord on requeue"
+            );
+        }
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r18_p2_2_to_p2_7_provisional_pass4_rekey_403_dialog_atomic_branch3_delete_echo_and_restore() {
+    use crate::engine::Contact;
+    use crate::state::UploadState;
+    use crate::util::key_to_text;
+    use futures::executor::LocalPool;
+    use protocol::handshake_v2::ClaimBundleResponse;
+    use protocol::mailbox_v2::{RegisterWriteTokenRequest, RegisterWriteTokenResponse};
+    use std::rc::Rc;
+
+    let make_announced_pending = |id: &[u8; 16], name: &str, size: u64, history_index: u64| {
+        let mut p = crate::vault::PendingUpload::default();
+        p.id = id.to_vec();
+        p.token = vec![0x44u8; 16];
+        p.key = vec![0x55u8; 32];
+        p.name = name.into();
+        p.mime = "application/octet-stream".into();
+        p.size = size;
+        p.expires = u64::MAX;
+        p.announced = true;
+        p.history_index = history_index;
+        p.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+        p
+    };
+
+    let mut pool = LocalPool::new();
+
+    // Part 1 (R18-P2-2): Provisional contact resumed via `finish_existing_contact_start_chat`;
+    // during the 4th (final) Phase-A `RegisterWriteToken` pass, an inbound PQ rekey replaces the
+    // active session -> Phase B MUST reconcile and register the new active token!
+    pool.run_until(async {
+        let (engine, _existing_peer, _existing_bob) = established_engine_on_localhost().await;
+        let (alice_id, alice_bundle) = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.state.published_at = 1;
+            inner.state.needs_publish = false;
+            let pub_a = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+            let m = pub_a.request.manifest.clone().unwrap();
+            let b = ClaimBundleResponse {
+                signed_prekey: m.signed_prekey.clone(),
+                signed_prekey_signature: pub_a.request.signed_prekey_signature.clone(),
+                one_time_prekey: None,
+                manifest: Some(m),
+                pq_last_resort: pub_a.request.pq_last_resort.first().cloned(),
+                pq_one_time_prekey: None,
+            };
+            inner.client.commit_publish_v2(pub_a);
+            (inner.client.identity_key(), b)
+        };
+        let bob = Client::new(Fetch::client(LOCAL_SERVER));
+        let bob_id = bob.identity_key();
+        let bob_key = key_to_text(&bob_id);
+
+        // Pre-build 5 PQ inbound sessions from Bob (outside `engine.inner`!) so each of the 4
+        // Phase-A passes triggers a fresh rekey (including pass 3, the 4th and final pass!).
+        let mut incomings = Vec::new();
+        for seq in 1u64..=5 {
+            let b = alice_bundle.clone();
+            let pps = session::PeerPqState::default();
+            let hello = Kind::Hello(bob.make_hello("Bob", seq)).to_bytes();
+            let claimed = {
+                let _mock = crate::transport::mock_fetch(move |_s, _p, _body| {
+                    Ok((200, b.encode_to_vec()))
+                });
+                session::claim_peer_bundle_v2(
+                    &Fetch::client(LOCAL_SERVER),
+                    "localhost",
+                    &alice_id,
+                    &pps,
+                    bob.pq_config(),
+                    bob.clock(),
+                )
+                .await
+                .unwrap()
+            };
+            let prep = bob
+                .finish_prepare_initiate_v2(claimed, &pps, &hello, Fetch::client(LOCAL_SERVER))
+                .unwrap();
+            incomings.push(Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap());
+        }
+        // Install provisional contact on incoming #0.
+        let mut inc_iter = incomings.into_iter();
+        let first_inc = inc_iter.next().unwrap();
+        let remaining_incs = Rc::new(RefCell::new(inc_iter.collect::<std::collections::VecDeque<_>>()));
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let opened = inner.open_initial(&bob_id, &first_inc).unwrap();
+            let c = Contact {
+                peer: bob_id,
+                session: opened.session,
+                deferred_carried: 0,
+                state: ContactState {
+                    peer: bob_id.to_vec(),
+                    request: false,
+                    provisional: true,
+                    conversation_gen: 7,
+                    ..Default::default()
+                },
+            };
+            inner.contacts.push(c);
+            inner.save_state().await.unwrap();
+        }
+        let reg_tokens = Rc::new(RefCell::new(Vec::<[u8; 32]>::new()));
+        let last_active_tok = Rc::new(Cell::new(Option::<[u8; 32]>::None));
+        {
+            let rt = reg_tokens.clone();
+            let rem = remaining_incs.clone();
+            let eng = engine.clone();
+            let lat = last_active_tok.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let body = body.to_vec();
+                let rt = rt.clone();
+                let rem = rem.clone();
+                let eng = eng.clone();
+                let lat = lat.clone();
+                async move {
+                    if path.ends_with("/RegisterWriteToken") {
+                        let req = RegisterWriteTokenRequest::decode(body.as_slice()).unwrap();
+                        let tok: [u8; 32] = req.token_hash.as_ref().try_into().unwrap();
+                        rt.borrow_mut().push(tok);
+                        let next_inc = rem.borrow_mut().pop_front();
+                        if let Some(inc) = next_inc {
+                            let mut guard = eng.inner.lock().await;
+                            let inner = guard.as_mut().unwrap();
+                            let opened = inner.open_initial(&bob_id, &inc).unwrap();
+                            let new_tok = opened.session.active_inbound_token_hash().unwrap();
+                            let c = inner.contact(&bob_id).unwrap();
+                            assert!(c.replace_session(opened.session, true).unwrap());
+                            lat.set(Some(new_tok));
+                        }
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            let sub = engine
+                .startup
+                .begin_new_chat_submit(crate::state::PendingNewChat {
+                    key: bob_key.clone(),
+                    name: "Bob".into(),
+                    server: None,
+                    pq_pinned: false,
+                    allow_classical: false,
+                    auto_start: false,
+                });
+            assert_eq!(
+                engine
+                    .start_chat(sub, &bob_key, "Bob".into(), None, false, false)
+                    .await,
+                Ok(bob_id)
+            );
+        }
+        let final_tok = last_active_tok.get().expect("pass-3 rekey must have run");
+        assert!(
+            reg_tokens.borrow().contains(&final_tok),
+            "R18-P2-2: Phase-B provisional resume must reconcile and register pass-3 rekey active token"
+        );
+    });
+
+    // Part 2 (R18-P2-3): Same-origin `403 permission_denied` on `start_chat` Phase-4
+    // `SendInitialV2` after concurrent `delete_for_gen` + fresh inbound request MUST return
+    // `Err(StartChatError::Cancelled)` AND leave an existing dialog untouched (never hijack to
+    // `Dialog::SignIn`)!
+    pool.run_until(async {
+        let (engine, _existing_peer, _existing_bob) = established_engine_on_localhost().await;
+        engine.startup.set_can_sign_in_here(true);
+        let eng_hook = engine.clone();
+        crate::transport::on_sign_in_required(move || {
+            eng_hook.refused_for_sign_in();
+        });
+        let (alice_id, alice_bundle) = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.state.published_at = 1;
+            inner.state.needs_publish = false;
+            let pub_a = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+            let m = pub_a.request.manifest.clone().unwrap();
+            let b = ClaimBundleResponse {
+                signed_prekey: m.signed_prekey.clone(),
+                signed_prekey_signature: pub_a.request.signed_prekey_signature.clone(),
+                one_time_prekey: None,
+                manifest: Some(m),
+                pq_last_resort: pub_a.request.pq_last_resort.first().cloned(),
+                pq_one_time_prekey: None,
+            };
+            inner.client.commit_publish_v2(pub_a);
+            (inner.client.identity_key(), b)
+        };
+        let mut carol = Client::new(Fetch::client(LOCAL_SERVER));
+        let carol_id = carol.identity_key();
+        let carol_key = key_to_text(&carol_id);
+        let pub_c = carol.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let m_c = pub_c.request.manifest.clone().unwrap();
+        let carol_bundle = ClaimBundleResponse {
+            signed_prekey: m_c.signed_prekey.clone(),
+            signed_prekey_signature: pub_c.request.signed_prekey_signature.clone(),
+            one_time_prekey: None,
+            manifest: Some(m_c),
+            pq_last_resort: pub_c.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: None,
+        };
+        carol.commit_publish_v2(pub_c);
+
+        // Pre-build a replacement inbound request from Carol strictly outside `engine.inner`.
+        let repl_inc = {
+            let ab = alice_bundle.clone();
+            let pps = session::PeerPqState::default();
+            let hello = Kind::Hello(carol.make_hello("Carol", 1)).to_bytes();
+            let claimed = {
+                let _mock = crate::transport::mock_fetch(move |_s, _p, _body| {
+                    Ok((200, ab.encode_to_vec()))
+                });
+                session::claim_peer_bundle_v2(
+                    &Fetch::client(LOCAL_SERVER),
+                    "localhost",
+                    &alice_id,
+                    &pps,
+                    carol.pq_config(),
+                    carol.clock(),
+                )
+                .await
+                .unwrap()
+            };
+            let prep = carol
+                .finish_prepare_initiate_v2(claimed, &pps, &hello, Fetch::client(LOCAL_SERVER))
+                .unwrap();
+            Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap()
+        };
+        let repl_cell = Rc::new(RefCell::new(Some(repl_inc)));
+        leptos::prelude::Set::set(&engine.ui.dialog, Some(crate::state::Dialog::Settings));
+        {
+            let cb = carol_bundle.clone();
+            let eng = engine.clone();
+            let rc = repl_cell.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let cb = cb.clone();
+                let eng = eng.clone();
+                let rc = rc.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        Ok((200, cb.encode_to_vec()))
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/SendInitialV2") {
+                        let cgen = {
+                            let guard = eng.inner.lock().await;
+                            guard
+                                .as_ref()
+                                .unwrap()
+                                .contacts
+                                .iter()
+                                .find(|c| c.peer == carol_id)
+                                .unwrap()
+                                .state
+                                .conversation_gen
+                        };
+                        eng.delete_for_gen(carol_id, cgen).await.unwrap();
+                        let inc = rc.borrow_mut().take().unwrap();
+                        {
+                            let mut guard = eng.inner.lock().await;
+                            let inner = guard.as_mut().unwrap();
+                            let opened = inner.open_initial(&carol_id, &inc).unwrap();
+                            let new_gen = inner.allocate_conversation_gen();
+                            inner.contacts.push(Contact {
+                                peer: carol_id,
+                                session: opened.session,
+                                deferred_carried: 0,
+                                state: ContactState {
+                                    peer: carol_id.to_vec(),
+                                    request: true,
+                                    conversation_gen: new_gen,
+                                    ..Default::default()
+                                },
+                            });
+                            inner.save_state().await.unwrap();
+                        }
+                        Ok((
+                            403,
+                            br#"{"code":"permission_denied","message":"sign in"}"#.to_vec(),
+                        ))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            let sub = engine
+                .startup
+                .begin_new_chat_submit(crate::state::PendingNewChat {
+                    key: carol_key.clone(),
+                    name: "Carol".into(),
+                    server: None,
+                    pq_pinned: false,
+                    allow_classical: false,
+                    auto_start: false,
+                });
+            assert_eq!(
+                engine
+                    .start_chat(sub, &carol_key, "Carol".into(), None, false, false)
+                    .await,
+                Err(StartChatError::Cancelled)
+            );
+        }
+        assert_eq!(
+            engine.ui.dialog.get_untracked(),
+            Some(crate::state::Dialog::Settings),
+            "R18-P2-3: 403 on SendInitialV2 for a deleted/replaced chat must preserve current dialog"
+        );
+        crate::transport::on_sign_in_required(|| {});
+    });
+
+    // Part 3 (R18-P2-4 + R18-P2-6 + R18-P2-7):
+    //   - Branch 3 (`settle_cancelled_upload_locked`) atomic commit: transient rollback error
+    //     preserves BOTH `OutgoingRecord` AND orphan checkpoint so retry still sends
+    //     `DeleteAttachment` with the recovered `ptr.key` even when `HistoryEntry` is corrupt!
+    //   - R18-P2-6: Peer echoes back the same attachment pointer ID as an incoming entry (newer
+    //     index) -> post-`forget_upload` `cancel_upload` still finds the earlier outgoing entry
+    //     and emits `DeleteAttachment`!
+    //   - R18-P2-7: `restore_uploads_from_vault` forgets a completed upload whose earlier
+    //     `forget_upload` failed AND clears its stale paused UI card and `uploads.files` cache!
+    pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let att_b3 = [0x81u8; 16];
+        let ptr_b3 = crate::content::AttachmentPointer {
+            id: att_b3.to_vec(),
+            key: vec![0x99u8; 32],
+            size: 64,
+            name: "b3.bin".into(),
+            mime: "application/octet-stream".into(),
+            expires: 0,
+        };
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let idx = inner
+                .add(&peer, Kind::Attachment(ptr_b3.clone()), false)
+                .await
+                .unwrap()
+                .index;
+            assert_eq!(idx, 0);
+            inner.contact(&peer).unwrap().state.outbox[0].attachment_id = att_b3.to_vec();
+            inner.save_state().await.unwrap();
+            inner.vault.corrupt_read_at.set(Some(0));
+            inner
+                .vault
+                .orphan_checkpoints
+                .borrow_mut()
+                .push(crate::vault::UploadCheckpoint {
+                    peer: peer.to_vec(),
+                    id: att_b3.to_vec(),
+                    uploaded: 1,
+                    revision: 1,
+                    upload_state: crate::vault::UPLOAD_STATE_ANNOUNCED,
+                    history_index: 0,
+                    ..Default::default()
+                });
+            inner.vault.fail_promote_upload_delete.set(true);
+        }
+        assert!(engine.cancel_upload(peer, att_b3).await.is_err());
+        // Verify OutgoingRecord and checkpoint BOTH survived the failed atomic tx!
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(inner.vault.outgoing(&peer, 0).await.is_ok());
+            assert_eq!(inner.vault.tracked_upload_checkpoints(Some(&peer)).len(), 1);
+            inner.vault.fail_promote_upload_delete.set(false);
+        }
+        let b3_del = Rc::new(Cell::new(0usize));
+        {
+            let d = b3_del.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let d = d.clone();
+                async move {
+                    if path.ends_with("/DeleteAttachment") {
+                        d.set(d.get() + 1);
+                        Ok((
+                            200,
+                            protocol::attachment::DeleteAttachmentResponse {}.encode_to_vec(),
+                        ))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            engine.flush(&peer).await.unwrap();
+        }
+        assert_eq!(
+            b3_del.get(),
+            1,
+            "R18-P2-4: retry after atomic Branch-3 failure must still recover ptr.key and delete"
+        );
+
+        // R18-P2-6: Incoming echo of same pointer ID at newer history index MUST NOT hide earlier
+        // outgoing entry during post-`forget_upload` `cancel_upload`!
+        let att_echo = [0x82u8; 16];
+        let ptr_echo = crate::content::AttachmentPointer {
+            id: att_echo.to_vec(),
+            key: vec![0xaau8; 32],
+            size: 64,
+            name: "echo.bin".into(),
+            mime: "application/octet-stream".into(),
+            expires: 0,
+        };
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.vault.corrupt_read_at.set(None);
+            let out_idx = inner
+                .add(&peer, Kind::Attachment(ptr_echo.clone()), false)
+                .await
+                .unwrap()
+                .index;
+            // Clear outbox so cancellation relies purely on `find_attachment_entry`.
+            inner.contact(&peer).unwrap().state.outbox.clear();
+            let in_entry = inner
+                .contact(&peer)
+                .unwrap()
+                .add_received(
+                    crate::content::Content {
+                        clock: 50,
+                        kind: Some(Kind::Attachment(ptr_echo.clone())),
+                        events: None,
+                    },
+                    false,
+                )
+                .unwrap();
+            assert!(in_entry.0 > out_idx);
+            inner.save(&[(peer, in_entry.0, in_entry.1)]).await.unwrap();
+        }
+        let echo_del = Rc::new(Cell::new(0usize));
+        {
+            let d = echo_del.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let d = d.clone();
+                async move {
+                    if path.ends_with("/DeleteAttachment") {
+                        d.set(d.get() + 1);
+                        Ok((
+                            200,
+                            protocol::attachment::DeleteAttachmentResponse {}.encode_to_vec(),
+                        ))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            engine.cancel_upload(peer, att_echo).await.unwrap();
+        }
+        assert_eq!(
+            echo_del.get(),
+            1,
+            "R18-P2-6: incoming echo must not hide earlier outgoing entry on cancel_upload"
+        );
+
+        // R18-P2-7: `restore_uploads_from_vault` forgets completed upload AND removes its stale
+        // paused UI card and `uploads.files` cache!
+        let att_done = [0x83u8; 16];
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let pending = make_announced_pending(&att_done, "done.bin", 64, 0);
+            inner.vault.save_upload(&peer, &pending).await.unwrap();
+            inner
+                .vault
+                .put_chunk(&peer, &att_done, 0, &[1u8; 64])
+                .await
+                .unwrap();
+            engine.uploads.insert_file(
+                (peer, att_done, [0x11u8; 32]),
+                crate::engine::attachments::ChunkSource::from_bytes(
+                    "done.bin",
+                    "application/octet-stream",
+                    vec![1u8; 64],
+                ),
+            );
+            engine.show_upload(&peer, &pending, UploadState::Paused("storage busy".into()));
+            engine.uploads.set_restore_needed(true);
+        }
+        assert!(engine.uploads.has_file(&peer, &att_done));
+        assert!(
+            engine
+                .ui
+                .uploads
+                .get_untracked()
+                .iter()
+                .any(|u| u.id == att_done)
+        );
+        engine.restore_uploads_from_vault().await.unwrap();
+        assert!(
+            !engine.uploads.has_file(&peer, &att_done),
+            "R18-P2-7: restore must clear cached file when forgetting a completed upload"
+        );
+        assert!(
+            !engine
+                .ui
+                .uploads
+                .get_untracked()
+                .iter()
+                .any(|u| u.id == att_done),
+            "R18-P2-7: restore must clear stale paused UI card when forgetting a completed upload"
+        );
+    });
+
+    // Part 4 (R18-P2-5): `delete_for_gen` MUST issue server `DeleteAttachment` for ALL THREE:
+    //   (a) a `PendingCancelRollback` in `pending_cancel_rollbacks`;
+    //   (b) a hidden incomplete announced `PendingUpload` (`!shown`, simulating deferred unlock);
+    //   (c) a `pending_cancellations` ID whose `PendingUpload` was already forgotten, using its
+    //       surviving outgoing history delete key!
+    pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let id_rb = [0x91u8; 16];
+        let id_hidden_inc = [0x92u8; 16];
+        let id_post_forget = [0x93u8; 16];
+        let conv_gen = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let cgen = inner.contact(&peer).unwrap().state.conversation_gen;
+            // (a) `PendingCancelRollback`
+            let rb_pending = make_announced_pending(&id_rb, "rb.bin", 128, 0);
+            engine.uploads.insert_pending_cancel_rollback(
+                (peer, 0),
+                crate::engine::runtime::PendingCancelRollback {
+                    conversation_gen: cgen,
+                    pending: rb_pending,
+                    failed_entry: HistoryEntry::default(),
+                },
+            );
+            // (b) Hidden incomplete announced `PendingUpload` (`uploaded == 0, chunks_kept == 0`,
+            // NOT in `ui.uploads`!)
+            let inc_pending = make_announced_pending(&id_hidden_inc, "inc.bin", 128, 1);
+            inner.vault.save_upload(&peer, &inc_pending).await.unwrap();
+            // (c) Post-`forget_upload` `pending_cancellations` entry with surviving outgoing
+            // history entry key (NOT in `vault.uploads()`!)
+            let ptr_pf = crate::content::AttachmentPointer {
+                id: id_post_forget.to_vec(),
+                key: vec![0xbbu8; 32],
+                size: 64,
+                name: "pf.bin".into(),
+                mime: "application/octet-stream".into(),
+                expires: 0,
+            };
+            let _ = inner
+                .add(&peer, Kind::Attachment(ptr_pf), false)
+                .await
+                .unwrap();
+            engine.uploads.insert_pending_cancel(peer, id_post_forget);
+            leptos::prelude::Set::set(&engine.ui.uploads, vec![]);
+            cgen
+        };
+        let deleted_ids = Rc::new(RefCell::new(Vec::<[u8; 16]>::new()));
+        {
+            let ids = deleted_ids.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let body = body.to_vec();
+                let ids = ids.clone();
+                async move {
+                    if path.ends_with("/DeleteAttachment") {
+                        let req =
+                            protocol::attachment::DeleteAttachmentRequest::decode(body.as_slice())
+                                .unwrap();
+                        ids.borrow_mut().push(req.id.as_ref().try_into().unwrap());
+                        Ok((
+                            200,
+                            protocol::attachment::DeleteAttachmentResponse {}.encode_to_vec(),
+                        ))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            engine.delete_for_gen(peer, conv_gen).await.unwrap();
+        }
+        let ids = deleted_ids.borrow();
+        assert!(
+            ids.contains(&id_rb),
+            "R18-P2-5: delete_for_gen must cancel PendingCancelRollback upload on server"
+        );
+        assert!(
+            ids.contains(&id_hidden_inc),
+            "R18-P2-5: delete_for_gen must cancel hidden incomplete announced upload on server"
+        );
+        assert!(
+            ids.contains(&id_post_forget),
+            "R18-P2-5: delete_for_gen must delete post-forget pending_cancellation via history key"
         );
     });
 }

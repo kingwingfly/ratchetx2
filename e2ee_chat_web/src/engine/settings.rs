@@ -143,6 +143,21 @@ impl<V: VaultStore> Engine<V> {
             if expected_gen.is_some_and(|want_gen| contact.state.conversation_gen != want_gen) {
                 return Err("chat changed; please retry.".to_string());
             }
+            // R18-P1-2: Enforce the exact same hard PQ-pin / downgrade block here as in
+            // `accept_inner`, `finish_existing_contact_start_chat`, and `Engine::flush` so
+            // `"Allow classical"` can never bypass an active PQ pin or active downgrade alarm, nor
+            // wipe alerts/quarantine while leaving a request permanently un-acceptable.
+            if local_pq
+                && (super::classical_hard_blocked_by_pin_or_downgrade(
+                    contact.session.peer_pq_state(),
+                ) || contact.state.quarantined_was_pq_pinned
+                    || contact.state.security_alert == SECURITY_ALERT_DOWNGRADE)
+            {
+                return Err(
+                    "Peer is post-quantum pinned or a downgrade was detected; upgrade to post-quantum encryption instead."
+                        .to_string(),
+                );
+            }
             let snapshot = contact.snapshot();
             contact
                 .session

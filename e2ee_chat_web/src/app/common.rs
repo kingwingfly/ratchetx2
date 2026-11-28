@@ -21,8 +21,12 @@ pub(super) fn strict_pq_enabled(ui: Ui) -> bool {
         .with(|me| me.as_ref().is_some_and(|me| me.pq_config.strict_pq))
 }
 
-pub(super) fn can_allow_classical(prompt: ClassicalPrompt, strict_pq: bool) -> bool {
-    !strict_pq && prompt != ClassicalPrompt::None
+pub(super) fn can_allow_classical(
+    prompt: ClassicalPrompt,
+    strict_pq: bool,
+    classical_hard_blocked: bool,
+) -> bool {
+    !strict_pq && !classical_hard_blocked && prompt != ClassicalPrompt::None
 }
 
 pub(super) fn pq_available(ui: Ui) -> bool {
@@ -684,6 +688,7 @@ pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
         peer_pq_capable: false,
         allow_classical_exception: false,
         downgrade_detected: false,
+        classical_hard_blocked: false,
         alert: SecurityAlert::None,
         classical_prompt: ClassicalPrompt::None,
     }
@@ -704,13 +709,16 @@ mod tests {
                     peer_was_pq_pinned: flag,
                 },
                 ClassicalPrompt::Outbound,
+                ClassicalPrompt::ServerPqDisabled,
             ] {
-                assert!(!can_allow_classical(prompt, true));
-                assert!(can_allow_classical(prompt, false));
+                assert!(!can_allow_classical(prompt, true, false));
+                assert!(!can_allow_classical(prompt, false, true));
+                assert!(can_allow_classical(prompt, false, false));
             }
         }
-        assert!(!can_allow_classical(ClassicalPrompt::None, false));
-        assert!(!can_allow_classical(ClassicalPrompt::None, true));
+        assert!(!can_allow_classical(ClassicalPrompt::None, false, false));
+        assert!(!can_allow_classical(ClassicalPrompt::None, true, false));
+        assert!(!can_allow_classical(ClassicalPrompt::None, false, true));
     }
 
     #[test]

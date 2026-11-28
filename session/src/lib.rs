@@ -2615,12 +2615,17 @@ impl<M> Session<M> {
                 if high_water > 0 && (incoming_seq == 0 || incoming_seq <= high_water) {
                     return Err(ErrorKind::StaleSession.into());
                 }
-                // Defense-in-depth: never let an unapproved classical peer-initiated session
-                // silently overwrite a PQ-pinned session.
+                // Defense-in-depth: never let a classical peer-initiated session silently
+                // overwrite an actively PQ-pinned or downgrade-flagged peer.
+                let signed_pq_off_approved = state.peer_pq.pq_pinned
+                    && !state.peer_pq.peer_pq_capable
+                    && state.peer_pq.allow_classical_exception;
                 if !active.security.is_pq
                     && local_pq_enabled
-                    && state.peer_pq.pq_pinned
-                    && !state.peer_pq.allow_classical_exception
+                    && ((state.peer_pq.downgrade_detected && !signed_pq_off_approved)
+                        || (state.peer_pq.pq_pinned
+                            && (state.peer_pq.peer_pq_capable
+                                || !state.peer_pq.allow_classical_exception)))
                 {
                     return Err(ErrorKind::DowngradeDetected.into());
                 }

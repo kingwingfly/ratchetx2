@@ -326,7 +326,12 @@ impl Contact {
     pub(super) fn record_policy_error(&mut self, kind: ErrorKind) -> bool {
         self.state.security_alert = match kind {
             ErrorKind::DowngradeDetected => {
-                self.session.peer_pq_state_mut().downgrade_detected = true;
+                let peer_pq = self.session.peer_pq_state_mut();
+                peer_pq.downgrade_detected = true;
+                // R18-P1-1: Clear any prior classical exception or leftover approval prompt so an
+                // active downgrade cannot be bypassed by an earlier exception or dismissal.
+                peer_pq.clear_classical_exception();
+                self.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                 SECURITY_ALERT_DOWNGRADE
             }
             ErrorKind::PqRequired => SECURITY_ALERT_PQ_REQUIRED,
@@ -457,6 +462,9 @@ impl Contact {
             peer_pq_capable: peer_pq.peer_pq_capable,
             allow_classical_exception: peer_pq.allow_classical_exception,
             downgrade_detected: peer_pq.downgrade_detected,
+            classical_hard_blocked: super::classical_hard_blocked_by_pin_or_downgrade(peer_pq)
+                || self.state.quarantined_was_pq_pinned
+                || self.state.security_alert == SECURITY_ALERT_DOWNGRADE,
             alert,
             classical_prompt,
         }

@@ -121,6 +121,10 @@ pub struct Fetch {
     server: String,
     /// Told as each request's body goes, if anything is.
     progress: Option<Progress>,
+    /// Whether a `403 permission_denied` response invokes the global `REFUSED` sign-in hook
+    /// before returning to the caller (`false` for generation-validated greeting sends in
+    /// `start_chat` Phase 4, `R18-P2-3`).
+    notify_refused: bool,
 }
 
 impl std::fmt::Debug for Fetch {
@@ -136,6 +140,18 @@ impl Fetch {
         ConnectClient::new(Self {
             server: server.trim_end_matches('/').to_string(),
             progress: None,
+            notify_refused: true,
+        })
+    }
+
+    /// A client that suppresses the global transport-level `REFUSED` sign-in hook so the caller
+    /// can validate conversation generation/cancellation before opening `Dialog::SignIn`
+    /// (`R18-P2-3`).
+    pub fn client_without_refused_hook(server: &str) -> Connect {
+        ConnectClient::new(Self {
+            server: server.trim_end_matches('/').to_string(),
+            progress: None,
+            notify_refused: false,
         })
     }
 
@@ -145,6 +161,7 @@ impl Fetch {
         ConnectClient::new(Self {
             server: server.trim_end_matches('/').to_string(),
             progress: Some(progress),
+            notify_refused: true,
         })
     }
 }
@@ -239,7 +256,8 @@ impl LocalPost for Fetch {
             });
             let (status, resp_body) = fut.await?;
             check_response_size(resp_body.len() as u64)?;
-            if asks_sign_in(status, &resp_body)
+            if self.notify_refused
+                && asks_sign_in(status, &resp_body)
                 && let Some(refused) = REFUSED.with_borrow(Clone::clone)
             {
                 refused();
@@ -372,7 +390,8 @@ impl LocalPost for Fetch {
                     })?;
             check_response_size(u64::from(body.byte_length()))?;
             let body = Uint8Array::new(&body).to_vec();
-            if asks_sign_in(status, &body)
+            if self.notify_refused
+                && asks_sign_in(status, &body)
                 && let Some(refused) = REFUSED.with_borrow(Clone::clone)
             {
                 refused();

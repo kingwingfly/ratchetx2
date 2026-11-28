@@ -1578,7 +1578,23 @@ impl<V: VaultStore> Engine<V> {
             Some(index) => {
                 let server = inner.server.clone();
                 let contact = &mut inner.contacts[index];
-                if let Some(pinned) = quarantine {
+                let is_pq = session.security().is_some_and(|security| security.is_pq);
+                // R18-P1-1: Never allow an inbound classical session to replace or auto-register
+                // write tokens on a peer with an active PQ pin or active downgrade alarm even if
+                // an earlier classical exception was set prior to the downgrade.
+                let hard_blocked_downgrade = !is_pq
+                    && local_pq
+                    && (super::classical_hard_blocked_by_pin_or_downgrade(
+                        contact.session.peer_pq_state(),
+                    ) || contact.state.security_alert == SECURITY_ALERT_DOWNGRADE);
+                let effective_quarantine = quarantine.or_else(|| {
+                    hard_blocked_downgrade.then_some(
+                        contact.session.peer_pq_state().pq_pinned
+                            && (contact.session.peer_pq_state().peer_pq_capable
+                                || contact.session.peer_pq_state().pinned_manifest_seq == 0),
+                    )
+                });
+                if let Some(pinned) = effective_quarantine {
                     let high_water = contact
                         .session
                         .peer_session_seq()
@@ -1602,7 +1618,9 @@ impl<V: VaultStore> Engine<V> {
                         ));
                         return InitialOutcome::Ack;
                     }
-                    let downgrade = pinned || session.peer_pq_state().downgrade_detected;
+                    let downgrade = pinned
+                        || hard_blocked_downgrade
+                        || session.peer_pq_state().downgrade_detected;
                     contact.record_quarantined_initial(
                         Some(session.state().into()),
                         first_message,
@@ -1616,7 +1634,6 @@ impl<V: VaultStore> Engine<V> {
                     ));
                     return InitialOutcome::Ack;
                 }
-                let is_pq = session.security().is_some_and(|security| security.is_pq);
                 let incoming_token_hash = session.active_inbound_token_hash();
                 let was_quarantined = contact.state.quarantined;
                 // Do not archive an unapproved primary classical session into `others` when
@@ -4056,17 +4073,22 @@ impl<V: VaultStore> Engine<V> {
                     )
                 } else if resumed_provisional {
                     contact.state.provisional = false;
-                    if revoke_pruned {
-                        let active = contact.session.active_inbound_token_hash();
-                        let earlier: Vec<[u8; 32]> = contact
-                            .session
-                            .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
-                            .filter(|h| Some(*h) != active)
-                            .collect();
-                        (active, earlier)
-                    } else {
-                        (None, vec![])
-                    }
+                    // R18-P2-2: Reconcile current active and policy-allowed retained tokens
+                    // against `staged_tokens` even when `!revoke_pruned` so an inbound rekey
+                    // arriving during the final Phase-A pass (suppressed while `provisional`)
+                    // never strands the resumed contact without its active relay write token.
+                    let active = contact.session.active_inbound_token_hash();
+                    let earlier: Vec<[u8; 32]> = contact
+                        .session
+                        .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
+                        .filter(|h| {
+                            Some(*h) != active && (revoke_pruned || !staged_tokens.contains(h))
+                        })
+                        .collect();
+                    (
+                        active.filter(|t| revoke_pruned || !staged_tokens.contains(t)),
+                        earlier,
+                    )
                 } else if flushed_grants || marked_provisional_for_accept {
                     // R10-P1-1: Contact became quarantined during Phase A (or is no longer
                     // eligible for acceptance): clear our temporary provisional flag, drop any
@@ -4088,7 +4110,7 @@ impl<V: VaultStore> Engine<V> {
                 stage_revoke(inner);
                 revoke_staged = true;
             }
-            if accepted_now || (resumed_provisional && revoke_for_pruned) {
+            if accepted_now || resumed_provisional {
                 if let Some(token_hash) = extra_tokens.0
                     && inner
                         .stage_write_token_grant(&peer, token_hash, true)
@@ -5326,7 +5348,10 @@ impl<V: VaultStore> Engine<V> {
             return Ok(peer);
         }
 
-        let send_res: session::Result<()> = Fetch::client(&server_url)
+        // R18-P2-3: Suppress the global transport-level `REFUSED` sign-in hook on `SendInitialV2`
+        // so Phase 4 validates `created_conv_gen` and submission cancellation BEFORE transitioning
+        // `ui.dialog` to `Dialog::SignIn` (preventing a 403 for a deleted chat from hijacking UI).
+        let send_res: session::Result<()> = Fetch::client_without_refused_hook(&server_url)
             .send_initial_v2(outgoing_request.clone())
             .await
             .map(|_| ())

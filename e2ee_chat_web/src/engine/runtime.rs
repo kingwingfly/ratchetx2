@@ -150,6 +150,18 @@ impl UploadRegistry {
             .retain(|(p, _), _| p != peer);
     }
 
+    pub(super) fn pending_cancel_rollbacks_for_peer(
+        &self,
+        peer: &PublicKey,
+    ) -> Vec<PendingCancelRollback> {
+        self.pending_cancel_rollbacks
+            .borrow()
+            .iter()
+            .filter(|((p, _), _)| p == peer)
+            .map(|(_, rb)| rb.clone())
+            .collect()
+    }
+
     pub(super) fn insert_pending_cancel(&self, peer: PublicKey, id: [u8; 16]) {
         self.pending_cancellations.borrow_mut().insert((peer, id));
     }

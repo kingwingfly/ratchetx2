@@ -208,6 +208,7 @@ pub struct ContactView {
     pub peer_pq_capable: bool,
     pub allow_classical_exception: bool,
     pub downgrade_detected: bool,
+    pub classical_hard_blocked: bool,
     pub alert: SecurityAlert,
     pub classical_prompt: ClassicalPrompt,
 }

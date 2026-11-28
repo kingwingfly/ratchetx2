@@ -583,6 +583,15 @@ impl<V: VaultStore> Engine<V> {
                                                             if !self.is_live(vgen) {
                                                                 return Ok(false);
                                                             }
+                                                            // R18-P2-7: Clear any stale paused UI
+                                                            // card and cached file handle left by
+                                                            // an earlier failed `forget_upload`.
+                                                            self.remove_attachment_caches(
+                                                                peer, &att_id,
+                                                            );
+                                                            self.ui.uploads.update(|uploads| {
+                                                                uploads.retain(|u| u.id != att_id)
+                                                            });
                                                             changed = true;
                                                             continue;
                                                         }
@@ -650,6 +659,12 @@ impl<V: VaultStore> Engine<V> {
                                                         if !self.is_live(vgen) {
                                                             return Ok(false);
                                                         }
+                                                        self.remove_attachment_caches(
+                                                            peer, &att_id,
+                                                        );
+                                                        self.ui.uploads.update(|uploads| {
+                                                            uploads.retain(|u| u.id != att_id)
+                                                        });
                                                         changed = true;
                                                         continue;
                                                     }
@@ -3683,7 +3698,9 @@ impl RequeueOutcome {
         resend: bool,
     ) {
         let verified = match (entry, content) {
-            (Some(entry), Some(kind)) => {
+            // R18-P1-3: Exclude attachments durably marked `gone` (e.g. deleted from server) so
+            // unread requeue after peer deletion never resends a dead attachment pointer.
+            (Some(entry), Some(kind)) if !entry.gone => {
                 let bytes = kind.to_bytes();
                 let digest_ok = expected_digest.len() == 32
                     && crate::vault::content_kind_digest(&bytes) == expected_digest;

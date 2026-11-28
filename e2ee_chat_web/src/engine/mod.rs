@@ -1661,11 +1661,11 @@ impl Engine<Vault> {
                         let hint_idx = (cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
                             .then_some(cp.history_index);
                         match inner
-                            .find_attachment_entry(&cp_peer, hint_idx, &cp_id)
+                            .find_attachment_entry(&cp_peer, hint_idx, &cp_id, Some(true))
                             .await
                         {
                             _ if !self.is_live(vgen) => return false,
-                            Ok(Some((idx, entry))) if entry.outgoing => {
+                            Ok(Some((idx, _))) => {
                                 outbox_match = inner.contact(&cp_peer).and_then(|c| {
                                     c.state.outbox.iter().find(|o| o.history_index == idx).map(
                                         |o| {
@@ -1891,6 +1891,14 @@ impl<V: VaultStore> Engine<V> {
                         if let Err(e) = inner.vault.forget_upload(&peer, &pending.id).await {
                             return Err(describe(&e));
                         }
+                        // R18-P2-7: Mirror `run_upload` completion cleanup so a paused card and
+                        // cached file left behind by an earlier failed `forget_upload` are cleared.
+                        self.remove_attachment_caches(&peer, &id);
+                        if self.is_live(vgen) {
+                            self.ui
+                                .uploads
+                                .update(|uploads| uploads.retain(|upload| upload.id != id));
+                        }
                         continue;
                     }
                 } else if !inner.contacts.iter().any(|c| {
@@ -1979,11 +1987,11 @@ impl<V: VaultStore> Engine<V> {
                     let hint_idx = (cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
                         .then_some(cp.history_index);
                     match inner
-                        .find_attachment_entry(&cp_peer, hint_idx, &cp_id)
+                        .find_attachment_entry(&cp_peer, hint_idx, &cp_id, Some(true))
                         .await
                     {
                         _ if !self.is_live(vgen) => return Ok(()),
-                        Ok(Some((idx, entry))) if entry.outgoing => {
+                        Ok(Some((idx, _))) => {
                             outbox_match = inner.contact(&cp_peer).and_then(|c| {
                                 c.state
                                     .outbox
@@ -2853,24 +2861,130 @@ impl<V: VaultStore> Engine<V> {
             .uploads(Some(&peer))
             .await
             .map_err(|e| describe(&e))?;
+        if !self.is_live(vgen) {
+            return Err("locked".into());
+        }
         let mut upload_ids: HashSet<[u8; 16]> = vault_uploads
             .iter()
             .filter_map(|(_, pending)| <[u8; 16]>::try_from(pending.id.as_slice()).ok())
             .collect();
-        let unfinished: Vec<(String, Upload)> = vault_uploads
-            .into_iter()
-            .filter(|(_, pending)| {
-                let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
-                let id_running = id_arr.is_some_and(|id| running.contains(&id));
-                let id_pending_cancel = id_arr.is_some_and(|id| pending_cancels.contains(&id));
-                pending.started()
-                    && (shown.contains(&pending.id)
-                        || id_running
-                        || id_pending_cancel
-                        || !pending.is_announced())
-            })
-            .filter_map(|(_, pending)| Some((pending.name.clone(), upload_of(&pending).ok()?)))
-            .collect();
+        let mut unfinished: Vec<(String, Upload)> = Vec::new();
+        let mut unfinished_ids: HashSet<[u8; 16]> = HashSet::new();
+        // R18-P2-5: Include any promoted uploads held in `pending_cancel_rollbacks` (whose
+        // cancel-after-promote rollback failed transiently) before `forget_peer` erases their
+        // upload tokens and clears `pending_cancel_rollbacks`.
+        for rb in self.uploads.pending_cancel_rollbacks_for_peer(&peer) {
+            if let Ok(id_arr) = <[u8; 16]>::try_from(rb.pending.id.as_slice()) {
+                upload_ids.insert(id_arr);
+                if rb.pending.started()
+                    && unfinished_ids.insert(id_arr)
+                    && let Ok(upload) = upload_of(&rb.pending)
+                {
+                    unfinished.push((rb.pending.name.clone(), upload));
+                }
+            }
+        }
+        for (_, pending) in vault_uploads {
+            if !pending.started() {
+                continue;
+            }
+            let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
+            let id_running = id_arr.is_some_and(|id| running.contains(&id));
+            let id_pending_cancel = id_arr.is_some_and(|id| pending_cancels.contains(&id));
+            let known_unfinished = shown.contains(&pending.id)
+                || id_running
+                || id_pending_cancel
+                || !pending.is_announced();
+            // R18-P2-5: When unlock deferred upload restoration (`!shown`), use persisted chunk
+            // progress to distinguish hidden incomplete announced uploads from completed ones.
+            let persisted_incomplete = if known_unfinished {
+                true
+            } else {
+                let chunks = attachment::chunk_count(pending.size);
+                if u64::from(pending.uploaded) >= chunks {
+                    false
+                } else {
+                    match inner.vault.chunks_kept(&peer, &pending.id).await {
+                        _ if !self.is_live(vgen) => return Err("locked".into()),
+                        Ok(kept) => u64::from(kept) < chunks,
+                        Err(_) => true,
+                    }
+                }
+            };
+            if persisted_incomplete
+                && id_arr.is_none_or(|id| unfinished_ids.insert(id))
+                && let Ok(upload) = upload_of(&pending)
+            {
+                unfinished.push((pending.name.clone(), upload));
+            }
+        }
+        // R18-P2-5: Resolve surviving outgoing delete keys for any `pending_cancellations` whose
+        // `PendingUpload` was already forgotten or is corrupt (and therefore omitted from
+        // `vault.uploads()`), before `forget_peer` erases history and outbox records.
+        let mut completed_deletes: Vec<(String, [u8; 16], zeroize::Zeroizing<[u8; 32]>)> =
+            Vec::new();
+        for cancel_id in &pending_cancels {
+            upload_ids.insert(*cancel_id);
+            if unfinished_ids.contains(cancel_id) {
+                continue;
+            }
+            let cp = inner
+                .vault
+                .tracked_upload_checkpoints(Some(&peer))
+                .into_iter()
+                .find(|cp| cp.id.as_slice() == cancel_id.as_slice());
+            let outbox_match = inner.contact(&peer).and_then(|c| {
+                c.state
+                    .outbox
+                    .iter()
+                    .find(|o| {
+                        o.attachment_id.as_slice() == cancel_id.as_slice()
+                            || cp
+                                .as_ref()
+                                .is_some_and(|cp| checkpoint_matches_outbox(cp, cancel_id, o))
+                    })
+                    .map(|o| (o.history_index, o.sealed))
+            });
+            let hint_idx = cp
+                .as_ref()
+                .filter(|cp| cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
+                .map(|cp| cp.history_index)
+                .or_else(|| outbox_match.map(|(idx, _)| idx));
+            let mut found_key: Option<(String, [u8; 32])> = None;
+            match inner
+                .find_attachment_entry(&peer, hint_idx, cancel_id, Some(true))
+                .await
+            {
+                _ if !self.is_live(vgen) => return Err("locked".into()),
+                Ok(Some((_, entry))) => {
+                    if !entry.gone
+                        && let Some(Kind::Attachment(ptr)) =
+                            entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                        && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
+                    {
+                        found_key = Some((ptr.name.clone(), key));
+                    }
+                }
+                Ok(None) | Err(_) => {}
+            }
+            if found_key.is_none()
+                && let Some((idx, false)) = outbox_match
+                && let Ok(rec) = inner.vault.outgoing(&peer, idx).await
+            {
+                if !self.is_live(vgen) {
+                    return Err("locked".into());
+                }
+                if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content)
+                    && ptr.id.as_slice() == cancel_id.as_slice()
+                    && let Ok(key) = <[u8; 32]>::try_from(ptr.key.as_slice())
+                {
+                    found_key = Some((ptr.name.clone(), key));
+                }
+            }
+            if let Some((name, key)) = found_key {
+                completed_deletes.push((name, *cancel_id, key.into()));
+            }
+        }
         // The peer is told, on the session as it is now, so that its next message starts a new
         // one, which comes here as a new chat; see `say_farewells`. If forgetting fails, the
         // session goes back to this, as the farewell never goes.
@@ -3008,7 +3122,7 @@ impl<V: VaultStore> Engine<V> {
         // does not wait for the rest; with their upload tokens, which name nobody.
         let server = inner.server.clone();
         drop(guard);
-        if !unfinished.is_empty() {
+        if !unfinished.is_empty() || !completed_deletes.is_empty() {
             let (ui, attachments) = (self.ui, Fetch::client(&server));
             #[cfg(target_arch = "wasm32")]
             spawn_local(async move {
@@ -3020,14 +3134,40 @@ impl<V: VaultStore> Engine<V> {
                         ));
                     }
                 }
+                for (name, id, key) in completed_deletes {
+                    match attachment::delete(&attachments, &id, &key).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => {
+                            ui.log(format!(
+                                "the server keeps what it has of {name} until it expires: {}",
+                                describe(&e)
+                            ));
+                        }
+                    }
+                }
             });
             #[cfg(not(target_arch = "wasm32"))]
-            for (name, upload) in unfinished {
-                if let Err(e) = upload.cancel(&attachments).await {
-                    ui.log(format!(
-                        "the server keeps what it has of {name} until it expires: {}",
-                        describe(&e)
-                    ));
+            {
+                for (name, upload) in unfinished {
+                    if let Err(e) = upload.cancel(&attachments).await {
+                        ui.log(format!(
+                            "the server keeps what it has of {name} until it expires: {}",
+                            describe(&e)
+                        ));
+                    }
+                }
+                for (name, id, key) in completed_deletes {
+                    match attachment::delete(&attachments, &id, &key).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == ErrorKind::NotFound => {}
+                        Err(e) => {
+                            ui.log(format!(
+                                "the server keeps what it has of {name} until it expires: {}",
+                                describe(&e)
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -3392,7 +3532,9 @@ impl<V: VaultStore> Inner<V> {
     }
 
     /// Locate a history entry carrying attachment `id` (checking `hint_index` first, then scanning
-    /// history backwards in `HISTORY_SHOWN` pages). When a page contains an unrelated corrupt row
+    /// history backwards in `HISTORY_SHOWN` pages). When `outgoing` is `Some(dir)`, matches only
+    /// entries with `entry.outgoing == dir` so an incoming echo of the same attachment pointer
+    /// cannot shadow an outgoing entry (`R18-P2-6`). When a page contains an unrelated corrupt row
     /// (`Error::Corrupt`), falls back to scanning individual entries in that page while still
     /// propagating transient `Error::Storage` failures (`R17-P2-6`).
     pub(super) async fn find_attachment_entry(
@@ -3400,12 +3542,14 @@ impl<V: VaultStore> Inner<V> {
         peer: &PublicKey,
         hint_index: Option<u64>,
         id: &[u8],
+        outgoing: Option<bool>,
     ) -> crate::vault::Result<Option<(u64, HistoryEntry)>> {
         let matches_id = |entry: &HistoryEntry| {
-            matches!(
-                entry.content.as_ref().and_then(|content| content.kind.as_ref()),
-                Some(Kind::Attachment(pointer)) if pointer.id == id
-            )
+            outgoing.is_none_or(|want| entry.outgoing == want)
+                && matches!(
+                    entry.content.as_ref().and_then(|content| content.kind.as_ref()),
+                    Some(Kind::Attachment(pointer)) if pointer.id == id
+                )
         };
         if let Some(index) = hint_index {
             match self.vault.entry(peer, index).await {

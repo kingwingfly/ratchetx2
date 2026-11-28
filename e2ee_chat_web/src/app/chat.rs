@@ -240,7 +240,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             {move || {
                 let c = contact()?;
                 let strict_pq = strict_pq.get();
-                let show_allow = can_allow_classical(c.classical_prompt, strict_pq);
+                let hard_blocked = pq_available(ui) && c.classical_hard_blocked;
+                let show_allow = can_allow_classical(c.classical_prompt, strict_pq, hard_blocked);
                 match c.classical_prompt {
                     ClassicalPrompt::InboundQuarantined { peer_was_pq_pinned } => {
                         let downgrade = peer_was_pq_pinned || c.has_downgrade();
@@ -260,6 +261,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         }}
                                         {if strict_pq {
                                             "Require post-quantum (strict mode) blocks classical exceptions. Upgrade to PQ or disable strict mode in Settings."
+                                        } else if hard_blocked {
+                                            "Its incoming message is held until you upgrade to post-quantum encryption."
                                         } else if downgrade {
                                             "Its incoming message is held until you explicitly allow classical encryption or upgrade to PQ."
                                         } else {

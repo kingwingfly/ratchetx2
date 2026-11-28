@@ -769,15 +769,16 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                 live_contact().map(|c| {
                     let strict_pq = strict_pq.get();
                     let conv_gen = c.conversation_gen;
-                    let show_allow = can_allow_classical(c.classical_prompt, strict_pq)
-                        || (!strict_pq
-                            && pq_available(ui)
-                            && c.request
-                            && !c.allow_classical_exception
-                            && !c.has_downgrade()
-                            && !(c.pq_pinned && c.peer_pq_capable)
-                            && ((!c.has_active_session && c.has_classical_earlier)
-                                || (c.has_active_session && !c.security.is_pq)));
+                    let hard_blocked = pq_available(ui) && c.classical_hard_blocked;
+                    let show_allow =
+                        can_allow_classical(c.classical_prompt, strict_pq, hard_blocked)
+                            || (!strict_pq
+                                && pq_available(ui)
+                                && c.request
+                                && !c.allow_classical_exception
+                                && !hard_blocked
+                                && ((!c.has_active_session && c.has_classical_earlier)
+                                    || (c.has_active_session && !c.security.is_pq)));
                     let show_upgrade = pq_available(ui) && contact_can_upgrade_to_pq(&c);
                     let show_dismiss = c.has_downgrade() && !c.is_quarantined();
                     view! {
