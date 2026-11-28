@@ -90,6 +90,7 @@ pub(super) fn security_badge_parts(
 pub(super) fn contact_can_upgrade_to_pq(contact: &ContactView) -> bool {
     contact.has_downgrade()
         || contact.is_quarantined()
+        || (!contact.has_active_session && contact.has_classical_earlier)
         || (contact.has_active_session && !contact.security.is_pq)
 }
 
@@ -110,6 +111,10 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
     let contact = move || ui.contact(&peer);
     let label = move || contact().map(|contact| contact.label()).unwrap_or_default();
     let request = move || contact().is_some_and(|contact| contact.request);
+    let greeting_unsent = move || contact().is_some_and(|contact| contact.greeting_unsent);
+    let greeting_uncertain = move || contact().is_some_and(|contact| contact.greeting_uncertain);
+    let greeting_unconfirmed = move || greeting_unsent() || greeting_uncertain();
+    let awaiting_acceptance = move || contact().is_some_and(|contact| contact.awaiting_acceptance);
     let quarantined = move || contact().is_some_and(|contact| contact.is_quarantined());
     let strict_pq = Memo::new(move |_| strict_pq_enabled(ui));
     let composer_disabled = move || request() || quarantined();
@@ -122,6 +127,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             }
         } else if request() {
             "Accept the request to write"
+        } else if greeting_unconfirmed() || awaiting_acceptance() {
+            "Write a message (delivers once accepted)"
         } else {
             "Write a message"
         }
@@ -182,6 +189,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                 // Suppress standalone downgrade banner when the merged quarantine banner is active
                 // so the user never sees two stacked "Upgrade to PQ" primary buttons.
                 if c.has_downgrade() && !c.is_quarantined() {
+                    let conv_gen = c.conversation_gen;
                     Some(
                         view! {
                             <div class="banner danger" role="alert">
@@ -197,7 +205,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                             disabled=move || sec_busy.get() || server_pq_disabled(ui)
                                             on:click=move |_| {
                                                 act_while(sec_busy, async move {
-                                                    engine().upgrade_to_pq(peer).await
+                                                    engine()
+                                                        .upgrade_to_pq_for_gen(peer, conv_gen)
+                                                        .await
                                                 });
                                             }
                                         >
@@ -210,7 +220,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         disabled=move || sec_busy.get()
                                         on:click=move |_| {
                                             act_while(sec_busy, async move {
-                                                engine().dismiss_downgrade(peer).await
+                                                engine()
+                                                    .dismiss_downgrade_for_gen(peer, conv_gen)
+                                                    .await
                                             });
                                         }
                                     >
@@ -228,7 +240,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
             {move || {
                 let c = contact()?;
                 let strict_pq = strict_pq.get();
-                let show_allow = can_allow_classical(c.classical_prompt, strict_pq);
+                let hard_blocked = pq_available(ui) && c.classical_hard_blocked;
+                let show_allow = can_allow_classical(c.classical_prompt, strict_pq, hard_blocked);
                 match c.classical_prompt {
                     ClassicalPrompt::InboundQuarantined { peer_was_pq_pinned } => {
                         let downgrade = peer_was_pq_pinned || c.has_downgrade();
@@ -246,7 +259,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         } else {
                                             "Classical chat request quarantined: this peer initiated without post-quantum encryption. "
                                         }}
-                                        {if strict_pq {
+                                        {if hard_blocked {
+                                            "Its incoming message is held until you upgrade to post-quantum encryption."
+                                        } else if strict_pq {
                                             "Require post-quantum (strict mode) blocks classical exceptions. Upgrade to PQ or disable strict mode in Settings."
                                         } else if downgrade {
                                             "Its incoming message is held until you explicitly allow classical encryption or upgrade to PQ."
@@ -255,7 +270,15 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                         }}
                                     </span>
                                     <div class="banner-actions">
-                                        {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
+                                        {show_allow.then(|| {
+                                            view! {
+                                                <AllowClassical
+                                                    peer
+                                                    conversation_gen=c.conversation_gen
+                                                    busy=sec_busy
+                                                />
+                                            }
+                                        })}
                                         <Show when=move || pq_available(ui)>
                                             <button
                                                 type="button"
@@ -265,8 +288,11 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                     sec_busy.get() || server_pq_disabled(ui)
                                                 }
                                                 on:click=move |_| {
+                                                    let conv_gen = c.conversation_gen;
                                                     act_while(sec_busy, async move {
-                                                        engine().upgrade_to_pq(peer).await
+                                                        engine()
+                                                            .upgrade_to_pq_for_gen(peer, conv_gen)
+                                                            .await
                                                     });
                                                 }
                                             >
@@ -279,29 +305,40 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                             .into_any(),
                         )
                     }
-                    ClassicalPrompt::Outbound { peer_signed_off } => Some(
-                        view! {
-                            <div class="banner warn" role="alert">
-                                <span>
-                                    {if peer_signed_off {
-                                        "Sending paused: this peer published a signed manifest disabling post-quantum encryption. "
-                                    } else {
-                                        "Sending paused: this peer has no post-quantum prekeys on the server. "
-                                    }}
-                                    {if strict_pq {
-                                        "Require post-quantum (strict mode) blocks classical fallback. Retry PQ when available or disable strict mode in Settings."
-                                    } else if peer_signed_off {
-                                        "Allow classical fallback to send?"
-                                    } else {
-                                        "Allow classical encryption for this chat?"
-                                    }}
-                                </span>
+                    ClassicalPrompt::Outbound | ClassicalPrompt::ServerPqDisabled => {
+                        let lead = if c.classical_prompt == ClassicalPrompt::ServerPqDisabled {
+                            "Sending paused: this server currently has post-quantum encryption disabled. "
+                        } else {
+                            "Sending paused: this peer published a signed manifest disabling post-quantum encryption. "
+                        };
+                        Some(
+                            view! {
+                                <div class="banner warn" role="alert">
+                                    <span>
+                                        {lead}
+                                        {if hard_blocked {
+                                            "This peer is post-quantum pinned or a downgrade was detected, which blocks classical fallback. Retry PQ when available."
+                                        } else if strict_pq {
+                                            "Require post-quantum (strict mode) blocks classical fallback. Retry PQ when available or disable strict mode in Settings."
+                                        } else {
+                                            "Allow classical fallback to send?"
+                                        }}
+                                    </span>
                                 {move || {
                                     let show_retry = pq_retry_ready(ui);
+                                    let conv_gen = c.conversation_gen;
                                     (show_allow || show_retry).then(|| {
                                         view! {
                                             <div class="banner-actions">
-                                                {show_allow.then(|| view! { <AllowClassical peer busy=sec_busy /> })}
+                                                {show_allow.then(|| {
+                                                    view! {
+                                                        <AllowClassical
+                                                            peer
+                                                            conversation_gen=conv_gen
+                                                            busy=sec_busy
+                                                        />
+                                                    }
+                                                })}
                                                 {show_retry.then(|| {
                                                     view! {
                                                         <button
@@ -310,7 +347,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                             disabled=move || sec_busy.get()
                                                             on:click=move |_| {
                                                                 act_while(sec_busy, async move {
-                                                                    engine().retry_pq(peer).await
+                                                                    engine()
+                                                                        .retry_pq_for_gen(peer, conv_gen)
+                                                                        .await
                                                                 });
                                                             }
                                                         >
@@ -325,7 +364,8 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                             </div>
                         }
                         .into_any(),
-                    ),
+                    )
+                    }
                     ClassicalPrompt::None => None,
                 }
             }}
@@ -344,6 +384,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                     view! {
                                         <div class="banner-actions">
                                             {show_retry.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -351,7 +392,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().retry_pq(peer).await
+                                                                engine()
+                                                                    .retry_pq_for_gen(peer, conv_gen)
+                                                                    .await
                                                             });
                                                         }
                                                     >
@@ -360,6 +403,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                 }
                                             })}
                                             {can_dismiss.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -367,7 +411,11 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().dismiss_downgrade(peer).await
+                                                                engine()
+                                                                    .dismiss_downgrade_for_gen(
+                                                                        peer, conv_gen,
+                                                                    )
+                                                                    .await
                                                             });
                                                         }
                                                     >
@@ -396,6 +444,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                     view! {
                                         <div class="banner-actions">
                                             {show_retry.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -403,7 +452,9 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().retry_pq(peer).await
+                                                                engine()
+                                                                    .retry_pq_for_gen(peer, conv_gen)
+                                                                    .await
                                                             });
                                                         }
                                                     >
@@ -412,6 +463,7 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                 }
                                             })}
                                             {can_dismiss.then(|| {
+                                                let conv_gen = c.conversation_gen;
                                                 view! {
                                                     <button
                                                         type="button"
@@ -419,7 +471,11 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                                                         disabled=move || sec_busy.get()
                                                         on:click=move |_| {
                                                             act_while(sec_busy, async move {
-                                                                engine().dismiss_downgrade(peer).await
+                                                                engine()
+                                                                    .dismiss_downgrade_for_gen(
+                                                                        peer, conv_gen,
+                                                                    )
+                                                                    .await
                                                             });
                                                         }
                                                     >
@@ -453,7 +509,49 @@ pub(super) fn ChatPane(peer: PublicKey) -> impl IntoView {
                     </button>
                 </div>
             </Show>
-            <Messages peer label=Signal::derive(label) />
+            <Show when=move || greeting_unsent() && !request() && !quarantined()>
+                <div class="banner awaiting-acceptance" role="status">
+                    <span>
+                        {move || {
+                            format!(
+                                "Sending chat request to {}… It hasn't reached the server yet and will retry automatically once connected.",
+                                label(),
+                            )
+                        }}
+                    </span>
+                </div>
+            </Show>
+            <Show when=move || greeting_uncertain() && !request() && !quarantined()>
+                <div class="banner awaiting-acceptance" role="status">
+                    <span>
+                        {move || {
+                            format!(
+                                "Sending chat request to {}… Delivery hasn't been confirmed yet. Retrying automatically.",
+                                label(),
+                            )
+                        }}
+                    </span>
+                </div>
+            </Show>
+            <Show when=move || awaiting_acceptance() && !request() && !quarantined()>
+                <div class="banner awaiting-acceptance" role="status">
+                    <span>
+                        {move || {
+                            format!(
+                                "Waiting for {} to accept your chat request. Messages you send stay queued here and will deliver automatically once they accept.",
+                                label(),
+                            )
+                        }}
+                    </span>
+                </div>
+            </Show>
+            <Messages
+                peer
+                label=Signal::derive(label)
+                greeting_unsent=Signal::derive(greeting_unsent)
+                greeting_uncertain=Signal::derive(greeting_uncertain)
+                awaiting_acceptance=Signal::derive(awaiting_acceptance)
+            />
             <Uploads peer />
             <Composer
                 peer
@@ -505,7 +603,13 @@ fn restore_visible_anchor(list: &web_sys::Element, anchor: &(String, f64)) {
 }
 
 #[component]
-fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
+fn Messages(
+    peer: PublicKey,
+    label: Signal<String>,
+    greeting_unsent: Signal<bool>,
+    greeting_uncertain: Signal<bool>,
+    awaiting_acceptance: Signal<bool>,
+) -> impl IntoView {
     let ui = ui();
     let list = NodeRef::<html::Div>::new();
     let loading_earlier = RwSignal::new(false);
@@ -619,7 +723,16 @@ fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
             <For
                 each=move || ui.messages.get()
                 key=|message| message.index
-                children=move |message| message_item(peer, message, label)
+                children=move |message| {
+                    message_item(
+                        peer,
+                        message,
+                        label,
+                        greeting_unsent,
+                        greeting_uncertain,
+                        awaiting_acceptance,
+                    )
+                }
             />
         </div>
     }
@@ -629,7 +742,14 @@ fn Messages(peer: PublicKey, label: Signal<String>) -> impl IntoView {
 /// The notes name the peer by `label`, which changes once a request is accepted.
 /// Delivery ticks and held-attachment pointer upgrades update via per-row reactive signals in O(1)
 /// without rescanning `ui.messages` or remounting active `<InlineMedia>` players.
-fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>) -> AnyView {
+fn message_item(
+    chat_peer: PublicKey,
+    message: MessageRow,
+    label: Signal<String>,
+    greeting_unsent: Signal<bool>,
+    greeting_uncertain: Signal<bool>,
+    awaiting_acceptance: Signal<bool>,
+) -> AnyView {
     let ui = ui();
     let index = message.index;
     let outgoing = message.outgoing;
@@ -715,7 +835,21 @@ fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>
     // it.
     let status = move || match delivery() {
         Delivery::Received => None,
-        Delivery::Pending => Some((Icon::Pending, "waiting to be sent", false)),
+        Delivery::Pending => Some((
+            Icon::Pending,
+            if ui.held.with(|held| held.contains(&(chat_peer, index))) {
+                "waiting for server sign-in"
+            } else if greeting_unsent.get() {
+                "waiting to send chat request"
+            } else if greeting_uncertain.get() {
+                "confirming chat request delivery"
+            } else if awaiting_acceptance.get() {
+                "waiting for peer to accept"
+            } else {
+                "waiting to be sent"
+            },
+            false,
+        )),
         Delivery::Failed => Some((Icon::Failed, "could not be sent", false)),
         Delivery::Sent => Some((Icon::Sent, "sent", false)),
         Delivery::Read => Some((Icon::Read, "read", true)),
@@ -725,6 +859,7 @@ fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>
     // can be cancelled, which lets what was sent after it go.
     let held = outgoing.then(|| {
         let cancelling = RwSignal::new(false);
+        let row_gen = ui.contact(&chat_peer).map_or(0, |c| c.conversation_gen);
         move || {
             ui.held
                 .with(|held| held.contains(&(chat_peer, index)))
@@ -739,7 +874,11 @@ fn message_item(chat_peer: PublicKey, message: MessageRow, label: Signal<String>
                             on:click=move |_| {
                                 act_while(
                                     cancelling,
-                                    async move { engine().cancel_held(chat_peer, index).await },
+                                    async move {
+                                        engine()
+                                            .cancel_held_for_gen(chat_peer, index, row_gen)
+                                            .await
+                                    },
                                 )
                             }
                         >

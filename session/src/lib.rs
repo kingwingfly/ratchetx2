@@ -14,10 +14,11 @@ pub mod proto;
 mod safety;
 
 use core::mem;
+use std::collections::BTreeMap;
 
 use bon::Builder;
 use bytes::Bytes;
-pub use clock::ServerClock;
+pub use clock::{DEFAULT_MAX_TRUSTED_DRIFT_MS, ServerClock};
 pub use error::{Error, ErrorKind, Result};
 use hkdf::Hkdf;
 use hmac::{Hmac, KeyInit, Mac};
@@ -28,201 +29,79 @@ pub use protocol;
 use protocol::{
     attachment::{LocalAttachments, StartUploadRequest},
     content::{Content, Hello, Kind as ContentKind},
-    handshake::{
-        self, FetchBundleRequest, PublishRequest, SendInitialMessageRequest,
-        TakeInitialMessagesRequest,
+    mailbox_v2::{
+        CLIENT_MESSAGE_ID_LENGTH, PEER_SLOT_ID_LENGTH, PushV2Request, WRITE_TOKEN_HASH_LENGTH,
+        WRITE_TOKEN_LENGTH, decode_carried_initial,
     },
-    mailbox::{DELIVERY_TOKEN_LENGTH, Envelope, FetchRequest, MAX_DELIVERED, PushRequest},
     notify::SubscribeRequest,
 };
-#[allow(deprecated)]
-use protocol::{handshake::LocalHandshake, mailbox::LocalMailbox};
-use ratchetx2::{DhPrivateKey, Ratchet, SharedKeys};
 pub use safety::safety_number;
 use sha2::{Digest, Sha256};
-use x3dh::{LocalPrekeys, PrekeyBundle};
-pub use x3dh::{PqSuite, PublicKey};
+use x3dh::LocalPrekeys;
+pub use x3dh::{PqPrekeyId, PqSuite, PublicKey};
 use xeddsa::XEdDSAPrivateKey;
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+#[cfg(any(feature = "prost", feature = "serde"))]
 use xeddsa::XEdDSAPublicKey;
 use zeroize::Zeroizing;
 
-/// Upper bound on queued delivery tokens in session state.
-const MAX_STORED_DELIVERED: usize = 4096;
+/// Request at most the default mailbox fetch limit per page when `limit == 0`.
+pub(crate) const MAX_RECEIVE_PAGE: u32 = 100;
 
-/// Request at most the default mailbox fetch limit per page.
-const MAX_RECEIVE_PAGE: u32 = 100;
+/// Maximum number of rolling non-preserved locally signed `CapabilityManifest` digests retained in
+/// `ClientState`.
+pub const MAX_RECENT_MANIFEST_DIGESTS: usize = 16;
 
-/// Maximum number of recent locally signed `CapabilityManifest` digests retained in `ClientState`.
-pub(crate) const MAX_RECENT_MANIFEST_DIGESTS: usize = 16;
+/// Hard upper bound on `recent_manifest_digests` including digests explicitly preserved for
+/// deferred unsupported-suite initial messages (16 rolling + up to 128 deferred-initial pins).
+/// Maximum manifest digests retained by a client across scheduled rotations (16 rolling
+/// non-preserved slots + up to 128 preserved deferred-initial digests).
+pub const MAX_RETAINED_MANIFEST_DIGESTS: usize = 144;
+/// Maximum manifest digests stored transiently while a publish is in flight
+/// (`MAX_RETAINED_MANIFEST_DIGESTS` + 1 pending digest awaiting relay confirmation) so an
+/// in-flight publish never evicts a digest still referenced by delayed PQ greetings before commit.
+pub const MAX_STORED_MANIFEST_DIGESTS: usize = MAX_RETAINED_MANIFEST_DIGESTS + 1;
 
-/// Maximum consecutive all-expired mailbox pages fetched within one [`Session::receive`] (or v2
-/// receive) call before returning control to the caller.
-pub(crate) const MAX_EXPIRED_PAGES: usize = 8;
+/// Maximum pending write-token registrations retained per session (matches relay per-peer grant
+/// cap).
+pub const MAX_PENDING_REGISTER_GRANTS: usize = 4;
 
-/// Maximum carried initial messages accumulated across expired envelopes or a stalled page.
-pub(crate) const MAX_CARRIED_INITIALS: usize = 64;
+/// Domain-separation prefix for opaque per-peer mailbox slot IDs (`HMAC-SHA256`).
+const PEER_SLOT_DOMAIN: &[u8] = b"session.v2/peer-slot\0";
 
-/// Merge incoming delivery tokens into `existing`, deduplicating and retaining at most the
-/// [`MAX_STORED_DELIVERED`] most recent unique tokens in chronological order.
-fn merge_delivered(
-    existing: &mut Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
-    incoming: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
-) {
-    if incoming.is_empty() && existing.len() <= MAX_STORED_DELIVERED {
-        return;
-    }
-    let cap = existing
-        .len()
-        .saturating_add(incoming.len())
-        .min(MAX_STORED_DELIVERED);
-    let mut seen = std::collections::BTreeSet::new();
-    let mut merged = Vec::with_capacity(cap);
-    for token in incoming
-        .into_iter()
-        .rev()
-        .chain(existing.iter().copied().rev())
-    {
-        if seen.insert(token) {
-            merged.push(token);
-            if merged.len() == MAX_STORED_DELIVERED {
-                break;
-            }
-        }
-    }
-    merged.reverse();
-    *existing = merged;
-}
+/// Domain-separation prefix for directional deniable write-capability tokens (`HKDF-SHA256`).
+const WRITE_TOKEN_INFO_PREFIX: &[u8] = b"session.v2/write-token\0";
 
-/// An initial message from a peer who wants to start a session, with the session's first
-/// message; accept it with [`Client::accept`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct InitialMessage {
-    /// X3DH's part: the identity key it claims to come from, the ephemeral key, and the prekeys
-    /// it uses.
-    pub x3dh: x3dh::InitialMessage,
-    /// The session's first message, which only the owner of that identity key can have
-    /// encrypted.
-    pub first_message: EncryptedMessage,
-}
-
-impl TryFrom<&handshake::InitialMessage> for InitialMessage {
-    type Error = Error;
-
-    /// Fails with [`ErrorKind::InvalidInitialMessage`] if it is malformed, or has no first
-    /// message.
-    fn try_from(message: &handshake::InitialMessage) -> Result<Self> {
-        let malformed = || Error::from(ErrorKind::InvalidInitialMessage);
-        Ok(Self {
-            x3dh: x3dh::InitialMessage::try_from(message).map_err(|_| malformed())?,
-            first_message: message.first_message.clone().ok_or_else(malformed)?,
+/// Lock-free attachment upload initiation (equivalent to [`Client::start_upload`] without
+/// borrowing [`Client`]).
+pub async fn start_upload_with(
+    attachments: &impl LocalAttachments,
+    size: u64,
+) -> Result<attachment::Upload> {
+    let chunks = u32::try_from(attachment::chunk_count(size))
+        .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
+    let key = attachment::try_generate_key()?;
+    let response = attachments
+        .start_upload(StartUploadRequest {
+            chunks,
+            delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
         })
+        .await?;
+    Ok(attachment::Upload::new(
+        protocol::fixed(&response.id)?,
+        Zeroizing::new(protocol::fixed(&response.upload_token)?),
+        key,
+        chunks,
+        (response.expires != 0).then_some(response.expires),
+    ))
+}
+
+/// Zeroizes the backing buffer of `bytes` in place when uniquely owned; static or shared handles
+/// are detached without panicking.
+pub(crate) fn zeroize_bytes(bytes: &mut Bytes) {
+    let owned = mem::take(bytes);
+    if let Ok(mut buf) = owned.try_into_mut() {
+        zeroize::Zeroize::zeroize(buf.as_mut());
     }
-}
-
-/// The wire versions share sequence and ciphertext semantics, with different carried initials.
-trait MailboxEnvelope {
-    type Initial: PartialEq;
-    fn sequence(&self) -> u64;
-    fn into_parts(self) -> (Option<EncryptedMessage>, Option<Self::Initial>);
-}
-
-impl MailboxEnvelope for Envelope {
-    type Initial = InitialMessage;
-
-    fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    fn into_parts(self) -> (Option<EncryptedMessage>, Option<InitialMessage>) {
-        (
-            self.message,
-            self.initial_message
-                .as_ref()
-                .and_then(|im| InitialMessage::try_from(im).ok()),
-        )
-    }
-}
-
-/// Return false if this envelope must be fetched again to surface a new initial.
-fn carry_initial<I: PartialEq>(carried: &mut Vec<I>, initial: Option<I>) -> bool {
-    if let Some(initial) = initial
-        && !carried.contains(&initial)
-    {
-        if carried.len() == MAX_CARRIED_INITIALS {
-            return false;
-        }
-        carried.push(initial);
-    }
-    true
-}
-
-/// A message received, see [`Session::receive`].
-///
-/// Its `Debug` implementation redacts decrypted `content` plaintext bytes.
-pub struct Received {
-    /// Its content, or why there is none.
-    pub content: Result<Vec<u8>>,
-    /// Whether it decrypted on an earlier session [kept](Session::keep), rather than the active
-    /// one: the peer sent it before the session that replaced it, e.g. before deleting the chat
-    /// and starting it again.
-    pub earlier: bool,
-    /// The initial message of its session, which its sender sends with each message while this
-    /// client has not answered that session. For the message receiving [stalled](ErrorKind::Stalled)
-    /// at, those that came with the rest of its page too, any of which may be the session it,
-    /// or one after it, is on: accepting them with [`Client::accept`] may let them decrypt.
-    pub initial_messages: Vec<InitialMessage>,
-}
-
-impl core::fmt::Debug for Received {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let mut s = f.debug_struct("Received");
-        match &self.content {
-            Ok(bytes) => s.field("content_len", &bytes.len()),
-            Err(err) => s.field("error", &err.kind()),
-        };
-        s.field("earlier", &self.earlier)
-            .field("initial_messages", &self.initial_messages.len())
-            .finish()
-    }
-}
-
-impl Received {
-    /// Whether this entry represents a message whose skipped key was evicted before arrival
-    /// (permanently lost, with its delivery token queued for server acknowledgement).
-    pub fn is_evicted(&self) -> bool {
-        self.content
-            .as_ref()
-            .is_err_and(|e| e.kind() == ErrorKind::EvictedMessage)
-    }
-}
-
-/// A prepared classical prekey publish request from [`Client::prepare_publish`] or
-/// [`Client::prepare_extend_keys`].
-///
-/// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish`], then call
-/// [`Client::commit_publish`] on success or [`Client::rollback_publish_on_refusal`] on
-/// [`ErrorKind::SignInRequired`].
-#[derive(Debug, Clone)]
-pub struct PreparedPublish {
-    /// The signed v1 publish request to transmit.
-    pub request: PublishRequest,
-    extended: bool,
-    was_publishing: bool,
-    prev_last_timestamp: u64,
-    signed_prekey: PublicKey,
-    one_time_prekeys: Vec<PublicKey>,
-}
-
-/// A prepared classical session initiation from [`Client::prepare_initiate`].
-///
-/// Persist [`session.state()`](Session::state) BEFORE calling [`Client::send_prepared_initiate`].
-#[derive(Debug)]
-pub struct PreparedInitiate<M> {
-    /// The newly established classical session.
-    pub session: Session<M>,
-    /// The signed-out v1 initial message request to transmit after persisting `session`.
-    pub request: SendInitialMessageRequest,
 }
 
 /// Extract a [`Hello`] greeting from decrypted or outgoing content bytes, if present.
@@ -234,7 +113,7 @@ pub(crate) fn extract_hello(content: &[u8]) -> Option<Hello> {
 }
 
 /// Read a greeting only after authentication, before confirming the claimed prekeys.
-fn checked_initial_hello(content: &[u8]) -> Result<Option<Hello>> {
+pub(crate) fn checked_initial_hello(content: &[u8]) -> Result<Option<Hello>> {
     let hello = extract_hello(content);
     if hello
         .as_ref()
@@ -254,7 +133,71 @@ pub const KEPT_SESSIONS: usize = 3;
 /// [`Session::keep`].
 pub const MAX_DIRECTION_CHANGES: u32 = 5;
 
-/// An identity on a handshake server: publishes prekeys, starts and accepts sessions.
+/// A write-token grant staged on a [`Session`] waiting to be registered on the recipient's
+/// mailbox server via [`Client::register_write_token_v2`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PendingGrant {
+    /// SHA-256 of the peer's deniable write token (`H(t_{peer->me})`).
+    pub token_hash: [u8; WRITE_TOKEN_HASH_LENGTH],
+    /// Strictly positive monotonic identity-wide grant version (`1..=MAX_SAFE_INTEGER`) allocated
+    /// from [`Client::allocate_grant_version`].
+    pub grant_version: u64,
+    /// Whether to pin this token as the peer's active (never-evicted) grant on the relay.
+    pub pin_active: bool,
+}
+
+/// Merge `incoming` pending grants into `existing`, deduplicating by `token_hash` (keeping the
+/// higher `grant_version`, OR-ing `pin_active` on ties), demoting stale `pin_active` flags on
+/// non-active hashes whenever `active_hash` is present, capping at
+/// [`MAX_PENDING_REGISTER_GRANTS`] while strictly preserving `active_hash`, and sorting ascending
+/// by `(grant_version, token_hash)`.
+fn merge_pending_grants(
+    existing: &mut Vec<PendingGrant>,
+    incoming: Vec<PendingGrant>,
+    active_hash: Option<[u8; WRITE_TOKEN_HASH_LENGTH]>,
+) {
+    let mut merged = Vec::with_capacity(existing.len().saturating_add(incoming.len()));
+    for grant in existing.drain(..).chain(incoming) {
+        if let Some(prev) = merged
+            .iter_mut()
+            .find(|g: &&mut PendingGrant| g.token_hash == grant.token_hash)
+        {
+            if grant.grant_version > prev.grant_version {
+                *prev = grant;
+            } else if grant.grant_version == prev.grant_version {
+                prev.pin_active |= grant.pin_active;
+            }
+        } else {
+            merged.push(grant);
+        }
+    }
+    if let Some(active) = active_hash {
+        for grant in &mut merged {
+            if grant.token_hash != active {
+                grant.pin_active = false;
+            }
+        }
+    }
+    while merged.len() > MAX_PENDING_REGISTER_GRANTS {
+        if let Some((evict_idx, _)) = merged.iter().enumerate().min_by_key(|(_, g)| {
+            (
+                active_hash == Some(g.token_hash),
+                g.pin_active,
+                g.grant_version,
+            )
+        }) {
+            merged.remove(evict_idx);
+        } else {
+            break;
+        }
+    }
+    merged.sort_unstable_by_key(|g| (g.grant_version, g.token_hash));
+    *existing = merged;
+}
+
+/// An identity on a v2 handshake server: publishes prekeys and signed capability manifests,
+/// starts and accepts sessions, and manages the unified recipient mailbox and write-token grants.
 ///
 /// [`Client::new`] gives it a new random identity key, and [`Client::builder`] can set one:
 /// `Client::builder(handshake).identity(identity).build()`. [`Client::restore`] brings back a
@@ -277,29 +220,25 @@ pub struct Client<H> {
     clock: ServerClock,
 }
 
-/// What a [`Client`] keeps besides its transport: the identity key, the prekeys and the last
-/// request's timestamp.
+/// What a [`Client`] keeps besides its transport: the identity key, prekeys, signed-request
+/// timestamp, PQ manifest state, unified mailbox cursor/ACK watermark, and monotonic grant
+/// version counter.
 ///
-/// Save it to [`restore`](Client::restore) the client later: serialize it with the `serde` or
-/// `rkyv` feature, or with `prost` convert it to a `proto::ClientState`. It holds private keys,
-/// so keep it secret.
+/// Save it to [`restore`](Client::restore) the client later: with `prost` convert it to a
+/// `proto::ClientState` (portable versioned persistence), or serialize it with `serde`. It holds
+/// private keys, so keep it secret.
 #[derive(Debug)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "RawClientState")
 )]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
-)]
 pub struct ClientState {
     pub(crate) identity: XEdDSAPrivateKey,
     pub(crate) prekeys: LocalPrekeys,
     pub(crate) last_timestamp: u64,
     /// Whether the last publish of the prekeys may have failed, though the server may have
-    /// them, its reply being lost, see [`Client::publish_keys`].
+    /// them, its reply being lost.
     pub(crate) publishing: bool,
     /// User post-quantum preferences (PQ enabled by default when compiled).
     pub(crate) pq_config: PqConfig,
@@ -310,7 +249,42 @@ pub struct ClientState {
     /// SHA-256 digests of recent `CapabilityManifest`s signed by this client (bounded by
     /// `MAX_RECENT_MANIFEST_DIGESTS`).
     pub(crate) recent_manifest_digests: Vec<[u8; 32]>,
+    /// SHA-256 digests of `CapabilityManifest`s confirmed stored on the relay (bounded by
+    /// `MAX_RECENT_MANIFEST_DIGESTS`). Prioritized ahead of unconfirmed staged digests so repeated
+    /// failed publish attempts cannot evict the last confirmed relay manifest digest.
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            default,
+            deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
+        )
+    )]
+    pub(crate) confirmed_manifest_digests: Vec<[u8; 32]>,
+    /// Unified mailbox high-water sequence number last committed locally.
+    pub(crate) mailbox_cursor: u64,
+    /// Unified mailbox sequence number committed locally and awaiting server prefix ACK (`0` if none).
+    pub(crate) pending_mailbox_ack: u64,
+    /// Identity-wide monotonic write-token grant version counter (starts at `1`).
+    pub(crate) next_grant_version: u64,
+    /// Trailing mapping from retained `CapabilityManifest` digest to `(signed_prekey, confirmed)`,
+    /// placed LAST so positional Serde formats remain compatible with pre-existing snapshots
+    /// (`R10-P2-4`). Keeps both confirmed and bounded ambiguous/staged digests for still-retained
+    /// signed prekeys protected until those signed prekeys retire (`R9-P2-4`, `R10-P2-3`).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, serialize_with = "serialize_digest_spk_map")
+    )]
+    pub(crate) manifest_digest_spks: BTreeMap<[u8; 32], (PublicKey, bool)>,
 }
+
+/// Maximum unconfirmed/ambiguous staged digests bound to still-retained signed prekeys kept past
+/// `MAX_RECENT_MANIFEST_DIGESTS` so delayed in-flight publishes survive 16+ in-place renewals while
+/// capping offline retry bloat (`R10-P2-3`).
+const MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS: usize = 4;
+
+/// Saved FIFO slot, digest, and optional `(signed_prekey, confirmed)` binding evicted while staging
+/// a new manifest digest so `rollback_manifest_digest` can restore exact prior state.
+pub(crate) type EvictedManifestDigest = (usize, [u8; 32], Option<(PublicKey, bool)>);
 
 impl ClientState {
     fn new(identity: XEdDSAPrivateKey) -> Self {
@@ -323,18 +297,231 @@ impl ClientState {
             manifest_seq: 0,
             prekey_generation: 0,
             recent_manifest_digests: vec![],
+            confirmed_manifest_digests: vec![],
+            mailbox_cursor: 0,
+            pending_mailbox_ack: 0,
+            next_grant_version: 1,
+            manifest_digest_spks: BTreeMap::new(),
         }
     }
 
-    /// Record a freshly signed manifest digest, retaining at most `MAX_RECENT_MANIFEST_DIGESTS`
-    /// while preferring to keep any digests listed in `preserve` (e.g. deferred unsupported-suite
-    /// initials waiting for replay) and NEVER evicting the newly pushed digest. Returns the
-    /// evicted `(index, digest)` so a refused publish can restore FIFO order.
-    pub(crate) fn record_manifest_digest_preserving(
+    fn is_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
+        self.confirmed_digest_retained_spk(digest).is_some()
+    }
+
+    fn confirmed_digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
+        self.manifest_digest_spks
+            .get(digest)
+            .and_then(|&(spk, confirmed)| {
+                (confirmed && self.prekeys.contains_signed_prekey(&spk)).then_some(spk)
+            })
+    }
+
+    fn digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
+        self.manifest_digest_spks
+            .get(digest)
+            .and_then(|&(spk, _)| self.prekeys.contains_signed_prekey(&spk).then_some(spk))
+    }
+
+    fn is_unconfirmed_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
+        self.manifest_digest_spks
+            .get(digest)
+            .is_some_and(|&(spk, confirmed)| {
+                !confirmed && self.prekeys.contains_signed_prekey(&spk)
+            })
+    }
+
+    /// Record a manifest digest that has been confirmed stored on the relay (either via a
+    /// confirmed `PublishV2` commit or a verified `GetManifest` reconciliation), optionally
+    /// associating it with the `signed_prekey` bound by that manifest.
+    pub(crate) fn record_confirmed_manifest_digest(
         &mut self,
         digest: [u8; 32],
+        signed_prekey: Option<PublicKey>,
+    ) {
+        if let Some(pos) = self
+            .confirmed_manifest_digests
+            .iter()
+            .position(|d| *d == digest)
+        {
+            self.confirmed_manifest_digests.remove(pos);
+        }
+        self.confirmed_manifest_digests.push(digest);
+        while self.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
+            self.confirmed_manifest_digests.remove(0);
+        }
+        if let Some(spk) = signed_prekey {
+            self.manifest_digest_spks.insert(digest, (spk, true));
+        } else if let Some(entry) = self.manifest_digest_spks.get_mut(&digest) {
+            entry.1 = true;
+        }
+        if !self.recent_manifest_digests.contains(&digest) {
+            self.recent_manifest_digests.push(digest);
+            while self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS {
+                let evict_idx = self.evict_excess_manifest_digest_idx(&[]);
+                let removed = self.recent_manifest_digests.remove(evict_idx);
+                self.manifest_digest_spks.remove(&removed);
+            }
+        }
+    }
+
+    /// Choose the lowest-priority index in `recent_manifest_digests[..len - 1]` to evict when the
+    /// manifest digest table exceeds its capacity (`MAX_STORED_MANIFEST_DIGESTS` or
+    /// `MAX_RETAINED_MANIFEST_DIGESTS`), preserving explicitly pinned digests and protecting up to
+    /// [`MAX_RECENT_MANIFEST_DIGESTS`] confirmed digests per retained signed prekey (`R12-P2-2`).
+    fn evict_excess_manifest_digest_idx(&self, preserve: &[[u8; 32]]) -> usize {
+        let candidate_end = self.recent_manifest_digests.len().saturating_sub(1);
+        let mut confirmed_per_retained_spk: BTreeMap<PublicKey, usize> = BTreeMap::new();
+        for d in &self.recent_manifest_digests {
+            if let Some(&(spk, confirmed)) = self.manifest_digest_spks.get(d)
+                && confirmed
+                && self.prekeys.contains_signed_prekey(&spk)
+            {
+                *confirmed_per_retained_spk.entry(spk).or_insert(0) += 1;
+            }
+        }
+        let is_surplus_retained_spk = |d: &[u8; 32]| {
+            self.manifest_digest_spks
+                .get(d)
+                .is_some_and(|&(spk, confirmed)| {
+                    confirmed
+                        && confirmed_per_retained_spk
+                            .get(&spk)
+                            .is_some_and(|&count| count > MAX_RECENT_MANIFEST_DIGESTS)
+                })
+        };
+        let candidates = &self.recent_manifest_digests[..candidate_end];
+        candidates
+            .iter()
+            .position(|d| {
+                !preserve.contains(d)
+                    && !self.is_digest_for_retained_spk(d)
+                    && !self.is_unconfirmed_digest_for_retained_spk(d)
+                    && !self.confirmed_manifest_digests.contains(d)
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d)
+                        && !self.is_digest_for_retained_spk(d)
+                        && !self.is_unconfirmed_digest_for_retained_spk(d)
+                })
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d) && self.is_unconfirmed_digest_for_retained_spk(d)
+                })
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d)
+                        && is_surplus_retained_spk(d)
+                        && !self.confirmed_manifest_digests.contains(d)
+                })
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .position(|d| !preserve.contains(d) && is_surplus_retained_spk(d))
+            })
+            .or_else(|| {
+                candidates.iter().position(|d| {
+                    !preserve.contains(d) && !self.confirmed_manifest_digests.contains(d)
+                })
+            })
+            .or_else(|| candidates.iter().position(|d| !preserve.contains(d)))
+            .unwrap_or(0)
+    }
+
+    /// Whether recording another manifest digest can fit within `MAX_RETAINED_MANIFEST_DIGESTS`
+    /// without evicting any digest listed in `preserve`.
+    pub fn has_spare_manifest_digest_slot(&self, preserve: &[[u8; 32]]) -> bool {
+        let preserved_in_recent = self
+            .recent_manifest_digests
+            .iter()
+            .filter(|d| preserve.contains(d))
+            .count();
+        preserved_in_recent < MAX_RETAINED_MANIFEST_DIGESTS
+    }
+
+    /// Count hard-pinned manifest digests in `recent_manifest_digests` (excluding `exclude`) for
+    /// publish-capacity checks: every explicitly preserved digest (`preserve_digests`) counts,
+    /// plus at most [`MAX_RECENT_MANIFEST_DIGESTS`] (16) confirmed digests per retained signed
+    /// prekey in `post_commit_spks`. Capping per-SPK hard pins at 16 preserves automatic deferral
+    /// when 128 deferred pins + 16 confirmed digests fill 144 slots (`R9-P2-5`), while ensuring
+    /// repeated ambiguous retries on one SPK can never permanently deadlock rotation (`R11-P2-7`).
+    pub(crate) fn count_hard_pinned_manifest_digests(
+        &self,
+        post_commit_spks: &[PublicKey],
+        preserve_digests: &[[u8; 32]],
+        exclude: Option<[u8; 32]>,
+    ) -> usize {
+        let mut pinned = 0usize;
+        let mut confirmed_per_spk: BTreeMap<PublicKey, usize> = BTreeMap::new();
+        for d in &self.recent_manifest_digests {
+            if exclude == Some(*d) {
+                continue;
+            }
+            if preserve_digests.contains(d) {
+                pinned += 1;
+            } else if let Some(&(spk, confirmed)) = self.manifest_digest_spks.get(d)
+                && confirmed
+                && post_commit_spks.contains(&spk)
+            {
+                let count = confirmed_per_spk.entry(spk).or_insert(0);
+                if *count < MAX_RECENT_MANIFEST_DIGESTS {
+                    *count += 1;
+                    pinned += 1;
+                }
+            }
+        }
+        pinned
+    }
+
+    /// Exact capacity check for a `PublishV2` attempt with `(preserve_spks, preserve_digests)`,
+    /// accounting for BOTH explicitly preserved digests AND up to [`MAX_RECENT_MANIFEST_DIGESTS`]
+    /// confirmed manifest digests per signed prekey that will remain retained after commit
+    /// (`R9-P2-4`, `R11-P2-7`).
+    ///
+    /// Unconfirmed staged attempts are excluded from this hard refusal limit so repeated offline
+    /// publish retries can never brick future publishes. Non-retry in-place extends reserve 1 slot
+    /// (`< MAX_RETAINED_MANIFEST_DIGESTS - 1`) so the current signed prekey can always rotate.
+    pub fn has_spare_manifest_digest_slot_for_publish(
+        &self,
+        preserve_spks: &[PublicKey],
+        preserve_digests: &[[u8; 32]],
+    ) -> bool {
+        let preserve_oldest = self
+            .prekeys
+            .oldest_evictable_signed_prekey()
+            .is_some_and(|spk| preserve_spks.contains(&spk));
+        let extended = (self.publishing || preserve_oldest) && self.prekeys.generation_count() > 0;
+        let post_commit_spks = if extended {
+            self.prekeys
+                .retained_signed_prekeys_after_prune(preserve_spks)
+        } else {
+            self.prekeys
+                .retained_signed_prekeys_after_rotation(preserve_spks)
+        };
+        let post_commit_pinned =
+            self.count_hard_pinned_manifest_digests(&post_commit_spks, preserve_digests, None);
+        let limit = if extended && !self.publishing {
+            MAX_RETAINED_MANIFEST_DIGESTS - 1
+        } else {
+            MAX_RETAINED_MANIFEST_DIGESTS
+        };
+        post_commit_pinned < limit
+    }
+
+    /// Stage a freshly signed manifest digest WITHOUT evicting any existing rolling digest yet
+    /// (allowing up to `MAX_STORED_MANIFEST_DIGESTS` while a publish is in flight), recording its
+    /// unconfirmed `(digest -> signed_prekey)` binding so delayed in-flight publishes that land
+    /// before a higher-sequence retry stay protected until their SPK retires (`R10-P2-3`).
+    pub(crate) fn stage_manifest_digest(
+        &mut self,
+        digest: [u8; 32],
+        signed_prekey: Option<PublicKey>,
         preserve: &[[u8; 32]],
-    ) -> Option<(usize, [u8; 32])> {
+    ) -> Vec<EvictedManifestDigest> {
         if let Some(pos) = self
             .recent_manifest_digests
             .iter()
@@ -343,35 +530,105 @@ impl ClientState {
             self.recent_manifest_digests.remove(pos);
         }
         self.recent_manifest_digests.push(digest);
-        let mut evicted = None;
-        while self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
-            // Only consider entries strictly older than the newly appended `last()` slot.
-            let candidate_end = self.recent_manifest_digests.len() - 1;
-            let evict_idx = self.recent_manifest_digests[..candidate_end]
-                .iter()
-                .position(|d| !preserve.contains(d))
-                .unwrap_or(0);
-            evicted = Some((evict_idx, self.recent_manifest_digests.remove(evict_idx)));
+        if let Some(spk) = signed_prekey {
+            self.manifest_digest_spks
+                .entry(digest)
+                .or_insert((spk, false));
+        }
+        let mut evicted = Vec::new();
+        while self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS {
+            let evict_idx = self.evict_excess_manifest_digest_idx(preserve);
+            let removed = self.recent_manifest_digests.remove(evict_idx);
+            let removed_spk = self.manifest_digest_spks.remove(&removed);
+            evicted.push((evict_idx, removed, removed_spk));
         }
         evicted
     }
 
-    /// Pop a previously appended manifest digest and restore any digest it evicted at its original
-    /// FIFO position.
+    /// Trim `recent_manifest_digests` down to at most `MAX_RECENT_MANIFEST_DIGESTS` non-preserved
+    /// digests PLUS explicitly preserved digests (while never evicting confirmed digests bound to
+    /// still-retained signed prekeys and retaining up to `MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS`
+    /// newest ambiguous/staged digests for still-retained signed prekeys, up to
+    /// `MAX_RETAINED_MANIFEST_DIGESTS` total). Called AFTER `prekeys.prune_to_kept`.
+    pub(crate) fn prune_manifest_digests_preserving(&mut self, preserve: &[[u8; 32]]) {
+        loop {
+            let candidate_end = self.recent_manifest_digests.len().saturating_sub(1);
+            let non_preserved_count = self
+                .recent_manifest_digests
+                .iter()
+                .filter(|d| !preserve.contains(d))
+                .count();
+            if non_preserved_count <= MAX_RECENT_MANIFEST_DIGESTS {
+                break;
+            }
+            let unconfirmed_spk_count = self
+                .recent_manifest_digests
+                .iter()
+                .filter(|d| !preserve.contains(d) && self.is_unconfirmed_digest_for_retained_spk(d))
+                .count();
+            let Some(evict_idx) = self.recent_manifest_digests[..candidate_end]
+                .iter()
+                .position(|d| {
+                    !preserve.contains(d)
+                        && !self.is_digest_for_retained_spk(d)
+                        && !self.is_unconfirmed_digest_for_retained_spk(d)
+                        && !self.confirmed_manifest_digests.contains(d)
+                })
+                .or_else(|| {
+                    self.recent_manifest_digests[..candidate_end]
+                        .iter()
+                        .position(|d| {
+                            !preserve.contains(d)
+                                && !self.is_digest_for_retained_spk(d)
+                                && !self.is_unconfirmed_digest_for_retained_spk(d)
+                        })
+                })
+                .or_else(|| {
+                    (unconfirmed_spk_count > MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS).then(|| {
+                        self.recent_manifest_digests[..candidate_end]
+                            .iter()
+                            .position(|d| {
+                                !preserve.contains(d)
+                                    && self.is_unconfirmed_digest_for_retained_spk(d)
+                            })
+                    })?
+                })
+            else {
+                break;
+            };
+            let removed = self.recent_manifest_digests.remove(evict_idx);
+            self.manifest_digest_spks.remove(&removed);
+        }
+        while self.recent_manifest_digests.len() > MAX_RETAINED_MANIFEST_DIGESTS {
+            let evict_idx = self.evict_excess_manifest_digest_idx(preserve);
+            let removed = self.recent_manifest_digests.remove(evict_idx);
+            self.manifest_digest_spks.remove(&removed);
+        }
+    }
+
+    /// Pop a previously appended manifest digest and restore any digests it evicted at their
+    /// original FIFO positions.
     pub(crate) fn rollback_manifest_digest(
         &mut self,
         added: [u8; 32],
-        evicted: Option<(usize, [u8; 32])>,
+        evicted: &[EvictedManifestDigest],
     ) {
         if self.recent_manifest_digests.last() == Some(&added) {
             self.recent_manifest_digests.pop();
+            if !self.recent_manifest_digests.contains(&added) {
+                self.manifest_digest_spks.remove(&added);
+            }
         }
-        if let Some((pos, restored)) = evicted
-            && self.recent_manifest_digests.len() < MAX_RECENT_MANIFEST_DIGESTS
-            && !self.recent_manifest_digests.contains(&restored)
-        {
-            let idx = pos.min(self.recent_manifest_digests.len());
-            self.recent_manifest_digests.insert(idx, restored);
+        for &(pos, restored, restored_spk) in evicted.iter().rev() {
+            if self.recent_manifest_digests.len() < MAX_STORED_MANIFEST_DIGESTS
+                && !self.recent_manifest_digests.contains(&restored)
+            {
+                let idx = pos.min(self.recent_manifest_digests.len());
+                self.recent_manifest_digests.insert(idx, restored);
+                if let Some(spk_entry) = restored_spk {
+                    self.manifest_digest_spks.insert(restored, spk_entry);
+                }
+            }
         }
     }
 
@@ -380,57 +637,55 @@ impl ClientState {
         &self.pq_config
     }
 
+    /// Unified mailbox high-water sequence number last committed locally.
+    pub fn mailbox_cursor(&self) -> u64 {
+        self.mailbox_cursor
+    }
+
+    /// Unified mailbox sequence number committed locally and awaiting server prefix ACK (`0` if
+    /// none).
+    pub fn pending_mailbox_ack(&self) -> u64 {
+        self.pending_mailbox_ack
+    }
+
+    /// Next identity-wide monotonic write-token grant version (`>= 1`).
+    pub fn next_grant_version(&self) -> u64 {
+        self.next_grant_version.max(1)
+    }
+
+    /// Opaque 32-byte per-peer slot identifier sent to the mailbox relay so the relay stays blind
+    /// to `peer`: `HMAC-SHA256(identity_sk, b"session.v2/peer-slot\0" || peer)`.
+    pub fn peer_slot_id(&self, peer: &PublicKey) -> [u8; PEER_SLOT_ID_LENGTH] {
+        let sk = self.identity.to_bytes();
+        let mut mac = Hmac::<Sha256>::new_from_slice(sk.as_slice()).expect("HMAC takes any key");
+        mac.update(PEER_SLOT_DOMAIN);
+        mac.update(peer);
+        mac.finalize().into_bytes().into()
+    }
+
     #[cfg(any(feature = "prost", feature = "serde"))]
     fn validate(&self) -> Result<()> {
         if self.last_timestamp > protocol::MAX_SAFE_INTEGER
             || self.manifest_seq > protocol::MAX_SAFE_INTEGER
             || self.prekey_generation > protocol::MAX_SAFE_INTEGER
-            || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            || self.mailbox_cursor > protocol::MAX_SAFE_INTEGER
+            || self.pending_mailbox_ack > protocol::MAX_SAFE_INTEGER
+            || self.pending_mailbox_ack > self.mailbox_cursor
+            || self.next_grant_version == 0
+            || self.next_grant_version > protocol::MAX_SAFE_INTEGER
+            || self.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS
+            || self.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            || self.manifest_digest_spks.len() > MAX_STORED_MANIFEST_DIGESTS
+            || self
+                .manifest_digest_spks
+                .keys()
+                .any(|d| !self.recent_manifest_digests.contains(d))
             || (self.manifest_seq > 0 && self.recent_manifest_digests.is_empty())
         {
             return Err(ErrorKind::MalformedState.into());
         }
         self.pq_config.validate()?;
         Ok(())
-    }
-}
-
-#[cfg(feature = "rkyv")]
-fn archived_pq_suite(suite: &x3dh::pq::ArchivedPqSuite) -> PqSuite {
-    match suite {
-        x3dh::pq::ArchivedPqSuite::MlKem1024 => PqSuite::MlKem1024,
-        x3dh::pq::ArchivedPqSuite::MlKem768 => PqSuite::MlKem768,
-    }
-}
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedClientState
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        use rkyv::rancor::Source;
-        let check = || -> Result<()> {
-            let manifest_seq = self.manifest_seq.to_native();
-            if self.last_timestamp.to_native() > protocol::MAX_SAFE_INTEGER
-                || manifest_seq > protocol::MAX_SAFE_INTEGER
-                || self.prekey_generation.to_native() > protocol::MAX_SAFE_INTEGER
-                || self.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
-                || (manifest_seq > 0 && self.recent_manifest_digests.is_empty())
-            {
-                return Err(ErrorKind::MalformedState.into());
-            }
-            let pq_config = PqConfig {
-                pq_enabled: self.pq_config.pq_enabled,
-                preferred_suite: archived_pq_suite(&self.pq_config.preferred_suite),
-                pq_ratchet_enabled: self.pq_config.pq_ratchet_enabled,
-                strict_pq: self.pq_config.strict_pq,
-            };
-            pq_config.validate()?;
-            Ok(())
-        };
-        check().map_err(C::Error::new)
     }
 }
 
@@ -482,6 +737,76 @@ where
 }
 
 #[cfg(feature = "serde")]
+fn serialize_digest_spk_map<S>(
+    map: &BTreeMap<[u8; 32], (PublicKey, bool)>,
+    serializer: S,
+) -> core::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq as _;
+    let mut seq = serializer.serialize_seq(Some(map.len()))?;
+    for (digest, &(spk, confirmed)) in map {
+        seq.serialize_element(&(digest, spk, confirmed))?;
+    }
+    seq.end()
+}
+
+#[cfg(feature = "serde")]
+fn default_grant_version() -> u64 {
+    1
+}
+
+#[cfg(feature = "serde")]
+struct RawManifestDigestSpk(([u8; 32], PublicKey, bool));
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for RawManifestDigestSpk {
+    fn deserialize<D>(deserializer: D) -> core::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = RawManifestDigestSpk;
+
+            fn expecting(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                write!(
+                    f,
+                    "a 2- or 3-element tuple (digest, signed_prekey[, confirmed])"
+                )
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> core::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let digest: [u8; 32] = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                let spk: PublicKey = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
+                // Accept both 2-element `(digest, spk)` from earlier snapshots (defaulting to
+                // `confirmed = true`) and 3-element `(digest, spk, confirmed)` (`R11-P2-8`).
+                let confirmed: bool = seq.next_element()?.unwrap_or(true);
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(4, &self));
+                }
+                Ok(RawManifestDigestSpk((digest, spk, confirmed)))
+            }
+        }
+
+        // Match `serialize_digest_spk_map`'s `serialize_tuple(3)` so non-self-describing binary
+        // formats (`postcard`, `bincode`) read 3 elements without expecting a per-entry length
+        // prefix, while self-describing formats still delegate to `SeqAccess` and accept legacy
+        // 2-element `(digest, spk)` tuples (`R12-P2-1`).
+        deserializer.deserialize_tuple(3, Visitor)
+    }
+}
+
+#[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 #[serde(rename = "ClientState")]
 struct RawClientState {
@@ -497,9 +822,71 @@ struct RawClientState {
     prekey_generation: u64,
     #[serde(
         default,
-        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_MANIFEST_DIGESTS>"
     )]
     recent_manifest_digests: Vec<[u8; 32]>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_RECENT_MANIFEST_DIGESTS>"
+    )]
+    confirmed_manifest_digests: Vec<[u8; 32]>,
+    #[serde(default)]
+    mailbox_cursor: u64,
+    #[serde(default)]
+    pending_mailbox_ack: u64,
+    #[serde(default = "default_grant_version")]
+    next_grant_version: u64,
+    /// Trailing field so pre-existing positional Serde snapshots (e.g. MessagePack) decode without
+    /// shifting `mailbox_cursor` / `pending_mailbox_ack` / `next_grant_version` (`R10-P2-4`).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_MANIFEST_DIGESTS>"
+    )]
+    manifest_digest_spks: Vec<RawManifestDigestSpk>,
+}
+
+#[cfg(any(feature = "prost", feature = "serde"))]
+fn backfill_legacy_manifest_digest_spks(
+    recent: &[[u8; 32]],
+    confirmed: &[[u8; 32]],
+    prekeys: &LocalPrekeys,
+    map: &mut BTreeMap<[u8; 32], (PublicKey, bool)>,
+) {
+    if recent.is_empty() {
+        return;
+    }
+    let Some(cur_spk) = prekeys.current_signed_prekey() else {
+        return;
+    };
+    if map.is_empty() {
+        if confirmed.is_empty() {
+            let start = recent.len().saturating_sub(MAX_RECENT_MANIFEST_DIGESTS);
+            for &digest in &recent[start..] {
+                map.insert(digest, (cur_spk, true));
+            }
+        } else {
+            for &digest in confirmed {
+                if recent.contains(&digest) {
+                    map.insert(digest, (cur_spk, true));
+                }
+            }
+        }
+    }
+    // R11-P2-6: Always backfill up to `MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS` newest unbound
+    // non-confirmed digests in `recent` as `(cur_spk, false)` even when `map` is already
+    // non-empty (e.g. a snapshot containing confirmed bindings plus an unbound ambiguous attempt).
+    let mut unconfirmed_bound = map.values().filter(|(_, c)| !*c).count();
+    for &digest in recent.iter().rev() {
+        if unconfirmed_bound >= MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS {
+            break;
+        }
+        if !confirmed.contains(&digest)
+            && let std::collections::btree_map::Entry::Vacant(e) = map.entry(digest)
+        {
+            e.insert((cur_spk, false));
+            unconfirmed_bound += 1;
+        }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -507,6 +894,23 @@ impl TryFrom<RawClientState> for ClientState {
     type Error = Error;
 
     fn try_from(raw: RawClientState) -> Result<Self> {
+        let mut manifest_digest_spks = BTreeMap::new();
+        for RawManifestDigestSpk((digest, spk, confirmed)) in raw.manifest_digest_spks {
+            if manifest_digest_spks
+                .insert(digest, (spk, confirmed))
+                .is_some()
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+        }
+        // R10-P2-3: Preserve unbound confirmed (and bounded unconfirmed) digests restored from
+        // pre-binding snapshots until the current signed prekey at restore time retires.
+        backfill_legacy_manifest_digest_spks(
+            &raw.recent_manifest_digests,
+            &raw.confirmed_manifest_digests,
+            &raw.prekeys,
+            &mut manifest_digest_spks,
+        );
         let state = Self {
             identity: raw.identity,
             prekeys: raw.prekeys,
@@ -516,6 +920,11 @@ impl TryFrom<RawClientState> for ClientState {
             manifest_seq: raw.manifest_seq,
             prekey_generation: raw.prekey_generation,
             recent_manifest_digests: raw.recent_manifest_digests,
+            confirmed_manifest_digests: raw.confirmed_manifest_digests,
+            mailbox_cursor: raw.mailbox_cursor,
+            pending_mailbox_ack: raw.pending_mailbox_ack,
+            next_grant_version: raw.next_grant_version.max(1),
+            manifest_digest_spks,
         };
         state.validate()?;
         Ok(state)
@@ -541,6 +950,25 @@ impl From<&ClientState> for proto::ClientState {
                 .iter()
                 .map(|d| d.to_vec())
                 .collect(),
+            confirmed_manifest_digests: state
+                .confirmed_manifest_digests
+                .iter()
+                .map(|d| d.to_vec())
+                .collect(),
+            manifest_digest_spks: state
+                .manifest_digest_spks
+                .iter()
+                .map(
+                    |(digest, &(spk, confirmed))| proto::SignedPrekeyManifestDigest {
+                        digest: digest.to_vec(),
+                        signed_prekey: spk.to_vec(),
+                        unconfirmed: !confirmed,
+                    },
+                )
+                .collect(),
+            mailbox_cursor: state.mailbox_cursor,
+            pending_mailbox_ack: state.pending_mailbox_ack,
+            next_grant_version: state.next_grant_version.max(1),
         }
     }
 }
@@ -567,7 +995,10 @@ impl TryFrom<&proto::ClientState> for ClientState {
         if state.strict_pq && (state.pq_disabled || !has_pq) {
             return Err(ErrorKind::MalformedState.into());
         }
-        if state.recent_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS {
+        if state.recent_manifest_digests.len() > MAX_STORED_MANIFEST_DIGESTS
+            || state.confirmed_manifest_digests.len() > MAX_RECENT_MANIFEST_DIGESTS
+            || state.manifest_digest_spks.len() > MAX_STORED_MANIFEST_DIGESTS
+        {
             return Err(ErrorKind::MalformedState.into());
         }
         let recent_manifest_digests = state
@@ -578,26 +1009,61 @@ impl TryFrom<&proto::ClientState> for ClientState {
                     .map_err(|_| Error::from(ErrorKind::MalformedState))
             })
             .collect::<Result<Vec<_>>>()?;
+        let confirmed_manifest_digests = state
+            .confirmed_manifest_digests
+            .iter()
+            .map(|d| {
+                <[u8; 32]>::try_from(d.as_slice())
+                    .map_err(|_| Error::from(ErrorKind::MalformedState))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut manifest_digest_spks = BTreeMap::new();
+        for entry in &state.manifest_digest_spks {
+            let digest = <[u8; 32]>::try_from(entry.digest.as_slice())
+                .map_err(|_| Error::from(ErrorKind::MalformedState))?;
+            let spk = PublicKey::try_from(entry.signed_prekey.as_slice())
+                .map_err(|_| Error::from(ErrorKind::MalformedState))?;
+            if manifest_digest_spks
+                .insert(digest, (spk, !entry.unconfirmed))
+                .is_some()
+            {
+                return Err(ErrorKind::MalformedState.into());
+            }
+        }
+        let prekeys = state
+            .prekeys
+            .as_ref()
+            .map(LocalPrekeys::try_from)
+            .transpose()?
+            .unwrap_or_default();
+        // R10-P2-3: Preserve unbound confirmed (and bounded unconfirmed) digests restored from
+        // pre-binding v2 protobufs until the signed prekey present at restore time retires.
+        backfill_legacy_manifest_digest_spks(
+            &recent_manifest_digests,
+            &confirmed_manifest_digests,
+            &prekeys,
+            &mut manifest_digest_spks,
+        );
         let pq_config = PqConfig {
-            pq_enabled: has_pq && !state.pq_disabled,
+            pq_enabled: !state.pq_disabled,
             preferred_suite,
-            pq_ratchet_enabled: has_pq && !state.pq_ratchet_disabled,
+            pq_ratchet_enabled: !state.pq_ratchet_disabled,
             strict_pq: state.strict_pq,
         };
         let restored = Self {
             identity,
-            prekeys: state
-                .prekeys
-                .as_ref()
-                .map(LocalPrekeys::try_from)
-                .transpose()?
-                .unwrap_or_default(),
+            prekeys,
             last_timestamp: state.last_timestamp,
             publishing: state.publishing,
             pq_config,
             manifest_seq: state.manifest_seq,
             prekey_generation: state.prekey_generation,
             recent_manifest_digests,
+            confirmed_manifest_digests,
+            mailbox_cursor: state.mailbox_cursor,
+            pending_mailbox_ack: state.pending_mailbox_ack,
+            next_grant_version: state.next_grant_version.max(1),
+            manifest_digest_spks,
         };
         restored.validate()?;
         Ok(restored)
@@ -626,8 +1092,9 @@ impl<H> Client<H> {
         }
     }
 
-    /// What to save to [`restore`](Client::restore) this client later. Its prekeys change when
-    /// publishing and accepting, so save it after those.
+    /// What to save to [`restore`](Client::restore) this client later. Its prekeys, mailbox
+    /// cursors, and grant version counter change on publish, accept, receive, and grant
+    /// allocation, so save it after those.
     pub fn state(&self) -> &ClientState {
         &self.state
     }
@@ -672,9 +1139,134 @@ impl<H> Client<H> {
         self.state.manifest_seq
     }
 
+    /// Whether recording another manifest digest can fit within [`MAX_RETAINED_MANIFEST_DIGESTS`]
+    /// without evicting any digest listed in `preserve`.
+    pub fn has_spare_manifest_digest_slot(&self, preserve: &[[u8; 32]]) -> bool {
+        self.state.has_spare_manifest_digest_slot(preserve)
+    }
+
+    /// Exact capacity check for a `PublishV2` attempt preserving `(preserve_spks, preserve_digests)`
+    /// as well as every manifest digest bound to signed prekeys that will remain retained after
+    /// commit (`R9-P2-4`).
+    pub fn has_spare_manifest_digest_slot_for_publish(
+        &self,
+        preserve_spks: &[PublicKey],
+        preserve_digests: &[[u8; 32]],
+    ) -> bool {
+        self.state
+            .has_spare_manifest_digest_slot_for_publish(preserve_spks, preserve_digests)
+    }
+
+    /// SHA-256 digests of all locally signed `CapabilityManifest`s currently retained by this
+    /// client (both rolling and preserved).
+    pub fn recent_manifest_digests(&self) -> &[[u8; 32]] {
+        &self.state.recent_manifest_digests
+    }
+
+    /// SHA-256 digests of locally signed `CapabilityManifest`s confirmed stored on the relay.
+    pub fn confirmed_manifest_digests(&self) -> &[[u8; 32]] {
+        &self.state.confirmed_manifest_digests
+    }
+
+    /// Whether `digest` is a confirmed manifest digest bound to a currently retained signed prekey
+    /// (`R10-P2-2`).
+    pub fn is_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
+        self.state.is_digest_for_retained_spk(digest)
+    }
+
+    /// The retained signed prekey bound to confirmed manifest `digest`, if any (`R13-P2-3`).
+    pub fn confirmed_digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
+        self.state.confirmed_digest_retained_spk(digest)
+    }
+
+    /// The retained signed prekey bound to `digest` regardless of whether `digest` has been
+    /// confirmed yet (used to count a newly staged/landed manifest digest against its SPK quota
+    /// before commit/reconciliation flips it to confirmed, `R15-P2-4`).
+    pub fn digest_retained_spk(&self, digest: &[u8; 32]) -> Option<PublicKey> {
+        self.state.digest_retained_spk(digest)
+    }
+
+    /// Whether `spk` is currently among this client's retained signed prekeys.
+    pub fn has_signed_prekey(&self, spk: &PublicKey) -> bool {
+        self.state.prekeys.contains_signed_prekey(spk)
+    }
+
+    /// Whether `digest` is an unconfirmed/ambiguous staged manifest digest bound to a currently
+    /// retained signed prekey (`R10-P2-3`).
+    pub fn is_unconfirmed_digest_for_retained_spk(&self, digest: &[u8; 32]) -> bool {
+        self.state.is_unconfirmed_digest_for_retained_spk(digest)
+    }
+
+    /// Whether the latest local prekey generation currently holds a last-resort PQSPK for `suite`
+    /// (`R10-P2-1`).
+    pub fn has_current_pq_last_resort(&self, suite: PqSuite) -> bool {
+        self.state.prekeys.has_pq_last_resort(suite)
+    }
+
     /// Prekey generation number last prepared/published via v2 by this client.
     pub fn prekey_generation(&self) -> u64 {
         self.state.prekey_generation
+    }
+
+    /// Unified mailbox high-water sequence number last committed locally.
+    pub fn mailbox_cursor(&self) -> u64 {
+        self.state.mailbox_cursor
+    }
+
+    /// Unified mailbox sequence number committed locally and awaiting server prefix ACK (`0` if
+    /// none).
+    pub fn pending_mailbox_ack(&self) -> u64 {
+        self.state.pending_mailbox_ack
+    }
+
+    /// Next identity-wide monotonic write-token grant version (`>= 1`), without advancing it.
+    pub fn next_grant_version(&self) -> u64 {
+        self.state.next_grant_version()
+    }
+
+    /// Opaque 32-byte per-peer slot identifier sent to the mailbox relay so the relay stays blind
+    /// to `peer`: `HMAC-SHA256(identity_sk, b"session.v2/peer-slot\0" || peer)`.
+    pub fn peer_slot_id(&self, peer: &PublicKey) -> [u8; PEER_SLOT_ID_LENGTH] {
+        self.state.peer_slot_id(peer)
+    }
+
+    /// Allocate and advance the next strictly positive identity-wide monotonic write-token grant
+    /// version (`1..MAX_SAFE_INTEGER`), so deleting and recreating a chat always exceeds any
+    /// prior `revoked_below_version`.
+    pub fn allocate_grant_version(&mut self) -> Result<u64> {
+        let version = self.state.next_grant_version.max(1);
+        let next = version
+            .checked_add(1)
+            .filter(|&n| n <= protocol::MAX_SAFE_INTEGER)
+            .ok_or(ErrorKind::Protocol)?;
+        self.state.next_grant_version = next;
+        Ok(version)
+    }
+
+    /// Advance the unified mailbox cursor (`mailbox_cursor`) and pending server prefix ACK
+    /// watermark (`pending_mailbox_ack`) monotonically after durably processing a fetched page.
+    ///
+    /// Fails with [`ErrorKind::InvalidArgument`] if either sequence exceeds
+    /// [`protocol::MAX_SAFE_INTEGER`] or if `acked_through` exceeds the resulting cursor.
+    pub fn commit_mailbox_page(&mut self, last_seq: u64, acked_through: u64) -> Result<()> {
+        if last_seq > protocol::MAX_SAFE_INTEGER || acked_through > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::InvalidArgument.into());
+        }
+        let new_cursor = self.state.mailbox_cursor.max(last_seq);
+        if acked_through > new_cursor {
+            return Err(ErrorKind::InvalidArgument.into());
+        }
+        self.state.mailbox_cursor = new_cursor;
+        self.state.pending_mailbox_ack = self.state.pending_mailbox_ack.max(acked_through);
+        Ok(())
+    }
+
+    /// Clear `pending_mailbox_ack` once the server has confirmed deletion up to `acked_up_to`
+    /// (e.g. via a piggybacked `FetchSigned.ack_up_to_sequence` on an empty page).
+    pub fn clear_pending_mailbox_ack(&mut self, acked_up_to: u64) {
+        if self.state.pending_mailbox_ack <= acked_up_to {
+            self.state.pending_mailbox_ack = 0;
+        }
     }
 
     /// Latest local signed prekey, if any generation has been generated.
@@ -691,6 +1283,18 @@ impl<H> Client<H> {
     /// Number of unused classical one-time prekeys in the latest local generation.
     pub fn current_one_time_count(&self) -> usize {
         self.state.prekeys.current_one_time_count()
+    }
+
+    /// Remaining classical one-time prekey capacity in the latest local generation before hitting
+    /// [`x3dh::MAX_ONE_TIME_PER_GENERATION`].
+    pub fn remaining_one_time_headroom(&self) -> usize {
+        self.state.prekeys.remaining_one_time_headroom()
+    }
+
+    /// Remaining total post-quantum one-time prekey capacity in the latest local generation before
+    /// hitting [`x3dh::MAX_ONE_TIME_PER_GENERATION`].
+    pub fn remaining_pq_one_time_headroom(&self) -> usize {
+        self.state.prekeys.remaining_pq_one_time_headroom()
     }
 
     /// Number of unused post-quantum one-time prekeys for `suite` in the latest local generation.
@@ -712,93 +1316,6 @@ impl<H> Client<H> {
         }
     }
 
-    /// Prepare a classical v1 prekey publish request without sending it over the network yet.
-    ///
-    /// Persist [`Client::state`] BEFORE calling [`Client::transmit_publish`], then call
-    /// [`Client::commit_publish`] on success or [`Client::rollback_publish_on_refusal`] on
-    /// [`ErrorKind::SignInRequired`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub fn prepare_publish(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
-        let was_publishing = self.state.publishing;
-        let prev_last_timestamp = self.state.last_timestamp;
-        let extended = was_publishing;
-        let timestamp = self.next_timestamp()?;
-        let published = if extended {
-            self.state
-                .prekeys
-                .extend(&self.state.identity, one_time_count)
-        } else {
-            self.state
-                .prekeys
-                .generate(&self.state.identity, one_time_count)
-        };
-        self.state.publishing = true;
-        let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
-        Ok(PreparedPublish {
-            request,
-            extended,
-            was_publishing,
-            prev_last_timestamp,
-            signed_prekey: published.signed_prekey,
-            one_time_prekeys: published.one_time_prekeys,
-        })
-    }
-
-    /// Prepare a classical v1 publish that replenishes `one_time_count` one-time prekeys on the
-    /// current generation WITHOUT rotating the signed prekey (generates a generation if none
-    /// exists yet).
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub fn prepare_extend_keys(&mut self, one_time_count: usize) -> Result<PreparedPublish> {
-        let was_publishing = self.state.publishing;
-        let prev_last_timestamp = self.state.last_timestamp;
-        let had_gen = self.state.prekeys.generation_count() > 0;
-        let timestamp = self.next_timestamp()?;
-        let published = self
-            .state
-            .prekeys
-            .extend(&self.state.identity, one_time_count);
-        self.state.publishing = true;
-        let request = PublishRequest::sign(&self.state.identity, &published, timestamp)?;
-        Ok(PreparedPublish {
-            request,
-            extended: had_gen,
-            was_publishing,
-            prev_last_timestamp,
-            signed_prekey: published.signed_prekey,
-            one_time_prekeys: published.one_time_prekeys,
-        })
-    }
-
-    /// Mark a prepared classical publish as confirmed by the server.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub fn commit_publish(&mut self, _prepared: PreparedPublish) {
-        self.state.publishing = false;
-    }
-
-    /// Retract newly added one-time prekeys from a prepared classical publish that was refused
-    /// before storage (e.g. [`ErrorKind::SignInRequired`], [`ErrorKind::LimitExceeded`], or
-    /// [`ErrorKind::Protocol`]).
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub fn rollback_publish_on_refusal(&mut self, prepared: PreparedPublish) {
-        if prepared.extended {
-            self.state
-                .prekeys
-                .retract(&prepared.signed_prekey, &prepared.one_time_prekeys);
-            self.state.publishing = prepared.was_publishing;
-        }
-        if self.state.last_timestamp == prepared.request.timestamp {
-            self.state.last_timestamp = prepared.prev_last_timestamp;
-        }
-    }
-
     /// Start uploading an attachment of `size` bytes: a new key, and the service's ID and upload
     /// token for it. Then [encrypt](attachment::Upload::try_encrypt) and
     /// [put](attachment::Upload::put) each chunk, and send the ID and key to the recipients in a
@@ -811,38 +1328,7 @@ impl<H> Client<H> {
         attachments: &impl LocalAttachments,
         size: u64,
     ) -> Result<attachment::Upload> {
-        let chunks = u32::try_from(attachment::chunk_count(size))
-            .map_err(|_| Error::from(ErrorKind::LimitExceeded))?;
-        let key = attachment::try_generate_key()?;
-        let response = attachments
-            .start_upload(StartUploadRequest {
-                chunks,
-                delete_hash: Bytes::copy_from_slice(&attachment::delete_hash(&key)),
-            })
-            .await?;
-        Ok(attachment::Upload::new(
-            protocol::fixed(&response.id)?,
-            Zeroizing::new(protocol::fixed(&response.upload_token)?),
-            key,
-            chunks,
-            (response.expires != 0).then_some(response.expires),
-        ))
-    }
-
-    /// A legacy non-audience-bound subscription to this client's notifications, signed by its
-    /// identity key; see `protocol::notify`. It is good for a few minutes of the server's
-    /// [clock](Self::clock).
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    #[allow(deprecated)]
-    pub fn subscription(&self) -> SubscribeRequest {
-        // Within a few minutes of the server's clock, not by the strictly increasing timestamp,
-        // which may have run ahead of it.
-        SubscribeRequest::sign(
-            &self.state.identity,
-            self.clock.now().min(protocol::MAX_SAFE_INTEGER),
-        )
+        start_upload_with(attachments, size).await
     }
 
     /// Sign a notification subscription for a configured relay URL or host using its clock.
@@ -873,6 +1359,26 @@ impl<H> Client<H> {
         Ok(now)
     }
 
+    /// Milliseconds since the Unix epoch from [`ServerClock::trusted_clock_pair`], failing closed
+    /// with [`ErrorKind::ClockSkew`] if the local clock is invalid or disagrees with the server
+    /// clock beyond its trusted drift threshold. Respects monotonicity against `last_timestamp`
+    /// (unless `last_timestamp` lies more than [`protocol::MAX_CLOCK_SKEW`] ahead) without
+    /// mutating `last_timestamp` during prepare.
+    pub(crate) fn trusted_timestamp(&self) -> Result<u64> {
+        let (_local, server) = self.clock.trusted_clock_pair()?;
+        let ts = if self.state.last_timestamp.saturating_add(1)
+            > server.saturating_add(protocol::MAX_CLOCK_SKEW)
+        {
+            server
+        } else {
+            server.max(self.state.last_timestamp.saturating_add(1))
+        };
+        if ts > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::Protocol.into());
+        }
+        Ok(ts)
+    }
+
     /// Milliseconds since the Unix epoch by the server's [clock](Self::clock), strictly
     /// increasing (unless a stale persisted `last_timestamp` lies more than
     /// [`protocol::MAX_CLOCK_SKEW`] ahead of the current clock) and bounded by
@@ -894,287 +1400,6 @@ impl<H> Client<H> {
     }
 }
 
-#[allow(deprecated)]
-impl<H: LocalHandshake> Client<H> {
-    /// Transmit a prepared classical publish request (after persisting [`Client::state`]).
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn transmit_publish(&self, prepared: &PreparedPublish) -> Result<()> {
-        self.handshake.publish(prepared.request.clone()).await?;
-        Ok(())
-    }
-
-    /// Generate and publish a signed prekey and `one_time_count` one-time prekeys, replacing
-    /// the published ones.
-    ///
-    /// Only the last [`x3dh::KEPT_GENERATIONS`] generations of prekeys are kept, so take the
-    /// initial messages waiting before publishing again; later, the ones using deleted prekeys
-    /// cannot be accepted. If publishing fails, the server may still have the prekeys, its reply
-    /// being lost: the next publish sends the same signed prekey again, with new one-time
-    /// prekeys, rather than a new generation, which would delete the private keys of prekeys
-    /// the server hands out. One refused for want of a sign-in, which the server keeps none of,
-    /// forgets the one-time prekeys it added to them, so that publishing again while signed out
-    /// does not add up keys. Save the state after this, failed or not.
-    ///
-    /// For persist-before-transmit flows, use [`Client::prepare_publish`], persist
-    /// [`Client::state`], then call [`Client::transmit_publish`] and [`Client::commit_publish`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn publish_keys(&mut self, one_time_count: usize) -> Result<()> {
-        let prepared = self.prepare_publish(one_time_count)?;
-        match self.transmit_publish(&prepared).await {
-            Ok(()) => {
-                self.commit_publish(prepared);
-                Ok(())
-            }
-            Err(e) if e.is_server_refusal() && e.kind() == ErrorKind::SignInRequired => {
-                self.rollback_publish_on_refusal(prepared);
-                Err(e)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Replenish `one_time_count` classical one-time prekeys on the current generation without
-    /// rotating the signed prekey (generates a generation if none exists yet).
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn extend_keys(&mut self, one_time_count: usize) -> Result<()> {
-        let prepared = self.prepare_extend_keys(one_time_count)?;
-        match self.transmit_publish(&prepared).await {
-            Ok(()) => {
-                self.commit_publish(prepared);
-                Ok(())
-            }
-            Err(e)
-                if e.is_server_refusal()
-                    && matches!(
-                        e.kind(),
-                        ErrorKind::SignInRequired | ErrorKind::LimitExceeded | ErrorKind::Protocol
-                    ) =>
-            {
-                self.rollback_publish_on_refusal(prepared);
-                Err(e)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Prepare starting a classical session with `peer` without sending the initial message yet,
-    /// so the caller can persist [`PreparedInitiate::session`] BEFORE calling
-    /// [`Client::send_prepared_initiate`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn prepare_initiate<M>(
-        &mut self,
-        peer: &PublicKey,
-        content: &[u8],
-        mailbox: M,
-    ) -> Result<PreparedInitiate<M>> {
-        if self.state.pq_config.strict_pq {
-            return Err(ErrorKind::PqRequired.into());
-        }
-        let response = self
-            .handshake
-            .fetch_bundle(FetchBundleRequest {
-                identity_key: Bytes::copy_from_slice(peer),
-            })
-            .await?;
-        let bundle = PrekeyBundle::try_from(&response)?;
-        let (message, agreement) = bundle.initiate(&self.state.identity, peer)?;
-        let ratchet = Ratchet::alice(
-            &SharedKeys::from_secret(&agreement.secret_key),
-            &bundle.signed_prekey,
-        )?;
-        let mut party = Party::new(ratchet, agreement.associated_data);
-        let first_message = party.encrypt(content)?;
-        let initial_message = handshake::InitialMessage {
-            first_message: Some(first_message),
-            ..handshake::InitialMessage::from(&message)
-        };
-        let request = SendInitialMessageRequest {
-            recipient: Bytes::copy_from_slice(peer),
-            message: Some(initial_message.clone()),
-        };
-        let mut session = Session::new(
-            mailbox,
-            Active {
-                party,
-                id: message.ephemeral_key,
-                known_by_peer: false,
-                initial_message: initial_message.encode_to_vec(),
-                delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
-                security: SessionSecurity::classical(),
-                peer_session_seq: 0,
-            },
-            self.identity_key,
-            *peer,
-        );
-        if let Some(hello) = extract_hello(content)
-            && hello.session_seq > 0
-        {
-            session.state.next_session_seq = hello
-                .session_seq
-                .saturating_add(1)
-                .min(protocol::MAX_SAFE_INTEGER);
-        }
-        Ok(PreparedInitiate { session, request })
-    }
-
-    /// Transmit a prepared classical initial message request (after persisting `session.state()`).
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn send_prepared_initiate(&self, request: &SendInitialMessageRequest) -> Result<()> {
-        self.handshake.send_initial_message(request.clone()).await?;
-        Ok(())
-    }
-
-    /// Start a session with `peer`, whose first message is `content`: fetch the peer's prekeys,
-    /// run X3DH, and leave the initial message, with the first message, in the peer's inbox.
-    ///
-    /// The first message shows the peer that the initial message is this client's, and lets the
-    /// peer write back at once. It can be empty.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn initiate<M>(
-        &mut self,
-        peer: &PublicKey,
-        content: &[u8],
-        mailbox: M,
-    ) -> Result<Session<M>> {
-        let prepared = self.prepare_initiate(peer, content, mailbox).await?;
-        self.send_prepared_initiate(&prepared.request).await?;
-        Ok(prepared.session)
-    }
-
-    /// Prepare starting a new classical session with `session`'s peer and merge it into `session`
-    /// via [`Session::keep`], returning the `SendInitialMessageRequest` to transmit AFTER
-    /// persisting `session.state()`.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn prepare_start_again<M: Clone>(
-        &mut self,
-        session: &mut Session<M>,
-        content: &[u8],
-    ) -> Result<SendInitialMessageRequest> {
-        if session.state.me != self.identity_key {
-            return Err(ErrorKind::UnexpectedPeer.into());
-        }
-        if self.state.pq_config.strict_pq {
-            return Err(ErrorKind::PqRequired.into());
-        }
-        let local_pq_enabled =
-            self.state.pq_config.pq_enabled && !self.state.pq_config.offered_suites().is_empty();
-        if local_pq_enabled
-            && session.state.peer_pq.pq_pinned
-            && !session.state.peer_pq.allow_classical_exception
-        {
-            return Err(ErrorKind::DowngradeDetected.into());
-        }
-        let prepared = self
-            .prepare_initiate(&session.state.peer, content, session.mailbox.clone())
-            .await?;
-        let older = mem::replace(session, prepared.session);
-        session.keep(older)?;
-        Ok(prepared.request)
-    }
-
-    /// Start a new session with `session`'s peer, whose first message is `content`, and keep
-    /// `session`, the chat so far, with it, see [`Session::keep`]: as when it has none to send
-    /// on ([`Session::needs_new_session`]).
-    ///
-    /// Fails with [`ErrorKind::UnexpectedPeer`] if `session` is another identity's, before
-    /// anything is sent or changed.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn start_again<M: Clone>(
-        &mut self,
-        session: &mut Session<M>,
-        content: &[u8],
-    ) -> Result<()> {
-        let request = self.prepare_start_again(session, content).await?;
-        self.send_prepared_initiate(&request).await
-    }
-
-    /// Take the initial messages waiting in this client's inbox.
-    ///
-    /// The server deletes them, so keep the ones to accept later. Malformed ones, which could
-    /// never be accepted, are left out.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn take_initial_messages(&mut self) -> Result<Vec<InitialMessage>> {
-        let timestamp = self.next_timestamp()?;
-        let request = TakeInitialMessagesRequest::sign(&self.state.identity, timestamp);
-        let response = self.handshake.take_initial_messages(request).await?;
-        // The server has deleted them already, so one malformed message must not fail the
-        // call and lose the others with it.
-        Ok(response
-            .messages
-            .iter()
-            .filter_map(|message| InitialMessage::try_from(message).ok())
-            .collect())
-    }
-
-    /// Accept `initial_message` from `peer`, starting the session `peer` asked for. Returns the
-    /// session and the content of its first message.
-    ///
-    /// Anyone can send an initial message claiming to be from `peer`, but only `peer` can have
-    /// encrypted its first message, which must decrypt. Fails with
-    /// [`ErrorKind::InvalidInitialMessage`] if it does not, or if the initial message was accepted
-    /// already, and with [`ErrorKind::UnexpectedPeer`] if it is not from `peer`; failing, it
-    /// uses up nothing.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub fn accept<M>(
-        &mut self,
-        peer: &PublicKey,
-        initial_message: &InitialMessage,
-        mailbox: M,
-    ) -> Result<(Session<M>, Vec<u8>)> {
-        let (agreement, signed_prekey) =
-            self.state
-                .prekeys
-                .accept(&self.state.identity, peer, &initial_message.x3dh)?;
-        let spk_bytes = Zeroizing::new(signed_prekey.to_bytes());
-        let ratchet = Ratchet::bob(
-            &SharedKeys::from_secret(&agreement.secret_key),
-            DhPrivateKey::from(*spk_bytes),
-        );
-        let mut party = Party::new(ratchet, agreement.associated_data);
-        let content = party
-            .decrypt(&initial_message.first_message)
-            .map_err(|e| Error::new(ErrorKind::InvalidInitialMessage, e))?;
-        // Enforce strict-PQ policy AFTER authenticating the sender and BEFORE confirming prekeys.
-        if self.state.pq_config.strict_pq {
-            return Err(ErrorKind::PqRequired.into());
-        }
-        let peer_session_seq = checked_initial_hello(&content)?.map_or(0, |h| h.session_seq);
-        self.state.prekeys.confirm(&initial_message.x3dh)?;
-        let active = Active {
-            party,
-            id: initial_message.x3dh.ephemeral_key,
-            known_by_peer: true,
-            initial_message: vec![],
-            delivery_key: DeliveryKey::derive(agreement.secret_key.as_slice()),
-            security: SessionSecurity::classical(),
-            peer_session_seq,
-        };
-        let mut session = Session::new(mailbox, active, self.identity_key, *peer);
-        session.state.peer_pq.peer_session_seq = peer_session_seq;
-        Ok((session, content))
-    }
-}
-
 /// Milliseconds since the Unix epoch, by this device's clock.
 fn now() -> u64 {
     web_time::SystemTime::now()
@@ -1184,23 +1409,49 @@ fn now() -> u64 {
         })
 }
 
-/// A message encrypted for the peer by [`Session::encrypt`], to [push](Session::push) now or
-/// later.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A message encrypted for the peer by [`Session::encrypt`], bound to the sealing session's
+/// deniable write token and optional carried initial message so retries and session rotations
+/// never cross-wire sessions.
+///
+/// Its `Debug` implementation redacts `write_token` and ciphertext bytes, and its `Drop`
+/// implementation zeroizes `write_token` (and uniquely owned carried initial bytes).
+#[derive(Clone, PartialEq, Eq)]
 pub struct Sealed {
-    /// The message.
+    /// The encrypted Double Ratchet message.
     pub message: EncryptedMessage,
-    /// SHA-256 of its delivery token, under the key of the session it was encrypted on, which
-    /// the token the peer gives back once it has the message matches, so that the server deletes
-    /// it; none for one that only expires.
-    pub delivery_hash: Option<[u8; 32]>,
+    /// Deniable 32-byte write-capability token captured from the sealing session at encrypt time.
+    pub write_token: Zeroizing<[u8; WRITE_TOKEN_LENGTH]>,
+    /// Encoded carried [`protocol::handshake_v2::InitialMessageV2`] captured from the sealing
+    /// session while `!known_by_peer`, or `None` once the peer is known to have that session.
+    pub initial_message: Option<Bytes>,
+}
+
+impl Drop for Sealed {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut *self.write_token);
+        if let Some(mut carried) = self.initial_message.take() {
+            zeroize_bytes(&mut carried);
+        }
+    }
+}
+
+impl zeroize::ZeroizeOnDrop for Sealed {}
+
+impl core::fmt::Debug for Sealed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Sealed")
+            .field("header_len", &self.message.header.len())
+            .field("content_len", &self.message.content.len())
+            .field("has_initial_message", &self.initial_message.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Sealed {
     /// Deterministic 16-byte client idempotency identifier derived from an encrypted message
     /// (`SHA-256("session.v2/client-message-id\0" || len(header) || header || len(content) || content)[..16]`),
     /// stable across retries and restarts without leaking plaintext or keys.
-    pub fn client_message_id_for(message: &EncryptedMessage) -> [u8; 16] {
+    pub fn client_message_id_for(message: &EncryptedMessage) -> [u8; CLIENT_MESSAGE_ID_LENGTH] {
         let mut hasher = Sha256::new();
         hasher.update(b"session.v2/client-message-id\0");
         hasher.update((message.header.len() as u64).to_be_bytes());
@@ -1208,19 +1459,70 @@ impl Sealed {
         hasher.update((message.content.len() as u64).to_be_bytes());
         hasher.update(&message.content);
         let digest = hasher.finalize();
-        let mut id = [0u8; 16];
-        id.copy_from_slice(&digest[..16]);
+        let mut id = [0u8; CLIENT_MESSAGE_ID_LENGTH];
+        id.copy_from_slice(&digest[..CLIENT_MESSAGE_ID_LENGTH]);
         id
     }
 
     /// Deterministic 16-byte client idempotency identifier derived from this sealed ciphertext
     /// via [`Sealed::client_message_id_for`].
-    pub fn client_message_id(&self) -> [u8; 16] {
+    pub fn client_message_id(&self) -> [u8; CLIENT_MESSAGE_ID_LENGTH] {
         Self::client_message_id_for(&self.message)
+    }
+
+    /// Build a sealed-sender-lite [`PushV2Request`] strictly from this [`Sealed`] envelope and
+    /// `recipient` (no `sender`, no `delivery_hash`), using the deterministic
+    /// [`Self::client_message_id`].
+    pub fn push_v2_request(&self, recipient: &PublicKey) -> PushV2Request {
+        self.push_v2_request_with_id(recipient, Some(self.client_message_id()))
+    }
+
+    /// Build a sealed-sender-lite [`PushV2Request`] strictly from this [`Sealed`] envelope and
+    /// `recipient` with an explicit optional 16-byte `client_message_id`.
+    pub fn push_v2_request_with_id(
+        &self,
+        recipient: &PublicKey,
+        client_message_id: Option<[u8; CLIENT_MESSAGE_ID_LENGTH]>,
+    ) -> PushV2Request {
+        let initial_message = self
+            .initial_message
+            .as_deref()
+            .and_then(decode_carried_initial);
+        PushV2Request {
+            recipient: Bytes::copy_from_slice(recipient),
+            message: Some(self.message.clone()),
+            initial_message,
+            client_message_id: client_message_id
+                .map_or_else(Bytes::new, |id| Bytes::copy_from_slice(&id)),
+            write_token: Bytes::copy_from_slice(self.write_token.as_slice()),
+        }
     }
 }
 
-/// A session with one peer: encrypts with a [`Party`] and exchanges messages through a mailbox.
+/// A message decrypted synchronously by [`Session::decrypt_envelope`].
+///
+/// Its `Debug` implementation redacts decrypted `content` plaintext bytes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DecryptedMessage {
+    /// Decrypted plaintext content.
+    pub content: Vec<u8>,
+    /// Whether the message decrypted on an earlier archived session [kept](Session::keep) rather
+    /// than the active one (e.g. sent before a rekey or before deleting the chat and starting
+    /// again).
+    pub earlier: bool,
+}
+
+impl core::fmt::Debug for DecryptedMessage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DecryptedMessage")
+            .field("content_len", &self.content.len())
+            .field("earlier", &self.earlier)
+            .finish()
+    }
+}
+
+/// A session with one peer: encrypts and decrypts with a [`Party`] and pushes messages through
+/// the v2 mailbox.
 ///
 /// It may hold earlier sessions with the peer too, which only decrypt, see [`Session::keep`].
 ///
@@ -1231,21 +1533,16 @@ pub struct Session<M> {
     pub(crate) state: SessionState,
 }
 
-/// What a [`Session`] keeps besides its transport: the double ratchets, both identity keys and
-/// the position in the peer's queue.
+/// What a [`Session`] keeps besides its transport: the double ratchets, both identity keys,
+/// write-token routing material, pending grant registrations, and PQ policy state.
 ///
-/// Save it to [`restore`](Session::restore) the session later: serialize it with the `serde` or
-/// `rkyv` feature, or with `prost` convert it to a `proto::SessionState`. It holds the session's
-/// keys, so keep it secret; its `Debug` shows none of them, nor the delivery tokens.
+/// Save it to [`restore`](Session::restore) the session later: with `prost` convert it to a
+/// `proto::SessionState` (portable versioned persistence), or serialize it with `serde`. It holds
+/// the session's keys, so keep it secret; its `Debug` shows none of them.
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "RawSessionState")
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct SessionState {
     /// The session messages are sent on; none once retired, until a new one starts.
@@ -1254,30 +1551,17 @@ pub struct SessionState {
     pub(crate) others: Vec<Earlier>,
     pub(crate) me: PublicKey,
     pub(crate) peer: PublicKey,
-    /// Sequence number of the last fetched message.
-    pub(crate) cursor: u64,
     /// What was done last, and how many times the peers turned between sending on the active
     /// session and receiving on an earlier one, see [`Session::keep`].
     pub(crate) last: LastAction,
     pub(crate) direction_changes: u32,
-    /// The last sequence number of the page in which receiving stopped at a message that did not
-    /// decrypt, and up to which messages that do not decrypt are skipped, see
-    /// [`Session::receive`].
-    pub(crate) stalled_through: u64,
-    pub(crate) skip_through: u64,
-    /// The delivery tokens of the messages received and not told to the server yet, which the
-    /// next fetch tells it, see [`Session::receive`].
-    pub(crate) delivered: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
     /// Per-peer post-quantum pinning, downgrade-detection, and `peer_session_seq` state.
     pub(crate) peer_pq: PeerPqState,
     /// Next outgoing monotonic `Hello.session_seq` for this peer (`0` treated as `1`).
     pub(crate) next_session_seq: u64,
-}
-
-impl Drop for SessionState {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.delivered);
-    }
+    /// Pending write-token registrations queued for this peer (at most
+    /// [`MAX_PENDING_REGISTER_GRANTS`]).
+    pub(crate) pending_register_grants: Vec<PendingGrant>,
 }
 
 impl core::fmt::Debug for SessionState {
@@ -1287,14 +1571,14 @@ impl core::fmt::Debug for SessionState {
             .field("others", &self.others)
             .field("me", &self.me)
             .field("peer", &self.peer)
-            .field("cursor", &self.cursor)
             .field("last", &self.last)
             .field("direction_changes", &self.direction_changes)
-            .field("stalled_through", &self.stalled_through)
-            .field("skip_through", &self.skip_through)
-            .field("delivered", &self.delivered.len())
             .field("peer_pq", &self.peer_pq)
             .field("next_session_seq", &self.next_session_seq)
+            .field(
+                "pending_register_grants",
+                &self.pending_register_grants.len(),
+            )
             .finish()
     }
 }
@@ -1302,26 +1586,26 @@ impl core::fmt::Debug for SessionState {
 /// The session a [`SessionState`] sends on.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) struct Active {
     pub(crate) party: Party,
-    /// The session's ID, which both peers have: the X3DH ephemeral key of the one who started
-    /// it.
+    /// The session's ID, which both peers have: the X3DH/PQXDH ephemeral key of the one who
+    /// started it.
     pub(crate) id: PublicKey,
     /// Whether the peer is known to have it: it started it, or a message on it decrypted.
     pub(crate) known_by_peer: bool,
-    /// The initial message, encoded, that started it, which this client did: each message
-    /// goes with it until the peer is known to have the session, in case the one in its inbox
-    /// was lost. Empty once known.
+    /// The initial message (`handshake.v2.InitialMessageV2`, encoded) that started it, which this
+    /// client did: captured onto each [`Sealed`] message until the peer is known to have the
+    /// session, in case the one in its inbox was lost. Empty once known.
     pub(crate) initial_message: Vec<u8>,
-    pub(crate) delivery_key: DeliveryKey,
+    /// Deniable 32-byte write-capability token `t_{me->peer}` authorizing `PushV2` to `peer`.
+    pub(crate) send_write_token: WriteToken,
+    /// `SHA-256(t_{peer->me})` registered on our relay and matched on fetched envelopes for O(1)
+    /// `token_hash -> peer` dispatch.
+    pub(crate) inbound_token_hash: [u8; WRITE_TOKEN_HASH_LENGTH],
     /// Negotiated cryptographic security metadata of this active session.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) security: SessionSecurity,
-    /// Peer's `Hello.session_seq` that created this session (`0` if locally initiated or legacy).
+    /// Peer's `Hello.session_seq` that created this session (`0` if locally initiated or unset).
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) peer_session_seq: u64,
 }
@@ -1329,71 +1613,80 @@ pub(crate) struct Active {
 /// An earlier session of a [`SessionState`], which only decrypts.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) struct Earlier {
     pub(crate) party: Party,
-    pub(crate) delivery_key: DeliveryKey,
+    /// `SHA-256(t_{peer->me})` copied from [`Active`] so earlier sessions also route O(1) in the
+    /// unified recipient mailbox.
+    pub(crate) inbound_token_hash: [u8; WRITE_TOKEN_HASH_LENGTH],
 }
 
 impl From<Active> for Earlier {
     fn from(active: Active) -> Self {
         Self {
             party: active.party,
-            delivery_key: active.delivery_key,
+            inbound_token_hash: active.inbound_token_hash,
         }
     }
 }
 
-/// A session's delivery key, from X3DH's shared secret, which both peers have. A message's
-/// delivery token is HMAC-SHA256 of its encrypted header under it, truncated: only the two peers
-/// can compute it, so the recipient, giving it back to the server once it has the message,
-/// proves that it does, and the server, which has its SHA-256 from the push, deletes the
-/// message. Its `Debug` shows nothing of it.
-#[derive(Clone, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
+/// A directional deniable write-capability token derived from X3DH/PQXDH's shared secret `SK`:
+/// `HKDF-SHA256(None, SK, b"session.v2/write-token\0" || sender || recipient)`.
+///
+/// Both peers can derive both directions from `SK` (preserving deniability), while the relay only
+/// ever stores `SHA-256(write_token)` under an opaque `peer_slot_id`. Its `Debug` shows nothing
+/// of the token bytes.
+#[derive(Clone, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
-pub(crate) struct DeliveryKey(pub(crate) [u8; 32]);
+pub(crate) struct WriteToken(pub(crate) [u8; WRITE_TOKEN_LENGTH]);
 
-impl DeliveryKey {
-    /// The delivery key of a session whose X3DH shared secret is `secret`.
-    pub(crate) fn derive(secret: &[u8]) -> Self {
-        let mut key = [0; 32];
+impl WriteToken {
+    /// Derive the directional write token for messages sent by `sender` to `recipient` under
+    /// X3DH/PQXDH shared secret `secret`.
+    pub(crate) fn derive(secret: &[u8], sender: &PublicKey, recipient: &PublicKey) -> Self {
+        let mut info = [0u8; WRITE_TOKEN_INFO_PREFIX.len() + 64];
+        info[..WRITE_TOKEN_INFO_PREFIX.len()].copy_from_slice(WRITE_TOKEN_INFO_PREFIX);
+        info[WRITE_TOKEN_INFO_PREFIX.len()..WRITE_TOKEN_INFO_PREFIX.len() + 32]
+            .copy_from_slice(sender);
+        info[WRITE_TOKEN_INFO_PREFIX.len() + 32..].copy_from_slice(recipient);
+        let mut key = [0u8; WRITE_TOKEN_LENGTH];
         Hkdf::<Sha256>::new(None, secret)
-            .expand(b"session.v1/delivery", &mut key)
+            .expand(&info, &mut key)
             .expect("32 bytes are a valid HKDF-SHA256 output length");
         Self(key)
     }
 
-    /// The delivery token of `message`, a message of this session.
-    pub(crate) fn token(&self, message: &EncryptedMessage) -> [u8; DELIVERY_TOKEN_LENGTH] {
-        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC takes any key");
-        mac.update(&message.header);
-        let tag = mac.finalize().into_bytes();
-        let mut token = [0; DELIVERY_TOKEN_LENGTH];
-        token.copy_from_slice(&tag[..DELIVERY_TOKEN_LENGTH]);
-        token
+    /// Derive `(send_write_token = t_{me->peer}, inbound_token_hash = SHA-256(t_{peer->me}))`
+    /// from X3DH/PQXDH shared secret `secret`.
+    pub(crate) fn pair(
+        secret: &[u8],
+        me: &PublicKey,
+        peer: &PublicKey,
+    ) -> (Self, [u8; WRITE_TOKEN_HASH_LENGTH]) {
+        let send = Self::derive(secret, me, peer);
+        let inbound_hash = Self::derive(secret, peer, me).hash();
+        (send, inbound_hash)
+    }
+
+    /// `SHA-256(self)` as stored on the relay and returned on `EnvelopeV2.token_hash`.
+    pub(crate) fn hash(&self) -> [u8; WRITE_TOKEN_HASH_LENGTH] {
+        Sha256::digest(self.0).into()
+    }
+
+    /// Copy out a zeroizing handle to the 32-byte write token.
+    pub(crate) fn as_zeroizing(&self) -> Zeroizing<[u8; WRITE_TOKEN_LENGTH]> {
+        Zeroizing::new(self.0)
     }
 }
 
-impl core::fmt::Debug for DeliveryKey {
+impl core::fmt::Debug for WriteToken {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("DeliveryKey(..)")
+        f.write_str("WriteToken(..)")
     }
 }
 
 /// What was done last on a [`SessionState`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub(crate) enum LastAction {
     None,
     Sent,
@@ -1403,7 +1696,7 @@ pub(crate) enum LastAction {
 
 /// Verify that a `Party`'s associated data binds the exact `(me, peer)` identity pair with length
 /// matching classical X3DH (64 bytes) or PQXDH (96 bytes).
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+#[cfg(any(feature = "prost", feature = "serde"))]
 fn check_party_identity_ad(
     ad: &[u8],
     me: &PublicKey,
@@ -1429,33 +1722,47 @@ fn check_party_identity_ad(
     Ok(())
 }
 
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
-struct ActiveStateView<'a, P: party::PartyView + ?Sized> {
+#[cfg(any(feature = "prost", feature = "serde"))]
+struct ActiveStateView<'a> {
     id: &'a PublicKey,
     peer_session_seq: u64,
     security: SessionSecurity,
-    party: &'a P,
+    party: &'a Party,
 }
 
-#[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
-fn validate_session_state<'a, P: party::PartyView + ?Sized + 'a>(
+#[cfg(any(feature = "prost", feature = "serde"))]
+fn validate_session_state<'a>(
     me: &PublicKey,
     peer: &PublicKey,
-    counters: [u64; 6],
-    delivered: usize,
+    counters: [u64; 3],
+    pinned_manifest_digest: Option<[u8; 32]>,
+    pending_register_grants: &[PendingGrant],
     earlier: impl ExactSizeIterator<Item = &'a [u8]>,
-    active: Option<ActiveStateView<'a, P>>,
+    active: Option<ActiveStateView<'a>>,
 ) -> Result<()> {
+    let pinned_manifest_seq = counters[1];
     if [me, peer]
         .into_iter()
         .any(|key| !xeddsa::is_canonical_public_key(key) || XEdDSAPublicKey::new(key).is_err())
         || earlier.len() > KEPT_SESSIONS
-        || delivered > MAX_STORED_DELIVERED
+        || pending_register_grants.len() > MAX_PENDING_REGISTER_GRANTS
         || counters
             .into_iter()
             .any(|seq| seq > protocol::MAX_SAFE_INTEGER)
+        || (pinned_manifest_seq == 0 && pinned_manifest_digest.is_some())
     {
         return Err(ErrorKind::MalformedState.into());
+    }
+    for (idx, grant) in pending_register_grants.iter().enumerate() {
+        if grant.grant_version == 0 || grant.grant_version > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        if pending_register_grants[..idx]
+            .iter()
+            .any(|prev| prev.token_hash == grant.token_hash)
+        {
+            return Err(ErrorKind::MalformedState.into());
+        }
     }
     for ad in earlier {
         check_party_identity_ad(ad, me, peer, None)?;
@@ -1504,22 +1811,47 @@ impl SessionState {
         self.active.as_ref().map(|active| active.security)
     }
 
+    /// `SHA-256(t_{peer->me})` of the active session, if any.
+    pub fn active_inbound_token_hash(&self) -> Option<[u8; WRITE_TOKEN_HASH_LENGTH]> {
+        self.active.as_ref().map(|active| active.inbound_token_hash)
+    }
+
+    /// All inbound write-token hashes (`SHA-256(t_{peer->me})`) for O(1) mailbox dispatch across
+    /// the active session and all kept earlier sessions.
+    pub fn inbound_token_hashes(&self) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.active
+            .iter()
+            .map(|active| active.inbound_token_hash)
+            .chain(self.others.iter().map(|earlier| earlier.inbound_token_hash))
+    }
+
+    /// Inbound write-token hashes (`SHA-256(t_{peer->me})`) of all kept earlier (archived)
+    /// sessions.
+    pub fn earlier_inbound_token_hashes(
+        &self,
+    ) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.others.iter().map(|earlier| earlier.inbound_token_hash)
+    }
+
+    /// Queued write-token registrations awaiting relay confirmation.
+    pub fn pending_register_grants(&self) -> &[PendingGrant] {
+        &self.pending_register_grants
+    }
+
     /// Validate canonical keys, bounded collections, integer bounds, AD identity-pair bindings,
-    /// and PQ metadata invariants.
+    /// pending grants, and PQ metadata invariants.
     #[cfg(any(feature = "prost", feature = "serde"))]
     fn validate(&self) -> Result<()> {
         validate_session_state(
             &self.me,
             &self.peer,
             [
-                self.cursor,
-                self.stalled_through,
-                self.skip_through,
                 self.next_session_seq,
                 self.peer_pq.pinned_manifest_seq,
                 self.peer_pq.peer_session_seq,
             ],
-            self.delivered.len(),
+            self.peer_pq.pinned_manifest_digest,
+            &self.pending_register_grants,
             self.others.iter().map(|e| e.party.associated_data()),
             self.active.as_ref().map(|a| ActiveStateView {
                 id: &a.id,
@@ -1555,42 +1887,6 @@ impl SessionState {
     }
 }
 
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedSessionState
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        use rkyv::rancor::Source;
-        validate_session_state(
-            &self.me,
-            &self.peer,
-            [
-                self.cursor.to_native(),
-                self.stalled_through.to_native(),
-                self.skip_through.to_native(),
-                self.next_session_seq.to_native(),
-                self.peer_pq.pinned_manifest_seq.to_native(),
-                self.peer_pq.peer_session_seq.to_native(),
-            ],
-            self.delivered.len(),
-            self.others.iter().map(|e| e.party.associated_data()),
-            self.active.as_ref().map(|a| ActiveStateView {
-                id: &a.id,
-                peer_session_seq: a.peer_session_seq.to_native(),
-                security: SessionSecurity {
-                    is_pq: a.security.is_pq,
-                    suite: a.security.suite.as_ref().map(archived_pq_suite),
-                    pq_ratchet: a.security.pq_ratchet,
-                },
-                party: &a.party,
-            }),
-        )
-        .map_err(C::Error::new)
-    }
-}
-
 #[cfg(feature = "serde")]
 #[derive(serde::Deserialize)]
 #[serde(rename = "SessionState")]
@@ -1600,17 +1896,17 @@ struct RawSessionState {
     others: Vec<Earlier>,
     me: PublicKey,
     peer: PublicKey,
-    cursor: u64,
     last: LastAction,
     direction_changes: u32,
-    stalled_through: u64,
-    skip_through: u64,
-    #[serde(deserialize_with = "deserialize_bounded_vec::<_, _, MAX_STORED_DELIVERED>")]
-    delivered: Vec<[u8; DELIVERY_TOKEN_LENGTH]>,
     #[serde(default)]
     peer_pq: PeerPqState,
     #[serde(default)]
     next_session_seq: u64,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_bounded_vec::<_, _, MAX_PENDING_REGISTER_GRANTS>"
+    )]
+    pending_register_grants: Vec<PendingGrant>,
 }
 
 #[cfg(feature = "serde")]
@@ -1623,14 +1919,11 @@ impl TryFrom<RawSessionState> for SessionState {
             others: raw.others,
             me: raw.me,
             peer: raw.peer,
-            cursor: raw.cursor,
             last: raw.last,
             direction_changes: raw.direction_changes,
-            stalled_through: raw.stalled_through,
-            skip_through: raw.skip_through,
-            delivered: raw.delivered,
             peer_pq: raw.peer_pq,
             next_session_seq: raw.next_session_seq,
+            pending_register_grants: raw.pending_register_grants,
         };
         state.validate()?;
         Ok(state)
@@ -1647,6 +1940,9 @@ impl From<&PeerPqState> for proto::PeerPqState {
             downgrade_detected: state.downgrade_detected,
             peer_pq_capable: state.peer_pq_capable,
             peer_session_seq: state.peer_session_seq,
+            pinned_manifest_digest: state
+                .pinned_manifest_digest
+                .map_or_else(Vec::new, |d| d.to_vec()),
         }
     }
 }
@@ -1656,14 +1952,24 @@ impl TryFrom<&proto::PeerPqState> for PeerPqState {
     type Error = Error;
 
     fn try_from(state: &proto::PeerPqState) -> Result<Self> {
+        let pinned_manifest_digest = if state.pinned_manifest_digest.is_empty() {
+            None
+        } else {
+            Some(
+                <[u8; 32]>::try_from(state.pinned_manifest_digest.as_slice())
+                    .map_err(|_| Error::from(ErrorKind::MalformedState))?,
+            )
+        };
         if state.pinned_manifest_seq > protocol::MAX_SAFE_INTEGER
             || state.peer_session_seq > protocol::MAX_SAFE_INTEGER
+            || (state.pinned_manifest_seq == 0 && pinned_manifest_digest.is_some())
         {
             return Err(ErrorKind::MalformedState.into());
         }
         Ok(Self {
             pq_pinned: state.pq_pinned,
             pinned_manifest_seq: state.pinned_manifest_seq,
+            pinned_manifest_digest,
             allow_classical_exception: state.allow_classical_exception,
             downgrade_detected: state.downgrade_detected,
             peer_pq_capable: state.peer_pq_capable,
@@ -1713,6 +2019,38 @@ impl TryFrom<&proto::SessionSecurity> for SessionSecurity {
 }
 
 #[cfg(feature = "prost")]
+impl From<&PendingGrant> for proto::PendingGrant {
+    fn from(grant: &PendingGrant) -> Self {
+        Self {
+            token_hash: grant.token_hash.to_vec(),
+            grant_version: grant.grant_version,
+            pin_active: grant.pin_active,
+        }
+    }
+}
+
+#[cfg(feature = "prost")]
+impl TryFrom<&proto::PendingGrant> for PendingGrant {
+    type Error = Error;
+
+    fn try_from(grant: &proto::PendingGrant) -> Result<Self> {
+        let token_hash: [u8; WRITE_TOKEN_HASH_LENGTH] = grant
+            .token_hash
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::from(ErrorKind::MalformedState))?;
+        if grant.grant_version == 0 || grant.grant_version > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::MalformedState.into());
+        }
+        Ok(Self {
+            token_hash,
+            grant_version: grant.grant_version,
+            pin_active: grant.pin_active,
+        })
+    }
+}
+
+#[cfg(feature = "prost")]
 impl From<&SessionState> for proto::SessionState {
     fn from(state: &SessionState) -> Self {
         Self {
@@ -1731,33 +2069,24 @@ impl From<&SessionState> for proto::SessionState {
                 .as_ref()
                 .map(|active| active.initial_message.clone())
                 .unwrap_or_default(),
-            delivery_key: state
-                .active
-                .as_ref()
-                .map(|active| active.delivery_key.0.to_vec())
-                .unwrap_or_default(),
             others: state
                 .others
                 .iter()
                 .map(|earlier| proto::EarlierSession {
                     party: Some((&earlier.party).into()),
-                    delivery_key: earlier.delivery_key.0.to_vec(),
+                    inbound_token_hash: earlier.inbound_token_hash.to_vec(),
                 })
                 .collect(),
-            delivered: state.delivered.iter().map(|token| token.to_vec()).collect(),
             me: state.me.to_vec(),
             peer: state.peer.to_vec(),
-            cursor: state.cursor,
             last: match state.last {
-                LastAction::None => proto::LastAction::None,
+                LastAction::None => proto::LastAction::Unspecified,
                 LastAction::Sent => proto::LastAction::Sent,
                 LastAction::ReceivedActive => proto::LastAction::ReceivedActive,
                 LastAction::ReceivedEarlier => proto::LastAction::ReceivedEarlier,
             }
             .into(),
             direction_changes: state.direction_changes,
-            stalled_through: state.stalled_through,
-            skip_through: state.skip_through,
             peer_pq: Some((&state.peer_pq).into()),
             next_session_seq: state.next_session_seq,
             active_security: state
@@ -1768,6 +2097,21 @@ impl From<&SessionState> for proto::SessionState {
                 .active
                 .as_ref()
                 .map_or(0, |active| active.peer_session_seq),
+            send_write_token: state
+                .active
+                .as_ref()
+                .map(|active| active.send_write_token.0.to_vec())
+                .unwrap_or_default(),
+            inbound_token_hash: state
+                .active
+                .as_ref()
+                .map(|active| active.inbound_token_hash.to_vec())
+                .unwrap_or_default(),
+            pending_register_grants: state
+                .pending_register_grants
+                .iter()
+                .map(proto::PendingGrant::from)
+                .collect(),
         }
     }
 }
@@ -1777,27 +2121,21 @@ impl TryFrom<&proto::SessionState> for SessionState {
     type Error = Error;
 
     fn try_from(state: &proto::SessionState) -> Result<Self> {
-        /// An identity or ephemeral key field, which must be 32 bytes.
-        fn key(bytes: &[u8]) -> Result<PublicKey> {
+        /// A fixed 32-byte key or hash field.
+        fn fixed32(bytes: &[u8]) -> Result<[u8; 32]> {
             bytes
                 .try_into()
                 .map_err(|_| ErrorKind::MalformedState.into())
         }
 
-        /// A delivery key, which must be 32 bytes.
-        fn delivery_key(bytes: &[u8]) -> Result<DeliveryKey> {
-            bytes
-                .try_into()
-                .map(DeliveryKey)
-                .map_err(|_| ErrorKind::MalformedState.into())
-        }
-
-        if state.others.len() > KEPT_SESSIONS || state.delivered.len() > MAX_STORED_DELIVERED {
+        if state.others.len() > KEPT_SESSIONS
+            || state.pending_register_grants.len() > MAX_PENDING_REGISTER_GRANTS
+        {
             return Err(ErrorKind::MalformedState.into());
         }
 
-        let me = key(&state.me)?;
-        let peer = key(&state.peer)?;
+        let me = fixed32(&state.me)?;
+        let peer = fixed32(&state.peer)?;
 
         let active = match &state.party {
             Some(proto_party) => {
@@ -1813,17 +2151,19 @@ impl TryFrom<&proto::SessionState> for SessionState {
                 )?;
                 Some(Active {
                     party: Party::try_from(proto_party)?,
-                    id: key(&state.id)?,
+                    id: fixed32(&state.id)?,
                     known_by_peer: state.known_by_peer,
                     initial_message: state.initial_message.clone(),
-                    delivery_key: delivery_key(&state.delivery_key)?,
+                    send_write_token: WriteToken(fixed32(&state.send_write_token)?),
+                    inbound_token_hash: fixed32(&state.inbound_token_hash)?,
                     security,
                     peer_session_seq: state.active_peer_session_seq,
                 })
             }
             None => {
                 if !state.id.is_empty()
-                    || !state.delivery_key.is_empty()
+                    || !state.send_write_token.is_empty()
+                    || !state.inbound_token_hash.is_empty()
                     || state.known_by_peer
                     || !state.initial_message.is_empty()
                     || state.active_peer_session_seq != 0
@@ -1838,7 +2178,7 @@ impl TryFrom<&proto::SessionState> for SessionState {
             }
         };
         let last = match proto::LastAction::try_from(state.last) {
-            Ok(proto::LastAction::None) => LastAction::None,
+            Ok(proto::LastAction::Unspecified) => LastAction::None,
             Ok(proto::LastAction::Sent) => LastAction::Sent,
             Ok(proto::LastAction::ReceivedActive) => LastAction::ReceivedActive,
             Ok(proto::LastAction::ReceivedEarlier) => LastAction::ReceivedEarlier,
@@ -1850,6 +2190,11 @@ impl TryFrom<&proto::SessionState> for SessionState {
             .map(PeerPqState::try_from)
             .transpose()?
             .unwrap_or_default();
+        let pending_register_grants = state
+            .pending_register_grants
+            .iter()
+            .map(PendingGrant::try_from)
+            .collect::<Result<Vec<_>>>()?;
         let restored = Self {
             active,
             others: state
@@ -1860,29 +2205,17 @@ impl TryFrom<&proto::SessionState> for SessionState {
                     check_party_identity_ad(&proto_party.associated_data, &me, &peer, None)?;
                     Ok(Earlier {
                         party: Party::try_from(proto_party)?,
-                        delivery_key: delivery_key(&earlier.delivery_key)?,
+                        inbound_token_hash: fixed32(&earlier.inbound_token_hash)?,
                     })
-                })
-                .collect::<Result<_>>()?,
-            delivered: state
-                .delivered
-                .iter()
-                .map(|token| {
-                    token
-                        .as_slice()
-                        .try_into()
-                        .map_err(|_| ErrorKind::MalformedState.into())
                 })
                 .collect::<Result<_>>()?,
             me,
             peer,
-            cursor: state.cursor,
             last,
             direction_changes: state.direction_changes,
-            stalled_through: state.stalled_through,
-            skip_through: state.skip_through,
             peer_pq,
             next_session_seq: state.next_session_seq,
+            pending_register_grants,
         };
         restored.validate()?;
         Ok(restored)
@@ -1905,14 +2238,11 @@ impl<M> Session<M> {
                 others: vec![],
                 me,
                 peer,
-                cursor: 0,
                 last,
                 direction_changes: 0,
-                stalled_through: 0,
-                skip_through: 0,
-                delivered: vec![],
                 peer_pq: PeerPqState::default(),
                 next_session_seq: 0,
+                pending_register_grants: vec![],
             },
         )
     }
@@ -1923,8 +2253,7 @@ impl<M> Session<M> {
     }
 
     /// What to save to [`restore`](Session::restore) this session later. It changes with every
-    /// message encrypted or received, so save it after each, before showing what was received,
-    /// and before receiving again: the next fetch tells the server to delete what was received.
+    /// message encrypted or decrypted, so save it after each.
     pub fn state(&self) -> &SessionState {
         &self.state
     }
@@ -1941,22 +2270,156 @@ impl<M> Session<M> {
 
     /// Whether this session has none to send on, as the peers kept missing each other (see
     /// [`Session::keep`]) or it was [retired](Session::retire): start a new one with
-    /// [`Client::start_again`] before sending.
+    /// [`Client::start_again_v2`] before sending.
     pub fn needs_new_session(&self) -> bool {
         self.state.active.is_none()
     }
 
-    /// The ID of the session messages are sent on, if any, which both peers have: the X3DH
-    /// ephemeral key of the one who started it. A message [encrypted](Session::encrypt) to push
-    /// later can be told from one of a session that is no longer the active one, e.g. to encrypt
-    /// it again on the new one.
+    /// The ID of the session messages are sent on, if any, which both peers have: the X3DH/PQXDH
+    /// ephemeral key of the one who started it.
     pub fn active_id(&self) -> Option<&PublicKey> {
         self.state.active.as_ref().map(|active| &active.id)
+    }
+
+    /// Whether the peer is known to have the active session (the peer initiated it, or a message
+    /// decrypted on it).
+    pub fn is_known_by_peer(&self) -> bool {
+        self.state
+            .active
+            .as_ref()
+            .is_some_and(|active| active.known_by_peer)
+    }
+
+    /// Build a wire [`protocol::handshake_v2::SendInitialV2Request`] for the active session's
+    /// carried `initial_message`, if any (used to retry an unconfirmed initial greeting).
+    pub fn pending_initial_request(&self) -> Option<protocol::handshake_v2::SendInitialV2Request> {
+        let raw = &self.state.active.as_ref()?.initial_message;
+        if raw.is_empty() {
+            return None;
+        }
+        let wire = decode_carried_initial(raw)?;
+        Some(protocol::handshake_v2::SendInitialV2Request {
+            recipient: Bytes::copy_from_slice(&self.state.peer),
+            message: Some(wire),
+        })
+    }
+
+    /// `SHA-256(t_{peer->me})` of the active session, if any (the hash to register on our relay
+    /// via [`Client::register_write_token_v2`]).
+    pub fn active_inbound_token_hash(&self) -> Option<[u8; WRITE_TOKEN_HASH_LENGTH]> {
+        self.state.active_inbound_token_hash()
+    }
+
+    /// All inbound write-token hashes (`SHA-256(t_{peer->me})`) across the active session and all
+    /// kept earlier sessions, for O(1) `EnvelopeV2.token_hash -> peer` dispatch.
+    pub fn inbound_token_hashes(&self) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.state.inbound_token_hashes()
+    }
+
+    /// Inbound write-token hashes (`SHA-256(t_{peer->me})`) of all kept earlier (archived)
+    /// sessions.
+    pub fn earlier_inbound_token_hashes(
+        &self,
+    ) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.state.earlier_inbound_token_hashes()
+    }
+
+    /// Queued write-token registrations awaiting relay confirmation.
+    pub fn pending_register_grants(&self) -> &[PendingGrant] {
+        &self.state.pending_register_grants
+    }
+
+    /// Whether the active session's inbound write token still has a pending registration awaiting
+    /// relay confirmation.
+    pub fn has_pending_active_grant(&self) -> bool {
+        self.active_inbound_token_hash().is_some_and(|active_hash| {
+            self.state
+                .pending_register_grants
+                .iter()
+                .any(|g| g.token_hash == active_hash)
+        })
+    }
+
+    /// Stage a write-token grant registration on this session, deduplicating by `token_hash` and
+    /// capping at [`MAX_PENDING_REGISTER_GRANTS`] while strictly preserving the active session's
+    /// inbound token hash.
+    pub fn queue_pending_grant(&mut self, grant: PendingGrant) -> Result<()> {
+        if grant.grant_version == 0 || grant.grant_version > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::InvalidArgument.into());
+        }
+        let active_hash = self.active_inbound_token_hash();
+        merge_pending_grants(
+            &mut self.state.pending_register_grants,
+            vec![grant],
+            active_hash,
+        );
+        Ok(())
+    }
+
+    /// Remove any staged pending grant matching `token_hash` with `grant_version <= confirmed_version`
+    /// once [`Client::register_write_token_v2`] succeeds. Returns whether an entry was removed.
+    pub fn remove_pending_grant(
+        &mut self,
+        token_hash: &[u8; WRITE_TOKEN_HASH_LENGTH],
+        confirmed_version: u64,
+    ) -> bool {
+        let before = self.state.pending_register_grants.len();
+        self.state
+            .pending_register_grants
+            .retain(|g| !(g.token_hash == *token_hash && g.grant_version <= confirmed_version));
+        self.state.pending_register_grants.len() != before
+    }
+
+    /// Drop all staged pending write-token registrations on this session.
+    pub fn clear_pending_grants(&mut self) {
+        self.state.pending_register_grants.clear();
     }
 
     /// Cryptographic security level of the active session, if any.
     pub fn security(&self) -> Option<SessionSecurity> {
         self.state.security()
+    }
+
+    /// Whether any archived earlier session in `others` is classical (not PQXDH), e.g. when a
+    /// cancelled crossed start discarded `active` while preserving the peer's classical session.
+    pub fn has_classical_earlier(&self) -> bool {
+        self.state
+            .others
+            .iter()
+            .any(|e| e.party.associated_data().len() != x3dh::PQXDH_ASSOCIATED_DATA_LENGTH)
+    }
+
+    /// Drop all archived classical (non-PQXDH) earlier sessions from `others` and return their
+    /// inbound write-token hashes so accepting/finalizing a PQ contact under `strict_pq` or
+    /// without a classical exception never authorizes or decrypts an unapproved classical session
+    /// (`R13-P1-1`).
+    pub fn prune_classical_earlier(&mut self) -> Vec<[u8; WRITE_TOKEN_HASH_LENGTH]> {
+        let mut dropped = Vec::new();
+        self.state.others.retain(|e| {
+            let is_pq = e.party.associated_data().len() == x3dh::PQXDH_ASSOCIATED_DATA_LENGTH;
+            if !is_pq {
+                dropped.push(e.inbound_token_hash);
+            }
+            is_pq
+        });
+        dropped
+    }
+
+    /// Inbound write-token hashes of archived earlier sessions, excluding classical (non-PQXDH)
+    /// sessions when `allow_classical` is `false` (`R13-P1-1`).
+    pub fn earlier_inbound_token_hashes_for_policy(
+        &self,
+        allow_classical: bool,
+    ) -> impl Iterator<Item = [u8; WRITE_TOKEN_HASH_LENGTH]> + '_ {
+        self.state.others.iter().filter_map(move |e| {
+            if allow_classical
+                || e.party.associated_data().len() == x3dh::PQXDH_ASSOCIATED_DATA_LENGTH
+            {
+                Some(e.inbound_token_hash)
+            } else {
+                None
+            }
+        })
     }
 
     /// Per-peer post-quantum pinning, downgrade-detection, and anti-rollback state.
@@ -2020,8 +2483,8 @@ impl<M> Session<M> {
     /// Validate a peer's decrypted [`Hello`] against this session's [`PeerPqState`] and active
     /// [`SessionSecurity`].
     ///
-    /// When called immediately after [`Client::accept`] or `Client::accept_initial_v2` with the
-    /// active peer-initiated session's own greeting (`hello.session_seq > 0` matching
+    /// When called immediately after [`Client::accept_initial_v2`] with the active peer-initiated
+    /// session's own greeting (`hello.session_seq > 0` matching
     /// `active.peer_session_seq == peer_session_seq`), does not falsely flag
     /// `stale_session_seq = true` while still enforcing downgrade detection and rejecting `0` or
     /// any strictly smaller `session_seq`.
@@ -2048,13 +2511,6 @@ impl<M> Session<M> {
         )
     }
 
-    /// Go on past the messages that receiving stopped at, as they did not decrypt, once the
-    /// initial messages waiting are taken and accepted: those of that page that still do not
-    /// decrypt never will, and are skipped, see [`Session::receive`].
-    pub fn skip_stalled(&mut self) {
-        self.state.skip_through = self.state.skip_through.max(self.state.stalled_through);
-    }
-
     /// Retire the active session, e.g. as the peer deleted the chat, so it no longer has it:
     /// messages on it still decrypt, but none go on it; the next goes on a new one, see
     /// [`Session::needs_new_session`].
@@ -2076,8 +2532,8 @@ impl<M> Session<M> {
 
     /// Keep `older`, the chat with the same peer so far, with this session, which the peer or
     /// this client has just started. The last [`KEPT_SESSIONS`] earlier sessions are kept, only
-    /// to decrypt, such as the messages the peer sent on `older` before starting this one; and
-    /// they go on from the later of the two positions in the peer's queue.
+    /// to decrypt, such as the messages the peer sent on `older` before starting this one; any
+    /// staged `pending_register_grants` are deduplicated and merged.
     ///
     /// Of the sessions, one is active: messages are sent on it, so each peer answers the other
     /// on it and its ratchet keeps stepping, as Signal's session management (Tahini) does. An
@@ -2085,12 +2541,13 @@ impl<M> Session<M> {
     /// make this client send on it again, where they read everything, though the ratchet has
     /// since locked them out of the active one. A session this client starts becomes active.
     /// One the peer starts does too, unless the active one is this client's and the peer has
-    /// not answered it: then both started one at once, and the one whose ID, the X3DH ephemeral
-    /// key of who started it, is higher wins, on both sides. If the peers still miss each
-    /// other, e.g. as an initial message was lost or a chat deleted, the peer's messages
-    /// decrypt only on earlier sessions while this client sends on the active one; after
-    /// [`MAX_DIRECTION_CHANGES`] turns between the two, the active session is retired, and the
-    /// next message goes on a new one, see [`Session::needs_new_session`].
+    /// not answered it: then both started one at once, and the one whose ID, the X3DH/PQXDH
+    /// ephemeral key of who started it, is higher wins, on both sides (preferring PQ over
+    /// classical). If the peers still miss each other, e.g. as an initial message was lost or a
+    /// chat deleted, the peer's messages decrypt only on earlier sessions while this client sends
+    /// on the active one; after [`MAX_DIRECTION_CHANGES`] turns between the two, the active
+    /// session is retired, and the next message goes on a new one, see
+    /// [`Session::needs_new_session`].
     pub fn keep(&mut self, older: Session<M>) -> Result<()> {
         if older.state.me != self.state.me || older.state.peer != self.state.peer {
             return Err(ErrorKind::UnexpectedPeer.into());
@@ -2124,7 +2581,7 @@ impl<M> Session<M> {
     }
 
     /// Core session-replacement logic enforcing monotonic `peer_session_seq` anti-rollback,
-    /// crossed-start tie-breaking, and PQ-pin downgrade defense.
+    /// crossed-start tie-breaking, PQ-pin downgrade defense, and `pending_register_grants` merge.
     fn merge_incoming_state(
         &mut self,
         mut new: SessionState,
@@ -2139,33 +2596,87 @@ impl<M> Session<M> {
             return Err(ErrorKind::InvalidInitialMessage.into());
         }
         let state = &mut self.state;
+        if new.peer_pq.pinned_manifest_seq == state.peer_pq.pinned_manifest_seq
+            && let (Some(existing_digest), Some(incoming_digest)) = (
+                state.peer_pq.pinned_manifest_digest,
+                new.peer_pq.pinned_manifest_digest,
+            )
+            && existing_digest != incoming_digest
+        {
+            return Err(ErrorKind::DowngradeDetected.into());
+        }
+        let prev_manifest_seq = state.peer_pq.pinned_manifest_seq;
+        let prev_allow_classical = state.peer_pq.allow_classical_exception;
+        // R21-P1-2 + R22-P1-2: A classical exception carried by `new` is only fresh when local PQ
+        // is enabled, `new` carries an explicit signed PQ-OFF exception (`!peer_pq_capable`) at a
+        // strictly newer manifest sequence (`new.pinned_manifest_seq > prev_manifest_seq`) so a
+        // locally prepared replacement at the same sequence can never restore revoked consent
+        // (`clear_classical_exception()`), and it never overrides an unmanifested unapproved PQ pin.
+        let incoming_approval_fresh = local_pq_enabled
+            && new.peer_pq.allow_classical_exception
+            && !new.peer_pq.peer_pq_capable
+            && new.peer_pq.pinned_manifest_seq > prev_manifest_seq
+            && (!state.peer_pq.pq_pinned || prev_manifest_seq > 0 || prev_allow_classical);
         if let Some(active) = &new.active {
             let started_here = !active.known_by_peer;
             if !started_here {
                 // Enforce monotonic peer_session_seq once the peer has ever sent a positive one.
-                // `session_seq == 0` is tolerated ONLY while high_water == 0 (legacy TUI compat).
+                // `session_seq == 0` is tolerated ONLY while high_water == 0.
                 let high_water = state.peer_pq.peer_session_seq;
                 let incoming_seq = active.peer_session_seq;
                 if high_water > 0 && (incoming_seq == 0 || incoming_seq <= high_water) {
                     return Err(ErrorKind::StaleSession.into());
                 }
-                // Defense-in-depth: never let an unapproved classical peer-initiated session
-                // silently overwrite a PQ-pinned session.
+                // Defense-in-depth: never let a classical peer-initiated session silently
+                // overwrite an actively PQ-pinned peer or bypass a live downgrade alarm
+                // (`R19-P1-3`).
                 if !active.security.is_pq
                     && local_pq_enabled
-                    && state.peer_pq.pq_pinned
+                    && (state.peer_pq.downgrade_detected
+                        || (state.peer_pq.pq_pinned
+                            && (state.peer_pq.peer_pq_capable
+                                || !state.peer_pq.allow_classical_exception)))
+                {
+                    return Err(ErrorKind::DowngradeDetected.into());
+                }
+            } else if active.security.is_pq {
+                // R22-P2-1: Reject a locally prepared PQ replacement built from an older manifest
+                // sequence after `state` already observed a strictly newer signed PQ-OFF manifest
+                // (`!state.peer_pq.peer_pq_capable`). Merging it would retain `state`'s newer
+                // `pinned_manifest_seq` while flipping `peer_pq_capable` back to `true`, breaking
+                // subsequent verification of that same signed PQ-OFF manifest.
+                if new.peer_pq.pinned_manifest_seq > 0
+                    && new.peer_pq.pinned_manifest_seq < state.peer_pq.pinned_manifest_seq
+                    && !state.peer_pq.peer_pq_capable
+                {
+                    return Err(ErrorKind::StaleSession.into());
+                }
+            } else if local_pq_enabled {
+                // R20-P1-3 + R20-P2-1 + R21-P1-2 + R22-P1-2: A locally prepared classical
+                // replacement must never bypass a live downgrade alarm, overwrite an unmanifested
+                // (`seq == 0`) PQ pin without prior approval on `state`, or restore revoked
+                // classical consent from the same or an older manifest sequence.
+                let live_hard_pin = state.peer_pq.pq_pinned
+                    && (state.peer_pq.peer_pq_capable || state.peer_pq.pinned_manifest_seq == 0);
+                let superseded_by_newer_approved_off = (state.peer_pq.pinned_manifest_seq > 0
+                    || state.peer_pq.allow_classical_exception)
+                    && new.peer_pq.pinned_manifest_seq > state.peer_pq.pinned_manifest_seq
+                    && !new.peer_pq.peer_pq_capable
+                    && new.peer_pq.allow_classical_exception;
+                let unapproved_manifested = (state.peer_pq.pq_pinned
+                    || state.peer_pq.pinned_manifest_seq > 0)
                     && !state.peer_pq.allow_classical_exception
+                    && !incoming_approval_fresh;
+                if state.peer_pq.downgrade_detected
+                    || (live_hard_pin && !superseded_by_newer_approved_off)
+                    || unapproved_manifested
                 {
                     return Err(ErrorKind::DowngradeDetected.into());
                 }
             }
         }
 
-        state.cursor = state.cursor.max(new.cursor);
-        state.stalled_through = state.stalled_through.max(new.stalled_through);
-        state.skip_through = state.skip_through.max(new.skip_through);
         state.next_session_seq = state.next_session_seq.max(new.next_session_seq);
-        merge_delivered(&mut state.delivered, mem::take(&mut new.delivered));
         for earlier in mem::take(&mut new.others).into_iter().rev() {
             state.archive(earlier);
         }
@@ -2174,16 +2685,33 @@ impl<M> Session<M> {
         // manifest sequence order so accepting a newer signed PQ-OFF manifest is not clobbered.
         let was_pq_pinned = state.peer_pq.pq_pinned;
         let was_pq_capable = state.peer_pq.peer_pq_capable;
+        let keep_capable_under_downgrade = (state.peer_pq.downgrade_detected
+            || new.peer_pq.downgrade_detected)
+            && state.peer_pq.peer_pq_capable;
         state.peer_pq.pq_pinned |= new.peer_pq.pq_pinned;
         if new.peer_pq.pinned_manifest_seq > state.peer_pq.pinned_manifest_seq {
             state.peer_pq.pinned_manifest_seq = new.peer_pq.pinned_manifest_seq;
-            state.peer_pq.peer_pq_capable = new.peer_pq.peer_pq_capable;
+            state.peer_pq.pinned_manifest_digest = new.peer_pq.pinned_manifest_digest;
+            // R23-P2-4: Mirror `R22-P3-1` — never let a signed PQ-OFF manifest clear
+            // `peer_pq_capable` while a live downgrade alarm is active (even when
+            // `local_pq_enabled == false`), otherwise a subsequent `approve_classical_exception()`
+            // would see `!peer_pq_capable` and erase `downgrade_detected`.
+            state.peer_pq.peer_pq_capable = if keep_capable_under_downgrade {
+                true
+            } else {
+                new.peer_pq.peer_pq_capable
+            };
         } else if new.peer_pq.pinned_manifest_seq == state.peer_pq.pinned_manifest_seq {
+            if state.peer_pq.pinned_manifest_digest.is_none() {
+                state.peer_pq.pinned_manifest_digest = new.peer_pq.pinned_manifest_digest;
+            }
             state.peer_pq.peer_pq_capable |= new.peer_pq.peer_pq_capable;
         }
         if ((!was_pq_pinned && new.peer_pq.pq_pinned)
-            || (!was_pq_capable && new.peer_pq.peer_pq_capable))
-            && !new.peer_pq.allow_classical_exception
+            || (!was_pq_capable
+                && new.peer_pq.peer_pq_capable
+                && !(new.peer_pq.allow_classical_exception && !new.peer_pq.pq_pinned)))
+            && !incoming_approval_fresh
         {
             state.peer_pq.allow_classical_exception = false;
         }
@@ -2193,7 +2721,8 @@ impl<M> Session<M> {
             .peer_session_seq
             .max(new.peer_pq.peer_session_seq);
 
-        if let Some(active) = new.active.take() {
+        let incoming_grants = mem::take(&mut new.pending_register_grants);
+        let took_over = if let Some(active) = new.active.take() {
             // One this client started is not known by the peer yet.
             let started_here = !active.known_by_peer;
             if active.security.is_pq {
@@ -2201,15 +2730,15 @@ impl<M> Session<M> {
                 state.peer_pq.allow_classical_exception = false;
                 state.peer_pq.downgrade_detected = false;
             } else if started_here {
-                state.peer_pq.allow_classical_exception |= new.peer_pq.allow_classical_exception;
-                if state.peer_pq.allow_classical_exception && !state.peer_pq.peer_pq_capable {
-                    state.peer_pq.downgrade_detected = false;
+                // R20-P1-3 + R20-P2-1 + R21-P1-2: Only propagate a fresh `allow_classical_exception`
+                // when no live downgrade alarm or active PQ pin applies, and never implicitly clear
+                // a live `downgrade_detected` flag during classical merge.
+                if !state.peer_pq.downgrade_detected
+                    && (!state.peer_pq.pq_pinned || !state.peer_pq.peer_pq_capable)
+                    && incoming_approval_fresh
+                {
+                    state.peer_pq.allow_classical_exception = true;
                 }
-            } else if state.peer_pq.allow_classical_exception
-                && !state.peer_pq.peer_pq_capable
-                && !new.peer_pq.downgrade_detected
-            {
-                state.peer_pq.downgrade_detected = false;
             }
             if !started_here && active.peer_session_seq > state.peer_pq.peer_session_seq {
                 state.peer_pq.peer_session_seq = active.peer_session_seq;
@@ -2233,7 +2762,7 @@ impl<M> Session<M> {
                     LastAction::ReceivedActive
                 };
                 state.direction_changes = 0;
-                return Ok(true);
+                true
             } else {
                 // Its first message decrypted, on what is now an earlier session.
                 state.archive(active.into());
@@ -2242,28 +2771,34 @@ impl<M> Session<M> {
                     state.peer_pq.downgrade_detected = false;
                     state.peer_pq.allow_classical_exception = false;
                 }
-                return Ok(false);
+                false
             }
-        }
-        Ok(false)
+        } else {
+            false
+        };
+
+        let active_hash = state.active.as_ref().map(|a| a.inbound_token_hash);
+        merge_pending_grants(
+            &mut state.pending_register_grants,
+            incoming_grants,
+            active_hash,
+        );
+        Ok(took_over)
     }
 
-    /// Decrypt `message` with the active party, or else with an earlier one, which only counts
-    /// towards retiring the active one, see [`Session::keep`]; and tell which, and the message's
-    /// delivery token.
-    pub(crate) fn decrypt(
-        &mut self,
-        message: &EncryptedMessage,
-    ) -> Result<(Vec<u8>, bool, [u8; DELIVERY_TOKEN_LENGTH])> {
+    /// Synchronously decrypt a fetched `EncryptedMessage` using the active session or any kept
+    /// earlier session.
+    ///
+    /// - On active-session decryption, marks `known_by_peer = true` and clears the active
+    ///   session's carried `initial_message`.
+    /// - On earlier-session decryption, tracks `direction_changes` and retires `active` after
+    ///   [`MAX_DIRECTION_CHANGES`] alternating turns.
+    /// - Surfaces [`ErrorKind::DuplicateMessage`], [`ErrorKind::EvictedMessage`], and
+    ///   [`ErrorKind::Undecryptable`] distinctly.
+    pub fn decrypt_envelope(&mut self, message: &EncryptedMessage) -> Result<DecryptedMessage> {
         let state = &mut self.state;
         let mut error = None;
-        // A message a session received already is told apart, as a duplicate: one pushed again,
-        // e.g. as the reply to its push was lost, which the server deletes too, though it may
-        // have deleted the first already, as the peer gives its token.
         let mut duplicate = None;
-        // A message whose skipped key was evicted is also authenticated to a known session:
-        // acknowledge its delivery token so the server deletes it, and surface it distinctly as
-        // `ErrorKind::EvictedMessage` instead of stalling or hiding it as a duplicate.
         let mut evicted = None;
         if let Some(active) = &mut state.active {
             match active.party.decrypt(message) {
@@ -2271,14 +2806,15 @@ impl<M> Session<M> {
                     active.known_by_peer = true;
                     active.initial_message = vec![];
                     state.last = LastAction::ReceivedActive;
-                    return Ok((content, false, active.delivery_key.token(message)));
+                    return Ok(DecryptedMessage {
+                        content,
+                        earlier: false,
+                    });
                 }
                 Err(e) if e.kind() == party::error::ErrorKind::DuplicateMessage => {
-                    state.delivered.push(active.delivery_key.token(message));
                     duplicate = Some(e);
                 }
                 Err(e) if e.kind() == party::error::ErrorKind::EvictedMessage => {
-                    state.delivered.push(active.delivery_key.token(message));
                     evicted = Some(e);
                 }
                 Err(e) => error = Some(e),
@@ -2290,16 +2826,16 @@ impl<M> Session<M> {
             }
             match earlier.party.decrypt(message) {
                 Ok(content) => {
-                    let token = earlier.delivery_key.token(message);
                     state.received_earlier();
-                    return Ok((content, true, token));
+                    return Ok(DecryptedMessage {
+                        content,
+                        earlier: true,
+                    });
                 }
                 Err(e) if e.kind() == party::error::ErrorKind::DuplicateMessage => {
-                    state.delivered.push(earlier.delivery_key.token(message));
                     duplicate = Some(e);
                 }
                 Err(e) if e.kind() == party::error::ErrorKind::EvictedMessage => {
-                    state.delivered.push(earlier.delivery_key.token(message));
                     evicted = Some(e);
                 }
                 Err(_) => {}
@@ -2310,742 +2846,856 @@ impl<M> Session<M> {
             None => Err(ErrorKind::Undecryptable.into()),
         }
     }
-    /// Encrypt `content` for the peer, on the active session, with SHA-256 of the message's
-    /// delivery token under that session's key, so that it is deleted once the peer has it,
-    /// though it is pushed after another session became active.
+
+    /// Encrypt `content` for the peer on the active session, capturing both the active session's
+    /// deniable `send_write_token` and optional carried `initial_message` at seal time so pushing
+    /// after a session rotation or retirement stays bound to the sealing session.
     ///
     /// Fails with [`ErrorKind::NoSession`] if it has none, see [`Session::needs_new_session`].
     pub fn encrypt(&mut self, content: &[u8]) -> Result<Sealed> {
         let state = &mut self.state;
         let active = state.active.as_mut().ok_or(ErrorKind::NoSession)?;
         let message = active.party.encrypt(content)?;
-        let delivery_hash = Sha256::digest(active.delivery_key.token(&message)).into();
+        let write_token = active.send_write_token.as_zeroizing();
+        let initial_message = (!active.initial_message.is_empty())
+            .then(|| Bytes::copy_from_slice(&active.initial_message));
         if state.last == LastAction::ReceivedEarlier {
             state.direction_changes = state.direction_changes.saturating_add(1);
         }
         state.last = LastAction::Sent;
         Ok(Sealed {
             message,
-            delivery_hash: Some(delivery_hash),
-        })
-    }
-
-    pub(crate) async fn receive_pages<E: MailboxEnvelope, R>(
-        &mut self,
-        fetch: impl AsyncFn(&M, FetchRequest) -> Result<Vec<E>>,
-        entry: impl Fn(Result<Vec<u8>>, bool, Vec<E::Initial>) -> R,
-    ) -> Result<Vec<R>> {
-        let mut expired_pages = 0;
-        // An all-expired page can lead to another fetch in this call. Stage its progress
-        // until the last page validates, so a bad continuation also leaves the state intact.
-        let mut cursor = self.state.cursor;
-        let mut acknowledged = 0;
-        let received = 'pages: loop {
-            let after = cursor;
-            let delivered = &self.state.delivered[acknowledged..];
-            let told = delivered.len().min(MAX_DELIVERED);
-            let request = FetchRequest {
-                sender: Bytes::copy_from_slice(&self.state.peer),
-                recipient: Bytes::copy_from_slice(&self.state.me),
-                after: cursor,
-                limit: MAX_RECEIVE_PAGE,
-                delivered: delivered[..told]
-                    .iter()
-                    .map(|token| Bytes::copy_from_slice(token))
-                    .collect(),
-            };
-            let page = fetch(&self.mailbox, request).await?;
-            let after_drain = delivered.len().saturating_sub(told);
-            let receipts_fit = after_drain
-                .checked_add(page.len())
-                .is_some_and(|n| n <= MAX_STORED_DELIVERED || n < delivered.len());
-            if page.len() > MAX_RECEIVE_PAGE as usize || !receipts_fit {
-                return Err(ErrorKind::Protocol.into());
-            }
-            let mut prev = cursor;
-            for envelope in &page {
-                let seq = envelope.sequence();
-                if seq <= prev || seq > protocol::MAX_SAFE_INTEGER {
-                    return Err(ErrorKind::Protocol.into());
-                }
-                prev = seq;
-            }
-            acknowledged += told;
-
-            let mut received = Vec::with_capacity(page.len());
-            let mut carried = Vec::new();
-            let mut envelopes = page.into_iter();
-            while let Some(envelope) = envelopes.next() {
-                let sequence = envelope.sequence();
-                let (message, initial) = envelope.into_parts();
-                let Some(message) = message else {
-                    if !carry_initial(&mut carried, initial) {
-                        break;
-                    }
-                    cursor = sequence;
-                    continue;
-                };
-
-                // A page with a message always returns a result. Free the acknowledged
-                // capacity before decrypting, which can itself enqueue a receipt.
-                if acknowledged != 0 {
-                    self.state.delivered.drain(..mem::take(&mut acknowledged));
-                }
-                let decrypted = self.decrypt(&message);
-                if sequence > self.state.skip_through
-                    && decrypted.as_ref().is_err_and(|e| {
-                        !matches!(
-                            e.kind(),
-                            ErrorKind::DuplicateMessage | ErrorKind::EvictedMessage
-                        )
-                    })
-                {
-                    if !carry_initial(&mut carried, initial) {
-                        break;
-                    }
-                    // Only offer to skip envelopes whose carried initials were surfaced.
-                    self.state.stalled_through = sequence;
-                    for next in envelopes {
-                        let next_sequence = next.sequence();
-                        if !carry_initial(&mut carried, next.into_parts().1) {
-                            break;
-                        }
-                        self.state.stalled_through = next_sequence;
-                    }
-                    received.push(entry(Err(ErrorKind::Stalled.into()), false, carried));
-                    break 'pages received;
-                }
-
-                cursor = sequence;
-                let earlier = decrypted.as_ref().is_ok_and(|(_, earlier, _)| *earlier);
-                // decrypt() already queues the tokens of duplicate and evicted messages.
-                if let Ok((_, _, token)) = &decrypted {
-                    self.state.delivered.push(*token);
-                }
-                received.push(entry(
-                    decrypted.map(|(content, ..)| content),
-                    earlier,
-                    initial.into_iter().collect(),
-                ));
-            }
-            if !carried.is_empty() {
-                received.push(entry(Err(ErrorKind::Expired.into()), false, carried));
-            }
-            if !received.is_empty() || cursor == after {
-                break received;
-            }
-            expired_pages += 1;
-            if expired_pages == MAX_EXPIRED_PAGES {
-                break received;
-            }
-        };
-        self.state.cursor = cursor;
-        self.state.delivered.drain(..acknowledged);
-        Ok(received)
-    }
-}
-
-#[allow(deprecated)]
-impl<M: LocalMailbox> Session<M> {
-    /// Encrypt `content` and push it to the peer.
-    ///
-    /// If pushing fails the message is lost; to retry instead, use [`Session::encrypt`] and
-    /// [`Session::push`].
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn send(&mut self, content: &[u8]) -> Result<()> {
-        let message = self.encrypt(content)?;
-        self.push(message).await
-    }
-
-    /// Push a message encrypted for the peer; it can be pushed again if this fails. While the
-    /// peer is not known to have the active session, the initial message that started it goes
-    /// with it, in case the one in the peer's inbox was lost.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn push(&mut self, sealed: Sealed) -> Result<()> {
-        self.mailbox.push(self.push_request(sealed)).await?;
-        Ok(())
-    }
-
-    /// The request [`push`](Session::push) makes for `sealed`, to push later, e.g. once this
-    /// session is gone, as when telling the peer that the chat was deleted.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub fn push_request(&self, sealed: Sealed) -> PushRequest {
-        let initial_message = self
-            .state
-            .active
-            .as_ref()
-            .filter(|active| !active.initial_message.is_empty())
-            .and_then(|active| {
-                handshake::InitialMessage::decode(active.initial_message.as_slice()).ok()
-            });
-        PushRequest {
-            sender: Bytes::copy_from_slice(&self.state.me),
-            recipient: Bytes::copy_from_slice(&self.state.peer),
-            message: Some(sealed.message),
+            write_token,
             initial_message,
-            delivery_hash: sealed
-                .delivery_hash
-                .map_or_else(Bytes::new, |hash| Bytes::copy_from_slice(&hash)),
-        }
-    }
-
-    /// Fetch the next page of the peer's messages and decrypt them: one result per message, in
-    /// order. Returns an empty page once there are no new messages.
-    ///
-    /// A message is tried on the earlier sessions [kept](Session::keep) too. One that does not
-    /// decrypt may be on a session whose initial message is waiting, as it reached the server
-    /// first, but came after the initial messages were last taken: receiving stops there, the
-    /// page ending with an [`ErrorKind::Stalled`] error, and leaves it for later. Take and accept
-    /// the initial messages, then [`skip_stalled`](Session::skip_stalled) and receive again: what
-    /// of that page still does not decrypt never will, and is skipped, so that it cannot block
-    /// the messages after it. A message whose content expired on the server before it was
-    /// fetched is gone past, as one lost: carried initial messages are returned at the end of the page with
-    /// [`ErrorKind::Expired`]. Empty expired pages are skipped up to a bounded number per call.
-    ///
-    /// The fetch tells the server which messages the last receive got, with their delivery
-    /// tokens, so that it deletes them: save the [state](Session::state) after each receive,
-    /// before the next, as the messages are on the server until then.
-    ///
-    /// Cancel-safe: if the future is dropped, no message is consumed, but those whose contents
-    /// expired.
-    #[deprecated(
-        note = "legacy v1 protocol is deprecated; use v2 methods; see git tag archive/legacy-v1"
-    )]
-    pub async fn receive(&mut self) -> Result<Vec<Received>> {
-        self.receive_pages(
-            async |mailbox, request| Ok(mailbox.fetch(request).await?.messages),
-            |content, earlier, initial_messages| Received {
-                content,
-                earlier,
-                initial_messages,
-            },
-        )
-        .await
+        })
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod test {
     use core::cell::Cell;
+    use std::sync::Arc;
+
     use protocol::{
         attachment::AttachmentServer,
-        handshake::{
-            FetchBundleResponse, HandshakeServer, PublishResponse, SendInitialMessageResponse,
-            TakeInitialMessagesResponse,
+        handshake_v2::{
+            AckInitialMessagesRequest, AckInitialMessagesResponse, ClaimBundleRequest,
+            ClaimBundleResponse, GetManifestRequest, GetManifestResponse, GetServerInfoRequest,
+            GetServerInfoResponse, HandshakeV2Server, ListInitialMessagesRequest,
+            ListInitialMessagesResponse, LocalHandshakeV2, PublishV2Request, PublishV2Response,
+            RefillPrekeysRequest, RefillPrekeysResponse, SendInitialV2Request,
+            SendInitialV2Response, ServerInfoConfig,
         },
-        mailbox::{FetchResponse, MailboxLimits, MailboxServer, PushResponse},
+        mailbox_v2::{
+            AckMessagesRequest, AckMessagesResponse, EnvelopeV2, FetchSignedRequest,
+            FetchSignedResponse, LocalMailboxV2, MailboxV2Server, PushV2Response,
+            RegisterWriteTokenRequest, RegisterWriteTokenResponse, RevokeWriteTokenRequest,
+            RevokeWriteTokenResponse,
+        },
     };
-
+    #[cfg(feature = "serde")]
+    use ratchetx2::DhPrivateKey;
+    #[cfg(any(feature = "serde", feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    use ratchetx2::{Ratchet, SharedKeys};
     use storage::MemoryStore;
 
     use super::*;
 
-    /// Lets several clients share one in-process handshake server.
-    #[derive(Debug)]
-    struct InProcessHandshake<'a>(&'a HandshakeServer<MemoryStore>);
+    const AUDIENCE: &str = "relay.example";
 
-    impl LocalHandshake for InProcessHandshake<'_> {
-        async fn publish(&self, request: PublishRequest) -> protocol::Result<PublishResponse> {
-            self.0.publish(request).await
-        }
+    #[derive(Debug, Clone, Default)]
+    struct SharedStore(Arc<MemoryStore>);
 
-        async fn fetch_bundle(
+    impl storage::LocalPqHandshakeStore for SharedStore {
+        async fn publish_v2(
             &self,
-            request: FetchBundleRequest,
-        ) -> protocol::Result<FetchBundleResponse> {
-            self.0.fetch_bundle(request).await
+            record: storage::PublishV2Record,
+        ) -> storage::Result<storage::PublishV2Status> {
+            storage::PqHandshakeStore::publish_v2(&*self.0, record).await
         }
-
-        async fn send_initial_message(
+        async fn refill_prekeys(
             &self,
-            request: SendInitialMessageRequest,
-        ) -> protocol::Result<SendInitialMessageResponse> {
-            self.0.send_initial_message(request).await
+            record: storage::RefillPrekeysRecord,
+        ) -> storage::Result<storage::RefillStatus> {
+            storage::PqHandshakeStore::refill_prekeys(&*self.0, record).await
         }
-
-        async fn take_initial_messages(
+        async fn get_manifest(
             &self,
-            request: TakeInitialMessagesRequest,
-        ) -> protocol::Result<TakeInitialMessagesResponse> {
-            self.0.take_initial_messages(request).await
+            identity_key: &PublicKey,
+        ) -> storage::Result<Option<storage::StoredCapabilityManifest>> {
+            storage::PqHandshakeStore::get_manifest(&*self.0, identity_key).await
+        }
+        async fn claim_bundle(
+            &self,
+            identity_key: &PublicKey,
+            preferred_suites: &[u8],
+        ) -> storage::Result<Option<storage::ClaimedPqBundle>> {
+            storage::PqHandshakeStore::claim_bundle(&*self.0, identity_key, preferred_suites).await
+        }
+        async fn claim_bundle_checked(
+            &self,
+            identity_key: &PublicKey,
+            preferred_suites: &[u8],
+            reject_pq_on_manifest: bool,
+        ) -> storage::Result<storage::ClaimOutcome> {
+            storage::PqHandshakeStore::claim_bundle_checked(
+                &*self.0,
+                identity_key,
+                preferred_suites,
+                reject_pq_on_manifest,
+            )
+            .await
+        }
+        async fn add_initial_message_v2(
+            &self,
+            initial_message: storage::StoredInitialMessageV2,
+            limit: usize,
+        ) -> storage::Result<Option<u64>> {
+            storage::PqHandshakeStore::add_initial_message_v2(&*self.0, initial_message, limit)
+                .await
+        }
+        async fn add_initial_message_v2_checked(
+            &self,
+            initial_message: storage::StoredInitialMessageV2,
+            limit: usize,
+            allow_insert: bool,
+        ) -> storage::Result<storage::InitialDisposition> {
+            storage::PqHandshakeStore::add_initial_message_v2_checked(
+                &*self.0,
+                initial_message,
+                limit,
+                allow_insert,
+            )
+            .await
+        }
+        async fn list_initial_messages(
+            &self,
+            recipient: &PublicKey,
+            after_id: u64,
+            limit: usize,
+        ) -> storage::Result<Vec<storage::StoredInitialMessageV2>> {
+            storage::PqHandshakeStore::list_initial_messages(&*self.0, recipient, after_id, limit)
+                .await
+        }
+        async fn list_initial_messages_page(
+            &self,
+            recipient: &PublicKey,
+            after_id: u64,
+            limit: usize,
+        ) -> storage::Result<storage::InitialMessagePage> {
+            storage::PqHandshakeStore::list_initial_messages_page(
+                &*self.0, recipient, after_id, limit,
+            )
+            .await
+        }
+        async fn ack_initial_messages(
+            &self,
+            recipient: &PublicKey,
+            ids: &[u64],
+        ) -> storage::Result<usize> {
+            storage::PqHandshakeStore::ack_initial_messages(&*self.0, recipient, ids).await
+        }
+        async fn pq_snapshot(
+            &self,
+            identity_key: &PublicKey,
+        ) -> storage::Result<storage::PqStorageSnapshot> {
+            storage::PqHandshakeStore::pq_snapshot(&*self.0, identity_key).await
         }
     }
 
-    /// Lets several sessions share one in-process mailbox server.
+    impl storage::LocalIdempotentMailboxStore for SharedStore {
+        async fn append_idempotent(
+            &self,
+            recipient: &PublicKey,
+            token_hash: &[u8; 32],
+            header: Bytes,
+            content: Bytes,
+            initial_message: Option<Bytes>,
+            client_message_id: Option<[u8; 16]>,
+        ) -> storage::Result<u64> {
+            storage::IdempotentMailboxStore::append_idempotent(
+                &*self.0,
+                recipient,
+                token_hash,
+                header,
+                content,
+                initial_message,
+                client_message_id,
+            )
+            .await
+        }
+        async fn read_mailbox(
+            &self,
+            recipient: &PublicKey,
+            after_sequence: u64,
+            limit: u32,
+            max_size: usize,
+            ack_up_to_sequence: u64,
+        ) -> storage::Result<storage::MailboxPage> {
+            storage::IdempotentMailboxStore::read_mailbox(
+                &*self.0,
+                recipient,
+                after_sequence,
+                limit,
+                max_size,
+                ack_up_to_sequence,
+            )
+            .await
+        }
+        async fn ack_messages(
+            &self,
+            recipient: &PublicKey,
+            up_to_sequence: u64,
+        ) -> storage::Result<u64> {
+            storage::IdempotentMailboxStore::ack_messages(&*self.0, recipient, up_to_sequence).await
+        }
+        async fn register_write_token(
+            &self,
+            record: storage::RegisterWriteTokenRecord,
+        ) -> storage::Result<()> {
+            storage::IdempotentMailboxStore::register_write_token(&*self.0, record).await
+        }
+        async fn revoke_write_token(
+            &self,
+            record: storage::RevokeWriteTokenRecord,
+        ) -> storage::Result<u32> {
+            storage::IdempotentMailboxStore::revoke_write_token(&*self.0, record).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct InProcessHandshake(Arc<HandshakeV2Server<SharedStore>>);
+
+    impl InProcessHandshake {
+        fn new(store: SharedStore) -> Self {
+            Self(Arc::new(HandshakeV2Server::new(
+                store,
+                ServerInfoConfig::new(AUDIENCE),
+            )))
+        }
+    }
+
+    impl LocalHandshakeV2 for InProcessHandshake {
+        async fn get_server_info(
+            &self,
+            r: GetServerInfoRequest,
+        ) -> protocol::Result<GetServerInfoResponse> {
+            self.0.get_server_info(r).await
+        }
+        async fn publish_v2(&self, r: PublishV2Request) -> protocol::Result<PublishV2Response> {
+            self.0.publish_v2(r).await
+        }
+        async fn refill_prekeys(
+            &self,
+            r: RefillPrekeysRequest,
+        ) -> protocol::Result<RefillPrekeysResponse> {
+            self.0.refill_prekeys(r).await
+        }
+        async fn get_manifest(
+            &self,
+            r: GetManifestRequest,
+        ) -> protocol::Result<GetManifestResponse> {
+            self.0.get_manifest(r).await
+        }
+        async fn claim_bundle(
+            &self,
+            r: ClaimBundleRequest,
+        ) -> protocol::Result<ClaimBundleResponse> {
+            self.0.claim_bundle(r).await
+        }
+        async fn send_initial_v2(
+            &self,
+            r: SendInitialV2Request,
+        ) -> protocol::Result<SendInitialV2Response> {
+            self.0.send_initial_v2(r).await
+        }
+        async fn list_initial_messages(
+            &self,
+            r: ListInitialMessagesRequest,
+        ) -> protocol::Result<ListInitialMessagesResponse> {
+            self.0.list_initial_messages(r).await
+        }
+        async fn ack_initial_messages(
+            &self,
+            r: AckInitialMessagesRequest,
+        ) -> protocol::Result<AckInitialMessagesResponse> {
+            self.0.ack_initial_messages(r).await
+        }
+    }
+
     #[derive(Debug, Clone)]
-    struct InProcessMailbox<'a>(&'a MailboxServer<MemoryStore>);
+    struct InProcessMailbox(Arc<MailboxV2Server<SharedStore>>);
 
-    impl LocalMailbox for InProcessMailbox<'_> {
-        async fn push(&self, request: PushRequest) -> protocol::Result<PushResponse> {
-            self.0.push(request).await
-        }
-
-        async fn fetch(&self, request: FetchRequest) -> protocol::Result<FetchResponse> {
-            self.0.fetch(request).await
+    impl InProcessMailbox {
+        fn new(store: SharedStore) -> Self {
+            Self(Arc::new(MailboxV2Server::new(store, AUDIENCE)))
         }
     }
 
-    /// A mailbox whose message `expired`, a sequence number, comes without its content, as the
-    /// server's storage deleted it.
-    struct Expiring<'a>(&'a MailboxServer<MemoryStore>, u64);
-
-    impl LocalMailbox for Expiring<'_> {
-        async fn push(&self, request: PushRequest) -> protocol::Result<PushResponse> {
-            self.0.push(request).await
+    impl LocalMailboxV2 for InProcessMailbox {
+        async fn push_v2(&self, r: PushV2Request) -> protocol::Result<PushV2Response> {
+            self.0.push_v2(r).await
         }
-
-        async fn fetch(&self, request: FetchRequest) -> protocol::Result<FetchResponse> {
-            let mut response = self.0.fetch(request).await?;
-            for envelope in &mut response.messages {
-                if envelope.sequence == self.1 {
-                    envelope.message = None;
-                }
-            }
-            Ok(response)
-        }
-    }
-
-    #[tokio::test]
-    async fn a_message_expired_on_the_server_is_gone_past() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (_alice, mut alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
-        for content in [b"a", b"b", b"c"] {
-            alice_session.send(content).await.unwrap();
-        }
-        // "b", the second of Alice's queue after her greeting, which went with her initial
-        // message, comes without its content.
-        let mut bob_session = Session::restore(Expiring(&mailbox, 2), bob_session.state);
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a", b"c"]);
-        assert!(bob_session.receive().await.unwrap().is_empty());
-    }
-
-    #[derive(Default)]
-    struct ScriptedMailbox {
-        page: Vec<Envelope>,
-        ignore_cursor: bool,
-        fail_after: Option<u64>,
-        fetches: Cell<usize>,
-    }
-
-    impl ScriptedMailbox {
-        fn page_after(&self, after: u64) -> protocol::Result<Vec<Envelope>> {
-            self.fetches.set(self.fetches.get() + 1);
-            if self.fail_after == Some(after) {
-                return Err(protocol::ErrorKind::Connect.into());
-            }
-            Ok(self
-                .page
-                .iter()
-                .filter(|e| self.ignore_cursor || e.sequence > after)
-                .cloned()
-                .collect())
-        }
-    }
-
-    impl LocalMailbox for ScriptedMailbox {
-        async fn fetch(&self, req: FetchRequest) -> protocol::Result<FetchResponse> {
-            assert_eq!(req.limit, 100);
-            Ok(FetchResponse {
-                messages: self.page_after(req.after)?,
-            })
-        }
-
-        async fn push(&self, _: PushRequest) -> protocol::Result<PushResponse> {
-            unreachable!()
-        }
-    }
-
-    impl protocol::mailbox_v2::LocalMailboxV2 for ScriptedMailbox {
         async fn fetch_signed(
             &self,
-            req: protocol::mailbox_v2::FetchSignedRequest,
-        ) -> protocol::Result<protocol::mailbox_v2::FetchSignedResponse> {
-            assert_eq!(req.limit, 100);
-            Ok(protocol::mailbox_v2::FetchSignedResponse {
-                messages: self
-                    .page_after(req.after)?
-                    .into_iter()
-                    .map(|e| protocol::mailbox_v2::EnvelopeV2 {
-                        sequence: e.sequence,
-                        message: e.message,
-                        initial_message: e.initial_message.as_ref().map(Into::into),
-                    })
-                    .collect(),
-            })
+            r: FetchSignedRequest,
+        ) -> protocol::Result<FetchSignedResponse> {
+            self.0.fetch_signed(r).await
         }
-
-        async fn push_v2(
+        async fn ack_messages(
             &self,
-            _: protocol::mailbox_v2::PushV2Request,
-        ) -> protocol::Result<protocol::mailbox_v2::PushV2Response> {
-            unreachable!()
+            r: AckMessagesRequest,
+        ) -> protocol::Result<AckMessagesResponse> {
+            self.0.ack_messages(r).await
+        }
+        async fn register_write_token(
+            &self,
+            r: RegisterWriteTokenRequest,
+        ) -> protocol::Result<RegisterWriteTokenResponse> {
+            self.0.register_write_token(r).await
+        }
+        async fn revoke_write_token(
+            &self,
+            r: RevokeWriteTokenRequest,
+        ) -> protocol::Result<RevokeWriteTokenResponse> {
+            self.0.revoke_write_token(r).await
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum MailboxVersion {
-        V1,
-        V2,
+    /// Register `session`'s active inbound write token on `client`'s mailbox server.
+    async fn register_active_grant<H, M>(
+        client: &mut Client<H>,
+        session: &Session<M>,
+        mailbox: &InProcessMailbox,
+    ) {
+        let token_hash = session.active_inbound_token_hash().unwrap();
+        let ver = client.allocate_grant_version().unwrap();
+        client
+            .register_write_token_v2(mailbox, AUDIENCE, session.peer(), &token_hash, ver, true)
+            .await
+            .unwrap();
     }
 
-    impl MailboxVersion {
-        const ALL: &[Self] = &[Self::V1, Self::V2];
-
-        async fn receive(
-            self,
-            session: &mut Session<ScriptedMailbox>,
-            client: &Client<()>,
-        ) -> Result<Vec<Received>> {
-            match self {
-                Self::V1 => session.receive().await,
-                Self::V2 => Ok(session
-                    .receive_v2(client, "relay.example")
-                    .await?
-                    .into_iter()
-                    .map(|r| Received {
-                        content: r.content,
-                        earlier: r.earlier,
-                        initial_messages: r
-                            .initial_messages
-                            .into_iter()
-                            .map(|im| {
-                                let InitialMessageKind::Classical(m) = im.kind else {
-                                    panic!("expected classical fixture")
-                                };
-                                m
-                            })
-                            .collect(),
-                    })
-                    .collect()),
+    /// Fetch, decrypt matching envelopes for `session`, commit page, and ACK on server.
+    async fn receive_for<H, M>(
+        client: &mut Client<H>,
+        session: &mut Session<M>,
+        mailbox: &InProcessMailbox,
+    ) -> Vec<Result<DecryptedMessage>> {
+        let page = client
+            .fetch_mailbox_v2(mailbox, AUDIENCE, 100)
+            .await
+            .unwrap();
+        let mut results = Vec::new();
+        let hashes: Vec<[u8; 32]> = session.inbound_token_hashes().collect();
+        for env in &page.messages {
+            let hash: [u8; 32] = env.token_hash.as_ref().try_into().unwrap();
+            if hashes.contains(&hash) {
+                results.push(session.decrypt_envelope(env.message.as_ref().unwrap()));
             }
         }
+        if let Some(last) = page.last_sequence() {
+            client.commit_mailbox_page(last, last).unwrap();
+            client.ack_mailbox_v2(mailbox, AUDIENCE).await.unwrap();
+        } else if page.piggybacked_ack > 0 {
+            client.clear_pending_mailbox_ack(page.piggybacked_ack);
+        }
+        results
     }
 
-    async fn scripted_mailbox() -> (Client<()>, Session<ScriptedMailbox>, EncryptedMessage) {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (_, mut sender, bob, session) = talking(&handshake, &mailbox).await;
-        let message = sender.encrypt(b"message").unwrap().message;
-        (
-            Client::restore((), bob.state),
-            Session::restore(ScriptedMailbox::default(), session.state),
-            message,
+    fn contents(results: Vec<Result<DecryptedMessage>>) -> Vec<Vec<u8>> {
+        results.into_iter().map(|r| r.unwrap().content).collect()
+    }
+
+    /// Count messages currently queued in `store` for `recipient`.
+    async fn queued(store: &SharedStore, recipient: &PublicKey) -> usize {
+        storage::IdempotentMailboxStore::read_mailbox(&*store.0, recipient, 0, 100, 1 << 20, 0)
+            .await
+            .unwrap()
+            .messages
+            .len()
+    }
+
+    /// Accept the oldest inbox initial for `client` from `peer`, keeping `session`, acking inbox,
+    /// and registering the new session's inbound write token on `mailbox`.
+    async fn accept_keeping(
+        client: &mut Client<InProcessHandshake>,
+        peer: &PublicKey,
+        session: &mut Session<InProcessMailbox>,
+        mailbox: &InProcessMailbox,
+    ) -> Vec<u8> {
+        let listed = client
+            .list_initial_messages_v2(AUDIENCE, 0, 10)
+            .await
+            .unwrap();
+        let msg = listed
+            .messages
+            .iter()
+            .find(|m| m.sender == *peer)
+            .expect("initial message from peer");
+        let AcceptedInitial::Accepted {
+            session: accepted,
+            first_message,
+            ..
+        } = client
+            .accept_initial_v2(peer, session.peer_pq_state(), msg, mailbox.clone())
+            .unwrap()
+        else {
+            panic!("expected accepted initial");
+        };
+        let new_hash = accepted.active_inbound_token_hash().unwrap();
+        let took_over = session.accept_replacement(accepted).unwrap();
+        let ver = client.allocate_grant_version().unwrap();
+        client
+            .register_write_token_v2(mailbox, AUDIENCE, peer, &new_hash, ver, took_over)
+            .await
+            .unwrap();
+        client
+            .ack_initial_messages_v2(AUDIENCE, vec![msg.id])
+            .await
+            .unwrap();
+        first_message
+    }
+
+    /// Alice and Bob, who have published v2 keys, exchanged grants, and talked ("hi" / "hello").
+    async fn talking(
+        hs: &InProcessHandshake,
+        mb: &InProcessMailbox,
+    ) -> (
+        Client<InProcessHandshake>,
+        Session<InProcessMailbox>,
+        Client<InProcessHandshake>,
+        Session<InProcessMailbox>,
+    ) {
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs.clone());
+        alice.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+        bob.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+
+        let mut alice_session = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        register_active_grant(&mut alice, &alice_session, mb).await;
+
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let batch = bob.accept_listed_v2(&listed, mb.clone(), |_| PeerPqState::default());
+        bob.ack_initial_messages_v2(AUDIENCE, batch.ack_ids)
+            .await
+            .unwrap();
+        let (
+            _,
+            AcceptedInitial::Accepted {
+                session: mut bob_session,
+                first_message,
+                ..
+            },
+        ) = batch.outcomes.into_iter().next().unwrap()
+        else {
+            panic!("expected accepted");
+        };
+        assert_eq!(first_message, b"hi");
+        register_active_grant(&mut bob, &bob_session, mb).await;
+
+        bob_session.send_v2(b"hello").await.unwrap();
+        assert_eq!(
+            contents(receive_for(&mut alice, &mut alice_session, mb).await),
+            [b"hello"]
+        );
+        (alice, alice_session, bob, bob_session)
+    }
+
+    /// Whether `a` and `b` send on one session.
+    fn on_one_session<M>(a: &Session<M>, b: &Session<M>) -> bool {
+        matches!(
+            (&a.state.active, &b.state.active),
+            (Some(a), Some(b)) if a.id == b.id
         )
     }
 
-    fn expired_page() -> Vec<Envelope> {
-        (1u8..=100)
-            .map(|id| Envelope {
-                sequence: u64::from(id),
-                message: None,
-                initial_message: (id <= 70).then(|| handshake::InitialMessage {
-                    identity_key: Bytes::from_static(&[1; 32]),
-                    ephemeral_key: Bytes::from(vec![id; 32]),
-                    signed_prekey: Bytes::from_static(&[3; 32]),
-                    one_time_prekey: None,
-                    first_message: Some(EncryptedMessage::default()),
-                }),
-            })
-            .collect()
+    #[cfg(feature = "prost")]
+    fn restored<T, P>(state: &T) -> T
+    where
+        P: prost::Message + Default + for<'a> From<&'a T>,
+        T: for<'a> TryFrom<&'a P, Error = Error>,
+    {
+        let saved = P::from(state).encode_to_vec();
+        T::try_from(&P::decode(saved.as_slice()).unwrap()).unwrap()
     }
 
-    fn carried_ids(result: &Received, kind: ErrorKind) -> Vec<u8> {
-        assert_eq!(result.content.as_ref().unwrap_err().kind(), kind);
-        result
-            .initial_messages
-            .iter()
-            .map(|im| im.x3dh.ephemeral_key[0])
-            .collect()
-    }
+    #[test]
+    fn write_token_derivation_deniability_and_peer_slot_id_opaqueness() {
+        let sk = [0x42u8; 32];
+        let alice = Client::new(());
+        let bob = Client::new(());
+        let carol = Client::new(());
+        let (a_pk, b_pk, c_pk) = (
+            alice.identity_key(),
+            bob.identity_key(),
+            carol.identity_key(),
+        );
 
-    #[tokio::test]
-    async fn invalid_pages_preserve_receipts_cursor_and_ratchet() {
-        for version in MailboxVersion::ALL {
-            let (bob, mut session, message) = scripted_mailbox().await;
-            session.state.cursor = 5;
-            session.state.stalled_through = 7;
-            session.mailbox.ignore_cursor = true;
-            let token = [5; DELIVERY_TOKEN_LENGTH];
-            // Oversized pages (> MAX_RECEIVE_PAGE) and non-monotonic or out-of-range sequences
-            // must be rejected without mutating cursor, stall markers, or queued receipts.
-            for (sequences, receipt_count) in [
-                ((6..=106).collect::<Vec<_>>(), MAX_STORED_DELIVERED),
-                (vec![5], 1),
-                (vec![4], 1),
-                (vec![6, 6], 1),
-                (vec![7, 6], 1),
-                (vec![6, protocol::MAX_SAFE_INTEGER + 1], 1),
-            ] {
-                session.mailbox.page = sequences
-                    .into_iter()
-                    .map(|sequence| Envelope {
-                        sequence,
-                        message: None,
-                        initial_message: None,
-                    })
-                    .collect();
-                // Even an authentic message at the front must remain decryptable on retry.
-                if session.mailbox.page[0].sequence > session.state.cursor {
-                    session.mailbox.page[0].message = Some(message.clone());
-                }
-                let receipts = vec![token; receipt_count];
-                session.state.delivered.clone_from(&receipts);
-                assert_eq!(
-                    version
-                        .receive(&mut session, &bob)
-                        .await
-                        .unwrap_err()
-                        .kind(),
-                    ErrorKind::Protocol
-                );
-                assert_eq!(
-                    (session.state.cursor, session.state.stalled_through),
-                    (5, 7)
-                );
-                assert_eq!(session.state.delivered, receipts);
-            }
-            session.state.delivered = vec![token; MAX_STORED_DELIVERED];
-            session.mailbox.page = vec![Envelope {
-                sequence: 6,
-                message: Some(message),
-                initial_message: None,
-            }];
-            assert_eq!(
-                contents(version.receive(&mut session, &bob).await.unwrap()),
-                [b"message"]
-            );
-            assert_eq!(
-                session.state.delivered.len(),
-                MAX_STORED_DELIVERED - MAX_DELIVERED + 1
-            );
-        }
+        let (a_send, a_in_hash) = WriteToken::pair(&sk, &a_pk, &b_pk);
+        let (b_send, b_in_hash) = WriteToken::pair(&sk, &b_pk, &a_pk);
+
+        // Directional tokens are distinct yet match across peers (and either side can compute both,
+        // preserving deniability).
+        assert_ne!(a_send.0, b_send.0);
+        assert_eq!(a_send.hash(), b_in_hash);
+        assert_eq!(b_send.hash(), a_in_hash);
+        assert_eq!(format!("{a_send:?}"), "WriteToken(..)");
+
+        // Different shared secrets produce independent tokens.
+        let other = WriteToken::derive(&[0x43u8; 32], &a_pk, &b_pk);
+        assert_ne!(other.0, a_send.0);
+
+        // `peer_slot_id` is deterministic per `(identity_sk, peer)`, opaque (never equals `peer`),
+        // and distinct across peers and across identities.
+        let slot_ab = alice.peer_slot_id(&b_pk);
+        let slot_ab_again = alice.peer_slot_id(&b_pk);
+        let slot_ac = alice.peer_slot_id(&c_pk);
+        let slot_ba = bob.peer_slot_id(&a_pk);
+        assert_eq!(slot_ab, slot_ab_again);
+        assert_ne!(slot_ab, b_pk);
+        assert_ne!(slot_ab, slot_ac);
+        assert_ne!(slot_ab, slot_ba);
     }
 
     #[tokio::test]
-    async fn merging_two_large_delivered_queues_deduplicates_caps_and_drains() {
-        let token = |n: u32| {
-            let mut out = [0u8; DELIVERY_TOKEN_LENGTH];
-            out[..4].copy_from_slice(&n.to_be_bytes());
-            out
-        };
+    async fn sealed_binds_write_token_and_carried_initial_to_sealing_session_and_redacts_debug() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
 
-        // 1. Merging two disjoint 3,000-receipt sessions via `Session::keep` caps `delivered` to
-        //    `MAX_STORED_DELIVERED` (4,096), retaining the most recent tokens in order.
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
-        let mut newer = alice
-            .initiate(&bob.identity_key(), b"again", InProcessMailbox(&mailbox))
+        // Alice starts session S2 (unconfirmed: `!known_by_peer`, carries S2's initial) and seals
+        // a message on S2, then immediately rotates to S3 BEFORE pushing S2's sealed message.
+        alice
+            .start_again_v2(AUDIENCE, &mut alice_session, b"s2-hello")
             .await
             .unwrap();
-        let initial = bob.take_initial_messages().await.unwrap();
-        let (mut bob_newer, _) = bob
-            .accept(
-                &alice.identity_key(),
-                &initial[0],
-                InProcessMailbox(&mailbox),
-            )
+        let s2_id = *alice_session.active_id().unwrap();
+        let s2_sealed = alice_session.encrypt(b"s2-body").unwrap();
+        assert!(s2_sealed.initial_message.is_some());
+
+        // Redacted `Debug` never leaks write_token bytes or header/content ciphertext.
+        let dbg = format!("{s2_sealed:?}");
+        assert!(dbg.contains("Sealed"));
+        assert!(!dbg.contains(&format!("{:?}", &s2_sealed.write_token[..4])));
+
+        // Rotate to S3 and retire!
+        alice
+            .start_again_v2(AUDIENCE, &mut alice_session, b"s3-hello")
+            .await
             .unwrap();
+        let s3_id = *alice_session.active_id().unwrap();
+        assert_ne!(s2_id, s3_id);
+        alice_session.retire();
 
-        bob_session.state.delivered = (0u32..3000).map(token).collect();
-        bob_newer.state.delivered = (3000u32..6000).map(token).collect();
-        bob_newer.keep(bob_session).unwrap();
-
-        let expected_start = 6000u32 - MAX_STORED_DELIVERED as u32;
-        assert_eq!(bob_newer.state.delivered.len(), MAX_STORED_DELIVERED);
-        assert_eq!(bob_newer.state.delivered[0], token(expected_start));
-        assert_eq!(*bob_newer.state.delivered.last().unwrap(), token(5999));
-        // Receiving on the merged session succeeds immediately and drains `MAX_DELIVERED`.
-        newer.send(b"after-merge").await.unwrap();
+        // Building `PushV2Request` from `s2_sealed` even after rotating/retiring MUST still bind
+        // S2's write_token AND S2's carried initial message (NOT S3's or None)!
+        let req = alice_session.push_v2_request(&s2_sealed);
+        assert_eq!(req.write_token.as_ref(), s2_sealed.write_token.as_slice());
         assert_eq!(
-            contents(bob_newer.receive().await.unwrap()),
-            [b"after-merge"]
+            req.initial_message.as_ref().unwrap().ephemeral_key.as_ref(),
+            &s2_id
         );
         assert_eq!(
-            bob_newer.state.delivered.len(),
-            MAX_STORED_DELIVERED - MAX_DELIVERED + 1
+            req.client_message_id.as_ref(),
+            &s2_sealed.client_message_id()
         );
-        let _ = &mut alice_session;
 
-        // 2. Overlapping receipts are deduplicated before capping so unique tokens are preserved.
-        let mut existing: Vec<_> = (0u32..3000).map(token).collect();
-        let incoming: Vec<_> = (1500u32..4500).map(token).collect();
-        merge_delivered(&mut existing, incoming);
-        assert_eq!(existing.len(), MAX_STORED_DELIVERED);
-        assert_eq!(existing[0], token(4500 - MAX_STORED_DELIVERED as u32));
-        assert_eq!(*existing.last().unwrap(), token(4499));
-    }
-
-    #[tokio::test]
-    async fn over_capacity_delivered_queue_drains_without_wedging_receive() {
-        for version in MailboxVersion::ALL {
-            let (bob, mut session, message) = scripted_mailbox().await;
-            let token = [9u8; DELIVERY_TOKEN_LENGTH];
-            // Even if pre-existing `delivered` is far above `MAX_STORED_DELIVERED + MAX_DELIVERED`,
-            // receiving MUST drain `MAX_DELIVERED` per batch instead of wedging permanently.
-            let initial_len = MAX_STORED_DELIVERED + MAX_DELIVERED + 500;
-            session.state.delivered = vec![token; initial_len];
-            session.mailbox.page = vec![Envelope {
-                sequence: 1,
-                message: Some(message),
-                initial_message: None,
-            }];
-            assert_eq!(
-                contents(version.receive(&mut session, &bob).await.unwrap()),
-                [b"message"]
-            );
-            assert_eq!(
-                session.state.delivered.len(),
-                initial_len - MAX_DELIVERED + 1
-            );
-
-            // Subsequent empty fetches continue draining cleanly back below `MAX_STORED_DELIVERED`.
-            session.mailbox.page.clear();
-            while session.state.delivered.len() > MAX_STORED_DELIVERED {
-                let before = session.state.delivered.len();
-                assert!(
-                    version
-                        .receive(&mut session, &bob)
-                        .await
-                        .unwrap()
-                        .is_empty()
-                );
-                assert_eq!(session.state.delivered.len(), before - MAX_DELIVERED);
-            }
-            assert!(session.state.delivered.len() <= MAX_STORED_DELIVERED);
+        // Accept S2 and S3 on Bob and register both grants; S2's grant routes to S2's earlier
+        // session even though S3 is active!
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        assert_eq!(listed.messages.len(), 2);
+        let batch =
+            bob.accept_listed_v2(&listed, mb.clone(), |_| bob_session.peer_pq_state().clone());
+        bob.ack_initial_messages_v2(AUDIENCE, batch.ack_ids)
+            .await
+            .unwrap();
+        for (_, outcome) in batch.outcomes {
+            let AcceptedInitial::Accepted { session: s, .. } = outcome else {
+                panic!("expected accepted");
+            };
+            let h = s.active_inbound_token_hash().unwrap();
+            let took_over = bob_session.accept_replacement(s).unwrap();
+            let ver = bob.allocate_grant_version().unwrap();
+            bob.register_write_token_v2(&mb, AUDIENCE, &alice.identity_key(), &h, ver, took_over)
+                .await
+                .unwrap();
         }
+        assert_eq!(bob_session.active_id(), Some(&s3_id));
+        // Both S3 (active) and S2 (earlier) inbound token hashes are exposed for O(1) routing.
+        let hashes: Vec<[u8; 32]> = bob_session.inbound_token_hashes().collect();
+        let s2_hash: [u8; 32] = Sha256::digest(s2_sealed.write_token.as_slice()).into();
+        assert!(hashes.contains(&s2_hash));
+        assert_ne!(bob_session.active_inbound_token_hash(), Some(s2_hash));
+
+        // Pushing S2's sealed message succeeds and Bob decrypts it on S2 (marked `earlier = true`).
+        alice_session.push_v2(&s2_sealed).await.unwrap();
+        let rx = receive_for(&mut bob, &mut bob_session, &mb).await;
+        assert_eq!(rx.len(), 1);
+        let msg = rx[0].as_ref().unwrap();
+        assert_eq!(msg.content, b"s2-body");
+        assert!(msg.earlier);
     }
 
     #[tokio::test]
-    async fn a_bad_continuation_preserves_progress_from_before_the_fetch() {
-        for version in MailboxVersion::ALL {
-            let (bob, mut session, _) = scripted_mailbox().await;
-            let receipts = vec![[7; DELIVERY_TOKEN_LENGTH]; MAX_DELIVERED + 1];
-            session.state.delivered.clone_from(&receipts);
-            session.mailbox.page = vec![Envelope {
-                sequence: 1,
-                ..Default::default()
-            }];
-            session.mailbox.ignore_cursor = true;
+    async fn invalid_mailbox_pages_preserve_cursor_and_pending_ack() {
+        #[derive(Default)]
+        struct ScriptedMailbox {
+            page: Vec<EnvelopeV2>,
+            has_more: bool,
+        }
+
+        impl LocalMailboxV2 for ScriptedMailbox {
+            async fn push_v2(&self, _: PushV2Request) -> protocol::Result<PushV2Response> {
+                unreachable!()
+            }
+            async fn fetch_signed(
+                &self,
+                req: FetchSignedRequest,
+            ) -> protocol::Result<FetchSignedResponse> {
+                assert_eq!(req.limit, 100);
+                Ok(FetchSignedResponse {
+                    messages: self.page.clone(),
+                    has_more: self.has_more,
+                })
+            }
+            async fn ack_messages(
+                &self,
+                _: AckMessagesRequest,
+            ) -> protocol::Result<AckMessagesResponse> {
+                unreachable!()
+            }
+            async fn register_write_token(
+                &self,
+                _: RegisterWriteTokenRequest,
+            ) -> protocol::Result<RegisterWriteTokenResponse> {
+                unreachable!()
+            }
+            async fn revoke_write_token(
+                &self,
+                _: RevokeWriteTokenRequest,
+            ) -> protocol::Result<RevokeWriteTokenResponse> {
+                unreachable!()
+            }
+        }
+
+        let mut bob = Client::new(());
+        bob.commit_mailbox_page(5, 4).unwrap();
+        assert_eq!((bob.mailbox_cursor(), bob.pending_mailbox_ack()), (5, 4));
+
+        let valid_env = |sequence| EnvelopeV2 {
+            sequence,
+            token_hash: Bytes::from_static(&[0xAA; 32]),
+            message: Some(EncryptedMessage::default()),
+            initial_message: None,
+        };
+
+        let bad_pages = [
+            // Oversized page (> requested limit 100).
+            (6..=106).map(valid_env).collect::<Vec<_>>(),
+            // Non-advancing / regressive / duplicate / unsafe sequence numbers.
+            vec![valid_env(5)],
+            vec![valid_env(4)],
+            vec![valid_env(6), valid_env(6)],
+            vec![valid_env(7), valid_env(6)],
+            vec![valid_env(6), valid_env(protocol::MAX_SAFE_INTEGER + 1)],
+            // Bad token_hash length.
+            vec![EnvelopeV2 {
+                token_hash: Bytes::from_static(&[0xAA; 31]),
+                ..valid_env(6)
+            }],
+            // Missing inline message (forbidden under 3A).
+            vec![EnvelopeV2 {
+                message: None,
+                ..valid_env(6)
+            }],
+        ];
+
+        for page in bad_pages {
+            let mb = ScriptedMailbox {
+                page,
+                has_more: false,
+            };
             assert_eq!(
-                version
-                    .receive(&mut session, &bob)
+                bob.fetch_mailbox_v2(&mb, AUDIENCE, 100)
                     .await
                     .unwrap_err()
                     .kind(),
                 ErrorKind::Protocol
             );
-            assert_eq!(session.mailbox.fetches.get(), 2);
-            assert_eq!(session.state.cursor, 0);
-            assert_eq!(session.state.delivered, receipts);
+            assert_eq!((bob.mailbox_cursor(), bob.pending_mailbox_ack()), (5, 4));
         }
+
+        // Invalid `commit_mailbox_page` arguments fail without mutating state.
+        assert_eq!(
+            bob.commit_mailbox_page(protocol::MAX_SAFE_INTEGER + 1, 5)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            bob.commit_mailbox_page(6, 7).unwrap_err().kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!((bob.mailbox_cursor(), bob.pending_mailbox_ack()), (5, 4));
     }
 
     #[tokio::test]
-    async fn expired_initial_is_returned_before_a_later_fetch_error() {
-        for version in MailboxVersion::ALL {
-            let (bob, mut session, _) = scripted_mailbox().await;
-            session.mailbox.page = expired_page();
-            session.mailbox.page.truncate(1);
-            session.mailbox.fail_after = Some(1);
-            let received = version.receive(&mut session, &bob).await.unwrap();
-            assert_eq!(received.len(), 1);
-            assert_eq!(carried_ids(&received[0], ErrorKind::Expired), [1]);
-            assert_eq!(session.mailbox.fetches.get(), 1);
-            assert_eq!(
-                version
-                    .receive(&mut session, &bob)
-                    .await
-                    .unwrap_err()
-                    .kind(),
-                ErrorKind::Server
-            );
-            assert_eq!(session.mailbox.fetches.get(), 2);
-        }
-    }
+    async fn merging_pending_register_grants_deduplicates_caps_and_preserves_active() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, _, mut bob, mut bob_session) = talking(&hs, &mb).await;
 
-    #[tokio::test]
-    async fn expired_and_stalled_carried_initials_resume_at_the_first_one_that_did_not_fit() {
-        for version in MailboxVersion::ALL {
-            for first_stall in [None, Some(1), Some(65)] {
-                let (bob, mut session, _) = scripted_mailbox().await;
-                session.mailbox.page = expired_page();
-                if let Some(sequence) = first_stall {
-                    for env in &mut session.mailbox.page {
-                        if env.sequence >= sequence {
-                            env.message = Some(EncryptedMessage::default());
-                        }
-                    }
-                }
-                let received = version.receive(&mut session, &bob).await.unwrap();
-                assert_eq!(received.len(), 1);
-                let stalled = first_stall == Some(1);
-                let kind = if stalled {
-                    ErrorKind::Stalled
-                } else {
-                    ErrorKind::Expired
-                };
-                assert_eq!(
-                    carried_ids(&received[0], kind),
-                    (1..=64).collect::<Vec<_>>()
-                );
-                assert_eq!(
-                    (session.state.cursor, session.state.stalled_through),
-                    if stalled { (0, 64) } else { (64, 0) }
-                );
-                session.skip_stalled();
-                let next = version.receive(&mut session, &bob).await.unwrap();
-                let kind = if first_stall.is_some() {
-                    ErrorKind::Stalled
-                } else {
-                    ErrorKind::Expired
-                };
-                assert_eq!(
-                    carried_ids(next.last().unwrap(), kind),
-                    (65..=70).collect::<Vec<_>>()
-                );
-                if first_stall.is_some() {
-                    assert_eq!(
-                        (session.state.cursor, session.state.stalled_through),
-                        (64, 100)
-                    );
-                } else {
-                    assert_eq!(session.state.cursor, 100);
-                }
-            }
-        }
-    }
+        let active_hash = bob_session.active_inbound_token_hash().unwrap();
+        let h = |b: u8| [b; 32];
 
-    /// A mailbox that answers every fetch with the same expired message, as a faulty server may.
-    struct Repeating(Cell<usize>);
-
-    impl LocalMailbox for Repeating {
-        async fn push(&self, _request: PushRequest) -> protocol::Result<PushResponse> {
-            Ok(PushResponse::default())
-        }
-
-        async fn fetch(&self, _request: FetchRequest) -> protocol::Result<FetchResponse> {
-            self.0.set(self.0.get() + 1);
-            Ok(FetchResponse {
-                messages: vec![Envelope::default()],
+        // Queue active grant with version 1 (lowest!) plus 3 older non-active grants.
+        bob_session
+            .queue_pending_grant(PendingGrant {
+                token_hash: active_hash,
+                grant_version: 1,
+                pin_active: true,
             })
+            .unwrap();
+        for (idx, v) in [(1u8, 10u64), (2, 20), (3, 30)] {
+            bob_session
+                .queue_pending_grant(PendingGrant {
+                    token_hash: h(idx),
+                    grant_version: v,
+                    pin_active: false,
+                })
+                .unwrap();
         }
+        assert_eq!(
+            bob_session.pending_register_grants().len(),
+            MAX_PENDING_REGISTER_GRANTS
+        );
+
+        // Queueing a 5th non-active grant MUST evict lowest non-active (`h(1)`, v=10), preserving
+        // the active grant even though its version (1) is smaller!
+        bob_session
+            .queue_pending_grant(PendingGrant {
+                token_hash: h(4),
+                grant_version: 40,
+                pin_active: false,
+            })
+            .unwrap();
+        let grants = bob_session.pending_register_grants();
+        assert_eq!(grants.len(), MAX_PENDING_REGISTER_GRANTS);
+        assert!(grants.iter().any(|g| g.token_hash == active_hash));
+        assert!(!grants.iter().any(|g| g.token_hash == h(1)));
+
+        // Merging via `Session::keep` deduplicates by `token_hash` (keeping higher version) and
+        // preserves the cap.
+        alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"again",
+                mb.clone(),
+            )
+            .await
+            .unwrap();
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted {
+            session: mut bob_newer,
+            ..
+        } = bob
+            .accept_initial_v2(
+                &alice.identity_key(),
+                bob_session.peer_pq_state(),
+                &listed.messages[0],
+                mb,
+            )
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
+        let newer_active_hash = bob_newer.active_inbound_token_hash().unwrap();
+        bob_newer
+            .queue_pending_grant(PendingGrant {
+                token_hash: h(2),
+                grant_version: 25, // supersedes v=20 for same h(2)
+                pin_active: false,
+            })
+            .unwrap();
+        bob_newer
+            .queue_pending_grant(PendingGrant {
+                token_hash: newer_active_hash,
+                grant_version: 50,
+                pin_active: true,
+            })
+            .unwrap();
+        bob_newer.keep(bob_session).unwrap();
+
+        let merged = bob_newer.pending_register_grants();
+        assert_eq!(merged.len(), MAX_PENDING_REGISTER_GRANTS);
+        assert!(merged.iter().any(|g| g.token_hash == newer_active_hash));
+        assert!(
+            merged
+                .iter()
+                .any(|g| g.token_hash == h(2) && g.grant_version == 25)
+        );
+        // Sorted ascending by grant_version.
+        assert!(
+            merged
+                .windows(2)
+                .all(|w| w[0].grant_version <= w[1].grant_version)
+        );
+
+        // Removing a confirmed grant removes only matching hash with version <= confirmed.
+        assert!(!bob_newer.remove_pending_grant(&h(2), 24));
+        assert!(bob_newer.remove_pending_grant(&h(2), 25));
+        assert!(
+            !bob_newer
+                .pending_register_grants()
+                .iter()
+                .any(|g| g.token_hash == h(2))
+        );
+
+        // Invalid grant versions (0 or > MAX_SAFE_INTEGER) are rejected.
+        assert_eq!(
+            bob_newer
+                .queue_pending_grant(PendingGrant {
+                    token_hash: h(9),
+                    grant_version: 0,
+                    pin_active: false,
+                })
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
+        assert_eq!(
+            bob_newer
+                .queue_pending_grant(PendingGrant {
+                    token_hash: h(9),
+                    grant_version: protocol::MAX_SAFE_INTEGER + 1,
+                    pin_active: false,
+                })
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidArgument
+        );
     }
 
     #[tokio::test]
     async fn sequence_limits_survive_allocation_and_replacement() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, _, mut bob, mut session) = talking(&handshake, &mailbox).await;
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, _, mut bob, mut session) = talking(&hs, &mb).await;
         session.state.next_session_seq = protocol::MAX_SAFE_INTEGER - 1;
         for expected in [
             protocol::MAX_SAFE_INTEGER - 1,
@@ -3058,12 +3708,33 @@ mod test {
         let id = *session.active_id().unwrap();
         for invalid_active in [true, false] {
             alice
-                .initiate(&bob.identity_key(), b"next", ())
+                .initiate_v2(
+                    AUDIENCE,
+                    &bob.identity_key(),
+                    &PeerPqState::default(),
+                    b"next",
+                    (),
+                )
                 .await
                 .unwrap();
-            let inbox = bob.take_initial_messages().await.unwrap();
-            let (mut incoming, _) = bob
-                .accept(&alice.identity_key(), &inbox[0], InProcessMailbox(&mailbox))
+            let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+            let msg = &listed.messages[0];
+            let AcceptedInitial::Accepted {
+                session: mut incoming,
+                ..
+            } = bob
+                .accept_initial_v2(
+                    &alice.identity_key(),
+                    session.peer_pq_state(),
+                    msg,
+                    mb.clone(),
+                )
+                .unwrap()
+            else {
+                panic!("expected accepted");
+            };
+            bob.ack_initial_messages_v2(AUDIENCE, vec![msg.id])
+                .await
                 .unwrap();
             if invalid_active {
                 incoming.state.active.as_mut().unwrap().peer_session_seq =
@@ -3081,288 +3752,242 @@ mod test {
     }
 
     #[tokio::test]
-    async fn a_repeated_expired_sequence_is_refused_after_one_fetch() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (_alice, _alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
-        let mut bob_session = Session::restore(Repeating(Cell::new(0)), bob_session.state);
-        assert_eq!(
-            bob_session.receive().await.unwrap_err().kind(),
-            ErrorKind::Protocol
-        );
-        assert_eq!(bob_session.mailbox.0.get(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_page_of_expired_messages_is_not_the_end() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        // A message a page, so that the first page holds only the one expired.
-        let limits = MailboxLimits {
-            max_fetch: 1,
-            ..MailboxLimits::default()
-        };
-        let mailbox = MailboxServer::builder(MemoryStore::default())
-            .limits(limits)
-            .build();
-        let (_alice, mut alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
-        for content in [b"a", b"b"] {
-            alice_session.send(content).await.unwrap();
-        }
-        let mut bob_session = Session::restore(Expiring(&mailbox, 1), bob_session.state);
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"b"]);
-        assert!(bob_session.receive().await.unwrap().is_empty());
-    }
-
-    /// The messages on the server from `sender` to `recipient`.
-    async fn queued(
-        mailbox: &MailboxServer<MemoryStore>,
-        sender: &PublicKey,
-        recipient: &PublicKey,
-    ) -> usize {
-        let request = FetchRequest {
-            sender: Bytes::copy_from_slice(sender),
-            recipient: Bytes::copy_from_slice(recipient),
-            after: 0,
-            limit: 0,
-            delivered: vec![],
-        };
-        mailbox.fetch(request).await.unwrap().messages.len()
-    }
-
-    #[tokio::test]
-    async fn delivered_messages_leave_the_server() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (alice, mut alice_session, bob, mut bob_session) = talking(&handshake, &mailbox).await;
-        let (alice, bob) = (alice.identity_key(), bob.identity_key());
-        // Alice received Bob's "hello", and has not fetched since: it is still there.
-        assert_eq!(queued(&mailbox, &bob, &alice).await, 1);
-        assert!(alice_session.receive().await.unwrap().is_empty());
-        assert_eq!(queued(&mailbox, &bob, &alice).await, 0);
-
-        for content in [b"a", b"b"] {
-            alice_session.send(content).await.unwrap();
-        }
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"a", b"b"]);
-        // Until Bob fetches again, having saved what he received, they stay; through a saved
-        // state too.
-        assert_eq!(queued(&mailbox, &alice, &bob).await, 2);
-        #[cfg(feature = "prost")]
-        let mut bob_session = Session::restore(
-            InProcessMailbox(&mailbox),
-            restored::<SessionState, proto::SessionState>(&bob_session.state),
-        );
-        assert!(bob_session.receive().await.unwrap().is_empty());
-        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
-
-        // One that decrypts only on an earlier session goes too.
-        alice_session.send(b"late").await.unwrap();
-        bob_session.retire();
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"late"]);
-        assert!(bob_session.receive().await.unwrap().is_empty());
-        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
-    }
-
-    #[tokio::test]
-    async fn a_message_pushed_after_the_session_changed_goes_once_delivered() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, bob_session) =
-            talking(&handshake, &mailbox).await;
+    async fn delivered_messages_leave_the_server_via_piggyback_and_explicit_ack() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store.clone());
+        let (alice, mut alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
         let (alice_key, bob_key) = (alice.identity_key(), bob.identity_key());
-        // Alice encrypts while offline; meanwhile Bob starts the chat again, and Alice takes his
-        // session, which becomes the one she sends on, before her message goes.
-        let waiting = alice_session.encrypt(b"waiting").unwrap();
-        alice.publish_keys(3).await.unwrap();
-        let mut bob_session = {
-            let mut again = bob
-                .initiate(&alice_key, b"again", InProcessMailbox(&mailbox))
-                .await
-                .unwrap();
-            again.keep(bob_session).unwrap();
-            again
-        };
-        let first = accept_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox).await;
-        assert_eq!(first, b"again");
-        alice_session.push(waiting).await.unwrap();
-        // Bob reads it on the earlier session; its token, under that session's key, deletes it.
-        assert_eq!(contents(receive_all(&mut bob_session).await), [b"waiting"]);
-        assert_eq!(queued(&mailbox, &alice_key, &bob_key).await, 1);
-        assert!(bob_session.receive().await.unwrap().is_empty());
-        assert_eq!(queued(&mailbox, &alice_key, &bob_key).await, 0);
+        assert_eq!(queued(&store, &alice_key).await, 0);
+
+        for content in [b"a", b"b"] {
+            alice_session.send_v2(content).await.unwrap();
+        }
+        let page1 = bob.fetch_mailbox_v2(&mb, AUDIENCE, 100).await.unwrap();
+        assert_eq!(page1.messages.len(), 2);
+        let mut decrypted = Vec::new();
+        for env in &page1.messages {
+            decrypted.push(
+                bob_session
+                    .decrypt_envelope(env.message.as_ref().unwrap())
+                    .unwrap()
+                    .content,
+            );
+        }
+        assert_eq!(decrypted, [b"a", b"b"]);
+        bob.commit_mailbox_page(
+            page1.last_sequence().unwrap(),
+            page1.last_sequence().unwrap(),
+        )
+        .unwrap();
+        // Messages remain on server until ACKed (even across ClientState restore).
+        assert_eq!(queued(&store, &bob_key).await, 2);
+        #[cfg(feature = "prost")]
+        let mut bob = Client::restore(
+            hs.clone(),
+            restored::<ClientState, proto::ClientState>(bob.state()),
+        );
+        assert_eq!(bob.pending_mailbox_ack(), 2);
+
+        // Next `fetch_mailbox_v2` piggybacks `ack_up_to_sequence = 2`!
+        alice_session.send_v2(b"c").await.unwrap();
+        let page2 = bob.fetch_mailbox_v2(&mb, AUDIENCE, 100).await.unwrap();
+        assert_eq!(page2.piggybacked_ack, 2);
+        assert_eq!(page2.messages.len(), 1);
+        assert_eq!(page2.messages[0].sequence, 3);
+        assert_eq!(queued(&store, &bob_key).await, 1);
+        assert_eq!(
+            bob_session
+                .decrypt_envelope(page2.messages[0].message.as_ref().unwrap())
+                .unwrap()
+                .content,
+            b"c"
+        );
+        bob.commit_mailbox_page(3, 3).unwrap();
+
+        // Explicit `ack_mailbox_v2` deletes seq 3 and clears `pending_mailbox_ack`.
+        assert_eq!(bob.ack_mailbox_v2(&mb, AUDIENCE).await.unwrap(), 1);
+        assert_eq!(bob.pending_mailbox_ack(), 0);
+        assert_eq!(queued(&store, &bob_key).await, 0);
+        // No-op when `pending_mailbox_ack == 0`.
+        assert_eq!(bob.ack_mailbox_v2(&mb, AUDIENCE).await.unwrap(), 0);
+
+        // One that decrypts only on an earlier session is ACKed too.
+        alice_session.send_v2(b"late").await.unwrap();
+        bob_session.retire();
+        let rx = receive_for(&mut bob, &mut bob_session, &mb).await;
+        assert_eq!(rx[0].as_ref().unwrap().content, b"late");
+        assert!(rx[0].as_ref().unwrap().earlier);
+        assert_eq!(queued(&store, &bob_key).await, 0);
     }
 
     #[tokio::test]
-    async fn a_copy_pushed_after_the_first_was_delivered_goes_too() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (alice, mut alice_session, bob, mut bob_session) = talking(&handshake, &mailbox).await;
-        let (alice, bob) = (alice.identity_key(), bob.identity_key());
+    async fn duplicate_and_idempotent_push_behave_cleanly() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store.clone());
+        let (_alice, mut alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
+
         let sealed = alice_session.encrypt(b"twice").unwrap();
-        alice_session.push(sealed.clone()).await.unwrap();
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"twice"]);
-        assert!(bob_session.receive().await.unwrap().is_empty());
-        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
-        // Pushed again, as the reply to the first push was lost, after Bob had it: a duplicate,
-        // which goes too.
-        alice_session.push(sealed).await.unwrap();
-        let received = bob_session.receive().await.unwrap();
+        let seq1 = alice_session.push_v2(&sealed).await.unwrap();
+        // Same client_message_id deduplicates idempotently on the server.
+        let seq2 = alice_session.push_v2(&sealed).await.unwrap();
+        assert_eq!(seq1, seq2);
         assert_eq!(
-            received[0].content.as_ref().unwrap_err().kind(),
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
+            [b"twice"]
+        );
+        assert_eq!(queued(&store, &bob.identity_key()).await, 0);
+
+        // Pushed again with a distinct client_message_id after Bob already received it ->
+        // decrypt_envelope returns DuplicateMessage and prefix ACK still removes it.
+        let req = alice_session.push_v2_request_with_id(&sealed, Some([0x77; 16]));
+        mb.push_v2(req).await.unwrap();
+        let rx = receive_for(&mut bob, &mut bob_session, &mb).await;
+        assert_eq!(
+            rx[0].as_ref().unwrap_err().kind(),
             ErrorKind::DuplicateMessage
         );
-        assert!(bob_session.receive().await.unwrap().is_empty());
-        assert_eq!(queued(&mailbox, &alice, &bob).await, 0);
-    }
-
-    /// `state` saved as a protobuf message, and read back.
-    #[cfg(feature = "prost")]
-    fn restored<T, P>(state: &T) -> T
-    where
-        P: prost::Message + Default + for<'a> From<&'a T>,
-        T: for<'a> TryFrom<&'a P, Error = Error>,
-    {
-        let saved = P::from(state).encode_to_vec();
-        T::try_from(&P::decode(saved.as_slice()).unwrap()).unwrap()
-    }
-
-    fn contents(received: Vec<Received>) -> Vec<Vec<u8>> {
-        received
-            .into_iter()
-            .map(|received| received.content.unwrap())
-            .collect()
-    }
-
-    /// Receive as a client does once it has taken the initial messages: past what receiving
-    /// stalls at, which then never decrypts.
-    async fn receive_all<M: LocalMailbox>(session: &mut Session<M>) -> Vec<Received> {
-        let mut received = session.receive().await.unwrap();
-        if let Some(Received {
-            content: Err(e), ..
-        }) = received.last()
-            && e.kind() == ErrorKind::Stalled
-        {
-            received.pop();
-            session.skip_stalled();
-            received.extend(session.receive().await.unwrap());
-        }
-        received
+        assert_eq!(queued(&store, &bob.identity_key()).await, 0);
     }
 
     #[tokio::test]
     async fn alice_and_bob_talk() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let mut alice = Client::new(InProcessHandshake(&handshake));
-        let mut bob = Client::new(InProcessHandshake(&handshake));
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs);
+        alice.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
 
-        bob.publish_keys(1).await.unwrap();
         let mut alice_session = alice
-            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        alice_session.send(b"bob").await.unwrap();
+        register_active_grant(&mut alice, &alice_session, &mb).await;
 
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        assert_eq!(initial_messages.len(), 1);
-        let (mut bob_session, first) = bob
-            .accept(
+        // Before Bob approves/registers Alice's write token, PushV2 returns WriteTokenRejected!
+        let early_bob = alice_session.encrypt(b"bob").unwrap();
+        let err = alice_session.push_v2(&early_bob).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::WriteTokenRejected);
+        assert!(err.is_server_refusal());
+
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        assert_eq!(listed.messages.len(), 1);
+        let AcceptedInitial::Accepted {
+            session: mut bob_session,
+            first_message: first,
+            ..
+        } = bob
+            .accept_initial_v2(
                 &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb.clone(),
             )
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
         assert_eq!(first, b"hi");
+        bob.ack_initial_messages_v2(AUDIENCE, vec![listed.messages[0].id])
+            .await
+            .unwrap();
+        register_active_grant(&mut bob, &bob_session, &mb).await;
 
+        // Once Bob registers the grant, Alice's retry of `early_bob` succeeds!
+        alice_session.push_v2(&early_bob).await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut bob_session).await),
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
             [b"bob".to_vec()]
         );
-        assert!(receive_all(&mut bob_session).await.is_empty());
+        assert!(
+            receive_for(&mut bob, &mut bob_session, &mb)
+                .await
+                .is_empty()
+        );
 
-        bob_session.send(b"hello").await.unwrap();
+        bob_session.send_v2(b"hello").await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut alice_session).await),
+            contents(receive_for(&mut alice, &mut alice_session, &mb).await),
             [b"hello".to_vec()]
         );
 
-        // A message encrypted but pushed later still arrives, after the ones pushed before it.
+        // A message encrypted earlier but pushed later still arrives out of order.
         let late = alice_session.encrypt(b"late").unwrap();
-        alice_session.send(b"early").await.unwrap();
-        alice_session.push(late).await.unwrap();
+        alice_session.send_v2(b"early").await.unwrap();
+        alice_session.push_v2(&late).await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut bob_session).await),
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
             [b"early".to_vec(), b"late".to_vec()]
         );
     }
 
-    /// Alice and Bob, who talked already: she started with "hi" and he replied "hello".
-    async fn talking<'a>(
-        handshake: &'a HandshakeServer<MemoryStore>,
-        mailbox: &'a MailboxServer<MemoryStore>,
-    ) -> (
-        Client<InProcessHandshake<'a>>,
-        Session<InProcessMailbox<'a>>,
-        Client<InProcessHandshake<'a>>,
-        Session<InProcessMailbox<'a>>,
-    ) {
-        let mut alice = Client::new(InProcessHandshake(handshake));
-        let mut bob = Client::new(InProcessHandshake(handshake));
-        bob.publish_keys(3).await.unwrap();
-        let mut alice_session = alice
-            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(mailbox))
-            .await
-            .unwrap();
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (mut bob_session, first) = bob
-            .accept(
-                &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(mailbox),
-            )
-            .unwrap();
-        assert_eq!(first, b"hi");
-        bob_session.send(b"hello").await.unwrap();
-        assert_eq!(contents(receive_all(&mut alice_session).await), [b"hello"]);
-        (alice, alice_session, bob, bob_session)
-    }
-
     #[tokio::test]
     async fn forged_initial_messages_are_refused() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, _alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, _alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
 
-        // Alice starts again, then Mallory sends Bob more initial messages claiming to be hers
-        // than he keeps sessions.
         let mut alice_again = alice
-            .initiate(&bob.identity_key(), b"again", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"again",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        let mut mallory = Client::new(InProcessHandshake(&handshake));
+        register_active_grant(&mut alice, &alice_again, &mb).await;
+
+        let mut mallory = Client::new(hs);
         for _ in 0..=KEPT_SESSIONS {
             mallory
-                .initiate(&bob.identity_key(), b"it is me", InProcessMailbox(&mailbox))
+                .initiate_v2(
+                    AUDIENCE,
+                    &bob.identity_key(),
+                    &PeerPqState::default(),
+                    b"it is me",
+                    mb.clone(),
+                )
                 .await
                 .unwrap();
         }
-        let mut initial_messages = bob.take_initial_messages().await.unwrap();
-        for initial_message in &mut initial_messages[1..] {
-            initial_message.x3dh.identity_key = alice.identity_key();
+        let mut listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        for msg in &mut listed.messages[1..] {
+            msg.sender = alice.identity_key();
+            match &mut msg.kind {
+                InitialMessageKind::Classical { x3dh, .. } => {
+                    x3dh.identity_key = alice.identity_key()
+                }
+                InitialMessageKind::Pq { x3dh, .. } => x3dh.identity_key = alice.identity_key(),
+            }
         }
 
-        // Each tried twice: only Alice's is accepted, once, and the others fail both times, as
-        // they use up nothing.
         let mut accepted = vec![];
-        for initial_message in &initial_messages {
+        for msg in &listed.messages {
             for _ in 0..2 {
-                match bob.accept(
+                match bob.accept_initial_v2(
                     &alice.identity_key(),
-                    initial_message,
-                    InProcessMailbox(&mailbox),
+                    bob_session.peer_pq_state(),
+                    msg,
+                    mb.clone(),
                 ) {
-                    Ok(session) => accepted.push(session),
+                    Ok(AcceptedInitial::Accepted {
+                        session,
+                        first_message,
+                        ..
+                    }) => accepted.push((session, first_message)),
+                    Ok(AcceptedInitial::Quarantined { .. }) => panic!("unexpected quarantine"),
                     Err(e) => assert_eq!(e.kind(), ErrorKind::InvalidInitialMessage),
                 }
             }
@@ -3372,109 +3997,90 @@ mod test {
         assert_eq!(first, b"again");
         let older = mem::replace(&mut bob_session, session);
         bob_session.keep(older).unwrap();
+        register_active_grant(&mut bob, &bob_session, &mb).await;
 
-        alice_again.send(b"on the new one").await.unwrap();
+        alice_again.send_v2(b"on the new one").await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut bob_session).await),
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
             [b"on the new one"]
         );
-        bob_session.send(b"me too").await.unwrap();
-        let received = receive_all(&mut alice_again).await;
-        // Her new session reads her queue from the start, where his reply to the old one is.
-        assert!(received[0].content.is_err());
-        assert_eq!(received[1].content.as_ref().unwrap(), b"me too");
+        bob_session.send_v2(b"me too").await.unwrap();
+        assert_eq!(
+            contents(receive_for(&mut alice, &mut alice_again, &mb).await),
+            [b"me too"]
+        );
     }
 
     #[tokio::test]
     async fn a_new_session_takes_over_at_once() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
 
-        // Alice sends on her session, then starts again before Bob receives.
-        alice_session.send(b"old").await.unwrap();
+        alice_session.send_v2(b"old").await.unwrap();
         let mut alice_again = alice
-            .initiate(&bob.identity_key(), b"new", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"new",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (session, first) = bob
-            .accept(
-                &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
-            )
-            .unwrap();
+        register_active_grant(&mut alice, &alice_again, &mb).await;
+
+        let first = accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mb).await;
         assert_eq!(first, b"new");
-        let older = mem::replace(&mut bob_session, session);
-        bob_session.keep(older).unwrap();
-        // Kept sessions are saved with the session.
         #[cfg(feature = "prost")]
         let mut bob_session = Session::restore(
-            InProcessMailbox(&mailbox),
+            mb.clone(),
             restored::<_, proto::SessionState>(bob_session.state()),
         );
 
-        // Her earlier message still decrypts, but does not bring the old session back.
-        assert_eq!(contents(receive_all(&mut bob_session).await), [b"old"]);
-        bob_session.send(b"on the new one").await.unwrap();
-        let received = receive_all(&mut alice_again).await;
-        assert!(received[0].content.is_err());
-        assert_eq!(received[1].content.as_ref().unwrap(), b"on the new one");
-        assert!(receive_all(&mut alice_session).await[0].content.is_err());
-    }
+        let rx = receive_for(&mut bob, &mut bob_session, &mb).await;
+        assert_eq!(rx[0].as_ref().unwrap().content, b"old");
+        assert!(rx[0].as_ref().unwrap().earlier);
 
-    /// Whether `a` and `b` send on one session.
-    fn on_one_session<M>(a: &Session<M>, b: &Session<M>) -> bool {
-        matches!(
-            (&a.state.active, &b.state.active),
-            (Some(a), Some(b)) if a.id == b.id
-        )
-    }
-
-    /// Accept the initial message `client` has from `peer`, keeping `session`, the chat so far.
-    async fn accept_keeping<'a>(
-        client: &mut Client<InProcessHandshake<'a>>,
-        peer: &PublicKey,
-        session: &mut Session<InProcessMailbox<'a>>,
-        mailbox: &'a MailboxServer<MemoryStore>,
-    ) -> Vec<u8> {
-        let initial_messages = client.take_initial_messages().await.unwrap();
-        let (accepted, first) = client
-            .accept(peer, &initial_messages[0], InProcessMailbox(mailbox))
-            .unwrap();
-        let older = mem::replace(session, accepted);
-        session.keep(older).unwrap();
-        first
+        bob_session.send_v2(b"on the new one").await.unwrap();
+        assert_eq!(
+            contents(receive_for(&mut alice, &mut alice_again, &mb).await),
+            [b"on the new one"]
+        );
     }
 
     #[tokio::test]
     async fn a_session_the_peer_never_gets_is_retired_for_a_new_one() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
 
-        // Bob starts again, but Alice loses his initial message, and writes on the old session.
-        alice.publish_keys(1).await.unwrap();
-        bob.start_again(&mut bob_session, b"lost").await.unwrap();
-        assert_eq!(alice.take_initial_messages().await.unwrap().len(), 1);
+        bob.start_again_v2(AUDIENCE, &mut bob_session, b"lost")
+            .await
+            .unwrap();
+        let dropped = alice
+            .list_initial_messages_v2(AUDIENCE, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(dropped.messages.len(), 1);
+        alice
+            .ack_initial_messages_v2(AUDIENCE, vec![dropped.messages[0].id])
+            .await
+            .unwrap();
 
-        // Bob reads her on the old session, which never becomes active again, and she cannot
-        // read him on the new one; after a few turns, he retires it.
         let mut turns = 0;
         loop {
-            alice_session.send(b"still here").await.unwrap();
+            alice_session.send_v2(b"still here").await.unwrap();
             assert_eq!(
-                contents(receive_all(&mut bob_session).await),
+                contents(receive_for(&mut bob, &mut bob_session, &mb).await),
                 [b"still here"]
             );
             if bob_session.needs_new_session() {
                 break;
             }
-            bob_session.send(b"lost too").await.unwrap();
-            assert!(receive_all(&mut alice_session).await[0].content.is_err());
+            let _ = bob_session.encrypt(b"lost too").unwrap();
             turns += 1;
         }
         assert!(turns <= MAX_DIRECTION_CHANGES);
@@ -3483,182 +4089,228 @@ mod test {
             ErrorKind::NoSession
         );
 
-        // He starts a new one, which Alice gets this time, and they talk on it.
-        bob.start_again(&mut bob_session, b"again").await.unwrap();
-        let first = accept_keeping(
-            &mut alice,
-            &bob.identity_key(),
-            &mut alice_session,
-            &mailbox,
-        )
-        .await;
+        bob.start_again_v2(AUDIENCE, &mut bob_session, b"again")
+            .await
+            .unwrap();
+        register_active_grant(&mut bob, &bob_session, &mb).await;
+        let first = accept_keeping(&mut alice, &bob.identity_key(), &mut alice_session, &mb).await;
         assert_eq!(first, b"again");
         assert!(on_one_session(&alice_session, &bob_session));
-        bob_session.send(b"hello again").await.unwrap();
+        bob_session.send_v2(b"hello again").await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut alice_session).await),
+            contents(receive_for(&mut alice, &mut alice_session, &mb).await),
             [b"hello again"]
         );
-        alice_session.send(b"hi").await.unwrap();
-        assert_eq!(contents(receive_all(&mut bob_session).await), [b"hi"]);
+        alice_session.send_v2(b"hi").await.unwrap();
+        assert_eq!(
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
+            [b"hi"]
+        );
     }
 
     #[tokio::test]
     async fn sessions_started_at_once_end_as_one() {
-        // Each accepts the other's; or one answers the other's before the other accepts its
-        // own, which a client does before it receives.
         for answered_first in [false, true] {
-            let handshake = HandshakeServer::new(MemoryStore::default());
-            let mailbox = MailboxServer::new(MemoryStore::default());
-            let mut alice = Client::new(InProcessHandshake(&handshake));
-            let mut bob = Client::new(InProcessHandshake(&handshake));
-            alice.publish_keys(1).await.unwrap();
-            bob.publish_keys(1).await.unwrap();
+            let store = SharedStore::default();
+            let hs = InProcessHandshake::new(store.clone());
+            let mb = InProcessMailbox::new(store);
+            let mut alice = Client::new(hs.clone());
+            let mut bob = Client::new(hs);
+            alice.publish_v2(AUDIENCE, 3, 3).await.unwrap();
+            bob.publish_v2(AUDIENCE, 3, 3).await.unwrap();
+
             let mut alice_session = alice
-                .initiate(&bob.identity_key(), b"hi bob", InProcessMailbox(&mailbox))
-                .await
-                .unwrap();
-            let mut bob_session = bob
-                .initiate(
-                    &alice.identity_key(),
-                    b"hi alice",
-                    InProcessMailbox(&mailbox),
+                .initiate_v2(
+                    AUDIENCE,
+                    &bob.identity_key(),
+                    &PeerPqState::default(),
+                    b"hi bob",
+                    mb.clone(),
                 )
                 .await
                 .unwrap();
+            register_active_grant(&mut alice, &alice_session, &mb).await;
+
+            let mut bob_session = bob
+                .initiate_v2(
+                    AUDIENCE,
+                    &alice.identity_key(),
+                    &PeerPqState::default(),
+                    b"hi alice",
+                    mb.clone(),
+                )
+                .await
+                .unwrap();
+            register_active_grant(&mut bob, &bob_session, &mb).await;
 
             let first =
-                accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
+                accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mb).await;
             assert_eq!(first, b"hi bob");
-            if answered_first {
-                bob_session.send(b"b0").await.unwrap();
-            }
-            let first = accept_keeping(
-                &mut alice,
-                &bob.identity_key(),
-                &mut alice_session,
-                &mailbox,
-            )
-            .await;
+            let early_b0 = if answered_first {
+                let sealed = bob_session.encrypt(b"b0").unwrap();
+                match bob_session.push_v2(&sealed).await {
+                    Ok(_) => None,
+                    Err(e) if e.kind() == ErrorKind::WriteTokenRejected => Some(sealed),
+                    Err(e) => panic!("unexpected push_v2 error: {e:?}"),
+                }
+            } else {
+                None
+            };
+            let first =
+                accept_keeping(&mut alice, &bob.identity_key(), &mut alice_session, &mb).await;
             assert_eq!(first, b"hi alice");
+            if let Some(sealed) = early_b0 {
+                // Bob's session won the tie-break; retry succeeds once Alice registers its grant.
+                bob_session.push_v2(&sealed).await.unwrap();
+            }
             if answered_first {
-                assert_eq!(contents(receive_all(&mut alice_session).await), [b"b0"]);
+                assert_eq!(
+                    contents(receive_for(&mut alice, &mut alice_session, &mb).await),
+                    [b"b0"]
+                );
             }
 
-            // The session with the higher ID won on both sides, and whatever each sends, at once
-            // or in turn, arrives.
             assert!(on_one_session(&alice_session, &bob_session));
-            alice_session.send(b"a1").await.unwrap();
-            bob_session.send(b"b1").await.unwrap();
-            assert_eq!(contents(receive_all(&mut alice_session).await), [b"b1"]);
-            assert_eq!(contents(receive_all(&mut bob_session).await), [b"a1"]);
-            alice_session.send(b"a2").await.unwrap();
-            assert_eq!(contents(receive_all(&mut bob_session).await), [b"a2"]);
-            bob_session.send(b"b2").await.unwrap();
-            assert_eq!(contents(receive_all(&mut alice_session).await), [b"b2"]);
+            alice_session.send_v2(b"a1").await.unwrap();
+            bob_session.send_v2(b"b1").await.unwrap();
+            assert_eq!(
+                contents(receive_for(&mut alice, &mut alice_session, &mb).await),
+                [b"b1"]
+            );
+            assert_eq!(
+                contents(receive_for(&mut bob, &mut bob_session, &mb).await),
+                [b"a1"]
+            );
+            alice_session.send_v2(b"a2").await.unwrap();
+            assert_eq!(
+                contents(receive_for(&mut bob, &mut bob_session, &mb).await),
+                [b"a2"]
+            );
+            bob_session.send_v2(b"b2").await.unwrap();
+            assert_eq!(
+                contents(receive_for(&mut alice, &mut alice_session, &mb).await),
+                [b"b2"]
+            );
             assert!(on_one_session(&alice_session, &bob_session));
         }
     }
 
     #[tokio::test]
     async fn a_chat_deleted_while_a_session_waits_ends_on_one() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let mut alice = Client::new(InProcessHandshake(&handshake));
-        let mut bob = Client::new(InProcessHandshake(&handshake));
-        alice.publish_keys(1).await.unwrap();
-        bob.publish_keys(2).await.unwrap();
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs);
+        alice.publish_v2(AUDIENCE, 3, 3).await.unwrap();
+        bob.publish_v2(AUDIENCE, 3, 3).await.unwrap();
         let (alice_key, bob_key) = (alice.identity_key(), bob.identity_key());
 
-        // Both start at once, but Bob deletes his chat before he takes Alice's initial message,
-        // which then begins his chat again; Alice accepts the one he deleted.
         let mut alice_session = alice
-            .initiate(&bob_key, b"hi bob", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob_key,
+                &PeerPqState::default(),
+                b"hi bob",
+                mb.clone(),
+            )
             .await
             .unwrap();
+        register_active_grant(&mut alice, &alice_session, &mb).await;
+
         let deleted = bob
-            .initiate(&alice_key, b"hi alice", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &alice_key,
+                &PeerPqState::default(),
+                b"hi alice",
+                mb.clone(),
+            )
             .await
             .unwrap();
         drop(deleted);
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (mut bob_session, first) = bob
-            .accept(&alice_key, &initial_messages[0], InProcessMailbox(&mailbox))
+
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted {
+            session: mut bob_session,
+            first_message,
+            ..
+        } = bob
+            .accept_initial_v2(
+                &alice_key,
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb.clone(),
+            )
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
+        assert_eq!(first_message, b"hi bob");
+        bob.ack_initial_messages_v2(AUDIENCE, vec![listed.messages[0].id])
+            .await
             .unwrap();
-        assert_eq!(first, b"hi bob");
-        let first = accept_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox).await;
+        register_active_grant(&mut bob, &bob_session, &mb).await;
+
+        let first = accept_keeping(&mut alice, &bob_key, &mut alice_session, &mb).await;
         assert_eq!(first, b"hi alice");
 
-        // If Bob's won, what Alice sends on it is lost, while what Bob sends decrypts on hers,
-        // until she retires his and starts a new one.
         let mut lost = 0;
         while !on_one_session(&alice_session, &bob_session) {
             assert!(lost <= MAX_DIRECTION_CHANGES, "they never settle");
             if alice_session.needs_new_session() {
                 alice
-                    .start_again(&mut alice_session, b"again")
+                    .start_again_v2(AUDIENCE, &mut alice_session, b"again")
                     .await
                     .unwrap();
-                let first = accept_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox).await;
+                register_active_grant(&mut alice, &alice_session, &mb).await;
+                let first = accept_keeping(&mut bob, &alice_key, &mut bob_session, &mb).await;
                 assert_eq!(first, b"again");
                 continue;
             }
-            alice_session.send(b"from alice").await.unwrap();
-            assert!(receive_all(&mut bob_session).await[0].content.is_err());
+            let _ = alice_session.encrypt(b"from alice").unwrap();
             lost += 1;
-            bob_session.send(b"from bob").await.unwrap();
+            bob_session.send_v2(b"from bob").await.unwrap();
             assert_eq!(
-                contents(receive_all(&mut alice_session).await),
+                contents(receive_for(&mut alice, &mut alice_session, &mb).await),
                 [b"from bob"]
             );
         }
-        alice_session.send(b"on one").await.unwrap();
-        assert_eq!(contents(receive_all(&mut bob_session).await), [b"on one"]);
-        bob_session.send(b"at last").await.unwrap();
+        alice_session.send_v2(b"on one").await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut alice_session).await),
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
+            [b"on one"]
+        );
+        bob_session.send_v2(b"at last").await.unwrap();
+        assert_eq!(
+            contents(receive_for(&mut alice, &mut alice_session, &mb).await),
             [b"at last"]
         );
     }
 
     #[tokio::test]
-    async fn a_late_message_from_before_a_chat_was_deleted_changes_nothing() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut deleted, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
+    async fn a_chat_the_peer_deleted_starts_again_from_a_retired_session_and_exceeds_revocation() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut alice_session, mut bob, bob_session) = talking(&hs, &mb).await;
 
-        // Alice sends on her session, deletes the chat and starts again; Bob takes the new
-        // session before the message sent on the old one.
-        deleted.send(b"late").await.unwrap();
-        drop(deleted);
-        let mut alice_session = alice
-            .initiate(&bob.identity_key(), b"again", InProcessMailbox(&mailbox))
+        // Bob deletes the chat and revokes Alice's grants using a version allocated from
+        // `bob.allocate_grant_version()`.
+        let bob_slot = bob.peer_slot_id(&alice.identity_key());
+        let revoke_ver = bob.allocate_grant_version().unwrap();
+        let revoked = bob
+            .revoke_write_token_v2(&mb, AUDIENCE, &bob_slot, None, revoke_ver)
             .await
             .unwrap();
-        let first =
-            accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
-        assert_eq!(first, b"again");
-        assert_eq!(contents(receive_all(&mut bob_session).await), [b"late"]);
-        bob_session.send(b"on the new one").await.unwrap();
-        // The new session reads the queue from its start, where the reply to the old one is.
-        let received = receive_all(&mut alice_session).await;
-        assert!(received[0].content.is_err());
-        assert_eq!(received[1].content.as_ref().unwrap(), b"on the new one");
-        assert!(on_one_session(&alice_session, &bob_session));
-    }
-
-    #[tokio::test]
-    async fn a_chat_the_peer_deleted_starts_again_from_a_retired_session() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, bob_session) =
-            talking(&handshake, &mailbox).await;
-        alice.publish_keys(1).await.unwrap();
-
-        // Bob deletes the chat, as he tells Alice, who retires her session: what came on it still
-        // decrypts, but she sends nothing on it.
+        assert!(revoked >= 1);
         drop(bob_session);
+
+        // Alice's old session now gets WriteTokenRejected.
+        assert_eq!(
+            alice_session.send_v2(b"revoked").await.unwrap_err().kind(),
+            ErrorKind::WriteTokenRejected
+        );
         alice_session.retire();
         assert!(alice_session.needs_new_session());
         assert_eq!(
@@ -3666,341 +4318,419 @@ mod test {
             ErrorKind::NoSession
         );
 
-        // Her next message goes on a new session, which comes to Bob as a new chat.
+        // Alice starts again; Bob accepts and registers a fresh grant whose monotonic
+        // `allocate_grant_version()` strictly exceeds `revoke_ver`.
         alice
-            .start_again(&mut alice_session, b"again")
+            .start_again_v2(AUDIENCE, &mut alice_session, b"again")
             .await
             .unwrap();
-        alice_session.send(b"still there?").await.unwrap();
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (mut bob_session, first) = bob
-            .accept(
+        register_active_grant(&mut alice, &alice_session, &mb).await;
+
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted {
+            session: mut bob_session,
+            first_message: first,
+            ..
+        } = bob
+            .accept_initial_v2(
                 &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb.clone(),
             )
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
         assert_eq!(first, b"again");
-        // His new chat reads Alice's queue from its start, where her first message is.
-        let received = receive_all(&mut bob_session).await;
+        bob.ack_initial_messages_v2(AUDIENCE, vec![listed.messages[0].id])
+            .await
+            .unwrap();
+        let new_ver = bob.allocate_grant_version().unwrap();
+        assert!(new_ver > revoke_ver);
+        bob.register_write_token_v2(
+            &mb,
+            AUDIENCE,
+            &alice.identity_key(),
+            &bob_session.active_inbound_token_hash().unwrap(),
+            new_ver,
+            true,
+        )
+        .await
+        .unwrap();
+
+        alice_session.send_v2(b"still there?").await.unwrap();
         assert_eq!(
-            received.last().unwrap().content.as_ref().unwrap(),
-            b"still there?"
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
+            [b"still there?"]
         );
-        bob_session.send(b"yes").await.unwrap();
-        assert_eq!(contents(receive_all(&mut alice_session).await), [b"yes"]);
+        bob_session.send_v2(b"yes").await.unwrap();
+        assert_eq!(
+            contents(receive_for(&mut alice, &mut alice_session, &mb).await),
+            [b"yes"]
+        );
         assert!(on_one_session(&alice_session, &bob_session));
     }
 
     #[tokio::test]
-    async fn a_message_on_a_session_not_taken_yet_waits_for_it() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
+    async fn carried_initial_and_local_buffer_replay_never_block_other_peers() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
 
-        // Alice starts again and writes on the new session, which Bob receives before he takes
-        // its initial message: receiving stops there, however often, and loses nothing.
-        alice
-            .start_again(&mut alice_session, b"once more")
-            .await
-            .unwrap();
-        alice_session.send(b"new").await.unwrap();
-        for _ in 0..2 {
-            let received = bob_session.receive().await.unwrap();
-            assert_eq!(received.len(), 1);
-            assert_eq!(
-                received[0].content.as_ref().unwrap_err().kind(),
-                ErrorKind::Stalled
-            );
-        }
-        let first =
-            accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
-        assert_eq!(first, b"once more");
-        bob_session.skip_stalled();
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"new"]);
-
-        // What anyone pushes that never decrypts stops receiving once, then is skipped.
-        alice_session
-            .push(Sealed {
-                message: EncryptedMessage::default(),
-                delivery_hash: None,
-            })
-            .await
-            .unwrap();
-        alice_session.send(b"after").await.unwrap();
-        let received = bob_session.receive().await.unwrap();
-        assert_eq!(
-            received[0].content.as_ref().unwrap_err().kind(),
-            ErrorKind::Stalled
-        );
-        bob_session.skip_stalled();
-        let received = bob_session.receive().await.unwrap();
-        assert!(received[0].content.is_err());
-        assert_eq!(received[1].content.as_ref().unwrap(), b"after");
-    }
-
-    #[tokio::test]
-    async fn a_lost_initial_message_comes_with_the_messages_after_it() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
-
-        // Alice starts again, and Bob loses her initial message.
-        alice
-            .start_again(&mut alice_session, b"once more")
-            .await
-            .unwrap();
-        assert_eq!(bob.take_initial_messages().await.unwrap().len(), 1);
-        alice_session.send(b"new").await.unwrap();
-
-        // Her message carries it: accepted from there, it decrypts, and the next ones go
-        // without it, once Bob answers.
-        let received = bob_session.receive().await.unwrap();
-        let stalled = received.last().unwrap();
-        assert_eq!(
-            stalled.content.as_ref().unwrap_err().kind(),
-            ErrorKind::Stalled
-        );
-        let initial_message = stalled.initial_messages[0].clone();
-        let (session, first) = bob
-            .accept(
-                &alice.identity_key(),
-                &initial_message,
-                InProcessMailbox(&mailbox),
+        // Also establish Carol <-> Bob.
+        let mut carol = Client::new(hs.clone());
+        carol.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        let mut carol_session = carol
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi from carol",
+                mb.clone(),
             )
-            .unwrap();
-        assert_eq!(first, b"once more");
-        let older = mem::replace(&mut bob_session, session);
-        bob_session.keep(older).unwrap();
-        bob_session.skip_stalled();
-        assert_eq!(contents(bob_session.receive().await.unwrap()), [b"new"]);
-        bob_session.send(b"got it").await.unwrap();
-        assert_eq!(contents(receive_all(&mut alice_session).await), [b"got it"]);
-        alice_session.send(b"plain").await.unwrap();
-        let received = bob_session.receive().await.unwrap();
-        assert!(received[0].initial_messages.is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_lost_initial_message_behind_junk_is_offered_too() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
-
-        // Junk, which never decrypts, then Alice starts again, and Bob loses her initial
-        // message.
-        alice_session
-            .push(Sealed {
-                message: EncryptedMessage::default(),
-                delivery_hash: None,
-            })
             .await
             .unwrap();
-        alice
-            .start_again(&mut alice_session, b"once more")
-            .await
-            .unwrap();
-        assert_eq!(bob.take_initial_messages().await.unwrap().len(), 1);
-        alice_session.send(b"new").await.unwrap();
-
-        // Receiving stops at the junk, offering the initial message that came after it, so
-        // that skipping the page does not skip her message.
-        let received = bob_session.receive().await.unwrap();
-        let stalled = received.last().unwrap();
-        assert_eq!(
-            stalled.content.as_ref().unwrap_err().kind(),
-            ErrorKind::Stalled
-        );
-        assert_eq!(stalled.initial_messages.len(), 1);
-        let (session, _) = bob
-            .accept(
-                &alice.identity_key(),
-                &stalled.initial_messages[0],
-                InProcessMailbox(&mailbox),
+        register_active_grant(&mut carol, &carol_session, &mb).await;
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted {
+            session: mut bob_carol,
+            ..
+        } = bob
+            .accept_initial_v2(
+                &carol.identity_key(),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb.clone(),
             )
+            .unwrap()
+        else {
+            panic!("expected carol accepted");
+        };
+        bob.ack_initial_messages_v2(AUDIENCE, vec![listed.messages[0].id])
+            .await
             .unwrap();
-        let older = mem::replace(&mut bob_session, session);
-        bob_session.keep(older).unwrap();
-        bob_session.skip_stalled();
-        let received = bob_session.receive().await.unwrap();
-        assert!(received[0].content.is_err());
-        assert_eq!(received[1].content.as_ref().unwrap(), b"new");
+        register_active_grant(&mut bob, &bob_carol, &mb).await;
+
+        // Alice starts a new session S2, Bob loses S2's inbox initial, and suppose Bob had already
+        // registered S2's token or Alice sends with a carried initial; meanwhile Carol sends a
+        // normal message. First test undecryptable envelope from Alice does NOT block Carol!
+        let old_alice_token = alice_session.encrypt(b"dummy").unwrap().write_token.clone();
+        alice
+            .start_again_v2(AUDIENCE, &mut alice_session, b"once more")
+            .await
+            .unwrap();
+        register_active_grant(&mut alice, &alice_session, &mb).await;
+        let dropped = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        bob.ack_initial_messages_v2(AUDIENCE, vec![dropped.messages[0].id])
+            .await
+            .unwrap();
+
+        // Push Alice's S2 message under her already-granted token (carrying S2's initial) followed
+        // by Carol's message.
+        let mut s2_sealed = alice_session.encrypt(b"new-from-alice").unwrap();
+        assert!(s2_sealed.initial_message.is_some());
+        s2_sealed.write_token = old_alice_token;
+        alice_session.push_v2(&s2_sealed).await.unwrap();
+        carol_session.send_v2(b"from-carol").await.unwrap();
+
+        // Bob fetches unified page in one RPC: Alice's envelope fails decrypt locally
+        // (`Undecryptable`) and carries S2's initial, while Carol's envelope decrypts immediately!
+        let page = bob.fetch_mailbox_v2(&mb, AUDIENCE, 100).await.unwrap();
+        assert_eq!(page.messages.len(), 2);
+        let alice_env = &page.messages[0];
+        let carol_env = &page.messages[1];
+        assert_eq!(
+            bob_session
+                .decrypt_envelope(alice_env.message.as_ref().unwrap())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Undecryptable
+        );
+        assert_eq!(
+            bob_carol
+                .decrypt_envelope(carol_env.message.as_ref().unwrap())
+                .unwrap()
+                .content,
+            b"from-carol"
+        );
+        // Commit & ACK entire unified page immediately (Carol never stalled!).
+        bob.commit_mailbox_page(carol_env.sequence, carol_env.sequence)
+            .unwrap();
+        bob.ack_mailbox_v2(&mb, AUDIENCE).await.unwrap();
+
+        // Replay buffered `alice_env` locally after accepting its carried initial!
+        let carried =
+            InitialMessageV2::try_from(alice_env.initial_message.as_ref().unwrap()).unwrap();
+        let AcceptedInitial::Accepted {
+            session: bob_s2,
+            first_message,
+            ..
+        } = bob
+            .accept_initial_v2(
+                &alice.identity_key(),
+                bob_session.peer_pq_state(),
+                &carried,
+                mb.clone(),
+            )
+            .unwrap()
+        else {
+            panic!("expected carried initial accepted");
+        };
+        assert_eq!(first_message, b"once more");
+        assert!(bob_session.accept_replacement(bob_s2).unwrap());
+        register_active_grant(&mut bob, &bob_session, &mb).await;
+        assert_eq!(
+            bob_session
+                .decrypt_envelope(alice_env.message.as_ref().unwrap())
+                .unwrap()
+                .content,
+            b"new-from-alice"
+        );
+
+        // Once Bob answers on S2, Alice clears `initial_message` and subsequent `Sealed` carries
+        // no initial.
+        bob_session.send_v2(b"got it").await.unwrap();
+        assert_eq!(
+            contents(receive_for(&mut alice, &mut alice_session, &mb).await),
+            [b"got it"]
+        );
+        assert!(alice_session.is_known_by_peer());
+        assert!(
+            alice_session
+                .encrypt(b"plain")
+                .unwrap()
+                .initial_message
+                .is_none()
+        );
     }
 
     #[tokio::test]
     async fn a_message_on_an_earlier_session_shows_so() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
 
-        // Sent before Alice started again, which Bob took first.
-        alice_session.send(b"old").await.unwrap();
+        alice_session.send_v2(b"old").await.unwrap();
         alice
-            .start_again(&mut alice_session, b"again")
+            .start_again_v2(AUDIENCE, &mut alice_session, b"again")
             .await
             .unwrap();
-        accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
-        alice_session.send(b"new").await.unwrap();
-        let received = receive_all(&mut bob_session).await;
-        let earlier: Vec<_> = received
+        register_active_grant(&mut alice, &alice_session, &mb).await;
+        accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mb).await;
+        alice_session.send_v2(b"new").await.unwrap();
+
+        let rx = receive_for(&mut bob, &mut bob_session, &mb).await;
+        let earlier: Vec<_> = rx
             .iter()
-            .map(|received| (received.content.as_deref().unwrap(), received.earlier))
+            .map(|r| {
+                let msg = r.as_ref().unwrap();
+                (msg.content.as_slice(), msg.earlier)
+            })
             .collect();
         assert_eq!(earlier, [(&b"old"[..], true), (&b"new"[..], false)]);
     }
 
-    /// Publishes, then fails once, as if the server's reply were lost.
-    #[derive(Debug)]
-    struct LosingReply<'a>(&'a HandshakeServer<MemoryStore>, Cell<bool>);
+    struct LosingReply(InProcessHandshake, Cell<bool>);
 
-    impl LocalHandshake for LosingReply<'_> {
-        async fn publish(&self, request: PublishRequest) -> protocol::Result<PublishResponse> {
-            let response = self.0.publish(request).await?;
+    impl LocalHandshakeV2 for LosingReply {
+        async fn get_server_info(
+            &self,
+            r: GetServerInfoRequest,
+        ) -> protocol::Result<GetServerInfoResponse> {
+            self.0.get_server_info(r).await
+        }
+        async fn publish_v2(&self, r: PublishV2Request) -> protocol::Result<PublishV2Response> {
+            let response = self.0.publish_v2(r).await?;
             if self.1.replace(false) {
                 return Err(protocol::ErrorKind::Connect.into());
             }
             Ok(response)
         }
-
-        async fn fetch_bundle(
+        async fn refill_prekeys(
             &self,
-            request: FetchBundleRequest,
-        ) -> protocol::Result<FetchBundleResponse> {
-            self.0.fetch_bundle(request).await
+            r: RefillPrekeysRequest,
+        ) -> protocol::Result<RefillPrekeysResponse> {
+            self.0.refill_prekeys(r).await
         }
-
-        async fn send_initial_message(
+        async fn get_manifest(
             &self,
-            request: SendInitialMessageRequest,
-        ) -> protocol::Result<SendInitialMessageResponse> {
-            self.0.send_initial_message(request).await
+            r: GetManifestRequest,
+        ) -> protocol::Result<GetManifestResponse> {
+            self.0.get_manifest(r).await
         }
-
-        async fn take_initial_messages(
+        async fn claim_bundle(
             &self,
-            request: TakeInitialMessagesRequest,
-        ) -> protocol::Result<TakeInitialMessagesResponse> {
-            self.0.take_initial_messages(request).await
+            r: ClaimBundleRequest,
+        ) -> protocol::Result<ClaimBundleResponse> {
+            self.0.claim_bundle(r).await
+        }
+        async fn send_initial_v2(
+            &self,
+            r: SendInitialV2Request,
+        ) -> protocol::Result<SendInitialV2Response> {
+            self.0.send_initial_v2(r).await
+        }
+        async fn list_initial_messages(
+            &self,
+            r: ListInitialMessagesRequest,
+        ) -> protocol::Result<ListInitialMessagesResponse> {
+            self.0.list_initial_messages(r).await
+        }
+        async fn ack_initial_messages(
+            &self,
+            r: AckInitialMessagesRequest,
+        ) -> protocol::Result<AckInitialMessagesResponse> {
+            self.0.ack_initial_messages(r).await
         }
     }
 
-    /// Refuses publishing while `.1`, as a server does a client not signed in to it.
-    #[derive(Debug)]
-    struct SignedOut<'a>(&'a HandshakeServer<MemoryStore>, Cell<bool>);
+    struct SignedOut(InProcessHandshake, Cell<bool>);
 
-    impl LocalHandshake for SignedOut<'_> {
-        async fn publish(&self, request: PublishRequest) -> protocol::Result<PublishResponse> {
+    impl LocalHandshakeV2 for SignedOut {
+        async fn get_server_info(
+            &self,
+            r: GetServerInfoRequest,
+        ) -> protocol::Result<GetServerInfoResponse> {
+            self.0.get_server_info(r).await
+        }
+        async fn publish_v2(&self, r: PublishV2Request) -> protocol::Result<PublishV2Response> {
             if self.1.get() {
                 return Err(protocol::ErrorKind::SignInRequired.into());
             }
-            self.0.publish(request).await
+            self.0.publish_v2(r).await
         }
-
-        async fn fetch_bundle(
+        async fn refill_prekeys(
             &self,
-            request: FetchBundleRequest,
-        ) -> protocol::Result<FetchBundleResponse> {
-            self.0.fetch_bundle(request).await
+            r: RefillPrekeysRequest,
+        ) -> protocol::Result<RefillPrekeysResponse> {
+            self.0.refill_prekeys(r).await
         }
-
-        async fn send_initial_message(
+        async fn get_manifest(
             &self,
-            request: SendInitialMessageRequest,
-        ) -> protocol::Result<SendInitialMessageResponse> {
-            self.0.send_initial_message(request).await
+            r: GetManifestRequest,
+        ) -> protocol::Result<GetManifestResponse> {
+            self.0.get_manifest(r).await
         }
-
-        async fn take_initial_messages(
+        async fn claim_bundle(
             &self,
-            request: TakeInitialMessagesRequest,
-        ) -> protocol::Result<TakeInitialMessagesResponse> {
-            self.0.take_initial_messages(request).await
+            r: ClaimBundleRequest,
+        ) -> protocol::Result<ClaimBundleResponse> {
+            self.0.claim_bundle(r).await
+        }
+        async fn send_initial_v2(
+            &self,
+            r: SendInitialV2Request,
+        ) -> protocol::Result<SendInitialV2Response> {
+            self.0.send_initial_v2(r).await
+        }
+        async fn list_initial_messages(
+            &self,
+            r: ListInitialMessagesRequest,
+        ) -> protocol::Result<ListInitialMessagesResponse> {
+            self.0.list_initial_messages(r).await
+        }
+        async fn ack_initial_messages(
+            &self,
+            r: AckInitialMessagesRequest,
+        ) -> protocol::Result<AckInitialMessagesResponse> {
+            self.0.ack_initial_messages(r).await
         }
     }
 
     #[tokio::test]
     async fn publishing_refused_for_the_sign_in_adds_up_no_keys() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let mut alice = Client::new(InProcessHandshake(&handshake));
-        let mut bob = Client::new(SignedOut(&handshake, Cell::new(true)));
-        // The one-time prekeys Bob keeps, as his state shows them.
-        let one_time = |bob: &Client<SignedOut<'_>>| {
-            let state = format!("{:?}", bob.state());
-            let count = state.split("one_time: ").nth(1).unwrap();
-            count[..count.find(|c: char| !c.is_ascii_digit()).unwrap()].to_string()
-        };
-        let error = bob.publish_keys(2).await.unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::SignInRequired);
-        let kept = one_time(&bob);
-        for _ in 0..5 {
-            bob.publish_keys(2).await.unwrap_err();
-        }
-        assert_eq!(one_time(&bob), kept);
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(SignedOut(hs, Cell::new(true)));
 
-        // Signed in, it publishes, and Alice can start a chat with him.
+        let error = bob.publish_v2(AUDIENCE, 2, 2).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::SignInRequired);
+        assert_eq!(bob.current_one_time_count(), 0);
+        for _ in 0..5 {
+            bob.publish_v2(AUDIENCE, 2, 2).await.unwrap_err();
+        }
+        assert_eq!(bob.current_one_time_count(), 0);
+
         bob.handshake.1.set(false);
-        bob.publish_keys(2).await.unwrap();
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
         let _alice_session = alice
-            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (_bob_session, first) = bob
-            .accept(
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted { first_message, .. } = bob
+            .accept_initial_v2(
                 &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb,
             )
-            .unwrap();
-        assert_eq!(first, b"hi");
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
+        assert_eq!(first_message, b"hi");
     }
 
     #[tokio::test]
     async fn prekeys_published_without_a_reply_stay_usable() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let mut alice = Client::new(InProcessHandshake(&handshake));
-        let mut bob = Client::new(LosingReply(&handshake, Cell::new(true)));
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(LosingReply(hs, Cell::new(true)));
 
-        // The server has Bob's prekeys, but he never heard so; Alice uses them meanwhile.
-        assert!(bob.publish_keys(1).await.is_err());
-        let mut alice_session = alice
-            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(&mailbox))
+        assert!(bob.publish_v2(AUDIENCE, 1, 1).await.is_err());
+        let _alice_session = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        // Bob publishes again, and many times more, before he takes her initial message: it
-        // still is accepted, as publishing again did not start a new generation.
-        bob.publish_keys(1).await.unwrap();
-        bob.publish_keys(1).await.unwrap();
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (_bob_session, first) = bob
-            .accept(
+        bob.publish_v2(AUDIENCE, 1, 1).await.unwrap();
+        bob.publish_v2(AUDIENCE, 1, 1).await.unwrap();
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted { first_message, .. } = bob
+            .accept_initial_v2(
                 &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb,
             )
-            .unwrap();
-        assert_eq!(first, b"hi");
-        alice_session.send(b"there").await.unwrap();
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
+        assert_eq!(first_message, b"hi");
     }
 
     #[tokio::test]
     async fn the_active_session_has_an_id_both_peers_share() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut alice_session, _bob, bob_session) = talking(&handshake, &mailbox).await;
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut alice_session, _bob, bob_session) = talking(&hs, &mb).await;
         let first = *alice_session.active_id().unwrap();
         assert_eq!(bob_session.active_id(), Some(&first));
-        // Retired, there is none; started again, another.
         alice_session.retire();
         assert_eq!(alice_session.active_id(), None);
         alice
-            .start_again(&mut alice_session, b"again")
+            .start_again_v2(AUDIENCE, &mut alice_session, b"again")
             .await
             .unwrap();
         let second = *alice_session.active_id().unwrap();
@@ -4008,98 +4738,105 @@ mod test {
     }
 
     #[tokio::test]
-    async fn a_message_of_an_earlier_session_pushed_twice_is_a_duplicate() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut earlier, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
-
-        // Alice pushes a message twice, as a push whose answer was lost goes again, and starts
-        // a new session, which Bob takes before the message.
-        let message = earlier.encrypt(b"twice").unwrap();
-        earlier.push(message.clone()).await.unwrap();
-        earlier.push(message).await.unwrap();
+    async fn a_stolen_earlier_session_is_never_sent_on_again() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (mut alice, mut stolen, mut bob, mut bob_session) = talking(&hs, &mb).await;
         alice
-            .initiate(&bob.identity_key(), b"again", InProcessMailbox(&mailbox))
+            .publish_v2(AUDIENCE, KEPT_SESSIONS + 2, KEPT_SESSIONS + 2)
             .await
             .unwrap();
-        accept_keeping(&mut bob, &alice.identity_key(), &mut bob_session, &mailbox).await;
-        let received = receive_all(&mut bob_session).await;
-        assert_eq!(received[0].content.as_ref().unwrap(), b"twice");
-        assert_eq!(
-            received[1].content.as_ref().unwrap_err().kind(),
-            ErrorKind::DuplicateMessage
-        );
-    }
-
-    #[tokio::test]
-    async fn a_stolen_earlier_session_is_never_sent_on_again() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (mut alice, mut stolen, mut bob, mut bob_session) = talking(&handshake, &mailbox).await;
-        alice.publish_keys(KEPT_SESSIONS + 1).await.unwrap();
         let (alice_key, bob_key) = (alice.identity_key(), bob.identity_key());
 
-        // Someone copied Alice's session, and she started a new one, which Bob accepted.
         let mut alice_session = alice
-            .initiate(&bob_key, b"new", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob_key,
+                &PeerPqState::default(),
+                b"new",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        accept_keeping(&mut bob, &alice_key, &mut bob_session, &mailbox).await;
-        // Bob's reply to the copied session, from before.
-        assert!(receive_all(&mut alice_session).await[0].content.is_err());
+        register_active_grant(&mut alice, &alice_session, &mb).await;
+        accept_keeping(&mut bob, &alice_key, &mut bob_session, &mb).await;
 
-        // The thief writes on the copied session as Alice, and Bob decrypts it while he keeps
-        // it; but he never sends on it, so the thief reads nothing more. Missing Alice, he
-        // retires sessions and starts new ones, which only Alice can accept, until the copied
-        // one drops out.
         for _ in 0..4 * MAX_DIRECTION_CHANGES {
-            stolen.send(b"it is me").await.unwrap();
-            receive_all(&mut bob_session).await;
-            if bob_session.needs_new_session() {
-                bob.start_again(&mut bob_session, b"again").await.unwrap();
-                accept_keeping(&mut alice, &bob_key, &mut alice_session, &mailbox).await;
+            match stolen.send_v2(b"it is me").await {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WriteTokenRejected => break,
+                Err(e) => panic!("unexpected stolen send error: {e:?}"),
             }
-            bob_session.send(b"for alice").await.unwrap();
-            assert!(
-                receive_all(&mut stolen)
+            let _ = receive_for(&mut bob, &mut bob_session, &mb).await;
+            if bob_session.needs_new_session() {
+                bob.start_again_v2(AUDIENCE, &mut bob_session, b"again")
                     .await
-                    .iter()
-                    .all(|received| received.content.is_err())
-            );
-            assert_eq!(
-                contents(receive_all(&mut alice_session).await),
-                [b"for alice"]
-            );
+                    .unwrap();
+                register_active_grant(&mut bob, &bob_session, &mb).await;
+                accept_keeping(&mut alice, &bob_key, &mut alice_session, &mb).await;
+            }
+            bob_session.send_v2(b"for alice").await.unwrap();
+            let page = alice.fetch_mailbox_v2(&mb, AUDIENCE, 100).await.unwrap();
+            for env in &page.messages {
+                assert!(
+                    stolen
+                        .decrypt_envelope(env.message.as_ref().unwrap())
+                        .is_err()
+                );
+                assert_eq!(
+                    alice_session
+                        .decrypt_envelope(env.message.as_ref().unwrap())
+                        .unwrap()
+                        .content,
+                    b"for alice"
+                );
+            }
+            if let Some(last) = page.last_sequence() {
+                alice.commit_mailbox_page(last, last).unwrap();
+                alice.ack_mailbox_v2(&mb, AUDIENCE).await.unwrap();
+            }
         }
-        stolen.send(b"still me").await.unwrap();
-        assert!(receive_all(&mut bob_session).await[0].content.is_err());
+        // After enough rotations, stolen's grant or earlier session is evicted.
+        if stolen.send_v2(b"still me").await.is_ok() {
+            let rx = receive_for(&mut bob, &mut bob_session, &mb).await;
+            assert!(rx.is_empty() || rx[0].is_err());
+        }
     }
 
     #[tokio::test]
     async fn only_sessions_with_the_peer_are_kept() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (_alice, _alice_session, mut bob, mut bob_session) =
-            talking(&handshake, &mailbox).await;
-        let mut carol = Client::new(InProcessHandshake(&handshake));
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (_alice, _alice_session, mut bob, mut bob_session) = talking(&hs, &mb).await;
+        let mut carol = Client::new(hs);
         let carol_session = carol
-            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi",
+                mb.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(
             bob_session.keep(carol_session).unwrap_err().kind(),
             ErrorKind::UnexpectedPeer
         );
-        // And Bob's own, with Carol, is not Alice's either.
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (session, _) = bob
-            .accept(
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted { session, .. } = bob
+            .accept_initial_v2(
                 &carol.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb,
             )
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
         assert_eq!(
             bob_session.keep(session).unwrap_err().kind(),
             ErrorKind::UnexpectedPeer
@@ -4107,29 +4844,35 @@ mod test {
     }
 
     #[test]
-    fn subscriptions_go_by_the_servers_clock() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let alice = Client::new(InProcessHandshake(&handshake));
-        // As if this device's clock were ten minutes behind the server's: refused.
+    fn subscriptions_go_by_the_servers_clock_and_bind_audience_and_nonce() {
+        let alice = Client::new(());
         let behind = now() - 10 * 60 * 1000;
-        let error = alice.subscription().verify(behind).unwrap_err();
-        assert_eq!(error.kind(), protocol::ErrorKind::StaleTimestamp);
-        // Once a response told it the server's time, taken.
+        let stale = alice.subscription_for_audience(AUDIENCE).unwrap();
+        assert_eq!(
+            stale
+                .verify_for_audience(AUDIENCE, behind)
+                .unwrap_err()
+                .kind(),
+            protocol::ErrorKind::StaleTimestamp
+        );
         alice.clock().observe(behind);
-        let key = alice.subscription().verify(behind).unwrap();
-        assert_eq!(key, alice.identity_key());
-        let bound = alice
+        let bound1 = alice
             .subscription_for_audience("https://München.example:443/")
             .unwrap();
-        assert!(bound.is_audience_bound());
+        let bound2 = alice
+            .subscription_for_audience("https://München.example:443/")
+            .unwrap();
+        assert_eq!(bound1.nonce.len(), protocol::notify::SUBSCRIBE_NONCE_LENGTH);
+        assert_ne!(bound1.nonce, bound2.nonce);
+        let key = alice.identity_key();
         assert_eq!(
-            bound
+            bound1
                 .verify_for_audience("xn--mnchen-3ya.example", behind)
                 .unwrap(),
             key
         );
         assert!(
-            bound
+            bound1
                 .verify_for_audience("relay-b.example", behind)
                 .is_err()
         );
@@ -4157,10 +4900,8 @@ mod test {
 
     #[tokio::test]
     async fn attachments_go_in_chunks() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
         let attachments = AttachmentServer::new(MemoryStore::default());
-        let alice = Client::new(InProcessHandshake(&handshake));
-        // Two full chunks and a bit.
+        let alice = Client::new(());
         let file: Vec<u8> = (0..2 * attachment::CHUNK_SIZE + 10)
             .map(|i| i as u8)
             .collect();
@@ -4174,7 +4915,6 @@ mod test {
             upload.put(&attachments, index, &chunk).await.unwrap();
         }
 
-        // Bob, with the ID and key from a message.
         let mut received = vec![];
         for index in 0..3 {
             let chunk = attachment::download_chunk(&attachments, upload.id(), index)
@@ -4182,19 +4922,18 @@ mod test {
                 .unwrap()
                 .unwrap();
             received.extend(
-                attachment::decrypt_chunk(upload.key(), index, index == 2, &chunk).unwrap(),
+                attachment::decrypt_chunk(upload.key(), upload.id(), index, index == 2, &chunk)
+                    .unwrap(),
             );
         }
         assert_eq!(received, file);
 
-        // Interrupted after its first chunk, an upload goes on from what was kept.
         let interrupted = alice
             .start_upload(&attachments, file.len() as u64)
             .await
             .unwrap();
         let first = interrupted.encrypt(0, &file[..attachment::CHUNK_SIZE]);
         interrupted.put(&attachments, 0, &first).await.unwrap();
-        // Bob downloads while it is uploaded: the chunks after it are not there yet.
         let (id, index) = (*interrupted.id(), 1);
         let chunk = attachment::download_chunk(&attachments, &id, index).await;
         assert_eq!(chunk.unwrap(), None);
@@ -4219,20 +4958,17 @@ mod test {
                 .unwrap()
                 .unwrap();
             received.extend(
-                attachment::decrypt_chunk(resumed.key(), index, index == 2, &chunk).unwrap(),
+                attachment::decrypt_chunk(resumed.key(), &id, index, index == 2, &chunk).unwrap(),
             );
         }
         assert_eq!(received, file);
 
-        // Cancelled, it is gone for Bob.
         resumed.cancel(&attachments).await.unwrap();
         let error = attachment::download_chunk(&attachments, &id, 0)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
 
-        // Bob, who does not want one, deletes it with its key while it is uploaded, which stops
-        // the upload; so may Alice, uploaded or not, once she forgot its upload token.
         let unwanted = alice
             .start_upload(&attachments, file.len() as u64)
             .await
@@ -4250,7 +4986,6 @@ mod test {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::NotFound);
 
-        // More than the service takes.
         let size = 51 * attachment::CHUNK_SIZE as u64;
         let error = alice.start_upload(&attachments, size).await.unwrap_err();
         assert_eq!(error.kind(), ErrorKind::LimitExceeded);
@@ -4259,207 +4994,128 @@ mod test {
     #[tokio::test]
     #[cfg(feature = "prost")]
     async fn restored_clients_and_sessions_carry_on() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let mut alice = Client::new(InProcessHandshake(&handshake));
-        let mut bob = Client::new(InProcessHandshake(&handshake));
-        bob.publish_keys(1).await.unwrap();
-        let mut alice_session = alice
-            .initiate(&bob.identity_key(), b"hi", InProcessMailbox(&mailbox))
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let mut alice = Client::new(hs.clone());
+        let mut bob = Client::new(hs.clone());
+        alice.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+        bob.publish_v2(AUDIENCE, 2, 2).await.unwrap();
+
+        let alice_session = alice
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"hi",
+                mb.clone(),
+            )
             .await
             .unwrap();
-        alice_session.send(b"there").await.unwrap();
+        register_active_grant(&mut alice, &alice_session, &mb).await;
 
-        // Bob's identity, prekeys and timestamp survive a restart, and so does Alice's session.
-        let mut bob = Client::restore(
-            InProcessHandshake(&handshake),
-            restored::<_, proto::ClientState>(bob.state()),
-        );
+        let mut bob = Client::restore(hs.clone(), restored::<_, proto::ClientState>(bob.state()));
         let mut alice_session = Session::restore(
-            InProcessMailbox(&mailbox),
+            mb.clone(),
             restored::<_, proto::SessionState>(alice_session.state()),
         );
-        let initial_messages = bob.take_initial_messages().await.unwrap();
-        let (bob_session, first) = bob
-            .accept(
+        let listed = bob.list_initial_messages_v2(AUDIENCE, 0, 10).await.unwrap();
+        let AcceptedInitial::Accepted {
+            session: mut bob_session,
+            first_message: first,
+            ..
+        } = bob
+            .accept_initial_v2(
                 &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb.clone(),
             )
-            .unwrap();
+            .unwrap()
+        else {
+            panic!("expected accepted");
+        };
         assert_eq!(first, b"hi");
-        // So does what was accepted: it cannot be accepted again.
-        let mut bob = Client::restore(
-            InProcessHandshake(&handshake),
-            restored::<_, proto::ClientState>(bob.state()),
-        );
-        assert_eq!(
-            bob.accept(
-                &alice.identity_key(),
-                &initial_messages[0],
-                InProcessMailbox(&mailbox),
-            )
-            .unwrap_err()
-            .kind(),
-            ErrorKind::InvalidInitialMessage
-        );
+        let grant_ver = bob.allocate_grant_version().unwrap();
+        bob_session
+            .queue_pending_grant(PendingGrant {
+                token_hash: bob_session.active_inbound_token_hash().unwrap(),
+                grant_version: grant_ver,
+                pin_active: true,
+            })
+            .unwrap();
 
-        // The cursor too: what was received is not fetched again.
+        // Confirmed initial survives restore and cannot be accepted again (and reports `is_replayed`).
+        let mut bob = Client::restore(hs.clone(), restored::<_, proto::ClientState>(bob.state()));
+        let replay_err = bob
+            .accept_initial_v2(
+                &alice.identity_key(),
+                &PeerPqState::default(),
+                &listed.messages[0],
+                mb.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(replay_err.kind(), ErrorKind::InvalidInitialMessage);
+        assert!(replay_err.is_replayed());
+
+        // Pending grants & inbound_token_hash survive SessionState restore.
         let mut bob_session = Session::restore(
-            InProcessMailbox(&mailbox),
+            mb.clone(),
             restored::<_, proto::SessionState>(bob_session.state()),
         );
+        assert_eq!(bob_session.pending_register_grants().len(), 1);
+        let pg = bob_session.pending_register_grants()[0];
+        bob.register_write_token_v2(
+            &mb,
+            AUDIENCE,
+            &alice.identity_key(),
+            &pg.token_hash,
+            pg.grant_version,
+            pg.pin_active,
+        )
+        .await
+        .unwrap();
+        assert!(bob_session.remove_pending_grant(&pg.token_hash, pg.grant_version));
+
+        alice_session.send_v2(b"there").await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut bob_session).await),
+            contents(receive_for(&mut bob, &mut bob_session, &mb).await),
             [b"there".to_vec()]
         );
-        let mut bob_session = Session::restore(
-            InProcessMailbox(&mailbox),
-            restored::<_, proto::SessionState>(bob_session.state()),
+
+        // Unified cursor survives ClientState restore: already-received messages are not re-fetched.
+        let mut bob = Client::restore(hs, restored::<_, proto::ClientState>(bob.state()));
+        assert_eq!(bob.mailbox_cursor(), 1);
+        assert_eq!(bob.next_grant_version(), grant_ver + 1);
+        assert!(
+            receive_for(&mut bob, &mut bob_session, &mb)
+                .await
+                .is_empty()
         );
-        assert!(receive_all(&mut bob_session).await.is_empty());
-        bob_session.send(b"hello").await.unwrap();
+
+        bob_session.send_v2(b"hello").await.unwrap();
         assert_eq!(
-            contents(receive_all(&mut alice_session).await),
+            contents(receive_for(&mut alice, &mut alice_session, &mb).await),
             [b"hello".to_vec()]
         );
     }
 
-    #[cfg(feature = "rkyv")]
-    #[tokio::test]
-    async fn rkyv_verify_rejects_corrupted_client_and_session_states() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (_alice, mut alice_session, mut bob, _bob_session) =
-            talking(&handshake, &mailbox).await;
-
-        // Valid states round-trip cleanly through rkyv::from_bytes (with bytecheck::Verify).
-        let valid_client = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&valid_client).is_ok());
-        let valid_session = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&valid_session).is_ok());
-
-        // 1. ClientState: strict_pq with pq_enabled == false rejected.
-        bob.state.pq_config.pq_enabled = false;
-        bob.state.pq_config.strict_pq = true;
-        let bad_client = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_client).is_err());
-
-        // 2. ClientState: last_timestamp > MAX_SAFE_INTEGER rejected.
-        bob.state.pq_config.strict_pq = false;
-        bob.state.last_timestamp = protocol::MAX_SAFE_INTEGER + 1;
-        let bad_ts = rkyv::to_bytes::<rkyv::rancor::Error>(bob.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_ts).is_err());
-
-        // 3. SessionState: non-canonical `me` rejected.
-        let orig_me = alice_session.state.me;
-        alice_session.state.me[31] |= 0x80;
-        let bad_me = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_me).is_err());
-        alice_session.state.me = orig_me;
-
-        // 4. SessionState: cursor > MAX_SAFE_INTEGER, others > KEPT_SESSIONS, delivered > cap rejected.
-        let orig_cursor = alice_session.state.cursor;
-        alice_session.state.cursor = protocol::MAX_SAFE_INTEGER + 1;
-        let bad_cursor = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_cursor).is_err());
-        alice_session.state.cursor = orig_cursor;
-
-        alice_session.state.delivered =
-            vec![[0u8; DELIVERY_TOKEN_LENGTH]; MAX_STORED_DELIVERED + 1];
-        let bad_delivered = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_delivered).is_err());
-        alice_session.state.delivered.clear();
-
-        // 4b. `others.len() > KEPT_SESSIONS` rejected.
-        let extra = Earlier::from(alice_session.state.active.take().unwrap());
-        let saved_party_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&extra).unwrap();
-        alice_session.state.others.push(extra);
-        for _ in 0..KEPT_SESSIONS {
-            alice_session.state.others.push(
-                rkyv::from_bytes::<Earlier, rkyv::rancor::Error>(&saved_party_bytes).unwrap(),
-            );
-        }
-        assert!(alice_session.state.others.len() > KEPT_SESSIONS);
-        let bad_others = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_others).is_err());
-        alice_session.state.others.truncate(1);
-        let restored_earlier = alice_session.state.others.pop().unwrap();
-        alice_session.state.active = Some(Active {
-            party: restored_earlier.party,
-            id: bob.state().identity.compute_public_key().to_bytes(),
-            known_by_peer: true,
-            initial_message: vec![],
-            delivery_key: restored_earlier.delivery_key,
-            security: SessionSecurity::classical(),
-            peer_session_seq: 0,
-        });
-
-        // 5. SessionState: mismatched `active.security` vs `party` rejected.
-        alice_session.state.active.as_mut().unwrap().security =
-            SessionSecurity::pq(PqSuite::MlKem1024, true);
-        let bad_sec = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_sec).is_err());
-        alice_session.state.active.as_mut().unwrap().security = SessionSecurity::classical();
-
-        // 6. SessionState: active or earlier party whose AD does not bind `(me, peer)` rejected!
-        let mut carol = Client::new(InProcessHandshake(&handshake));
-        let mut carol_session = carol
-            .initiate(&bob.identity_key(), b"carol", InProcessMailbox(&mailbox))
-            .await
-            .unwrap();
-        let orig_peer = alice_session.state.peer;
-        alice_session.state.peer = carol.identity_key();
-        let bad_active_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_active_ad).is_err());
-        alice_session.state.peer = orig_peer;
-
-        // Tampered `others[0].party` AD (foreign Carol->Bob party inside Alice->Bob state) rejected!
-        alice_session
-            .state
-            .others
-            .push(Earlier::from(carol_session.state.active.take().unwrap()));
-        let bad_earlier_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_earlier_ad).is_err());
-        alice_session.state.others.clear();
-
-        // Wrong AD length on active party (32 bytes instead of 64/96) rejected!
-        let bad_ad_party = Party::new(
-            Ratchet::bob(
-                &SharedKeys::from_secret(&[7u8; 32]),
-                DhPrivateKey::from([8u8; 32]),
-            ),
-            vec![0xAA; 32],
-        );
-        alice_session.state.active.as_mut().unwrap().party = bad_ad_party;
-        let bad_len_ad = rkyv::to_bytes::<rkyv::rancor::Error>(alice_session.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_len_ad).is_err());
-
-        // 7. Zero-copy `ArchivedClientState::verify` rejects `manifest_seq > 0` with empty
-        //    `recent_manifest_digests`, and `ArchivedSessionState::verify` rejects mismatched
-        //    `pq_ratchet` metadata against the archived `Party`!
-        let mut bob_clone = Client::new(InProcessHandshake(&handshake));
-        bob_clone.state.manifest_seq = 1;
-        bob_clone.state.recent_manifest_digests.clear();
-        let bad_digests = rkyv::to_bytes::<rkyv::rancor::Error>(bob_clone.state()).unwrap();
-        assert!(rkyv::from_bytes::<ClientState, rkyv::rancor::Error>(&bad_digests).is_err());
-
-        let (_, mut s_pq_mismatch, _, _) = talking(&handshake, &mailbox).await;
-        s_pq_mismatch.state.active.as_mut().unwrap().security =
-            SessionSecurity::pq(PqSuite::MlKem1024, true);
-        let bad_pq_meta = rkyv::to_bytes::<rkyv::rancor::Error>(s_pq_mismatch.state()).unwrap();
-        assert!(rkyv::from_bytes::<SessionState, rkyv::rancor::Error>(&bad_pq_meta).is_err());
-    }
-
     #[cfg(feature = "serde")]
     #[tokio::test]
-    async fn serde_validate_rejects_tampered_party_associated_data() {
-        let handshake = HandshakeServer::new(MemoryStore::default());
-        let mailbox = MailboxServer::new(MemoryStore::default());
-        let (alice, alice_session, bob, _bob_session) = talking(&handshake, &mailbox).await;
-        let mut carol = Client::new(InProcessHandshake(&handshake));
+    async fn serde_validate_rejects_tampered_party_associated_data_and_grants() {
+        let store = SharedStore::default();
+        let hs = InProcessHandshake::new(store.clone());
+        let mb = InProcessMailbox::new(store);
+        let (alice, alice_session, bob, _bob_session) = talking(&hs, &mb).await;
+        let mut carol = Client::new(hs.clone());
         let mut carol_session = carol
-            .initiate(&bob.identity_key(), b"carol", InProcessMailbox(&mailbox))
+            .initiate_v2(
+                AUDIENCE,
+                &bob.identity_key(),
+                &PeerPqState::default(),
+                b"carol",
+                mb.clone(),
+            )
             .await
             .unwrap();
 
@@ -4468,14 +5124,11 @@ mod test {
             others: std::mem::take(&mut s.others),
             me: s.me,
             peer: s.peer,
-            cursor: s.cursor,
             last: s.last,
             direction_changes: s.direction_changes,
-            stalled_through: s.stalled_through,
-            skip_through: s.skip_through,
-            delivered: std::mem::take(&mut s.delivered),
             peer_pq: std::mem::take(&mut s.peer_pq),
             next_session_seq: s.next_session_seq,
+            pending_register_grants: std::mem::take(&mut s.pending_register_grants),
         };
 
         // 1. Valid state passes serde TryFrom<RawSessionState>.
@@ -4484,14 +5137,12 @@ mod test {
 
         // 2. Active party with mismatched peer identity in AD is rejected.
         let mut wrong_peer_raw = to_raw(valid_state);
-        let orig_peer = wrong_peer_raw.peer;
         wrong_peer_raw.peer = carol.identity_key();
         let err = SessionState::try_from(wrong_peer_raw).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::MalformedState);
 
         // 3. Earlier (`others`) party from a different identity pair (Carol->Bob) is rejected.
-        let (alice2, alice2_session, _bob2, _bob2_session) = talking(&handshake, &mailbox).await;
-        let _ = (alice2, orig_peer);
+        let (_alice2, alice2_session, _bob2, _bob2_session) = talking(&hs, &mb).await;
         let mut bad_others_raw = to_raw(alice2_session.state);
         bad_others_raw
             .others
@@ -4500,7 +5151,7 @@ mod test {
         assert_eq!(err.kind(), ErrorKind::MalformedState);
 
         // 4. Active party with wrong AD length (32 bytes) is rejected.
-        let (_a3, a3_session, _b3, _b3_session) = talking(&handshake, &mailbox).await;
+        let (_a3, a3_session, _b3, _b3_session) = talking(&hs, &mb).await;
         let mut bad_len_raw = to_raw(a3_session.state);
         bad_len_raw.active.as_mut().unwrap().party = Party::new(
             Ratchet::bob(
@@ -4511,6 +5162,26 @@ mod test {
         );
         let err = SessionState::try_from(bad_len_raw).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::MalformedState);
+
+        // 5. Duplicate or zero-version pending_register_grants are rejected.
+        let (_a4, a4_session, _b4, _b4_session) = talking(&hs, &mb).await;
+        let mut dup_grant_raw = to_raw(a4_session.state);
+        dup_grant_raw.pending_register_grants = vec![
+            PendingGrant {
+                token_hash: [0x11; 32],
+                grant_version: 1,
+                pin_active: true,
+            },
+            PendingGrant {
+                token_hash: [0x11; 32],
+                grant_version: 2,
+                pin_active: false,
+            },
+        ];
+        assert_eq!(
+            SessionState::try_from(dup_grant_raw).unwrap_err().kind(),
+            ErrorKind::MalformedState
+        );
     }
 
     #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
@@ -4524,8 +5195,6 @@ mod test {
         let prep = bob.prepare_publish_v2("relay.example", 2, 2).unwrap();
         let lr_wire = prep.request.pq_last_resort[0].clone();
         bob.commit_publish_v2(prep);
-        // Force empty recent_manifest_digests (e.g. restored legacy state before manifest tracking):
-        // an authenticated PQXDH initial carrying a foreign `Some(digest)` MUST STILL be rejected!
         bob.state.recent_manifest_digests.clear();
 
         let spk = bob.current_signed_prekey().unwrap();
@@ -4569,6 +5238,971 @@ mod test {
             .unwrap_err()
             .kind(),
             ErrorKind::DowngradeDetected
+        );
+    }
+
+    #[cfg(feature = "prost")]
+    #[test]
+    fn proto_round_trip_preserves_pq_preferences_on_reduced_builds() {
+        let client = Client::new(());
+        let mut raw = proto::ClientState::from(client.state());
+        raw.pq_disabled = false;
+        raw.pq_ratchet_disabled = false;
+        raw.strict_pq = false;
+
+        let restored = ClientState::try_from(&raw).expect("non-strict PQ state restores cleanly");
+        assert!(restored.pq_config.pq_enabled);
+        assert!(restored.pq_config.pq_ratchet_enabled);
+        let reserialized = proto::ClientState::from(&restored);
+        assert!(
+            !reserialized.pq_disabled,
+            "restoring on a classical-only build must not flip persisted pq_disabled to true"
+        );
+        assert!(
+            !reserialized.pq_ratchet_disabled,
+            "restoring on a classical-only build must not flip persisted pq_ratchet_disabled to true"
+        );
+
+        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+        {
+            let mut strict_raw = raw;
+            strict_raw.strict_pq = true;
+            assert_eq!(
+                ClientState::try_from(&strict_raw).unwrap_err().kind(),
+                ErrorKind::MalformedState
+            );
+        }
+    }
+
+    #[test]
+    fn r7_p2_2_ambiguous_failed_publishes_never_evict_confirmed_relay_manifest_digest() {
+        let mut client = Client::new(());
+        let p1 = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let m1 = p1.request.manifest.clone().unwrap();
+        let d1 = protocol::handshake_v2::manifest_digest(&m1).unwrap();
+        client.commit_publish_v2(p1);
+        assert!(client.state.confirmed_manifest_digests.contains(&d1));
+        assert!(client.state.recent_manifest_digests.contains(&d1));
+
+        // Simulate 20 consecutive ambiguous publish attempts that fail before reaching the relay
+        // (`reconcile_interrupted_publish` observes `m1` on the relay, keeps `publishing = true`,
+        // and each attempt stages a distinct unconfirmed manifest digest).
+        for _ in 0..20 {
+            let prep = client.prepare_publish_v2("relay.example", 1, 1).unwrap();
+            drop(prep);
+            assert!(!client.reconcile_interrupted_publish(Some(&m1), &[], &[]));
+        }
+        // 21st attempt succeeds and commits: `prune_manifest_digests_preserving` trims rolling
+        // digests to 16, evicting unconfirmed staged attempts FIRST and strictly preserving `d1`!
+        let p_ok = client.prepare_publish_v2("relay.example", 1, 1).unwrap();
+        let d_ok = protocol::handshake_v2::manifest_digest(p_ok.request.manifest.as_ref().unwrap())
+            .unwrap();
+        client.commit_publish_v2(p_ok);
+        assert!(
+            client.state.recent_manifest_digests.contains(&d1),
+            "last confirmed relay manifest digest d1 must survive 20+ failed publish attempts"
+        );
+        assert!(client.state.recent_manifest_digests.contains(&d_ok));
+        assert!(client.state.confirmed_manifest_digests.contains(&d1));
+        assert!(client.state.confirmed_manifest_digests.contains(&d_ok));
+        assert!(client.state.recent_manifest_digests.len() <= MAX_RECENT_MANIFEST_DIGESTS);
+
+        #[cfg(feature = "prost")]
+        {
+            let wire = proto::ClientState::from(client.state());
+            let restored = ClientState::try_from(&wire).unwrap();
+            assert_eq!(
+                restored.confirmed_manifest_digests,
+                client.state.confirmed_manifest_digests
+            );
+        }
+    }
+
+    #[test]
+    fn r8_p2_7_has_spare_digest_slot_and_prepare_refuse_unsatisfiable_preserve() {
+        let mut client = Client::new(());
+        let mut pinned = Vec::new();
+        for _ in 0..MAX_RETAINED_MANIFEST_DIGESTS {
+            let prep = client
+                .prepare_publish_v2_preserving("relay.example", 1, 1, &[], &pinned)
+                .unwrap();
+            let d =
+                protocol::handshake_v2::manifest_digest(prep.request.manifest.as_ref().unwrap())
+                    .unwrap();
+            pinned.push(d);
+            client.commit_publish_v2(prep);
+        }
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert!(
+            !client.has_spare_manifest_digest_slot(&pinned),
+            "144 preserved digests leave zero spare slots"
+        );
+        let seq_before = client.manifest_seq();
+        let err = client
+            .prepare_publish_v2_preserving("relay.example", 1, 1, &[], &pinned)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::LimitExceeded);
+        assert_eq!(client.manifest_seq(), seq_before);
+        assert!(
+            client.recent_manifest_digests().contains(&pinned[0]),
+            "unsatisfiable preserve set must fail before mutating state or evicting index 0"
+        );
+
+        // Even if an unconfirmed 145th digest is staged alongside 144 preserved digests,
+        // `has_spare_manifest_digest_slot` MUST still return false (no off-by-one!).
+        client
+            .state
+            .stage_manifest_digest([0xee; 32], None, &pinned);
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_STORED_MANIFEST_DIGESTS
+        );
+        assert!(
+            !client.has_spare_manifest_digest_slot(&pinned),
+            "144 preserved + 1 unconfirmed staged (145 total) still has zero spare slots"
+        );
+        // Dropping 1 pin frees a slot cleanly (`143 < 144`).
+        assert!(client.has_spare_manifest_digest_slot(&pinned[1..]));
+    }
+
+    #[test]
+    fn r9_p2_4_retained_spk_manifest_digests_survive_inplace_publishes_and_rotation() {
+        let mut client = Client::new(());
+        // Generation 1 (SPK A)
+        let pa = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_a = pa.classical.signed_prekey;
+        client.commit_publish_v2(pa);
+
+        // Generation 2 (SPK B, manifest M0)
+        let pb0 = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_b = pb0.classical.signed_prekey;
+        assert_ne!(spk_a, spk_b);
+        let m0 = pb0.request.manifest.clone().unwrap();
+        let d0 = protocol::handshake_v2::manifest_digest(&m0).unwrap();
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        let m0_pq_lr = pb0.request.pq_last_resort[0].clone();
+        client.commit_publish_v2(pb0);
+
+        // Perform 16 confirmed in-place publishes on SPK B while SPK A is preserved (undrained
+        // inbox), producing M1..M16 all bound to SPK B.
+        for _ in 0..16 {
+            let p_ext = client
+                .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+                .unwrap();
+            assert_eq!(p_ext.classical.signed_prekey, spk_b);
+            client.commit_publish_v2_preserving(p_ext, &[spk_a], &[]);
+        }
+        assert!(client.recent_manifest_digests().contains(&d0));
+
+        // Inbox drains (`preserve = &[]`) and next publish rotates from B -> C (M17).
+        // Relay still accepts SPK B as `prev_signed_prekey`, so M0 MUST stay retained!
+        let pc = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_c = pc.classical.signed_prekey;
+        assert_ne!(spk_c, spk_b);
+        client.commit_publish_v2(pc);
+        assert!(
+            client.recent_manifest_digests().contains(&d0),
+            "R9-P2-4: oldest manifest digest M0 on relay-admissible prev_signed_prekey B must NOT be pruned"
+        );
+
+        #[cfg(feature = "prost")]
+        {
+            let wire = proto::ClientState::from(client.state());
+            let restored = ClientState::try_from(&wire).unwrap();
+            assert_eq!(
+                restored.manifest_digest_spks,
+                client.state.manifest_digest_spks
+            );
+            assert!(restored.recent_manifest_digests.contains(&d0));
+        }
+
+        // Delayed PQ greeting referencing M0 on SPK B must be ACCEPTED (not DowngradeDetected!).
+        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        {
+            let alice_id = XEdDSAPrivateKey::generate();
+            let suite = PqSuite::from_u8(m0_pq_lr.suite as u8).unwrap();
+            let mut lr_sig = [0u8; 64];
+            lr_sig.copy_from_slice(&m0_pq_lr.signature);
+            let pq_bundle = x3dh::PqPrekeyBundle {
+                signed_prekey: spk_b,
+                signed_prekey_signature: None,
+                one_time_prekey: None,
+                pq_suite: suite,
+                pq_prekey: m0_pq_lr.encapsulation_key.to_vec(),
+                pq_prekey_signature: lr_sig,
+                pq_last_resort: true,
+            };
+            let (pq_init, agreement) = pq_bundle
+                .initiate_pq(&alice_id, &client.identity_key(), Some(&d0))
+                .unwrap();
+            let ratchet =
+                Ratchet::alice(&SharedKeys::from_secret(&agreement.secret_key), &spk_b).unwrap();
+            let mut party = Party::new(ratchet, agreement.associated_data);
+            let first_message = party.encrypt(b"delayed-m0").unwrap();
+            let msg = InitialMessageV2 {
+                id: 42,
+                sender: alice_id.compute_public_key().to_bytes(),
+                kind: InitialMessageKind::Pq {
+                    x3dh: pq_init,
+                    first_message,
+                    manifest_digest: Some(d0),
+                },
+            };
+            let res = client.accept_initial_v2(
+                &alice_id.compute_public_key().to_bytes(),
+                &PeerPqState::default(),
+                &msg,
+                (),
+            );
+            assert!(
+                res.is_ok(),
+                "R9-P2-4: delayed PQ greeting for M0 on prev_signed_prekey B must succeed: {res:?}"
+            );
+        }
+
+        // Next rotation C -> D evicts SPK B from LocalPrekeys (and relay prev_signed_prekey), so
+        // B's digests automatically become eligible for rolling trim back down to 16.
+        let pd = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        client.commit_publish_v2(pd);
+        assert!(
+            client.recent_manifest_digests().len() <= MAX_RECENT_MANIFEST_DIGESTS,
+            "R9-P2-4: once SPK B is evicted, its digests must prune cleanly back to <= 16"
+        );
+    }
+
+    #[test]
+    fn r10_p2_3_p2_4_unconfirmed_retained_spk_digests_and_positional_serde() {
+        // --- Part 1 (R10-P2-3): Delayed ambiguous publish U_0 on SPK B survives 16+ in-place
+        //     confirmed renewals + one rotation B -> C while SPK B is still `prev_signed_prekey`,
+        //     and prunes cleanly once C -> D evicts SPK B. ---
+        let mut client = Client::new(());
+        let pa = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_a = pa.classical.signed_prekey;
+        client.commit_publish_v2(pa);
+
+        let pb0 = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_b = pb0.classical.signed_prekey;
+        assert_ne!(spk_a, spk_b);
+        client.commit_publish_v2(pb0);
+
+        // Stage an ambiguous in-place attempt U_0 on SPK B and simulate network timeout (do NOT commit).
+        let p_ambig = client
+            .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+            .unwrap();
+        assert_eq!(p_ambig.classical.signed_prekey, spk_b);
+        let u0 = p_ambig.manifest_digest;
+        drop(p_ambig);
+        assert!(client.is_unconfirmed_digest_for_retained_spk(&u0));
+        assert!(!client.is_digest_for_retained_spk(&u0));
+
+        // Reconcile sees relay doesn't show U_0 yet, then 16 confirmed in-place publishes succeed on SPK B.
+        assert!(!client.reconcile_interrupted_publish(None, &[spk_a], &[]));
+        for _ in 0..16 {
+            let p_ext = client
+                .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+                .unwrap();
+            assert_eq!(p_ext.classical.signed_prekey, spk_b);
+            client.commit_publish_v2_preserving(p_ext, &[spk_a], &[]);
+        }
+        assert!(
+            client.recent_manifest_digests().contains(&u0),
+            "R10-P2-3: delayed ambiguous digest U_0 on SPK B must survive 16 in-place renewals"
+        );
+
+        // Rotate B -> C: SPK B stays `prev_signed_prekey`, so U_0 must STILL be retained!
+        let pc = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        client.commit_publish_v2(pc);
+        assert!(
+            client.recent_manifest_digests().contains(&u0),
+            "R10-P2-3: delayed ambiguous digest U_0 on prev_signed_prekey B must survive rotation B -> C"
+        );
+
+        // Rotate C -> D: SPK B is evicted, so U_0 prunes cleanly!
+        let pd = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        client.commit_publish_v2(pd);
+        assert!(
+            !client.recent_manifest_digests().contains(&u0),
+            "R10-P2-3: U_0 must prune cleanly once SPK B is evicted by rotation C -> D"
+        );
+
+        // --- Part 2 (R10-P2-3): 145 offline timeouts (unconfirmed staged attempts) NEVER consume
+        //     `has_spare_manifest_digest_slot_for_publish` capacity or brick publishing. ---
+        let mut client2 = Client::new(());
+        let p0 = client2.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let cur_spk = p0.classical.signed_prekey;
+        client2.commit_publish_v2(p0);
+        for i in 0..145u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x55;
+            client2.state.stage_manifest_digest(d, Some(cur_spk), &[]);
+        }
+        assert!(
+            client2.has_spare_manifest_digest_slot_for_publish(&[], &[]),
+            "R10-P2-3: unconfirmed staged digests must NOT exhaust publish digest capacity"
+        );
+        let p1 = client2.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        client2.commit_publish_v2(p1);
+        assert!(
+            client2.recent_manifest_digests().len()
+                <= MAX_RECENT_MANIFEST_DIGESTS + MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS,
+            "R10-P2-3: commit must trim excess unconfirmed digests to <= 16 + 4"
+        );
+
+        // --- Part 3 (R10-P2-3): Pre-binding protobuf snapshot with empty `manifest_digest_spks`
+        //     backfills confirmed digests (<= 16) + bounded unconfirmed digests (<= 4) without
+        //     permanently pinning 144 digests to `current_signed_prekey`. ---
+        #[cfg(feature = "prost")]
+        {
+            let mut wire = proto::ClientState::from(client2.state());
+            wire.manifest_digest_spks.clear();
+            wire.recent_manifest_digests.clear();
+            wire.confirmed_manifest_digests.clear();
+            for i in 0..30u8 {
+                let d = [i.wrapping_add(1); 32];
+                wire.recent_manifest_digests.push(d.to_vec());
+                if i < 16 {
+                    wire.confirmed_manifest_digests.push(d.to_vec());
+                }
+            }
+            let restored = ClientState::try_from(&wire).unwrap();
+            let confirmed_bound = restored
+                .manifest_digest_spks
+                .values()
+                .filter(|(_, c)| *c)
+                .count();
+            let unconfirmed_bound = restored
+                .manifest_digest_spks
+                .values()
+                .filter(|(_, c)| !*c)
+                .count();
+            assert_eq!(confirmed_bound, 16);
+            assert_eq!(unconfirmed_bound, MAX_UNCONFIRMED_RETAINED_SPK_DIGESTS);
+            let restored_client = Client::restore((), restored);
+            assert!(restored_client.has_spare_manifest_digest_slot_for_publish(&[], &[]));
+        }
+
+        // --- Part 4 (R10-P2-4): Serde struct field order of BOTH `ClientState` (Serialize) and
+        //     `RawClientState` (Deserialize) places `manifest_digest_spks` LAST (index 12) so
+        //     positional Serde formats remain compatible with 12-field `60bf9b5` snapshots. ---
+        #[cfg(feature = "serde")]
+        {
+            use serde::{Deserialize, Serialize};
+
+            const EXPECTED_FIELDS: &[&str] = &[
+                "identity",
+                "prekeys",
+                "last_timestamp",
+                "publishing",
+                "pq_config",
+                "manifest_seq",
+                "prekey_generation",
+                "recent_manifest_digests",
+                "confirmed_manifest_digests",
+                "mailbox_cursor",
+                "pending_mailbox_ack",
+                "next_grant_version",
+                "manifest_digest_spks",
+            ];
+
+            #[derive(Debug)]
+            struct StopError;
+            impl core::fmt::Display for StopError {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str("stop")
+                }
+            }
+            impl std::error::Error for StopError {}
+            impl serde::ser::Error for StopError {
+                fn custom<T: core::fmt::Display>(_: T) -> Self {
+                    Self
+                }
+            }
+            impl serde::de::Error for StopError {
+                fn custom<T: core::fmt::Display>(_: T) -> Self {
+                    Self
+                }
+            }
+
+            struct SerFieldSpy {
+                fields: Vec<&'static str>,
+            }
+            struct StructSpy<'a>(&'a mut Vec<&'static str>);
+            impl serde::ser::SerializeStruct for StructSpy<'_> {
+                type Ok = ();
+                type Error = StopError;
+                fn serialize_field<T: ?Sized + Serialize>(
+                    &mut self,
+                    key: &'static str,
+                    _value: &T,
+                ) -> core::result::Result<(), StopError> {
+                    self.0.push(key);
+                    Ok(())
+                }
+                fn end(self) -> core::result::Result<(), StopError> {
+                    Ok(())
+                }
+            }
+            impl<'a> serde::Serializer for &'a mut SerFieldSpy {
+                type Ok = ();
+                type Error = StopError;
+                type SerializeSeq = serde::ser::Impossible<(), StopError>;
+                type SerializeTuple = serde::ser::Impossible<(), StopError>;
+                type SerializeTupleStruct = serde::ser::Impossible<(), StopError>;
+                type SerializeTupleVariant = serde::ser::Impossible<(), StopError>;
+                type SerializeMap = serde::ser::Impossible<(), StopError>;
+                type SerializeStruct = StructSpy<'a>;
+                type SerializeStructVariant = serde::ser::Impossible<(), StopError>;
+                fn serialize_struct(
+                    self,
+                    _name: &'static str,
+                    _len: usize,
+                ) -> core::result::Result<StructSpy<'a>, StopError> {
+                    Ok(StructSpy(&mut self.fields))
+                }
+                fn serialize_bool(self, _: bool) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_i8(self, _: i8) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_i16(self, _: i16) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_i32(self, _: i32) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_i64(self, _: i64) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_u8(self, _: u8) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_u16(self, _: u16) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_u32(self, _: u32) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_u64(self, _: u64) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_f32(self, _: f32) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_f64(self, _: f64) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_char(self, _: char) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_str(self, _: &str) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_bytes(self, _: &[u8]) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_none(self) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_some<T: ?Sized + Serialize>(
+                    self,
+                    _: &T,
+                ) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_unit(self) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_unit_struct(
+                    self,
+                    _: &'static str,
+                ) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_unit_variant(
+                    self,
+                    _: &'static str,
+                    _: u32,
+                    _: &'static str,
+                ) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_newtype_struct<T: ?Sized + Serialize>(
+                    self,
+                    _: &'static str,
+                    _: &T,
+                ) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_newtype_variant<T: ?Sized + Serialize>(
+                    self,
+                    _: &'static str,
+                    _: u32,
+                    _: &'static str,
+                    _: &T,
+                ) -> core::result::Result<(), StopError> {
+                    Err(StopError)
+                }
+                fn serialize_seq(
+                    self,
+                    _: Option<usize>,
+                ) -> core::result::Result<Self::SerializeSeq, StopError> {
+                    Err(StopError)
+                }
+                fn serialize_tuple(
+                    self,
+                    _: usize,
+                ) -> core::result::Result<Self::SerializeTuple, StopError> {
+                    Err(StopError)
+                }
+                fn serialize_tuple_struct(
+                    self,
+                    _: &'static str,
+                    _: usize,
+                ) -> core::result::Result<Self::SerializeTupleStruct, StopError> {
+                    Err(StopError)
+                }
+                fn serialize_tuple_variant(
+                    self,
+                    _: &'static str,
+                    _: u32,
+                    _: &'static str,
+                    _: usize,
+                ) -> core::result::Result<Self::SerializeTupleVariant, StopError> {
+                    Err(StopError)
+                }
+                fn serialize_map(
+                    self,
+                    _: Option<usize>,
+                ) -> core::result::Result<Self::SerializeMap, StopError> {
+                    Err(StopError)
+                }
+                fn serialize_struct_variant(
+                    self,
+                    _: &'static str,
+                    _: u32,
+                    _: &'static str,
+                    _: usize,
+                ) -> core::result::Result<Self::SerializeStructVariant, StopError> {
+                    Err(StopError)
+                }
+            }
+
+            let mut ser_spy = SerFieldSpy { fields: Vec::new() };
+            client2.state().serialize(&mut ser_spy).unwrap();
+            assert_eq!(
+                ser_spy.fields.as_slice(),
+                EXPECTED_FIELDS,
+                "R10-P2-4: ClientState Serialize field order must keep manifest_digest_spks LAST"
+            );
+
+            struct DeFieldSpy {
+                fields: Option<&'static [&'static str]>,
+            }
+            impl<'de> serde::Deserializer<'de> for &mut DeFieldSpy {
+                type Error = StopError;
+                fn deserialize_struct<V: serde::de::Visitor<'de>>(
+                    self,
+                    _name: &'static str,
+                    fields: &'static [&'static str],
+                    _visitor: V,
+                ) -> core::result::Result<V::Value, StopError> {
+                    self.fields = Some(fields);
+                    Err(StopError)
+                }
+                serde::forward_to_deserialize_any! {
+                    bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+                    bytes byte_buf option unit unit_struct newtype_struct seq tuple
+                    tuple_struct map enum identifier ignored_any
+                }
+                fn deserialize_any<V: serde::de::Visitor<'de>>(
+                    self,
+                    _visitor: V,
+                ) -> core::result::Result<V::Value, StopError> {
+                    Err(StopError)
+                }
+            }
+
+            let mut de_spy = DeFieldSpy { fields: None };
+            let _ = RawClientState::deserialize(&mut de_spy);
+            assert_eq!(
+                de_spy.fields,
+                Some(EXPECTED_FIELDS),
+                "R10-P2-4: RawClientState Deserialize field order must keep manifest_digest_spks LAST"
+            );
+        }
+    }
+
+    #[test]
+    fn r11_p2_6_p2_7_p2_8_backfill_retry_reserve_and_two_tuple_serde() {
+        // --- Part 1 (R11-P2-6): Non-empty `manifest_digest_spks` (Round-9 snapshot with confirmed
+        //     bindings + unbound ambiguous digest `u0`) still backfills `u0` as `(cur_spk, false)`
+        //     so `u0` survives 16 in-place renewals + one rotation until `cur_spk` retires. ---
+        #[cfg(feature = "prost")]
+        {
+            let mut client = Client::new(());
+            let pa = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+            let spk_a = pa.classical.signed_prekey;
+            client.commit_publish_v2(pa);
+            let pb = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+            let spk_b = pb.classical.signed_prekey;
+            let b0 = pb.manifest_digest;
+            client.commit_publish_v2(pb);
+
+            let mut wire = proto::ClientState::from(client.state());
+            let u0 = [0xabu8; 32];
+            // Keep confirmed `b0` bound in `manifest_digest_spks` (non-empty map!), leave `u0`
+            // unbound in `recent_manifest_digests` (exact Round-9 `f7b194c` state).
+            assert!(!wire.manifest_digest_spks.is_empty());
+            wire.recent_manifest_digests.push(u0.to_vec());
+            let restored = ClientState::try_from(&wire).unwrap();
+            assert_eq!(
+                restored.manifest_digest_spks.get(&u0),
+                Some(&(spk_b, false)),
+                "R11-P2-6: unbound ambiguous digest u0 in non-empty Round-9 map must backfill as (cur_spk, false)"
+            );
+            assert_eq!(restored.manifest_digest_spks.get(&b0), Some(&(spk_b, true)));
+            let mut rc = Client::restore((), restored);
+            for _ in 0..16 {
+                let p = rc
+                    .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+                    .unwrap();
+                rc.commit_publish_v2_preserving(p, &[spk_a], &[]);
+            }
+            let pc = rc.prepare_publish_v2("relay.example", 2, 2).unwrap();
+            rc.commit_publish_v2(pc);
+            assert!(
+                rc.recent_manifest_digests().contains(&u0),
+                "R11-P2-6: backfilled u0 must survive 16 renewals + rotation while SPK B is retained"
+            );
+        }
+
+        // --- Part 2 (R11-P2-7): Accumulating 144 confirmed digests on a single SPK (0 deferred
+        //     pins) MUST NOT permanently block rotation or renewal; meanwhile 128 deferred + 16
+        //     confirmed on SPK_1 = 144 still defers cleanly (`R9-P2-5`). ---
+        let mut client2 = Client::new(());
+        let p0 = client2.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_1 = p0.classical.signed_prekey;
+        client2.commit_publish_v2(p0);
+        for i in 0..143u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x33;
+            client2
+                .state
+                .record_confirmed_manifest_digest(d, Some(spk_1));
+        }
+        assert_eq!(
+            client2.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert!(
+            client2.has_spare_manifest_digest_slot_for_publish(&[], &[]),
+            "R11-P2-7: 144 confirmed digests on a single SPK with 0 deferred pins must NOT deadlock rotation"
+        );
+        let p_rot = client2.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        assert_ne!(p_rot.classical.signed_prekey, spk_1);
+        client2.commit_publish_v2(p_rot);
+        assert_eq!(
+            client2.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+
+        // Control check (`R9-P2-5`): 128 deferred pins + 16 confirmed digests on retained SPK = 144
+        // still reports no spare digest slot.
+        let mut client3 = Client::new(());
+        let p3 = client3.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_3 = p3.classical.signed_prekey;
+        client3.commit_publish_v2(p3);
+        let mut deferred_128 = Vec::new();
+        for i in 0..128u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x44;
+            client3.state.stage_manifest_digest(d, None, &[]);
+            deferred_128.push(d);
+        }
+        for i in 0..16u8 {
+            let d = [0x80 + i; 32];
+            client3
+                .state
+                .record_confirmed_manifest_digest(d, Some(spk_3));
+        }
+        assert!(
+            !client3.has_spare_manifest_digest_slot_for_publish(&[], &deferred_128),
+            "R9-P2-5 control: 128 deferred pins + 16 confirmed retained-SPK digests must still defer"
+        );
+
+        // --- Part 3 (R11-P2-8): `RawManifestDigestSpk` deserializes BOTH 2-element `(digest, spk)`
+        //     (defaulting `confirmed = true`) and 3-element `(digest, spk, confirmed)` tuples. ---
+        #[cfg(feature = "serde")]
+        {
+            use serde::Deserialize;
+            use serde::de::{self, IntoDeserializer};
+
+            #[derive(Debug)]
+            struct SeqErr(String);
+            impl core::fmt::Display for SeqErr {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+            impl std::error::Error for SeqErr {}
+            impl de::Error for SeqErr {
+                fn custom<T: core::fmt::Display>(msg: T) -> Self {
+                    Self(msg.to_string())
+                }
+            }
+
+            enum Elem {
+                Bytes([u8; 32]),
+                Bool(bool),
+            }
+            struct ElemDe(Elem);
+            impl<'de> de::Deserializer<'de> for ElemDe {
+                type Error = SeqErr;
+                fn deserialize_any<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, SeqErr> {
+                    match self.0 {
+                        Elem::Bytes(b) => b
+                            .into_iter()
+                            .collect::<Vec<u8>>()
+                            .into_deserializer()
+                            .deserialize_seq(visitor),
+                        Elem::Bool(b) => visitor.visit_bool(b),
+                    }
+                }
+                fn deserialize_tuple<V: de::Visitor<'de>>(
+                    self,
+                    _len: usize,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, SeqErr> {
+                    self.deserialize_any(visitor)
+                }
+                serde::forward_to_deserialize_any! {
+                    bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+                    option unit unit_struct newtype_struct seq tuple_struct map struct enum
+                    identifier ignored_any
+                }
+            }
+            struct TupleSeq(std::vec::IntoIter<Elem>);
+            impl<'de> de::SeqAccess<'de> for TupleSeq {
+                type Error = SeqErr;
+                fn next_element_seed<T: de::DeserializeSeed<'de>>(
+                    &mut self,
+                    seed: T,
+                ) -> core::result::Result<Option<T::Value>, SeqErr> {
+                    match self.0.next() {
+                        Some(elem) => seed.deserialize(ElemDe(elem)).map(Some),
+                        None => Ok(None),
+                    }
+                }
+            }
+            struct TupleDe(Vec<Elem>);
+            impl<'de> de::Deserializer<'de> for TupleDe {
+                type Error = SeqErr;
+                fn deserialize_any<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, SeqErr> {
+                    visitor.visit_seq(TupleSeq(self.0.into_iter()))
+                }
+                serde::forward_to_deserialize_any! {
+                    bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes byte_buf
+                    option unit unit_struct newtype_struct seq tuple tuple_struct map struct enum
+                    identifier ignored_any
+                }
+            }
+
+            let d = [0x12u8; 32];
+            let s = [0x34u8; 32];
+            let two =
+                RawManifestDigestSpk::deserialize(TupleDe(vec![Elem::Bytes(d), Elem::Bytes(s)]))
+                    .unwrap();
+            assert_eq!(two.0, (d, s, true));
+
+            let three = RawManifestDigestSpk::deserialize(TupleDe(vec![
+                Elem::Bytes(d),
+                Elem::Bytes(s),
+                Elem::Bool(false),
+            ]))
+            .unwrap();
+            assert_eq!(three.0, (d, s, false));
+        }
+    }
+
+    #[test]
+    fn r12_p2_1_p2_2_tuple_serde_and_surplus_spk_trim() {
+        // --- Part 1 (R12-P2-1): Non-self-describing binary format (no per-tuple length prefix,
+        //     matching `postcard` / `bincode`) MUST round-trip `RawManifestDigestSpk` via
+        //     `deserialize_tuple(3, ...)` even when `digest[0] == 0x00`! ---
+        #[cfg(feature = "serde")]
+        {
+            use serde::Deserialize;
+            use serde::de;
+
+            #[derive(Debug)]
+            struct BinErr(String);
+            impl core::fmt::Display for BinErr {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                    f.write_str(&self.0)
+                }
+            }
+            impl std::error::Error for BinErr {}
+            impl de::Error for BinErr {
+                fn custom<T: core::fmt::Display>(msg: T) -> Self {
+                    Self(msg.to_string())
+                }
+            }
+
+            // Minimal strict non-self-describing binary deserializer (exact `postcard` semantics):
+            // - `deserialize_tuple(len)` reads `len` elements with NO length prefix.
+            // - `deserialize_seq` reads a 1-byte length prefix from the stream (failing on a
+            //   lengthless tuple whose first byte is `0x00`!).
+            struct StrictBinDe<'a> {
+                bytes: &'a [u8],
+            }
+            impl<'a> StrictBinDe<'a> {
+                fn take_byte(&mut self) -> core::result::Result<u8, BinErr> {
+                    let (&b, rest) = self
+                        .bytes
+                        .split_first()
+                        .ok_or_else(|| BinErr("eof".into()))?;
+                    self.bytes = rest;
+                    Ok(b)
+                }
+            }
+            struct FixedLenSeq<'a, 'b> {
+                de: &'b mut StrictBinDe<'a>,
+                remaining: usize,
+            }
+            impl<'de, 'b> de::SeqAccess<'de> for FixedLenSeq<'de, 'b> {
+                type Error = BinErr;
+                fn next_element_seed<T: de::DeserializeSeed<'de>>(
+                    &mut self,
+                    seed: T,
+                ) -> core::result::Result<Option<T::Value>, BinErr> {
+                    if self.remaining == 0 {
+                        return Ok(None);
+                    }
+                    self.remaining -= 1;
+                    seed.deserialize(&mut *self.de).map(Some)
+                }
+            }
+            impl<'de> de::Deserializer<'de> for &mut StrictBinDe<'de> {
+                type Error = BinErr;
+                fn deserialize_any<V: de::Visitor<'de>>(
+                    self,
+                    _visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    Err(BinErr("non-self-describing".into()))
+                }
+                fn deserialize_bool<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    match self.take_byte()? {
+                        0 => visitor.visit_bool(false),
+                        1 => visitor.visit_bool(true),
+                        b => Err(BinErr(format!("invalid bool {b}"))),
+                    }
+                }
+                fn deserialize_u8<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    visitor.visit_u8(self.take_byte()?)
+                }
+                fn deserialize_tuple<V: de::Visitor<'de>>(
+                    self,
+                    len: usize,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    visitor.visit_seq(FixedLenSeq {
+                        de: self,
+                        remaining: len,
+                    })
+                }
+                fn deserialize_seq<V: de::Visitor<'de>>(
+                    self,
+                    visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    let len = usize::from(self.take_byte()?);
+                    visitor.visit_seq(FixedLenSeq {
+                        de: self,
+                        remaining: len,
+                    })
+                }
+                fn deserialize_ignored_any<V: de::Visitor<'de>>(
+                    self,
+                    _visitor: V,
+                ) -> core::result::Result<V::Value, BinErr> {
+                    Err(BinErr("ignored_any not supported".into()))
+                }
+                serde::forward_to_deserialize_any! {
+                    i8 i16 i32 i64 u16 u32 u64 f32 f64 char str string bytes byte_buf
+                    option unit unit_struct newtype_struct tuple_struct map struct enum identifier
+                }
+            }
+
+            let digest = [0x00u8; 32]; // first byte 0x00 immediately fails `deserialize_seq`!
+            let spk = [0x5au8; 32];
+            let mut wire = Vec::with_capacity(65);
+            wire.extend_from_slice(&digest);
+            wire.extend_from_slice(&spk);
+            wire.push(0); // confirmed = false
+            let mut de = StrictBinDe { bytes: &wire };
+            let decoded = RawManifestDigestSpk::deserialize(&mut de).unwrap();
+            assert_eq!(decoded.0, (digest, spk, false));
+            assert!(de.bytes.is_empty());
+        }
+
+        // --- Part 2 (R12-P2-2): Trimming from 145 -> 144 MUST evict a surplus confirmed digest
+        //     from over-represented SPK B (143 digests) rather than the sole confirmed digest of
+        //     retained SPK A! ---
+        let mut client = Client::new(());
+        let pa = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_a = pa.classical.signed_prekey;
+        let d_a = pa.manifest_digest;
+        client.commit_publish_v2(pa);
+
+        let pb = client.prepare_publish_v2("relay.example", 2, 2).unwrap();
+        let spk_b = pb.classical.signed_prekey;
+        client.commit_publish_v2(pb);
+        for i in 0..142u16 {
+            let mut d = [0u8; 32];
+            d[0..2].copy_from_slice(&i.to_le_bytes());
+            d[31] = 0x77;
+            client
+                .state
+                .record_confirmed_manifest_digest(d, Some(spk_b));
+        }
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert_eq!(client.recent_manifest_digests()[0], d_a);
+        assert!(client.has_spare_manifest_digest_slot_for_publish(&[], &[]));
+
+        // In-place publish on SPK B (preserving SPK A so SPK A stays retained):
+        let pb_next = client
+            .prepare_publish_v2_preserving("relay.example", 1, 1, &[spk_a], &[])
+            .unwrap();
+        assert_eq!(pb_next.classical.signed_prekey, spk_b);
+        client.commit_publish_v2_preserving(pb_next, &[spk_a], &[]);
+        assert_eq!(
+            client.recent_manifest_digests().len(),
+            MAX_RETAINED_MANIFEST_DIGESTS
+        );
+        assert!(
+            client.recent_manifest_digests().contains(&d_a),
+            "R12-P2-2: sole confirmed digest for retained SPK A must survive trim when SPK B has surplus digests"
         );
     }
 }

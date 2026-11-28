@@ -43,8 +43,19 @@ const NONCE_LENGTH: usize = <Aes256Gcm as AeadCore>::NonceSize::USIZE;
 pub const CHUNK_SIZE: usize = MAX_CHUNK_SIZE - TAG_LENGTH;
 /// Length of an attachment's key.
 pub const KEY_LENGTH: usize = 32;
-/// The associated data of every chunk.
-const ASSOCIATED_DATA: &[u8] = b"attachment.v1";
+/// Domain-separation prefix for attachment chunk associated data (`b"attachment.v2\0" || id`).
+const ASSOCIATED_DATA_PREFIX: &[u8; 14] = b"attachment.v2\0";
+/// Length of the stack-allocated chunk AAD: `b"attachment.v2\0"` (14) || `id` (16) = 30 bytes.
+const ASSOCIATED_DATA_LENGTH: usize = ASSOCIATED_DATA_PREFIX.len() + ID_LENGTH;
+
+/// Stack-allocated chunk associated data binding the domain separator and attachment `id`:
+/// `b"attachment.v2\0" || id`.
+fn chunk_aad(id: &[u8; ID_LENGTH]) -> [u8; ASSOCIATED_DATA_LENGTH] {
+    let mut aad = [0u8; ASSOCIATED_DATA_LENGTH];
+    aad[..ASSOCIATED_DATA_PREFIX.len()].copy_from_slice(ASSOCIATED_DATA_PREFIX);
+    aad[ASSOCIATED_DATA_PREFIX.len()..].copy_from_slice(id);
+    aad
+}
 
 /// An attachment's key, zeroized on drop.
 pub type Key = Zeroizing<[u8; KEY_LENGTH]>;
@@ -58,34 +69,44 @@ pub fn chunk_count(size: u64) -> u64 {
     size.div_ceil(CHUNK_SIZE as u64).max(1)
 }
 
-/// Chunk `index` of an attachment, encrypted under `key`; `last` if it is the last chunk.
-pub fn encrypt_chunk(key: &[u8; KEY_LENGTH], index: u32, last: bool, plaintext: &[u8]) -> Vec<u8> {
+/// Chunk `index` of attachment `id`, encrypted under `key`; `last` if it is the last chunk.
+pub fn encrypt_chunk(
+    key: &[u8; KEY_LENGTH],
+    id: &[u8; ID_LENGTH],
+    index: u32,
+    last: bool,
+    plaintext: &[u8],
+) -> Vec<u8> {
+    let aad = chunk_aad(id);
     Aes256Gcm::new(key.into())
         .encrypt(
             &nonce(index, last).into(),
             Payload {
                 msg: plaintext,
-                aad: ASSOCIATED_DATA,
+                aad: &aad,
             },
         )
         .expect("AES-GCM encrypts any chunk that fits in memory")
 }
 
-/// The plaintext of chunk `index`, encrypted under `key`; `last` if it is the last chunk.
+/// The plaintext of chunk `index` of attachment `id`, encrypted under `key`; `last` if it is the
+/// last chunk.
 ///
-/// Fails with [`ErrorKind::Undecryptable`] if it is not that chunk of an attachment under `key`.
+/// Fails with [`ErrorKind::Undecryptable`] if it is not that chunk of attachment `id` under `key`.
 pub fn decrypt_chunk(
     key: &[u8; KEY_LENGTH],
+    id: &[u8; ID_LENGTH],
     index: u32,
     last: bool,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>> {
+    let aad = chunk_aad(id);
     Aes256Gcm::new(key.into())
         .decrypt(
             &nonce(index, last).into(),
             Payload {
                 msg: ciphertext,
-                aad: ASSOCIATED_DATA,
+                aad: &aad,
             },
         )
         .map_err(|_| ErrorKind::Undecryptable.into())
@@ -281,7 +302,7 @@ impl Upload {
             sealed.sealed_through = index.saturating_add(1);
         }
         drop(sealed);
-        Ok(encrypt_chunk(&self.key, index, last, plaintext))
+        Ok(encrypt_chunk(&self.key, &self.id, index, last, plaintext))
     }
 
     /// Chunk `index`, encrypted: `plaintext` is its part of the file, [`CHUNK_SIZE`] bytes from
@@ -324,6 +345,22 @@ impl Upload {
             .delete_attachment(DeleteAttachmentRequest {
                 id: Bytes::copy_from_slice(&self.id),
                 token: Bytes::copy_from_slice(self.token.as_slice()),
+                only_if_incomplete: false,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Cancel the upload only if the relay has not already received all of its chunks.
+    ///
+    /// Preserves a completed upload whose final `PutChunk` committed on the relay while its HTTP
+    /// response was delayed past local teardown (`R22-P2-8`).
+    pub async fn cancel_if_incomplete(&self, attachments: &impl LocalAttachments) -> Result<()> {
+        attachments
+            .delete_attachment(DeleteAttachmentRequest {
+                id: Bytes::copy_from_slice(&self.id),
+                token: Bytes::copy_from_slice(self.token.as_slice()),
+                only_if_incomplete: true,
             })
             .await?;
         Ok(())
@@ -396,6 +433,25 @@ pub async fn delete(
         .delete_attachment(DeleteAttachmentRequest {
             id: Bytes::copy_from_slice(id),
             token: Bytes::copy_from_slice(token.as_slice()),
+            only_if_incomplete: false,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Delete the attachment `id`, whose key is `key`, only if not all of its chunks have been
+/// uploaded yet (`R22-P2-8`).
+pub async fn delete_if_incomplete(
+    attachments: &impl LocalAttachments,
+    id: &[u8; ID_LENGTH],
+    key: &[u8; KEY_LENGTH],
+) -> Result<()> {
+    let token = delete_token(key);
+    attachments
+        .delete_attachment(DeleteAttachmentRequest {
+            id: Bytes::copy_from_slice(id),
+            token: Bytes::copy_from_slice(token.as_slice()),
+            only_if_incomplete: true,
         })
         .await?;
     Ok(())
@@ -420,22 +476,39 @@ mod test {
     #[test]
     fn chunks_decrypt_only_in_place() {
         let key = generate_key();
+        let id = [0x42; ID_LENGTH];
+        let other_id = [0x43; ID_LENGTH];
         assert_eq!(chunk_count(0), 1);
         assert_eq!(chunk_count(CHUNK_SIZE as u64), 1);
         assert_eq!(chunk_count(CHUNK_SIZE as u64 + 1), 2);
+        assert_eq!(chunk_aad(&id).len(), 30);
 
-        let first = encrypt_chunk(&key, 0, false, b"first");
-        let last = encrypt_chunk(&key, 1, true, b"last");
+        let first = encrypt_chunk(&key, &id, 0, false, b"first");
+        let last = encrypt_chunk(&key, &id, 1, true, b"last");
         assert_eq!(last.len(), b"last".len() + TAG_LENGTH);
-        assert_eq!(decrypt_chunk(&key, 0, false, &first).unwrap(), b"first");
-        assert_eq!(decrypt_chunk(&key, 1, true, &last).unwrap(), b"last");
-        // Elsewhere, as the last when it is not (the attachment cut short), or under another
-        // key, a chunk does not decrypt.
+        assert_eq!(
+            decrypt_chunk(&key, &id, 0, false, &first).unwrap(),
+            b"first"
+        );
+        assert_eq!(decrypt_chunk(&key, &id, 1, true, &last).unwrap(), b"last");
+        // Elsewhere, as the last when it is not (the attachment cut short), under another
+        // attachment ID, or under another key, a chunk does not decrypt.
         for (index, is_last, chunk) in [(1, false, &first), (0, true, &first), (0, false, &last)] {
-            let error = decrypt_chunk(&key, index, is_last, chunk).unwrap_err();
+            let error = decrypt_chunk(&key, &id, index, is_last, chunk).unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Undecryptable);
         }
-        assert!(decrypt_chunk(&generate_key(), 0, false, &first).is_err());
+        assert_eq!(
+            decrypt_chunk(&key, &other_id, 0, false, &first)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Undecryptable
+        );
+        assert_eq!(
+            decrypt_chunk(&generate_key(), &id, 0, false, &first)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::Undecryptable
+        );
     }
 
     #[test]
@@ -499,7 +572,7 @@ mod test {
         );
         let c2 = resumed.try_encrypt(2, b"chunk-two").unwrap();
         assert_eq!(
-            decrypt_chunk(resumed.key(), 2, true, &c2).unwrap(),
+            decrypt_chunk(resumed.key(), resumed.id(), 2, true, &c2).unwrap(),
             b"chunk-two"
         );
     }

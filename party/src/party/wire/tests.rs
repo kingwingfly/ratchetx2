@@ -51,10 +51,9 @@ fn versioned_postcard_fixtures_across_builds() {
         assert_eq!(restored.is_ok(), supports(capability));
         if let Ok(restored) = restored {
             assert_eq!(restored.is_pq_ratchet_active(), capability != 0);
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            assert_eq!(restored.pq_suite().map_or(0, PqSuite::id), capability);
+            assert_eq!(restored.pq_suite_id().unwrap_or(0), capability);
             let expected = bob();
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+            #[cfg(has_pq)]
             let expected = match PqSuite::from_id(capability) {
                 Some(suite) => Party::new_pq(expected.ratchet, expected.associated_data, suite),
                 None => expected,
@@ -192,12 +191,12 @@ fn legacy_readers_validate_before_conversion() {
         let v1 = postcard::to_allocvec(&(six, &bob.current_chain_evicted)).unwrap();
         assert!(postcard::from_bytes::<LegacyPartyV0>(&v0).is_err());
         assert!(postcard::from_bytes::<LegacyPartyV1>(&v1).is_err());
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+        #[cfg(has_pq)]
         assert!(postcard::from_bytes::<LegacyPartyPqV1>(&[v1.as_slice(), &[0]].concat()).is_err());
     }
 }
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[cfg(has_pq)]
 mod pq_legacy {
     use super::*;
     use crate::EncryptedMessage;
@@ -490,7 +489,7 @@ fn legacy_positional_readers_bound_associated_data() {
     bad_v0.extend_from_slice(&[0xC0, 0x84, 0x3D]);
     assert!(postcard::from_bytes::<LegacyPartyV0>(&bad_v0).is_err());
 
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[cfg(has_pq)]
     {
         let base_pq = serde_json::to_value((
             &party.ratchet,

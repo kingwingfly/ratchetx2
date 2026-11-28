@@ -9,7 +9,7 @@ use dh_root::DhRootRatchet;
 use message::MessageRatchet;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+#[cfg(any(feature = "serde", feature = "prost"))]
 use crate::error::MalformedState;
 use crate::{
     error::CryptoError,
@@ -25,10 +25,6 @@ use crate::{
 /// - [`NextStep::UpdateReceiver`]: next DH step updates the receiving chain and rotates the
 ///   local DH private key afterwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 enum NextStep {
     UpdateSender,
     UpdateReceiver,
@@ -60,27 +56,12 @@ impl NextStep {
     }
 }
 
-#[cfg(feature = "rkyv")]
-impl ArchivedNextStep {
-    const fn to_next_step(&self) -> NextStep {
-        match self {
-            Self::UpdateSender => NextStep::UpdateSender,
-            Self::UpdateReceiver => NextStep::UpdateReceiver,
-        }
-    }
-}
-
 /// Double ratchet. See the example in [`document`](crate::document).
 ///
-/// With the `serde` or `rkyv` feature, it serializes with all its keys, and with `prost` it
-/// converts to and from `proto::Ratchet`, so a session can be kept between runs: keep the output
-/// secret.
+/// With the `prost` feature, it converts to and from `proto::Ratchet` (portable versioned
+/// persistence), and with `serde` it serializes with all its keys, so a session can be kept
+/// between runs: keep the output secret.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
-)]
 pub struct Ratchet {
     dh_root: DhRootRatchet,
     message_ratchet_sender: MessageRatchet,
@@ -89,8 +70,8 @@ pub struct Ratchet {
     next_step: NextStep,
 }
 
-/// Validate chain-presence invariants shared across `Ratchet` and `ArchivedRatchet`.
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+/// Validate chain-presence invariants on deserialized `Ratchet` state.
+#[cfg(any(feature = "serde", feature = "prost"))]
 fn validate_chain_invariants(
     next_step: NextStep,
     has_sender_chain: bool,
@@ -161,46 +142,6 @@ impl TryFrom<RatchetUnchecked> for Ratchet {
         };
         ratchet.validate()?;
         Ok(ratchet)
-    }
-}
-
-#[cfg(feature = "rkyv")]
-impl ArchivedRatchet {
-    /// Whether the next DH step establishes the sending chain.
-    pub fn dh_step_updates_sender(&self) -> bool {
-        self.next_step.to_next_step().updates_sender()
-    }
-
-    /// Current sending header key of the archived ratchet, if a sending chain is established.
-    pub fn header_key_sender(&self) -> Option<Zeroizing<HeaderKey>> {
-        self.message_ratchet_sender.header_key()
-    }
-
-    /// Current receiving header key of the archived ratchet, if a receiving chain is established.
-    pub fn header_key_receiver(&self) -> Option<Zeroizing<HeaderKey>> {
-        self.message_ratchet_receiver.header_key()
-    }
-
-    /// Next receiving header key of the archived ratchet.
-    pub fn next_header_key_receiver(&self) -> Zeroizing<HeaderKey> {
-        self.message_ratchet_receiver.next_header_key()
-    }
-}
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedRatchet
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> Result<(), C::Error> {
-        use rkyv::rancor::Source;
-        validate_chain_invariants(
-            self.next_step.to_next_step(),
-            self.message_ratchet_sender.has_chain(),
-            self.message_ratchet_receiver.has_chain(),
-        )
-        .map_err(C::Error::new)
     }
 }
 
@@ -641,23 +582,18 @@ mod test {
     }
 
     /// `ratchet` saved and restored, once through each format enabled.
-    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[cfg(any(feature = "serde", feature = "prost"))]
     fn restored(ratchet: &Ratchet) -> Vec<Ratchet> {
         Vec::from([
             #[cfg(feature = "serde")]
             serde_json::from_str(&serde_json::to_string(ratchet).unwrap()).unwrap(),
-            #[cfg(feature = "rkyv")]
-            rkyv::from_bytes::<_, rkyv::rancor::Error>(
-                &rkyv::to_bytes::<rkyv::rancor::Error>(ratchet).unwrap(),
-            )
-            .unwrap(),
             #[cfg(feature = "prost")]
             Ratchet::try_from(&crate::proto::Ratchet::from(ratchet)).unwrap(),
         ])
     }
 
     #[test]
-    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[cfg(any(feature = "serde", feature = "prost"))]
     fn restored_ratchets_carry_on() {
         let keys = test_keys();
         let mut bob = Ratchet::bob(&keys, DhPrivateKey::generate());
@@ -682,7 +618,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[cfg(any(feature = "serde", feature = "prost"))]
     fn rejects_invalid_restored_invariants() {
         let keys = test_keys();
         let bob = Ratchet::bob(&keys, DhPrivateKey::generate());
@@ -716,15 +652,6 @@ mod test {
                 serde_json::from_str(&serde_json::to_string(&alice).unwrap()).unwrap();
             val["dh_step_updates_sender"] = serde_json::json!(true);
             assert!(serde_json::from_value::<Ratchet>(val).is_err());
-        }
-
-        #[cfg(feature = "rkyv")]
-        {
-            // Construct an invalid Ratchet directly and verify rkyv bytecheck rejects it.
-            let mut invalid = alice.clone();
-            invalid.next_step = NextStep::UpdateSender;
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&invalid).unwrap();
-            assert!(rkyv::from_bytes::<Ratchet, rkyv::rancor::Error>(&bytes).is_err());
         }
     }
 }

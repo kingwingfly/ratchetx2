@@ -15,6 +15,14 @@ const SECURITY_HEADERS = {
   'X-Content-Type-Options': 'nosniff',
 };
 
+const SAFE_MEDIA_MIME = /^(audio|video)\/[\w.+-]+$/i;
+
+function safeMediaMime(mime) {
+  return typeof mime === 'string' && SAFE_MEDIA_MIME.test(mime.trim())
+    ? mime.trim()
+    : 'application/octet-stream';
+}
+
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
@@ -130,7 +138,7 @@ async function serve(request, clientId, token) {
         'Accept-Ranges': 'bytes',
         'Content-Length': String(bytes.byteLength),
         'Content-Range': `bytes ${start}-${start + bytes.byteLength - 1}/${size}`,
-        'Content-Type': mime,
+        'Content-Type': safeMediaMime(mime),
       },
     });
   }
@@ -149,7 +157,7 @@ async function serve(request, clientId, token) {
     ...SECURITY_HEADERS,
     'Accept-Ranges': 'bytes',
     'Content-Length': String(size),
-    'Content-Type': mime,
+    'Content-Type': safeMediaMime(mime),
   };
   if (size === 0 || bytes.byteLength >= size) {
     return new Response(bytes, { status: 200, headers });

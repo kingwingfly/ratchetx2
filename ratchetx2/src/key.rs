@@ -46,10 +46,6 @@ pub type HeaderKey = [u8; KEY_LENGTH];
 /// X25519 private key of a DH ratchet key pair.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct DhPrivateKey([u8; DH_KEY_LENGTH]);
 
 impl DhPrivateKey {

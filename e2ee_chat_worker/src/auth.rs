@@ -1,13 +1,10 @@
 //! Signing in, which every call that writes takes, as the server is only for those who have its
 //! password. A client signs in once with the server's password, a secret, and gets
-//! a cookie, signed with another secret, which it sends with its calls until it expires. The
-//! cookie names who signed in, its subject: `password`, for now; later, e.g. a blockchain account
-//! that signed in with SIWE, SIWS or SIWX (CAIP-122), whose bought storage would be counted
-//! against it.
+//! a cookie, signed with another secret, which it sends with its calls until it expires.
 //!
-//! Each isolate throttles failed password attempts per client IP from Cloudflare's
-//! `CF-Connecting-IP` header (normalizing IPv6 addresses to `/64` prefixes). Requests without a
-//! usable address share one fallback bucket.
+//! `POST /auth/password` is gated by Cloudflare's GA `AUTH_RATE_LIMITER` binding (`20 / 60s` per
+//! normalized `CF-Connecting-IP`) before buffering the body, backed by an isolate-local failure
+//! tracker and 1–5 s wrong-password backoff.
 
 use std::{
     cell::RefCell,
@@ -19,16 +16,24 @@ use std::{
 use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
-use worker::{Date, Delay, Env, Headers, Method, Request, Response, Result, Url};
+use sha2::{Digest, Sha256};
+use wasm_bindgen::{JsCast, JsValue, prelude::wasm_bindgen};
+use worker::{
+    Date, Delay, Env, Headers, Method, Request, Response, Result, Url, console_error, js_sys,
+    wasm_bindgen_futures::JsFuture,
+};
 
 /// The cookie: `__Host-` keeps it to this host, over HTTPS, for all its paths.
 const COOKIE: &str = "__Host-e2ee-chat";
+/// Maximum `Cookie` header length parsed (protects against header-stuffing DoS).
+const MAX_COOKIE_HEADER_BYTES: usize = 4096;
 /// The secret that clients sign in with.
 const PASSWORD: &str = "PASSWORD";
 /// The secret that signs the cookies: apart from the password, so that a cookie cannot help
 /// guess the password offline, and so that sign-ins without a password can sign them too.
 const AUTH_KEY: &str = "AUTH_KEY";
+/// Rate-limiter binding gating `POST /auth/password` (`20 / 60s`).
+pub(crate) const AUTH_RATE_LIMITER: &str = "AUTH_RATE_LIMITER";
 /// How long a sign-in lasts, unless the `SESSION_DAYS` variable says.
 const DEFAULT_SESSION_DAYS: u64 = 30;
 /// Base delay after a wrong password, which scales with recent failures from the same client.
@@ -48,6 +53,102 @@ thread_local! {
     static FAILED_ATTEMPTS: RefCell<FailureTracker> = RefCell::new(FailureTracker::default());
 }
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(extends = js_sys::Object)]
+    type JsRateLimiter;
+
+    #[wasm_bindgen(method, catch)]
+    fn limit(
+        this: &JsRateLimiter,
+        options: js_sys::Object,
+    ) -> std::result::Result<js_sys::Promise, JsValue>;
+}
+
+/// Checks a Cloudflare `[[ratelimits]]` binding for `key`, returning `true` if allowed and
+/// `false` if rate-limited.
+///
+/// Tries `env.rate_limiter(binding)` first and falls back to direct JS FFI (`binding.limit({key})`)
+/// if `workers-rs#700` rejects the binding's JS constructor name in `workerd`.
+pub(crate) async fn check_rate_limit(env: &Env, binding: &str, key: String) -> bool {
+    let fail_open = !password_configured(env);
+    if let Ok(limiter) = env.rate_limiter(binding) {
+        return match limiter.limit(key).await {
+            Ok(outcome) => outcome.success,
+            Err(error) => {
+                console_error!("rate limiter `{binding}` failed: {error}");
+                fail_open
+            }
+        };
+    }
+
+    let Ok(val) = js_sys::Reflect::get(env.as_ref(), &JsValue::from_str(binding)) else {
+        console_error!("rate limiter binding `{binding}` could not be read from env");
+        return fail_open;
+    };
+    if val.is_undefined() || val.is_null() {
+        console_error!("rate limiter binding `{binding}` is missing from env");
+        return fail_open;
+    }
+    let has_limit = js_sys::Reflect::get(&val, &JsValue::from_str("limit"))
+        .map(|f| f.is_function())
+        .unwrap_or(false);
+    if !has_limit {
+        console_error!("rate limiter binding `{binding}` has no limit() method");
+        return fail_open;
+    }
+    let opts = js_sys::Object::new();
+    if js_sys::Reflect::set(&opts, &JsValue::from_str("key"), &JsValue::from_str(&key)).is_err() {
+        console_error!("rate limiter `{binding}` could not build options object");
+        return fail_open;
+    }
+    let limiter: JsRateLimiter = val.unchecked_into();
+    let promise = match limiter.limit(opts) {
+        Ok(promise) => promise,
+        Err(error) => {
+            console_error!("rate limiter `{binding}` call threw: {error:?}");
+            return fail_open;
+        }
+    };
+    match JsFuture::from(promise).await {
+        Ok(outcome) => match js_sys::Reflect::get(&outcome, &JsValue::from_str("success"))
+            .ok()
+            .and_then(|v| v.as_bool())
+        {
+            Some(allowed) => allowed,
+            None => {
+                console_error!("rate limiter `{binding}` returned malformed outcome");
+                fail_open
+            }
+        },
+        Err(error) => {
+            console_error!("rate limiter `{binding}` promise rejected: {error:?}");
+            fail_open
+        }
+    }
+}
+
+/// Checks both the normalized client IP key and (when signed in) the hashed cookie-tag key
+/// against a `[[ratelimits]]` binding.
+pub(crate) async fn check_rate_limits(
+    env: &Env,
+    binding: &str,
+    prefix: &str,
+    ip_key: &str,
+    cookie_tag_hash: Option<&[u8; 32]>,
+) -> bool {
+    if !check_rate_limit(env, binding, format!("{prefix}:ip:{ip_key}")).await {
+        return false;
+    }
+    if let Some(tag_hash) = cookie_tag_hash {
+        let tok_hex = crate::hex(&tag_hash[..16]);
+        if !check_rate_limit(env, binding, format!("{prefix}:tok:{tok_hex}")).await {
+            return false;
+        }
+    }
+    true
+}
+
 /// What a cookie says of who signed in.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
@@ -65,20 +166,44 @@ pub fn password_configured(env: &Env) -> bool {
 /// Who `request` is signed in as, by its cookie, if this server signed it and it has not
 /// expired.
 pub fn signed_in(request: &Request, env: &Env) -> Option<Claims> {
+    signed_in_with_tag(request, env).map(|(claims, _)| claims)
+}
+
+/// Who `request` is signed in as, alongside `SHA-256(b"rl:cookie-tag\0" || tag_bytes)` for
+/// rate-limiter keying without exposing the raw HMAC tag.
+pub fn signed_in_with_tag(request: &Request, env: &Env) -> Option<(Claims, [u8; 32])> {
     let key = secret(env, AUTH_KEY)?;
     let header = request.headers().get("cookie").ok()??;
-    verify_cookie(&key, &header, Date::now().as_millis())
+    verify_cookie_with_tag(&key, &header, Date::now().as_millis())
 }
 
 /// Verifies the `__Host-e2ee-chat` cookie inside `cookie_header` against `key` and `now_ms`.
-pub(crate) fn verify_cookie(key: &str, cookie_header: &str, now_ms: u64) -> Option<Claims> {
-    if key.is_empty() {
+///
+/// Hardened bounds:
+/// - Rejects `Cookie` headers exceeding [`MAX_COOKIE_HEADER_BYTES`] (4096 bytes).
+/// - Scans all `;`-separated pairs and rejects duplicate `__Host-e2ee-chat` cookies to eliminate
+///   cookie-shadowing ambiguity.
+pub(crate) fn verify_cookie_with_tag(
+    key: &str,
+    cookie_header: &str,
+    now_ms: u64,
+) -> Option<(Claims, [u8; 32])> {
+    if key.is_empty() || cookie_header.len() > MAX_COOKIE_HEADER_BYTES {
         return None;
     }
-    let value = cookie_header.split(';').find_map(|pair| {
-        let (name, value) = pair.trim().split_once('=')?;
-        (name == COOKIE).then_some(value.trim())
-    })?;
+    let mut found = None;
+    for pair in cookie_header.split(';') {
+        let Some((name, value)) = pair.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim() == COOKIE {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(value.trim());
+        }
+    }
+    let value = found?;
     let (claims_b64, tag_b64) = value.split_once('.')?;
     let tag = BASE64_URL_SAFE_NO_PAD.decode(tag_b64).ok()?;
     mac(key, b"cookie", claims_b64.as_bytes())
@@ -86,7 +211,19 @@ pub(crate) fn verify_cookie(key: &str, cookie_header: &str, now_ms: u64) -> Opti
         .ok()?;
     let claims_bytes = BASE64_URL_SAFE_NO_PAD.decode(claims_b64).ok()?;
     let claims: Claims = serde_json::from_slice(&claims_bytes).ok()?;
-    (claims.expires > now_ms).then_some(claims)
+    if claims.expires <= now_ms {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"rl:cookie-tag\0");
+    hasher.update(&tag);
+    let tag_hash: [u8; 32] = hasher.finalize().into();
+    Some((claims, tag_hash))
+}
+
+#[cfg(test)]
+pub(crate) fn verify_cookie(key: &str, cookie_header: &str, now_ms: u64) -> Option<Claims> {
+    verify_cookie_with_tag(key, cookie_header, now_ms).map(|(claims, _)| claims)
 }
 
 fn encode_cookie_value(key: &str, claims: &Claims) -> Result<String> {
@@ -254,7 +391,7 @@ pub(crate) fn ws_upgrade_origin_allowed(
     origin_audience == expected_audience
 }
 
-fn client_ip_key(request: &Request) -> String {
+pub(crate) fn client_ip_key(request: &Request) -> String {
     let header = request.headers().get("CF-Connecting-IP").ok().flatten();
     normalize_client_ip_key(header.as_deref())
 }
@@ -370,6 +507,12 @@ impl FailureTracker {
     }
 }
 
+fn rate_limited_response() -> Result<Response> {
+    let mut response = Response::error("too many failed sign-in attempts", 429)?;
+    response.headers_mut().set("retry-after", "60")?;
+    Ok(response)
+}
+
 /// Sign `request` in with the server's password, its body.
 async fn password(mut request: Request, env: &Env) -> Result<Response> {
     let (Some(password), Some(key)) = (secret(env, PASSWORD), secret(env, AUTH_KEY)) else {
@@ -378,13 +521,17 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
             503,
         );
     };
-    // Enforce rate limiting BEFORE buffering the request body.
+    // Enforce Cloudflare `AUTH_RATE_LIMITER` AND isolate-local failure throttling BEFORE
+    // buffering the request body.
     let client_key = client_ip_key(&request);
+    if !check_rate_limit(env, AUTH_RATE_LIMITER, format!("auth:{client_key}")).await {
+        return rate_limited_response();
+    }
     let now = Date::now().as_millis();
     if FAILED_ATTEMPTS.with_borrow_mut(|tracker| tracker.recent_failures(&client_key, now))
         >= MAX_FAILURES_PER_WINDOW
     {
-        return Response::error("too many failed sign-in attempts", 429);
+        return rate_limited_response();
     }
     let given = crate::read_body(&mut request, MAX_PASSWORD).await?;
     let now = Date::now().as_millis();
@@ -393,7 +540,7 @@ async fn password(mut request: Request, env: &Env) -> Result<Response> {
     });
     match outcome {
         PasswordAttemptOutcome::RateLimited => {
-            return Response::error("too many failed sign-in attempts", 429);
+            return rate_limited_response();
         }
         PasswordAttemptOutcome::WrongPassword { failures } => {
             let delay_ms = WRONG_PASSWORD_BASE_DELAY_MS
@@ -463,7 +610,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verify_cookie_accepts_valid_signed_cookie_and_rejects_tampering_or_expiry() {
+    fn verify_cookie_accepts_valid_signed_cookie_and_rejects_tampering_expiry_duplicates_and_oversized()
+     {
         let key = "test-signing-key";
         let claims = Claims {
             subject: "password".to_string(),
@@ -472,7 +620,44 @@ mod tests {
         let value = encode_cookie_value(key, &claims).unwrap();
         let header = format!("other=1; {COOKIE}={value}; theme=dark");
 
-        assert_eq!(verify_cookie(key, &header, 9_999), Some(claims));
+        let (verified, tag_hash) = verify_cookie_with_tag(key, &header, 9_999).unwrap();
+        assert_eq!(verified, claims);
+        // Tag hash is deterministic for the same signed cookie and differs for a rotated expiry.
+        let (_, tag_hash_again) = verify_cookie_with_tag(key, &header, 9_998).unwrap();
+        assert_eq!(tag_hash, tag_hash_again);
+        let claims2 = Claims {
+            subject: "password".to_string(),
+            expires: 10_001,
+        };
+        let value2 = encode_cookie_value(key, &claims2).unwrap();
+        let (_, tag_hash2) =
+            verify_cookie_with_tag(key, &format!("{COOKIE}={value2}"), 9_999).unwrap();
+        assert_ne!(tag_hash, tag_hash2);
+
+        // Duplicate __Host-e2ee-chat cookies MUST be rejected (even if both are valid!).
+        assert_eq!(
+            verify_cookie(key, &format!("{COOKIE}={value}; {COOKIE}={value}"), 5_000),
+            None
+        );
+        assert_eq!(
+            verify_cookie(key, &format!("{COOKIE}=bogus; {COOKIE}={value}"), 5_000),
+            None
+        );
+        assert_eq!(
+            verify_cookie(key, &format!("{COOKIE}={value}; {COOKIE}=bogus"), 5_000),
+            None
+        );
+
+        // Oversized Cookie header (> 4096 bytes) MUST be rejected.
+        let pad_len = MAX_COOKIE_HEADER_BYTES - format!("{COOKIE}={value}; x=").len() + 1;
+        let oversized = format!("{COOKIE}={value}; x={}", "a".repeat(pad_len));
+        assert!(oversized.len() > MAX_COOKIE_HEADER_BYTES);
+        assert_eq!(verify_cookie(key, &oversized, 5_000), None);
+        // Exact boundary (4096 bytes) succeeds.
+        let exact = format!("{COOKIE}={value}; x={}", "a".repeat(pad_len - 1));
+        assert_eq!(exact.len(), MAX_COOKIE_HEADER_BYTES);
+        assert_eq!(verify_cookie(key, &exact, 5_000), Some(claims));
+
         // Expired at boundary and past boundary.
         assert_eq!(verify_cookie(key, &header, 10_000), None);
         assert_eq!(verify_cookie(key, &header, 10_001), None);
@@ -502,7 +687,6 @@ mod tests {
         let target = Url::parse("https://chat.example/auth/password").unwrap();
         let target_port = Url::parse("https://chat.example:8443/auth/password").unwrap();
 
-        // Sec-Fetch-Site takes precedence over Origin/Referer.
         assert!(same_origin_headers(
             Some("same-origin"),
             Some("https://evil.example"),
@@ -523,7 +707,6 @@ mod tests {
             &target
         ));
 
-        // Fallback to Origin when Sec-Fetch-Site is absent.
         assert!(same_origin_headers(
             None,
             Some("https://chat.example"),
@@ -556,7 +739,6 @@ mod tests {
             &target
         ));
 
-        // Fallback to Referer when both Sec-Fetch-Site and Origin are absent.
         assert!(same_origin_headers(
             None,
             None,
@@ -576,13 +758,11 @@ mod tests {
             &target_port
         ));
 
-        // Non-browser clients omitting all three headers are allowed.
         assert!(same_origin_headers(None, None, None, &target));
 
-        // WebSocket Origin validation handles http/ws and https/wss equivalence.
-        let wss_url = Url::parse("wss://chat.example/notifications?identity=00").unwrap();
-        let https_url = Url::parse("https://chat.example/notifications?identity=00").unwrap();
-        let ws_local = Url::parse("ws://localhost:8787/notifications?identity=00").unwrap();
+        let wss_url = Url::parse("wss://chat.example/notifications").unwrap();
+        let https_url = Url::parse("https://chat.example/notifications").unwrap();
+        let ws_local = Url::parse("ws://localhost:8787/notifications").unwrap();
         assert!(ws_origin_matches("https://chat.example", &wss_url));
         assert!(ws_origin_matches("https://chat.example:443", &https_url));
         assert!(ws_origin_matches("http://localhost:8787", &ws_local));
@@ -591,9 +771,7 @@ mod tests {
         assert!(!ws_origin_matches("wss://chat.example", &wss_url));
         assert!(!ws_origin_matches("null", &https_url));
 
-        // WebSocket upgrade policy: allows omitted Origin, Sec-Fetch-Site: same-origin (e.g.
-        // trunk serve dev proxy), exact request URL match, or configured SERVER_ID match.
-        let wrangler_dev = Url::parse("http://localhost:8787/notifications?identity=00").unwrap();
+        let wrangler_dev = Url::parse("http://localhost:8787/notifications").unwrap();
         assert!(ws_upgrade_origin_allowed(None, None, &https_url, None));
         assert!(ws_upgrade_origin_allowed(
             Some("http://localhost:8080"),
@@ -619,7 +797,6 @@ mod tests {
             &https_url,
             Some("public.example")
         ));
-        // Scheme downgrade against SERVER_ID is rejected.
         assert!(!ws_upgrade_origin_allowed(
             Some("http://public.example"),
             None,
@@ -648,14 +825,12 @@ mod tests {
             normalize_client_ip_key(Some("::ffff:192.0.2.1")),
             "192.0.2.1"
         );
-        // Distinct host IDs inside the same IPv6 /64 share one rate-limit bucket.
         let a = normalize_client_ip_key(Some("2001:0db8:abcd:0012:ffff:1111:2222:3333"));
         let b = normalize_client_ip_key(Some("2001:db8:abcd:12::1"));
         let c = normalize_client_ip_key(Some("2001:db8:abcd:13::1"));
         assert_eq!(a, "2001:db8:abcd:12::/64");
         assert_eq!(a, b);
         assert_ne!(a, c);
-        // Missing, empty, or overly long headers share the fallback bucket.
         assert_eq!(normalize_client_ip_key(None), "<unknown>");
         assert_eq!(normalize_client_ip_key(Some("   ")), "<unknown>");
         assert_eq!(normalize_client_ip_key(Some(&"a".repeat(129))), "<unknown>");
@@ -674,7 +849,6 @@ mod tests {
     fn in_flight_password_attempts_observe_the_limit_until_the_window_expires() {
         let mut tracker = FailureTracker::default();
         let now = 100;
-        // All requests pass their pre-body checks before any body finishes arriving.
         for _ in 0..MAX_FAILURES_PER_WINDOW + 2 {
             assert!(tracker.recent_failures("client", now) < MAX_FAILURES_PER_WINDOW);
         }

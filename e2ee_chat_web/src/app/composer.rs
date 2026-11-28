@@ -56,11 +56,19 @@ pub(super) fn Composer(
             return;
         }
         let message = text.get_untracked();
-        if message.trim().is_empty() {
+        let trimmed = message.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed.len() > crate::engine::MAX_TEXT_BYTES {
+            super::ui().notify(format!(
+                "Message is too long (maximum {} KiB).",
+                crate::engine::MAX_TEXT_BYTES / 1024
+            ));
             return;
         }
         text.set(String::new());
-        send(peer, content::Kind::Text(message.trim().to_string()));
+        send(peer, content::Kind::Text(trimmed.to_string()));
     };
     let on_keydown = move |event: ev::KeyboardEvent| {
         if event.key() == "Enter" && !event.shift_key() && !event.is_composing() {

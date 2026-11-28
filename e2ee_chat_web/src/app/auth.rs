@@ -4,9 +4,10 @@ use leptos::{ev, prelude::*, task::spawn_local};
 use session::PqConfig;
 
 use crate::{
-    engine::{StartChatError, origin, same_server},
+    engine::{StartChatError, VaultOpenError, origin, same_server},
+    kdf_worker::KdfCancelToken,
     state::{Dialog, SignInSuccessAction, UnavailableReason},
-    util::{NAME_MAX, day, sleep, validate_relay_url},
+    util::{NAME_MAX, day, validate_relay_url},
 };
 
 use super::{
@@ -282,7 +283,11 @@ pub(super) fn CreateVault() -> impl IntoView {
     let name = RwSignal::new(String::new());
     let passphrase_input = SecretInput::new();
     let repeat_input = SecretInput::new();
+    let cancel_token = StoredValue::new_local(None::<KdfCancelToken>);
     on_cleanup(move || {
+        if let Some(token) = cancel_token.try_update_value(Option::take).flatten() {
+            token.cancel();
+        }
         passphrase_input.clear();
         repeat_input.clear();
     });
@@ -295,6 +300,11 @@ pub(super) fn CreateVault() -> impl IntoView {
         .is_some_and(|inv| !same_server(inv, &page_origin));
     let server = RwSignal::new(invited.unwrap_or_else(|| page_origin.clone()));
     let progress = Progress::new();
+    let cancel_kdf = move |_| {
+        if let Some(token) = cancel_token.try_update_value(Option::take).flatten() {
+            token.cancel();
+        }
+    };
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         if progress.working.get_untracked() {
@@ -322,16 +332,35 @@ pub(super) fn CreateVault() -> impl IntoView {
         drop(repeated);
         let enable_pq = pq_enabled.get_untracked();
         let display_name = name.get_untracked();
-        progress.start("Deriving the key…");
+        let cancel = KdfCancelToken::new();
+        cancel_token.set_value(Some(cancel.clone()));
+        progress.start("Deriving encryption key…");
         let engine = engine();
         spawn_local(async move {
-            // Argon2 blocks the page for a moment; let it show why first.
-            sleep(50).await;
             let result = engine
-                .create(display_name, secret, target_server, enable_pq)
+                .create(
+                    display_name,
+                    secret,
+                    target_server,
+                    enable_pq,
+                    cancel.clone(),
+                )
                 .await;
-            if let Err(e) = result {
-                progress.try_fail(e);
+            let _ = cancel_token.try_update_value(|slot| {
+                if slot.as_ref().is_some_and(|active| active.ptr_eq(&cancel)) {
+                    *slot = None;
+                }
+            });
+            match result {
+                Ok(()) => {}
+                Err(VaultOpenError::Cancelled) => {
+                    progress.clear();
+                    passphrase_input.focus();
+                }
+                Err(VaultOpenError::Failed(e)) => {
+                    progress.try_fail(e);
+                    passphrase_input.focus();
+                }
             }
         });
     };
@@ -349,13 +378,20 @@ pub(super) fn CreateVault() -> impl IntoView {
                 "vault is lost."
             </p>
             <label for="name">"Your name, which new chats see"</label>
-            <input id="name" autocomplete="nickname" maxlength=NAME_MAX bind:value=name />
+            <input
+                id="name"
+                autocomplete="nickname"
+                maxlength=NAME_MAX
+                disabled=move || progress.working.get()
+                bind:value=name
+            />
             <label for="password">"Passphrase"</label>
             <input
                 id="password"
                 type="password"
                 autocomplete="new-password"
                 required
+                disabled=move || progress.working.get()
                 node_ref=passphrase_input.node
             />
             <label for="repeat">"Passphrase, again"</label>
@@ -364,10 +400,17 @@ pub(super) fn CreateVault() -> impl IntoView {
                 type="password"
                 autocomplete="new-password"
                 required
+                disabled=move || progress.working.get()
                 node_ref=repeat_input.node
             />
             <label for="server">"Server"</label>
-            <input id="server" type="url" required bind:value=server />
+            <input
+                id="server"
+                type="url"
+                required
+                disabled=move || progress.working.get()
+                bind:value=server
+            />
             <Show when=is_third_party>
                 <p class="warning" role="alert">
                     {if cross_origin_invited {
@@ -380,6 +423,7 @@ pub(super) fn CreateVault() -> impl IntoView {
                     <button
                         type="button"
                         class="link"
+                        disabled=move || progress.working.get()
                         on:click={
                             let page_origin = page_origin.clone();
                             move |_| server.set(page_origin.clone())
@@ -405,6 +449,11 @@ pub(super) fn CreateVault() -> impl IntoView {
             })}
             {progress.view()}
             <div class="actions">
+                <Show when=move || progress.working.get()>
+                    <button type="button" class="btn" on:click=cancel_kdf>
+                        "Cancel"
+                    </button>
+                </Show>
                 <button class="btn primary" type="submit" disabled=move || progress.working.get()>
                     "Create"
                 </button>
@@ -416,9 +465,21 @@ pub(super) fn CreateVault() -> impl IntoView {
 #[component]
 pub(super) fn UnlockVault() -> impl IntoView {
     let passphrase_input = SecretInput::new();
-    on_cleanup(move || passphrase_input.clear());
+    let cancel_token = StoredValue::new_local(None::<KdfCancelToken>);
+    let deriving = RwSignal::new(false);
+    on_cleanup(move || {
+        if let Some(token) = cancel_token.try_update_value(Option::take).flatten() {
+            token.cancel();
+        }
+        passphrase_input.clear();
+    });
     let progress = Progress::new();
     let confirm_reset = ConfirmGuard::new();
+    let cancel_kdf = move |_| {
+        if let Some(token) = cancel_token.try_update_value(Option::take).flatten() {
+            token.cancel();
+        }
+    };
     let submit = move |event: ev::SubmitEvent| {
         event.prevent_default();
         if progress.working.get_untracked() {
@@ -426,13 +487,29 @@ pub(super) fn UnlockVault() -> impl IntoView {
         }
         confirm_reset.disarm();
         let secret = passphrase_input.take();
-        progress.start("Deriving the key…");
+        let cancel = KdfCancelToken::new();
+        cancel_token.set_value(Some(cancel.clone()));
+        deriving.set(true);
+        progress.start("Deriving encryption key…");
         let engine = engine();
         spawn_local(async move {
-            sleep(50).await;
-            if let Err(e) = engine.unlock(secret).await {
-                progress.try_fail(e);
-                passphrase_input.focus();
+            let result = engine.unlock(secret, cancel.clone()).await;
+            let _ = cancel_token.try_update_value(|slot| {
+                if slot.as_ref().is_some_and(|active| active.ptr_eq(&cancel)) {
+                    *slot = None;
+                }
+            });
+            let _ = deriving.try_set(false);
+            match result {
+                Ok(()) => {}
+                Err(VaultOpenError::Cancelled) => {
+                    progress.clear();
+                    passphrase_input.focus();
+                }
+                Err(VaultOpenError::Failed(e)) => {
+                    progress.try_fail(e);
+                    passphrase_input.focus();
+                }
             }
         });
     };
@@ -463,8 +540,78 @@ pub(super) fn UnlockVault() -> impl IntoView {
                 autocomplete="current-password"
                 required
                 autofocus
+                disabled=move || progress.working.get()
                 node_ref=passphrase_input.node
             />
+            {progress.view()}
+            <div class="actions">
+                <Show
+                    when=move || deriving.get()
+                    fallback=move || {
+                        view! {
+                            <button
+                                type="button"
+                                class="btn danger"
+                                disabled=move || progress.working.get()
+                                on:click=reset
+                            >
+                                {move || {
+                                    if confirm_reset.is_armed() {
+                                        "Delete it all, for good?"
+                                    } else {
+                                        "Forgot it: start over"
+                                    }
+                                }}
+                            </button>
+                        }
+                    }
+                >
+                    <button type="button" class="btn" on:click=cancel_kdf>
+                        "Cancel"
+                    </button>
+                </Show>
+                <button class="btn primary" type="submit" disabled=move || progress.working.get()>
+                    "Unlock"
+                </button>
+            </div>
+        </form>
+    }
+}
+
+#[component]
+pub(super) fn IncompatibleVault(version: u32) -> impl IntoView {
+    let progress = Progress::new();
+    let confirm_reset = ConfirmGuard::new();
+    let reset = move |_| {
+        if progress.working.get_untracked() {
+            return;
+        }
+        if !confirm_reset.confirm_or_arm() {
+            return;
+        }
+        progress.start("Deleting incompatible vault…");
+        spawn_local(async move {
+            match crate::vault::Vault::destroy().await {
+                Ok(()) => lock(),
+                Err(e) => progress.try_fail(e.to_string()),
+            }
+        });
+    };
+    view! {
+        <div>
+            <h2>"Incompatible vault format"</h2>
+            <p>
+                {format!(
+                    "This browser holds a vault from format version {version}, which is \
+                     incompatible with the current vault format (v{}). Automatic migration is \
+                     not supported; reset the vault to create a new identity and start fresh.",
+                    crate::vault::VAULT_VERSION_V3
+                )}
+            </p>
+            <p class="warning" role="alert">
+                "Resetting permanently deletes the incompatible local vault, keys, and chat \
+                 history from this browser."
+            </p>
             {progress.view()}
             <div class="actions">
                 <button
@@ -475,17 +622,14 @@ pub(super) fn UnlockVault() -> impl IntoView {
                 >
                     {move || {
                         if confirm_reset.is_armed() {
-                            "Delete it all, for good?"
+                            "Delete old vault, for good?"
                         } else {
-                            "Forgot it: start over"
+                            "Reset vault and start over"
                         }
                     }}
                 </button>
-                <button class="btn primary" type="submit" disabled=move || progress.working.get()>
-                    "Unlock"
-                </button>
             </div>
-        </form>
+        </div>
     }
 }
 
@@ -510,6 +654,24 @@ pub(super) fn Elsewhere() -> impl IntoView {
 
 #[component]
 pub(super) fn Unavailable(reason: UnavailableReason, error: String) -> impl IntoView {
+    let progress = Progress::new();
+    let confirm_reset = ConfirmGuard::new();
+    let allow_reset = reason == UnavailableReason::CorruptVault;
+    let reset = move |_| {
+        if progress.working.get_untracked() {
+            return;
+        }
+        if !confirm_reset.confirm_or_arm() {
+            return;
+        }
+        progress.start("Deleting incomplete vault…");
+        spawn_local(async move {
+            match crate::vault::Vault::destroy().await {
+                Ok(()) => lock(),
+                Err(e) => progress.try_fail(e.to_string()),
+            }
+        });
+    };
     let (heading, copy) = match reason {
         UnavailableReason::InsecureContext => (
             "Secure context required",
@@ -526,14 +688,41 @@ pub(super) fn Unavailable(reason: UnavailableReason, error: String) -> impl Into
             "The browser would not open its storage, so whether a vault is here is unknown, and \
              nothing was changed. Private windows and blocked site data can cause this.",
         ),
+        UnavailableReason::CorruptVault => (
+            "Vault data incomplete or corrupt",
+            "The vault header is missing, but encrypted records or rollback metadata still exist \
+             in this browser. Nothing was overwritten automatically. Reset the vault explicitly \
+             if you want to discard the remaining data and start fresh.",
+        ),
     };
     view! {
         <div>
             <h2>{heading}</h2>
             <p>{copy}</p>
             <p class="error">{error}</p>
+            {progress.view()}
             <div class="actions">
-                <button class="btn primary" on:click=move |_| lock()>
+                <Show when=move || allow_reset>
+                    <button
+                        type="button"
+                        class="btn danger"
+                        disabled=move || progress.working.get()
+                        on:click=reset
+                    >
+                        {move || {
+                            if confirm_reset.is_armed() {
+                                "Delete incomplete vault, for good?"
+                            } else {
+                                "Reset vault and start over"
+                            }
+                        }}
+                    </button>
+                </Show>
+                <button
+                    class="btn primary"
+                    disabled=move || progress.working.get()
+                    on:click=move |_| lock()
+                >
                     "Reload"
                 </button>
             </div>

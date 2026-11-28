@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use leptos::{ev, html, leptos_dom::helpers::TimeoutHandle, prelude::*, task::spawn_local};
 use session::PublicKey;
-use web_sys::{FileList, HtmlInputElement, Url};
+use web_sys::{FileList, HtmlInputElement};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -21,8 +21,12 @@ pub(super) fn strict_pq_enabled(ui: Ui) -> bool {
         .with(|me| me.as_ref().is_some_and(|me| me.pq_config.strict_pq))
 }
 
-pub(super) fn can_allow_classical(prompt: ClassicalPrompt, strict_pq: bool) -> bool {
-    !strict_pq && prompt != ClassicalPrompt::None
+pub(super) fn can_allow_classical(
+    prompt: ClassicalPrompt,
+    strict_pq: bool,
+    classical_hard_blocked: bool,
+) -> bool {
+    !strict_pq && !classical_hard_blocked && prompt != ClassicalPrompt::None
 }
 
 pub(super) fn pq_available(ui: Ui) -> bool {
@@ -48,13 +52,21 @@ pub(super) fn upgrade_disabled_tip(ui: Ui) -> Option<&'static str> {
 }
 
 #[component]
-pub(super) fn AllowClassical(peer: PublicKey, busy: RwSignal<bool>) -> impl IntoView {
+pub(super) fn AllowClassical(
+    peer: PublicKey,
+    conversation_gen: u64,
+    busy: RwSignal<bool>,
+) -> impl IntoView {
     view! {
         <button
             type="button"
             class="btn small"
             disabled=move || busy.get()
-            on:click=move |_| act_while(busy, async move { engine().approve_classical(peer).await })
+            on:click=move |_| {
+                act_while(busy, async move {
+                    engine().approve_classical_for_gen(peer, conversation_gen).await
+                })
+            }
         >
             "Allow classical"
         </button>
@@ -167,8 +179,10 @@ pub(super) fn writable_recipients(
         .collect()
 }
 
-/// Lock the vault: the page starts over, keeping nothing in memory.
+/// Lock the vault: synchronously revoke lock ownership, scrub all unlocked state, release the
+/// exclusive Web Lock, and reload cleanly.
 pub(super) fn lock() {
+    crate::glue::teardown_and_release_lock();
     let _ = window().location().reload();
 }
 
@@ -216,7 +230,7 @@ pub(super) fn download_blob(
     let _ = anchor.remove_attribute("download");
     set_timeout(
         move || {
-            let _ = Url::revoke_object_url(&url);
+            super::media::revoke_blob_url(&url);
         },
         Duration::from_secs(60),
     );
@@ -538,8 +552,17 @@ impl Progress {
 
     pub(super) fn view(self) -> impl IntoView {
         view! {
-            <p class="error" class:working=move || self.working.get() role="alert">
-                {move || self.message.get()}
+            <p
+                class="error"
+                class:working=move || self.working.get()
+                role=move || if self.working.get() { "status" } else { "alert" }
+                aria-live=move || if self.working.get() { "polite" } else { "assertive" }
+                aria-busy=move || self.working.get().then_some("true")
+            >
+                <Show when=move || self.working.get()>
+                    <span class="kdf-spinner" aria-hidden="true"></span>
+                </Show>
+                <span>{move || self.message.get()}</span>
             </p>
         }
     }
@@ -648,18 +671,24 @@ pub(super) fn make_contact(byte: u8, name: &str) -> ContactView {
 
     ContactView {
         peer: [byte; 32],
+        conversation_gen: 1,
         name: name.to_string(),
         request: false,
+        greeting_unsent: false,
+        greeting_uncertain: false,
+        awaiting_acceptance: false,
         hello_name: String::new(),
         unread: 0,
         last_activity: 0,
         last_message: None,
         security: SecurityView::default(),
         has_active_session: false,
+        has_classical_earlier: false,
         pq_pinned: false,
         peer_pq_capable: false,
         allow_classical_exception: false,
         downgrade_detected: false,
+        classical_hard_blocked: false,
         alert: SecurityAlert::None,
         classical_prompt: ClassicalPrompt::None,
     }
@@ -679,16 +708,17 @@ mod tests {
                 ClassicalPrompt::InboundQuarantined {
                     peer_was_pq_pinned: flag,
                 },
-                ClassicalPrompt::Outbound {
-                    peer_signed_off: flag,
-                },
+                ClassicalPrompt::Outbound,
+                ClassicalPrompt::ServerPqDisabled,
             ] {
-                assert!(!can_allow_classical(prompt, true));
-                assert!(can_allow_classical(prompt, false));
+                assert!(!can_allow_classical(prompt, true, false));
+                assert!(!can_allow_classical(prompt, false, true));
+                assert!(can_allow_classical(prompt, false, false));
             }
         }
-        assert!(!can_allow_classical(ClassicalPrompt::None, false));
-        assert!(!can_allow_classical(ClassicalPrompt::None, true));
+        assert!(!can_allow_classical(ClassicalPrompt::None, false, false));
+        assert!(!can_allow_classical(ClassicalPrompt::None, true, false));
+        assert!(!can_allow_classical(ClassicalPrompt::None, false, true));
     }
 
     #[test]

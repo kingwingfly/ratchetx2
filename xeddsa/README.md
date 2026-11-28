@@ -4,7 +4,7 @@ Based on Ed25519 and X25519. Pure Rust, so it also builds for `wasm32-unknown-un
 
 # Features
 
-- **serde**, **rkyv**: serialize private keys, to keep them between runs. For protobuf, a private key is the bytes of `XEdDSAPrivateKey::to_bytes`.
+- **serde**: serialize private keys, to keep them between runs. For portable protobuf (`prost`) persistence, a private key is the bytes of `XEdDSAPrivateKey::to_bytes`.
 
 # Example
 

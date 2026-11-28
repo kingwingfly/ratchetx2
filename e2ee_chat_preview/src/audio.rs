@@ -17,18 +17,11 @@ pub const COVER_MAX: usize = 4 << 20;
 /// Maximum audio input byte length accepted for tag extraction (64 MiB).
 pub const MAX_AUDIO_BYTES: usize = 64 << 20;
 /// Raster image MIME types accepted for audio cover art and RPC wire decoding.
-pub const IMAGE_MIMES: &[&str] = &[
-    "image/png",
-    "image/jpeg",
-    "image/gif",
-    "image/webp",
-    "image/avif",
-    "image/bmp",
-];
+pub const IMAGE_MIMES: &[&str] = crate::sniff::RASTER_IMAGE_MIMES;
 
 /// Whether `mime` is in the raster image MIME allowlist [`IMAGE_MIMES`].
 pub fn is_image_mime(mime: &str) -> bool {
-    IMAGE_MIMES.contains(&mime)
+    crate::sniff::is_raster_image_mime(mime)
 }
 
 /// Maximum byte length kept for a single audio text tag (title, artist, album).
@@ -1154,41 +1147,7 @@ impl crate::rpc::WorkerService for AudioService {
 /// PNG, JPEG, GIF, WebP, AVIF or BMP.
 #[cfg(feature = "audio")]
 fn picture_type(data: &[u8]) -> Option<&'static str> {
-    match data {
-        [0x89, b'P', b'N', b'G', ..] => Some("image/png"),
-        [0xFF, 0xD8, 0xFF, ..] => Some("image/jpeg"),
-        [b'G', b'I', b'F', b'8', ..] => Some("image/gif"),
-        _ if data.starts_with(b"RIFF") && data.get(8..12) == Some(b"WEBP") => Some("image/webp"),
-        [
-            _,
-            _,
-            _,
-            _,
-            b'f',
-            b't',
-            b'y',
-            b'p',
-            b'a',
-            b'v',
-            b'i',
-            b'f' | b's',
-            ..,
-        ] => Some("image/avif"),
-        [b'B', b'M', ..] if is_valid_bmp_header(data) => Some("image/bmp"),
-        _ => None,
-    }
-}
-
-/// Require a full BMP file header (14 B) + recognized DIB header size (>= 12 B, total >= 26 B)
-/// so arbitrary 2-byte `"BM"` prefixes are never misclassified as BMP images.
-#[cfg(feature = "audio")]
-fn is_valid_bmp_header(data: &[u8]) -> bool {
-    if data.len() < 26 {
-        return false;
-    }
-    let file_size = u32::from_le_bytes([data[2], data[3], data[4], data[5]]);
-    let dib_size = u32::from_le_bytes([data[14], data[15], data[16], data[17]]);
-    file_size >= 26 && matches!(dib_size, 12 | 40 | 52 | 56 | 64 | 108 | 124)
+    crate::sniff::sniff_cover_image(data)
 }
 
 #[cfg(all(test, feature = "audio"))]
@@ -1347,11 +1306,18 @@ mod tests {
     fn bmp_sniff_rejects_short_and_malformed_headers_and_accepts_valid_bmp() {
         assert_eq!(picture_type(b"BM"), None);
         assert_eq!(picture_type(b"BMnot_a_real_bmp_header_123456"), None);
-        let mut valid_bmp = vec![0u8; 58];
-        valid_bmp[0..2].copy_from_slice(b"BM");
-        valid_bmp[2..6].copy_from_slice(&58u32.to_le_bytes());
-        valid_bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
-        valid_bmp[14..18].copy_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER
+        let mut incomplete_bmp = vec![0u8; 58];
+        incomplete_bmp[0..2].copy_from_slice(b"BM");
+        incomplete_bmp[2..6].copy_from_slice(&58u32.to_le_bytes());
+        incomplete_bmp[10..14].copy_from_slice(&54u32.to_le_bytes());
+        incomplete_bmp[14..18].copy_from_slice(&40u32.to_le_bytes()); // zero dims/planes/bpp
+        assert_eq!(picture_type(&incomplete_bmp), None);
+
+        let mut valid_bmp = incomplete_bmp;
+        valid_bmp[18..22].copy_from_slice(&1i32.to_le_bytes()); // width
+        valid_bmp[22..26].copy_from_slice(&1i32.to_le_bytes()); // height
+        valid_bmp[26..28].copy_from_slice(&1u16.to_le_bytes()); // planes
+        valid_bmp[28..30].copy_from_slice(&24u16.to_le_bytes()); // bpp
         assert_eq!(picture_type(&valid_bmp), Some("image/bmp"));
         assert!(is_image_mime("image/bmp"));
         assert!(!is_image_mime("image/svg+xml"));

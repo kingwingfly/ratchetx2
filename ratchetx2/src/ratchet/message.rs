@@ -10,10 +10,6 @@ use crate::key::{ChainKey, HeaderKey, KEY_LENGTH, MessageKey};
 /// An established chain: its ChainKey and the HeaderKey of its messages.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 struct Chain {
     chain_key: ChainKey,
     header_key: HeaderKey,
@@ -38,10 +34,6 @@ impl Eq for Chain {}
 
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct MessageRatchet {
     /// None until a DH-root step sets up this chain.
     chain: Option<Chain>,
@@ -120,23 +112,6 @@ impl MessageRatchet {
         chain.chain_key.zeroize();
         chain.chain_key = *next_chain_key;
         Some(message_key)
-    }
-}
-
-#[cfg(feature = "rkyv")]
-impl ArchivedMessageRatchet {
-    pub(crate) fn has_chain(&self) -> bool {
-        self.chain.is_some()
-    }
-
-    pub(crate) fn header_key(&self) -> Option<Zeroizing<HeaderKey>> {
-        self.chain
-            .as_ref()
-            .map(|chain| Zeroizing::new(chain.header_key))
-    }
-
-    pub(crate) fn next_header_key(&self) -> Zeroizing<HeaderKey> {
-        Zeroizing::new(self.next_header_key)
     }
 }
 

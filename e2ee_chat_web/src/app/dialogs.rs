@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     ActivityList, Toast,
-    auth::{CreateVault, Elsewhere, SignInDialog, Unavailable, UnlockVault},
+    auth::{CreateVault, Elsewhere, IncompatibleVault, SignInDialog, Unavailable, UnlockVault},
     chat::{contact_can_upgrade_to_pq, security_badge},
     common::{
         AllowClassical, ConfirmGuard, ContactKey, CopyButton, CopyFeedbackButton, Copyable,
@@ -36,7 +36,11 @@ pub(super) fn VaultDialog() -> impl IntoView {
     let ui = ui();
     let dialog = NodeRef::<html::Dialog>::new();
     let shown = move || match ui.phase.get() {
-        Phase::Create | Phase::Locked | Phase::Elsewhere | Phase::Unavailable(_, _) => true,
+        Phase::Create
+        | Phase::Locked
+        | Phase::IncompatibleVault(_)
+        | Phase::Elsewhere
+        | Phase::Unavailable(_, _) => true,
         Phase::Unlocked => ui.dialog.get().is_some(),
         Phase::Loading => false,
     };
@@ -55,8 +59,9 @@ pub(super) fn VaultDialog() -> impl IntoView {
     });
     let on_cancel = move |event: ev::Event| {
         restored_new_chat_non_cancelable.set_value(false);
-        // The vault's dialog stays until the vault opens.
+        // The vault's dialog stays until the vault opens; Escape still cancels any active KDF.
         if ui.phase.get_untracked() != Phase::Unlocked {
+            crate::kdf_worker::cancel_active();
             event.prevent_default();
         } else if ui
             .dialog
@@ -98,7 +103,11 @@ pub(super) fn VaultDialog() -> impl IntoView {
             // restored `NewChat` draft so the modal cannot permanently vanish.
             if matches!(
                 ui.phase.get_untracked(),
-                Phase::Create | Phase::Locked | Phase::Elsewhere | Phase::Unavailable(_, _)
+                Phase::Create
+                    | Phase::Locked
+                    | Phase::IncompatibleVault(_)
+                    | Phase::Elsewhere
+                    | Phase::Unavailable(_, _)
             ) {
                 let _ = d.show_modal();
                 return;
@@ -141,6 +150,9 @@ pub(super) fn VaultDialog() -> impl IntoView {
             {move || match (ui.phase.get(), ui.dialog.get()) {
                 (Phase::Create, _) => view! { <CreateVault /> }.into_any(),
                 (Phase::Locked, _) => view! { <UnlockVault /> }.into_any(),
+                (Phase::IncompatibleVault(version), _) => {
+                    view! { <IncompatibleVault version /> }.into_any()
+                }
                 (Phase::Elsewhere, _) => view! { <Elsewhere /> }.into_any(),
                 (Phase::Unavailable(reason, error), _) => {
                     view! { <Unavailable reason error /> }.into_any()
@@ -179,25 +191,40 @@ pub(super) fn VaultDialog() -> impl IntoView {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClassicalApprovalReason {
+    PeerSignedOff,
+    ServerPqDisabled,
+    ExistingRequest,
+}
+
 fn apply_start_chat_error(
     err: StartChatError,
-    classical_needed: RwSignal<Option<bool>>,
+    classical_needed: RwSignal<Option<ClassicalApprovalReason>>,
     progress: Progress,
 ) {
     match err {
         StartChatError::SignInRequired | StartChatError::Cancelled => progress.clear(),
-        StartChatError::ClassicalApprovalRequired { peer_signed_off } => {
-            let _ = classical_needed.try_set(Some(peer_signed_off));
-            progress.try_fail(if peer_signed_off {
-                "This peer signed a manifest disabling post-quantum encryption."
-            } else {
-                "This peer has no post-quantum prekeys on the server."
-            });
+        StartChatError::ClassicalApprovalRequired => {
+            let _ = classical_needed.try_set(Some(ClassicalApprovalReason::PeerSignedOff));
+            progress.try_fail(
+                "This peer published a signed manifest disabling post-quantum encryption.",
+            );
+        }
+        StartChatError::ServerPqDisabledApprovalRequired => {
+            let _ = classical_needed.try_set(Some(ClassicalApprovalReason::ServerPqDisabled));
+            progress.try_fail("This server currently has post-quantum encryption disabled.");
+        }
+        StartChatError::ExistingClassicalRequestApprovalRequired => {
+            let _ = classical_needed.try_set(Some(ClassicalApprovalReason::ExistingRequest));
+            progress.try_fail(
+                "This pending chat request uses classical (non-post-quantum) encryption.",
+            );
         }
         StartChatError::DowngradeDetected => {
             progress.try_fail(
-                "Downgrade detected: this invitation pinned post-quantum encryption, but \
-                 the server did not provide valid PQ prekeys.",
+                "Downgrade detected: post-quantum verification failed (missing valid PQ prekeys, \
+                 conflicting classical session, or manifest rollback/equivocation).",
             );
         }
         StartChatError::PeerManifestExpired => {
@@ -266,7 +293,7 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
     let key = RwSignal::new(key);
     let name = RwSignal::new(initial_name);
     let progress = Progress::new();
-    let classical_needed = RwSignal::new(None::<bool>);
+    let classical_needed = RwSignal::new(None::<ClassicalApprovalReason>);
     if let Some(feedback) = engine().take_new_chat_feedback() {
         apply_start_chat_error(feedback, classical_needed, progress);
     }
@@ -421,8 +448,8 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
         <form on:submit=submit>
             <h2>"New chat"</h2>
             <p>
-                "Paste their identity key. Their prekeys come from the server, and a greeting "
-                "with your name starts the session."
+                "Paste their identity key. Their prekeys come from the server, and a chat request "
+                "with your name starts the session; messages you send deliver once they accept."
             </p>
             {move || {
                 let (_, eff_pq_pinned) = effective.get();
@@ -475,17 +502,25 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                 })
             }}
             {move || {
-                classical_needed.get().map(|peer_signed_off| {
+                classical_needed.get().map(|reason| {
                     let strict_pq = strict_pq_enabled(ui);
                     view! {
                         <div class="classical-box" role="alert">
                             <p>
                                 {if strict_pq {
                                     "Require post-quantum (strict mode) blocks classical exceptions. To allow a classical chat, disable strict mode in Settings first."
-                                } else if peer_signed_off {
-                                    "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
                                 } else {
-                                    "No post-quantum prekeys were returned for this peer. Allow a classical (non-PQ) chat?"
+                                    match reason {
+                                        ClassicalApprovalReason::PeerSignedOff => {
+                                            "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
+                                        }
+                                        ClassicalApprovalReason::ServerPqDisabled => {
+                                            "This server currently has post-quantum encryption disabled. Only allow classical encryption if you expect that."
+                                        }
+                                        ClassicalApprovalReason::ExistingRequest => {
+                                            "This pending chat request was received without post-quantum encryption. Allow classical encryption to accept it, or open the request to upgrade to post-quantum encryption."
+                                        }
+                                    }
                                 }}
                             </p>
                             {(!strict_pq).then(|| view! {
@@ -634,6 +669,13 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         }
     });
     let confirm_delete = ConfirmGuard::new();
+    let initial_conv_gen = contact.conversation_gen;
+    // Disarm delete confirmation if this peer's conversation incarnation changes while open.
+    Effect::new(move |_| {
+        if live_contact().map(|c| c.conversation_gen) != Some(initial_conv_gen) {
+            confirm_delete.disarm();
+        }
+    });
     // Saving, accepting or deleting, which its buttons wait for.
     let busy = RwSignal::new(false);
     let submit = move |event: ev::SubmitEvent| {
@@ -652,9 +694,13 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         let next_name = name.get_untracked();
         act_while(busy, async move {
             if req {
-                engine.accept(peer, next_name).await?;
+                engine
+                    .accept_for_gen(peer, next_name, initial_conv_gen)
+                    .await?;
             } else {
-                engine.rename(peer, next_name).await?;
+                engine
+                    .rename_for_gen(peer, next_name, initial_conv_gen)
+                    .await?;
             }
             if !busy.is_disposed()
                 && engine
@@ -673,7 +719,7 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
         }
         let engine = engine();
         act_while(busy, async move {
-            engine.delete(peer).await?;
+            engine.delete_for_gen(peer, initial_conv_gen).await?;
             history::forget_peer(peer);
             if !busy.is_disposed()
                 && engine
@@ -695,6 +741,18 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                 format!("{} wants to chat, and goes by “{hello}”.", short(&peer))
             }
         }
+        Some(c) if c.greeting_unsent => format!(
+            "Sending your chat request to {}… It hasn't reached the server yet and will retry automatically once connected.",
+            c.label()
+        ),
+        Some(c) if c.greeting_uncertain => format!(
+            "Sending your chat request to {}… Delivery hasn't been confirmed yet. Retrying automatically.",
+            c.label()
+        ),
+        Some(c) if c.awaiting_acceptance => format!(
+            "Waiting for {} to accept your chat request. Messages will deliver once they accept.",
+            c.label()
+        ),
         Some(c) => format!("Your chat with {}.", c.label()),
         None => String::new(),
     };
@@ -710,7 +768,17 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
             {move || {
                 live_contact().map(|c| {
                     let strict_pq = strict_pq.get();
-                    let show_allow = can_allow_classical(c.classical_prompt, strict_pq);
+                    let conv_gen = c.conversation_gen;
+                    let hard_blocked = pq_available(ui) && c.classical_hard_blocked;
+                    let show_allow =
+                        can_allow_classical(c.classical_prompt, strict_pq, hard_blocked)
+                            || (!strict_pq
+                                && pq_available(ui)
+                                && c.request
+                                && !c.allow_classical_exception
+                                && !hard_blocked
+                                && ((!c.has_active_session && c.has_classical_earlier)
+                                    || (c.has_active_session && !c.security.is_pq)));
                     let show_upgrade = pq_available(ui) && contact_can_upgrade_to_pq(&c);
                     let show_dismiss = c.has_downgrade() && !c.is_quarantined();
                     view! {
@@ -728,7 +796,15 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                             {(show_allow || show_upgrade || show_dismiss).then(|| {
                                 view! {
                                     <div class="banner-actions">
-                                        {show_allow.then(|| view! { <AllowClassical peer busy /> })}
+                                        {show_allow.then(|| {
+                                            view! {
+                                                <AllowClassical
+                                                    peer
+                                                    conversation_gen=conv_gen
+                                                    busy
+                                                />
+                                            }
+                                        })}
                                         {show_upgrade.then(|| {
                                             view! {
                                                 <button
@@ -740,7 +816,9 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                                                     }
                                                     on:click=move |_| {
                                                         act_while(busy, async move {
-                                                            engine().upgrade_to_pq(peer).await
+                                                            engine()
+                                                                .upgrade_to_pq_for_gen(peer, conv_gen)
+                                                                .await
                                                         });
                                                     }
                                                 >
@@ -756,7 +834,11 @@ fn ContactInfo(peer: PublicKey) -> impl IntoView {
                                                     disabled=move || busy.get()
                                                     on:click=move |_| {
                                                         act_while(busy, async move {
-                                                            engine().dismiss_downgrade(peer).await
+                                                            engine()
+                                                                .dismiss_downgrade_for_gen(
+                                                                    peer, conv_gen,
+                                                                )
+                                                                .await
                                                         });
                                                     }
                                                 >

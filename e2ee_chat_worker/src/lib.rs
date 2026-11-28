@@ -1,28 +1,30 @@
-//! The E2EE chat server as a Cloudflare Worker: the v2 handshake, v2 mailbox, and attachment
-//! services over the Connect protocol, kept in Durable Objects and R2, and notifications over
-//! hibernating WebSockets. See the README.
+//! The E2EE chat server as a Cloudflare Worker: the v2 handshake, unified sealed-sender-lite v2
+//! mailbox, and attachment services over the Connect protocol, kept in `IdentityV2` /
+//! `AttachmentV2` Durable Objects and R2 (attachments only), plus pre-authenticated notifications
+//! over hibernating WebSockets. See the README.
 
 mod auth;
 mod objects;
 mod store;
 
-use std::time::Duration;
+use std::{cell::Cell, time::Duration};
 
+use base64::{Engine, prelude::BASE64_URL_SAFE_NO_PAD};
 use futures_util::{Stream, StreamExt};
-use prost::bytes::Bytes;
+use prost::{Message as _, bytes::Bytes};
 use protocol::{
     ErrorKind,
     attachment::{AttachmentLimits, AttachmentServer},
     connect::{self, AttachmentProcedure, PROTOCOL_VERSION_HEADER, ProcedureV2},
     handshake_v2::{HandshakeV2Server, ServerInfoConfig},
-    mailbox::MailboxLimits,
-    mailbox_v2::MailboxV2Server,
-    notify::SubscribeRequest,
+    mailbox_v2::{MailboxLimits, MailboxV2Server},
+    notify::{SUBSCRIBE_NONCE_LENGTH, SubscribeRequest},
 };
-use worker::{Context, Cors, Env, Headers, Method, Request, RequestInit, Response, Result, event};
-use xeddsa::XEdDSAPublicKey;
+use worker::{
+    Context, Cors, Date, Env, Headers, Method, Request, RequestInit, Response, Result, event,
+};
 
-pub use crate::objects::{Attachment, Identity};
+pub use crate::objects::{AttachmentV2, IdentityV2};
 use crate::store::Store;
 pub(crate) use crate::store::{decode_hex_fixed, hex};
 
@@ -30,26 +32,65 @@ pub(crate) use crate::store::{decode_hex_fixed, hex};
 const NOTIFICATIONS_PATH: &str = "/notifications";
 /// Header advertising whether post-quantum suites are enabled at runtime (`"1"` or `"0"`).
 const PQ_HEADER: &str = "x-e2ee-pq";
-/// Header identifying a deprecated protocol version rejected by this server.
-const DEPRECATED_HEADER: &str = "x-e2ee-deprecated";
-/// Value of [`DEPRECATED_HEADER`] for rejected legacy v1 requests.
-const DEPRECATED_V1_VALUE: &str = "v1";
-/// Error message returned on deprecated legacy v1 handshake/mailbox Connect requests.
-const LEGACY_V1_CONNECT_MESSAGE: &str = "Legacy v1 protocol is deprecated and removed. Refresh the web app, or switch from an archived v1/TUI client to the web app.";
-/// Body returned on deprecated legacy query-param `/notifications?request=...` requests.
-const LEGACY_V1_NOTIFICATIONS_MESSAGE: &str = "Legacy v1 notifications are deprecated and removed. Please refresh or upgrade the app to continue.";
-/// The binding of the R2 bucket.
+/// The binding of the R2 bucket (attachment chunks only).
 pub(crate) const BUCKET: &str = "BUCKET";
-/// The largest request body: the largest message, 4 MiB - 64 KiB, with room for the rest of a
-/// push.
-const MAX_BODY: usize = 4 << 20;
+/// Rate-limiter binding gating `GET /notifications` (`30 / 60s`).
+const WS_RATE_LIMITER: &str = "WS_RATE_LIMITER";
+/// Rate-limiter binding gating `ClaimBundle` and `SendInitialV2` (`30 / 60s`).
+const HANDSHAKE_RATE_LIMITER: &str = "HANDSHAKE_RATE_LIMITER";
+/// Rate-limiter binding gating `StartUpload` (`30 / 60s`).
+const UPLOAD_RATE_LIMITER: &str = "UPLOAD_RATE_LIMITER";
 /// Cap on speculative `Vec::with_capacity` from an untrusted `Content-Length` header.
 const MAX_PREALLOC_BODY: usize = 64 << 10;
+/// Maximum concurrent large-body operations (`PutChunk`, `GetChunk`, `FetchSigned`) per isolate.
+const MAX_CONCURRENT_LARGE_OPS: usize = 4;
+/// Subprotocol token prefix carrying the canonical unpadded base64url `SubscribeRequest`.
+const WS_SUBPROTOCOL_SUB_PREFIX: &str = "e2ee-sub.";
+/// Maximum byte length of the incoming `Sec-WebSocket-Protocol` header.
+const MAX_WS_PROTOCOL_HEADER_BYTES: usize = 2560;
+/// Maximum decoded protobuf byte length of a `SubscribeRequest`.
+const MAX_SUBSCRIBE_PROTO_BYTES: usize = 1536;
+
+thread_local! {
+    static IN_FLIGHT_LARGE_OPS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// RAII concurrency guard limiting concurrent large-body RPCs (`PutChunk`, `GetChunk`,
+/// `FetchSigned`) to [`MAX_CONCURRENT_LARGE_OPS`] per isolate, acquired BEFORE reading the body.
+struct LargeBodyPermit;
+
+impl LargeBodyPermit {
+    fn try_acquire() -> Option<Self> {
+        IN_FLIGHT_LARGE_OPS.with(|count| {
+            let current = count.get();
+            if current >= MAX_CONCURRENT_LARGE_OPS {
+                None
+            } else {
+                count.set(current + 1);
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for LargeBodyPermit {
+    fn drop(&mut self) {
+        IN_FLIGHT_LARGE_OPS.with(|count| {
+            count.set(count.get().saturating_sub(1));
+        });
+    }
+}
 
 /// Unified Connect RPC procedure abstraction shared by [`ProcedureV2`] and [`AttachmentProcedure`].
 trait Procedure: Copy {
     fn max_body(self) -> usize;
     fn requires_sign_in(self) -> bool;
+    fn uses_large_body_permit(self) -> bool {
+        false
+    }
+    fn rate_limit(self) -> Option<(&'static str, &'static str)> {
+        None
+    }
     fn disabled_without_pq(self) -> bool {
         false
     }
@@ -58,7 +99,7 @@ trait Procedure: Copy {
         env: &Env,
         request: &Request,
         content_type: Option<&str>,
-        body: &Bytes,
+        body: Bytes,
         pq_enabled: bool,
     ) -> Result<connect::Response>;
 }
@@ -80,16 +121,30 @@ impl Procedure for AttachmentProcedure {
         )
     }
 
+    fn uses_large_body_permit(self) -> bool {
+        matches!(
+            self,
+            AttachmentProcedure::PutChunk | AttachmentProcedure::GetChunk
+        )
+    }
+
+    fn rate_limit(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            AttachmentProcedure::StartUpload => Some((UPLOAD_RATE_LIMITER, "upload")),
+            _ => None,
+        }
+    }
+
     async fn dispatch(
         self,
         env: &Env,
         _request: &Request,
         content_type: Option<&str>,
-        body: &Bytes,
+        body: Bytes,
         _pq_enabled: bool,
     ) -> Result<connect::Response> {
         let limits = MailboxLimits::default();
-        let store = Store::new(env, limits.max_message_size)?;
+        let store = Store::new(env, limits.max_fetch_bytes)?;
         let retention = period(
             env,
             "FILE_RETENTION_DAYS",
@@ -112,12 +167,15 @@ impl Procedure for ProcedureV2 {
             ProcedureV2::GetServerInfo
             | ProcedureV2::GetManifest
             | ProcedureV2::ClaimBundle
-            | ProcedureV2::ListInitialMessages => 4 << 10,
+            | ProcedureV2::ListInitialMessages
+            | ProcedureV2::FetchSigned
+            | ProcedureV2::AckMessages
+            | ProcedureV2::RegisterWriteToken
+            | ProcedureV2::RevokeWriteToken => 4 << 10,
             ProcedureV2::AckInitialMessages => 8 << 10,
             ProcedureV2::SendInitialV2 => 16 << 10,
-            ProcedureV2::FetchSigned => 32 << 10,
+            ProcedureV2::PushV2 => 80 << 10,
             ProcedureV2::PublishV2 | ProcedureV2::RefillPrekeys => 256 << 10,
-            ProcedureV2::PushV2 => MAX_BODY,
         }
     }
 
@@ -132,12 +190,25 @@ impl Procedure for ProcedureV2 {
         )
     }
 
+    fn uses_large_body_permit(self) -> bool {
+        matches!(self, ProcedureV2::FetchSigned)
+    }
+
+    fn rate_limit(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            ProcedureV2::ClaimBundle => Some((HANDSHAKE_RATE_LIMITER, "claim")),
+            ProcedureV2::SendInitialV2 => Some((HANDSHAKE_RATE_LIMITER, "init")),
+            _ => None,
+        }
+    }
+
     /// V2 procedures completely disabled when `PQ_ENABLED="false"` without inspecting the request
-    /// body. Other v2 procedures enforce fine-grained rollback rules inside `HandshakeV2Server` /
-    /// `MailboxV2Server` so existing PQ users can drain in-flight handshakes and publish signed
-    /// OFF manifests.
+    /// body. All v2 procedures remain active (including read-only `GetManifest` returning signed
+    /// classical/PQ-off manifests) while `HandshakeV2Server` / `MailboxV2Server` enforce
+    /// fine-grained PQ-disabled rules so clients can drain in-flight handshakes, publish signed
+    /// OFF manifests, and verify peer SPK rotations without consuming one-time prekeys.
     fn disabled_without_pq(self) -> bool {
-        matches!(self, ProcedureV2::GetManifest)
+        false
     }
 
     async fn dispatch(
@@ -145,12 +216,12 @@ impl Procedure for ProcedureV2 {
         env: &Env,
         request: &Request,
         content_type: Option<&str>,
-        body: &Bytes,
+        body: Bytes,
         pq_enabled: bool,
     ) -> Result<connect::Response> {
         let server_id = server_id(env, request)?;
         let limits = MailboxLimits::default();
-        let store = Store::new(env, limits.max_message_size)?;
+        let store = Store::new(env, limits.max_fetch_bytes)?;
         let info = server_info_config(server_id.clone(), pq_enabled);
         let supported_suites = info.supported_suites.clone();
         let handshake = HandshakeV2Server::new(store.clone(), info);
@@ -168,44 +239,13 @@ impl Procedure for ProcedureV2 {
 enum Route {
     V2(ProcedureV2),
     Attachment(AttachmentProcedure),
-    LegacyV1Deprecated,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SubscribeQuery {
-    LegacyRequest,
-    Identity(String),
-    Missing,
 }
 
 fn resolve_route(path: &str) -> Option<Route> {
     if let Some(procedure) = ProcedureV2::from_path(path) {
         Some(Route::V2(procedure))
-    } else if let Some(procedure) = AttachmentProcedure::from_path(path) {
-        Some(Route::Attachment(procedure))
-    } else if connect::is_legacy_v1_path(path) {
-        Some(Route::LegacyV1Deprecated)
     } else {
-        None
-    }
-}
-
-fn legacy_v1_connect_error() -> connect::Response {
-    connect::error(ErrorKind::Unimplemented, LEGACY_V1_CONNECT_MESSAGE)
-}
-
-fn parse_subscribe_query(url: &worker::Url) -> SubscribeQuery {
-    let mut identity = None;
-    for (name, value) in url.query_pairs() {
-        match name.as_ref() {
-            "request" => return SubscribeQuery::LegacyRequest,
-            "identity" => identity = Some(value.into_owned()),
-            _ => {}
-        }
-    }
-    match identity {
-        Some(identity) => SubscribeQuery::Identity(identity),
-        None => SubscribeQuery::Missing,
+        AttachmentProcedure::from_path(path).map(Route::Attachment)
     }
 }
 
@@ -227,17 +267,10 @@ fn extract_conformance_token<'a>(
     }
 }
 
-/// Requires either a valid sign-in cookie OR a matching `CONFORMANCE_TOKEN` secret.
-/// Fails closed if neither is satisfied.
+/// Strictly requires a matching `CONFORMANCE_TOKEN` secret (never bypassed by a sign-in cookie).
+/// Fails closed if `CONFORMANCE_TOKEN` is unset/empty or does not match in constant time.
 #[cfg(any(test, feature = "conformance"))]
-fn conformance_authorized(
-    expected_token: Option<&str>,
-    presented_token: Option<&str>,
-    signed_in: bool,
-) -> bool {
-    if signed_in {
-        return true;
-    }
+fn conformance_authorized(expected_token: Option<&str>, presented_token: Option<&str>) -> bool {
     match (expected_token, presented_token) {
         (Some(expected), Some(presented)) => auth::constant_time_secret_eq(expected, presented),
         _ => false,
@@ -253,15 +286,15 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
         let auth_header = request.headers().get("authorization")?;
         let token_header = request.headers().get("x-conformance-token")?;
         let presented = extract_conformance_token(auth_header.as_deref(), token_header.as_deref());
-        let is_signed_in = auth::signed_in(&request, &env).is_some();
-        if !conformance_authorized(expected_token.as_deref(), presented, is_signed_in) {
+        if !conformance_authorized(expected_token.as_deref(), presented) {
             return with_security_headers(Response::error("unauthorized", 403)?);
         }
         // A failure panics, which fails the request.
-        let store = Store::new(&env, MailboxLimits::default().max_message_size)?;
+        let store = Store::new(&env, MailboxLimits::default().max_fetch_bytes)?;
         storage::testing::attachment_store(&store).await;
         storage::testing::pq_handshake_store(&store).await;
-        storage::testing::idempotent_mailbox_store(&store).await;
+        storage::testing::idempotent_mailbox_store_at(&store, worker::Date::now().as_millis())
+            .await;
         return with_security_headers(Response::ok("the storage conformance suites passed")?);
     }
     if request.path() == NOTIFICATIONS_PATH {
@@ -274,7 +307,7 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
 
     let path = request.path();
     // Answer CORS preflights before procedure lookup so cross-origin clients cleanly decode
-    // Connect errors (including legacy v1 deprecation responses).
+    // Connect errors.
     if request.method() == Method::Options {
         return with_cors(Response::empty()?, pq_enabled);
     }
@@ -286,25 +319,11 @@ async fn fetch(request: Request, env: Env, _context: Context) -> Result<Response
                 Route::Attachment(procedure) => {
                     call_connect(request, &env, procedure, pq_enabled).await?
                 }
-                Route::LegacyV1Deprecated => {
-                    let mut response = respond(legacy_v1_connect_error())?;
-                    response
-                        .headers_mut()
-                        .set(DEPRECATED_HEADER, DEPRECATED_V1_VALUE)?;
-                    response
-                }
             },
             _ => {
                 let headers = Headers::new();
                 headers.set("allow", "POST, OPTIONS")?;
-                let mut response =
-                    Response::error("method not allowed", 405)?.with_headers(headers);
-                if route == Route::LegacyV1Deprecated {
-                    response
-                        .headers_mut()
-                        .set(DEPRECATED_HEADER, DEPRECATED_V1_VALUE)?;
-                }
-                response
+                Response::error("method not allowed", 405)?.with_headers(headers)
             }
         },
         None => Response::error("not found", 404)?,
@@ -324,8 +343,9 @@ async fn call_connect<P: Procedure>(
             "post-quantum routes are disabled",
         ));
     }
-    // Check sign-in BEFORE buffering the request body!
-    if procedure.requires_sign_in() && auth::signed_in(&request, env).is_none() {
+    // Check sign-in BEFORE buffering the request body or invoking rate limiters / DOs.
+    let auth_info = auth::signed_in_with_tag(&request, env);
+    if procedure.requires_sign_in() && auth_info.is_none() {
         let message = "sign in to this server to use it";
         return respond(connect::error(ErrorKind::SignInRequired, message));
     }
@@ -333,11 +353,44 @@ async fn call_connect<P: Procedure>(
     if let Some(response) = connect::check_content_type(content_type.as_deref()) {
         return respond(response);
     }
+    // Enforce Connect RPC rate limiters BEFORE buffering the body or routing to DOs.
+    // Returns Connect `Code::Unavailable` (HTTP 503 JSON + `Retry-After: 60`) — NEVER
+    // `Code::ResourceExhausted` (`LimitExceeded`), which clients treat as permanent refusal.
+    if let Some((binding, prefix)) = procedure.rate_limit() {
+        let ip_key = auth::client_ip_key(&request);
+        let tag_hash = auth_info.as_ref().map(|(_, hash)| hash);
+        if !auth::check_rate_limits(env, binding, prefix, &ip_key, tag_hash).await {
+            let mut resp = respond(connect::error(
+                ErrorKind::Storage,
+                "rate limited; retry shortly",
+            ))?;
+            resp.headers_mut().set("retry-after", "60")?;
+            return Ok(resp);
+        }
+    }
+    // Acquire `LargeBodyPermit` BEFORE `read_body` so concurrent chunked uploads or large fetches
+    // cannot OOM the isolate. Returns Connect `Code::Unavailable` (HTTP 503 JSON + `Retry-After: 1`).
+    let _permit = if procedure.uses_large_body_permit() {
+        match LargeBodyPermit::try_acquire() {
+            Some(permit) => Some(permit),
+            None => {
+                let mut resp = respond(connect::error(
+                    ErrorKind::Storage,
+                    "server busy; retry shortly",
+                ))?;
+                resp.headers_mut().set("retry-after", "1")?;
+                return Ok(resp);
+            }
+        }
+    } else {
+        None
+    };
+
     let response = match read_body(&mut request, procedure.max_body()).await? {
         Some(body) => {
             let body = Bytes::from(body);
             procedure
-                .dispatch(env, &request, content_type.as_deref(), &body, pq_enabled)
+                .dispatch(env, &request, content_type.as_deref(), body, pq_enabled)
                 .await?
         }
         None => connect::error(ErrorKind::LimitExceeded, "request too large"),
@@ -345,8 +398,7 @@ async fn call_connect<P: Procedure>(
     respond(response)
 }
 
-/// Builds the runtime [`ServerInfoConfig`] for `server_id` and `pq_enabled`, keeping deprecated
-/// legacy v1 flags (`legacy_v1_enabled`, `allow_unsigned_fetch`) permanently `false`.
+/// Builds the runtime [`ServerInfoConfig`] for `server_id` and `pq_enabled`.
 fn server_info_config(server_id: String, pq_enabled: bool) -> ServerInfoConfig {
     let mut info = ServerInfoConfig::new(server_id);
     info.pq_enabled = pq_enabled;
@@ -372,7 +424,7 @@ fn cors_policy(methods: impl IntoIterator<Item = Method>) -> Cors {
         .with_origins(["*"])
         .with_methods(methods)
         .with_allowed_headers(["content-type", PROTOCOL_VERSION_HEADER])
-        .with_exposed_headers(["date", PQ_HEADER, DEPRECATED_HEADER])
+        .with_exposed_headers(["date", PQ_HEADER, "retry-after"])
         .with_max_age(86400)
 }
 
@@ -446,18 +498,6 @@ pub(crate) fn subscribe_audience(authority: String) -> String {
     }
 }
 
-/// Verifies an audience-bound v2 [`SubscribeRequest`] against `audience` and `now_ms`.
-pub(crate) fn verify_subscribe_request(
-    subscription: &SubscribeRequest,
-    audience: &str,
-    now_ms: u64,
-) -> protocol::Result<[u8; 32]> {
-    if !subscription.is_audience_bound() {
-        return Err(ErrorKind::InvalidSignature.into());
-    }
-    subscription.verify_for_audience(audience, now_ms)
-}
-
 fn env_bool(env: &Env, name: &str, default: bool) -> bool {
     env.var(name)
         .ok()
@@ -471,42 +511,100 @@ fn env_bool(env: &Env, name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn is_internal_subscribe_header(name: &str) -> bool {
+/// Parses the offered `Sec-WebSocket-Protocol` header (`["e2ee-notify.v2", "e2ee-sub.<b64url>"]`):
+/// - Total header length `<= MAX_WS_PROTOCOL_HEADER_BYTES` (2560 bytes).
+/// - Exactly 2 non-empty comma-separated tokens: `e2ee-notify.v2` and `e2ee-sub.<b64url_nopad>`.
+/// - Strict canonical unpadded base64url decoding (no padding, no non-canonical trailing bits).
+/// - Decoded protobuf length `<= MAX_SUBSCRIBE_PROTO_BYTES` (1536 bytes).
+///
+/// NEVER logs or returns offered subprotocol tokens.
+fn parse_ws_subprotocol(header: &str) -> Option<SubscribeRequest> {
+    if header.len() > MAX_WS_PROTOCOL_HEADER_BYTES {
+        return None;
+    }
+    let mut saw_v2 = false;
+    let mut sub_b64: Option<&str> = None;
+    let mut token_count = 0usize;
+    for raw_token in header.split(',') {
+        let token = raw_token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        token_count += 1;
+        if token_count > 2 {
+            return None;
+        }
+        if token == objects::WS_SUBPROTOCOL_V2 {
+            if saw_v2 {
+                return None;
+            }
+            saw_v2 = true;
+        } else {
+            let b64 = token.strip_prefix(WS_SUBPROTOCOL_SUB_PREFIX)?;
+            if b64.is_empty() || sub_b64.is_some() {
+                return None;
+            }
+            sub_b64 = Some(b64);
+        }
+    }
+    if token_count != 2 || !saw_v2 {
+        return None;
+    }
+    let b64 = sub_b64?;
+    let raw = BASE64_URL_SAFE_NO_PAD.decode(b64.as_bytes()).ok()?;
+    if raw.len() > MAX_SUBSCRIBE_PROTO_BYTES {
+        return None;
+    }
+    // Enforce canonical unpadded base64url encoding (no non-canonical trailing bits or padding).
+    if BASE64_URL_SAFE_NO_PAD.encode(&raw) != b64 {
+        return None;
+    }
+    SubscribeRequest::decode(raw.as_slice()).ok()
+}
+
+fn is_stripped_subscribe_header(name: &str) -> bool {
     [
+        "sec-websocket-protocol",
         objects::HEADER_DEPLOYMENT_AUTH,
-        objects::HEADER_PENDING_IDENTITY,
-        objects::HEADER_SUBSCRIBE_AUDIENCE,
+        objects::HEADER_VERIFIED_IDENTITY,
+        objects::HEADER_VERIFIED_AUDIENCE,
+        objects::HEADER_VERIFIED_TS,
+        objects::HEADER_VERIFIED_NONCE,
         objects::HEADER_SESSION_EXPIRES,
-        objects::HEADER_SUBSCRIBE_SIG,
-        objects::HEADER_SUBSCRIBE_TS,
     ]
     .iter()
     .any(|header| name.eq_ignore_ascii_case(header))
 }
 
-/// Strip all internal subscribe headers case-insensitively and append the trusted Worker-computed
-/// auth, pending identity, canonical audience, and optional session expiry headers for forwarding
-/// to the Identity Durable Object.
+/// Strip incoming `Sec-WebSocket-Protocol` and all internal headers case-insensitively, then
+/// append the trusted Worker-verified headers for forwarding to the `IdentityV2` Durable Object.
 fn forwarded_subscribe_headers<'a>(
     incoming: impl IntoIterator<Item = (&'a str, &'a str)>,
     identity_key: &[u8; 32],
     audience: &str,
+    timestamp: u64,
+    nonce: &[u8; SUBSCRIBE_NONCE_LENGTH],
     session_expires: Option<u64>,
 ) -> Vec<(String, String)> {
     let mut forwarded: Vec<(String, String)> = incoming
         .into_iter()
-        .filter(|(name, _)| !is_internal_subscribe_header(name))
+        .filter(|(name, _)| !is_stripped_subscribe_header(name))
         .map(|(name, value)| (name.to_owned(), value.to_owned()))
         .collect();
     forwarded.push((objects::HEADER_DEPLOYMENT_AUTH.to_owned(), "1".to_owned()));
     forwarded.push((
-        objects::HEADER_PENDING_IDENTITY.to_owned(),
+        objects::HEADER_VERIFIED_IDENTITY.to_owned(),
         hex(identity_key),
     ));
     forwarded.push((
-        objects::HEADER_SUBSCRIBE_AUDIENCE.to_owned(),
+        objects::HEADER_VERIFIED_AUDIENCE.to_owned(),
         audience.to_owned(),
     ));
+    forwarded.push((
+        objects::HEADER_VERIFIED_TS.to_owned(),
+        timestamp.to_string(),
+    ));
+    forwarded.push((objects::HEADER_VERIFIED_NONCE.to_owned(), hex(nonce)));
     if let Some(expires) = session_expires {
         forwarded.push((
             objects::HEADER_SESSION_EXPIRES.to_owned(),
@@ -516,12 +614,13 @@ fn forwarded_subscribe_headers<'a>(
     forwarded
 }
 
-/// Hand a WebSocket asking for an identity's notifications to its object.
+/// Pre-authenticate a notification WebSocket upgrade at Worker ingress BEFORE routing to any
+/// `IdentityV2` Durable Object.
 ///
-/// Only first-frame audience-bound v2 authentication is supported:
-/// `GET /notifications?identity=<64-hex-pubkey>`, followed by a first WebSocket binary or
-/// base64url text frame carrying an audience-bound v2 `SubscribeRequest`.
-/// Legacy query-param requests (`GET /notifications?request=...`) return HTTP `410 Gone`.
+/// Clients connect to `GET /notifications` offering
+/// `Sec-WebSocket-Protocol: e2ee-notify.v2, e2ee-sub.<base64url_nopad(SubscribeRequest)>`.
+/// Invalid signatures, bad audiences, stale timestamps, or malformed subprotocols are rejected at
+/// the Worker edge without ever waking a victim DO.
 async fn subscribe(request: Request, env: &Env) -> Result<Response> {
     let pq_enabled = pq_runtime_enabled(env);
     if request.method() == Method::Options {
@@ -535,30 +634,12 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
             pq_enabled,
         );
     }
-    let url = request.url()?;
-    let identity_hex = match parse_subscribe_query(&url) {
-        SubscribeQuery::LegacyRequest => {
-            let mut response = Response::error(LEGACY_V1_NOTIFICATIONS_MESSAGE, 410)?;
-            response
-                .headers_mut()
-                .set(DEPRECATED_HEADER, DEPRECATED_V1_VALUE)?;
-            return with_notifications_cors(response, pq_enabled);
-        }
-        SubscribeQuery::Identity(identity_hex) => identity_hex,
-        SubscribeQuery::Missing => {
-            let upgrade = request.headers().get("upgrade")?;
-            if !upgrade.is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket")) {
-                return with_security_headers(Response::error("expected a WebSocket", 426)?);
-            }
-            return with_security_headers(Response::error("malformed subscription", 400)?);
-        }
-    };
     let upgrade = request.headers().get("upgrade")?;
     if !upgrade.is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket")) {
         return with_security_headers(Response::error("expected a WebSocket", 426)?);
     }
-    // Validate Origin on WebSocket upgrades whenever a browser sends one (CSWSH defense),
-    // allowing `Sec-Fetch-Site: same-origin` (e.g. `trunk serve` dev proxy) and `SERVER_ID`.
+    let url = request.url()?;
+    // Validate Origin on WebSocket upgrades whenever a browser sends one (CSWSH defense).
     let origin = request.headers().get("origin")?;
     let sec_fetch_site = request.headers().get("sec-fetch-site")?;
     let configured_server_id = env.var("SERVER_ID").ok().map(|v| v.to_string());
@@ -571,24 +652,50 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
         return with_security_headers(Response::error("cross-origin WebSocket refused", 403)?);
     }
 
-    // Require a valid sign-in cookie before upgrading unauthenticated first-frame WS sockets
-    // whenever server PASSWORD authentication is configured, preventing unauthenticated
-    // third parties from exhausting an identity's pending WebSocket cap.
-    let claims = auth::signed_in(&request, env);
-    if auth::password_configured(env) && claims.is_none() {
+    // Parse sign-in cookie (for both `WS_RATE_LIMITER` cookie-tag keying and auth enforcement).
+    let auth_info = auth::signed_in_with_tag(&request, env);
+    let ip_key = auth::client_ip_key(&request);
+    let tag_hash = auth_info.as_ref().map(|(_, hash)| hash);
+    if !auth::check_rate_limits(env, WS_RATE_LIMITER, "ws", &ip_key, tag_hash).await {
+        let mut resp = Response::error("too many WebSocket upgrade attempts", 429)?;
+        resp.headers_mut().set("retry-after", "60")?;
+        return with_security_headers(resp);
+    }
+    if auth_info.is_none() {
         return with_security_headers(Response::error("sign in to this server to use it", 403)?);
     }
-    let Some(identity_key) = crate::decode_hex_fixed::<32>(&identity_hex) else {
-        return with_security_headers(Response::error("malformed identity", 400)?);
-    };
-    if XEdDSAPublicKey::new(&identity_key).is_err() {
-        return with_security_headers(Response::error("invalid identity key", 400)?);
-    }
-    // Validate and normalize the relay audience before forwarding to the Durable Object.
-    let audience = server_id(env, &request)?;
 
-    // Clone incoming headers, stripping all internal auth headers so a client can never spoof
-    // them toward the Durable Object.
+    // Parse and cryptographically verify `SubscribeRequest` from `Sec-WebSocket-Protocol` BEFORE
+    // instantiating or routing to any Durable Object. Never log the offered header value.
+    let Some(protocol_header) = request.headers().get("sec-websocket-protocol")? else {
+        return with_security_headers(Response::error("missing subscription subprotocol", 400)?);
+    };
+    let Some(subscription) = parse_ws_subprotocol(&protocol_header) else {
+        return with_security_headers(Response::error("malformed subscription", 400)?);
+    };
+    let expected_authority = server_id(env, &request)?;
+    let verify_audience = subscribe_audience(expected_authority.clone());
+    let now_ms = Date::now().as_millis();
+    let identity_key = match subscription.verify_for_audience(&verify_audience, now_ms) {
+        Ok(key) => key,
+        Err(err) => {
+            let status = match err.kind() {
+                ErrorKind::Malformed => 400,
+                _ => 403,
+            };
+            return with_security_headers(Response::error("invalid subscription", status)?);
+        }
+    };
+    let nonce: [u8; SUBSCRIBE_NONCE_LENGTH] = match subscription.nonce.as_ref().try_into() {
+        Ok(nonce) => nonce,
+        Err(_) => {
+            return with_security_headers(Response::error("malformed subscription", 400)?);
+        }
+    };
+    let verified_ts = subscription.timestamp;
+
+    // Strip incoming `Sec-WebSocket-Protocol` and all internal headers so a client can never
+    // spoof verified headers or leak credentials into the Durable Object.
     let incoming_headers: Vec<(String, String)> = request.headers().entries().collect();
     let forward_headers = Headers::new();
     for (name, value) in forwarded_subscribe_headers(
@@ -596,8 +703,10 @@ async fn subscribe(request: Request, env: &Env) -> Result<Response> {
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str())),
         &identity_key,
-        &audience,
-        claims.map(|c| c.expires),
+        &expected_authority,
+        verified_ts,
+        &nonce,
+        auth_info.map(|(claims, _)| claims.expires),
     ) {
         forward_headers.set(&name, &value)?;
     }
@@ -702,147 +811,186 @@ pub(crate) mod tests {
         }
     }
 
-    pub(crate) fn legacy_unbound_subscribe(
-        identity: &XEdDSAPrivateKey,
-        timestamp: u64,
-    ) -> SubscribeRequest {
-        let key = identity.compute_public_key().to_bytes();
-        let mut msg = b"notify.v1/subscribe".to_vec();
-        msg.extend_from_slice(&key);
-        msg.extend_from_slice(&timestamp.to_le_bytes());
-        SubscribeRequest {
-            identity_key: Bytes::copy_from_slice(&key),
-            timestamp,
-            signature: Bytes::copy_from_slice(&identity.sign(msg)),
-            audience: String::new(),
-        }
-    }
-
     #[test]
-    fn legacy_v1_paths_are_detected_and_return_deprecation_error() {
-        for path in [
+    fn route_resolution_limits_permits_and_rate_limiters_match_v2_spec() {
+        for legacy in [
             "/handshake.v1.HandshakeService/Publish",
             "/handshake.v1.HandshakeService/FetchBundle",
-            "/handshake.v1.HandshakeService/SendInitialMessage",
-            "/handshake.v1.HandshakeService/TakeInitialMessages",
             "/mailbox.v1.MailboxService/Push",
             "/mailbox.v1.MailboxService/Fetch",
-            "/handshake.v1.HandshakeService/Unknown",
-            "/mailbox.v1.MailboxService/Unknown",
+            "/unknown.v1.Service/Method",
         ] {
-            assert!(connect::is_legacy_v1_path(path));
-            assert_eq!(resolve_route(path), Some(Route::LegacyV1Deprecated));
+            assert_eq!(resolve_route(legacy), None);
         }
 
         for procedure in AttachmentProcedure::ALL {
-            assert!(!connect::is_legacy_v1_path(procedure.path()));
             assert_eq!(
                 resolve_route(procedure.path()),
                 Some(Route::Attachment(procedure))
             );
         }
+        assert_eq!(ProcedureV2::ALL.len(), 13);
         for procedure in ProcedureV2::ALL {
-            assert!(!connect::is_legacy_v1_path(procedure.path()));
             assert_eq!(resolve_route(procedure.path()), Some(Route::V2(procedure)));
         }
-        assert_eq!(resolve_route("/unknown.v1.Service/Method"), None);
 
-        let err = legacy_v1_connect_error();
-        assert_eq!(err.status, 501);
-        assert_eq!(err.content_type, connect::ERROR_CONTENT_TYPE);
-        let json: serde_json::Value = serde_json::from_slice(&err.body).unwrap();
-        assert_eq!(json["code"], "unimplemented");
-        assert_eq!(json["message"], LEGACY_V1_CONNECT_MESSAGE);
+        // Exact limits & sign-in requirements for mailbox v2 RPCs.
+        assert_eq!(ProcedureV2::PushV2.max_body(), 80 << 10);
+        assert!(ProcedureV2::PushV2.requires_sign_in());
+        for proc in [
+            ProcedureV2::FetchSigned,
+            ProcedureV2::AckMessages,
+            ProcedureV2::RegisterWriteToken,
+            ProcedureV2::RevokeWriteToken,
+        ] {
+            assert_eq!(proc.max_body(), 4 << 10);
+            assert!(!proc.requires_sign_in());
+        }
+
+        // LargeBodyPermit procedures.
+        assert!(AttachmentProcedure::PutChunk.uses_large_body_permit());
+        assert!(AttachmentProcedure::GetChunk.uses_large_body_permit());
+        assert!(!AttachmentProcedure::StartUpload.uses_large_body_permit());
+        assert!(!AttachmentProcedure::DeleteAttachment.uses_large_body_permit());
+        assert!(ProcedureV2::FetchSigned.uses_large_body_permit());
+        assert!(!ProcedureV2::PushV2.uses_large_body_permit());
+
+        // Rate-limited Connect procedures.
+        assert_eq!(
+            ProcedureV2::ClaimBundle.rate_limit(),
+            Some((HANDSHAKE_RATE_LIMITER, "claim"))
+        );
+        assert_eq!(
+            ProcedureV2::SendInitialV2.rate_limit(),
+            Some((HANDSHAKE_RATE_LIMITER, "init"))
+        );
+        assert_eq!(
+            AttachmentProcedure::StartUpload.rate_limit(),
+            Some((UPLOAD_RATE_LIMITER, "upload"))
+        );
+        assert_eq!(ProcedureV2::PushV2.rate_limit(), None);
+        assert_eq!(ProcedureV2::FetchSigned.rate_limit(), None);
     }
 
     #[test]
-    fn subscribe_query_rejects_legacy_request_param_and_accepts_identity() {
-        let legacy_url = Url::parse("https://relay.example/notifications?request=abc123").unwrap();
-        assert_eq!(
-            parse_subscribe_query(&legacy_url),
-            SubscribeQuery::LegacyRequest
-        );
-
-        let both_url =
-            Url::parse("https://relay.example/notifications?identity=0011&request=legacy_payload")
-                .unwrap();
-        assert_eq!(
-            parse_subscribe_query(&both_url),
-            SubscribeQuery::LegacyRequest
-        );
-
-        let v2_url = Url::parse("https://relay.example/notifications?identity=deadbeef").unwrap();
-        assert_eq!(
-            parse_subscribe_query(&v2_url),
-            SubscribeQuery::Identity("deadbeef".to_string())
-        );
-
-        let missing_url = Url::parse("https://relay.example/notifications").unwrap();
-        assert_eq!(parse_subscribe_query(&missing_url), SubscribeQuery::Missing);
+    fn large_body_permit_caps_concurrency_at_four_and_releases_on_drop() {
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_LARGE_OPS {
+            permits.push(LargeBodyPermit::try_acquire().expect("permit available"));
+        }
+        assert!(LargeBodyPermit::try_acquire().is_none());
+        permits.pop();
+        let acquired = LargeBodyPermit::try_acquire().expect("slot freed on drop");
+        assert!(LargeBodyPermit::try_acquire().is_none());
+        drop(acquired);
+        drop(permits);
+        assert!(LargeBodyPermit::try_acquire().is_some());
     }
 
     #[test]
-    fn server_info_config_reflects_pq_enabled_and_disables_legacy_v1() {
+    fn parse_ws_subprotocol_enforces_exact_two_tokens_bounds_and_canonical_base64url() {
+        let id = XEdDSAPrivateKey::generate();
+        let sub =
+            SubscribeRequest::sign_for_audience(&id, "https://relay.example", 10_000).unwrap();
+        let encoded = BASE64_URL_SAFE_NO_PAD.encode(sub.encode_to_vec());
+
+        // Both token orders accepted when exact 2 tokens match.
+        let h1 = format!("e2ee-notify.v2, e2ee-sub.{encoded}");
+        let h2 = format!("e2ee-sub.{encoded}, e2ee-notify.v2");
+        assert_eq!(parse_ws_subprotocol(&h1), Some(sub.clone()));
+        assert_eq!(parse_ws_subprotocol(&h2), Some(sub));
+
+        // Reject missing token, extra token, duplicate token, wrong prefix, padding, oversized.
+        assert_eq!(parse_ws_subprotocol("e2ee-notify.v2"), None);
+        assert_eq!(parse_ws_subprotocol(&format!("e2ee-sub.{encoded}")), None);
+        assert_eq!(
+            parse_ws_subprotocol(&format!("e2ee-notify.v2, e2ee-sub.{encoded}, extra")),
+            None
+        );
+        assert_eq!(parse_ws_subprotocol("e2ee-notify.v2, e2ee-notify.v2"), None);
+        assert_eq!(
+            parse_ws_subprotocol(&format!("e2ee-sub.{encoded}, e2ee-sub.{encoded}")),
+            None
+        );
+        assert_eq!(parse_ws_subprotocol("e2ee-notify.v2, e2ee-sub."), None);
+        // Padded base64url rejected.
+        assert_eq!(
+            parse_ws_subprotocol(&format!("e2ee-notify.v2, e2ee-sub.{encoded}=")),
+            None
+        );
+        // Oversized header (> 2560 bytes) rejected.
+        let huge = format!(
+            "e2ee-notify.v2, e2ee-sub.{}",
+            "A".repeat(MAX_WS_PROTOCOL_HEADER_BYTES)
+        );
+        assert!(huge.len() > MAX_WS_PROTOCOL_HEADER_BYTES);
+        assert_eq!(parse_ws_subprotocol(&huge), None);
+    }
+
+    #[test]
+    fn server_info_config_reflects_pq_enabled() {
         let on = server_info_config("relay.example".into(), true);
         assert!(on.pq_enabled);
         assert!(!on.supported_suites.is_empty());
         assert!(on.pq_ratchet_supported);
-        assert!(!on.legacy_v1_enabled);
-        assert!(!on.allow_unsigned_fetch);
 
         let off = server_info_config("relay.example".into(), false);
         assert!(!off.pq_enabled);
         assert!(off.supported_suites.is_empty());
         assert!(!off.pq_ratchet_supported);
-        assert!(!off.legacy_v1_enabled);
-        assert!(!off.allow_unsigned_fetch);
 
-        assert!(ProcedureV2::GetManifest.disabled_without_pq());
         for proc in ProcedureV2::ALL {
-            if proc != ProcedureV2::GetManifest {
-                assert!(!proc.disabled_without_pq());
-            }
+            assert!(!proc.disabled_without_pq());
         }
     }
 
     #[test]
-    fn internal_subscribe_headers_are_filtered_case_insensitively() {
+    fn internal_and_subprotocol_headers_are_stripped_case_insensitively() {
         for header in [
+            "sec-websocket-protocol",
             objects::HEADER_DEPLOYMENT_AUTH,
-            objects::HEADER_PENDING_IDENTITY,
-            objects::HEADER_SUBSCRIBE_AUDIENCE,
+            objects::HEADER_VERIFIED_IDENTITY,
+            objects::HEADER_VERIFIED_AUDIENCE,
+            objects::HEADER_VERIFIED_TS,
+            objects::HEADER_VERIFIED_NONCE,
             objects::HEADER_SESSION_EXPIRES,
-            objects::HEADER_SUBSCRIBE_SIG,
-            objects::HEADER_SUBSCRIBE_TS,
         ] {
-            assert!(is_internal_subscribe_header(header));
-            assert!(is_internal_subscribe_header(&header.to_ascii_uppercase()));
+            assert!(is_stripped_subscribe_header(header));
+            assert!(is_stripped_subscribe_header(&header.to_ascii_uppercase()));
         }
-        assert!(!is_internal_subscribe_header("upgrade"));
-        assert!(!is_internal_subscribe_header("cookie"));
+        assert!(!is_stripped_subscribe_header("upgrade"));
+        assert!(!is_stripped_subscribe_header("cookie"));
 
         let id = [0x42u8; 32];
+        let nonce = [0x99u8; SUBSCRIBE_NONCE_LENGTH];
         let forwarded = forwarded_subscribe_headers(
             [
                 ("upgrade", "websocket"),
-                ("cookie", "session=abc"),
+                ("Sec-WebSocket-Protocol", "e2ee-notify.v2, e2ee-sub.SECRET"),
                 ("X-E2EE-Deployment-Auth", "0"),
-                ("x-e2ee-pending-identity", "00"),
+                ("x-e2ee-verified-identity", "00"),
+                ("X-E2EE-Verified-Audience", "evil.example"),
+                ("X-E2EE-Verified-Ts", "1"),
+                ("X-E2EE-Verified-Nonce", "00"),
                 ("X-E2EE-Session-Expires", "999999999999"),
-                ("X-E2EE-Subscribe-Sig", "deadbeef"),
-                ("x-e2ee-subscribe-ts", "9999999999"),
-                ("X-E2EE-Subscribe-Audience", "evil.example"),
             ],
             &id,
             "relay.example:443",
+            55_555,
+            &nonce,
             Some(123_456),
         );
         assert!(forwarded.contains(&("upgrade".into(), "websocket".into())));
-        assert!(forwarded.contains(&("cookie".into(), "session=abc".into())));
-        assert!(!forwarded.iter().any(
-            |(k, _)| k.eq_ignore_ascii_case(objects::HEADER_SUBSCRIBE_SIG)
-                || k.eq_ignore_ascii_case(objects::HEADER_SUBSCRIBE_TS)
-        ));
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("sec-websocket-protocol"))
+        );
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(_, v)| v.contains("SECRET") || v.contains("e2ee-sub"))
+        );
         assert_eq!(
             forwarded
                 .iter()
@@ -853,19 +1001,33 @@ pub(crate) mod tests {
         assert_eq!(
             forwarded
                 .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_PENDING_IDENTITY))
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_VERIFIED_IDENTITY))
                 .collect::<Vec<_>>(),
-            vec![&(objects::HEADER_PENDING_IDENTITY.to_string(), hex(&id))]
+            vec![&(objects::HEADER_VERIFIED_IDENTITY.to_string(), hex(&id))]
         );
         assert_eq!(
             forwarded
                 .iter()
-                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_SUBSCRIBE_AUDIENCE))
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_VERIFIED_AUDIENCE))
                 .collect::<Vec<_>>(),
             vec![&(
-                objects::HEADER_SUBSCRIBE_AUDIENCE.to_string(),
+                objects::HEADER_VERIFIED_AUDIENCE.to_string(),
                 "relay.example:443".to_string()
             )]
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_VERIFIED_TS))
+                .collect::<Vec<_>>(),
+            vec![&(objects::HEADER_VERIFIED_TS.to_string(), "55555".to_string())]
+        );
+        assert_eq!(
+            forwarded
+                .iter()
+                .filter(|(k, _)| k.eq_ignore_ascii_case(objects::HEADER_VERIFIED_NONCE))
+                .collect::<Vec<_>>(),
+            vec![&(objects::HEADER_VERIFIED_NONCE.to_string(), hex(&nonce))]
         );
         assert_eq!(
             forwarded
@@ -876,41 +1038,6 @@ pub(crate) mod tests {
                 objects::HEADER_SESSION_EXPIRES.to_string(),
                 "123456".to_string()
             )]
-        );
-    }
-
-    #[test]
-    fn subscribe_requires_audience_bound_v2_and_rejects_legacy_unbound() {
-        let identity = XEdDSAPrivateKey::generate();
-        let key = identity.compute_public_key().to_bytes();
-        let now = 1_000_000;
-        let bound =
-            SubscribeRequest::sign_for_audience(&identity, "https://Relay.Example", now).unwrap();
-        let legacy = legacy_unbound_subscribe(&identity, now);
-        let mut mislabeled = legacy.clone();
-        mislabeled.audience = "relay.example".into();
-
-        assert_eq!(
-            verify_subscribe_request(&bound, "relay.example", now).unwrap(),
-            key
-        );
-        assert_eq!(
-            verify_subscribe_request(&bound, "other.example", now)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidSignature
-        );
-        assert_eq!(
-            verify_subscribe_request(&mislabeled, "relay.example", now)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidSignature
-        );
-        assert_eq!(
-            verify_subscribe_request(&legacy, "relay.example", now)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidSignature
         );
     }
 
@@ -961,12 +1088,10 @@ pub(crate) mod tests {
         for url in ["https://relay.example:80", "http://relay.example:443"] {
             let signed = SubscribeRequest::sign_for_audience(&identity, url, now).unwrap();
             let authority = normalize_server_id(None, &Url::parse(url).unwrap()).unwrap();
-            let query_audience = subscribe_audience(authority.clone());
-            let attachment = protocol::normalize_audience(&subscribe_audience(authority)).unwrap();
-            for audience in [query_audience, subscribe_audience(attachment)] {
-                assert!(verify_subscribe_request(&signed, &audience, now).is_ok());
-                assert!(verify_subscribe_request(&plain_host, &audience, now).is_err());
-            }
+            let verify_aud = subscribe_audience(authority.clone());
+            assert!(signed.verify_for_audience(&verify_aud, now).is_ok());
+            assert_eq!(signed.audience, authority);
+            assert!(plain_host.verify_for_audience(&verify_aud, now).is_err());
         }
     }
 
@@ -1001,7 +1126,6 @@ pub(crate) mod tests {
             .unwrap();
             assert_eq!(exact, Some(b"abcdefgh".to_vec()));
 
-            // Stops immediately once cumulative chunks cross `limit` (the error chunk is never polled).
             let oversized = read_body_stream(
                 stream::iter([
                     Ok::<_, &'static str>(b"12345".to_vec()),
@@ -1018,22 +1142,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn conformance_auth_requires_sign_in_or_valid_token() {
-        assert!(!conformance_authorized(None, None, false));
-        assert!(!conformance_authorized(Some("secret"), None, false));
-        assert!(!conformance_authorized(
-            Some("secret"),
-            Some("wrong"),
-            false
-        ));
-        assert!(!conformance_authorized(None, Some("secret"), false));
-        assert!(conformance_authorized(
-            Some("secret"),
-            Some("secret"),
-            false
-        ));
-        assert!(conformance_authorized(None, None, true));
-        assert!(conformance_authorized(Some("secret"), Some("wrong"), true));
+    fn conformance_auth_is_strictly_conformance_token_only() {
+        assert!(!conformance_authorized(None, None));
+        assert!(!conformance_authorized(Some("secret"), None));
+        assert!(!conformance_authorized(Some("secret"), Some("wrong")));
+        assert!(!conformance_authorized(None, Some("secret")));
+        assert!(conformance_authorized(Some("secret"), Some("secret")));
 
         assert_eq!(
             extract_conformance_token(Some("Bearer tok123"), None),

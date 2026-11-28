@@ -231,7 +231,10 @@ fn subtitle_tooltip(subtitle: &ChatItemSubtitle) -> String {
 pub(super) fn chat_item_meta(contact: &ContactView) -> ChatItemMeta {
     let has_downgrade = contact.has_downgrade();
     let is_quarantined = contact.is_quarantined();
-    let has_outbound_prompt = matches!(contact.classical_prompt, ClassicalPrompt::Outbound { .. });
+    let has_outbound_prompt = matches!(
+        contact.classical_prompt,
+        ClassicalPrompt::Outbound | ClassicalPrompt::ServerPqDisabled
+    );
     let has_warn_alert = matches!(
         contact.alert,
         SecurityAlert::ManifestExpired | SecurityAlert::PqRequired
@@ -256,6 +259,10 @@ pub(super) fn chat_item_meta(contact: &ContactView) -> ChatItemMeta {
         ChatItemSubtitle::Status("PQ required (paused)".to_string())
     } else if contact.request {
         ChatItemSubtitle::Status("wants to chat".to_string())
+    } else if contact.greeting_unsent || contact.greeting_uncertain {
+        ChatItemSubtitle::Status("sending request…".to_string())
+    } else if contact.awaiting_acceptance {
+        ChatItemSubtitle::Status("waiting for acceptance".to_string())
     } else if let Some(msg) = &contact.last_message {
         ChatItemSubtitle::Message(msg.clone())
     } else {

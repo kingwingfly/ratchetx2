@@ -14,30 +14,29 @@ crate-type = ["cdylib"]
 
 [dependencies]
 base64.workspace = true
+const-hex.workspace = true
 futures-util = { workspace = true, features = ["alloc"] }
 getrandom = { workspace = true, features = ["wasm_js"] }
 hmac.workspace = true
 postcard.workspace = true
 prost.workspace = true
-protocol = { path = "../protocol", features = ["server", "connect", "pq"] }
+protocol = { path = "../protocol", features = ["server", "connect"] }
 serde.workspace = true
 serde_bytes = "0.11"
 serde_json.workspace = true
 sha2.workspace = true
-storage = { path = "../storage", default-features = false, features = ["pq"] }
+storage = { path = "../storage", default-features = false, features = ["serde"] }
+subtle.workspace = true
 # The `#[durable_object]` macro expands to wasm-bindgen code.
 wasm-bindgen.workspace = true
 worker = "0.9"
 xeddsa = { path = "../xeddsa" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-storage = { path = "../storage", features = ["memory", "pq"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+storage = { path = "../storage", features = ["memory", "serde"] }
 
 [features]
-default = ["pq"]
-# Retained as a no-op feature for compatibility; handshake.v2 and mailbox.v2 routes & storage are
-# always enabled (zero ML-KEM deps) and controlled at runtime via `PQ_ENABLED`.
-pq = []
 # `POST /conformance` runs the storage conformance suites against the bindings, which must be
 # empty, e.g. a fresh `wrangler dev`. Never deploy it.
 conformance = ["storage/testing"]

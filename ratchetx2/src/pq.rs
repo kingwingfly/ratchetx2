@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::CryptoError;
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+#[cfg(any(feature = "serde", feature = "prost"))]
 use crate::error::MalformedState;
 
 /// Length of an ML-KEM `(d, z)` seed in bytes.
@@ -46,10 +46,6 @@ const KEM_ID_DOMAIN: &[u8] = b"ratchetx2.pq.v1/id\0";
 #[non_exhaustive]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub enum PqSuite {
     /// FIPS 203 ML-KEM-1024 (NIST Category 5: 1568-byte ek, 1568-byte ct, 32-byte ss).
     #[cfg(feature = "ml-kem-1024")]
@@ -155,18 +151,6 @@ impl<'de> serde::Deserialize<'de> for PqSuite {
     }
 }
 
-#[cfg(feature = "rkyv")]
-impl ArchivedPqSuite {
-    fn to_suite(&self) -> PqSuite {
-        match self {
-            #[cfg(feature = "ml-kem-1024")]
-            ArchivedPqSuite::MlKem1024 => PqSuite::MlKem1024,
-            #[cfg(feature = "ml-kem-768")]
-            ArchivedPqSuite::MlKem768 => PqSuite::MlKem768,
-        }
-    }
-}
-
 /// Compute the deterministic 16-byte key identifier for an encapsulation key:
 /// `SHA-256(b"ratchetx2.pq.v1/id\0" || [suite.id()] || ek)[..16]`.
 pub fn kem_key_id(suite: PqSuite, ek: &[u8]) -> [u8; KEM_KEY_ID_LENGTH] {
@@ -203,10 +187,6 @@ impl KemHeader {
 /// Rekey cadence configuration for [`KemRatchet`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct KemRatchetConfig {
     /// Number of messages sent or received since the last KEM mix before offering a fresh KEM key.
     /// Set to `0` to disable message-count-triggered rekeying.
@@ -237,10 +217,6 @@ impl KemRatchetConfig {
 
 /// 64-byte FIPS 203 `(d, z)` seed wrapper that zeroizes on drop and never prints secrets.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 struct KemSeed([u8; KEM_SEED_LENGTH]);
 
 impl KemSeed {
@@ -311,10 +287,6 @@ impl<'de> serde::Deserialize<'de> for KemSeed {
 /// Pending local KEM offer awaiting encapsulation by the peer.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 struct PendingOffer {
     id: [u8; KEM_KEY_ID_LENGTH],
     seed: KemSeed,
@@ -414,10 +386,6 @@ where
 /// Ciphertext retransmitted on every message of the current sending chain.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 struct ActiveSendCt {
     ek_id: [u8; KEM_KEY_ID_LENGTH],
     #[cfg_attr(
@@ -439,10 +407,6 @@ impl fmt::Debug for ActiveSendCt {
 /// Peer's offered encapsulation key queued for our next sending chain.
 #[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 struct PeerPendingEk {
     ek_id: [u8; KEM_KEY_ID_LENGTH],
     #[cfg_attr(
@@ -478,17 +442,12 @@ fn header_ct_pin(header: &KemHeader) -> RecvCtPin {
 /// offers resolve deterministically without deadlocking.
 ///
 /// Supports [`Clone`] for tentative execution before AEAD verification and serializes with
-/// `serde`, `rkyv`, and `prost`.
+/// `prost` and `serde`.
 #[derive(Clone)]
 #[cfg_attr(
     feature = "serde",
     derive(serde::Serialize, serde::Deserialize),
     serde(try_from = "KemRatchetUnchecked")
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct KemRatchet {
     suite: PqSuite,
@@ -506,12 +465,10 @@ pub struct KemRatchet {
     /// `prepare_send` calls do not re-expand from seed. Skipped on serialization to keep wire
     /// state seed-only and postcard-compatible.
     #[cfg_attr(feature = "serde", serde(skip))]
-    #[cfg_attr(feature = "rkyv", rkyv(with = rkyv::with::Skip))]
     active_offer_ek: Option<([u8; KEM_KEY_ID_LENGTH], Vec<u8>)>,
     /// Transient pin of the `(ek_id, SHA-256(ct))` seen on the current receiving chain so
     /// mid-chain retransmissions with a mismatched `ek_id` or `ct` are rejected.
     #[cfg_attr(feature = "serde", serde(skip))]
-    #[cfg_attr(feature = "rkyv", rkyv(with = rkyv::with::Skip))]
     current_recv_ct_pin: Option<RecvCtPin>,
 }
 
@@ -924,7 +881,7 @@ impl KemRatchet {
     }
 }
 
-#[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+#[cfg(any(feature = "serde", feature = "prost"))]
 fn validate_kem_ratchet_state<'a>(
     suite: PqSuite,
     pending_offers: impl Iterator<Item = ([u8; KEM_KEY_ID_LENGTH], &'a [u8; KEM_SEED_LENGTH])>,
@@ -1087,40 +1044,6 @@ impl TryFrom<KemRatchetUnchecked> for KemRatchet {
         };
         ratchet.validate()?;
         Ok(ratchet)
-    }
-}
-
-#[cfg(feature = "rkyv")]
-impl ArchivedKemRatchet {
-    /// The ML-KEM parameter suite used by this archived ratchet.
-    pub fn suite(&self) -> PqSuite {
-        self.suite.to_suite()
-    }
-}
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedKemRatchet
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> Result<(), C::Error> {
-        use rkyv::rancor::Source;
-        validate_kem_ratchet_state(
-            self.suite(),
-            self.pending_offers
-                .iter()
-                .map(|offer| (offer.id, &offer.seed.0)),
-            self.active_offer_id.as_ref().copied(),
-            self.active_send_ct
-                .as_ref()
-                .map(|a| (a.ek_id, a.ct.as_slice())),
-            self.peer_pending_ek
-                .as_ref()
-                .map(|p| (p.ek_id, p.ek.as_slice())),
-            self.encapsulated_ek_ids.iter().copied(),
-        )
-        .map_err(C::Error::new)
     }
 }
 
@@ -1549,7 +1472,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[cfg(any(feature = "serde", feature = "prost"))]
     fn serialization_roundtrip_and_invalid_state_rejection() {
         for suite in enabled_suites() {
             let mut alice = KemRatchet::new(suite);
@@ -1575,27 +1498,6 @@ mod test {
                 oversized["encapsulated_ek_ids"] =
                     serde_json::to_value(vec![[1u8; 16]; MAX_ENCAPSULATED_HISTORY + 1]).unwrap();
                 assert!(serde_json::from_value::<KemRatchet>(oversized).is_err());
-            }
-
-            #[cfg(feature = "rkyv")]
-            {
-                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&alice).unwrap();
-                let mut restored =
-                    rkyv::from_bytes::<KemRatchet, rkyv::rancor::Error>(&bytes).unwrap();
-                let (ss, _) = restored.receive_chain_step(&h_b0).unwrap();
-                assert!(ss.is_some());
-
-                // Corrupted offer id fails rkyv Verify.
-                let mut bad_offer = alice.clone();
-                bad_offer.pending_offers[0].id[0] ^= 0xFF;
-                let bad_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bad_offer).unwrap();
-                assert!(rkyv::from_bytes::<KemRatchet, rkyv::rancor::Error>(&bad_bytes).is_err());
-
-                // Dangling active_offer_id fails rkyv Verify.
-                let mut bad_active = alice.clone();
-                bad_active.active_offer_id = Some([0xAA; KEM_KEY_ID_LENGTH]);
-                let bad_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bad_active).unwrap();
-                assert!(rkyv::from_bytes::<KemRatchet, rkyv::rancor::Error>(&bad_bytes).is_err());
             }
 
             #[cfg(feature = "prost")]

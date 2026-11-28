@@ -11,12 +11,18 @@ publish = false
 [dependencies]
 bytes.workspace = true
 parking_lot = { version = "0.13", optional = true }
+serde = { workspace = true, optional = true }
+serde-big-array = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+subtle = { workspace = true, optional = true }
 thiserror.workspace = true
 trait-variant.workspace = true
 web-time = { workspace = true, optional = true }
 
 [dev-dependencies]
 futures.workspace = true
+postcard.workspace = true
+serde_json.workspace = true
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
 xeddsa = { path = "../xeddsa" }
@@ -24,8 +30,8 @@ xeddsa = { path = "../xeddsa" }
 [features]
 default = ["memory"]
 # In-memory backend, for tests and development servers.
-memory = ["dep:parking_lot", "dep:web-time"]
-# Optional post-quantum handshake & idempotent mailbox storage traits (zero ML-KEM deps).
-pq = []
+memory = ["dep:parking_lot", "dep:sha2", "dep:subtle", "dep:web-time"]
+# Derive `serde::Serialize` and `serde::Deserialize` on storage records for RPC/DO serialization.
+serde = ["dep:serde", "dep:serde-big-array", "bytes/serde"]
 # Conformance suites every backend should pass.
 testing = []

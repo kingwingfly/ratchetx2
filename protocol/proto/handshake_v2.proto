@@ -70,12 +70,6 @@ message GetServerInfoResponse {
   bool pq_ratchet_supported = 3;
   // Canonical server audience identifier bound into signed v2 requests and manifests.
   string server_id = 4;
-  // Deprecated compatibility flag kept at false for wire stability: whether legacy v1
-  // handshake/mailbox routes are enabled.
-  bool legacy_v1_enabled = 5;
-  // Deprecated compatibility flag kept at false for wire stability: whether unsigned legacy
-  // v1 mailbox Fetch requests are allowed.
-  bool allow_unsigned_fetch = 6;
 }
 
 // Publish a signed CapabilityManifest along with classical and optional PQ prekeys.
@@ -213,7 +207,7 @@ message SendInitialV2Response {
   uint64 id = 1;
 }
 
-// Recipient-signed non-destructive listing of pending inbox initial messages (both v1 and v2).
+// Recipient-signed non-destructive listing of pending inbox initial messages.
 message ListInitialMessagesRequest {
   // Relay audience / server identifier.
   string audience = 1;
@@ -225,12 +219,16 @@ message ListInitialMessagesRequest {
   uint64 timestamp = 4;
   // Recipient's XEdDSA signature (64 bytes) over canonical ListInitialMessages signing input.
   bytes signature = 5;
+  // Cursor: return initial messages strictly after this inbox ID (0 for the start).
+  uint64 after_id = 6;
 }
 
 // Reply to ListInitialMessagesRequest.
 message ListInitialMessagesResponse {
-  // Pending initial messages (both v1 and v2), oldest first.
+  // Pending initial messages (both classical X3DH v1 and PQXDH v2), oldest first.
   repeated InitialMessageV2 messages = 1;
+  // Whether additional initial messages remain after the last returned item.
+  bool has_more = 2;
 }
 
 // Recipient-signed explicit acknowledgement deleting only the specified inbox message IDs.

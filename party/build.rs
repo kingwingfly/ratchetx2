@@ -1,7 +1,5 @@
 const SERDE: &str =
     r#"#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]"#;
-const RKYV: &str =
-    r#"#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]"#;
 /// The message format, from `proto/party.proto`.
 const WIRE: [&str; 2] = [".party.v1.EncryptedMessage", ".party.v1.Header"];
 /// The party's secret-holding state messages, from `proto/party_state.proto`, with `prost`.
@@ -13,15 +11,17 @@ const STATE: [&str; 3] = [
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rustc-check-cfg=cfg(has_pq)");
+    if cfg!(any(feature = "ml-kem-1024", feature = "ml-kem-768")) {
+        println!("cargo:rustc-cfg=has_pq");
+    }
     let mut protos = vec!["proto/party.proto"];
     let mut includes = vec!["proto"];
     let mut config = prost_build::Config::new();
     config.bytes(WIRE);
-    // The party's state has its own serde and rkyv impls, on `Party`.
+    // The party's state has its own serde impl, on `Party`.
     for message in WIRE {
-        config
-            .type_attribute(message, SERDE)
-            .type_attribute(message, RKYV);
+        config.type_attribute(message, SERDE);
     }
     if cfg!(feature = "prost") {
         protos.push("proto/party_state.proto");

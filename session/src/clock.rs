@@ -5,6 +5,13 @@ use std::sync::{
     atomic::{AtomicI64, Ordering},
 };
 
+use crate::error::{ErrorKind, Result};
+
+/// Maximum default absolute drift (24 hours, in milliseconds) tolerated between the local device
+/// clock and the server's observed `Date` before security-sensitive manifest operations fail
+/// closed with [`ErrorKind::ClockSkew`].
+pub const DEFAULT_MAX_TRUSTED_DRIFT_MS: u64 = 24 * 60 * 60 * 1000;
+
 /// A server's clock, as this device sees it from the `Date` of the server's responses.
 ///
 /// The server takes the requests it checks the time of, such as a subscription, only within
@@ -13,16 +20,77 @@ use std::sync::{
 /// is off, e.g. set by hand, still makes requests that the server takes. Until a response tells
 /// the server's time, it is this device's clock. Its clones share it, so that a transport can
 /// learn it for a client.
-#[derive(Debug, Clone, Default)]
+///
+/// For security-sensitive capability-manifest freshness and issuance checks, callers use
+/// [`Self::trusted_clock_pair`], which fails closed with [`ErrorKind::ClockSkew`] whenever the
+/// local clock is invalid (`0` or above [`protocol::MAX_SAFE_INTEGER`]) or the observed drift
+/// exceeds `max_trusted_drift_ms` (defaulting to [`DEFAULT_MAX_TRUSTED_DRIFT_MS`]).
+#[derive(Debug, Clone)]
 pub struct ServerClock {
     /// The server's clock less this device's, in milliseconds.
     offset: Arc<AtomicI64>,
+    /// Maximum absolute drift (ms) trusted by [`Self::trusted_clock_pair`].
+    max_trusted_drift_ms: u64,
+}
+
+impl Default for ServerClock {
+    fn default() -> Self {
+        Self::with_max_drift(DEFAULT_MAX_TRUSTED_DRIFT_MS)
+    }
 }
 
 impl ServerClock {
+    /// Create a clock with a custom maximum trusted drift threshold (in milliseconds) for
+    /// [`Self::trusted_clock_pair`].
+    pub fn with_max_drift(max_trusted_drift_ms: u64) -> Self {
+        Self {
+            offset: Arc::new(AtomicI64::new(0)),
+            max_trusted_drift_ms,
+        }
+    }
+
     /// The server's time now, in milliseconds since the Unix epoch.
+    ///
+    /// Intended for relay-authenticated request timestamps checked within
+    /// [`protocol::MAX_CLOCK_SKEW`]. Security-sensitive manifest checks use
+    /// [`Self::trusted_clock_pair`].
     pub fn now(&self) -> u64 {
         crate::now().saturating_add_signed(self.offset.load(Ordering::Relaxed))
+    }
+
+    /// The observed offset (`server_time - local_time`) in milliseconds.
+    pub fn offset_ms(&self) -> i64 {
+        self.offset.load(Ordering::Relaxed)
+    }
+
+    /// Whether the observed offset exceeds this clock's maximum trusted drift threshold.
+    pub fn is_drift_exceeded(&self) -> bool {
+        self.offset_ms().unsigned_abs() > self.max_trusted_drift_ms
+    }
+
+    /// Return `(local_now, server_now)` in milliseconds since the Unix epoch, failing closed with
+    /// [`ErrorKind::ClockSkew`] if the local clock is invalid (`0` or above
+    /// [`protocol::MAX_SAFE_INTEGER`]), if `|server_now - local_now|` exceeds this clock's
+    /// maximum trusted drift threshold, or if `server_now` is out of range.
+    pub fn trusted_clock_pair(&self) -> Result<(u64, u64)> {
+        self.trusted_clock_pair_at(crate::now())
+    }
+
+    pub(crate) fn trusted_clock_pair_at(&self, local: u64) -> Result<(u64, u64)> {
+        if local == 0 || local > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::ClockSkew.into());
+        }
+        let offset = self.offset_ms();
+        if offset.unsigned_abs() > self.max_trusted_drift_ms {
+            return Err(ErrorKind::ClockSkew.into());
+        }
+        let server = local
+            .checked_add_signed(offset)
+            .ok_or(ErrorKind::ClockSkew)?;
+        if server == 0 || server > protocol::MAX_SAFE_INTEGER {
+            return Err(ErrorKind::ClockSkew.into());
+        }
+        Ok((local, server))
     }
 
     /// Learn that the server's time is `server_time`, in milliseconds since the Unix epoch.
@@ -173,5 +241,65 @@ mod test {
         assert!(clock.observe_date("Thu, 01 Jan 1970 00:00:10 GMT"));
         assert!(clock.now().abs_diff(10_500) < 1000);
         assert!(!clock.observe_date("yesterday"));
+    }
+
+    #[test]
+    fn trusted_clock_pair_enforces_local_validity_and_drift_cap() {
+        let clock = ServerClock::default();
+        assert_eq!(clock.offset_ms(), 0);
+        assert!(!clock.is_drift_exceeded());
+        let (local, server) = clock.trusted_clock_pair().unwrap();
+        assert_eq!(local, server);
+
+        // Broken / pre-epoch or above-MAX_SAFE_INTEGER local clocks fail closed with ClockSkew.
+        assert_eq!(
+            clock.trusted_clock_pair_at(0).unwrap_err().kind(),
+            ErrorKind::ClockSkew
+        );
+        assert_eq!(
+            clock
+                .trusted_clock_pair_at(protocol::MAX_SAFE_INTEGER + 1)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::ClockSkew
+        );
+
+        // Exact ±24h boundary passes; ±25h fails closed with ClockSkew (no silent clamping).
+        let now = 1_750_000_000_000u64;
+        clock
+            .offset
+            .store(DEFAULT_MAX_TRUSTED_DRIFT_MS as i64, Ordering::Relaxed);
+        assert!(!clock.is_drift_exceeded());
+        assert_eq!(
+            clock.trusted_clock_pair_at(now).unwrap(),
+            (now, now + DEFAULT_MAX_TRUSTED_DRIFT_MS)
+        );
+        clock
+            .offset
+            .store(-(DEFAULT_MAX_TRUSTED_DRIFT_MS as i64), Ordering::Relaxed);
+        assert!(!clock.is_drift_exceeded());
+        assert_eq!(
+            clock.trusted_clock_pair_at(now).unwrap(),
+            (now, now - DEFAULT_MAX_TRUSTED_DRIFT_MS)
+        );
+
+        let twenty_five_hours = 25 * 60 * 60 * 1000i64;
+        for bad_offset in [twenty_five_hours, -twenty_five_hours] {
+            clock.offset.store(bad_offset, Ordering::Relaxed);
+            assert!(clock.is_drift_exceeded());
+            assert_eq!(
+                clock.trusted_clock_pair_at(now).unwrap_err().kind(),
+                ErrorKind::ClockSkew
+            );
+        }
+
+        // Custom drift threshold works as configured.
+        let strict = ServerClock::with_max_drift(60_000);
+        strict.offset.store(60_001, Ordering::Relaxed);
+        assert!(strict.is_drift_exceeded());
+        assert_eq!(
+            strict.trusted_clock_pair_at(now).unwrap_err().kind(),
+            ErrorKind::ClockSkew
+        );
     }
 }

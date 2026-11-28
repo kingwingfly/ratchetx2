@@ -3,8 +3,8 @@ name = "e2ee_chat_preview"
 version = "0.3.0"
 edition.workspace = true
 publish = false
-description = "The E2EE chat web client's file previews that run in web workers: PDF pages, Mermaid diagrams and highlighted code."
-keywords = ["E2EE", "preview", "pdf", "mermaid", "tree-sitter"]
+description = "The E2EE chat web client's file previews that run in web workers: PDF pages, Mermaid diagrams, Markdown/MathML, and highlighted code."
+keywords = ["E2EE", "preview", "pdf", "mermaid", "markdown", "tree-sitter"]
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -16,6 +16,7 @@ pdf = ["dep:hayro"]
 audio = ["dep:lofty"]
 search = ["dep:regex"]
 diagram = ["dep:merman", "dep:serde_json"]
+markdown = ["dep:ammonia", "dep:data-url", "dep:pulldown-cmark", "dep:pulldown-latex"]
 code-web = [
     "dep:arborium",
     "dep:arborium-css",
@@ -74,6 +75,7 @@ rpc = ["dep:js-sys", "dep:wasm-bindgen"]
 worker = ["rpc", "dep:console_error_panic_hook", "dep:web-sys"]
 
 [dependencies]
+ammonia = { version = "4", optional = true }
 # Tree-sitter's grammars and highlight queries, a crate a language: each worker links only its own.
 arborium = { version = "2.18", optional = true }
 arborium-bash = { version = "2.18", optional = true }
@@ -117,15 +119,23 @@ arborium-xml = { version = "2.18", optional = true }
 arborium-yaml = { version = "2.18", optional = true }
 arborium-zig = { version = "2.18", optional = true }
 console_error_panic_hook = { workspace = true, optional = true }
+data-url = { version = "0.3", optional = true }
 hayro = { version = "0.9", optional = true }
+infer = { version = "0.19", default-features = false }
 js-sys = { workspace = true, optional = true }
 lofty = { version = "0.25", optional = true }
+# Without the ELK layout (EPL-2.0) or embedded KaTeX math fonts (`math` feature).
+merman = { version = "0.11", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"], optional = true }
+mime = "0.3"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"], optional = true }
+pulldown-latex = { version = "0.8", optional = true }
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"], optional = true }
-# Without the ELK layout, which is under the EPL-2.0.
-merman = { version = "0.11", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape", "math"], optional = true }
 serde_json = { workspace = true, optional = true }
 wasm-bindgen = { workspace = true, optional = true }
 web-sys = { workspace = true, features = ["console", "DedicatedWorkerGlobalScope", "MessageEvent"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 # The workers, which the web client's trunk build compiles to WebAssembly.
 [[bin]]
@@ -143,6 +153,10 @@ required-features = ["search", "worker"]
 [[bin]]
 name = "preview_diagram"
 required-features = ["diagram", "worker"]
+
+[[bin]]
+name = "preview_markdown"
+required-features = ["markdown", "worker"]
 
 [[bin]]
 name = "preview_code_web"

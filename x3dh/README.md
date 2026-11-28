@@ -10,8 +10,8 @@ Nothing in an initial message shows that it is Alice's: anyone can send one clai
 
 # Features
 
-- **serde**, **rkyv**: derive their traits on [`PrekeyBundle`] and [`InitialMessage`], and on [`LocalPrekeys`], which serializes with its private keys, to keep them between runs.
-- **prost**: [`LocalPrekeys`] as protobuf messages too, defined in `proto/x3dh.proto` (package `x3dh.v1`) so other languages can read them; [protox](https://crates.io/crates/protox) compiles it, so `protoc` is not needed. The bundle and the initial message are in the protocol's `handshake.proto`.
+- **prost**: portable, versioned protobuf persistence format for [`LocalPrekeys`], defined in `proto/x3dh.proto` (package `x3dh.v1`) so other languages can read them; [protox](https://crates.io/crates/protox) compiles it, so `protoc` is not needed. The bundle and the initial message are in the protocol's `handshake.proto`.
+- **serde**: derive its traits on [`PrekeyBundle`] and [`InitialMessage`], and on [`LocalPrekeys`], which serializes with its private keys, to keep them between runs.
 
 On `wasm32-unknown-unknown`, enable getrandom's `wasm_js` feature in the final application.
 

@@ -11,6 +11,7 @@ use arborium::{Config, GrammarStore, Highlighter, HtmlFormat};
 
 use crate::Worker;
 use crate::rpc::{Method, Request, Response, WorkerService};
+pub use crate::validate_highlight_html;
 
 #[cfg(doc)]
 use crate::language::Group;
@@ -102,77 +103,6 @@ impl WorkerService for Code {
             other => Err(format!("no method {}", other.method().as_str())),
         }
     }
-}
-
-/// Strictly validate highlighted HTML output in O(N): only balanced `<span class="hl-[a-z0-9_-]+">`
-/// and `</span>` tags plus entity-escaped text (no raw `<`, `>`, or malformed `&` entities).
-pub fn validate_highlight_html(html: &str) -> Result<(), String> {
-    const OPEN_PREFIX: &[u8] = b"<span class=\"hl-";
-    const CLOSE_TAG: &[u8] = b"</span>";
-
-    let bytes = html.as_bytes();
-    let mut i = 0usize;
-    let mut depth = 0usize;
-
-    while i < bytes.len() {
-        match bytes[i] {
-            b'<' => {
-                if bytes[i..].starts_with(CLOSE_TAG) {
-                    if depth == 0 {
-                        return Err("unexpected closing span in highlighted HTML".to_string());
-                    }
-                    depth -= 1;
-                    i += CLOSE_TAG.len();
-                } else if bytes[i..].starts_with(OPEN_PREFIX) {
-                    i += OPEN_PREFIX.len();
-                    let name_start = i;
-                    while i < bytes.len()
-                        && (bytes[i].is_ascii_lowercase()
-                            || bytes[i].is_ascii_digit()
-                            || bytes[i] == b'_'
-                            || bytes[i] == b'-')
-                    {
-                        i += 1;
-                    }
-                    if i == name_start || !bytes[i..].starts_with(b"\">") {
-                        return Err("invalid highlight span tag in HTML".to_string());
-                    }
-                    depth += 1;
-                    i += 2;
-                } else {
-                    return Err("disallowed tag in highlighted HTML".to_string());
-                }
-            }
-            b'>' => {
-                return Err("unescaped '>' in highlighted HTML".to_string());
-            }
-            b'&' => {
-                let rest = &bytes[i + 1..];
-                let Some(semi) = rest.iter().position(|&b| b == b';') else {
-                    return Err("unescaped '&' in highlighted HTML".to_string());
-                };
-                let entity = &rest[..semi];
-                let valid = matches!(entity, b"amp" | b"lt" | b"gt" | b"quot" | b"apos")
-                    || (entity.len() >= 2
-                        && entity[0] == b'#'
-                        && entity[1..].iter().all(u8::is_ascii_digit))
-                    || (entity.len() >= 3
-                        && entity[0] == b'#'
-                        && matches!(entity[1], b'x' | b'X')
-                        && entity[2..].iter().all(u8::is_ascii_hexdigit));
-                if !valid {
-                    return Err("invalid HTML entity in highlighted HTML".to_string());
-                }
-                i += semi + 2;
-            }
-            _ => i += 1,
-        }
-    }
-
-    if depth != 0 {
-        return Err("unclosed span in highlighted HTML".to_string());
-    }
-    Ok(())
 }
 
 /// A function returning the [`Code`] of the languages it lists, by name and arborium's crate,

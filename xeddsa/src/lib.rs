@@ -87,17 +87,12 @@ pub type Result<T> = core::result::Result<T, Error>;
 
 /// XEdDSA private key.
 ///
-/// With the `serde` or `rkyv` feature, it serializes as its scalar, like
+/// With the `serde` feature, it serializes as its scalar, like
 /// [`to_bytes`](Self::to_bytes): keep the output secret.
 #[derive(Zeroize, ZeroizeOnDrop)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "RawXEdDSAPrivateKey"))]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
 pub struct XEdDSAPrivateKey {
-    #[cfg_attr(feature = "rkyv", rkyv(with = ScalarDef))]
     private_key: Scalar,
 }
 
@@ -114,44 +109,6 @@ impl TryFrom<RawXEdDSAPrivateKey> for XEdDSAPrivateKey {
 
     fn try_from(raw: RawXEdDSAPrivateKey) -> core::result::Result<Self, Self::Error> {
         Self::try_from(raw.private_key)
-    }
-}
-
-/// Archives a [`Scalar`] as its canonical non-zero bytes.
-#[cfg(feature = "rkyv")]
-#[derive(Zeroize, ZeroizeOnDrop, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-#[rkyv(remote = Scalar, bytecheck(verify))]
-struct ScalarDef {
-    #[rkyv(getter = Scalar::to_bytes)]
-    bytes: [u8; PRIVATE_KEY_LENGTH],
-}
-
-#[cfg(feature = "rkyv")]
-#[derive(Debug, Error)]
-#[error("invalid XEdDSA private scalar (non-canonical or zero)")]
-struct InvalidScalarError;
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedScalarDef
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        if XEdDSAPrivateKey::from_bytes(self.bytes).is_none() {
-            rkyv::rancor::fail!(InvalidScalarError);
-        }
-        Ok(())
-    }
-}
-
-#[cfg(feature = "rkyv")]
-impl From<ScalarDef> for Scalar {
-    fn from(scalar: ScalarDef) -> Self {
-        Scalar::from_canonical_bytes(scalar.bytes)
-            .into_option()
-            .filter(|s| *s != Scalar::ZERO)
-            .expect("rkyv archived scalar must be canonical and non-zero")
     }
 }
 
@@ -691,25 +648,5 @@ mod test {
 
         let non_canon_json = format!("{{\"private_key\":{:?}}}", [0xffu8; 32]);
         assert!(serde_json::from_str::<XEdDSAPrivateKey>(&non_canon_json).is_err());
-    }
-
-    #[cfg(feature = "rkyv")]
-    #[test]
-    fn rkyv_rejects_zero_and_non_canonical_scalars() {
-        let valid = XEdDSAPrivateKey::generate();
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&valid).unwrap();
-        let restored = rkyv::from_bytes::<XEdDSAPrivateKey, rkyv::rancor::Error>(&bytes).unwrap();
-        assert_eq!(
-            valid.compute_public_key().to_bytes(),
-            restored.compute_public_key().to_bytes()
-        );
-
-        let zero_bytes = [0u8; PRIVATE_KEY_LENGTH];
-        assert!(rkyv::from_bytes::<XEdDSAPrivateKey, rkyv::rancor::Error>(&zero_bytes).is_err());
-
-        let non_canon_bytes = [0xffu8; PRIVATE_KEY_LENGTH];
-        assert!(
-            rkyv::from_bytes::<XEdDSAPrivateKey, rkyv::rancor::Error>(&non_canon_bytes).is_err()
-        );
     }
 }

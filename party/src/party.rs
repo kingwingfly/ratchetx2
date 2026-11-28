@@ -1,12 +1,10 @@
 //! The party who participates in the E2EE chat.
 
+mod kem;
 mod skipped;
 #[cfg(feature = "serde")]
 mod wire;
-#[cfg(all(
-    feature = "serde",
-    any(feature = "ml-kem-1024", feature = "ml-kem-768")
-))]
+#[cfg(all(feature = "serde", has_pq))]
 pub use wire::LegacyPartyPqV1;
 #[cfg(feature = "serde")]
 pub use wire::{LegacyPartyV0, LegacyPartyV1};
@@ -21,8 +19,12 @@ use bytes::Bytes;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac, digest::OutputSizeUser};
 use prost::Message as _;
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-use ratchetx2::pq::{KEM_KEY_ID_LENGTH, KemHeader, KemRatchet, KemRatchetConfig, PqSuite};
+#[cfg(all(test, has_pq))]
+use ratchetx2::pq::KEM_KEY_ID_LENGTH;
+#[cfg(all(feature = "serde", has_pq))]
+use ratchetx2::pq::KemRatchet;
+#[cfg(has_pq)]
+use ratchetx2::pq::{KemRatchetConfig, PqSuite};
 use ratchetx2::{
     Ratchet,
     error::CryptoError,
@@ -32,9 +34,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+use self::kem::KemState;
 use self::skipped::{EvictedSet, SkippedChain, SkippedKeys};
-#[cfg(any(feature = "serde", feature = "prost", feature = "rkyv"))]
-use self::skipped::{EvictionState, SkippedState};
 use crate::{
     error::{Error, ErrorKind, Result},
     proto::{EncryptedMessage, Header},
@@ -47,36 +48,26 @@ pub const SKIP_MAX: u64 = 1024;
 /// kept; a message delayed longer cannot be decrypted.
 pub const MAX_SKIPPED_CHAINS: usize = 5;
 
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[cfg(has_pq)]
 const _: () = assert!(ratchetx2::pq::MAX_ENCAPSULATED_HISTORY > MAX_SKIPPED_CHAINS);
 
 /// The party who participates in the E2EE chat: encrypts and decrypts messages, without I/O.
 /// See the example in the [crate docs](crate).
 ///
-/// To keep a session between runs, it serializes with the `serde` or `rkyv` feature, and with
-/// `prost` it converts to and from `proto::Party`, all with its keys: keep the output secret.
+/// To keep a session between runs, it converts to and from `proto::Party` with the `prost`
+/// feature (portable versioned persistence), and serializes with `serde`, all with its keys:
+/// keep the output secret.
 ///
 /// Serde version 2 starts with version and capability bytes. Capability 0 identifies a
 /// classical party, 1 identifies ML-KEM-1024, and 2 identifies ML-KEM-768. The final
 /// field is the KEM state option in every build.
 #[cfg_attr(
-    all(
-        feature = "serde",
-        not(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
-    ),
+    all(feature = "serde", not(has_pq)),
     doc = "For unversioned positional records, select [`LegacyPartyV0`] or [`LegacyPartyV1`] using the enclosing storage format."
 )]
 #[cfg_attr(
-    all(
-        feature = "serde",
-        any(feature = "ml-kem-1024", feature = "ml-kem-768")
-    ),
+    all(feature = "serde", has_pq),
     doc = "For unversioned positional records, select [`LegacyPartyV0`], [`LegacyPartyV1`], or [`LegacyPartyPqV1`] using the enclosing storage format."
-)]
-#[cfg_attr(
-    feature = "rkyv",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize),
-    rkyv(bytecheck(verify))
 )]
 pub struct Party {
     ratchet: Ratchet,
@@ -91,65 +82,44 @@ pub struct Party {
     associated_data: Vec<u8>,
     /// Message numbers whose skipped keys were evicted on the current receiving chain.
     current_chain_evicted: EvictedSet,
-    /// Optional post-quantum KEM ratchet state; `None` in classical sessions.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    kem_ratchet: Option<KemRatchet>,
+    /// Optional post-quantum KEM ratchet state (`None` in classical sessions; zero-sized when no
+    /// ML-KEM suite is compiled in).
+    kem_ratchet: KemState,
 }
 
-/// Zero-copy read-only view of a [`Party`] or archived `ArchivedParty`, allowing callers such as
-/// `session` to inspect PQ state and associated data without deserializing secret keys onto the
-/// heap.
-pub trait PartyView {
-    /// Whether post-quantum KEM ratcheting is active on this party.
-    fn is_pq_ratchet_active(&self) -> bool;
-
-    /// Wire identifier (`1` = ML-KEM-1024, `2` = ML-KEM-768) of the active PQ KEM suite, if any.
-    fn pq_suite_id(&self) -> Option<u8>;
-
-    /// Associated data bound to every header and message in this session.
-    fn associated_data(&self) -> &[u8];
+/// Crate-private tentative staging transaction for `(Ratchet, KemState)` mutations.
+///
+/// Clones only `(Ratchet, KemState)` (never [`SkippedKeys`]) so failed encrypt/decrypt paths
+/// leave the [`Party`] untouched and zeroize staged secret material on drop.
+struct RatchetTx<'a> {
+    party: &'a mut Party,
+    ratchet: Ratchet,
+    kem: KemState,
 }
 
-impl PartyView for Party {
-    fn is_pq_ratchet_active(&self) -> bool {
-        self.is_pq_ratchet_active()
-    }
-
-    fn pq_suite_id(&self) -> Option<u8> {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet.as_ref().map(|k| k.suite().id())
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            None
+impl<'a> RatchetTx<'a> {
+    fn begin(party: &'a mut Party) -> Self {
+        let ratchet = party.ratchet.clone();
+        let kem = party.kem_ratchet.clone();
+        Self {
+            party,
+            ratchet,
+            kem,
         }
     }
 
-    fn associated_data(&self) -> &[u8] {
-        self.associated_data()
+    /// Commit staged `(Ratchet, KemState)` into `self.party`; the replaced pre-step state is
+    /// swapped into `self` and zeroized on drop.
+    fn commit(mut self) {
+        core::mem::swap(&mut self.party.ratchet, &mut self.ratchet);
+        core::mem::swap(&mut self.party.kem_ratchet, &mut self.kem);
     }
 }
 
-#[cfg(feature = "rkyv")]
-impl PartyView for ArchivedParty {
-    fn is_pq_ratchet_active(&self) -> bool {
-        self.is_pq_ratchet_active()
-    }
-
-    fn pq_suite_id(&self) -> Option<u8> {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet.as_ref().map(|k| k.suite().id())
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            None
-        }
-    }
-
-    fn associated_data(&self) -> &[u8] {
-        self.associated_data()
+impl Drop for RatchetTx<'_> {
+    fn drop(&mut self) {
+        self.ratchet.zeroize();
+        self.kem.zeroize();
     }
 }
 
@@ -192,21 +162,20 @@ impl Party {
             message_number_receiver: 0,
             associated_data: associated_data.as_ref().to_vec(),
             current_chain_evicted: EvictedSet::default(),
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            kem_ratchet: None,
+            kem_ratchet: KemState::disabled(),
         }
     }
 
     /// Create a party with post-quantum KEM ratcheting enabled using default cadence.
     /// The ratchet must meet the message-boundary precondition of [`Self::new`].
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[cfg(has_pq)]
     pub fn new_pq(ratchet: Ratchet, associated_data: impl AsRef<[u8]>, suite: PqSuite) -> Self {
         Self::new_pq_with_config(ratchet, associated_data, suite, KemRatchetConfig::default())
     }
 
     /// Create a party with post-quantum KEM ratcheting enabled and custom rekey cadence.
     /// The ratchet must meet the message-boundary precondition of [`Self::new`].
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[cfg(has_pq)]
     pub fn new_pq_with_config(
         ratchet: Ratchet,
         associated_data: impl AsRef<[u8]>,
@@ -214,7 +183,7 @@ impl Party {
         config: KemRatchetConfig,
     ) -> Self {
         let mut party = Self::new(ratchet, associated_data);
-        party.kem_ratchet = Some(KemRatchet::with_config(suite, config));
+        party.kem_ratchet = KemState::enabled(suite, config);
         party
     }
 
@@ -223,7 +192,7 @@ impl Party {
     /// If the same `suite` is already enabled, this is a no-op so pending KEM offer seeds and
     /// active ciphertexts are preserved. Returns [`ErrorKind::Crypto`] if a different PQ suite
     /// is already enabled.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[cfg(has_pq)]
     pub fn enable_pq_ratchet(&mut self, suite: PqSuite) -> Result<()> {
         self.enable_pq_ratchet_with_config(suite, KemRatchetConfig::default())
     }
@@ -233,26 +202,24 @@ impl Party {
     /// If the same `suite` is already enabled, this is a no-op so pending KEM offer seeds and
     /// active ciphertexts are preserved. Returns [`ErrorKind::Crypto`] if a different PQ suite
     /// is already enabled.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[cfg(has_pq)]
     pub fn enable_pq_ratchet_with_config(
         &mut self,
         suite: PqSuite,
         config: KemRatchetConfig,
     ) -> Result<()> {
-        if let Some(existing) = &self.kem_ratchet {
-            if existing.suite() == suite {
-                return Ok(());
-            }
-            return Err(ErrorKind::Crypto.into());
-        }
-        self.kem_ratchet = Some(KemRatchet::with_config(suite, config));
-        Ok(())
+        self.kem_ratchet.enable(suite, config)
     }
 
     /// The configured post-quantum KEM suite, if PQ ratcheting is enabled.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[cfg(has_pq)]
     pub fn pq_suite(&self) -> Option<PqSuite> {
-        self.kem_ratchet.as_ref().map(KemRatchet::suite)
+        self.kem_ratchet.suite()
+    }
+
+    /// Wire identifier (`1` = ML-KEM-1024, `2` = ML-KEM-768) of the active PQ KEM suite, if any.
+    pub fn pq_suite_id(&self) -> Option<u8> {
+        self.kem_ratchet.suite_id()
     }
 
     /// Associated data bound to every header and message in this session.
@@ -262,14 +229,7 @@ impl Party {
 
     /// Whether post-quantum KEM ratcheting is active on this party.
     pub fn is_pq_ratchet_active(&self) -> bool {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet.is_some()
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            false
-        }
+        self.kem_ratchet.is_active()
     }
 
     /// Encrypt a message. The party's state only advances if RNG and AEAD encryption succeed.
@@ -282,64 +242,42 @@ impl Party {
             .checked_add(1)
             .ok_or(ErrorKind::Crypto)?;
 
-        let mut ratchet = self.ratchet.clone();
-        let header_key = ratchet
+        let mut tx = RatchetTx::begin(self);
+        let header_key = tx
+            .ratchet
             .header_key_sender()
             .ok_or(ErrorKind::NoSendingChain)?;
-
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let (kem_ratchet, pq_suite, pq_public_key, pq_ciphertext, pq_key_id) = {
-            let mut kem = self.kem_ratchet.clone();
-            let kem_header = match &mut kem {
-                Some(k) => Some(k.prepare_send()?),
-                None => None,
-            };
-            match kem_header {
-                Some(kh) => (
-                    kem,
-                    kh.suite.map(u32::from),
-                    kh.ek.map(Bytes::from),
-                    kh.ct.map(Bytes::from),
-                    kh.ek_id.map(|id| Bytes::copy_from_slice(&id)),
-                ),
-                None => (kem, None, None, None, None),
-            }
-        };
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let (pq_suite, pq_public_key, pq_ciphertext, pq_key_id) = (None, None, None, None);
+        let kem_fields = tx.kem.prepare_send()?;
 
         let header = Header {
-            public_key: Bytes::copy_from_slice(&ratchet.public_key()),
-            previous_chain_length: self.previous_chain_length,
-            message_number: self.message_number_sender,
-            pq_suite,
-            pq_public_key,
-            pq_ciphertext,
-            pq_key_id,
+            public_key: Bytes::copy_from_slice(&tx.ratchet.public_key()),
+            previous_chain_length: tx.party.previous_chain_length,
+            message_number: tx.party.message_number_sender,
+            pq_suite: kem_fields.pq_suite,
+            pq_public_key: kem_fields.pq_public_key,
+            pq_ciphertext: kem_fields.pq_ciphertext,
+            pq_key_id: kem_fields.pq_key_id,
         };
         let header_bytes = Zeroizing::new(header.encode_to_vec());
         let header = encrypt(
             &header_key,
             HEADER_INFO,
-            &self.associated_data,
+            &tx.party.associated_data,
             &header_bytes,
         )?;
-        let message_key = ratchet
+        let message_key = tx
+            .ratchet
             .step_message_ratchet_sender()
             .ok_or(ErrorKind::NoSendingChain)?;
         let content = encrypt(
             &message_key,
             CONTENT_INFO,
-            &content_associated_data(&self.associated_data, &header),
+            &content_associated_data(&tx.party.associated_data, &header),
             content,
         )?;
 
         // Commit state only after both fallible encryptions succeed.
-        self.ratchet = ratchet;
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet = kem_ratchet;
-        }
+        tx.commit();
         self.message_number_sender = next_message_number;
         Ok(EncryptedMessage {
             header: Bytes::from(header),
@@ -405,27 +343,12 @@ impl Party {
             // received, so report `DuplicateMessage` rather than stalling as `Undecryptable`.
             return Err(ErrorKind::DuplicateMessage.into());
         };
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let mut kem_ratchet = self.kem_ratchet.clone();
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        match &mut kem_ratchet {
-            Some(kem) => {
-                let kem_header = kem_header_from_proto(&header)?;
-                kem.receive_skipped_header(&kem_header)
-                    .map_err(|e| Error::new(ErrorKind::InvalidHeader, e))?;
-            }
-            None => ensure_no_pq_header(&header)?,
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        ensure_no_pq_header(&header)?;
-
-        let content = self.open_content(&message_key, message)?;
+        let mut tx = RatchetTx::begin(self);
+        tx.kem.receive_skipped(&header)?;
+        let content = open_content(&tx.party.associated_data, &message_key, message)?;
+        tx.commit();
         self.skipped_message_keys
             .remove(&header_key, header.message_number);
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet = kem_ratchet;
-        }
         Ok(SkippedOutcome::Decrypted(content))
     }
 
@@ -449,37 +372,21 @@ impl Party {
             .checked_add(1)
             .ok_or(ErrorKind::InvalidHeader)?;
 
-        let mut ratchet = self.ratchet.clone();
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let mut kem_ratchet = self.kem_ratchet.clone();
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        match &mut kem_ratchet {
-            Some(kem) => {
-                let kem_header = kem_header_from_proto(header)?;
-                kem.receive_current_chain(&kem_header)
-                    .map_err(|e| Error::new(ErrorKind::InvalidHeader, e))?;
-            }
-            None => ensure_no_pq_header(header)?,
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        ensure_no_pq_header(header)?;
-
+        let mut tx = RatchetTx::begin(self);
+        tx.kem.receive_current_chain(header)?;
         let skipped = skip_message_keys(
-            &mut ratchet,
-            self.message_number_receiver,
+            &mut tx.ratchet,
+            tx.party.message_number_receiver,
             header.message_number,
         )?;
-        let message_key = ratchet
+        let message_key = tx
+            .ratchet
             .step_message_ratchet_receiver()
             .ok_or(ErrorKind::InvalidHeader)?;
-        let content = self.open_content(&message_key, message)?;
+        let content = open_content(&tx.party.associated_data, &message_key, message)?;
 
-        let current_recv_hk = ratchet.header_key_receiver();
-        self.ratchet = ratchet;
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet = kem_ratchet;
-        }
+        let current_recv_hk = tx.ratchet.header_key_receiver();
+        tx.commit();
         self.skipped_message_keys
             .extend_with_evictions(skipped, |evicted_hk, msg_num| {
                 if current_recv_hk
@@ -513,64 +420,32 @@ impl Party {
             .checked_add(1)
             .ok_or(ErrorKind::InvalidHeader)?;
 
-        let mut ratchet = self.ratchet.clone();
-        let prev_recv_hk = ratchet.header_key_receiver();
+        let mut tx = RatchetTx::begin(self);
+        let prev_recv_hk = tx.ratchet.header_key_receiver();
         let skipped_previous = skip_message_keys(
-            &mut ratchet,
-            self.message_number_receiver,
+            &mut tx.ratchet,
+            tx.party.message_number_receiver,
             header.previous_chain_length,
         )?;
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let mut kem_ratchet = self.kem_ratchet.clone();
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let (kem_recv_ss, kem_send_ss) = match &mut kem_ratchet {
-            Some(kem) => {
-                let kem_header = kem_header_from_proto(header)?;
-                kem.receive_chain_step(&kem_header)
-                    .map_err(|e| Error::new(ErrorKind::InvalidHeader, e))?
-            }
-            None => {
-                ensure_no_pq_header(header)?;
-                (None, None)
-            }
-        };
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        ensure_no_pq_header(header)?;
+        let kem_secrets = tx.kem.receive_chain_step(header)?;
+        tx.ratchet
+            .step_dh_root_with(&header.public_key, kem_secrets.recv())
+            .map_err(|e| Error::new(ErrorKind::InvalidPublicKey, e))?;
+        tx.ratchet
+            .step_dh_root_with(&header.public_key, kem_secrets.send())
+            .map_err(|e| Error::new(ErrorKind::InvalidPublicKey, e))?;
 
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            let recv_extra: &[u8] = kem_recv_ss.as_deref().map_or(&[], |s| s.as_slice());
-            ratchet
-                .step_dh_root_with(&header.public_key, recv_extra)
-                .map_err(|e| Error::new(ErrorKind::InvalidPublicKey, e))?;
-            let send_extra: &[u8] = kem_send_ss.as_deref().map_or(&[], |s| s.as_slice());
-            ratchet
-                .step_dh_root_with(&header.public_key, send_extra)
-                .map_err(|e| Error::new(ErrorKind::InvalidPublicKey, e))?;
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            for _ in 0..2 {
-                ratchet
-                    .step_dh_root(&header.public_key)
-                    .map_err(|e| Error::new(ErrorKind::InvalidPublicKey, e))?;
-            }
-        }
-
-        let skipped_next = skip_message_keys(&mut ratchet, 0, header.message_number)?;
-        let message_key = ratchet
+        let skipped_next = skip_message_keys(&mut tx.ratchet, 0, header.message_number)?;
+        let message_key = tx
+            .ratchet
             .step_message_ratchet_receiver()
             .ok_or(ErrorKind::InvalidHeader)?;
-        let content = self.open_content(&message_key, message)?;
+        let content = open_content(&tx.party.associated_data, &message_key, message)?;
 
         // Commit BOTH ratchets only after content AEAD succeeds.
-        let new_recv_hk = ratchet.header_key_receiver();
-        self.ratchet = ratchet;
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet = kem_ratchet;
-        }
+        let new_recv_hk = tx.ratchet.header_key_receiver();
+        tx.commit();
         self.skipped_message_keys.extend(skipped_previous);
         if let Some(prev_hk) = prev_recv_hk.as_ref() {
             self.skipped_message_keys
@@ -611,152 +486,46 @@ impl Party {
         Some(Header::decode(header.as_slice()).map_err(|e| Error::new(ErrorKind::InvalidHeader, e)))
     }
 
-    /// Decrypt the content with `message_key`; it only authenticates with the encrypted header
-    /// it was sent with.
-    fn open_content(
-        &self,
-        message_key: &MessageKey,
-        message: &EncryptedMessage,
-    ) -> Result<Vec<u8>> {
-        decrypt(
-            message_key,
-            CONTENT_INFO,
-            &content_associated_data(&self.associated_data, &message.header),
-            &message.content,
-        )
-        .map_err(|e| Error::new(ErrorKind::Undecryptable, e))
-    }
-
     /// Validate all party invariants on deserialization.
     #[cfg(any(feature = "serde", feature = "prost"))]
     fn validate(&self) -> Result<()> {
-        PartyInvariants {
-            dh_step_updates_sender: self.ratchet.dh_step_updates_sender(),
-            has_sender_chain: self.ratchet.header_key_sender().is_some(),
-            receiver_header_key: self.ratchet.header_key_receiver(),
-            next_receiver_header_key: self.ratchet.next_header_key_receiver(),
-            previous_chain_length: self.previous_chain_length,
-            message_number_sender: self.message_number_sender,
-            message_number_receiver: self.message_number_receiver,
-        }
-        .validate(&self.skipped_message_keys, &self.current_chain_evicted)
-    }
-}
-
-#[cfg(any(feature = "serde", feature = "prost", feature = "rkyv"))]
-struct PartyInvariants {
-    dh_step_updates_sender: bool,
-    has_sender_chain: bool,
-    receiver_header_key: Option<Zeroizing<HeaderKey>>,
-    next_receiver_header_key: Zeroizing<HeaderKey>,
-    previous_chain_length: u64,
-    message_number_sender: u64,
-    message_number_receiver: u64,
-}
-
-#[cfg(any(feature = "serde", feature = "prost", feature = "rkyv"))]
-impl PartyInvariants {
-    fn validate(&self, skipped: &impl SkippedState, evicted: &impl EvictionState) -> Result<()> {
-        if self.dh_step_updates_sender
-            || (!self.has_sender_chain
+        let receiver_header_key = self.ratchet.header_key_receiver();
+        let next_receiver_header_key = self.ratchet.next_header_key_receiver();
+        if self.ratchet.dh_step_updates_sender()
+            || (self.ratchet.header_key_sender().is_none()
                 && (self.message_number_sender != 0 || self.previous_chain_length != 0))
-            || (self.receiver_header_key.is_none()
+            || (receiver_header_key.is_none()
                 && (self.message_number_receiver != 0
-                    || !skipped.is_empty()
-                    || !evicted.is_empty()))
+                    || !self.skipped_message_keys.is_empty()
+                    || !self.current_chain_evicted.is_empty()))
         {
             return Err(ErrorKind::MalformedState.into());
         }
-        evicted.validate(Some(self.message_number_receiver))?;
-        skipped.validate(
-            self.receiver_header_key
+        self.current_chain_evicted
+            .validate(Some(self.message_number_receiver))?;
+        self.skipped_message_keys.validate(
+            receiver_header_key
                 .as_deref()
                 .map(|key| (key, self.message_number_receiver)),
-            Some(&*self.next_receiver_header_key),
+            Some(&*next_receiver_header_key),
         )
     }
 }
 
-/// Reject any PQ header fields when PQ ratcheting is disabled.
-fn ensure_no_pq_header(header: &Header) -> Result<()> {
-    if header.pq_suite.is_some()
-        || header.pq_public_key.is_some()
-        || header.pq_ciphertext.is_some()
-        || header.pq_key_id.is_some()
-    {
-        return Err(ErrorKind::InvalidHeader.into());
-    }
-    Ok(())
-}
-
-/// Convert wire protobuf PQ header fields to [`KemHeader`].
-#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-fn kem_header_from_proto(header: &Header) -> Result<KemHeader> {
-    let suite = match header.pq_suite {
-        Some(v) => Some(u8::try_from(v).map_err(|_| ErrorKind::InvalidHeader)?),
-        None => None,
-    };
-    let ek_id = match &header.pq_key_id {
-        Some(bytes) => Some(
-            <[u8; KEM_KEY_ID_LENGTH]>::try_from(bytes.as_ref())
-                .map_err(|_| ErrorKind::InvalidHeader)?,
-        ),
-        None => None,
-    };
-    Ok(KemHeader {
-        suite,
-        ek: header.pq_public_key.as_ref().map(|b| b.to_vec()),
-        ct: header.pq_ciphertext.as_ref().map(|b| b.to_vec()),
-        ek_id,
-    })
-}
-
-#[cfg(feature = "rkyv")]
-impl ArchivedParty {
-    /// Whether this archived party uses a post-quantum KEM ratchet.
-    pub fn is_pq_ratchet_active(&self) -> bool {
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        {
-            self.kem_ratchet.is_some()
-        }
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        {
-            false
-        }
-    }
-
-    /// The configured ML-KEM suite of this archived party, if enabled.
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-    pub fn pq_suite(&self) -> Option<PqSuite> {
-        self.kem_ratchet.as_ref().map(|kem| kem.suite())
-    }
-
-    /// Associated data bound to every header and message in this archived session.
-    pub fn associated_data(&self) -> &[u8] {
-        self.associated_data.as_slice()
-    }
-}
-
-#[cfg(feature = "rkyv")]
-unsafe impl<C> rkyv::bytecheck::Verify<C> for ArchivedParty
-where
-    C: rkyv::rancor::Fallible + ?Sized,
-    C::Error: rkyv::rancor::Source,
-{
-    fn verify(&self, _context: &mut C) -> core::result::Result<(), C::Error> {
-        use rkyv::rancor::Source;
-        PartyInvariants {
-            dh_step_updates_sender: self.ratchet.dh_step_updates_sender(),
-            has_sender_chain: self.ratchet.header_key_sender().is_some(),
-            receiver_header_key: self.ratchet.header_key_receiver(),
-            next_receiver_header_key: self.ratchet.next_header_key_receiver(),
-            previous_chain_length: self.previous_chain_length.to_native(),
-            message_number_sender: self.message_number_sender.to_native(),
-            message_number_receiver: self.message_number_receiver.to_native(),
-        }
-        .validate(&self.skipped_message_keys, &self.current_chain_evicted)
-        .map_err(C::Error::new)
-    }
+/// Decrypt the content with `message_key`; it only authenticates with the encrypted header it was
+/// sent with.
+fn open_content(
+    associated_data: &[u8],
+    message_key: &MessageKey,
+    message: &EncryptedMessage,
+) -> Result<Vec<u8>> {
+    decrypt(
+        message_key,
+        CONTENT_INFO,
+        &content_associated_data(associated_data, &message.header),
+        &message.content,
+    )
+    .map_err(|e| Error::new(ErrorKind::Undecryptable, e))
 }
 
 #[cfg(feature = "prost")]
@@ -764,10 +533,6 @@ impl From<&Party> for crate::proto::Party {
     fn from(party: &Party) -> Self {
         let (current_chain_evicted, current_chain_evicted_below) =
             party.current_chain_evicted.to_proto();
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let kem_ratchet = party.kem_ratchet.as_ref().map(Into::into);
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        let kem_ratchet = None;
         Self {
             ratchet: Some((&party.ratchet).into()),
             skipped_chains: party.skipped_message_keys.to_proto(),
@@ -777,7 +542,7 @@ impl From<&Party> for crate::proto::Party {
             associated_data: party.associated_data.clone(),
             current_chain_evicted,
             current_chain_evicted_below,
-            kem_ratchet,
+            kem_ratchet: party.kem_ratchet.to_proto(),
         }
     }
 }
@@ -788,18 +553,7 @@ impl TryFrom<&crate::proto::Party> for Party {
 
     fn try_from(party: &crate::proto::Party) -> Result<Self> {
         let ratchet = party.ratchet.as_ref().ok_or(ErrorKind::MalformedState)?;
-        #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
-        if party.kem_ratchet.is_some() {
-            // Fail closed: never silently drop PQ ratchet state on a non-PQ build.
-            return Err(ErrorKind::MalformedState.into());
-        }
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        let kem_ratchet = match &party.kem_ratchet {
-            Some(kem) => Some(
-                KemRatchet::try_from(kem).map_err(|e| Error::new(ErrorKind::MalformedState, e))?,
-            ),
-            None => None,
-        };
+        let kem_ratchet = KemState::from_proto(party.kem_ratchet.as_ref())?;
         let restored = Self {
             ratchet: Ratchet::try_from(ratchet)
                 .map_err(|e| Error::new(ErrorKind::MalformedState, e))?,
@@ -812,7 +566,6 @@ impl TryFrom<&crate::proto::Party> for Party {
                 &party.current_chain_evicted,
                 party.current_chain_evicted_below,
             )?,
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
             kem_ratchet,
         };
         restored.validate()?;
@@ -998,11 +751,7 @@ mod test {
             party.message_number_sender,
             party.message_number_receiver,
             party.current_chain_evicted.clone(),
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            party
-                .kem_ratchet
-                .as_ref()
-                .map(KemRatchet::pending_offer_count),
+            party.kem_ratchet.test_snapshot(),
         )
     }
 
@@ -1327,23 +1076,18 @@ mod test {
     }
 
     /// `party` saved and restored, once through each format enabled.
-    #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+    #[cfg(any(feature = "prost", feature = "serde"))]
     fn restored(party: &Party) -> Vec<Party> {
         Vec::from([
             #[cfg(feature = "prost")]
             Party::try_from(&crate::proto::Party::from(party)).unwrap(),
             #[cfg(feature = "serde")]
             serde_json::from_str(&serde_json::to_string(party).unwrap()).unwrap(),
-            #[cfg(feature = "rkyv")]
-            rkyv::from_bytes::<_, rkyv::rancor::Error>(
-                &rkyv::to_bytes::<rkyv::rancor::Error>(party).unwrap(),
-            )
-            .unwrap(),
         ])
     }
 
     #[test]
-    #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+    #[cfg(any(feature = "prost", feature = "serde"))]
     fn restored_parties_carry_on() {
         let (mut alice, mut bob) = session();
         let delayed = alice.encrypt(b"delayed").unwrap();
@@ -1362,7 +1106,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+    #[cfg(any(feature = "prost", feature = "serde"))]
     fn rejects_malformed_deserialized_party_states() {
         let (_alice, bob) = session();
 
@@ -1422,7 +1166,7 @@ mod test {
             val["message_number_receiver"] = serde_json::json!(5);
             assert!(serde_json::from_value::<Party>(val).is_err());
 
-            #[cfg(not(any(feature = "ml-kem-1024", feature = "ml-kem-768")))]
+            #[cfg(not(has_pq))]
             {
                 // Non-PQ build MUST fail closed if serde JSON contains a non-null `kem_ratchet`.
                 let mut with_pq: serde_json::Value =
@@ -1438,10 +1182,7 @@ mod test {
             }
         }
 
-        #[cfg(all(
-            feature = "prost",
-            not(any(feature = "ml-kem-1024", feature = "ml-kem-768"))
-        ))]
+        #[cfg(all(feature = "prost", not(has_pq)))]
         {
             // Non-PQ build MUST fail closed if protobuf state contains `kem_ratchet`.
             let mut with_pq = crate::proto::Party::from(&bob);
@@ -1453,17 +1194,9 @@ mod test {
                 ErrorKind::MalformedState
             );
         }
-
-        #[cfg(feature = "rkyv")]
-        {
-            let mut bad = bob;
-            bad.message_number_sender = 3;
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bad).unwrap();
-            assert!(rkyv::from_bytes::<Party, rkyv::rancor::Error>(&bytes).is_err());
-        }
     }
 
-    #[cfg(any(feature = "serde", feature = "rkyv", feature = "prost"))]
+    #[cfg(any(feature = "serde", feature = "prost"))]
     #[test]
     fn party_rejects_a_ratchet_between_dh_steps() {
         let (alice, mut bob) = session();
@@ -1476,11 +1209,6 @@ mod test {
             assert!(serde_json::from_str::<Party>(&serde_json::to_string(&bob).unwrap()).is_err());
             assert!(postcard::from_bytes::<Party>(&postcard::to_allocvec(&bob).unwrap()).is_err());
         }
-        #[cfg(feature = "rkyv")]
-        {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bob).unwrap();
-            assert!(rkyv::access::<ArchivedParty, rkyv::rancor::Error>(&bytes).is_err());
-        }
         #[cfg(feature = "prost")]
         {
             let bytes = crate::proto::Party::from(&bob).encode_to_vec();
@@ -1492,26 +1220,19 @@ mod test {
         }
     }
 
-    #[cfg(feature = "rkyv")]
     #[test]
-    fn archived_kem_accessors_match_the_party() {
-        fn check(party: &Party) {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(party).unwrap();
-            let archived = rkyv::access::<ArchivedParty, rkyv::rancor::Error>(&bytes).unwrap();
-            assert_eq!(
-                archived.is_pq_ratchet_active(),
-                party.is_pq_ratchet_active()
-            );
-            #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-            assert_eq!(archived.pq_suite(), party.pq_suite());
+    fn ratchet_tx_drop_leaves_party_unchanged() {
+        let (mut alice, mut bob) = session();
+        let before = state(&alice);
+        {
+            let mut tx = RatchetTx::begin(&mut alice);
+            let _ = tx.ratchet.step_message_ratchet_sender().unwrap();
+            let _ = tx.kem.prepare_send().unwrap();
+            // Drop without calling `tx.commit()`.
         }
-        check(&session().1);
-        #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
-        for suite in [1, 2].into_iter().filter_map(PqSuite::from_id) {
-            let (_, mut party) = session();
-            party.enable_pq_ratchet(suite).unwrap();
-            check(&party);
-        }
+        assert_eq!(state(&alice), before);
+        let msg = alice.encrypt(b"still-in-sync").unwrap();
+        assert_eq!(bob.decrypt(&msg).unwrap(), b"still-in-sync");
     }
 
     #[test]
@@ -1528,13 +1249,7 @@ mod test {
         let custom_ad = [0xABu8; 96];
         let custom_bob = Party::new(Ratchet::bob(&keys, DhPrivateKey::generate()), custom_ad);
         assert_eq!(custom_bob.associated_data(), &custom_ad);
-
-        #[cfg(feature = "rkyv")]
-        {
-            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&custom_bob).unwrap();
-            let archived = rkyv::access::<ArchivedParty, rkyv::rancor::Error>(&bytes).unwrap();
-            assert_eq!(archived.associated_data(), &custom_ad);
-        }
+        assert_eq!(custom_bob.pq_suite_id(), None);
     }
 
     #[cfg(feature = "serde")]
@@ -1591,7 +1306,7 @@ mod test {
         }
     }
 
-    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    #[cfg(has_pq)]
     mod pq_tests {
         use super::*;
 
@@ -1884,7 +1599,26 @@ mod test {
         }
 
         #[test]
-        #[cfg(any(feature = "prost", feature = "serde", feature = "rkyv"))]
+        fn pq_ratchet_tx_drop_leaves_party_and_kem_unchanged() {
+            for suite in enabled_suites() {
+                let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::every_turn());
+                let before = state(&alice);
+                {
+                    let mut tx = RatchetTx::begin(&mut alice);
+                    let _ = tx.ratchet.step_message_ratchet_sender().unwrap();
+                    let header = tx.kem.prepare_send().unwrap();
+                    assert!(header.pq_public_key.is_some());
+                    // Drop without calling `tx.commit()`.
+                }
+                assert_eq!(state(&alice), before);
+                assert_eq!(alice.kem_ratchet.as_ref().unwrap().pending_offer_count(), 0);
+                let msg = alice.encrypt(b"pq-still-in-sync").unwrap();
+                assert_eq!(bob.decrypt(&msg).unwrap(), b"pq-still-in-sync");
+            }
+        }
+
+        #[test]
+        #[cfg(any(feature = "prost", feature = "serde"))]
         fn pq_state_serialization_roundtrip_carries_on() {
             for suite in enabled_suites() {
                 let (mut alice, mut bob) = pq_session(suite, KemRatchetConfig::every_turn());

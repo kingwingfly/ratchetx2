@@ -35,6 +35,15 @@ pub const HIGHLIGHT_MAX: usize = 1_000_000;
 pub const DIAGRAM_SOURCE_MAX: usize = 64 * 1024;
 /// Maximum rendered SVG size returned by the diagram worker (2 MiB).
 pub const DIAGRAM_SVG_MAX: usize = 2 * 1024 * 1024;
+/// Maximum Markdown source size accepted by the Markdown worker (5,000,000 bytes).
+pub const MARKDOWN_SOURCE_MAX: usize = 5_000_000;
+/// Maximum rendered Markdown HTML bytes returned by the Markdown worker (2 MiB, including any
+/// truncation notice).
+pub const MARKDOWN_HTML_MAX: usize = 2 * 1024 * 1024;
+/// Maximum total slides across all columns returned by the Markdown worker.
+pub const SLIDES_MAX: usize = 200;
+/// Maximum cumulative HTML bytes across an entire slide deck returned by the Markdown worker (4 MiB).
+pub const SLIDES_HTML_MAX: usize = 4 * 1024 * 1024;
 
 macro_rules! define_methods {
     ($( $variant:ident => ($name:literal, $worker:pat) ),+ $(,)?) => {
@@ -79,6 +88,8 @@ define_methods! {
     Tags      => ("tags", Worker::Audio),
     Find      => ("find", Worker::Search),
     Svg       => ("svg", Worker::Diagram),
+    Markdown  => ("markdown", Worker::Markdown),
+    Slides    => ("slides", Worker::Markdown),
     Highlight => ("highlight", Worker::Code(_)),
 }
 
@@ -103,6 +114,12 @@ pub enum Request<B = Vec<u8>, S = String> {
         regex: bool,
     },
     Svg(S),
+    Markdown {
+        source: S,
+    },
+    Slides {
+        source: S,
+    },
     Highlight {
         language: S,
         text: S,
@@ -118,6 +135,8 @@ impl<B, S> Request<B, S> {
             Self::Tags(_) => Method::Tags,
             Self::Find { .. } => Method::Find,
             Self::Svg(_) => Method::Svg,
+            Self::Markdown { .. } => Method::Markdown,
+            Self::Slides { .. } => Method::Slides,
             Self::Highlight { .. } => Method::Highlight,
         }
     }
@@ -230,6 +249,8 @@ pub enum Response {
     Tags(Option<Tags>),
     Found(SearchFound),
     Svg(String),
+    Markdown(String),
+    Slides(Vec<Vec<String>>),
     Highlighted(String),
 }
 
@@ -413,6 +434,52 @@ impl<'a> RpcCall<'a> for DiagramSvgCall<'a> {
     }
 }
 
+/// Typed RPC call for rendering Markdown source to sanitized HTML.
+#[derive(Debug, Clone, Copy)]
+pub struct MarkdownCall<'a>(pub &'a str);
+
+impl<'a> RpcCall<'a> for MarkdownCall<'a> {
+    #[cfg(feature = "rpc")]
+    type Reply = String;
+    const METHOD: Method = Method::Markdown;
+
+    fn worker(&self) -> Worker {
+        Worker::Markdown
+    }
+
+    fn into_request(self) -> Request<&'a [u8], &'a str> {
+        Request::Markdown { source: self.0 }
+    }
+
+    #[cfg(feature = "rpc")]
+    fn decode_reply(value: wasm_bindgen::JsValue) -> Result<Self::Reply, String> {
+        decode_markdown(value)
+    }
+}
+
+/// Typed RPC call for rendering reveal.js Markdown source to columns of slide HTML.
+#[derive(Debug, Clone, Copy)]
+pub struct SlidesCall<'a>(pub &'a str);
+
+impl<'a> RpcCall<'a> for SlidesCall<'a> {
+    #[cfg(feature = "rpc")]
+    type Reply = Vec<Vec<String>>;
+    const METHOD: Method = Method::Slides;
+
+    fn worker(&self) -> Worker {
+        Worker::Markdown
+    }
+
+    fn into_request(self) -> Request<&'a [u8], &'a str> {
+        Request::Slides { source: self.0 }
+    }
+
+    #[cfg(feature = "rpc")]
+    fn decode_reply(value: wasm_bindgen::JsValue) -> Result<Self::Reply, String> {
+        decode_slides(value)
+    }
+}
+
 /// Typed RPC call for syntax-highlighting source code.
 #[derive(Debug, Clone, Copy)]
 pub struct CodeHighlightCall<'a> {
@@ -477,7 +544,7 @@ mod tests {
 
     #[test]
     fn requests_name_their_wire_method_and_worker() {
-        let requests: [(Request<&[u8], &str>, _, _, _); 7] = [
+        let requests: [(Request<&[u8], &str>, _, _, _); 9] = [
             (Request::Open(&[]), "open", Method::Open, Worker::Pdf),
             (
                 Request::Render {
@@ -509,6 +576,18 @@ mod tests {
             ),
             (Request::Svg(""), "svg", Method::Svg, Worker::Diagram),
             (
+                Request::Markdown { source: "" },
+                "markdown",
+                Method::Markdown,
+                Worker::Markdown,
+            ),
+            (
+                Request::Slides { source: "" },
+                "slides",
+                Method::Slides,
+                Worker::Markdown,
+            ),
+            (
                 Request::Highlight {
                     language: "rust",
                     text: "",
@@ -528,6 +607,7 @@ mod tests {
                 Worker::Audio,
                 Worker::Search,
                 Worker::Diagram,
+                Worker::Markdown,
                 Worker::Code(Group::Systems),
             ] {
                 assert_eq!(method.is_served_by(kind), kind == worker);
@@ -564,6 +644,8 @@ mod tests {
             regex: false,
         });
         check(DiagramSvgCall("flowchart LR\n A-->B"));
+        check(MarkdownCall("# hello"));
+        check(SlidesCall("# slide 1\n---\n# slide 2"));
         for group in Group::ALL {
             check(CodeHighlightCall {
                 group,

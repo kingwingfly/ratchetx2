@@ -12,7 +12,6 @@ publish = false
 curve25519-dalek.workspace = true
 ed25519-dalek = "3.0"
 getrandom.workspace = true
-rkyv = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 sha2.workspace = true
 subtle.workspace = true
@@ -22,7 +21,6 @@ zeroize.workspace = true
 [features]
 # Serialize private keys, to keep them between runs.
 serde = ["dep:serde", "curve25519-dalek/serde"]
-rkyv = ["dep:rkyv"]
 
 [dev-dependencies]
 serde_json.workspace = true

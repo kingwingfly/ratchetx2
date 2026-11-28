@@ -247,26 +247,14 @@ pub fn key_to_url(key: &PublicKey) -> String {
 }
 
 pub fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-fn hex_byte(hi: u8, lo: u8) -> Option<u8> {
-    let hi = (hi as char).to_digit(16)?;
-    let lo = (lo as char).to_digit(16)?;
-    Some(((hi << 4) | lo) as u8)
+    const_hex::encode(bytes)
 }
 
 pub fn from_hex(text: &str) -> Option<Vec<u8>> {
-    let bytes = text.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
+    if text.starts_with("0x") || text.starts_with("0X") {
         return None;
     }
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| hex_byte(pair[0], pair[1]))
-        .collect()
+    const_hex::decode(text).ok()
 }
 
 /// Percent-decode a URI component or fragment, pure Rust for native tests.
@@ -276,9 +264,9 @@ pub fn percent_decode(input: &str) -> Option<String> {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
-            let hi = *bytes.get(i + 1)?;
-            let lo = *bytes.get(i + 2)?;
-            out.push(hex_byte(hi, lo)?);
+            let pair = bytes.get(i + 1..i + 3)?;
+            let [byte] = const_hex::decode_to_array::<_, 1>(pair).ok()?;
+            out.push(byte);
             i += 3;
         } else {
             out.push(bytes[i]);
@@ -453,56 +441,132 @@ pub fn describe(error: &dyn std::error::Error) -> String {
     description
 }
 
-/// Wait `millis` milliseconds. Cancels the underlying browser timer via `clearTimeout` if the
-/// returned future is dropped early (e.g. inside `futures_util::future::select`).
-pub async fn sleep(millis: i32) {
-    use std::{cell::Cell, rc::Rc};
-    use wasm_bindgen::closure::Closure;
+/// Clamp a signed millisecond timeout to a non-negative `u32` so negative delays never wrap to
+/// `u32::MAX` when passed to `gloo-timers`.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn clamp_timeout_ms(millis: i32) -> u32 {
+    u32::try_from(millis.max(0)).unwrap_or(0)
+}
 
-    struct TimerGuard {
-        window: web_sys::Window,
-        handle: Option<i32>,
-        _closure: Closure<dyn FnMut()>,
+/// RAII browser timer backed by `gloo_timers::callback::Timeout` on `wasm32` (no-op stub on
+/// native targets so host tests compile cleanly without target-only dependencies).
+pub(crate) struct Timeout {
+    #[cfg(target_arch = "wasm32")]
+    _inner: gloo_timers::callback::Timeout,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for Timeout {
+    fn drop(&mut self) {}
+}
+
+impl Timeout {
+    pub(crate) fn new(millis: i32, callback: impl FnOnce() + 'static) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self {
+                _inner: gloo_timers::callback::Timeout::new(clamp_timeout_ms(millis), callback),
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (millis, callback);
+            Self {}
+        }
+    }
+}
+
+/// RAII DOM event listener backed by `gloo_events::EventListener` on `wasm32` (no-op stub on
+/// native targets so host tests compile cleanly without target-only dependencies).
+pub(crate) struct EventListener {
+    #[cfg(target_arch = "wasm32")]
+    inner: gloo_events::EventListener,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for EventListener {
+    fn drop(&mut self) {}
+}
+
+impl EventListener {
+    pub(crate) fn new(
+        target: &web_sys::EventTarget,
+        event_type: &'static str,
+        callback: impl FnMut(&web_sys::Event) + 'static,
+    ) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self {
+                inner: gloo_events::EventListener::new(target, event_type, callback),
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (target, event_type, callback);
+            Self {}
+        }
     }
 
-    impl Drop for TimerGuard {
-        fn drop(&mut self) {
-            if let Some(handle) = self.handle.take() {
-                self.window.clear_timeout_with_handle(handle);
+    pub(crate) fn new_cancellable(
+        target: &web_sys::EventTarget,
+        event_type: &'static str,
+        callback: impl FnMut(&web_sys::Event) + 'static,
+    ) -> Self {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Self {
+                inner: gloo_events::EventListener::new_with_options(
+                    target,
+                    event_type,
+                    gloo_events::EventListenerOptions::enable_prevent_default(),
+                    callback,
+                ),
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = (target, event_type, callback);
+            Self {}
+        }
+    }
+
+    pub(crate) fn forget(self) {
+        #[cfg(target_arch = "wasm32")]
+        self.inner.forget();
+    }
+}
+
+/// Wait `millis` milliseconds. Cancels the underlying browser timer via `clearTimeout` if the
+/// returned future is dropped early (e.g. inside `futures_util::future::select`).
+#[cfg(target_arch = "wasm32")]
+pub async fn sleep(millis: i32) {
+    gloo_timers::future::TimeoutFuture::new(clamp_timeout_ms(millis)).await;
+}
+
+/// Instant async yield on non-wasm32 targets so native tests run deterministically without real
+/// wall-clock sleeps.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep(_millis: i32) {
+    struct YieldOnce(bool);
+
+    impl std::future::Future for YieldOnce {
+        type Output = ();
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if self.0 {
+                std::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
             }
         }
     }
 
-    let (tx, rx) = futures_channel::oneshot::channel::<()>();
-    let tx = Rc::new(Cell::new(Some(tx)));
-    let fired = Rc::new(Cell::new(false));
-    let closure = {
-        let tx = tx.clone();
-        let fired = fired.clone();
-        Closure::<dyn FnMut()>::new(move || {
-            fired.set(true);
-            if let Some(tx) = tx.take() {
-                let _ = tx.send(());
-            }
-        })
-    };
-    let window = web_sys::window().expect("a window");
-    let handle = window
-        .set_timeout_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            millis,
-        )
-        .ok();
-    let mut guard = TimerGuard {
-        window,
-        handle,
-        _closure: closure,
-    };
-    let _ = rx.await;
-    if fired.get() {
-        guard.handle = None;
-    }
-    drop(guard);
+    YieldOnce(false).await;
 }
 
 /// A JavaScript error as text.
@@ -628,11 +692,27 @@ mod test {
 
     #[test]
     fn hex_and_percent_decode_reject_plus_signs() {
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x0a, 0x1f, 0xff]), "0a1fff");
+        assert_eq!(from_hex(""), Some(vec![]));
         assert_eq!(from_hex("0a1f"), Some(vec![0x0a, 0x1f]));
+        assert_eq!(from_hex("0A1F"), Some(vec![0x0a, 0x1f]));
+        assert_eq!(from_hex("0x0a1f"), None);
+        assert_eq!(from_hex("0X0a1f"), None);
+        assert_eq!(from_hex("0a1"), None);
         assert_eq!(from_hex("+a"), None);
         assert_eq!(from_hex("+a+b"), None);
         assert_eq!(percent_decode("foo%20bar"), Some("foo bar".into()));
         assert_eq!(percent_decode("foo%+a"), None);
+    }
+
+    #[test]
+    fn clamp_timeout_ms_clamps_negative_values_without_wrapping() {
+        assert_eq!(clamp_timeout_ms(i32::MIN), 0);
+        assert_eq!(clamp_timeout_ms(-1), 0);
+        assert_eq!(clamp_timeout_ms(0), 0);
+        assert_eq!(clamp_timeout_ms(250), 250);
+        assert_eq!(clamp_timeout_ms(i32::MAX), i32::MAX as u32);
     }
 
     #[test]

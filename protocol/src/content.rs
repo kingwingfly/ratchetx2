@@ -51,7 +51,7 @@ pub fn place(clock: u64, floor: u64, highest: u64) -> u64 {
 impl Events {
     /// Whether there is nothing to tell.
     pub fn is_empty(&self) -> bool {
-        self.read.is_empty() && self.downloaded.is_empty()
+        self.read.is_empty() && self.downloaded.is_empty() && !self.accepted
     }
 
     /// The bytes of a message telling these events only.
@@ -138,7 +138,18 @@ mod test {
         let events = Events {
             read: vec![4],
             downloaded: vec![],
+            accepted: true,
         };
+        assert!(!events.is_empty());
+        assert!(
+            !Events {
+                read: vec![],
+                downloaded: vec![],
+                accepted: true,
+            }
+            .is_empty()
+        );
+        assert!(Events::default().is_empty());
         let content = Content::decode(events.to_bytes().as_slice()).unwrap();
         assert_eq!((content.kind, content.events), (None, Some(events)));
         // A kind of a later version, field 15, is dropped.

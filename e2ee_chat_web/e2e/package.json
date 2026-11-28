@@ -1,0 +1,14 @@
+{
+  "name": "e2ee-chat-web-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright browser E2E smoke suite for the E2EE chat web client",
+  "scripts": {
+    "test": "playwright test",
+    "test:bfcache": "playwright test --project=chromium-bfcache"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.59.0"
+  }
+}

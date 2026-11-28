@@ -16,15 +16,14 @@ ml-kem-768 = ["session/ml-kem-768", "party/ml-kem-768"]
 pq = ["ml-kem-1024", "ml-kem-768", "session/pq", "party/pq"]
 
 [dependencies]
-aes-gcm.workspace = true
-argon2 = { version = "0.6", default-features = false, features = ["alloc", "zeroize"] }
 base64.workspace = true
 bytes.workspace = true
+chacha20poly1305.workspace = true
 console_error_panic_hook.workspace = true
-# File previews: CSV tables, tar.gz listings, Markdown, maths in it as MathML, and ZIP listings.
+const-hex.workspace = true
+# File previews: CSV tables, tar.gz listings, and ZIP listings.
 crc32fast = "1"
 csv = "1.4"
-data-url = "0.3"
 # Which of the previews' workers highlights what; the workers themselves are its binaries.
 e2ee_chat_preview = { path = "../e2ee_chat_preview", features = ["rpc"] }
 flate2 = "1.1"
@@ -32,14 +31,15 @@ form_urlencoded = "1"
 futures-channel = "0.3"
 futures-util = { workspace = true, features = ["std"] }
 getrandom = { workspace = true, features = ["wasm_js"] }
+hkdf.workspace = true
+hmac.workspace = true
 idb = "0.6"
 js-sys.workspace = true
 leptos = { version = "0.8", features = ["csr"] }
 party = { path = "../party" }
 percent-encoding = "2"
 prost.workspace = true
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-pulldown-latex = "0.8"
+qrcodegen = "1.8"
 scopeguard = "1"
 # `prost`: the vault keeps the states as protobuf messages.
 session = { path = "../session", features = ["connect", "prost"] }
@@ -66,6 +66,7 @@ web-sys = { workspace = true, features = [
     "DragEvent",
     "Element",
     "Event",
+    "EventTarget",
     "File",
     "FileList",
     "History",
@@ -111,5 +112,19 @@ web-sys = { workspace = true, features = [
 zeroize.workspace = true
 zip = { version = "9.8", default-features = false }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-events = "0.2"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+e2ee_chat_kdf = { path = "../e2ee_chat_kdf" }
+
 [dev-dependencies]
 futures.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+png = "0.18"
+rqrr = "0.10"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

@@ -1,77 +1,151 @@
 syntax = "proto3";
 
-// Hardened mailbox service (v2): recipient-signed FetchSigned and idempotent PushV2 sharing the
-// same underlying mailbox queues as mailbox.v1 so classical and upgraded clients interoperate.
+// Hardened sealed-sender-lite mailbox service (v2): unified per-recipient monotonic queue,
+// deniable write-capability tokens registered/revoked by the recipient, recipient-signed
+// FetchSigned with piggybacked monotonic prefix ACK, and explicit AckMessages.
 package mailbox.v2;
 
 import "handshake_v2.proto";
 import "party.proto";
 
-// Append a message to the queue from sender to recipient with per-field caps and optional
-// client_message_id deduplication.
+// Append a message to the recipient's unified queue, authorized by a deniable write token.
 message PushV2Request {
-  // Sender's canonical identity key (32 bytes).
-  bytes sender = 1;
   // Recipient's canonical identity key (32 bytes).
-  bytes recipient = 2;
-  // Encrypted ratchet message (header <= 8 KiB).
-  party.v1.EncryptedMessage message = 3;
-  // Optional carried initial message (v1 or v2; encoded <= 8 KiB).
-  handshake.v2.InitialMessageV2 initial_message = 4;
-  // SHA-256 of the delivery token (32 bytes), or empty.
-  bytes delivery_hash = 5;
-  // Optional 16-byte client-generated idempotency ID for safe retries.
-  bytes client_message_id = 6;
+  bytes recipient = 1;
+  // Encrypted ratchet message (header <= 8 KiB; total inline envelope <= 64 KiB).
+  party.v1.EncryptedMessage message = 2;
+  // Optional carried initial message (v1 or v2; encoded <= 12 KiB).
+  handshake.v2.InitialMessageV2 initial_message = 3;
+  // Optional 16-byte client-generated idempotency ID scoped to (token_hash, client_message_id).
+  bytes client_message_id = 4;
+  // Mandatory 32-byte deniable write-capability token (hashed to SHA-256 at the protocol boundary).
+  bytes write_token = 5;
 }
 
 // Reply to PushV2Request.
 message PushV2Response {
-  // The message's position in the shared queue, starting at 1.
+  // The message's position in the recipient's unified monotonic queue, starting at 1.
   uint64 sequence = 1;
 }
 
-// Recipient-signed mailbox fetch sharing the same underlying queue as mailbox.v1.
+// A fetched message envelope in the recipient's unified mailbox.v2 queue.
+message EnvelopeV2 {
+  // Position in the recipient's unified monotonic queue.
+  uint64 sequence = 1;
+  // SHA-256 of the write token that authorized this message (32 bytes, for O(1) client peer dispatch).
+  bytes token_hash = 2;
+  // Encrypted ratchet message (always present under the 64 KiB inline envelope cap).
+  party.v1.EncryptedMessage message = 3;
+  // Optional carried initial message.
+  handshake.v2.InitialMessageV2 initial_message = 4;
+}
+
+// Recipient-signed unified mailbox fetch with optional piggybacked monotonic prefix ACK.
 message FetchSignedRequest {
   // Relay audience / server identifier bound into the signature.
   string audience = 1;
-  // Sender's (peer's) canonical identity key (32 bytes).
-  bytes sender = 2;
   // Recipient's canonical identity key (32 bytes), who signs this request.
-  bytes recipient = 3;
-  // Fetch messages after this sequence number; 0 for the start of the queue.
-  uint64 after = 4;
+  bytes recipient = 2;
+  // Fetch messages strictly after this unified sequence number; 0 for the start of the queue.
+  uint64 after_sequence = 3;
   // At most this many messages; 0 for the server's maximum.
-  uint32 limit = 5;
-  // Maximum response byte budget; 0 for the server's default.
-  uint32 max_size = 6;
-  // Delivery tokens (16 bytes each) of messages to delete before reading.
-  repeated bytes delivered = 7;
+  uint32 limit = 4;
+  // Maximum response byte budget; 0 for the server's default (<= 1 MiB).
+  uint32 max_size = 5;
+  // Optional piggybacked monotonic prefix ACK: 0 = no delete; > 0 atomically deletes
+  // messages with sequence <= ack_up_to_sequence before reading (rejecting > high-water mark).
+  uint64 ack_up_to_sequence = 6;
   // Request timestamp in milliseconds since the Unix epoch (within clock skew).
-  uint64 timestamp = 8;
+  uint64 timestamp = 7;
   // Recipient's XEdDSA signature (64 bytes) over canonical FetchSigned signing input.
-  bytes signature = 9;
-}
-
-// A fetched message envelope in mailbox.v2.
-message EnvelopeV2 {
-  // Position in the shared queue.
-  uint64 sequence = 1;
-  // Encrypted ratchet message; absent if its content expired before it was fetched.
-  party.v1.EncryptedMessage message = 2;
-  // Optional carried initial message (normalized from either v1 or v2).
-  handshake.v2.InitialMessageV2 initial_message = 3;
+  bytes signature = 8;
 }
 
 // Reply to FetchSignedRequest.
 message FetchSignedResponse {
   // Fetched envelopes, in ascending sequence order.
   repeated EnvelopeV2 messages = 1;
+  // Whether additional messages remain after the last returned envelope.
+  bool has_more = 2;
+}
+
+// Recipient-signed explicit monotonic prefix acknowledgement.
+message AckMessagesRequest {
+  // Relay audience / server identifier bound into the signature.
+  string audience = 1;
+  // Recipient's canonical identity key (32 bytes), who signs this request.
+  bytes recipient = 2;
+  // Delete all messages with sequence <= up_to_sequence (1..=last_sequence).
+  uint64 up_to_sequence = 3;
+  // Request timestamp in milliseconds since the Unix epoch (within clock skew).
+  uint64 timestamp = 4;
+  // Recipient's XEdDSA signature (64 bytes) over canonical AckMessages signing input.
+  bytes signature = 5;
+}
+
+// Reply to AckMessagesRequest.
+message AckMessagesResponse {
+  // Number of messages deleted.
+  uint64 deleted = 1;
+}
+
+// Recipient-signed registration of a write-token hash for an opaque peer slot.
+message RegisterWriteTokenRequest {
+  // Relay audience / server identifier bound into the signature.
+  string audience = 1;
+  // Recipient's canonical identity key (32 bytes), who signs this request.
+  bytes recipient = 2;
+  // Opaque 32-byte client-derived per-peer slot identifier (keeps relay blind to peer_pk).
+  bytes peer_slot_id = 3;
+  // SHA-256 of the 32-byte write token to authorize (32 bytes).
+  bytes token_hash = 4;
+  // Strictly positive monotonic grant version (1..=2^53 - 1).
+  uint64 grant_version = 5;
+  // Whether to pin this token as the peer's active grant (never evicted by the per-peer cap).
+  bool pin_active = 6;
+  // Request timestamp in milliseconds since the Unix epoch (within clock skew).
+  uint64 timestamp = 7;
+  // Recipient's XEdDSA signature (64 bytes) over canonical RegisterWriteToken signing input.
+  bytes signature = 8;
+}
+
+// Reply to RegisterWriteTokenRequest.
+message RegisterWriteTokenResponse {}
+
+// Recipient-signed revocation of one or all write tokens for an opaque peer slot.
+message RevokeWriteTokenRequest {
+  // Relay audience / server identifier bound into the signature.
+  string audience = 1;
+  // Recipient's canonical identity key (32 bytes), who signs this request.
+  bytes recipient = 2;
+  // Opaque 32-byte client-derived per-peer slot identifier.
+  bytes peer_slot_id = 3;
+  // Specific 32-byte token_hash to revoke, or empty to revoke all grants for peer_slot_id.
+  bytes token_hash = 4;
+  // Monotonic version floor (1..=2^53 - 1): registrations <= min_grant_version are rejected.
+  uint64 min_grant_version = 5;
+  // Request timestamp in milliseconds since the Unix epoch (within clock skew).
+  uint64 timestamp = 6;
+  // Recipient's XEdDSA signature (64 bytes) over canonical RevokeWriteToken signing input.
+  bytes signature = 7;
+}
+
+// Reply to RevokeWriteTokenRequest.
+message RevokeWriteTokenResponse {
+  // Number of write-token grants revoked.
+  uint32 revoked = 1;
 }
 
 // The v2 mailbox service.
 service MailboxService {
-  // Append a message to a queue with per-field caps and optional idempotency.
+  // Append a message to a recipient's unified queue using a deniable write token.
   rpc PushV2(PushV2Request) returns (PushV2Response);
-  // Read messages from a queue with recipient authentication.
+  // Read messages from a recipient's unified queue with recipient authentication and optional ACK.
   rpc FetchSigned(FetchSignedRequest) returns (FetchSignedResponse);
+  // Explicitly acknowledge and delete messages up to a unified sequence number.
+  rpc AckMessages(AckMessagesRequest) returns (AckMessagesResponse);
+  // Register a write-token hash for an opaque peer slot.
+  rpc RegisterWriteToken(RegisterWriteTokenRequest) returns (RegisterWriteTokenResponse);
+  // Revoke one or all write tokens for an opaque peer slot.
+  rpc RevokeWriteToken(RevokeWriteTokenRequest) returns (RevokeWriteTokenResponse);
 }

@@ -1,41 +1,113 @@
+//! Markdown and reveal.js slides rendered as sanitized HTML with MathML, bounded in input size,
+//! event count, inline images, math expressions, and output bytes.
+//!
+//! Raw HTML in Markdown source is escaped as text (comments stripped) before `pulldown-cmark`
+//! emits HTML, and the rendered HTML passes through an `ammonia`-backed allowlist sanitizer with
+//! strict MathML namespace/text-integration isolation as defense-in-depth.
+
+mod mathml;
+mod sanitize;
+#[cfg(test)]
+mod tests;
+
 use std::{collections::VecDeque, fmt};
 
-use e2ee_chat_preview::rpc::DIAGRAM_SOURCE_MAX;
 use pulldown_cmark::{CodeBlockKind, CowStr, Event, LinkType, Options, Parser, Tag, TagEnd};
 use pulldown_latex::config::DisplayMode;
 
-use super::{
-    HIGHLIGHT_MAX, PreviewBudget,
+use crate::Worker;
+use crate::rpc::{DIAGRAM_SOURCE_MAX, HIGHLIGHT_MAX, Method, Request, Response, WorkerService};
+pub use crate::rpc::{MARKDOWN_HTML_MAX, MARKDOWN_SOURCE_MAX, SLIDES_HTML_MAX, SLIDES_MAX};
+
+use self::{
     mathml::mathml,
     sanitize::{escape, is_safe_image_src, normalize_safe_href, sanitize_html},
 };
 
-/// Maximum rendered HTML bytes emitted by [`markdown`] before truncating cleanly.
-pub(super) const MARKDOWN_HTML_MAX: usize = 2 * 1024 * 1024;
 /// Maximum Markdown parser events processed per document.
-pub(super) const MARKDOWN_EVENTS_MAX: usize = 100_000;
+const MARKDOWN_EVENTS_MAX: usize = 100_000;
 /// Maximum byte length allowed for a single Markdown link destination URL.
-pub(super) const LINK_URL_MAX: usize = 4 * 1024;
+const LINK_URL_MAX: usize = 4 * 1024;
 /// Maximum byte length allowed for a link/image title attribute.
 const LINK_TITLE_MAX: usize = 1024;
 /// Maximum math expressions rendered per Markdown document before falling back to escaped TeX.
-pub(super) const MARKDOWN_MATH_MAX: usize = 500;
+const MARKDOWN_MATH_MAX: usize = 500;
 /// Maximum cumulative rendered MathML bytes per Markdown document.
-pub(super) const MARKDOWN_MATH_BYTES_MAX: usize = 512 * 1024;
+const MARKDOWN_MATH_BYTES_MAX: usize = 512 * 1024;
 /// Maximum inline data-URL images admitted per Markdown document.
-pub(super) const MARKDOWN_IMAGES_MAX: usize = 64;
+const MARKDOWN_IMAGES_MAX: usize = 64;
 /// Maximum cumulative bytes across inline data-URL images per Markdown document.
-pub(super) const MARKDOWN_IMAGE_BYTES_MAX: usize = 2 * 1024 * 1024;
-/// Maximum total slides across all columns in [`slides`].
-pub(super) const SLIDES_MAX: usize = 200;
-/// Maximum cumulative HTML bytes across an entire slide deck in [`slides`].
-const SLIDES_HTML_MAX: usize = 4 * 1024 * 1024;
+const MARKDOWN_IMAGE_BYTES_MAX: usize = 2 * 1024 * 1024;
 /// Chunk size used when splitting unusually large single `Event::Text` items so bounded writes
 /// retain the prefix up to `MARKDOWN_HTML_MAX` instead of dropping the whole paragraph.
 const TEXT_CHUNK_MAX: usize = 64 * 1024;
+/// Reserved byte budget for the final slide-count truncation banner so both each individual slide
+/// and the cumulative deck strictly stay within [`MARKDOWN_HTML_MAX`] and [`SLIDES_HTML_MAX`].
+const SLIDES_COUNT_NOTE_BUDGET: usize = 128;
 
 const MARKDOWN_TRUNCATION_NOTE: &str =
     "<p class=\"preview-note\">Preview truncated because this document is too large.</p>";
+
+/// Bounded counter used to cap events, math expressions, images, slides, and byte budgets.
+#[derive(Debug, Clone, Copy)]
+struct PreviewBudget {
+    used: usize,
+    limit: usize,
+}
+
+impl PreviewBudget {
+    const fn new(limit: usize) -> Self {
+        Self { used: 0, limit }
+    }
+
+    fn take(&mut self, amount: usize) -> bool {
+        match self.used.checked_add(amount) {
+            Some(next) if next <= self.limit => {
+                self.used = next;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn try_push(&mut self) -> bool {
+        self.take(1)
+    }
+}
+
+/// Stateless Markdown & reveal.js slides renderer implementing [`WorkerService`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Service;
+
+impl WorkerService for Service {
+    fn accepts(&self, method: Method) -> bool {
+        method.is_served_by(Worker::Markdown)
+    }
+
+    fn handle(&mut self, req: Request) -> Result<Response, String> {
+        match req {
+            Request::Markdown { source } => render_markdown(&source).map(Response::Markdown),
+            Request::Slides { source } => render_slides(&source).map(Response::Slides),
+            other => Err(format!("no method {}", other.method().as_str())),
+        }
+    }
+}
+
+/// Render Markdown `source` as sanitized HTML, enforcing [`MARKDOWN_SOURCE_MAX`].
+pub fn render_markdown(source: &str) -> Result<String, String> {
+    if source.len() > MARKDOWN_SOURCE_MAX {
+        return Err("the document is too large".to_string());
+    }
+    Ok(markdown(source))
+}
+
+/// Render reveal.js Markdown `source` as sanitized HTML slides, enforcing [`MARKDOWN_SOURCE_MAX`].
+pub fn render_slides(source: &str) -> Result<Vec<Vec<String>>, String> {
+    if source.len() > MARKDOWN_SOURCE_MAX {
+        return Err("the document is too large".to_string());
+    }
+    Ok(slides(source))
+}
 
 struct BoundedHtmlWriter {
     out: String,
@@ -366,12 +438,13 @@ fn clamp_title(title: CowStr<'_>) -> CowStr<'_> {
 /// Markdown `source` as HTML: GitHub's flavour, with maths, as MathML. Raw HTML shows as
 /// written, and HTML comments not at all, such as reveal.js's slide attributes. Code blocks are
 /// `<pre><code data-lang="…">`, for the page to highlight, or to draw if Mermaid, unless too
-/// large. Output is strictly bounded to prevent reference-link/image amplification.
+/// large. Output is strictly bounded to [`MARKDOWN_HTML_MAX`] (including any truncation note)
+/// to prevent reference-link/image amplification.
 pub fn markdown(source: &str) -> String {
     markdown_with_budget(source, MARKDOWN_HTML_MAX)
 }
 
-fn markdown_with_budget(source: &str, max_html: usize) -> String {
+fn render_raw_markdown(source: &str, max_raw: usize) -> (String, bool) {
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_FOOTNOTES
         | Options::ENABLE_STRIKETHROUGH
@@ -379,13 +452,38 @@ fn markdown_with_budget(source: &str, max_html: usize) -> String {
         | Options::ENABLE_MATH
         | Options::ENABLE_GFM;
     let mut events_truncated = false;
-    let mut writer = BoundedHtmlWriter::new(max_html);
+    let mut writer = BoundedHtmlWriter::new(max_raw);
     {
         let events = MarkdownEvents::new(Parser::new_ext(source, options), &mut events_truncated);
         let _ = pulldown_cmark::html::write_html_fmt(&mut writer, events);
     }
-    let mut sanitized = sanitize_html(&writer.out);
-    if events_truncated || writer.truncated {
+    (writer.out, events_truncated || writer.truncated)
+}
+
+fn markdown_with_budget(source: &str, max_html: usize) -> String {
+    // Reserve closing-tag headroom so truncated raw HTML closed by `ammonia` fits on the first pass.
+    const CLOSE_TAG_HEADROOM: usize = 256;
+    let note_len = MARKDOWN_TRUNCATION_NOTE.len();
+    let body_limit = max_html.saturating_sub(note_len);
+    let mut raw_limit = body_limit.saturating_sub(CLOSE_TAG_HEADROOM);
+    let (mut sanitized, mut truncated) = {
+        let (raw, raw_trunc) = render_raw_markdown(source, raw_limit);
+        (sanitize_html(&raw), raw_trunc)
+    };
+    // Defense against post-sanitization expansion (e.g. tens of thousands of tiny external links
+    // gaining `target="_blank" rel="noopener noreferrer"`): tighten the raw budget so the final
+    // sanitized output + truncation note strictly fits inside `max_html`.
+    while sanitized.len() > body_limit && raw_limit > 0 {
+        truncated = true;
+        raw_limit /= 3;
+        let (raw, _) = render_raw_markdown(source, raw_limit);
+        sanitized = sanitize_html(&raw);
+    }
+    if sanitized.len() > body_limit {
+        truncated = true;
+        sanitized.clear();
+    }
+    if truncated && sanitized.len().saturating_add(note_len) <= max_html {
         sanitized.push_str(MARKDOWN_TRUNCATION_NOTE);
     }
     sanitized
@@ -477,12 +575,17 @@ pub fn slides(source: &str) -> Vec<Vec<String>> {
     let mut fence = FenceTracker::default();
     let mut slide_budget = PreviewBudget::new(SLIDES_MAX);
     let _ = slide_budget.try_push(); // Count the first slide.
-    let mut html_remaining = SLIDES_HTML_MAX;
+    let single_slide_max = MARKDOWN_HTML_MAX.saturating_sub(SLIDES_COUNT_NOTE_BUDGET);
+    let mut html_remaining = SLIDES_HTML_MAX.saturating_sub(SLIDES_COUNT_NOTE_BUDGET);
     let mut truncated = false;
 
     let render_slide = |raw: &str, remaining: &mut usize| -> String {
-        let cap = (*remaining).min(MARKDOWN_HTML_MAX);
-        let html = markdown_with_budget(without_notes(raw), cap);
+        let cap = (*remaining).min(single_slide_max);
+        let html = if cap >= MARKDOWN_TRUNCATION_NOTE.len() {
+            markdown_with_budget(without_notes(raw), cap)
+        } else {
+            String::new()
+        };
         *remaining = remaining.saturating_sub(html.len());
         html
     };

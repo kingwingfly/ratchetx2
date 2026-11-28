@@ -2,15 +2,17 @@
 
 use super::EVENTS_KEPT;
 use crate::content::{Content, Events, Kind};
+#[cfg(test)]
+use crate::state::message_order_key;
 use crate::state::{
     Attachment, Body, ClassicalPrompt, ContactView, Delivery, IsolatedContactView, LastMessageKind,
-    LocalFile, MessageView, RemoteFile, SecurityAlert, SecurityView, Step, message_order_key,
+    LocalFile, MessageView, RemoteFile, SecurityAlert, SecurityView, Step,
 };
 use crate::transport::{Connect, Fetch};
 use crate::util::{describe, now, sanitize_filename, sanitize_preview_text, short};
 use crate::vault::{
-    Awaiting, CLASSICAL_APPROVAL_LEGACY, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SIGNED_OFF,
-    ContactState, GREETING_DELIVERY_CONFIRMED, GREETING_DELIVERY_LEGACY_UNKNOWN,
+    Awaiting, CLASSICAL_APPROVAL_NONE, CLASSICAL_APPROVAL_SERVER_PQ_DISABLED,
+    CLASSICAL_APPROVAL_SIGNED_OFF, ContactState, GREETING_DELIVERY_CONFIRMED,
     GREETING_DELIVERY_UNCERTAIN, GREETING_DELIVERY_UNSENT, HistoryEntry, IndexRange,
     LastMessageRecord, SECURITY_ALERT_DOWNGRADE, SECURITY_ALERT_MANIFEST_EXPIRED,
     SECURITY_ALERT_NONE, SECURITY_ALERT_PQ_REQUIRED,
@@ -104,6 +106,7 @@ pub(super) fn preview_for_entry(entry: &HistoryEntry) -> LastMessageRecord {
 }
 
 /// Pick the bottom-most message in display order from `entries` and return its sidebar preview.
+#[cfg(test)]
 pub(super) fn latest_entry_preview(
     entries: &[(u64, HistoryEntry)],
     me: &PublicKey,
@@ -178,6 +181,7 @@ pub(super) fn accept_contact_request_state(
         );
     }
     state.request = false;
+    state.provisional = false;
     state.name = name.trim().to_string();
     Ok(())
 }
@@ -312,6 +316,7 @@ impl Contact {
             // A peer-initiated session took over as the active session, replacing any unconfirmed
             // local greeting and any superseded fallback farewells on the previous session.
             self.mark_greeting_confirmed();
+            self.state.awaiting_peer_acceptance = false;
             self.state.sealed_events = None;
             self.state.needs_requeue_sealed |= self.state.outbox.iter().any(|o| o.sealed);
         }
@@ -321,7 +326,12 @@ impl Contact {
     pub(super) fn record_policy_error(&mut self, kind: ErrorKind) -> bool {
         self.state.security_alert = match kind {
             ErrorKind::DowngradeDetected => {
-                self.session.peer_pq_state_mut().downgrade_detected = true;
+                let peer_pq = self.session.peer_pq_state_mut();
+                peer_pq.downgrade_detected = true;
+                // R18-P1-1: Clear any prior classical exception or leftover approval prompt so an
+                // active downgrade cannot be bypassed by an earlier exception or dismissal.
+                peer_pq.clear_classical_exception();
+                self.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                 SECURITY_ALERT_DOWNGRADE
             }
             ErrorKind::PqRequired => SECURITY_ALERT_PQ_REQUIRED,
@@ -357,14 +367,33 @@ impl Contact {
             downgrade_detected,
             at,
         );
+        if peer_was_pq_pinned {
+            // R20-P1-5: Propagate authenticated PQ capability pins (e.g. from `Hello.pq_capable`
+            // on an inbound quarantined classical initial) onto the live contact session so
+            // subsequent claims and quarantined initials never lose the PQ pin.
+            self.session.pin_peer_pq();
+        }
         if peer_was_pq_pinned || downgrade_detected {
-            self.session.peer_pq_state_mut().downgrade_detected = true;
+            let peer_pq = self.session.peer_pq_state_mut();
+            peer_pq.downgrade_detected = true;
+            // R19-P1-2: Revoke any pre-downgrade classical exception or pending prompt alongside
+            // recording a downgrade-triggered quarantine.
+            peer_pq.clear_classical_exception();
+            self.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
         }
     }
 
     /// Accept a non-quarantined chat request, refusing while quarantined.
     pub(super) fn accept_request(&mut self, name: &str) -> Result<(), String> {
         accept_contact_request_state(&mut self.state, name)
+    }
+
+    /// Whether this contact's active session (or archived earlier session when `active` was
+    /// discarded, e.g. after a cancelled crossed start) is classical (non-PQ).
+    pub(super) fn is_classical_session(&self) -> bool {
+        self.session
+            .security()
+            .map_or_else(|| self.session.has_classical_earlier(), |s| !s.is_pq)
     }
 
     /// Clear quarantine state and active security prompts after establishing a verified PQ session.
@@ -384,8 +413,25 @@ impl Contact {
     }
 
     pub(super) fn view(&self) -> ContactView {
+        self.view_with(false)
+    }
+
+    pub(super) fn view_with(&self, approval_backed_off: bool) -> ContactView {
         let peer_pq = self.session.peer_pq_state();
         let active_security = self.session.security();
+        let has_active_session = active_security.is_some();
+        let pending_peer = !self.state.request
+            && !self.state.quarantined
+            && has_active_session
+            && !self.session.is_known_by_peer()
+            && (self.state.awaiting_peer_acceptance
+                || (self.state.peer_last == 0 && self.state.awaiting.is_empty())
+                || approval_backed_off);
+        let greeting_unsent =
+            pending_peer && self.state.greeting_delivery == GREETING_DELIVERY_UNSENT;
+        let greeting_uncertain =
+            pending_peer && self.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN;
+        let awaiting_acceptance = pending_peer && !greeting_unsent && !greeting_uncertain;
         let alert = match self.state.security_alert {
             SECURITY_ALERT_DOWNGRADE => SecurityAlert::DowngradeDetected,
             SECURITY_ALERT_MANIFEST_EXPIRED => SecurityAlert::ManifestExpired,
@@ -399,19 +445,19 @@ impl Contact {
             }
         } else {
             match self.state.classical_approval_needed {
-                CLASSICAL_APPROVAL_LEGACY => ClassicalPrompt::Outbound {
-                    peer_signed_off: false,
-                },
-                CLASSICAL_APPROVAL_SIGNED_OFF => ClassicalPrompt::Outbound {
-                    peer_signed_off: true,
-                },
+                CLASSICAL_APPROVAL_SIGNED_OFF => ClassicalPrompt::Outbound,
+                CLASSICAL_APPROVAL_SERVER_PQ_DISABLED => ClassicalPrompt::ServerPqDisabled,
                 _ => ClassicalPrompt::None,
             }
         };
         ContactView {
             peer: self.peer,
+            conversation_gen: self.state.conversation_gen,
             name: self.state.name.clone(),
             request: self.state.request,
+            greeting_unsent,
+            greeting_uncertain,
+            awaiting_acceptance,
             hello_name: self.state.hello_name.clone(),
             unread: self.state.unread,
             last_activity: self.state.last_activity,
@@ -421,11 +467,15 @@ impl Contact {
                 .as_ref()
                 .and_then(LastMessageRecord::to_view),
             security: SecurityView::from_session(active_security.unwrap_or_default()),
-            has_active_session: active_security.is_some(),
+            has_active_session,
+            has_classical_earlier: self.session.has_classical_earlier(),
             pq_pinned: peer_pq.pq_pinned,
             peer_pq_capable: peer_pq.peer_pq_capable,
             allow_classical_exception: peer_pq.allow_classical_exception,
             downgrade_detected: peer_pq.downgrade_detected,
+            classical_hard_blocked: super::classical_hard_blocked_by_pin_or_downgrade(peer_pq)
+                || self.state.quarantined_was_pq_pinned
+                || self.state.security_alert == SECURITY_ALERT_DOWNGRADE,
             alert,
             classical_prompt,
         }
@@ -467,11 +517,23 @@ impl Contact {
 
     /// Add `content`, received, to the history, at its place in the chat, counting it as unread
     /// unless the chat is `open`: then it is read, which the peer is told. Returns the entry and
-    /// its index.
+    /// its index. Uses `now()` for tests that construct a standalone [`Contact`].
+    #[cfg(test)]
     pub(super) fn add_received(
         &mut self,
         content: Content,
         open: bool,
+    ) -> Result<(u64, HistoryEntry), &'static str> {
+        self.add_received_at(content, open, now())
+    }
+
+    /// Add `content`, received, to the history using `server_now` (from `ServerClock`) when
+    /// comparing server-issued `AttachmentPointer.expires` timestamps (`R23-P2-3`).
+    pub(super) fn add_received_at(
+        &mut self,
+        content: Content,
+        open: bool,
+        server_now: u64,
     ) -> Result<(u64, HistoryEntry), &'static str> {
         let index = self.next_history_index()?;
         let place = place_of(content.clock, &self.state);
@@ -496,15 +558,100 @@ impl Contact {
             }
         }
         self.state.last_activity = now();
+        // R21-P3-3 + R22-P3-4 + R23-P2-3: If this incoming attachment echo arrived after the
+        // attachment was already confirmed deleted/missing on the server OR after its server
+        // expiry timestamp (compared in the server clock domain), mark the new history row
+        // `gone = true` immediately so Files and chat views never offer the dead object again.
+        let already_gone = matches!(
+            &content.kind,
+            Some(Kind::Attachment(ptr))
+                if self.is_attachment_deleted(&ptr.id)
+                    || (ptr.expires > 0 && ptr.expires <= server_now)
+        );
         let entry = HistoryEntry {
             outgoing: false,
             at: now(),
             content: Some(content),
             place,
+            gone: already_gone,
             ..HistoryEntry::default()
         };
         self.record_last_message(&entry);
         Ok((index, entry))
+    }
+
+    /// Record attachment `id` as durably deleted/missing on the server (`R21-P2-10`, `R21-P3-3`,
+    /// `R22-P3-4`, `R23-P2-3`), pruning expired tombstones against `server_now` before enforcing
+    /// the high-water cap. Returns `true` if `ContactState.deleted_attachments` changed.
+    pub(super) fn record_deleted_attachment(
+        &mut self,
+        id: &[u8; 16],
+        expires: u64,
+        server_now: u64,
+    ) -> bool {
+        let before_len = self.state.deleted_attachments.len();
+        self.state
+            .deleted_attachments
+            .retain(|existing| existing.expires == 0 || existing.expires > server_now);
+        let mut changed = self.state.deleted_attachments.len() != before_len;
+        if let Some(existing) = self
+            .state
+            .deleted_attachments
+            .iter_mut()
+            .find(|existing| existing.id.as_slice() == id.as_slice())
+        {
+            if expires > 0 && existing.expires != expires {
+                existing.expires = expires;
+                changed = true;
+            }
+            return changed;
+        }
+        self.state
+            .deleted_attachments
+            .push(crate::vault::DeletedAttachment {
+                id: id.to_vec(),
+                expires,
+            });
+        const MAX_DELETED_ATTACHMENTS: usize = 4096;
+        if self.state.deleted_attachments.len() > MAX_DELETED_ATTACHMENTS {
+            let excess = self.state.deleted_attachments.len() - MAX_DELETED_ATTACHMENTS;
+            self.state.deleted_attachments.drain(..excess);
+        }
+        true
+    }
+
+    /// Keep tombstone `id` unexpirable (`expires = 0`) when persisting `HistoryEntry.gone = true`
+    /// fails transiently so a subsequent tombstone prune cannot discard it before reconciliation
+    /// (`R23-P2-3`, `R24-P2-3`). Returns `true` if `ContactState.deleted_attachments` changed.
+    pub(super) fn clear_deleted_attachment_expiry(&mut self, id: &[u8; 16]) -> bool {
+        if let Some(existing) = self
+            .state
+            .deleted_attachments
+            .iter_mut()
+            .find(|existing| existing.id.as_slice() == id.as_slice())
+        {
+            if existing.expires != 0 {
+                existing.expires = 0;
+                return true;
+            }
+            false
+        } else {
+            self.state
+                .deleted_attachments
+                .push(crate::vault::DeletedAttachment {
+                    id: id.to_vec(),
+                    expires: 0,
+                });
+            true
+        }
+    }
+
+    /// Whether attachment `id` has already been recorded as deleted/missing on the server.
+    pub(super) fn is_attachment_deleted(&self, id: &[u8]) -> bool {
+        self.state
+            .deleted_attachments
+            .iter()
+            .any(|existing| existing.id.as_slice() == id)
     }
 
     /// Tell the peer that its message at `clock` was read.
@@ -537,18 +684,15 @@ impl Contact {
     /// Mark the active session's greeting as confirmed delivered and drop any superseded fallback
     /// farewells from prior/deleted sessions. Returns `true` if contact state changed.
     pub(super) fn mark_greeting_confirmed(&mut self) -> bool {
-        let changed = self.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
+        let mut changed = self.state.greeting_delivery != GREETING_DELIVERY_CONFIRMED
             || !self.state.fallback_farewells.is_empty();
         self.state.greeting_delivery = GREETING_DELIVERY_CONFIRMED;
+        if self.state.greeting_sent_at == 0 {
+            self.state.greeting_sent_at = now();
+            changed = true;
+        }
         self.state.fallback_farewells.clear();
         changed
-    }
-
-    /// Whether the active local session still carries an unacknowledged initial message.
-    pub(super) fn has_carried_initial(&self) -> bool {
-        !proto::SessionState::from(self.session.state())
-            .initial_message
-            .is_empty()
     }
 
     /// How deleting this contact should handle farewell transmission.
@@ -558,10 +702,7 @@ impl Contact {
             || self.state.greeting_delivery == GREETING_DELIVERY_UNSENT
         {
             FarewellMode::Suppress
-        } else if self.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
-            || (self.state.greeting_delivery == GREETING_DELIVERY_LEGACY_UNKNOWN
-                && self.has_carried_initial())
-        {
+        } else if self.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
             FarewellMode::WithoutInitial
         } else {
             FarewellMode::Normal
@@ -699,6 +840,7 @@ impl Contact {
                     history_index: outgoing.history_index,
                     read: true,
                     attachment: true,
+                    content_digest: outgoing.content_digest.clone(),
                 });
             }
             false
@@ -713,8 +855,20 @@ impl Contact {
         }
     }
 
-    /// History entry `index`, as shown.
-    pub(super) fn message(&self, index: u64, mut entry: HistoryEntry) -> MessageView {
+    /// History entry `index`, as shown (using `now()` in tests without a live `ServerClock`).
+    #[cfg(test)]
+    pub(super) fn message(&self, index: u64, entry: HistoryEntry) -> MessageView {
+        self.message_at(index, entry, now())
+    }
+
+    /// History entry `index`, as shown, comparing server-issued `AttachmentPointer.expires`
+    /// against `server_now` (`R23-P2-3`).
+    pub(super) fn message_at(
+        &self,
+        index: u64,
+        mut entry: HistoryEntry,
+        server_now: u64,
+    ) -> MessageView {
         // The clock the peer sent an attachment's message at, to tell it once downloaded.
         let clock = match &entry.content {
             Some(content) if !entry.outgoing => content.clock,
@@ -775,12 +929,18 @@ impl Contact {
                 Some(Kind::File(content)) => file(content.name, content.mime, content.data),
                 Some(Kind::Hello(hello)) => Body::Hello(super::sanitize_shared_name(&hello.name)),
                 Some(Kind::Deleted(_)) => Body::Deleted,
-                Some(Kind::Attachment(pointer)) => Body::Remote(RemoteFile {
-                    peer: self.peer,
-                    index,
-                    pointer,
-                    clock,
-                }),
+                Some(Kind::Attachment(pointer)) => {
+                    let gone = entry.gone
+                        || self.is_attachment_deleted(&pointer.id)
+                        || (pointer.expires > 0 && pointer.expires <= server_now);
+                    Body::Remote(RemoteFile {
+                        peer: self.peer,
+                        index,
+                        pointer,
+                        clock,
+                        gone,
+                    })
+                }
                 Some(Kind::Contact(contact)) => match contact.key.try_into() {
                     Ok(key) => Body::Contact(crate::state::SharedContact {
                         key,
@@ -813,6 +973,9 @@ pub(super) fn forget_told(events: &mut Events, told: &Events) {
     events
         .downloaded
         .retain(|clock| !told.downloaded.contains(clock));
+    if told.accepted {
+        events.accepted = false;
+    }
 }
 
 fn validate_history(state: &ContactState) -> Result<(), &'static str> {
@@ -871,10 +1034,7 @@ pub(super) fn is_pq_incompatible_isolated(state: &ContactState, me: &PublicKey) 
     let Some(raw) = state.session.as_ref() else {
         return false;
     };
-    if raw.me != me.as_slice()
-        || raw.peer != state.peer
-        || raw.cursor > session::protocol::MAX_SAFE_INTEGER
-    {
+    if raw.me != me.as_slice() || raw.peer != state.peer {
         return false;
     }
     let active_kem = raw
@@ -893,6 +1053,40 @@ pub(super) fn is_pq_incompatible_isolated(state: &ContactState, me: &PublicKey) 
         .as_ref()
         .is_some_and(|s| s.is_pq && is_unsupported_known_pq_suite(s.suite));
     active_kem || earlier_kem || active_sec
+}
+
+/// Extract every valid 32-byte inbound write-token hash from a PQ-incompatible isolated contact's
+/// raw `SessionState` (`inbound_token_hash`, `others[*].inbound_token_hash`, and
+/// `pending_register_grants[*].token_hash`) so unified mailbox receive can defer its envelopes
+/// instead of silently discarding and ACKing them.
+pub(super) fn pq_incompatible_isolated_token_hashes(
+    state: &ContactState,
+    me: &PublicKey,
+) -> Option<(PublicKey, Vec<[u8; 32]>)> {
+    if !is_pq_incompatible_isolated(state, me) {
+        return None;
+    }
+    let peer = PublicKey::try_from(state.peer.as_slice()).ok()?;
+    let raw = state.session.as_ref()?;
+    let mut hashes = Vec::new();
+    if let Ok(h) = <[u8; 32]>::try_from(raw.inbound_token_hash.as_slice()) {
+        hashes.push(h);
+    }
+    for earlier in &raw.others {
+        if let Ok(h) = <[u8; 32]>::try_from(earlier.inbound_token_hash.as_slice())
+            && !hashes.contains(&h)
+        {
+            hashes.push(h);
+        }
+    }
+    for grant in &raw.pending_register_grants {
+        if let Ok(h) = <[u8; 32]>::try_from(grant.token_hash.as_slice())
+            && !hashes.contains(&h)
+        {
+            hashes.push(h);
+        }
+    }
+    Some((peer, hashes))
 }
 
 /// Restore each contact independently. Validate from borrowed fields so every failure retains
@@ -954,9 +1148,15 @@ pub(super) fn isolated_contact_views(
             .as_ref()
             .and_then(|s| s.peer_pq.as_ref())
             .is_some_and(|pq| pq.pq_pinned);
-        let reason = validate_contact_state(state, me)
+        let mut reason = validate_contact_state(state, me)
             .err()
             .unwrap_or_else(|| "corrupt contact record".to_string());
+        if state.evicted_while_isolated > 0 {
+            reason.push_str(&format!(
+                " ({} message(s) exceeded the local offline buffer while unsupported)",
+                state.evicted_while_isolated
+            ));
+        }
         if let Some(existing) = views.iter_mut().find(|v| v.raw_peer == state.peer) {
             existing.pq_pinned |= pq_pinned;
             existing.records += 1;

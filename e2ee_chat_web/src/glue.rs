@@ -5,6 +5,7 @@
 
 use std::{
     cell::{Cell, RefCell},
+    collections::HashMap,
     rc::Rc,
 };
 
@@ -16,6 +17,8 @@ use web_sys::{
     AbortController, AbortSignal, Blob, BlobPropertyBag, Clipboard, MessageEvent, MessagePort,
     Navigator, PageTransitionEvent, ServiceWorkerContainer,
 };
+
+use crate::util::{EventListener, Timeout};
 
 #[wasm_bindgen]
 extern "C" {
@@ -108,6 +111,8 @@ const LOCK_RELOAD_GRACE_MS: i32 = 250;
 
 /// Handler callback for media range requests forwarded from `media-worker.js`.
 type MediaHandler = Rc<dyn Fn(MediaRequest)>;
+/// Tracked service-worker media reply port and its shared abort flag.
+type MediaPortEntry = (Rc<Cell<bool>>, MessagePort);
 
 thread_local! {
     /// Whether `pagehide` has fired for this page (unconditionally set so neither late lock grants
@@ -115,6 +120,12 @@ thread_local! {
     static LOCK_RELEASED: Cell<bool> = const { Cell::new(false) };
     /// Whether this page currently holds the exclusive vault Web Lock.
     static LOCK_HELD: Cell<bool> = const { Cell::new(false) };
+    /// Monotonic lock generation bumped synchronously inside `pagehide` teardown BEFORE releasing
+    /// the Web Lock so any in-flight IDB transaction that outlived `pagehide` fails closed.
+    static LOCK_GENERATION: Cell<u64> = const { Cell::new(1) };
+    /// Synchronous teardown callback invoked directly inside the `pagehide` handler BEFORE
+    /// releasing the Web Lock.
+    static ON_PAGEHIDE: RefCell<Option<Rc<dyn Fn()>>> = const { RefCell::new(None) };
     /// Resolver for the currently held Web Lock promise, invoked synchronously on `pagehide` so
     /// shared-process tabs and bfcache entries release `"e2ee-chat"` immediately.
     static LOCK_RESOLVER: RefCell<Option<Function>> = const { RefCell::new(None) };
@@ -129,11 +140,93 @@ thread_local! {
     /// Replaceable media-request handler invoked by the one-time service-worker message listener.
     static MEDIA_HANDLER: RefCell<Option<MediaHandler>> = const { RefCell::new(None) };
     static MEDIA_LISTENER_INSTALLED: Cell<bool> = const { Cell::new(false) };
+    /// Every currently open service-worker media reply `MessagePort` and its abort flag, keyed by
+    /// monotonic request ID; automatically removed in [`MediaRequest::drop`] and synchronously
+    /// drained/closed on `pagehide`.
+    static ACTIVE_MEDIA_PORTS: RefCell<HashMap<u64, MediaPortEntry>> =
+        RefCell::new(HashMap::new());
+    static NEXT_MEDIA_PORT_ID: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Whether `pagehide` has fired for this page (releasing or forfeiting its exclusive vault lock).
 pub fn lock_released() -> bool {
     LOCK_RELEASED.with(Cell::get)
+}
+
+/// Monotonic vault lock generation; incremented synchronously on `pagehide` BEFORE releasing the
+/// Web Lock so in-flight IndexedDB reads/writes fail closed even across lock re-acquisition races.
+pub fn lock_generation() -> u64 {
+    LOCK_GENERATION.with(Cell::get)
+}
+
+/// Increment and return the monotonic lock generation synchronously.
+pub fn bump_lock_generation() -> u64 {
+    LOCK_GENERATION.with(|gen_cell| {
+        let next = gen_cell.get().wrapping_add(1).max(1);
+        gen_cell.set(next);
+        next
+    })
+}
+
+fn post_aborted(port: &MessagePort) {
+    let msg = Object::new();
+    let _ = Reflect::set(&msg, &JsValue::from_str("aborted"), &JsValue::TRUE);
+    let _ = port.post_message(&msg);
+}
+
+/// Synchronously abort, detach, and close every active service-worker media `MessagePort`.
+pub fn close_all_media_ports() {
+    MEDIA_HANDLER.with(|handler| *handler.borrow_mut() = None);
+    let ports: Vec<_> = ACTIVE_MEDIA_PORTS.with(|map| map.borrow_mut().drain().collect());
+    for (_, (aborted, port)) in ports {
+        aborted.set(true);
+        post_aborted(&port);
+        port.set_onmessage(None);
+        port.close();
+    }
+}
+
+/// Synchronously revoke lock ownership, bump the monotonic lock generation, close all media ports,
+/// invoke the registered `pagehide` teardown callback (e.g. `Engine::teardown_on_pagehide`), and
+/// release the exclusive Web Lock. Shared by both the browser `pagehide` listener and manual vault
+/// Lock so `lock_released()` is `true` BEFORE `teardown_on_pagehide()` scrubs `Ui` signals.
+/// Idempotent.
+pub fn teardown_and_release_lock() {
+    // 1. Revoke lock ownership and bump monotonic generation FIRST so no in-flight IDB
+    //    operation, reactive history Effect, or async continuation can act after this point.
+    LOCK_RELEASED.with(|released| released.set(true));
+    LOCK_HELD.with(|held| held.set(false));
+    bump_lock_generation();
+    // 2. Close all active service-worker media ports synchronously.
+    close_all_media_ports();
+    // 3. Run synchronous Engine teardown (cancel KDF, close WS, revoke blob URLs,
+    //    terminate preview workers, scrub DOM/Ui/title, drop Inner) BEFORE releasing Lock.
+    let teardown = ON_PAGEHIDE.with(|cb| cb.borrow().clone());
+    if let Some(teardown) = teardown {
+        teardown();
+    }
+    // 4. Abort queued lock waits and release the exclusive Web Lock LAST.
+    if let Some((cancelled, controller)) = LOCK_WAIT_ABORT.with(|slot| slot.borrow_mut().take()) {
+        cancelled.set(true);
+        controller.abort();
+    }
+    if let Some(wake) = LOCK_INACTIVE_WAKE.with(|slot| slot.borrow_mut().take()) {
+        wake();
+    }
+    if let Some(resolve) = LOCK_RESOLVER.with(|slot| slot.borrow_mut().take()) {
+        let _ = resolve.call0(&JsValue::UNDEFINED);
+    }
+}
+
+/// Register a synchronous teardown callback invoked directly inside the browser `pagehide` event
+/// handler BEFORE releasing the exclusive Web Lock. Also installs the `pagehide`/`pageshow`
+/// listeners immediately on `wasm32`.
+pub fn on_pagehide(callback: impl Fn() + 'static) {
+    ON_PAGEHIDE.with(|slot| {
+        *slot.borrow_mut() = Some(Rc::new(callback));
+    });
+    #[cfg(target_arch = "wasm32")]
+    install_lock_lifecycle();
 }
 
 /// Whether this page currently owns the exclusive vault lock and may open IndexedDB write
@@ -152,6 +245,16 @@ pub fn owns_lock() -> bool {
 #[cfg(test)]
 pub(crate) fn set_lock_released_for_test(released: bool) -> bool {
     LOCK_RELEASED.with(|slot| slot.replace(released))
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+pub(crate) fn bump_lock_generation_for_test() -> u64 {
+    bump_lock_generation()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn active_media_port_count() -> usize {
+    ACTIVE_MEDIA_PORTS.with(|map| map.borrow().len())
 }
 
 /// Whether this tab is currently visible and focused (eligible to automatically claim the vault
@@ -176,39 +279,20 @@ fn install_lock_lifecycle() {
     let Some(window) = web_sys::window() else {
         return;
     };
-    let on_pagehide =
-        Closure::<dyn FnMut(PageTransitionEvent)>::new(move |_event: PageTransitionEvent| {
-            LOCK_RELEASED.with(|released| released.set(true));
-            LOCK_HELD.with(|held| held.set(false));
-            MEDIA_HANDLER.with(|handler| *handler.borrow_mut() = None);
-            if let Some((cancelled, controller)) =
-                LOCK_WAIT_ABORT.with(|slot| slot.borrow_mut().take())
-            {
-                cancelled.set(true);
-                controller.abort();
-            }
-            if let Some(wake) = LOCK_INACTIVE_WAKE.with(|slot| slot.borrow_mut().take()) {
-                wake();
-            }
-            if let Some(resolve) = LOCK_RESOLVER.with(|slot| slot.borrow_mut().take()) {
-                let _ = resolve.call0(&JsValue::UNDEFINED);
-            }
-        });
-    let _ =
-        window.add_event_listener_with_callback("pagehide", on_pagehide.as_ref().unchecked_ref());
-    on_pagehide.forget();
+    EventListener::new(&window, "pagehide", move |_event| {
+        teardown_and_release_lock();
+    })
+    .forget();
 
-    let on_pageshow =
-        Closure::<dyn FnMut(PageTransitionEvent)>::new(move |event: PageTransitionEvent| {
-            if event.persisted()
-                && let Some(window) = web_sys::window()
-            {
-                let _ = window.location().reload();
-            }
-        });
-    let _ =
-        window.add_event_listener_with_callback("pageshow", on_pageshow.as_ref().unchecked_ref());
-    on_pageshow.forget();
+    EventListener::new(&window, "pageshow", move |event| {
+        if let Some(event) = event.dyn_ref::<PageTransitionEvent>()
+            && event.persisted()
+            && let Some(window) = web_sys::window()
+        {
+            let _ = window.location().reload();
+        }
+    })
+    .forget();
 }
 
 /// Return a held Web Lock promise whose `resolve` callback is stored for `pagehide` release.
@@ -290,12 +374,31 @@ async fn request_lock_if_available(
 }
 
 struct EventListenerGuard {
-    window: web_sys::Window,
-    window_event: &'static str,
-    doc: Option<web_sys::Document>,
-    on_window: Closure<dyn FnMut()>,
-    on_vis: Closure<dyn FnMut()>,
+    _window_listener: EventListener,
+    _doc_listener: Option<EventListener>,
     clear_inactive_wake: bool,
+}
+
+impl EventListenerGuard {
+    fn attach(
+        window: &web_sys::Window,
+        window_event: &'static str,
+        clear_inactive_wake: bool,
+        callback: impl Fn() + Clone + 'static,
+    ) -> Self {
+        let on_window = {
+            let callback = callback.clone();
+            EventListener::new(window, window_event, move |_| callback())
+        };
+        let on_vis = window
+            .document()
+            .map(|doc| EventListener::new(&doc, "visibilitychange", move |_| callback()));
+        Self {
+            _window_listener: on_window,
+            _doc_listener: on_vis,
+            clear_inactive_wake,
+        }
+    }
 }
 
 impl Drop for EventListenerGuard {
@@ -305,30 +408,14 @@ impl Drop for EventListenerGuard {
                 *slot.borrow_mut() = None;
             });
         }
-        let _ = self.window.remove_event_listener_with_callback(
-            self.window_event,
-            self.on_window.as_ref().unchecked_ref(),
-        );
-        if let Some(ref doc) = self.doc {
-            let _ = doc.remove_event_listener_with_callback(
-                "visibilitychange",
-                self.on_vis.as_ref().unchecked_ref(),
-            );
-        }
     }
 }
 
-struct TimeoutGuard {
-    window: web_sys::Window,
-    handle: Rc<Cell<Option<i32>>>,
-    _closure: Closure<dyn FnMut()>,
-}
+struct TimeoutGuard(Rc<RefCell<Option<Timeout>>>);
 
 impl Drop for TimeoutGuard {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            self.window.clear_timeout_with_handle(handle);
-        }
+        self.0.borrow_mut().take();
     }
 }
 
@@ -365,15 +452,11 @@ async fn request_lock_with_signal(
     };
     let cancelled = Rc::new(Cell::new(false));
     let aborted_inactive = Rc::new(Cell::new(false));
-    let timer_handle = Rc::new(Cell::new(None::<i32>));
+    let timeout_slot = Rc::new(RefCell::new(None::<Timeout>));
     let clear_timer = {
-        let timer_handle = timer_handle.clone();
+        let timeout_slot = timeout_slot.clone();
         move || {
-            if let Some(handle) = timer_handle.take()
-                && let Some(window) = web_sys::window()
-            {
-                window.clear_timeout_with_handle(handle);
-            }
+            timeout_slot.borrow_mut().take();
         }
     };
     LOCK_WAIT_ABORT.with(|slot| {
@@ -398,12 +481,15 @@ async fn request_lock_with_signal(
     );
     let mut _inactive_listeners: Option<EventListenerGuard> = None;
     if abort_when_inactive && let Some(window) = web_sys::window() {
-        let make_abort = || {
-            let cancelled = cancelled.clone();
-            let aborted_inactive = aborted_inactive.clone();
-            let controller = controller.clone();
-            let tell = tell.clone();
-            Closure::<dyn FnMut()>::new(move || {
+        let cancelled = cancelled.clone();
+        let aborted_inactive = aborted_inactive.clone();
+        let controller = controller.clone();
+        let tell = tell.clone();
+        _inactive_listeners = Some(EventListenerGuard::attach(
+            &window,
+            "blur",
+            false,
+            move || {
                 if !is_tab_active() {
                     aborted_inactive.set(true);
                     cancelled.set(true);
@@ -411,53 +497,21 @@ async fn request_lock_with_signal(
                     controller.abort();
                     tell(SignalWaitResult::AbortedInactive);
                 }
-            })
-        };
-        let on_blur = make_abort();
-        let on_vis = make_abort();
-        let _ = window.add_event_listener_with_callback("blur", on_blur.as_ref().unchecked_ref());
-        let doc = window.document();
-        if let Some(ref doc) = doc {
-            let _ = doc.add_event_listener_with_callback(
-                "visibilitychange",
-                on_vis.as_ref().unchecked_ref(),
-            );
-        }
-        _inactive_listeners = Some(EventListenerGuard {
-            window,
-            window_event: "blur",
-            doc,
-            on_window: on_blur,
-            on_vis,
-            clear_inactive_wake: false,
-        });
+            },
+        ));
     }
     let mut _timeout_guard: Option<TimeoutGuard> = None;
-    if let Some(ms) = timeout_ms
-        && let Some(window) = web_sys::window()
-    {
+    if let Some(ms) = timeout_ms {
         let cancelled = cancelled.clone();
         let controller = controller.clone();
         let tell = tell.clone();
-        let timer_handle_fire = timer_handle.clone();
-        let on_timeout = Closure::<dyn FnMut()>::new(move || {
-            timer_handle_fire.set(None);
+        *timeout_slot.borrow_mut() = Some(Timeout::new(ms, move || {
             cancelled.set(true);
             clear_lock_wait_abort(&cancelled);
             controller.abort();
             tell(SignalWaitResult::Status(LockStatus::HeldElsewhere));
-        });
-        if let Ok(handle) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-            on_timeout.as_ref().unchecked_ref(),
-            ms,
-        ) {
-            timer_handle.set(Some(handle));
-            _timeout_guard = Some(TimeoutGuard {
-                window,
-                handle: timer_handle.clone(),
-                _closure: on_timeout,
-            });
-        }
+        }));
+        _timeout_guard = Some(TimeoutGuard(timeout_slot));
     }
     let granted = {
         let tell = tell.clone();
@@ -545,35 +599,13 @@ async fn wait_until_tab_active() {
         let wake = wake.clone();
         *slot.borrow_mut() = Some(Box::new(wake));
     });
-    let on_focus = {
+    let _listeners = {
         let wake = wake.clone();
-        Closure::<dyn FnMut()>::new(move || {
+        EventListenerGuard::attach(&window, "focus", true, move || {
             if is_tab_active() || lock_released() {
                 wake();
             }
         })
-    };
-    let on_vis = {
-        let wake = wake.clone();
-        Closure::<dyn FnMut()>::new(move || {
-            if is_tab_active() || lock_released() {
-                wake();
-            }
-        })
-    };
-    let _ = window.add_event_listener_with_callback("focus", on_focus.as_ref().unchecked_ref());
-    let doc = window.document();
-    if let Some(ref doc) = doc {
-        let _ = doc
-            .add_event_listener_with_callback("visibilitychange", on_vis.as_ref().unchecked_ref());
-    }
-    let _listeners = EventListenerGuard {
-        window,
-        window_event: "focus",
-        doc,
-        on_window: on_focus,
-        on_vis,
-        clear_inactive_wake: true,
     };
     if is_tab_active() || lock_released() {
         wake();
@@ -687,11 +719,18 @@ pub fn register_media_worker() {
 /// Whether the service worker controls the page, so that media streams through it; else it is
 /// fetched whole before it plays.
 pub fn streaming() -> bool {
-    navigator()
-        .optional_service_worker()
-        .ok()
-        .flatten()
-        .is_some_and(|container| container.controller().is_some())
+    #[cfg(target_arch = "wasm32")]
+    {
+        navigator()
+            .optional_service_worker()
+            .ok()
+            .flatten()
+            .is_some_and(|container| container.controller().is_some())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        true
+    }
 }
 
 /// The byte range requested by the service worker for a media stream.
@@ -710,10 +749,12 @@ pub enum MediaError {
 
 /// The service worker's request for the bytes of a stream for a player of the page.
 pub struct MediaRequest {
+    id: u64,
     pub token: String,
     pub range: MediaRange,
     reply: MessagePort,
     aborted: Rc<Cell<bool>>,
+    replied: bool,
     _on_abort: Option<Closure<dyn FnMut(MessageEvent)>>,
 }
 
@@ -727,10 +768,11 @@ impl MediaRequest {
         self.aborted.get()
     }
 
-    pub fn reply(self, reply: MediaReply<'_>) {
+    pub fn reply(mut self, reply: MediaReply<'_>) {
         if self.aborted.get() {
             return;
         }
+        self.replied = true;
         let message: MediaReplyMsg = Object::new().unchecked_into();
         let transfer = Array::new();
         match reply {
@@ -757,6 +799,12 @@ impl MediaRequest {
 
 impl Drop for MediaRequest {
     fn drop(&mut self) {
+        ACTIVE_MEDIA_PORTS.with(|map| {
+            map.borrow_mut().remove(&self.id);
+        });
+        if !self.replied && !self.aborted.get() {
+            post_aborted(&self.reply);
+        }
         self.reply.set_onmessage(None);
         self.reply.close();
     }
@@ -778,7 +826,10 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
         MEDIA_LISTENER_INSTALLED.with(|installed| installed.set(false));
         return;
     };
-    let listener = Closure::<dyn Fn(MessageEvent)>::new(move |event: MessageEvent| {
+    let listener = EventListener::new(&container, "message", move |event| {
+        let Some(event) = event.dyn_ref::<MessageEvent>() else {
+            return;
+        };
         let data = event.data();
         if !data.is_object() || data.is_null() {
             return;
@@ -789,6 +840,11 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
         let (Some(token), Some(reply)) = (token, reply) else {
             return;
         };
+        if lock_released() {
+            post_aborted(&reply);
+            reply.close();
+            return;
+        }
         let valid_u64 = |v: f64| {
             (v.is_finite() && (0.0..=9_007_199_254_740_991.0).contains(&v) && v.fract() == 0.0)
                 .then_some(v as u64)
@@ -836,11 +892,22 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
             })
         };
         reply.set_onmessage(Some(on_abort.as_ref().unchecked_ref()));
+        let id = NEXT_MEDIA_PORT_ID.with(|cell| {
+            let next = cell.get().wrapping_add(1).max(1);
+            cell.set(next);
+            next
+        });
+        ACTIVE_MEDIA_PORTS.with(|map| {
+            map.borrow_mut()
+                .insert(id, (aborted.clone(), reply.clone()));
+        });
         let req = MediaRequest {
+            id,
             token,
             range,
             reply,
             aborted,
+            replied: false,
             _on_abort: Some(on_abort),
         };
         if let Some(handler) = MEDIA_HANDLER.with(|h| h.borrow().clone()) {
@@ -849,8 +916,6 @@ pub fn serve_media(answer: impl Fn(MediaRequest) + 'static) {
             req.reply(Err(MediaError::Status(404)));
         }
     });
-    let _ =
-        container.add_event_listener_with_callback("message", listener.as_ref().unchecked_ref());
     // Messages are let through once the page loads, or once asked to, which web-sys cannot.
     let _ = container.try_start_messages();
     // Listening once for as long as the page lives.

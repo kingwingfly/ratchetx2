@@ -1,10 +1,12 @@
-use js_sys::{Array, ArrayBuffer, Float64Array, Uint8Array, Uint8ClampedArray, Uint32Array};
+use js_sys::{
+    Array, ArrayBuffer, Float64Array, JsString, Uint8Array, Uint8ClampedArray, Uint32Array,
+};
 use wasm_bindgen::{JsCast, JsValue};
 
 use super::{
-    DIAGRAM_SVG_MAX, MATCHES_MAX, MAX_PAGES, MAX_PDF_BYTES, MAX_PDF_PIXELS, MAX_PDF_SIDE, Method,
-    PdfOpened, RenderedPage, Request, Response, SearchFound, Tags, pack_pairs, unpack_pairs,
-    whole_u16, whole_u32,
+    DIAGRAM_SVG_MAX, MARKDOWN_HTML_MAX, MARKDOWN_SOURCE_MAX, MATCHES_MAX, MAX_PAGES, MAX_PDF_BYTES,
+    MAX_PDF_PIXELS, MAX_PDF_SIDE, Method, PdfOpened, RenderedPage, Request, Response,
+    SLIDES_HTML_MAX, SLIDES_MAX, SearchFound, Tags, pack_pairs, unpack_pairs, whole_u16, whole_u32,
 };
 use crate::READY;
 use crate::audio::{COVER_MAX, MAX_AUDIO_BYTES, is_image_mime};
@@ -59,7 +61,7 @@ pub fn encode_request_frame(id: u32, request: Request<&[u8], &str>) -> WirePaylo
         } => {
             frame.push_many(&[text.into(), pattern.into(), case.into(), regex.into()]);
         }
-        Request::Svg(source) => {
+        Request::Svg(source) | Request::Markdown { source } | Request::Slides { source } => {
             frame.push(&source.into());
         }
         Request::Highlight { language, text } => {
@@ -93,6 +95,22 @@ fn string(value: JsValue) -> Result<String, String> {
     value
         .as_string()
         .ok_or_else(|| "expected a string".to_string())
+}
+
+fn string_capped(value: JsValue, max_bytes: usize, err_msg: &str) -> Result<String, String> {
+    let js_str = value
+        .dyn_into::<JsString>()
+        .map_err(|_| "expected a string".to_string())?;
+    // Every UTF-16 code unit encodes to at least 1 UTF-8 byte, so `length() > max_bytes` rejects
+    // oversized JS strings before copying them into WASM linear memory.
+    if js_str.length() as usize > max_bytes {
+        return Err(err_msg.to_string());
+    }
+    let text = String::from(js_str);
+    if text.len() > max_bytes {
+        return Err(err_msg.to_string());
+    }
+    Ok(text)
 }
 
 fn boolean(value: JsValue) -> Result<bool, String> {
@@ -182,6 +200,26 @@ impl RequestFrame {
                 let [source] = fields(&self.frame, 2)?;
                 Request::Svg(string(source)?)
             }
+            Method::Markdown => {
+                let [source] = fields(&self.frame, 2)?;
+                Request::Markdown {
+                    source: string_capped(
+                        source,
+                        MARKDOWN_SOURCE_MAX,
+                        "the document is too large",
+                    )?,
+                }
+            }
+            Method::Slides => {
+                let [source] = fields(&self.frame, 2)?;
+                Request::Slides {
+                    source: string_capped(
+                        source,
+                        MARKDOWN_SOURCE_MAX,
+                        "the document is too large",
+                    )?,
+                }
+            }
             Method::Highlight => {
                 let [language, text] = fields(&self.frame, 2)?;
                 Request::Highlight {
@@ -215,7 +253,20 @@ impl Response {
                 let matches = Uint32Array::from(pack_pairs(&found.matches).as_slice());
                 WirePayload::with_buffer(Array::of2(&matches, &found.more.into()), matches.buffer())
             }
-            Self::Svg(text) | Self::Highlighted(text) => WirePayload::new(text),
+            Self::Svg(text) | Self::Markdown(text) | Self::Highlighted(text) => {
+                WirePayload::new(text)
+            }
+            Self::Slides(columns) => {
+                let outer = Array::new_with_length(columns.len() as u32);
+                for (col_idx, col) in columns.into_iter().enumerate() {
+                    let inner = Array::new_with_length(col.len() as u32);
+                    for (row_idx, slide) in col.into_iter().enumerate() {
+                        inner.set(row_idx as u32, slide.into());
+                    }
+                    outer.set(col_idx as u32, inner.into());
+                }
+                WirePayload::new(outer)
+            }
         }
     }
 }
@@ -398,6 +449,56 @@ pub fn decode_diagram_svg(value: JsValue) -> Result<String, String> {
         return Err("the rendered diagram is too large".into());
     }
     Ok(svg)
+}
+
+/// Read the sanitized Markdown HTML returned by the Markdown worker, enforcing [`MARKDOWN_HTML_MAX`].
+pub fn decode_markdown(value: JsValue) -> Result<String, String> {
+    string_capped(
+        value,
+        MARKDOWN_HTML_MAX,
+        "the rendered document is too large",
+    )
+}
+
+/// Read the reveal.js slide deck returned by the Markdown worker, enforcing [`SLIDES_MAX`],
+/// [`MARKDOWN_HTML_MAX`] per slide, and [`SLIDES_HTML_MAX`] cumulative HTML bytes.
+pub fn decode_slides(value: JsValue) -> Result<Vec<Vec<String>>, String> {
+    let outer = array(value)?;
+    let col_count = outer.length() as usize;
+    if col_count == 0 {
+        return Err("expected at least one slide column".into());
+    }
+    if col_count > SLIDES_MAX {
+        return Err(format!("slide deck exceeds {SLIDES_MAX} slides"));
+    }
+    let mut columns = Vec::with_capacity(col_count);
+    let mut total_slides = 0usize;
+    let mut total_bytes = 0usize;
+    for col_idx in 0..outer.length() {
+        let inner = array(outer.get(col_idx))?;
+        let row_count = inner.length() as usize;
+        if row_count == 0 {
+            return Err("expected non-empty slide column".into());
+        }
+        total_slides = total_slides.saturating_add(row_count);
+        if total_slides > SLIDES_MAX {
+            return Err(format!("slide deck exceeds {SLIDES_MAX} slides"));
+        }
+        let mut column = Vec::with_capacity(row_count);
+        for row_idx in 0..inner.length() {
+            let remaining = SLIDES_HTML_MAX.saturating_sub(total_bytes);
+            let slide_cap = remaining.min(MARKDOWN_HTML_MAX);
+            let html = string_capped(
+                inner.get(row_idx),
+                slide_cap,
+                "the rendered slides are too large",
+            )?;
+            total_bytes = total_bytes.saturating_add(html.len());
+            column.push(html);
+        }
+        columns.push(column);
+    }
+    Ok(columns)
 }
 
 /// Read the highlighted HTML returned by a code worker.

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "e2ee_chat_kdf",
     "e2ee_chat_preview",
     "e2ee_chat_web",
     "e2ee_chat_worker",
@@ -24,7 +25,9 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 base64 = "0.23"
 bon = "3.10"
 bytes = "1"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 console_error_panic_hook = "0.1"
+const-hex = { version = "1", default-features = false, features = ["alloc"] }
 curve25519-dalek = "5.0"
 futures = "0.3"
 futures-util = { version = "0.3", default-features = false }
@@ -37,8 +40,8 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 prost = "0.14"
 prost-build = "0.14"
 protox = "0.10"
-rkyv = "0.8"
 serde = { version = "1", features = ["derive"] }
+serde-big-array = "0.5"
 serde_json = "1"
 sha2 = { version = "0.11", features = ["zeroize"] }
 subtle = { version = "2.6", default-features = false }
@@ -57,6 +60,12 @@ opt-level = 3
 codegen-units = 1
 strip = "debuginfo"
 panic = "abort"
+
+# `arborium-tree-sitter`'s C `stack.c` keeps a dead `stderr` reference at `-O0` (its `fprintf`
+# macro expands to `0` in `arborium-sysroot/wasm-sysroot/stdio.h`), which fails `rust-lld` on
+# `wasm32-unknown-unknown` dev builds (`trunk build` / `trunk serve`). `-O1` eliminates it.
+[profile.dev.package.arborium-tree-sitter]
+opt-level = 1
 
 # The web client's Mermaid worker, the most Rust code it loads: built for size, it takes 40%
 # less, and still draws a diagram in milliseconds. The grammars' workers are mostly tables, which

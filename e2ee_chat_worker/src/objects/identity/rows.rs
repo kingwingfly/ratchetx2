@@ -1,12 +1,15 @@
-//! Rows returned by the identity SQLite queries.
+//! Rows returned by canonical `SCHEMA_V5` identity SQLite queries.
 
 use serde::Deserialize;
+use storage::{Bytes, PublicKey, StoredInitialMessageV2, StoredMessage, StoredPqPrekey};
+use worker::{Error, Result};
 
-use crate::objects::{InitialMessageV2Wire, PqPrekeyWire, sql::Blob};
+use crate::objects::sql::Blob;
 
-#[derive(Deserialize)]
-pub(super) struct TableInfoRow {
-    pub(super) name: String,
+pub(super) fn fixed_blob<const N: usize>(blob: Blob, name: &str) -> Result<[u8; N]> {
+    blob.into_vec()
+        .try_into()
+        .map_err(|_| Error::RustError(format!("corrupt stored {name} length")))
 }
 
 #[derive(Deserialize)]
@@ -15,19 +18,8 @@ pub(super) struct SchemaVersionRow {
 }
 
 #[derive(Deserialize)]
-pub(super) struct TimestampRow {
-    pub(super) timestamp: u64,
-}
-
-#[derive(Deserialize)]
 pub(super) struct WatermarkRow {
     pub(super) last_refill_ts: u64,
-}
-
-#[derive(Deserialize)]
-pub(super) struct BundleRow {
-    pub(super) signed_prekey: Blob,
-    pub(super) signature: Blob,
 }
 
 #[derive(Deserialize)]
@@ -42,17 +34,41 @@ pub(super) struct CountRow {
 }
 
 #[derive(Deserialize)]
-pub(super) struct QueueStateRow {
+pub(super) struct RecipientStatsRow {
     pub(super) last_sequence: u64,
+    pub(super) total_bytes: u64,
+    pub(super) authorized_peer_count: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct LastSequenceRow {
+    pub(super) last_sequence: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct PeerGrantRow {
+    pub(super) max_version: u64,
+    pub(super) revoked_below_version: u64,
+    pub(super) active_token_hash: Option<Blob>,
     pub(super) message_count: u64,
     pub(super) total_bytes: u64,
 }
 
 #[derive(Deserialize)]
-pub(super) struct RecipientStatsRow {
-    pub(super) queue_count: u64,
-    pub(super) total_bytes: u64,
-    pub(super) sequence_floor: u64,
+pub(super) struct WriteTokenRow {
+    pub(super) peer_slot_id: Blob,
+}
+
+#[derive(Deserialize)]
+pub(super) struct WriteTokenAuthRow {
+    pub(super) token_hash: Blob,
+    pub(super) peer_slot_id: Blob,
+    pub(super) grant_version: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct TokenHashRow {
+    pub(super) token_hash: Blob,
 }
 
 #[derive(Deserialize)]
@@ -62,56 +78,50 @@ pub(super) struct DedupRow {
 }
 
 #[derive(Deserialize)]
-pub(super) struct SenderCountRow {
-    pub(super) sender: Blob,
+pub(super) struct TokenCountRow {
+    pub(super) token_hash: Blob,
     pub(super) count: u64,
 }
 
 #[derive(Deserialize)]
-pub(super) struct DeletedMessageRow {
+pub(super) struct DeletedPeerBytesRow {
+    pub(super) peer_slot_id: Blob,
     pub(super) bytes: u64,
-    pub(super) object: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub(super) struct DeletedSenderBytesRow {
-    pub(super) sender: Blob,
-    pub(super) bytes: u64,
-}
-
-#[derive(Deserialize)]
-pub(super) struct PendingObjectRow {
-    pub(super) object: String,
 }
 
 #[derive(Deserialize)]
 pub(super) struct MessageMetaRow {
     pub(super) sequence: u64,
-    pub(super) header_len: u64,
-    pub(super) size: u64,
-    pub(super) init_len: u64,
-    pub(super) is_object: u64,
+    pub(super) bytes: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SequenceRow {
+    #[allow(dead_code)]
+    pub(super) sequence: u64,
 }
 
 #[derive(Deserialize)]
 pub(super) struct MessageRow {
     pub(super) sequence: u64,
+    pub(super) token_hash: Blob,
     pub(super) header: Blob,
-    pub(super) content: Option<Blob>,
-    pub(super) object: Option<String>,
+    pub(super) content: Blob,
     pub(super) initial_message: Option<Blob>,
 }
 
-#[derive(Deserialize)]
-pub(super) struct ObjectRow {
-    pub(super) object: Option<String>,
-}
+impl TryFrom<MessageRow> for StoredMessage {
+    type Error = Error;
 
-#[derive(Deserialize)]
-pub(super) struct ExpiredObjectRow {
-    pub(super) sender: Blob,
-    pub(super) sequence: u64,
-    pub(super) object: String,
+    fn try_from(row: MessageRow) -> Result<Self> {
+        Ok(Self {
+            sequence: row.sequence,
+            token_hash: fixed_blob(row.token_hash, "token_hash")?,
+            header: Bytes::from(row.header.into_vec()),
+            content: Bytes::from(row.content.into_vec()),
+            initial_message: row.initial_message.map(|b| Bytes::from(b.into_vec())),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -120,8 +130,45 @@ pub(super) struct OldestRow {
 }
 
 #[derive(Deserialize)]
+pub(super) struct AckedInitialRow {
+    pub(super) id: u64,
+    pub(super) sender: Blob,
+    pub(super) ephemeral_key: Blob,
+    pub(super) payload_hash: Blob,
+}
+
+#[derive(Deserialize)]
+pub(super) struct SpkOnlyRow {
+    pub(super) signed_prekey: Blob,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ExpiresAtRow {
+    pub(super) expires_at: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct EvictedUntilRow {
+    pub(super) acked_initial_evicted_until: u64,
+}
+
+#[derive(Deserialize)]
 pub(super) struct ManifestSeqRow {
+    #[allow(dead_code)]
     pub(super) manifest_seq: u64,
+}
+
+#[derive(Deserialize)]
+pub(super) struct ManifestSpkRow {
+    pub(super) manifest_seq: u64,
+    pub(super) signed_prekey: Blob,
+    pub(super) prev_signed_prekey: Option<Blob>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct RetainedSpkRow {
+    pub(super) signed_prekey: Blob,
+    pub(super) prev_signed_prekey: Option<Blob>,
 }
 
 #[derive(Deserialize)]
@@ -137,6 +184,7 @@ pub(super) struct ManifestRow {
     pub(super) pq_ratchet_supported: u64,
     pub(super) offered_suites: Blob,
     pub(super) signed_prekey: Blob,
+    pub(super) signed_prekey_signature: Option<Blob>,
     pub(super) pq_last_resort_commitments: Blob,
     pub(super) signature: Blob,
 }
@@ -154,14 +202,16 @@ pub(super) struct PqLastResortRow {
     pub(super) signature: Blob,
 }
 
-impl From<PqLastResortRow> for PqPrekeyWire {
-    fn from(row: PqLastResortRow) -> Self {
-        Self {
+impl TryFrom<PqLastResortRow> for StoredPqPrekey {
+    type Error = Error;
+
+    fn try_from(row: PqLastResortRow) -> Result<Self> {
+        Ok(Self {
             suite: row.suite as u8,
-            id: row.prekey_id.into_vec(),
-            encapsulation_key: row.encapsulation_key.into_vec(),
-            signature: row.signature.into_vec(),
-        }
+            id: fixed_blob(row.prekey_id, "prekey_id")?,
+            encapsulation_key: Bytes::from(row.encapsulation_key.into_vec()),
+            signature: fixed_blob(row.signature, "pq signature")?,
+        })
     }
 }
 
@@ -174,14 +224,16 @@ pub(super) struct PqOneTimeRow {
     pub(super) signature: Blob,
 }
 
-impl From<PqOneTimeRow> for PqPrekeyWire {
-    fn from(row: PqOneTimeRow) -> Self {
-        Self {
+impl TryFrom<PqOneTimeRow> for StoredPqPrekey {
+    type Error = Error;
+
+    fn try_from(row: PqOneTimeRow) -> Result<Self> {
+        Ok(Self {
             suite: row.suite as u8,
-            id: row.prekey_id.into_vec(),
-            encapsulation_key: row.encapsulation_key.into_vec(),
-            signature: row.signature.into_vec(),
-        }
+            id: fixed_blob(row.prekey_id, "prekey_id")?,
+            encapsulation_key: Bytes::from(row.encapsulation_key.into_vec()),
+            signature: fixed_blob(row.signature, "pq signature")?,
+        })
     }
 }
 
@@ -197,70 +249,55 @@ pub(super) struct IdRow {
 }
 
 #[derive(Deserialize)]
-pub(super) struct InitialMessageWithIdRow {
+pub(super) struct InitialPayloadRow {
     pub(super) id: u64,
-    pub(super) sender: Blob,
-    pub(super) ephemeral_key: Blob,
-    pub(super) signed_prekey: Blob,
-    pub(super) one_time_prekey: Option<Blob>,
-    pub(super) header: Blob,
-    pub(super) content: Blob,
-}
-
-impl From<InitialMessageWithIdRow> for InitialMessageV2Wire {
-    fn from(row: InitialMessageWithIdRow) -> Self {
-        Self {
-            id: row.id,
-            version: 1,
-            sender: row.sender.into_vec(),
-            ephemeral_key: row.ephemeral_key.into_vec(),
-            signed_prekey: row.signed_prekey.into_vec(),
-            one_time_prekey: row.one_time_prekey.map(Blob::into_vec),
-            header: row.header.into_vec(),
-            content: row.content.into_vec(),
-            pq_suite: None,
-            pq_last_resort: false,
-            pq_prekey_id: None,
-            pq_ciphertext: None,
-            manifest_digest: None,
-        }
-    }
+    pub(super) payload_hash: Blob,
 }
 
 #[derive(Deserialize)]
-pub(super) struct InitialMessageJoinedRow {
+pub(super) struct InitialMessageRow {
     pub(super) id: u64,
+    pub(super) version: u64,
     pub(super) sender: Blob,
     pub(super) ephemeral_key: Blob,
     pub(super) signed_prekey: Blob,
     pub(super) one_time_prekey: Option<Blob>,
     pub(super) header: Blob,
     pub(super) content: Blob,
-    pub(super) version: Option<u64>,
     pub(super) pq_suite: Option<u64>,
-    pub(super) pq_last_resort: Option<u64>,
+    pub(super) pq_last_resort: u64,
     pub(super) pq_prekey_id: Option<Blob>,
     pub(super) pq_ciphertext: Option<Blob>,
     pub(super) manifest_digest: Option<Blob>,
 }
 
-impl From<InitialMessageJoinedRow> for InitialMessageV2Wire {
-    fn from(row: InitialMessageJoinedRow) -> Self {
-        Self {
-            id: row.id,
-            version: row.version.map_or(1, |v| v as u32),
-            sender: row.sender.into_vec(),
-            ephemeral_key: row.ephemeral_key.into_vec(),
-            signed_prekey: row.signed_prekey.into_vec(),
-            one_time_prekey: row.one_time_prekey.map(Blob::into_vec),
-            header: row.header.into_vec(),
-            content: row.content.into_vec(),
-            pq_suite: row.pq_suite.map(|s| s as u8),
-            pq_last_resort: row.pq_last_resort.unwrap_or(0) != 0,
-            pq_prekey_id: row.pq_prekey_id.map(Blob::into_vec),
-            pq_ciphertext: row.pq_ciphertext.map(Blob::into_vec),
-            manifest_digest: row.manifest_digest.map(Blob::into_vec),
-        }
+impl InitialMessageRow {
+    pub(super) fn into_stored(self, recipient: PublicKey) -> Result<StoredInitialMessageV2> {
+        Ok(StoredInitialMessageV2 {
+            id: self.id,
+            version: self.version as u32,
+            sender: fixed_blob(self.sender, "sender")?,
+            recipient,
+            ephemeral_key: fixed_blob(self.ephemeral_key, "ephemeral_key")?,
+            signed_prekey: fixed_blob(self.signed_prekey, "signed_prekey")?,
+            one_time_prekey: self
+                .one_time_prekey
+                .map(|b| fixed_blob(b, "one_time_prekey"))
+                .transpose()?,
+            header: Bytes::from(self.header.into_vec()),
+            content: Bytes::from(self.content.into_vec()),
+            pq_suite: self.pq_suite.map(|s| s as u8),
+            pq_last_resort: self.pq_last_resort != 0,
+            pq_prekey_id: self
+                .pq_prekey_id
+                .map(|b| fixed_blob(b, "pq_prekey_id"))
+                .transpose()?,
+            pq_ciphertext: self.pq_ciphertext.map(|b| Bytes::from(b.into_vec())),
+            manifest_digest: self
+                .manifest_digest
+                .map(|b| fixed_blob(b, "manifest_digest"))
+                .transpose()?,
+        })
     }
 }
 

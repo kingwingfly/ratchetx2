@@ -22,6 +22,8 @@ pub enum UnavailableReason {
     LocksUnavailable,
     /// Browser storage (IndexedDB) could not be opened.
     StorageUnavailable,
+    /// Vault header is missing while encrypted records or a rollback anchor survive.
+    CorruptVault,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +32,8 @@ pub enum Phase {
     /// No vault in this browser yet.
     Create,
     Locked,
+    /// Existing vault has an incompatible schema version (detected pre-KDF) and requires reset.
+    IncompatibleVault(u32),
     Unlocked,
     /// Another tab has the vault open.
     Elsewhere,
@@ -135,8 +139,12 @@ pub enum SecurityAlert {
 pub enum ClassicalPrompt {
     #[default]
     None,
-    /// Outbound initiation or session renewal requires explicit classical approval.
-    Outbound { peer_signed_off: bool },
+    /// Outbound initiation or session renewal requires explicit classical approval because the
+    /// peer published a signed manifest disabling PQ.
+    Outbound,
+    /// Outbound initiation or session renewal requires explicit classical approval because the
+    /// server/relay currently has PQ disabled (`R15-P2-3`).
+    ServerPqDisabled,
     /// Inbound classical initial message is held in quarantine pending explicit approval.
     InboundQuarantined { peer_was_pq_pinned: bool },
 }
@@ -172,9 +180,20 @@ pub struct LastMessage {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ContactView {
     pub peer: PublicKey,
+    pub conversation_gen: u64,
     pub name: String,
     /// The peer started the chat, and it is not accepted yet.
     pub request: bool,
+    /// This client started the chat (or restarted it after peer deletion), and its initial
+    /// greeting has not yet reached the server (will retry automatically once connected).
+    pub greeting_unsent: bool,
+    /// This client transmitted its initial greeting, but delivery has not yet been confirmed
+    /// (e.g. connection dropped before receiving the response); retrying automatically.
+    pub greeting_uncertain: bool,
+    /// This client started the chat (or restarted it after peer deletion), its initial request
+    /// reached the server, and the peer has not yet accepted it; outgoing messages stay queued
+    /// locally until the peer accepts.
+    pub awaiting_acceptance: bool,
     /// The name the peer gave in its greeting.
     pub hello_name: String,
     pub unread: u32,
@@ -184,10 +203,12 @@ pub struct ContactView {
     /// Active session cryptographic security level.
     pub security: SecurityView,
     pub has_active_session: bool,
+    pub has_classical_earlier: bool,
     pub pq_pinned: bool,
     pub peer_pq_capable: bool,
     pub allow_classical_exception: bool,
     pub downgrade_detected: bool,
+    pub classical_hard_blocked: bool,
     pub alert: SecurityAlert,
     pub classical_prompt: ClassicalPrompt,
 }
@@ -335,6 +356,10 @@ pub enum Step {
     Pushed,
     /// The server refused it for good, or there is no session to send it on.
     Refused,
+    /// A previously dispatched item hit an ambiguous post-dispatch refusal or corrupt outbox
+    /// record: settle outbox without duplicating or deleting attachments, leaving `Pending` so a
+    /// later peer receipt can still mark it `Read`/`Downloaded`.
+    Unknown,
     /// The peer says it read it, ...
     Read,
     /// ... or downloaded its attachment.
@@ -351,6 +376,7 @@ impl Delivery {
         match (self, step) {
             (Self::Pending, Step::Pushed) => Self::Sent,
             (Self::Pending, Step::Refused) => Self::Failed,
+            (Self::Pending, Step::Unknown) => Self::Pending,
             // Pushed already, though its reply was lost.
             (Self::Pending | Self::Sent, Step::Read) => Self::Read,
             (Self::Pending | Self::Sent | Self::Read, Step::Downloaded) => Self::Downloaded,
@@ -420,6 +446,8 @@ pub struct RemoteFile {
     /// The clock of the message the peer sent it in, to tell the peer once it is downloaded;
     /// 0 for this client's own.
     pub clock: u64,
+    /// Whether the attachment is already known to be deleted/missing on the server (`R22-P3-3`).
+    pub gone: bool,
 }
 
 /// An attachment being opened: fetched, unless kept here, and decrypted, a chunk at a time.
@@ -744,7 +772,16 @@ impl SignInFlow {
                 | Dialog::ShareContact(_)
                 | Dialog::Files(_)
                 | Dialog::Activity,
-            ) => None,
+            ) => {
+                // R28-P2-1: Never let background sync/transport 403s hijack open modals, while
+                // allowing explicit interactive actions inside those dialogs (Accept, Allow
+                // classical, Upgrade to PQ, New prekeys, Save settings) to open `Dialog::SignIn`.
+                if background {
+                    None
+                } else {
+                    Some(Dialog::SignIn)
+                }
+            }
         }
     }
 
@@ -945,8 +982,8 @@ pub struct Ui {
     pub log: RwSignal<Vec<(u64, String)>>,
     /// A message for the notice, and its number, so that a newer one is not hidden early.
     pub notice: RwSignal<Option<(u64, String)>>,
-    /// Set when the server rejects this client's protocol (e.g. WebSocket close `4010` or
-    /// `ErrorKind::Unimplemented`), prompting the user to refresh/reload the page.
+    /// Set when the server rejects this client's protocol (e.g. a confirmed
+    /// `ErrorKind::Unimplemented` server refusal), prompting the user to refresh/reload the page.
     pub update_required: RwSignal<Option<String>>,
     pub dialog: RwSignal<Option<Dialog>>,
     /// The file in the viewer, ...
@@ -1242,6 +1279,25 @@ mod tests {
         );
         assert_eq!(
             flow.on_ask_sign_in(Some(&Dialog::Settings), true, true),
+            None
+        );
+        // R28-P2-1: Explicit interactive actions (`background == false`) inside those dialogs DO
+        // open `Dialog::SignIn` (even if `declined_sign_in == true`), while cross-origin vaults
+        // still return `None`.
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Contact([2; 32])), true, false),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Identity), true, false),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Settings), true, false),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Contact([2; 32])), false, false),
             None
         );
         // Cross-origin vaults never show SignInDialog.

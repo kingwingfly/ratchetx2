@@ -2,12 +2,16 @@
   "name": "e2ee-chat-worker",
   "version": "0.3.0",
   "private": true,
+  "type": "module",
   "description": "The E2EE chat server and web client on Cloudflare Workers",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test:workerd": "vitest run"
   },
   "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.9.2",
+    "vitest": "^4.1.12",
     "wrangler": "^4.168.0"
   }
 }
