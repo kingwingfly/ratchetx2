@@ -4645,6 +4645,13 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
             return Err(StartChatError::Cancelled);
         }
+        // R26-P2-3: Arm `in_flight_start_chat(submission_id, false)` BEFORE branching into
+        // `finish_existing_contact_start_chat` so concurrent background 403s during Phase-A
+        // `RegisterWriteToken` / Phase B cannot hijack or cancel an active existing-contact start.
+        self.startup.set_in_flight_start_chat(submission_id, false);
+        let _in_flight = scopeguard::guard((), |()| {
+            self.startup.clear_in_flight_start_chat(submission_id);
+        });
         {
             let inner = guard
                 .as_mut()
@@ -4677,11 +4684,6 @@ impl<V: VaultStore> Engine<V> {
                     .await;
             }
         }
-
-        self.startup.set_in_flight_start_chat(submission_id, false);
-        let _in_flight = scopeguard::guard((), |()| {
-            self.startup.clear_in_flight_start_chat(submission_id);
-        });
 
         let mut peer_state = PeerPqState::default();
         // R20-P2-2 + R21-P2-3: Always seed any verified signed PQ-OFF `(seq, digest)` observed
@@ -4748,6 +4750,9 @@ impl<V: VaultStore> Engine<V> {
                 // Check `is_live(vgen)` BEFORE `is_submission_cancelled` / any UI writes per PR 29.2.
                 if !self.is_live(vgen) || self.is_submission_cancelled(submission_id) {
                     return Err(StartChatError::Cancelled);
+                }
+                if signs_in_here {
+                    self.queue.clear_peer_sign_in_wait(&peer);
                 }
                 {
                     let inner = guard
@@ -5736,9 +5741,11 @@ impl<V: VaultStore> Engine<V> {
                     && greeting_still_pending
                     && !self.is_submission_cancelled(submission_id)
                 {
-                    // R25-P3-1: Mark peer sign-in wait before `self.wake()` so `retry_pending_greetings`
-                    // does not immediately send a duplicate guaranteed-403 `SendInitialV2`.
+                    // R25-P3-1 + R26-P3-1: Mark peer sign-in wait (and hold any queued outbox head)
+                    // before `self.wake()` so `retry_pending_greetings` does not immediately send a
+                    // duplicate guaranteed-403 `SendInitialV2`.
                     self.queue.mark_waits_sign_in(peer);
+                    self.hold_outbox_head_for_sign_in(inner, &peer);
                     let dialog = self
                         .startup
                         .on_chat_created_greeting_needs_sign_in(submission_id);
@@ -5833,6 +5840,9 @@ impl<V: VaultStore> Engine<V> {
                     return Err(StartChatError::Cancelled);
                 }
                 if matches_session {
+                    if signs_in_here {
+                        self.queue.clear_peer_sign_in_wait(&peer);
+                    }
                     if let Some(contact) = inner.contact(&peer) {
                         contact.mark_greeting_confirmed();
                     }
@@ -5950,6 +5960,8 @@ impl<V: VaultStore> Engine<V> {
         retained_farewells: &[Farewell],
         revoke_grant: bool,
     ) {
+        // R26-P2-1: Clear any peer sign-in wait set before this cancelled start rolled back.
+        self.queue.clear_peer_sign_in_wait(peer);
         let staged_revoke = if revoke_grant {
             let peer_slot_id = inner.client.peer_slot_id(peer);
             inner

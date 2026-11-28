@@ -661,7 +661,8 @@ impl<V: VaultStore> Engine<V> {
                                                             vgen,
                                                             inner,
                                                             peer,
-                                                            &outgoing,
+                                                            outgoing.history_index,
+                                                            outgoing.sealed,
                                                             att_id,
                                                             initial_del_key,
                                                             pending.name.clone(),
@@ -764,7 +765,8 @@ impl<V: VaultStore> Engine<V> {
                                                     vgen,
                                                     inner,
                                                     peer,
-                                                    &outgoing,
+                                                    outgoing.history_index,
+                                                    outgoing.sealed,
                                                     att_id,
                                                     None,
                                                     String::new(),
@@ -2365,26 +2367,43 @@ impl<V: VaultStore> Engine<V> {
         result.map(|()| changed)
     }
 
+    /// Record the peer's non-`awaits_upload` outbox head in `ui.held` when signing in is
+    /// required (`R25-P1-1`, `R26-P3-1`), so the UI displays `"waiting for server sign-in"` and
+    /// `"Cancel it"` consistently across flush, rekey, greeting retry, and PQ upgrade paths.
+    pub(super) fn hold_outbox_head_for_sign_in(&self, inner: &Inner<V>, peer: &PublicKey) {
+        if let Some(head_idx) = inner
+            .contacts
+            .iter()
+            .find(|c| c.peer == *peer)
+            .and_then(|c| c.state.outbox.first())
+            .filter(|o| !o.awaits_upload)
+            .map(|o| o.history_index)
+        {
+            self.hold(peer, head_idx);
+        }
+    }
+
     /// Recover any 32-byte attachment delete key + filename from history/outgoing, atomically fail
     /// the outbox item and forget the corrupt/orphaned upload checkpoint, clear caches/UI, and
-    /// enqueue `ServerDeleteJob::for_completed` (`R24-P2-1`, `R25-P2-4`).
+    /// enqueue `ServerDeleteJob::for_completed` (`R24-P2-1`, `R25-P2-4`, `R26-P2-2`).
     ///
     /// Returns `Ok(true)` when settled, `Ok(false)` when the vault generation became stale, or
     /// `Err(msg)` on transient storage errors.
     #[allow(clippy::too_many_arguments)]
-    async fn fail_unresumable_upload_outbox(
+    pub(super) async fn fail_unresumable_upload_outbox(
         &self,
         vgen: u64,
         inner: &mut Inner<V>,
         peer: &PublicKey,
-        outgoing: &Outgoing,
+        history_index: u64,
+        sealed: bool,
         att_id: [u8; 16],
         mut del_key: Option<zeroize::Zeroizing<[u8; session::attachment::KEY_LENGTH]>>,
         mut name: String,
         server_deletes: &mut Vec<ServerDeleteJob>,
     ) -> Result<bool, String> {
         if del_key.is_none() || name.is_empty() {
-            match inner.vault.entry(peer, outgoing.history_index).await {
+            match inner.vault.entry(peer, history_index).await {
                 _ if !self.is_live(vgen) => return Ok(false),
                 Ok(Some(entry)) => {
                     if let Some(Kind::Attachment(ptr)) =
@@ -2404,8 +2423,8 @@ impl<V: VaultStore> Engine<V> {
                 Err(e) => return Err(describe(&e)),
             }
         }
-        if (del_key.is_none() || name.is_empty()) && !outgoing.sealed {
-            match inner.vault.outgoing(peer, outgoing.history_index).await {
+        if (del_key.is_none() || name.is_empty()) && !sealed {
+            match inner.vault.outgoing(peer, history_index).await {
                 _ if !self.is_live(vgen) => return Ok(false),
                 Ok(rec) => {
                     if let Some(Kind::Attachment(ptr)) = Kind::from_bytes(&rec.content) {
@@ -2423,15 +2442,8 @@ impl<V: VaultStore> Engine<V> {
                 Err(e) => return Err(describe(&e)),
             }
         }
-        self.fail_outbox_and_forget_upload(
-            vgen,
-            inner,
-            peer,
-            outgoing.history_index,
-            &att_id,
-            false,
-        )
-        .await?;
+        self.fail_outbox_and_forget_upload(vgen, inner, peer, history_index, &att_id, false)
+            .await?;
         if !self.is_live(vgen) {
             return Ok(false);
         }
@@ -2445,7 +2457,7 @@ impl<V: VaultStore> Engine<V> {
             server_deletes.push(ServerDeleteJob::for_completed(
                 inner.server.clone(),
                 att_id,
-                Some(outgoing.history_index),
+                Some(history_index),
                 name,
                 key,
             ));
@@ -2693,14 +2705,7 @@ impl<V: VaultStore> Engine<V> {
         if kind == ErrorKind::SignInRequired {
             if same_server(&inner.server, &origin()) {
                 self.queue.mark_waits_sign_in(*peer);
-                if let Some(head_idx) = inner
-                    .contact(peer)
-                    .and_then(|c| c.state.outbox.first())
-                    .filter(|o| !o.awaits_upload)
-                    .map(|o| o.history_index)
-                {
-                    self.hold(peer, head_idx);
-                }
+                self.hold_outbox_head_for_sign_in(inner, peer);
                 self.ask_sign_in_for(background);
                 self.refresh_contacts(inner);
                 return Ok(RekeyOutcome::Paused);
@@ -2902,7 +2907,15 @@ impl<V: VaultStore> Engine<V> {
             }
 
             let claimed = match claim_res {
-                Ok(claimed) => claimed,
+                Ok(claimed) => {
+                    // R26-P2-1: Authenticated `ClaimBundle` succeeded; clear any stale peer
+                    // sign-in wait immediately so a subsequent grant pause or transient failure
+                    // never strands background sync behind an obsolete wait flag.
+                    if same_server(&inner.server, &origin()) {
+                        self.queue.clear_peer_sign_in_wait(peer);
+                    }
+                    claimed
+                }
                 Err(e) => {
                     return self
                         .handle_rekey_session_error(
@@ -3158,14 +3171,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                     self.queue.mark_waits_sign_in(*peer);
-                    if let Some(head_idx) = inner
-                        .contact(peer)
-                        .and_then(|c| c.state.outbox.first())
-                        .filter(|o| !o.awaits_upload)
-                        .map(|o| o.history_index)
-                    {
-                        self.hold(peer, head_idx);
-                    }
+                    self.hold_outbox_head_for_sign_in(inner, peer);
                     self.ask_sign_in_for(background);
                     self.refresh_contacts(inner);
                     return Ok(RekeyOutcome::Paused);

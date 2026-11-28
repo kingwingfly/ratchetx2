@@ -1896,6 +1896,7 @@ impl<V: VaultStore> Engine<V> {
                         if e.kind() == ErrorKind::SignInRequired && signs_in_here && matches_session
                         {
                             self.queue.mark_waits_sign_in(peer);
+                            self.hold_outbox_head_for_sign_in(inner, &peer);
                             self.ask_sign_in_background();
                             self.refresh_contacts(inner);
                         } else if e.kind() == ErrorKind::SignInRequired && signs_in_here {

@@ -404,7 +404,12 @@ impl<V: VaultStore> Engine<V> {
             return Err("locked".into());
         }
         let upload = match started {
-            Ok(upload) => upload,
+            Ok(upload) => {
+                if signs_in_here {
+                    self.queue.clear_peer_sign_in_wait(&peer);
+                }
+                upload
+            }
             // The server keeps attachments only for those signed in to it: its message takes its
             // place in the chat, and waits, with what is sent after it, until this browser is.
             Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
@@ -818,7 +823,12 @@ impl<V: VaultStore> Engine<V> {
             session::start_upload_with(&Fetch::client_without_refused_hook(&server), kept.size)
                 .await;
         let upload = match started {
-            Ok(upload) => upload,
+            Ok(upload) => {
+                if same_server(&server, &origin()) {
+                    self.queue.clear_peer_sign_in_wait(&peer);
+                }
+                upload
+            }
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
                 if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                     return Ok(());
@@ -1463,11 +1473,11 @@ impl<V: VaultStore> Engine<V> {
                 return Err(msg);
             }
         };
-        // R12-P1-4 + R13-P2-1: If this upload had 0 chunks uploaded before a reload (whether
-        // saved as `UPLOAD_STATE_ANNOUNCED` or interrupted in `UPLOAD_STATE_STARTED` after
-        // `inner.add`), `Engine::flush` held its outbox announcement until the file was re-attached
-        // above. Flush now that `self.uploads` holds the file handle before chunk upload begins.
-        if before_announce.uploaded == 0
+        // R12-P1-4 + R13-P2-1 + R26-P2-1: Flush before chunk upload when `before_announce.uploaded
+        // == 0` (outbox announcement held until file re-attached) OR when `waits_for_sign_in` was
+        // set (so resuming an already-announced upload after cross-tab sign-in flushes the held
+        // outbox announcement immediately instead of stranding it behind a stale sign-in wait).
+        if (before_announce.uploaded == 0 || self.queue.waits_for_sign_in(&peer))
             && self.is_live(vgen)
             && !self.is_cancelled(&id)
             && let Err(e) = self.flush(&peer).await
@@ -3079,7 +3089,14 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(true);
             }
             match upload.put(attachments, index, chunk).await {
-                Ok(()) => return Ok(true),
+                Ok(()) => {
+                    // R26-P2-1: Authenticated `PutChunk` succeeded; clear any stale peer sign-in
+                    // wait so completion's `self.wake()` flushes any held announcement/outbox.
+                    if signs_in_here && self.is_live(vgen) {
+                        self.queue.clear_peer_sign_in_wait(peer);
+                    }
+                    return Ok(true);
+                }
                 Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
                 Err(e) if e.kind() == ErrorKind::Server => {
                     if !self.is_live(vgen) || self.is_cancelled(upload.id()) {

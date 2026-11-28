@@ -656,13 +656,21 @@ impl<V: VaultStore> Engine<V> {
                 ));
             }
             let claimed = match claim_res {
-                Ok(claimed) => claimed,
+                Ok(claimed) => {
+                    // R26-P2-1: Clear any stale peer sign-in wait once authenticated `ClaimBundle`
+                    // succeeds so `self.wake()` flushes requeued messages after cross-tab sign-in.
+                    if super::same_server(&inner.server, &super::origin()) {
+                        self.queue.clear_peer_sign_in_wait(&peer);
+                    }
+                    claimed
+                }
                 Err(e) => {
                     if e.kind() == ErrorKind::SignInRequired
                         && super::same_server(&inner.server, &super::origin())
                     {
                         if require_approved {
                             self.queue.mark_waits_sign_in(peer);
+                            self.hold_outbox_head_for_sign_in(inner, &peer);
                         }
                         self.ask_sign_in_for(require_approved);
                     }
@@ -988,6 +996,9 @@ impl<V: VaultStore> Engine<V> {
             });
         match send_res {
             Ok(()) if matches_session => {
+                if signs_in_here {
+                    self.queue.clear_peer_sign_in_wait(&peer);
+                }
                 if inner
                     .contact(&peer)
                     .is_some_and(Contact::mark_greeting_confirmed)
@@ -1019,6 +1030,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                     self.queue.mark_waits_sign_in(peer);
+                    self.hold_outbox_head_for_sign_in(inner, &peer);
                     self.ask_sign_in_for(require_approved);
                 } else {
                     self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);

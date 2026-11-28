@@ -34791,3 +34791,458 @@ fn r25_round25_web_engine_regressions() {
         );
     });
 }
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r26_round26_web_engine_regressions() {
+    use crate::util::key_to_text;
+    use leptos::prelude::{Set, Update, WithUntracked};
+    use prost::Message as _;
+    use sha2::Digest as _;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    let _guard = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+    let mut pool = futures::executor::LocalPool::new();
+    let sign_in_403 = || {
+        Ok((
+            403,
+            br#"{"code":"permission_denied","message":"sign in"}"#.to_vec(),
+        ))
+    };
+
+    // Part 1 (R26-P2-1):
+    // - `upgrade_to_pq_for_gen` clears `waits_for_sign_in(&peer)` on authenticated `ClaimBundle` /
+    //   `SendInitialV2` success so `flush_background(&peer)` delivers requeued messages.
+    // - `resume_upload_source` (with `before_announce.uploaded == 1 > 0`) flushes a held
+    //   announcement when `waits_for_sign_in(&peer)` is set, and `put_chunk` `Ok(())` clears
+    //   `waits_for_sign_in(&peer)`.
+    // - `ensure_session_for_outbox` clears `waits_for_sign_in(&peer)` on `ClaimBundle` `Ok` even
+    //   if `SendInitialV2` fails transiently (5xx), and `rollback_cancelled_start_chat` clears it.
+    pool.run_until(async {
+        let (eng, peer, mut peer_client) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner
+                .add(&peer, Kind::Text("requeued-after-pq-upgrade".into()), false)
+                .await
+                .unwrap();
+            inner.contact(&peer).unwrap().state.conversation_gen
+        };
+        eng.queue.mark_waits_sign_in(peer);
+
+        // 1a: `upgrade_to_pq_for_gen` clears `waits_for_sign_in(&peer)`!
+        let pq_bundle = publish_bundle_for_test(&mut peer_client, "localhost", 1).remove(0);
+        let push_calls = Rc::new(Cell::new(0usize));
+        {
+            let pc = push_calls.clone();
+            let bundle = pq_bundle.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ClaimBundle") {
+                    return Ok((200, bundle.encode_to_vec()));
+                }
+                if path.ends_with("/PushV2") {
+                    pc.set(pc.get() + 1);
+                    return Ok((
+                        200,
+                        protocol::mailbox_v2::PushV2Response {
+                            sequence: pc.get() as u64,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            eng.upgrade_to_pq_for_gen(peer, cgen).await.unwrap();
+            assert!(
+                !eng.queue.waits_for_sign_in(&peer),
+                "R26-P2-1: upgrade_to_pq_for_gen must clear waits_for_sign_in on authenticated RPC success"
+            );
+            assert!(
+                eng.flush_background(&peer).await.unwrap(),
+                "R26-P2-1: flush_background must deliver requeued messages after PQ upgrade clears waits_for_sign_in"
+            );
+        }
+        assert_eq!(push_calls.get(), 1);
+
+        // 1b: `resume_upload_source` with `uploaded == 1 > 0` while `waits_for_sign_in == true`
+        // flushes the held announcement and clears `waits_for_sign_in`!
+        let att_id = [0x81u8; 16];
+        let att_key = [0x82u8; 32];
+        let two_chunks = (session::attachment::CHUNK_SIZE as u64) + 64;
+        let file_bytes = vec![0x42u8; two_chunks as usize];
+        let prefix_hash = sha2::Sha256::digest(&file_bytes[..session::attachment::CHUNK_SIZE]).to_vec();
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let ptr = crate::content::AttachmentPointer {
+                id: att_id.to_vec(),
+                key: att_key.to_vec(),
+                name: "partial_resume.bin".into(),
+                size: two_chunks,
+                mime: "application/octet-stream".into(),
+                expires: crate::util::now().saturating_add(3_600_000),
+            };
+            let v = inner.add(&peer, Kind::Attachment(ptr), false).await.unwrap();
+            let mut p = crate::vault::PendingUpload::default();
+            p.id = att_id.to_vec();
+            p.token = [0x83u8; 16].to_vec();
+            p.key = att_key.to_vec();
+            p.name = "partial_resume.bin".into();
+            p.size = two_chunks;
+            p.uploaded = 1;
+            p.encrypted = 1;
+            p.prefix_hash = prefix_hash;
+            p.announced = true;
+            p.history_index = v.index;
+            p.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+            inner.vault.save_upload(&peer, &p).await.unwrap();
+            eng.hold(&peer, v.index);
+        }
+        eng.queue.mark_waits_sign_in(peer);
+        let resume_pushes = Rc::new(Cell::new(0usize));
+        {
+            let rp = resume_pushes.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PushV2") {
+                    rp.set(rp.get() + 1);
+                    return Ok((
+                        200,
+                        protocol::mailbox_v2::PushV2Response {
+                            sequence: 10 + rp.get() as u64,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            let src = super::attachments::ChunkSource::Bytes {
+                name: "partial_resume.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: Arc::new(file_bytes),
+            };
+            eng.resume_upload_source(peer, att_id, Some(src))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            resume_pushes.get(),
+            1,
+            "R26-P2-1: resume_upload_source with uploaded>0 and waits_for_sign_in must flush held announcement"
+        );
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer),
+            "R26-P2-1: resume_upload_source / put_chunk Ok must clear waits_for_sign_in"
+        );
+
+        // 1c: `ensure_session_for_outbox` clears `waits_for_sign_in` on `ClaimBundle` Ok even when
+        // `SendInitialV2` hits a transient 503 error; `rollback_cancelled_start_chat` clears it too.
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.contact(&peer).unwrap().session.retire();
+            inner
+                .add(&peer, Kind::Text("rekey-after-503".into()), false)
+                .await
+                .unwrap();
+        }
+        eng.queue.mark_waits_sign_in(peer);
+        let bundle2 = publish_bundle_for_test(&mut peer_client, "localhost", 1).remove(0);
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ClaimBundle") {
+                    return Ok((200, bundle2.encode_to_vec()));
+                }
+                if path.ends_with("/SendInitialV2") {
+                    return Ok((
+                        503,
+                        br#"{"code":"unavailable","message":"retry later"}"#.to_vec(),
+                    ));
+                }
+                if path.ends_with("/PushV2") {
+                    return Ok((
+                        503,
+                        br#"{"code":"unavailable","message":"retry later"}"#.to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            let _ = eng.flush(&peer).await;
+        }
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer),
+            "R26-P2-1: ensure_session_for_outbox ClaimBundle Ok must clear waits_for_sign_in even if SendInitialV2 fails transiently"
+        );
+
+        let temp_peer = [0x89u8; 32];
+        eng.queue.mark_waits_sign_in(temp_peer);
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            eng.rollback_cancelled_start_chat(inner, &temp_peer, &[], false)
+                .await;
+        }
+        assert!(
+            !eng.queue.waits_for_sign_in(&temp_peer),
+            "R26-P2-1: rollback_cancelled_start_chat must clear waits_for_sign_in"
+        );
+    });
+
+    // Part 2 (R26-P2-2):
+    // `restore_uploads_from_vault()` on an incomplete orphan `UploadCheckpoint` recovers `ptr.key`,
+    // issues `DeleteAttachment` outside `Engine::inner` / `peer_flush_lock`, atomically fails the
+    // outbox item + forgets the checkpoint, marks cancelled, and clears `ui.uploads`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        let orphan_id = [0x91u8; 16];
+        let orphan_key = [0x92u8; 32];
+        let two_chunks = (session::attachment::CHUNK_SIZE as u64) + 128;
+        let idx_orphan = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let ptr = crate::content::AttachmentPointer {
+                id: orphan_id.to_vec(),
+                key: orphan_key.to_vec(),
+                name: "restore_orphan.bin".into(),
+                size: two_chunks,
+                mime: "application/octet-stream".into(),
+                expires: crate::util::now().saturating_add(3_600_000),
+            };
+            let v = inner
+                .add(&peer, Kind::Attachment(ptr), false)
+                .await
+                .unwrap();
+            inner
+                .vault
+                .orphan_checkpoints
+                .borrow_mut()
+                .push(crate::vault::UploadCheckpoint {
+                    peer: peer.to_vec(),
+                    id: orphan_id.to_vec(),
+                    upload_state: crate::vault::UPLOAD_STATE_ANNOUNCED,
+                    uploaded: 1,
+                    history_index: v.index,
+                    ..Default::default()
+                });
+            v.index
+        };
+        let del_ids: Rc<RefCell<Vec<[u8; 16]>>> = Rc::new(RefCell::new(Vec::new()));
+        {
+            let di = del_ids.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, body| {
+                if path.ends_with("/DeleteAttachment") {
+                    let req =
+                        protocol::attachment::DeleteAttachmentRequest::decode(body.as_slice())
+                            .unwrap();
+                    di.borrow_mut()
+                        .push(<[u8; 16]>::try_from(req.id.as_ref()).unwrap());
+                }
+                Ok((200, vec![]))
+            });
+            eng.restore_uploads_from_vault().await.unwrap();
+        }
+        assert!(
+            del_ids.borrow().contains(&orphan_id),
+            "R26-P2-2: restore_uploads_from_vault must recover ptr.key and emit DeleteAttachment"
+        );
+        assert!(
+            eng.is_cancelled(&orphan_id),
+            "R26-P2-2: restore_uploads_from_vault must mark orphan att_id cancelled"
+        );
+        {
+            let guard = eng.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert_eq!(
+                inner
+                    .vault
+                    .entry(&peer, idx_orphan)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .delivery(),
+                Delivery::Failed
+            );
+            assert!(
+                inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer)
+                    .unwrap()
+                    .state
+                    .outbox
+                    .is_empty()
+            );
+            assert!(
+                inner
+                    .vault
+                    .tracked_upload_checkpoints(Some(&peer))
+                    .is_empty()
+            );
+        }
+    });
+
+    // Part 3 (R26-P2-3) & Part 4 (R26-P3-1):
+    // - During `finish_existing_contact_start_chat` Phase-A `RegisterWriteToken`,
+    //   `in_flight_start_chat` is already armed so background 403s cannot hijack `Dialog::NewChat`.
+    // - `retry_pending_greetings` and `upgrade_to_pq_auto` `ClaimBundle` 403 mark any queued
+    //   non-`awaits_upload` outbox head in `ui.held`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let peer_key = key_to_text(&peer);
+        let cgen = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.state.request = true;
+            c.state.provisional = false;
+            let cgen = c.state.conversation_gen;
+            inner.save_state().await.unwrap();
+            cgen
+        };
+        let draft = crate::state::PendingNewChat {
+            key: peer_key.clone(),
+            name: "ExistingPhaseA".into(),
+            server: None,
+            pq_pinned: false,
+            allow_classical: false,
+            auto_start: false,
+        };
+        eng.ui.dialog.set(Some(draft.clone().into_dialog()));
+        let sub_id = eng.startup.begin_new_chat_submit(draft);
+        let saw_register = Rc::new(Cell::new(false));
+        let bg_suppressed = Rc::new(Cell::new(false));
+        {
+            let sr = saw_register.clone();
+            let bs = bg_suppressed.clone();
+            let eng_c = eng.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let sr = sr.clone();
+                let bs = bs.clone();
+                let eng_c = eng_c.clone();
+                async move {
+                    if path.ends_with("/RegisterWriteToken") {
+                        sr.set(true);
+                        // Concurrent background 403 during Phase-A RegisterWriteToken MUST be
+                        // suppressed because `in_flight_start_chat` is already armed!
+                        let dlg = eng_c
+                            .startup
+                            .on_ask_sign_in_background(eng_c.ui.dialog.get_untracked().as_ref());
+                        bs.set(dlg.is_none());
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            assert_eq!(
+                eng.start_chat(sub_id, &peer_key, "ExistingPhaseA".into(), None, false, false)
+                    .await,
+                Ok(peer)
+            );
+        }
+        assert!(saw_register.get());
+        assert!(
+            bg_suppressed.get(),
+            "R26-P2-3: background 403 during finish_existing_contact_start_chat Phase A must be suppressed"
+        );
+        eng.startup.finish_submission(sub_id);
+
+        // Part 4 (R26-P3-1): `upgrade_to_pq_auto` ClaimBundle 403 & `retry_pending_greetings`
+        // `SendInitialV2` 403 both mark the non-`awaits_upload` outbox head in `ui.held`!
+        eng.decline_sign_in_prompts();
+        let head_idx = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let v = inner
+                .add(&peer, Kind::Text("held-by-upgrade-and-greeting".into()), false)
+                .await
+                .unwrap();
+            v.index
+        };
+        eng.ui.held.update(|h| h.clear());
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ClaimBundle") {
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            assert!(eng.upgrade_to_pq_auto(peer, cgen).await.is_err());
+        }
+        assert!(
+            eng.ui.held.with_untracked(|h| h.contains(&(peer, head_idx))),
+            "R26-P3-1: upgrade_to_pq_auto ClaimBundle 403 must record non-awaits_upload outbox head in ui.held"
+        );
+
+        // Now test `retry_pending_greetings` 403 holding the outbox head too!
+        eng.ui.held.update(|h| h.clear());
+        eng.queue.clear_peer_sign_in_wait(&peer);
+        let mut bob_client = session::Client::new(Fetch::client(LOCAL_SERVER));
+        let bob_peer = bob_client.identity_key();
+        let bob_key = key_to_text(&bob_peer);
+        let bob_bundle = publish_bundle_for_test(&mut bob_client, "localhost", 1).remove(0);
+        let sub_bob = eng
+            .startup
+            .begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key.clone(),
+                name: "BobHeld".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: false,
+                auto_start: false,
+            });
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ClaimBundle") {
+                    return Ok((200, bob_bundle.encode_to_vec()));
+                }
+                if path.ends_with("/SendInitialV2") {
+                    return Ok((
+                        503,
+                        br#"{"code":"unavailable","message":"offline"}"#.to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            assert_eq!(
+                eng.start_chat(sub_bob, &bob_key, "BobHeld".into(), None, false, false)
+                    .await,
+                Ok(bob_peer)
+            );
+        }
+        eng.startup.finish_submission(sub_bob);
+        let bob_msg_idx = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&bob_peer).unwrap();
+            c.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNSENT;
+            let v = inner
+                .add(&bob_peer, Kind::Text("held-by-greeting-retry".into()), false)
+                .await
+                .unwrap();
+            v.index
+        };
+        eng.ui.held.update(|h| h.clear());
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/SendInitialV2") {
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            eng.retry_pending_greetings().await.unwrap();
+        }
+        assert!(
+            eng.ui
+                .held
+                .with_untracked(|h| h.contains(&(bob_peer, bob_msg_idx))),
+            "R26-P3-1: retry_pending_greetings SendInitialV2 403 must record non-awaits_upload outbox head in ui.held"
+        );
+    });
+}

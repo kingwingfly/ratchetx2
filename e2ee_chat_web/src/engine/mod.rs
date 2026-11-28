@@ -32,7 +32,7 @@ use crate::vault::{
     VaultPresence,
 };
 use crate::{glue, transport};
-use attachments::{ChunkSource, upload_of};
+use attachments::{ChunkSource, ServerDeleteJob, upload_of};
 use contact::{
     Contact, DisplayedEntry, FarewellMode, isolated_contact_views, restore_contacts,
     stored_contacts,
@@ -1544,6 +1544,7 @@ impl Engine<Vault> {
         self.refresh_contacts(&inner);
         self.ui.isolated_contacts.set(inner.isolated_views());
         // Uploads the page left: their files are gone with it.
+        let mut orphan_server_deletes: Vec<(PublicKey, ServerDeleteJob)> = Vec::new();
         match inner.vault.uploads(None).await {
             Ok(uploads) => {
                 let mut restore_incomplete = false;
@@ -1763,20 +1764,51 @@ impl Engine<Vault> {
                             false
                         };
                         if !is_complete {
-                            // R15-P2-5: Only forget the checkpoint AFTER `fail_waiting` commits so
-                            // a transient IDB failure never strips the zero-chunk guard or strands
-                            // an `awaits_upload` outbox item with no checkpoint.
-                            if self.fail_waiting(&mut inner, &cp_peer, idx).await.is_err() {
-                                if !self.is_live(vgen) {
-                                    return false;
+                            // R15-P2-5 + R26-P2-2: Recover `ptr.key` for `DeleteCompleted`,
+                            // atomically fail the outbox item + forget the orphan checkpoint, and
+                            // clear caches/UI (mirroring `Engine::flush` so reload never bypasses
+                            // server cleanup or loses `OutgoingRecord` keys on transient errors).
+                            let mut peer_deletes = Vec::new();
+                            match self
+                                .fail_unresumable_upload_outbox(
+                                    vgen,
+                                    &mut inner,
+                                    &cp_peer,
+                                    idx,
+                                    sealed,
+                                    cp_id,
+                                    None,
+                                    String::new(),
+                                    &mut peer_deletes,
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    if cancelled() {
+                                        drop(inner);
+                                        self.abort_cancelled_unlock(vgen).await;
+                                        return false;
+                                    }
+                                    for job in peer_deletes {
+                                        orphan_server_deletes.push((cp_peer, job));
+                                    }
+                                    orphans_settled = true;
+                                    continue;
                                 }
-                                restore_incomplete = true;
-                                continue;
+                                Ok(false) => return false,
+                                Err(_) => {
+                                    if !self.is_live(vgen) {
+                                        return false;
+                                    }
+                                    if cancelled() {
+                                        drop(inner);
+                                        self.abort_cancelled_unlock(vgen).await;
+                                        return false;
+                                    }
+                                    restore_incomplete = true;
+                                    continue;
+                                }
                             }
-                            if !self.is_live(vgen) {
-                                return false;
-                            }
-                            orphans_settled = true;
                         }
                     }
                     if inner.vault.forget_upload(&cp_peer, &cp_id).await.is_err() {
@@ -1866,6 +1898,17 @@ impl Engine<Vault> {
         self.ui.log("vault unlocked");
         self.clone().run(vgen);
         self.clone().listen(vgen);
+        if !orphan_server_deletes.is_empty() {
+            let engine = self.clone();
+            spawn_local(async move {
+                for (del_peer, job) in orphan_server_deletes {
+                    if !engine.is_live(vgen) {
+                        break;
+                    }
+                    engine.finish_server_deletes(&del_peer, vec![job]).await;
+                }
+            });
+        }
         let engine = self.clone();
         glue::serve_media(move |request| {
             let engine = engine.clone();
@@ -1996,128 +2039,158 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return Ok(());
             }
-            let peer_lock = self.queue.peer_flush_lock(&cp_peer);
-            let _peer_guard = peer_lock.lock().await;
-            if !self.is_live(vgen) {
-                return Ok(());
-            }
-            let mut guard = self.lock_inner().await;
-            if !self.is_live(vgen) {
-                return Ok(());
-            }
-            let Some(inner) = guard.as_mut() else {
-                return Ok(());
-            };
-            let mut orphans_settled = false;
-            for cp in inner.vault.tracked_upload_checkpoints(Some(&cp_peer)) {
-                let Ok(cp_id) = <[u8; 16]>::try_from(cp.id.as_slice()) else {
-                    continue;
-                };
-                if self.is_cancelled(&cp_id) || self.uploads.is_running(&cp_id) {
-                    continue;
-                }
-                let upload_lookup = inner.vault.upload(&cp_peer, &cp_id).await;
+            let server_deletes = {
+                let peer_lock = self.queue.peer_flush_lock(&cp_peer);
+                let _peer_guard = peer_lock.lock().await;
                 if !self.is_live(vgen) {
                     return Ok(());
                 }
-                match upload_lookup {
-                    Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
-                    Ok(Some(_)) => continue,
-                    Err(_) => {
-                        restore_incomplete = true;
+                let mut guard = self.lock_inner().await;
+                if !self.is_live(vgen) {
+                    return Ok(());
+                }
+                let Some(inner) = guard.as_mut() else {
+                    return Ok(());
+                };
+                let mut orphans_settled = false;
+                let mut server_deletes: Vec<ServerDeleteJob> = Vec::new();
+                for cp in inner.vault.tracked_upload_checkpoints(Some(&cp_peer)) {
+                    let Ok(cp_id) = <[u8; 16]>::try_from(cp.id.as_slice()) else {
+                        continue;
+                    };
+                    if self.is_cancelled(&cp_id) || self.uploads.is_running(&cp_id) {
                         continue;
                     }
-                }
-                let mut outbox_match = inner.contact(&cp_peer).and_then(|c| {
-                    c.state
-                        .outbox
-                        .iter()
-                        .find(|o| checkpoint_matches_outbox(&cp, &cp_id, o))
-                        .map(|o| (o.history_index, o.dispatched, o.awaits_upload, o.sealed))
-                });
-                if outbox_match.is_none() {
-                    let hint_idx = (cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
-                        .then_some(cp.history_index);
-                    match inner
-                        .find_attachment_entry(&cp_peer, hint_idx, &cp_id, Some(true))
-                        .await
-                    {
-                        _ if !self.is_live(vgen) => return Ok(()),
-                        Ok(Some((idx, _))) => {
-                            outbox_match = inner.contact(&cp_peer).and_then(|c| {
-                                c.state
-                                    .outbox
-                                    .iter()
-                                    .find(|o| o.history_index == idx)
-                                    .map(|o| {
-                                        (o.history_index, o.dispatched, o.awaits_upload, o.sealed)
-                                    })
-                            });
-                        }
-                        Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
+                    let upload_lookup = inner.vault.upload(&cp_peer, &cp_id).await;
+                    if !self.is_live(vgen) {
+                        return Ok(());
+                    }
+                    match upload_lookup {
+                        Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
+                        Ok(Some(_)) => continue,
                         Err(_) => {
                             restore_incomplete = true;
                             continue;
                         }
                     }
-                }
-                if let Some((idx, dispatched, awaits_upload, sealed)) = outbox_match
-                    && !dispatched
-                {
-                    let is_complete = if !awaits_upload
-                        && matches!(
-                            cp.upload_state,
-                            crate::vault::UPLOAD_STATE_STARTED
-                                | crate::vault::UPLOAD_STATE_ANNOUNCED
-                        ) {
-                        let size = match inner
-                            .attachment_size_for_outbox(&cp_peer, idx, &cp_id, sealed)
+                    let mut outbox_match = inner.contact(&cp_peer).and_then(|c| {
+                        c.state
+                            .outbox
+                            .iter()
+                            .find(|o| checkpoint_matches_outbox(&cp, &cp_id, o))
+                            .map(|o| (o.history_index, o.dispatched, o.awaits_upload, o.sealed))
+                    });
+                    if outbox_match.is_none() {
+                        let hint_idx = (cp.upload_state == crate::vault::UPLOAD_STATE_ANNOUNCED)
+                            .then_some(cp.history_index);
+                        match inner
+                            .find_attachment_entry(&cp_peer, hint_idx, &cp_id, Some(true))
                             .await
                         {
                             _ if !self.is_live(vgen) => return Ok(()),
-                            Ok(size) => size,
+                            Ok(Some((idx, _))) => {
+                                outbox_match = inner.contact(&cp_peer).and_then(|c| {
+                                    c.state.outbox.iter().find(|o| o.history_index == idx).map(
+                                        |o| {
+                                            (
+                                                o.history_index,
+                                                o.dispatched,
+                                                o.awaits_upload,
+                                                o.sealed,
+                                            )
+                                        },
+                                    )
+                                });
+                            }
+                            Ok(_) | Err(crate::vault::Error::Corrupt(_)) => {}
                             Err(_) => {
                                 restore_incomplete = true;
                                 continue;
                             }
-                        };
-                        if let Some(size) = size {
-                            let total_chunks = attachment::chunk_count(size);
-                            let kept = match inner.vault.chunks_kept(&cp_peer, &cp_id).await {
+                        }
+                    }
+                    if let Some((idx, dispatched, awaits_upload, sealed)) = outbox_match
+                        && !dispatched
+                    {
+                        let is_complete = if !awaits_upload
+                            && matches!(
+                                cp.upload_state,
+                                crate::vault::UPLOAD_STATE_STARTED
+                                    | crate::vault::UPLOAD_STATE_ANNOUNCED
+                            ) {
+                            let size = match inner
+                                .attachment_size_for_outbox(&cp_peer, idx, &cp_id, sealed)
+                                .await
+                            {
                                 _ if !self.is_live(vgen) => return Ok(()),
-                                Ok(n) => u64::from(n),
+                                Ok(size) => size,
                                 Err(_) => {
                                     restore_incomplete = true;
                                     continue;
                                 }
                             };
-                            u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
+                            if let Some(size) = size {
+                                let total_chunks = attachment::chunk_count(size);
+                                let kept = match inner.vault.chunks_kept(&cp_peer, &cp_id).await {
+                                    _ if !self.is_live(vgen) => return Ok(()),
+                                    Ok(n) => u64::from(n),
+                                    Err(_) => {
+                                        restore_incomplete = true;
+                                        continue;
+                                    }
+                                };
+                                u64::from(cp.uploaded) >= total_chunks || kept >= total_chunks
+                            } else {
+                                false
+                            }
                         } else {
                             false
-                        }
-                    } else {
-                        false
-                    };
-                    if !is_complete {
-                        if self.fail_waiting(inner, &cp_peer, idx).await.is_err() {
-                            if !self.is_live(vgen) {
-                                return Ok(());
+                        };
+                        if !is_complete {
+                            // R26-P2-2: Route incomplete orphan settlement through
+                            // `fail_unresumable_upload_outbox` so `ptr.key` is recovered for
+                            // `DeleteAttachment`, outbox+checkpoint commit atomically, and
+                            // caches/`ui.uploads` are cleared cleanly.
+                            match self
+                                .fail_unresumable_upload_outbox(
+                                    vgen,
+                                    inner,
+                                    &cp_peer,
+                                    idx,
+                                    sealed,
+                                    cp_id,
+                                    None,
+                                    String::new(),
+                                    &mut server_deletes,
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    orphans_settled = true;
+                                    continue;
+                                }
+                                Ok(false) => return Ok(()),
+                                Err(_) => {
+                                    if !self.is_live(vgen) {
+                                        return Ok(());
+                                    }
+                                    restore_incomplete = true;
+                                    continue;
+                                }
                             }
-                            restore_incomplete = true;
-                            continue;
                         }
-                        if !self.is_live(vgen) {
-                            return Ok(());
-                        }
-                        orphans_settled = true;
+                    }
+                    if inner.vault.forget_upload(&cp_peer, &cp_id).await.is_err() {
+                        restore_incomplete = true;
                     }
                 }
-                if inner.vault.forget_upload(&cp_peer, &cp_id).await.is_err() {
-                    restore_incomplete = true;
+                if orphans_settled && self.is_live(vgen) {
+                    self.refresh_contacts(inner);
                 }
-            }
-            if orphans_settled && self.is_live(vgen) {
-                self.refresh_contacts(inner);
+                server_deletes
+            };
+            if !server_deletes.is_empty() && self.is_live(vgen) {
+                self.finish_server_deletes(&cp_peer, server_deletes).await;
             }
         }
         self.uploads
