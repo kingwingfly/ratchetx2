@@ -108,6 +108,18 @@ impl StoredAttachment {
     pub fn was_uploaded(&self, index: u32) -> bool {
         self.uploaded & uploaded_bit(index) != 0
     }
+
+    /// Whether every chunk (`0..self.chunks`) has been noted in [`uploaded`](Self::uploaded).
+    ///
+    /// Returns `false` when `chunks == 0` or `chunks > UPLOADED_NOTED` (where the bitmask cannot
+    /// prove completeness for chunks at or above [`UPLOADED_NOTED`]).
+    pub fn is_complete(&self) -> bool {
+        if self.chunks == 0 || self.chunks > UPLOADED_NOTED {
+            return false;
+        }
+        let all_chunks_mask = (1u64 << self.chunks) - 1;
+        (self.uploaded & all_chunks_mask) == all_chunks_mask
+    }
 }
 
 /// The bit of chunk `index` in [`StoredAttachment::uploaded`]; none from chunk
@@ -163,6 +175,12 @@ pub trait LocalAttachmentStore {
     async fn chunk(&self, id: &AttachmentId, index: u32) -> Result<Option<Bytes>>;
     /// Delete the attachment `id` and its chunks, if any.
     async fn delete_attachment(&self, id: &AttachmentId) -> Result<()>;
+    /// Atomically delete the attachment `id` and its chunks only if it is still incomplete
+    /// (`!StoredAttachment::is_complete`).
+    ///
+    /// Returns `true` if a stored incomplete attachment was deleted, and `false` if the
+    /// attachment was absent or already complete and therefore preserved.
+    async fn delete_attachment_if_incomplete(&self, id: &AttachmentId) -> Result<bool>;
 }
 
 /// The error type of this crate.

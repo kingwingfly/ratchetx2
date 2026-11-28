@@ -337,12 +337,44 @@ describe("workerd runtime twins", () => {
     expect(badDel.status).toBe(401);
     expect(await badDel.json()).toMatchObject({ code: "unauthenticated" });
 
+    // R22-P2-8: `only_if_incomplete = true` preserves a completed 1-chunk attachment in DO + R2.
+    const condComplete = await connectPost(
+      "/attachment.v1.AttachmentService/DeleteAttachment",
+      encodeDeleteAttachmentRequest(att2.id, att2.uploadToken, true),
+    );
+    expect(condComplete.status).toBe(200);
+    expect(await env.BUCKET.get(key2)).not.toBeNull();
+
     const goodDel = await connectPost(
       "/attachment.v1.AttachmentService/DeleteAttachment",
       encodeDeleteAttachmentRequest(att2.id, deleteToken),
     );
     expect(goodDel.status).toBe(200);
     expect(await env.BUCKET.get(key2)).toBeNull();
+
+    // R22-P2-8: `only_if_incomplete = true` deletes an incomplete 2-chunk attachment in DO + R2.
+    const start3 = await connectPost(
+      "/attachment.v1.AttachmentService/StartUpload",
+      encodeStartUploadRequest(2, deleteHash),
+      cookie,
+      exports.default,
+      { "CF-Connecting-IP": "198.51.100.10" },
+    );
+    const att3 = decodeStartUploadResponse(new Uint8Array(await start3.arrayBuffer()));
+    const put3 = await connectPost(
+      "/attachment.v1.AttachmentService/PutChunk",
+      encodePutChunkRequest(att3.id, att3.uploadToken, 0, utf8("incomplete-chunk-zero")),
+      cookie,
+    );
+    expect(put3.status).toBe(200);
+    const key3 = `v2/attachments/${hex(att3.id)}/0`;
+    expect(await env.BUCKET.get(key3)).not.toBeNull();
+    const condIncomplete = await connectPost(
+      "/attachment.v1.AttachmentService/DeleteAttachment",
+      encodeDeleteAttachmentRequest(att3.id, att3.uploadToken, true),
+    );
+    expect(condIncomplete.status).toBe(200);
+    expect(await env.BUCKET.get(key3)).toBeNull();
   });
 
   // -------------------------------------------------------------------------

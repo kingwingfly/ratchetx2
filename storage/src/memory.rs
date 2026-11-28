@@ -1417,6 +1417,19 @@ impl AttachmentStore for MemoryStore {
         self.inner.lock().attachments.remove(id);
         Ok(())
     }
+
+    async fn delete_attachment_if_incomplete(&self, id: &AttachmentId) -> Result<bool> {
+        let mut inner = self.inner.lock();
+        if inner
+            .attachments
+            .get(id)
+            .is_none_or(|(attachment, _)| attachment.is_complete())
+        {
+            return Ok(false);
+        }
+        inner.attachments.remove(id);
+        Ok(true)
+    }
 }
 
 #[cfg(test)]

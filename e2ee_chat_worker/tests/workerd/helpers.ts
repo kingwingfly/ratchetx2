@@ -636,8 +636,14 @@ export function decodeGetChunkResponse(bytes: Uint8Array): {
   return { data, uploaded };
 }
 
-export function encodeDeleteAttachmentRequest(id: Uint8Array, token: Uint8Array): Uint8Array {
-  return concatBytes(pbBytes(1, id), pbBytes(2, token));
+export function encodeDeleteAttachmentRequest(
+  id: Uint8Array,
+  token: Uint8Array,
+  onlyIfIncomplete = false,
+): Uint8Array {
+  return onlyIfIncomplete
+    ? concatBytes(pbBytes(1, id), pbBytes(2, token), pbVarint(3, 1n))
+    : concatBytes(pbBytes(1, id), pbBytes(2, token));
 }
 
 export async function signAckInitialMessagesRequest(params: {

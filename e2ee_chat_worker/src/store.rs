@@ -403,6 +403,11 @@ impl LocalAttachmentStore for Store {
     async fn delete_attachment(&self, id: &AttachmentId) -> Result<()> {
         self.attachment_call(id, rpc::DeleteAttachment).await
     }
+
+    async fn delete_attachment_if_incomplete(&self, id: &AttachmentId) -> Result<bool> {
+        self.attachment_call(id, rpc::DeleteAttachmentIfIncomplete)
+            .await
+    }
 }
 
 /// The opaque R2 object key of chunk `index` of attachment `id` (zero identity keys in R2).

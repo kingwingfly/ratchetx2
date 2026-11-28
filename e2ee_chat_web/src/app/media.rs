@@ -267,9 +267,12 @@ pub(super) fn inline_media(body: &Body) -> Option<(Source, Sort)> {
             ("video", _) => Sort::Video,
             _ => Sort::Audio,
         },
-        // Not one whose upload waits to start, which has nothing to fetch yet.
+        // Not one whose upload waits to start or is already confirmed deleted from the server
+        // (`R22-P3-3`), which has nothing to auto-fetch.
         Body::Remote(remote)
-            if remote.pointer.size <= MEDIA_INLINE_MAX && !remote.pointer.id.is_empty() =>
+            if !remote.gone
+                && remote.pointer.size <= MEDIA_INLINE_MAX
+                && !remote.pointer.id.is_empty() =>
         {
             let pointer = &remote.pointer;
             match preview::sort(&pointer.name, &pointer.mime, &[]) {
@@ -288,12 +291,30 @@ pub(super) fn file_card(source: Source) -> AnyView {
     let name = sanitize_filename(source.name());
     let extension = extension(&name);
     let length = size_u64(source.size());
+    let remote_meta = match &source {
+        Source::Remote(remote) => Some((remote.peer, remote.index, remote.gone)),
+        Source::Local(_) => None,
+    };
+    let ui = ui();
+    let gone = move || {
+        remote_meta.is_some_and(|(peer, index, initial_gone)| {
+            initial_gone || ui.gone.with(|gone| gone.contains(&(peer, index)))
+        })
+    };
     view! {
-        <button class="file-card" on:click=move |_| source.open()>
+        <button class="file-card" class:gone=gone on:click=move |_| source.open()>
             <span class="file-icon">{extension}</span>
             <span>
                 <strong>{name}</strong>
-                <span>{length}</span>
+                <span>
+                    {move || {
+                        if gone() {
+                            format!("{length} · deleted from server")
+                        } else {
+                            length.clone()
+                        }
+                    }}
+                </span>
             </span>
         </button>
     }
@@ -751,6 +772,29 @@ pub(super) fn image_url(data: &[u8], mime: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::content::AttachmentPointer;
+
+    #[test]
+    fn inline_media_skips_remote_attachments_marked_gone() {
+        let base = RemoteFile {
+            peer: [1; 32],
+            index: 0,
+            pointer: AttachmentPointer {
+                id: vec![2; 16],
+                key: vec![3; 32],
+                name: "pic.png".into(),
+                size: 128,
+                mime: "image/png".into(),
+                expires: 0,
+            },
+            clock: 1,
+            gone: false,
+        };
+        assert!(inline_media(&Body::Remote(base.clone())).is_some());
+        let mut gone = base;
+        gone.gone = true;
+        assert!(inline_media(&Body::Remote(gone)).is_none());
+    }
 
     #[test]
     fn live_blob_urls_do_not_leak_and_drain_on_revoke_all() {

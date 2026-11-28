@@ -2970,18 +2970,25 @@ impl<V: VaultStore> Engine<V> {
             if let Ok(id_arr) = <[u8; 16]>::try_from(rb.pending.id.as_slice()) {
                 upload_ids.insert(id_arr);
                 explicit_cancel_ids.insert(id_arr);
-                if rb.pending.started()
-                    && !unfinished_ids.contains(&id_arr)
-                    && let Ok(upload) = upload_of(&rb.pending)
-                {
-                    unfinished_ids.insert(id_arr);
-                    unfinished.push((rb.pending.name.clone(), upload));
+                if rb.pending.has_started_state() && !unfinished_ids.contains(&id_arr) {
+                    if let Ok(upload) = upload_of(&rb.pending) {
+                        unfinished_ids.insert(id_arr);
+                        unfinished.push((rb.pending.name.clone(), upload));
+                    } else if !completed_delete_ids.contains(&id_arr)
+                        && let Ok(key) = <[u8; 32]>::try_from(rb.pending.key.as_slice())
+                    {
+                        completed_delete_ids.insert(id_arr);
+                        completed_deletes.push((rb.pending.name.clone(), id_arr, key.into()));
+                    }
                 }
             }
         }
         for (_, pending) in vault_uploads {
             let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
-            if !pending.started() {
+            // R22-P2-9: Use `has_started_state()` (not `started()`, which returns false on an
+            // empty upload token) so malformed started uploads are never misclassified as
+            // never-started waiting uploads and still recover their deletion key.
+            if !pending.has_started_state() {
                 if let Some(id) = id_arr {
                     intact_upload_ids.insert(id);
                 }
@@ -2992,12 +2999,12 @@ impl<V: VaultStore> Engine<V> {
             }
             let valid_upload = upload_of(&pending).ok();
             let id_pending_cancel = id_arr.is_some_and(|id| seen_pending_cancels.contains(&id));
-            // R18-P2-5 + R19-P1-5 + R20-P2-4 + R21-P2-6: Cancel on the server ONLY when
-            // unannounced, explicitly pending-cancelled, OR durable chunk progress shows the
-            // announced upload is genuinely incomplete — re-checking `is_server_completed` AFTER
-            // `chunks_kept().await` so a final `PutChunk` completing during IDB I/O is never
-            // deleted for the recipient.
-            let should_cancel = if !pending.is_announced() || id_pending_cancel {
+            // R18-P2-5 + R19-P1-5 + R20-P2-4 + R21-P2-6 + R22-P2-9: Cancel on the server ONLY when
+            // unannounced (`!has_announced_state()`), explicitly pending-cancelled, OR durable
+            // chunk progress shows the announced upload is genuinely incomplete — re-checking
+            // `is_server_completed` AFTER `chunks_kept().await` so a final `PutChunk` completing
+            // during IDB I/O is never deleted for the recipient.
+            let should_cancel = if !pending.has_announced_state() || id_pending_cancel {
                 true
             } else {
                 let chunks = attachment::chunk_count(pending.size);
@@ -3025,7 +3032,7 @@ impl<V: VaultStore> Engine<V> {
                 intact_upload_ids.insert(id);
             }
             if should_cancel && id_arr.is_none_or(|id| !unfinished_ids.contains(&id)) {
-                let is_announced_auto = pending.is_announced() && !id_pending_cancel;
+                let is_announced_auto = pending.has_announced_state() && !id_pending_cancel;
                 if let Some(upload) = valid_upload {
                     if let Some(id) = id_arr {
                         unfinished_ids.insert(id);
@@ -3037,12 +3044,20 @@ impl<V: VaultStore> Engine<V> {
                 } else if let Some(id) = id_arr
                     && !completed_delete_ids.contains(&id)
                 {
-                    let cp = tracked_checkpoints
-                        .iter()
-                        .find(|cp| cp.id.as_slice() == id.as_slice());
-                    if let Some((name, key, _)) = self
-                        .resolve_delete_pointer(vgen, inner, &peer, &id, cp)
-                        .await?
+                    // R22-P2-9: Prefer a valid 32-byte `pending.key` directly (covering unannounced
+                    // `STARTED` rows with no history record yet), falling back to history/outbox
+                    // pointer lookup when `pending.key` is also corrupt.
+                    let resolved = if let Ok(key) = <[u8; 32]>::try_from(pending.key.as_slice()) {
+                        Some((pending.name.clone(), key))
+                    } else {
+                        let cp = tracked_checkpoints
+                            .iter()
+                            .find(|cp| cp.id.as_slice() == id.as_slice());
+                        self.resolve_delete_pointer(vgen, inner, &peer, &id, cp)
+                            .await?
+                            .map(|(name, key, _)| (name, key))
+                    };
+                    if let Some((name, key)) = resolved
                         && !(is_announced_auto && self.uploads.is_server_completed(&id))
                     {
                         completed_delete_ids.insert(id);
@@ -3184,7 +3199,14 @@ impl<V: VaultStore> Engine<V> {
         }
         for (id, pending) in &vault_uploads_by_id {
             if upload_of(pending).is_err() {
-                retain_candidates.insert(*id);
+                if !unfinished_ids.contains(id)
+                    && !completed_delete_ids.contains(id)
+                    && let Ok(key) = <[u8; 32]>::try_from(pending.key.as_slice())
+                {
+                    retained_cancel_delete_keys.insert(*id, (pending.name.clone(), key.into()));
+                } else {
+                    retain_candidates.insert(*id);
+                }
             }
         }
         for id in self.uploads.server_completed_for_peer(&peer) {
@@ -3399,13 +3421,16 @@ impl<V: VaultStore> Engine<V> {
             if let Ok(id_arr) = <[u8; 16]>::try_from(rb.pending.id.as_slice()) {
                 upload_ids.insert(id_arr);
                 explicit_cancel_ids.insert(id_arr);
-                if rb.pending.started()
+                if rb.pending.has_started_state()
                     && !unfinished_ids.contains(&id_arr)
                     && !completed_delete_ids.contains(&id_arr)
                 {
                     if let Ok(upload) = upload_of(&rb.pending) {
                         unfinished_ids.insert(id_arr);
                         unfinished.push((rb.pending.name.clone(), upload));
+                    } else if let Ok(key) = <[u8; 32]>::try_from(rb.pending.key.as_slice()) {
+                        completed_delete_ids.insert(id_arr);
+                        completed_deletes.push((rb.pending.name.clone(), id_arr, key.into()));
                     } else if let Some((name, key)) = retained_cancel_delete_keys.remove(&id_arr) {
                         completed_delete_ids.insert(id_arr);
                         completed_deletes.push((name, id_arr, key));
@@ -3413,19 +3438,35 @@ impl<V: VaultStore> Engine<V> {
                 }
             }
         }
-        // R21-P2-6: Drop any non-explicit announced auto-cancel whose final `PutChunk` succeeded
-        // on the server during `delete_inner`'s vault awaits before clearing `server_completed`.
-        unfinished.retain(|(_, upload)| {
-            let id = upload.id();
-            !(announced_auto_cancel_ids.contains(id)
-                && !explicit_cancel_ids.contains(id)
-                && self.uploads.is_server_completed(id))
-        });
-        completed_deletes.retain(|(_, id, _)| {
-            !(announced_auto_cancel_ids.contains(id)
-                && !explicit_cancel_ids.contains(id)
-                && self.uploads.is_server_completed(id))
-        });
+        // R21-P2-6 + R22-P2-8: Drop any non-explicit announced auto-cancel whose final `PutChunk`
+        // succeeded locally during `delete_inner`'s vault awaits, AND mark remaining non-explicit
+        // announced auto-cancels `only_if_incomplete = true` so even a final `PutChunk` whose HTTP
+        // response was delayed past `forget_peer` is atomically preserved by the relay.
+        let unfinished: Vec<(String, Upload, bool)> = unfinished
+            .into_iter()
+            .filter_map(|(name, upload)| {
+                let id = *upload.id();
+                let is_announced_auto =
+                    announced_auto_cancel_ids.contains(&id) && !explicit_cancel_ids.contains(&id);
+                if is_announced_auto && self.uploads.is_server_completed(&id) {
+                    None
+                } else {
+                    Some((name, upload, is_announced_auto))
+                }
+            })
+            .collect();
+        let completed_deletes: Vec<_> = completed_deletes
+            .into_iter()
+            .filter_map(|(name, id, key)| {
+                let is_announced_auto =
+                    announced_auto_cancel_ids.contains(&id) && !explicit_cancel_ids.contains(&id);
+                if is_announced_auto && self.uploads.is_server_completed(&id) {
+                    None
+                } else {
+                    Some((name, id, key, is_announced_auto))
+                }
+            })
+            .collect();
         for id in upload_ids {
             self.uploads.mark_cancelled(id);
             self.uploads.clear_server_completed(&id);
@@ -3472,16 +3513,26 @@ impl<V: VaultStore> Engine<V> {
             let (ui, attachments) = (self.ui, Fetch::client(&server));
             #[cfg(target_arch = "wasm32")]
             spawn_local(async move {
-                for (name, upload) in unfinished {
-                    if let Err(e) = upload.cancel(&attachments).await {
+                for (name, upload, only_if_incomplete) in unfinished {
+                    let res = if only_if_incomplete {
+                        upload.cancel_if_incomplete(&attachments).await
+                    } else {
+                        upload.cancel(&attachments).await
+                    };
+                    if let Err(e) = res {
                         ui.log(format!(
                             "the server keeps what it has of {name} until it expires: {}",
                             describe(&e)
                         ));
                     }
                 }
-                for (name, id, key) in completed_deletes {
-                    match attachment::delete(&attachments, &id, &key).await {
+                for (name, id, key, only_if_incomplete) in completed_deletes {
+                    let res = if only_if_incomplete {
+                        attachment::delete_if_incomplete(&attachments, &id, &key).await
+                    } else {
+                        attachment::delete(&attachments, &id, &key).await
+                    };
+                    match res {
                         Ok(()) => {}
                         Err(e) if e.kind() == ErrorKind::NotFound => {}
                         Err(e) => {
@@ -3495,16 +3546,26 @@ impl<V: VaultStore> Engine<V> {
             });
             #[cfg(not(target_arch = "wasm32"))]
             {
-                for (name, upload) in unfinished {
-                    if let Err(e) = upload.cancel(&attachments).await {
+                for (name, upload, only_if_incomplete) in unfinished {
+                    let res = if only_if_incomplete {
+                        upload.cancel_if_incomplete(&attachments).await
+                    } else {
+                        upload.cancel(&attachments).await
+                    };
+                    if let Err(e) = res {
                         ui.log(format!(
                             "the server keeps what it has of {name} until it expires: {}",
                             describe(&e)
                         ));
                     }
                 }
-                for (name, id, key) in completed_deletes {
-                    match attachment::delete(&attachments, &id, &key).await {
+                for (name, id, key, only_if_incomplete) in completed_deletes {
+                    let res = if only_if_incomplete {
+                        attachment::delete_if_incomplete(&attachments, &id, &key).await
+                    } else {
+                        attachment::delete(&attachments, &id, &key).await
+                    };
+                    match res {
                         Ok(()) => {}
                         Err(e) if e.kind() == ErrorKind::NotFound => {}
                         Err(e) => {

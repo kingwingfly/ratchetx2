@@ -605,6 +605,11 @@ mod v2 {
             &self.manifest
         }
 
+        /// The canonical SHA-256 digest of the peer's verified [`CapabilityManifest`].
+        pub fn manifest_digest(&self) -> [u8; 32] {
+            self.manifest_digest
+        }
+
         /// Whether this bundle was claimed via explicit classical fallback while the relay had
         /// `PQ_ENABLED="false"`.
         pub fn is_server_pq_disabled_fallback(&self) -> bool {
@@ -1109,6 +1114,20 @@ mod v2 {
         let manifest = &claimed.manifest;
         let mut updated_peer_state = peer_state.clone();
         if manifest.pq_enabled {
+            updated_peer_state
+                .check_and_pin_manifest(manifest.manifest_seq, claimed.manifest_digest)?;
+        } else if peer_state.downgrade_detected && peer_state.peer_pq_capable {
+            // R22-P3-1: While a live downgrade alarm is active on a PQ-capable peer, never let a
+            // signed PQ-OFF manifest clear `peer_pq_capable` (even when `local_pq_enabled == false`).
+            // Still enforce monotonic manifest pinning and reject rollbacks / same-seq replays.
+            if local_pq_enabled {
+                return Err(ErrorKind::DowngradeDetected.into());
+            }
+            if updated_peer_state.pinned_manifest_seq > 0
+                && manifest.manifest_seq <= updated_peer_state.pinned_manifest_seq
+            {
+                return Err(ErrorKind::DowngradeDetected.into());
+            }
             updated_peer_state
                 .check_and_pin_manifest(manifest.manifest_seq, claimed.manifest_digest)?;
         } else {

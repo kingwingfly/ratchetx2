@@ -266,6 +266,7 @@ fn copy_zeroizing_array<const N: usize>(bytes: &[u8]) -> Option<Zeroizing<[u8; N
 
 /// Error fetching an attachment chunk, preserving HTTP 404 (`NotFound`) and the pinned
 /// conversation generation so callers only mark the attachment gone in the same conversation.
+#[derive(Debug)]
 pub(super) enum FetchError {
     NotFound {
         message: String,
@@ -318,6 +319,10 @@ pub(super) struct Fetching {
     /// How far this client's own upload of it got, if it is unfinished, its file gone with the
     /// page: what the server lacks only comes once the file is chosen again.
     pub(super) unfinished: Option<u32>,
+    /// Whether this attachment is already known deleted/missing on the server (`R22-P3-3`):
+    /// locally cached chunks still open offline, while cache misses fail immediately without
+    /// issuing `GetChunk`.
+    pub(super) known_gone: bool,
     pub(super) attachments: Connect,
 }
 
@@ -1420,15 +1425,20 @@ impl<V: VaultStore> Engine<V> {
         peer: &PublicKey,
         id: [u8; 16],
     ) -> Result<(Vec<ServerDeleteJob>, bool), String> {
-        // R15-P2-7 + R21-P2-7: Route `Error::Corrupt` AND malformed started `PendingUpload`
-        // records (whose upload token/key fails `upload_of`) into the orphan/history recovery path
-        // below (while still forgetting the malformed IDB record) and propagating transient
-        // `Storage` errors.
+        // R15-P2-7 + R21-P2-7 + R22-P2-9: Route `Error::Corrupt` AND malformed started
+        // `PendingUpload` records (including `UPLOAD_STATE_STARTED` / `UPLOAD_STATE_ANNOUNCED`
+        // rows whose upload token was emptied or corrupted so `upload_of` fails) into the
+        // recovery path below while retaining any valid 32-byte `pending.key` as a delete-key
+        // fallback (even for unannounced `STARTED` uploads that have no history row yet).
         let mut malformed_pending = false;
+        let mut malformed_delete_key: Option<(String, [u8; attachment::KEY_LENGTH])> = None;
         let pending = match inner.vault.upload(peer, &id).await {
             _ if !self.is_live(vgen) => return Err("locked".into()),
-            Ok(Some(pending)) if pending.started() && upload_of(&pending).is_err() => {
+            Ok(Some(pending)) if pending.has_started_state() && upload_of(&pending).is_err() => {
                 malformed_pending = true;
+                if let Ok(key) = <[u8; attachment::KEY_LENGTH]>::try_from(pending.key.as_slice()) {
+                    malformed_delete_key = Some((pending.name.clone(), key));
+                }
                 None
             }
             Ok(pending) => pending,
@@ -1438,7 +1448,10 @@ impl<V: VaultStore> Engine<V> {
         // One that waited for a sign-in never went: its message fails only if that outbox entry
         // still awaits an upload (a stale unstarted record left behind after `start_waiting`
         // promoted the message must only be forgotten, without failing the active message).
-        if let Some(waiting) = pending.as_ref().filter(|pending| !pending.started()) {
+        if let Some(waiting) = pending
+            .as_ref()
+            .filter(|pending| !pending.has_started_state())
+        {
             let still_awaits = inner.contact(peer).is_some_and(|contact| {
                 contact.state.outbox.iter().any(|o| {
                     o.history_index == waiting.history_index
@@ -1547,6 +1560,17 @@ impl<V: VaultStore> Engine<V> {
                         Err(e) => return Err(describe(&e)),
                     }
                 }
+                if delete_jobs.is_empty()
+                    && let Some((name, key)) = malformed_delete_key.take()
+                {
+                    delete_jobs.push(ServerDeleteJob {
+                        server: inner.server.clone(),
+                        id,
+                        history_index: outbox_match.map(|(idx, _, _)| idx),
+                        name,
+                        kind: ServerDeleteKind::DeleteCompleted(key.into()),
+                    });
+                }
                 let mut forgot_upload = false;
                 if let Some((idx, dispatched, _)) = outbox_match {
                     if !dispatched {
@@ -1644,6 +1668,17 @@ impl<V: VaultStore> Engine<V> {
                     Err(crate::vault::Error::Corrupt(_)) => {}
                     Err(e) => return Err(describe(&e)),
                 }
+            }
+            if delete_jobs.is_empty()
+                && let Some((name, key)) = malformed_delete_key.take()
+            {
+                delete_jobs.push(ServerDeleteJob {
+                    server: inner.server.clone(),
+                    id,
+                    history_index: outbox_match.map(|(idx, _, _)| idx),
+                    name,
+                    kind: ServerDeleteKind::DeleteCompleted(key.into()),
+                });
             }
             let mut should_flush = false;
             let mut forgot_upload = false;
@@ -2368,14 +2403,14 @@ impl<V: VaultStore> Engine<V> {
         let changed = inner
             .with_contact_tx(peer, async |inner| {
                 let mut hist = Vec::new();
-                if let Some(contact) = inner.contact(peer) {
-                    contact.state.outbox.retain(|o| o.history_index != idx);
-                    if mark_gone {
-                        contact.record_deleted_attachment(id);
-                    }
-                }
+                let mut expires = 0u64;
                 match inner.vault.entry(peer, idx).await {
                     Ok(Some(mut entry)) => {
+                        if let Some(Kind::Attachment(ptr)) =
+                            entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                        {
+                            expires = ptr.expires;
+                        }
                         entry.set_delivery(entry.delivery().after(Step::Refused));
                         if mark_gone {
                             entry.gone = true;
@@ -2384,6 +2419,12 @@ impl<V: VaultStore> Engine<V> {
                     }
                     Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
                     Err(e) => return Err(describe(&e)),
+                }
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.outbox.retain(|o| o.history_index != idx);
+                    if mark_gone {
+                        contact.record_deleted_attachment(id, expires);
+                    }
                 }
                 inner
                     .promote_upload_with(
@@ -2673,7 +2714,7 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    async fn note_gone_inner(
+    pub(super) async fn note_gone_inner(
         &self,
         vgen: u64,
         inner: &mut Inner<V>,
@@ -2681,23 +2722,50 @@ impl<V: VaultStore> Engine<V> {
         hint_index: Option<u64>,
         id: &[u8; 16],
     ) -> Result<(), String> {
+        // R21-P2-10 + R21-P3-3 + R22-P2-10: Record `id` in `ContactState.deleted_attachments`
+        // FIRST (before `find_all_attachment_entries`) so even a transient history read error
+        // still persists the tombstone in `AppState`.
+        let mut recorded_deleted = inner
+            .contact(peer)
+            .is_some_and(|contact| contact.record_deleted_attachment(id, 0));
         // R19-P2-3 + R20-P3-2: Locate EVERY history entry carrying attachment `id` (both the
         // original outgoing message and any reflected incoming echo(es)) so deleting from either
         // direction marks all matching rows `gone = true` atomically in one save.
-        let to_mark = inner
+        let to_mark = match inner
             .find_all_attachment_entries(peer, hint_index, id)
             .await
-            .map_err(|e| describe(&e))?;
+        {
+            Ok(entries) => entries,
+            Err(e) => {
+                if recorded_deleted {
+                    inner.unsaved_state = true;
+                    if inner.save_state().await.is_ok() {
+                        inner.unsaved_state = false;
+                    }
+                }
+                return Err(describe(&e));
+            }
+        };
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
-        // R21-P2-10 + R21-P3-3: Always record `id` durably in `ContactState.deleted_attachments`
-        // so (a) delayed incoming echoes arriving later are created with `gone = true`, and
-        // (b) reload after a transient history write failure still excludes `id` from unread
-        // requeue once `AppState` saves.
-        let recorded_deleted = inner
-            .contact(peer)
-            .is_some_and(|contact| contact.record_deleted_attachment(id));
+        let max_expires = to_mark
+            .iter()
+            .filter_map(
+                |(_, entry)| match entry.content.as_ref().and_then(|c| c.kind.as_ref()) {
+                    Some(Kind::Attachment(ptr)) if ptr.expires > 0 => Some(ptr.expires),
+                    _ => None,
+                },
+            )
+            .max()
+            .unwrap_or(0);
+        if max_expires > 0
+            && inner
+                .contact(peer)
+                .is_some_and(|contact| contact.record_deleted_attachment(id, max_expires))
+        {
+            recorded_deleted = true;
+        }
         if to_mark.is_empty() {
             if recorded_deleted && let Err(e) = inner.save_state().await {
                 inner.unsaved_state = true;
@@ -3270,12 +3338,18 @@ impl<V: VaultStore> Engine<V> {
             u32::try_from(attachment::chunk_count(pointer.size)).map_err(|_| malformed())?;
         let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
-        let conversation_gen = inner
+        let (conversation_gen, deleted_in_state) = inner
             .contacts
             .iter()
             .find(|c| c.peer == peer)
-            .map(|c| c.state.conversation_gen)
+            .map(|c| (c.state.conversation_gen, c.is_attachment_deleted(&id)))
             .ok_or("no such chat")?;
+        let entry_gone = if deleted_in_state {
+            true
+        } else {
+            matches!(inner.vault.entry(&peer, index).await, Ok(Some(entry)) if entry.gone)
+        };
+        let known_gone = deleted_in_state || entry_gone;
         let unfinished = inner
             .vault
             .upload(&peer, &id)
@@ -3293,6 +3367,7 @@ impl<V: VaultStore> Engine<V> {
             size: pointer.size,
             chunks,
             unfinished,
+            known_gone,
             attachments: Fetch::client(&inner.server),
         })
     }
@@ -3337,7 +3412,14 @@ impl<V: VaultStore> Engine<V> {
             return Ok(Some((plaintext, false)));
         }
         // Missing locally, or a cached chunk failed decryption / expected length validation:
-        // re-fetch from the server below and repair IndexedDB via `keep_chunk`.
+        // short-circuit immediately if already known deleted from the server (`R22-P3-3`),
+        // otherwise re-fetch from the server below and repair IndexedDB via `keep_chunk`.
+        if fetching.known_gone {
+            return Err(FetchError::NotFound {
+                message: format!("{} is gone from the server", fetching.name),
+                conversation_gen: Some(fetching.conversation_gen),
+            });
+        }
         if fetching
             .unfinished
             .is_some_and(|uploaded| index >= uploaded)
@@ -3436,7 +3518,7 @@ impl<V: VaultStore> Engine<V> {
 
     /// Keep chunk `index` of the attachment `id`, in the chat with `peer`, unless its upload was
     /// cancelled or the chat deleted/recreated meanwhile. Returns `Ok(true)` if kept.
-    async fn keep_chunk_for_gen(
+    pub(super) async fn keep_chunk_for_gen(
         &self,
         peer: &PublicKey,
         id: &[u8],

@@ -1338,11 +1338,22 @@ pub struct ContactState {
     /// proving the server retained a live row or ACK tombstone so no further probes are needed.
     #[prost(bool, tag = "37")]
     pub greeting_delivery_verified: bool,
-    /// Bounded, deduplicated list of 16-byte attachment IDs confirmed deleted or missing on the
-    /// server (`R21-P2-10`, `R21-P3-3`), ensuring unread requeue after reload never resends a dead
-    /// pointer and delayed incoming echoes of already-deleted attachments arrive marked `gone`.
-    #[prost(bytes = "vec", repeated, tag = "38")]
-    pub deleted_attachments: Vec<Vec<u8>>,
+    /// Bounded, deduplicated list of attachments confirmed deleted or missing on the server
+    /// (`R21-P2-10`, `R21-P3-3`, `R22-P3-4`), retaining server expiry timestamps so expired
+    /// tombstones are pruned before any cap applies.
+    #[prost(message, repeated, tag = "38")]
+    pub deleted_attachments: Vec<DeletedAttachment>,
+}
+
+/// Tombstone for an attachment confirmed deleted or missing on the server (`R22-P3-4`).
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct DeletedAttachment {
+    /// 16-byte attachment ID.
+    #[prost(bytes = "vec", tag = "1")]
+    pub id: Vec<u8>,
+    /// Server expiry timestamp in Unix ms (`0` if unknown).
+    #[prost(uint64, tag = "2")]
+    pub expires: u64,
 }
 
 /// Persisted structured preview of the most recent message in a chat.
@@ -1487,17 +1498,29 @@ pub struct PendingUpload {
 }
 
 impl PendingUpload {
-    /// Whether its upload started, so that the server has it, under its ID.
-    pub fn started(&self) -> bool {
+    /// Whether its upload lifecycle state reached `STARTED` or `ANNOUNCED` (even if its upload
+    /// token was later emptied or corrupted, `R22-P2-9`).
+    pub fn has_started_state(&self) -> bool {
         matches!(
             self.upload_state,
             UPLOAD_STATE_STARTED | UPLOAD_STATE_ANNOUNCED
-        ) && !self.token.is_empty()
+        )
+    }
+
+    /// Whether its upload lifecycle state reached `ANNOUNCED` (even if its upload token was later
+    /// emptied or corrupted, `R22-P2-9`).
+    pub fn has_announced_state(&self) -> bool {
+        self.upload_state == UPLOAD_STATE_ANNOUNCED
+    }
+
+    /// Whether its upload started, so that the server has it, under its ID.
+    pub fn started(&self) -> bool {
+        self.has_started_state() && !self.token.is_empty()
     }
 
     /// Whether the server-assigned attachment pointer has been durably announced in chat history.
     pub fn is_announced(&self) -> bool {
-        self.upload_state == UPLOAD_STATE_ANNOUNCED && !self.token.is_empty()
+        self.has_announced_state() && !self.token.is_empty()
     }
 
     fn clear_secrets(&mut self) {

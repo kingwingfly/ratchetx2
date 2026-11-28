@@ -546,12 +546,16 @@ impl Contact {
             }
         }
         self.state.last_activity = now();
-        // R21-P3-3: If this incoming attachment echo arrived after the attachment was already
-        // confirmed deleted/missing on the server, mark the new history row `gone = true`
-        // immediately so Files and chat views never offer the dead object again.
+        // R21-P3-3 + R22-P3-4: If this incoming attachment echo arrived after the attachment was
+        // already confirmed deleted/missing on the server OR after its server expiry timestamp,
+        // mark the new history row `gone = true` immediately so Files and chat views never offer
+        // the dead object again.
+        let current_ms = now();
         let already_gone = matches!(
             &content.kind,
-            Some(Kind::Attachment(ptr)) if self.is_attachment_deleted(&ptr.id)
+            Some(Kind::Attachment(ptr))
+                if self.is_attachment_deleted(&ptr.id)
+                    || (ptr.expires > 0 && ptr.expires <= current_ms)
         );
         let entry = HistoryEntry {
             outgoing: false,
@@ -565,19 +569,35 @@ impl Contact {
         Ok((index, entry))
     }
 
-    /// Record attachment `id` as durably deleted/missing on the server (`R21-P2-10`, `R21-P3-3`),
-    /// keeping a bounded deduplicated list in `ContactState`. Returns `true` if newly recorded.
-    pub(super) fn record_deleted_attachment(&mut self, id: &[u8; 16]) -> bool {
-        if self
+    /// Record attachment `id` as durably deleted/missing on the server (`R21-P2-10`, `R21-P3-3`,
+    /// `R22-P3-4`), pruning expired tombstones before enforcing the high-water cap. Returns `true`
+    /// if `ContactState.deleted_attachments` changed.
+    pub(super) fn record_deleted_attachment(&mut self, id: &[u8; 16], expires: u64) -> bool {
+        let current_ms = now();
+        let before_len = self.state.deleted_attachments.len();
+        self.state
+            .deleted_attachments
+            .retain(|existing| existing.expires == 0 || existing.expires > current_ms);
+        let mut changed = self.state.deleted_attachments.len() != before_len;
+        if let Some(existing) = self
             .state
             .deleted_attachments
-            .iter()
-            .any(|existing| existing.as_slice() == id.as_slice())
+            .iter_mut()
+            .find(|existing| existing.id.as_slice() == id.as_slice())
         {
-            return false;
+            if expires > 0 && existing.expires != expires {
+                existing.expires = expires;
+                changed = true;
+            }
+            return changed;
         }
-        self.state.deleted_attachments.push(id.to_vec());
-        const MAX_DELETED_ATTACHMENTS: usize = 256;
+        self.state
+            .deleted_attachments
+            .push(crate::vault::DeletedAttachment {
+                id: id.to_vec(),
+                expires,
+            });
+        const MAX_DELETED_ATTACHMENTS: usize = 4096;
         if self.state.deleted_attachments.len() > MAX_DELETED_ATTACHMENTS {
             let excess = self.state.deleted_attachments.len() - MAX_DELETED_ATTACHMENTS;
             self.state.deleted_attachments.drain(..excess);
@@ -590,7 +610,7 @@ impl Contact {
         self.state
             .deleted_attachments
             .iter()
-            .any(|existing| existing.as_slice() == id)
+            .any(|existing| existing.id.as_slice() == id)
     }
 
     /// Tell the peer that its message at `clock` was read.
@@ -856,12 +876,16 @@ impl Contact {
                 Some(Kind::File(content)) => file(content.name, content.mime, content.data),
                 Some(Kind::Hello(hello)) => Body::Hello(super::sanitize_shared_name(&hello.name)),
                 Some(Kind::Deleted(_)) => Body::Deleted,
-                Some(Kind::Attachment(pointer)) => Body::Remote(RemoteFile {
-                    peer: self.peer,
-                    index,
-                    pointer,
-                    clock,
-                }),
+                Some(Kind::Attachment(pointer)) => {
+                    let gone = entry.gone || self.is_attachment_deleted(&pointer.id);
+                    Body::Remote(RemoteFile {
+                        peer: self.peer,
+                        index,
+                        pointer,
+                        clock,
+                        gone,
+                    })
+                }
                 Some(Kind::Contact(contact)) => match contact.key.try_into() {
                     Ok(key) => Body::Contact(crate::state::SharedContact {
                         key,

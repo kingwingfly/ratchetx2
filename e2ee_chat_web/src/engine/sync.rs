@@ -1347,8 +1347,12 @@ impl<V: VaultStore> Engine<V> {
                 contact.record_policy_error(ErrorKind::DowngradeDetected);
             }
         } else {
-            let mut probe_check = contact.session.peer_pq_state().clone();
-            if probe_check
+            // R22-P2-6: Pin strictly newer verified signed PQ-OFF manifests monotonically directly
+            // onto `contact` (while keeping `peer_pq_capable` and `downgrade_detected` intact) so
+            // subsequent probes or upgrades never accept a rollback below `probe.manifest_seq`.
+            if contact
+                .session
+                .peer_pq_state_mut()
                 .check_and_pin_manifest(probe.manifest_seq, probe.manifest_digest)
                 .is_err()
             {

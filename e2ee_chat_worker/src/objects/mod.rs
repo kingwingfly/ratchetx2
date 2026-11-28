@@ -307,6 +307,10 @@ pub mod rpc {
     #[derive(Debug, Serialize, Deserialize)]
     pub struct DeleteAttachment;
     impl_attachment_rpc!(DeleteAttachment => Delete, Reply = ());
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct DeleteAttachmentIfIncomplete;
+    impl_attachment_rpc!(DeleteAttachmentIfIncomplete => DeleteIfIncomplete, Reply = bool);
 }
 
 /// What the Worker asks of an [`IdentityV2`], about its identity's manifest, prekeys, inbox,
@@ -354,6 +358,8 @@ pub enum AttachmentCall {
     Note(rpc::NoteChunk),
     /// Tag `3`: delete the attachment and its chunks.
     Delete(rpc::DeleteAttachment),
+    /// Tag `4`: atomically delete the attachment and its chunks only if still incomplete.
+    DeleteIfIncomplete(rpc::DeleteAttachmentIfIncomplete),
 }
 
 /// Make typed `call` of the object `stub`, and decode its statically paired reply type.
@@ -628,5 +634,6 @@ mod tests {
         assert_eq!(rpc::GetAttachment.encode().unwrap(), vec![1]);
         assert_eq!(rpc::NoteChunk { index: 0 }.encode().unwrap()[0], 2);
         assert_eq!(rpc::DeleteAttachment.encode().unwrap(), vec![3]);
+        assert_eq!(rpc::DeleteAttachmentIfIncomplete.encode().unwrap(), vec![4]);
     }
 }

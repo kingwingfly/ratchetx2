@@ -122,10 +122,20 @@ impl<'a, S: SqlExec> AttachmentStore<'a, S> {
 
     /// Marks the attachment row as `deleting = 1` (if any row exists, including expired or
     /// previously-marked rows awaiting R2 retry) and returns the stored row for chunk deletion.
-    fn begin_delete(&self) -> Result<Option<AttachmentDbRow>> {
+    ///
+    /// When `only_if_incomplete` is `true`, an unexpired, non-deleting row whose chunks are all
+    /// uploaded (`StoredAttachment::is_complete`) is preserved untouched and `Ok(None)` is returned.
+    fn begin_delete(
+        &self,
+        only_if_incomplete: bool,
+        now_ms: u64,
+    ) -> Result<Option<AttachmentDbRow>> {
         let Some(attachment) = self.load_row(false, 0)? else {
             return Ok(None);
         };
+        if only_if_incomplete && self.get(now_ms)?.is_some_and(|stored| stored.is_complete()) {
+            return Ok(None);
+        }
         self.sql
             .exec("UPDATE attachment SET deleting = 1", vec![])?;
         Ok(Some(attachment))
@@ -157,12 +167,17 @@ impl DurableObject for AttachmentV2 {
             }
             AttachmentCall::Get(_) => answer_rpc::<rpc::GetAttachment>(self.get()),
             AttachmentCall::Note(req) => answer_rpc::<rpc::NoteChunk>(self.note(req.index)),
-            AttachmentCall::Delete(_) => answer_rpc::<rpc::DeleteAttachment>(self.delete().await),
+            AttachmentCall::Delete(_) => {
+                answer_rpc::<rpc::DeleteAttachment>(self.delete(false).await.map(|_| ()))
+            }
+            AttachmentCall::DeleteIfIncomplete(_) => {
+                answer_rpc::<rpc::DeleteAttachmentIfIncomplete>(self.delete(true).await)
+            }
         }
     }
 
     async fn alarm(&self) -> Result<Response> {
-        self.delete().await?;
+        let _ = self.delete(false).await?;
         Response::empty()
     }
 }
@@ -214,9 +229,15 @@ impl AttachmentV2 {
     /// that a chunk put meanwhile, which finds it gone, is deleted by the Worker, and a failure
     /// leaves the row, rather than chunks no row names. If R2 fails, the alarm tries again
     /// later; the attachment is gone meanwhile.
-    async fn delete(&self) -> Result<()> {
-        let Some(attachment) = self.with_store(|store| store.begin_delete())? else {
-            return Ok(());
+    ///
+    /// When `only_if_incomplete` is `true`, returns `Ok(false)` without deleting if the row is
+    /// still live and every chunk has already been noted as uploaded.
+    async fn delete(&self, only_if_incomplete: bool) -> Result<bool> {
+        let now_ms = Date::now().as_millis();
+        let Some(attachment) =
+            self.with_store(|store| store.begin_delete(only_if_incomplete, now_ms))?
+        else {
+            return Ok(false);
         };
         let objects = (0..attachment.chunks)
             .map(|index| crate::store::chunk_object(&attachment.id, index))
@@ -229,13 +250,14 @@ impl AttachmentV2 {
         if let Err(e) = deleted {
             console_error!("cannot delete an attachment's chunks: {e}");
             let at = Date::now().as_millis().saturating_add(RETRY_ALARM);
-            return storage.set_alarm(alarm_at(at)).await;
+            storage.set_alarm(alarm_at(at)).await?;
+            return Ok(true);
         }
         storage.delete_all().await?;
         if let Err(e) = storage.delete_alarm().await {
             console_error!("cannot delete attachment alarm after deleting storage: {e}");
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -305,7 +327,8 @@ mod tests {
         assert!(store.get(1_000).unwrap().is_none());
         assert!(!store.note(0, 1_000).unwrap());
         assert!(store.load_row(false, 1_000).unwrap().is_none());
-        assert!(store.begin_delete().unwrap().is_none());
+        assert!(store.begin_delete(false, 1_000).unwrap().is_none());
+        assert!(store.begin_delete(true, 1_000).unwrap().is_none());
         assert!(!has_table(&sql, "attachment").unwrap());
     }
 
@@ -393,7 +416,7 @@ mod tests {
 
         // Transition to `deleting = 1` (e.g. while R2 deletion is in flight or retrying).
         let started = store
-            .begin_delete()
+            .begin_delete(false, 10_000)
             .unwrap()
             .expect("row returned for R2 delete");
         assert_eq!(started.chunks, 3);
@@ -410,11 +433,42 @@ mod tests {
             .unwrap()
             .expect("deleting row retained for R2 retry");
         assert_eq!(retry.id.as_ref(), &att.id);
-        assert!(store.begin_delete().unwrap().is_some());
+        assert!(store.begin_delete(false, 10_000).unwrap().is_some());
 
         // After storage wipe (simulated `delete_all`), row is gone for all callers.
         sql.exec("DROP TABLE attachment", vec![]).unwrap();
         assert!(store.load_row(false, 10_000).unwrap().is_none());
-        assert!(store.begin_delete().unwrap().is_none());
+        assert!(store.begin_delete(false, 10_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn begin_delete_only_if_incomplete_preserves_complete_and_deletes_incomplete() {
+        // 1. Live complete attachment is preserved by `only_if_incomplete = true`.
+        let sql = TestSql::in_memory();
+        let store = AttachmentStore::new(&sql, RETENTION_MS);
+        let att = sample_attachment(0x55, 2);
+        assert!(store.prepare_add().unwrap());
+        assert!(store.insert_row(&att, 10_000).unwrap());
+        assert!(store.note(0, 10_100).unwrap());
+        assert!(store.note(1, 10_200).unwrap());
+        assert!(store.get(10_300).unwrap().unwrap().is_complete());
+        assert!(store.begin_delete(true, 10_300).unwrap().is_none());
+        // Still live and readable after the conditional delete!
+        assert!(store.get(10_300).unwrap().is_some());
+        // Unconditional delete still marks it for deletion.
+        assert!(store.begin_delete(false, 10_300).unwrap().is_some());
+        assert!(store.get(10_300).unwrap().is_none());
+
+        // 2. Live incomplete attachment IS deleted by `only_if_incomplete = true`.
+        let sql2 = TestSql::in_memory();
+        let store2 = AttachmentStore::new(&sql2, RETENTION_MS);
+        let att2 = sample_attachment(0x66, 2);
+        assert!(store2.prepare_add().unwrap());
+        assert!(store2.insert_row(&att2, 10_000).unwrap());
+        assert!(store2.note(0, 10_100).unwrap());
+        assert!(!store2.get(10_200).unwrap().unwrap().is_complete());
+        assert!(store2.begin_delete(true, 10_200).unwrap().is_some());
+        assert!(store2.get(10_200).unwrap().is_none());
+        assert!(!store2.note(1, 10_200).unwrap());
     }
 }

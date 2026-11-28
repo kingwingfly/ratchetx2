@@ -73,6 +73,8 @@ message DeleteAttachmentRequest {
   bytes id = 1;
   // Its upload token, or its delete token.
   bytes token = 2;
+  // When true, delete the attachment only if not all of its chunks have been uploaded yet.
+  bool only_if_incomplete = 3;
 }
 
 // Reply to `DeleteAttachmentRequest`.

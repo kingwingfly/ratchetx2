@@ -721,22 +721,33 @@ impl<V: VaultStore> Engine<V> {
                                 }
                             }
                         }
-                        // R17-P1-4: Even after `forget_upload` removes the checkpoint (or on a
-                        // legacy outbox item without `attachment_id`), check cancellation before
-                        // sealing/pushing any un-dispatched attachment.
-                        if first_dispatch_att_id.is_none() && self.uploads.has_any_cancelled() {
+                        // R17-P1-4 + R22-P2-11: Check both in-memory cancellation AND durable
+                        // `ContactState.deleted_attachments` / `HistoryEntry.gone` before sealing
+                        // or pushing any un-dispatched attachment (even after reload once upload
+                        // checkpoints are gone).
+                        let has_deleted_attachments = inner
+                            .contacts
+                            .iter()
+                            .any(|c| c.peer == *peer && !c.state.deleted_attachments.is_empty());
+                        let mut first_dispatch_entry_gone = false;
+                        if first_dispatch_att_id.is_some()
+                            || self.uploads.has_any_cancelled()
+                            || has_deleted_attachments
+                        {
                             match inner.vault.entry(peer, outgoing.history_index).await {
                                 _ if !self.is_live(vgen) => return Ok(false),
                                 Ok(Some(entry)) => {
-                                    if let Some(Kind::Attachment(ptr)) =
-                                        entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                                    first_dispatch_entry_gone = entry.gone;
+                                    if first_dispatch_att_id.is_none()
+                                        && let Some(Kind::Attachment(ptr)) =
+                                            entry.content.as_ref().and_then(|c| c.kind.as_ref())
                                         && let Ok(att_id) = <[u8; 16]>::try_from(ptr.id.as_slice())
                                     {
                                         first_dispatch_att_id = Some(att_id);
                                     }
                                 }
                                 Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {
-                                    if !outgoing.sealed {
+                                    if first_dispatch_att_id.is_none() && !outgoing.sealed {
                                         match inner
                                             .vault
                                             .outgoing(peer, outgoing.history_index)
@@ -772,6 +783,36 @@ impl<V: VaultStore> Engine<V> {
                             step = NextPush::Done;
                             break;
                         }
+                        let durably_deleted = first_dispatch_entry_gone
+                            || first_dispatch_att_id.is_some_and(|id| {
+                                inner
+                                    .contacts
+                                    .iter()
+                                    .any(|c| c.peer == *peer && c.is_attachment_deleted(&id))
+                            });
+                        if durably_deleted {
+                            match self
+                                .settle_gone_undispatched_outbox(
+                                    vgen,
+                                    inner,
+                                    peer,
+                                    outgoing.history_index,
+                                    first_dispatch_att_id,
+                                )
+                                .await
+                            {
+                                Ok(true) => {
+                                    changed = true;
+                                    continue;
+                                }
+                                Ok(false) => return Ok(false),
+                                Err(e) => {
+                                    result = Err(e);
+                                    step = NextPush::Done;
+                                    break;
+                                }
+                            }
+                        }
                     }
                     if !outgoing.sealed {
                         if needs_new_session {
@@ -782,6 +823,39 @@ impl<V: VaultStore> Engine<V> {
                                 break;
                             }
                             step = NextPush::NeedsNewSession;
+                            break;
+                        }
+                        // R22-P1-1: Never seal a new outbox message onto an active classical
+                        // session (including a peer-confirmed classical session) while local PQ
+                        // policy blocks classical transmission (e.g. `strict_pq`, live downgrade
+                        // alarm, or refused `#chat=...&pq=1` pin).
+                        let strict_pq = inner.client.pq_config().strict_pq;
+                        let local_pq = inner.local_pq_enabled();
+                        let blocked_classical = inner.contacts.iter().any(|c| {
+                            c.peer == *peer
+                                && c.is_classical_session()
+                                && super::classical_policy_blocked(
+                                    strict_pq,
+                                    local_pq,
+                                    c.session.peer_pq_state(),
+                                )
+                        });
+                        if blocked_classical {
+                            if strict_pq
+                                && let Some(c) = inner.contact(peer)
+                                && c.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                                && c.state.security_alert != SECURITY_ALERT_DOWNGRADE
+                            {
+                                c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                                if inner.save_state().await.is_err() {
+                                    inner.unsaved_state = true;
+                                }
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
+                                self.refresh_contacts(inner);
+                            }
+                            step = NextPush::Done;
                             break;
                         }
                         match inner.seal_head_on_active_session(peer).await {
@@ -1031,14 +1105,18 @@ impl<V: VaultStore> Engine<V> {
                     // carries an initial for the CURRENT active session (never when retrying old
                     // ciphertext from a superseded session `S1` while `S2` is still `UNSENT`).
                     let first_dispatch = !outgoing.dispatched;
-                    // R13-P1-3 + R17-P1-4: Re-check synchronously right before persisting
-                    // `dispatched = true` so a `cancel_upload` that arrived during
-                    // `vault.outgoing(...)` / sealing (for ANY un-dispatched attachment, 0 or more
-                    // uploaded chunks) never marks it dispatched or discloses its pointer.
+                    // R13-P1-3 + R17-P1-4 + R22-P2-11: Re-check synchronously right before
+                    // persisting `dispatched = true` so a `cancel_upload` or durable deletion
+                    // arriving during `vault.outgoing(...)` / sealing (for ANY un-dispatched
+                    // attachment) never marks it dispatched or discloses its pointer.
                     if first_dispatch
                         && let Some(att_id) = first_dispatch_att_id
                         && (self.is_cancelled(&att_id)
-                            || (first_dispatch_needs_file && !self.uploads.has_file(peer, &att_id)))
+                            || (first_dispatch_needs_file && !self.uploads.has_file(peer, &att_id))
+                            || inner
+                                .contacts
+                                .iter()
+                                .any(|c| c.peer == *peer && c.is_attachment_deleted(&att_id)))
                     {
                         step = NextPush::Done;
                         break;
@@ -1052,15 +1130,24 @@ impl<V: VaultStore> Engine<V> {
                                         id.as_slice() == record.session_id.as_slice()
                                     }))
                         });
-                    // R13-P1-2 + R14-P1-1 + R14-P1-2: Never transmit a classical carried initial
-                    // (for ANY greeting delivery state: UNSENT, UNCERTAIN, or CONFIRMED `!known`)
-                    // when current local PQ policy blocks classical sessions.
-                    if !record.carried_initial.is_empty()
+                    // R13-P1-2 + R14-P1-1 + R14-P1-2 + R22-P1-1: Never transmit a classical
+                    // carried initial OR a message on an active classical session (including a
+                    // peer-confirmed classical session with empty `carried_initial`) when current
+                    // local PQ policy blocks classical sessions.
+                    let carries_classical_initial = !record.carried_initial.is_empty()
                         && session::protocol::mailbox_v2::decode_carried_initial(
                             &record.carried_initial,
                         )
-                        .is_some_and(|w| w.version < 2)
-                    {
+                        .is_some_and(|w| w.version < 2);
+                    let on_active_classical_session = inner.contacts.iter().any(|c| {
+                        c.peer == *peer
+                            && c.is_classical_session()
+                            && (record.session_id.is_empty()
+                                || c.session.active_id().is_some_and(|id| {
+                                    id.as_slice() == record.session_id.as_slice()
+                                }))
+                    });
+                    if carries_classical_initial || on_active_classical_session {
                         let strict_pq = inner.client.pq_config().strict_pq;
                         let local_pq = inner.local_pq_enabled();
                         let blocked = inner.contacts.iter().any(|c| {
@@ -1147,6 +1234,7 @@ impl<V: VaultStore> Engine<V> {
                             if strict_pq
                                 && let Some(c) = inner.contact(peer)
                                 && c.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                                && c.state.security_alert != SECURITY_ALERT_DOWNGRADE
                             {
                                 c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
                                 if inner.save_state().await.is_err() {
@@ -2276,6 +2364,71 @@ impl<V: VaultStore> Engine<V> {
         Ok(CommitOutcome::Committed)
     }
 
+    /// Atomically settle an un-dispatched outbox item whose attachment is already durably marked
+    /// deleted/gone (`R22-P2-11`), removing it from the outbox, marking its history row refused +
+    /// gone, deleting its `OutgoingRecord`, and forgetting any surviving upload checkpoint without
+    /// transmitting it on the wire. Returns `Ok(true)` if settled, `Ok(false)` if vault locked.
+    async fn settle_gone_undispatched_outbox(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<V>,
+        peer: &PublicKey,
+        idx: u64,
+        att_id: Option<[u8; 16]>,
+    ) -> Result<bool, String> {
+        let changed = inner
+            .with_contact_tx(peer, async |inner| {
+                let mut hist = Vec::new();
+                if let Some(contact) = inner.contact(peer) {
+                    contact.state.outbox.retain(|o| o.history_index != idx);
+                }
+                match inner.vault.entry(peer, idx).await {
+                    Ok(Some(mut entry)) => {
+                        entry.set_delivery(entry.delivery().after(Step::Refused));
+                        entry.gone = true;
+                        hist.push((idx, entry));
+                    }
+                    Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
+                    Err(e) => return Err(describe(&e)),
+                }
+                if let Some(id) = att_id {
+                    inner
+                        .promote_upload_with(
+                            peer,
+                            &id,
+                            None,
+                            &records(peer, &hist),
+                            &[(*peer, idx, None)],
+                        )
+                        .await
+                        .map_err(|e| describe(&e))?;
+                } else {
+                    inner
+                        .save_with(&records(peer, &hist), &[(*peer, idx, None)])
+                        .await
+                        .map_err(|e| describe(&e))?;
+                }
+                Ok(hist)
+            })
+            .await?;
+        if !self.is_live(vgen) {
+            return Ok(false);
+        }
+        self.release(peer, idx);
+        if let Some(id) = att_id {
+            self.uploads.clear_server_completed(&id);
+            self.remove_attachment_caches(peer, &id);
+            self.ui
+                .uploads
+                .update(|uploads| uploads.retain(|u| u.id != id));
+        }
+        if !changed.is_empty() {
+            self.show_changes(inner, peer, &changed);
+        }
+        self.refresh_contacts(inner);
+        Ok(true)
+    }
+
     /// Map a `session::Error` from `claim_peer_bundle_v2` or `finish_prepare_start_again_v2`
     /// during outbox rekey into [`RekeyOutcome`] while holding `inner` (after rolling back any
     /// in-memory mutations).
@@ -2320,6 +2473,17 @@ impl<V: VaultStore> Engine<V> {
         }
         if should_require_update_for_rpc(ProtocolRpcScope::CoreV2, &error) {
             return Ok(RekeyOutcome::UpdateRequired(describe(&error)));
+        }
+        // R22-P2-7: Handle `SignInRequired` ONLY after `ensure_session_for_outbox` verified the
+        // live `conversation_gen` so a late 403 for a deleted/replaced chat never opens sign-in.
+        if kind == ErrorKind::SignInRequired {
+            if same_server(&inner.server, &origin()) {
+                self.queue.mark_waits_sign_in(*peer);
+                self.ask_sign_in();
+                self.refresh_contacts(inner);
+                return Ok(RekeyOutcome::Paused);
+            }
+            return Err(describe(&error));
         }
         let paused = match kind {
             ErrorKind::ClassicalApprovalRequired => {
@@ -2455,8 +2619,10 @@ impl<V: VaultStore> Engine<V> {
                 )
             };
 
+            // R22-P2-7: Suppress the global `REFUSED` sign-in hook so a late 403 for a chat
+            // deleted or replaced while `ClaimBundle` was suspended cannot open `Dialog::SignIn`.
             let claim_res = session::claim_peer_bundle_v2(
-                &Fetch::client(&server),
+                &Fetch::client_without_refused_hook(&server),
                 &audience,
                 peer,
                 &peer_pq,
@@ -2783,6 +2949,8 @@ impl<V: VaultStore> Engine<V> {
             let Some(inner) = guard.as_mut() else {
                 return Ok(false);
             };
+            let strict_pq = inner.client.pq_config().strict_pq;
+            let local_pq = inner.local_pq_enabled();
             let Some(contact) = inner.contact(peer) else {
                 return Ok(false);
             };
@@ -2811,6 +2979,32 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(false);
             }
             let active = contact.session.active_id().map(|id| id.to_vec());
+            let expected_conversation_gen = contact.state.conversation_gen;
+            // R22-P1-1: Never seal or push events on an active classical session while local PQ
+            // policy blocks classical transmission (e.g. `strict_pq`, live downgrade alarm, or a
+            // refused `#chat=...&pq=1` pin).
+            if contact.is_classical_session()
+                && super::classical_policy_blocked(
+                    strict_pq,
+                    local_pq,
+                    contact.session.peer_pq_state(),
+                )
+            {
+                if strict_pq
+                    && contact.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                    && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
+                {
+                    contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                    if inner.save_state().await.is_err() {
+                        inner.unsaved_state = true;
+                    }
+                    if !self.is_live(vgen) {
+                        return Ok(false);
+                    }
+                    self.refresh_contacts(inner);
+                }
+                return Ok(false);
+            }
             // One encrypted on a session that is no longer the active one, which the peer may
             // never have had: what it tells, still in the events, is encrypted again on the active
             // one.
@@ -2923,19 +3117,33 @@ impl<V: VaultStore> Engine<V> {
             let known_at_dispatch = inner
                 .contact(peer)
                 .is_some_and(|c| c.session.is_known_by_peer());
+            let signs_in_here = same_server(&inner.server, &origin());
             let push_req = message.push_v2_request(peer);
             (
                 inner.server.clone(),
+                expected_conversation_gen,
+                signs_in_here,
                 sealed,
                 push_req,
                 promoted_from_unsent,
                 known_at_dispatch,
             )
         };
-        let (server, sealed, push_req, promoted_from_unsent, known_at_dispatch) = prepared;
+        let (
+            server,
+            expected_conversation_gen,
+            signs_in_here,
+            sealed,
+            push_req,
+            promoted_from_unsent,
+            known_at_dispatch,
+        ) = prepared;
 
         // Phase 2 outside `self.inner`: await `PushV2` RPC.
-        let push_res: session::Result<_> = Fetch::client(&server)
+        // R22-P2-7: Suppress the global `REFUSED` sign-in hook so a late 403 for a chat deleted or
+        // replaced while `PushV2` was suspended cannot open `Dialog::SignIn` or poison the new
+        // chat's sign-in wait state.
+        let push_res: session::Result<_> = Fetch::client_without_refused_hook(&server)
             .push_v2(push_req)
             .await
             .map_err(session::Error::from);
@@ -2943,8 +3151,8 @@ impl<V: VaultStore> Engine<V> {
             return Ok(false);
         }
 
-        // Phase 3: Re-acquire `self.inner` and validate live generation, contact existence, and
-        // matching `sealed_events.session` before mutating or persisting.
+        // Phase 3: Re-acquire `self.inner` and validate live generation, contact existence, exact
+        // `conversation_gen`, and matching `sealed_events.session` before mutating or persisting.
         let mut guard = self.lock_inner().await;
         if !self.is_live(vgen) {
             return Ok(false);
@@ -2960,10 +3168,11 @@ impl<V: VaultStore> Engine<V> {
             .iter()
             .find(|c| c.peer == *peer)
             .is_some_and(|c| {
-                c.state
-                    .sealed_events
-                    .as_ref()
-                    .is_some_and(|s| s.session == sealed.session)
+                c.state.conversation_gen == expected_conversation_gen
+                    && c.state
+                        .sealed_events
+                        .as_ref()
+                        .is_some_and(|s| s.session == sealed.session)
                     && (sealed.session.is_empty()
                         || c.session
                             .active_id()
@@ -2994,7 +3203,9 @@ impl<V: VaultStore> Engine<V> {
         }
         match push_res {
             Ok(_) => {
-                self.clear_approval_backoff(peer);
+                if matches_sealed {
+                    self.clear_approval_backoff(peer);
+                }
             }
             Err(e) if e.kind() == ErrorKind::WriteTokenRejected => {
                 if !matches_sealed {
@@ -3039,10 +3250,19 @@ impl<V: VaultStore> Engine<V> {
             // The chat waits for the sign-in, as a message refused for it does, rather than
             // tries every round, and goes once signed in.
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                if !matches_sealed {
+                    return Ok(false);
+                }
                 self.queue.mark_waits_sign_in(*peer);
+                if signs_in_here {
+                    self.ask_sign_in();
+                }
                 return Ok(false);
             }
             Err(e) => {
+                if !matches_sealed {
+                    return Ok(false);
+                }
                 self.check_protocol_error(ProtocolRpcScope::CoreV2, &e);
                 return Err(describe(&e));
             }
@@ -3568,16 +3788,8 @@ impl<V: VaultStore> Inner<V> {
             BTreeSet::new()
         };
         let all_sealed = contact.state.needs_requeue_sealed || contact.session.needs_new_session();
-        // R21-P2-10: Also exclude attachment IDs durably recorded in `deleted_attachments` so
-        // reload after a transient `HistoryEntry.gone` save failure never resends a dead pointer.
-        let mut effective_gone = pending_gone_ids.clone();
-        for raw_id in &contact.state.deleted_attachments {
-            if let Ok(id) = <[u8; 16]>::try_from(raw_id.as_slice()) {
-                effective_gone.insert(id);
-            }
-        }
         let outcome = self
-            .rebuild_outbox(peer, again, all_sealed, entries, &effective_gone)
+            .rebuild_outbox(peer, again, all_sealed, entries, pending_gone_ids)
             .await?;
         if deleted {
             let contact = self.contact(peer).ok_or("no such chat")?;
@@ -3708,6 +3920,16 @@ impl<V: VaultStore> Inner<V> {
         let in_flight = self.in_flight_push.get(peer).copied();
         let contact = self.contact(peer).ok_or("no such chat")?;
         let conversation_gen = contact.state.conversation_gen;
+        // R21-P2-10 + R22-P2-12: Always union durably recorded `deleted_attachments` with
+        // `pending_gone_ids` directly inside `rebuild_outbox` so BOTH `requeue_excluding_gone`
+        // AND `requeue_sealed` exclude dead attachment pointers even if `HistoryEntry.gone`
+        // failed to persist earlier.
+        let mut effective_gone = pending_gone_ids.clone();
+        for deleted in &contact.state.deleted_attachments {
+            if let Ok(id) = <[u8; 16]>::try_from(deleted.id.as_slice()) {
+                effective_gone.insert(id);
+            }
+        }
         let mut expected_digests: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
         for a in &contact.state.awaiting {
             if again.contains(&a.history_index) {
@@ -3768,7 +3990,7 @@ impl<V: VaultStore> Inner<V> {
                 content,
                 expected,
                 again.contains(&index),
-                pending_gone_ids,
+                &effective_gone,
             );
         }
         // No contact state changes until every fallible history and file read has completed.

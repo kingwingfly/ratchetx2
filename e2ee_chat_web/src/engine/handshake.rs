@@ -42,6 +42,138 @@ pub(super) const DEFERRED_REPLAY_WINDOW_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// empty-OPK fallback refill probe proves the relay still had stocked OPKs (`R12-P2-4`).
 const OPK_FALLBACK_PROBE_COOLDOWN_MS: u64 = 60 * 60 * 1000;
 
+/// Verified manifest summary extracted from a crossed `ClaimBundle` so
+/// `finish_existing_contact_start_chat` can commit monotonic manifest pins and detect equivocation
+/// before accepting or blocking the existing contact (`R22-P2-2`, `R22-P2-4`).
+#[derive(Clone, Copy)]
+struct ClaimedManifestInfo {
+    seq: u64,
+    digest: [u8; 32],
+    pq_enabled: bool,
+    server_pq_disabled_fallback: bool,
+}
+
+impl ClaimedManifestInfo {
+    fn from_claimed(claimed: &session::ClaimedPeerBundle) -> Self {
+        Self {
+            seq: claimed.manifest().manifest_seq,
+            digest: claimed.manifest_digest(),
+            pq_enabled: claimed.manifest().pq_enabled,
+            server_pq_disabled_fallback: claimed.is_server_pq_disabled_fallback(),
+        }
+    }
+}
+
+/// Monotonically apply verified New Chat manifest observations (`pending_new_chat_off_pins`
+/// and/or a crossed `ClaimBundle`'s verified manifest) onto an existing `contact` BEFORE
+/// evaluating Phase-A / Phase-B PQ block policy (`R21-P2-3`, `R22-P2-2`, `R22-P2-4`).
+///
+/// Returns `(mutated, equivocated)`.
+fn apply_observed_start_chat_manifests(
+    contact: &mut Contact,
+    off_pin: Option<(u64, [u8; 32])>,
+    claimed: Option<ClaimedManifestInfo>,
+) -> (bool, bool) {
+    let before_pq = contact.session.peer_pq_state().clone();
+    let before_alert = contact.state.security_alert;
+    let before_prompt = contact.state.classical_approval_needed;
+    let mut equivocated = false;
+
+    if let Some((seq, digest)) = off_pin {
+        let cur_seq = contact.session.peer_pq_state().pinned_manifest_seq;
+        if seq > cur_seq {
+            let _ = contact
+                .session
+                .peer_pq_state_mut()
+                .check_and_pin_manifest(seq, digest);
+        } else if seq == cur_seq
+            && contact
+                .session
+                .peer_pq_state()
+                .pinned_manifest_digest
+                .is_some_and(|d| d != digest)
+        {
+            contact.record_policy_error(ErrorKind::DowngradeDetected);
+            equivocated = true;
+        }
+    }
+
+    if let Some(info) = claimed {
+        let cur_seq = contact.session.peer_pq_state().pinned_manifest_seq;
+        if info.seq > cur_seq {
+            if info.pq_enabled {
+                if contact
+                    .session
+                    .peer_pq_state_mut()
+                    .check_and_pin_manifest(info.seq, info.digest)
+                    .is_ok()
+                {
+                    let ppq = contact.session.peer_pq_state_mut();
+                    ppq.peer_pq_capable = true;
+                    if !info.server_pq_disabled_fallback {
+                        ppq.pq_pinned = true;
+                        ppq.clear_classical_exception();
+                        contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                    }
+                }
+            } else if !contact.state.quarantined
+                && !contact.session.peer_pq_state().downgrade_detected
+                && contact.state.security_alert != SECURITY_ALERT_DOWNGRADE
+                && contact.is_classical_session()
+            {
+                if contact
+                    .session
+                    .peer_pq_state_mut()
+                    .commit_signed_pq_off_manifest(info.seq, info.digest)
+                    .is_err()
+                {
+                    contact.record_policy_error(ErrorKind::DowngradeDetected);
+                    equivocated = true;
+                }
+            } else {
+                let _ = contact
+                    .session
+                    .peer_pq_state_mut()
+                    .check_and_pin_manifest(info.seq, info.digest);
+            }
+        } else if info.seq == cur_seq && cur_seq > 0 {
+            if contact
+                .session
+                .peer_pq_state()
+                .pinned_manifest_digest
+                .is_some_and(|d| d != info.digest)
+            {
+                contact.record_policy_error(ErrorKind::DowngradeDetected);
+                equivocated = true;
+            } else if contact
+                .session
+                .peer_pq_state()
+                .pinned_manifest_digest
+                .is_none()
+            {
+                let _ = contact
+                    .session
+                    .peer_pq_state_mut()
+                    .check_and_pin_manifest(info.seq, info.digest);
+            }
+            if !equivocated && info.pq_enabled {
+                let ppq = contact.session.peer_pq_state_mut();
+                ppq.peer_pq_capable = true;
+                if !info.server_pq_disabled_fallback {
+                    ppq.pq_pinned = true;
+                    ppq.clear_classical_exception();
+                    contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                }
+            }
+        }
+    }
+
+    let mutated = *contact.session.peer_pq_state() != before_pq
+        || contact.state.security_alert != before_alert
+        || contact.state.classical_approval_needed != before_prompt;
+    (mutated, equivocated)
+}
+
 /// Result of [`Engine::join_carried`].
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct JoinCarriedOutcome {
@@ -3428,17 +3560,10 @@ impl<V: VaultStore> Engine<V> {
             ErrorKind::SignInRequired => {
                 StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
             }
-            // R20-P1-1: Explicit `#chat=...&pq=1` invitation links promise to refuse classical
-            // downgrades; never offer `"Allow classical"` when a `pin_pq` invite encounters a
-            // `PQ-OFF` or server-disabled classical fallback.
-            ErrorKind::ClassicalApprovalRequired if pin_pq => StartChatError::DowngradeDetected,
-            ErrorKind::ClassicalApprovalRequired if error.is_server_pq_disabled_approval() => {
-                StartChatError::ServerPqDisabledApprovalRequired
-            }
             ErrorKind::ClassicalApprovalRequired => {
-                // R20-P2-2: Remember the verified signed PQ-OFF `(seq, digest)` across the
-                // `"Allow classical"` consent dialog so the retry rejects any rollback or
-                // equivocation instead of starting from `pinned_manifest_seq == 0`.
+                // R20-P2-2 + R22-P2-3: Always record any verified signed PQ-OFF `(seq, digest)`
+                // BEFORE branching on `pin_pq` so an initial `#chat=...&pq=1` attempt still seeds
+                // monotonic rollback/equivocation detection across subsequent retries.
                 if let Some((seq, digest)) = error.signed_pq_off_manifest()
                     && self
                         .startup
@@ -3447,7 +3572,16 @@ impl<V: VaultStore> Engine<V> {
                 {
                     return StartChatError::DowngradeDetected;
                 }
-                StartChatError::ClassicalApprovalRequired
+                // R20-P1-1: Explicit `#chat=...&pq=1` invitation links promise to refuse classical
+                // downgrades; never offer `"Allow classical"` when a `pin_pq` invite encounters a
+                // `PQ-OFF` or server-disabled classical fallback.
+                if pin_pq {
+                    StartChatError::DowngradeDetected
+                } else if error.is_server_pq_disabled_approval() {
+                    StartChatError::ServerPqDisabledApprovalRequired
+                } else {
+                    StartChatError::ClassicalApprovalRequired
+                }
             }
             ErrorKind::DowngradeDetected => StartChatError::DowngradeDetected,
             ErrorKind::PeerManifestExpired => StartChatError::PeerManifestExpired,
@@ -3490,6 +3624,7 @@ impl<V: VaultStore> Engine<V> {
         name: String,
         pin_pq: bool,
         allow_classical: bool,
+        claimed_manifest: Option<ClaimedManifestInfo>,
     ) -> Result<PublicKey, StartChatError> {
         let stage_revoke = |inner: &mut Inner<V>| {
             let peer_slot_id = inner.client.peer_slot_id(&peer);
@@ -3581,14 +3716,26 @@ impl<V: VaultStore> Engine<V> {
                 let cur_request = inner.contacts[index].state.request;
                 let cur_provisional = inner.contacts[index].state.provisional;
                 let cur_quarantined = inner.contacts[index].state.quarantined;
+                // R21-P2-3 + R22-P2-2 + R22-P2-4: Monotonically apply verified New Chat manifest
+                // observations (`pending_new_chat_off_pins` and any crossed `ClaimBundle` manifest)
+                // BEFORE evaluating `pq_block_err` so equivocation or a newer signed PQ-ON pin
+                // immediately forces `StartChatError::DowngradeDetected` and prevents Phase-A
+                // grant staging.
+                let off_pin = self.startup.new_chat_signed_pq_off(&peer);
+                let transfer_off_pin = off_pin.is_some();
+                let (manifest_dirty, manifest_equivocated) = apply_observed_start_chat_manifests(
+                    &mut inner.contacts[index],
+                    off_pin,
+                    claimed_manifest,
+                );
                 // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3 + R17-P1-2 + R17-P1-3 + R21-P1-3:
                 // Never stage grants for or accept/resume an unquarantined classical request OR
                 // rolled-back provisional contact when local policy requires PQ, AND never silently
                 // open an already-accepted classical chat from an explicit `#chat=...&pq=1`
                 // (`pin_pq`) invitation under `strict_pq` or `local_pq`.
-                let pq_block_err = if !cur_quarantined
-                    && inner.contacts[index].is_classical_session()
-                {
+                let pq_block_err = if manifest_equivocated {
+                    Some(StartChatError::DowngradeDetected)
+                } else if !cur_quarantined && inner.contacts[index].is_classical_session() {
                     let strict_pq = inner.client.pq_config().strict_pq;
                     let local_pq = inner.local_pq_enabled();
                     let peer_pq = inner.contacts[index].session.peer_pq_state();
@@ -3622,31 +3769,8 @@ impl<V: VaultStore> Engine<V> {
                     None
                 };
                 if let Some(block_err) = pq_block_err {
-                    let mut dirty = false;
+                    let mut dirty = manifest_dirty;
                     let was_unrequested_provisional = cur_provisional && !cur_request;
-                    // R21-P2-3: Transfer any higher verified New Chat signed PQ-OFF `(seq, digest)`
-                    // before returning so monotonic anti-rollback state is never lost.
-                    let mut transfer_off_pin = false;
-                    if let Some((seq, digest)) = self.startup.new_chat_signed_pq_off(&peer) {
-                        let c = &mut inner.contacts[index];
-                        let cur_seq = c.session.peer_pq_state().pinned_manifest_seq;
-                        if seq > cur_seq {
-                            let _ = c
-                                .session
-                                .peer_pq_state_mut()
-                                .check_and_pin_manifest(seq, digest);
-                            dirty = true;
-                        } else if seq == cur_seq
-                            && c.session
-                                .peer_pq_state()
-                                .pinned_manifest_digest
-                                .is_some_and(|d| d != digest)
-                        {
-                            c.record_policy_error(ErrorKind::DowngradeDetected);
-                            dirty = true;
-                        }
-                        transfer_off_pin = true;
-                    }
                     // R13-P2-2 + R20-P1-1 + R21-P1-3: Persist a fresh `pin_pq` invitation pin
                     // (clearing any stale `allow_classical_exception`) under BOTH
                     // `DowngradeDetected` AND `PqRequired`, and flag `downgrade_detected` + alert
@@ -3990,11 +4114,23 @@ impl<V: VaultStore> Engine<V> {
             let was_request = inner.contacts[index].state.request;
             let was_provisional = inner.contacts[index].state.provisional;
             let quarantined = inner.contacts[index].state.quarantined;
+            // R21-P2-3 + R22-P2-2 + R22-P2-4: Re-apply observed New Chat manifests BEFORE Phase B's
+            // PQ block check so any manifest update that landed while Phase A awaited
+            // `RegisterWriteToken` is checked for equivocation before accepting the chat.
+            let off_pin_b = self.startup.new_chat_signed_pq_off(&peer);
+            let transfer_off_pin = off_pin_b.is_some();
+            let (manifest_dirty_b, manifest_equivocated_b) = apply_observed_start_chat_manifests(
+                &mut inner.contacts[index],
+                off_pin_b,
+                claimed_manifest,
+            );
             // R11-P1-2 + R12-P1-1 + R12-P1-2 + R12-P1-3 + R17-P1-2 + R17-P1-3 + R21-P1-3: Re-check
             // classical request, provisional-resume, and already-accepted `pin_pq` policy under
             // Phase B's `guard` (in case `strict_pq`, `pq_enabled`, or peer session changed while
             // Phase A awaited `RegisterWriteToken`).
-            let phase_b_pq_block = if !quarantined && inner.contacts[index].is_classical_session() {
+            let phase_b_pq_block = if manifest_equivocated_b {
+                Some(StartChatError::DowngradeDetected)
+            } else if !quarantined && inner.contacts[index].is_classical_session() {
                 let strict_pq = inner.client.pq_config().strict_pq;
                 let local_pq = inner.local_pq_enabled();
                 let peer_pq = inner.contacts[index].session.peer_pq_state();
@@ -4027,29 +4163,8 @@ impl<V: VaultStore> Engine<V> {
                 None
             };
             if let Some(block_err) = phase_b_pq_block {
-                let mut dirty = false;
+                let mut dirty = manifest_dirty_b;
                 let was_unrequested_provisional = was_provisional && !was_request;
-                let mut transfer_off_pin = false;
-                if let Some((seq, digest)) = self.startup.new_chat_signed_pq_off(&peer) {
-                    let c = &mut inner.contacts[index];
-                    let cur_seq = c.session.peer_pq_state().pinned_manifest_seq;
-                    if seq > cur_seq {
-                        let _ = c
-                            .session
-                            .peer_pq_state_mut()
-                            .check_and_pin_manifest(seq, digest);
-                        dirty = true;
-                    } else if seq == cur_seq
-                        && c.session
-                            .peer_pq_state()
-                            .pinned_manifest_digest
-                            .is_some_and(|d| d != digest)
-                    {
-                        c.record_policy_error(ErrorKind::DowngradeDetected);
-                        dirty = true;
-                    }
-                    transfer_off_pin = true;
-                }
                 if pin_pq
                     && matches!(
                         block_err,
@@ -4132,26 +4247,6 @@ impl<V: VaultStore> Engine<V> {
             let local_pq_b = inner.local_pq_enabled();
             let (extra_tokens, revoke_for_pruned) = {
                 let contact = &mut inner.contacts[index];
-                // R21-P2-3: Monotonically transfer any verified signed PQ-OFF `(seq, digest)`
-                // observed during New Chat onto the existing (e.g. crossed inbound) contact
-                // without clearing `peer_pq_capable`.
-                if let Some((seq, digest)) = self.startup.new_chat_signed_pq_off(&peer) {
-                    let cur_seq = contact.session.peer_pq_state().pinned_manifest_seq;
-                    if seq > cur_seq {
-                        let _ = contact
-                            .session
-                            .peer_pq_state_mut()
-                            .check_and_pin_manifest(seq, digest);
-                    } else if seq == cur_seq
-                        && contact
-                            .session
-                            .peer_pq_state()
-                            .pinned_manifest_digest
-                            .is_some_and(|d| d != digest)
-                    {
-                        contact.record_policy_error(ErrorKind::DowngradeDetected);
-                    }
-                }
                 if pin_pq {
                     contact.session.pin_peer_pq();
                     contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
@@ -4527,6 +4622,7 @@ impl<V: VaultStore> Engine<V> {
                         name,
                         pin_pq,
                         allow_classical,
+                        None,
                     )
                     .await;
             }
@@ -4606,7 +4702,9 @@ impl<V: VaultStore> Engine<V> {
                     inner.check_outgoing_peer(&peer)?;
                     if inner.contacts.iter().any(|c| c.peer == peer) {
                         // Peer arrived via an inbound initial while `ClaimBundle` was suspended:
-                        // discard the stale bundle cleanly without corrupting the inbound ratchet!
+                        // discard the stale bundle cleanly without corrupting the inbound ratchet,
+                        // while preserving its verified manifest observation (`R22-P2-4`).
+                        let claimed_info = Some(ClaimedManifestInfo::from_claimed(&claimed));
                         drop(claimed);
                         if allow_classical
                             && super::settings::check_classical_approval(inner.client.pq_config())
@@ -4624,6 +4722,7 @@ impl<V: VaultStore> Engine<V> {
                                 name,
                                 pin_pq,
                                 allow_classical,
+                                claimed_info,
                             )
                             .await;
                     }
@@ -4686,6 +4785,7 @@ impl<V: VaultStore> Engine<V> {
                 .ok_or_else(|| StartChatError::Other("locked".into()))?;
             inner.check_outgoing_peer(&peer)?;
             if inner.contacts.iter().any(|c| c.peer == peer) {
+                let claimed_info = Some(ClaimedManifestInfo::from_claimed(&claimed));
                 drop(claimed);
                 if allow_classical
                     && super::settings::check_classical_approval(inner.client.pq_config()).is_err()
@@ -4702,6 +4802,7 @@ impl<V: VaultStore> Engine<V> {
                         name,
                         pin_pq,
                         allow_classical,
+                        claimed_info,
                     )
                     .await;
             }

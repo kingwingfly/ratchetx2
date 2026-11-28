@@ -60,7 +60,56 @@ pub async fn attachment_store<S: LocalAttachmentStore>(store: &S) {
     let uploaded = store.attachment(&attachment.id).await.unwrap().unwrap();
     assert!(uploaded.was_uploaded(0) && uploaded.was_uploaded(1));
     assert!(!uploaded.was_uploaded(2));
+    assert!(uploaded.is_complete());
     assert_eq!(store.chunk(&[9; 16], 0).await.unwrap(), None);
+
+    // Conditional incomplete-only delete preserves a completed attachment and deletes an
+    // incomplete one.
+    assert!(
+        !store
+            .delete_attachment_if_incomplete(&attachment.id)
+            .await
+            .unwrap()
+    );
+    assert!(store.attachment(&attachment.id).await.unwrap().is_some());
+    assert_eq!(
+        store.chunk(&attachment.id, 0).await.unwrap(),
+        Some(Bytes::from_static(b"first"))
+    );
+    let incomplete = StoredAttachment {
+        id: [2; 16],
+        chunks: 2,
+        token_hash: [4; 32],
+        delete_hash: [6; 32],
+        uploaded: 0,
+    };
+    assert!(store.add_attachment(incomplete.clone()).await.unwrap());
+    store
+        .put_chunk(&incomplete.id, 0, Bytes::from_static(b"part0"))
+        .await
+        .unwrap();
+    assert!(
+        !store
+            .attachment(&incomplete.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_complete()
+    );
+    assert!(
+        store
+            .delete_attachment_if_incomplete(&incomplete.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.attachment(&incomplete.id).await.unwrap(), None);
+    assert_eq!(store.chunk(&incomplete.id, 0).await.unwrap(), None);
+    assert!(
+        !store
+            .delete_attachment_if_incomplete(&incomplete.id)
+            .await
+            .unwrap()
+    );
 
     // Deleted, it is gone with its chunks, and deleting it again does nothing.
     store.delete_attachment(&attachment.id).await.unwrap();

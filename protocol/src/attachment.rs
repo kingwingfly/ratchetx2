@@ -95,6 +95,7 @@ impl fmt::Debug for DeleteAttachmentRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DeleteAttachmentRequest")
             .field("id", &self.id)
+            .field("only_if_incomplete", &self.only_if_incomplete)
             .finish_non_exhaustive()
     }
 }
@@ -326,6 +327,7 @@ mod server {
         ) -> Result<DeleteAttachmentResponse> {
             let id_bytes = core::mem::take(&mut request.id);
             let mut token = core::mem::take(&mut request.token);
+            let only_if_incomplete = request.only_if_incomplete;
             drop(request);
             let id_res: Result<[u8; ID_LENGTH]> = fixed(&id_bytes);
             drop(id_bytes);
@@ -339,7 +341,14 @@ mod server {
             if !bool::from(matches) {
                 return Err(ErrorKind::InvalidSignature.into());
             }
-            self.store.delete_attachment(&attachment.id).await?;
+            if only_if_incomplete {
+                let _deleted = self
+                    .store
+                    .delete_attachment_if_incomplete(&attachment.id)
+                    .await?;
+            } else {
+                self.store.delete_attachment(&attachment.id).await?;
+            }
             Ok(DeleteAttachmentResponse {})
         }
     }
@@ -465,6 +474,7 @@ mod server {
             let delete = |token: &Bytes| DeleteAttachmentRequest {
                 id: started.id.clone(),
                 token: token.clone(),
+                only_if_incomplete: false,
             };
             assert_eq!(
                 server
@@ -496,8 +506,81 @@ mod server {
             let delete = DeleteAttachmentRequest {
                 id: started.id.clone(),
                 token: started.upload_token.clone(),
+                only_if_incomplete: false,
             };
             server.delete_attachment(delete).await.unwrap();
+
+            // R22-P2-8: `only_if_incomplete = true` preserves a completed attachment and deletes
+            // an incomplete one, while still rejecting unauthorized tokens.
+            let started_complete = server.start_upload(start(1)).await.unwrap();
+            server
+                .put_chunk(PutChunkRequest {
+                    id: started_complete.id.clone(),
+                    upload_token: started_complete.upload_token.clone(),
+                    index: 0,
+                    data: Bytes::from_static(first_chunk),
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                server
+                    .delete_attachment(DeleteAttachmentRequest {
+                        id: started_complete.id.clone(),
+                        token: wrong.clone(),
+                        only_if_incomplete: true,
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidSignature
+            );
+            server
+                .delete_attachment(DeleteAttachmentRequest {
+                    id: started_complete.id.clone(),
+                    token: started_complete.upload_token.clone(),
+                    only_if_incomplete: true,
+                })
+                .await
+                .unwrap();
+            let got = server
+                .get_chunk(GetChunkRequest {
+                    id: started_complete.id.clone(),
+                    index: 0,
+                })
+                .await
+                .unwrap();
+            assert!(got.uploaded);
+            assert_eq!(got.data.as_ref(), first_chunk);
+
+            let started_incomplete = server.start_upload(start(2)).await.unwrap();
+            server
+                .put_chunk(PutChunkRequest {
+                    id: started_incomplete.id.clone(),
+                    upload_token: started_incomplete.upload_token.clone(),
+                    index: 0,
+                    data: Bytes::from_static(first_chunk),
+                })
+                .await
+                .unwrap();
+            server
+                .delete_attachment(DeleteAttachmentRequest {
+                    id: started_incomplete.id.clone(),
+                    token: started_incomplete.upload_token.clone(),
+                    only_if_incomplete: true,
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                server
+                    .get_chunk(GetChunkRequest {
+                        id: started_incomplete.id.clone(),
+                        index: 0,
+                    })
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::NotFound
+            );
         }
 
         #[tokio::test]
@@ -534,6 +617,7 @@ mod server {
             let del_req = DeleteAttachmentRequest {
                 id: started.id.clone(),
                 token: delete_token.clone(),
+                only_if_incomplete: false,
             };
             let del_dbg = format!("{del_req:?}");
             assert!(!del_dbg.contains("token"), "{del_dbg}");
@@ -581,6 +665,12 @@ mod server {
                 }
                 async fn delete_attachment(&self, id: &[u8; 16]) -> storage::Result<()> {
                     storage::AttachmentStore::delete_attachment(&self.inner, id).await
+                }
+                async fn delete_attachment_if_incomplete(
+                    &self,
+                    id: &[u8; 16],
+                ) -> storage::Result<bool> {
+                    storage::AttachmentStore::delete_attachment_if_incomplete(&self.inner, id).await
                 }
             }
 

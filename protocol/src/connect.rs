@@ -1215,6 +1215,7 @@ mod test {
             .delete_attachment(DeleteAttachmentRequest {
                 id: started.id.clone(),
                 token: delete_token,
+                only_if_incomplete: false,
             })
             .await
             .unwrap();

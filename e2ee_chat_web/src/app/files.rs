@@ -680,6 +680,7 @@ mod tests {
                 index,
                 pointer,
                 clock: index,
+                gone: false,
             }),
         }
     }

@@ -446,6 +446,8 @@ pub struct RemoteFile {
     /// The clock of the message the peer sent it in, to tell the peer once it is downloaded;
     /// 0 for this client's own.
     pub clock: u64,
+    /// Whether the attachment is already known to be deleted/missing on the server (`R22-P3-3`).
+    pub gone: bool,
 }
 
 /// An attachment being opened: fetched, unless kept here, and decrypted, a chunk at a time.

@@ -345,6 +345,22 @@ impl Upload {
             .delete_attachment(DeleteAttachmentRequest {
                 id: Bytes::copy_from_slice(&self.id),
                 token: Bytes::copy_from_slice(self.token.as_slice()),
+                only_if_incomplete: false,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Cancel the upload only if the relay has not already received all of its chunks.
+    ///
+    /// Preserves a completed upload whose final `PutChunk` committed on the relay while its HTTP
+    /// response was delayed past local teardown (`R22-P2-8`).
+    pub async fn cancel_if_incomplete(&self, attachments: &impl LocalAttachments) -> Result<()> {
+        attachments
+            .delete_attachment(DeleteAttachmentRequest {
+                id: Bytes::copy_from_slice(&self.id),
+                token: Bytes::copy_from_slice(self.token.as_slice()),
+                only_if_incomplete: true,
             })
             .await?;
         Ok(())
@@ -417,6 +433,25 @@ pub async fn delete(
         .delete_attachment(DeleteAttachmentRequest {
             id: Bytes::copy_from_slice(id),
             token: Bytes::copy_from_slice(token.as_slice()),
+            only_if_incomplete: false,
+        })
+        .await?;
+    Ok(())
+}
+
+/// Delete the attachment `id`, whose key is `key`, only if not all of its chunks have been
+/// uploaded yet (`R22-P2-8`).
+pub async fn delete_if_incomplete(
+    attachments: &impl LocalAttachments,
+    id: &[u8; ID_LENGTH],
+    key: &[u8; KEY_LENGTH],
+) -> Result<()> {
+    let token = delete_token(key);
+    attachments
+        .delete_attachment(DeleteAttachmentRequest {
+            id: Bytes::copy_from_slice(id),
+            token: Bytes::copy_from_slice(token.as_slice()),
+            only_if_incomplete: true,
         })
         .await?;
     Ok(())

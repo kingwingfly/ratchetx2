@@ -580,8 +580,10 @@ impl<V: VaultStore> Engine<V> {
             };
 
             // Phase 2 outside `self.inner`: claim peer bundle over the network.
+            // R22-P2-7: Suppress the global `REFUSED` sign-in hook so a late 403 for a chat
+            // deleted or superseded while `ClaimBundle` was suspended cannot open `Dialog::SignIn`.
             let claim_res = session::claim_peer_bundle_v2(
-                &Fetch::client(&server),
+                &Fetch::client_without_refused_hook(&server),
                 &audience,
                 &peer,
                 &peer_pq_for_claim,
@@ -644,6 +646,11 @@ impl<V: VaultStore> Engine<V> {
             let claimed = match claim_res {
                 Ok(claimed) => claimed,
                 Err(e) => {
+                    if e.kind() == ErrorKind::SignInRequired
+                        && super::same_server(&inner.server, &super::origin())
+                    {
+                        self.ask_sign_in();
+                    }
                     return Err(self.handle_upgrade_pq_error(vgen, inner, &peer, e).await);
                 }
             };
@@ -1006,6 +1013,25 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err("locked".into());
         }
+        // R22-P3-2: If the chat was deleted/replaced or its active session changed while
+        // `SendInitialV2` was suspended, return immediately without replaying deferred envelopes
+        // or logging a PQ upgrade success for the replacement chat.
+        if !matches_session {
+            let healthy_same_gen =
+                inner
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer)
+                    .is_some_and(|c| {
+                        c.state.conversation_gen == expected_conversation_gen
+                            && c.has_healthy_pq_session()
+                    });
+            return if healthy_same_gen {
+                Ok(())
+            } else {
+                Err("chat changed while upgrading; please retry.".to_string())
+            };
+        }
         let replay_grants = match self
             .replay_deferred_envelopes(inner, Some(&peer), None, None)
             .await
@@ -1126,6 +1152,13 @@ impl<V: VaultStore> Engine<V> {
                     }
                     _ => {}
                 }
+            } else if kind == ErrorKind::DowngradeDetected && !contact.has_healthy_pq_session() {
+                // R22-P2-5: Never drop a verified downgrade alarm on an established peer-confirmed
+                // classical chat (`!persist_alert`): persist `downgrade_detected`,
+                // `SECURITY_ALERT_DOWNGRADE`, and revoke `allow_classical_exception` so the
+                // downgrade banner surfaces and classical transmission halts until upgraded.
+                contact.record_policy_error(ErrorKind::DowngradeDetected);
+                need_save = true;
             } else if kind == ErrorKind::ClassicalApprovalRequired
                 && !e.is_server_pq_disabled_approval()
                 && !contact.state.quarantined
