@@ -2368,6 +2368,13 @@ impl<V: VaultStore> Engine<V> {
                     let Some(inner) = guard.as_mut() else {
                         return Err(PublishError::locked());
                     };
+                    // R28-P2-3: `PublishV2` #1 passed Worker sign-in auth before returning
+                    // `Unimplemented` -> `ServerPqDisabled`; clear latched origin waits and
+                    // non-waiting `ui.held` rows immediately before classical-OFF preparation or
+                    // the second transmit (which might fail with `ClockSkew`, IDB, or 5xx).
+                    if same_server(&inner.server, &origin()) {
+                        self.on_origin_auth_proven_locked(vgen, inner);
+                    }
                     let (mut preserve_spks, mut preserve_digests) =
                         preserved_deferred_prekeys(inner, now());
                     let inbox_ready_for_eviction = allow_scheduled_rotation
@@ -2594,9 +2601,12 @@ impl<V: VaultStore> Engine<V> {
                 .map(|()| PublishFullOutcome::Deferred)
             }
             Err(e) => {
+                // R28-P2-3: `ErrorKind::DowngradeDetected` from `transmit_publish_v2_with` is
+                // only produced by `check_server_info_with` strictly after `PublishV2` passed
+                // Worker sign-in auth and returned `Unimplemented`.
                 if same_server(&inner.server, &origin())
-                    && e.is_server_refusal()
-                    && e.kind() != ErrorKind::SignInRequired
+                    && ((e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired)
+                        || e.kind() == ErrorKind::DowngradeDetected)
                 {
                     self.on_origin_auth_proven_locked(vgen, inner);
                 }

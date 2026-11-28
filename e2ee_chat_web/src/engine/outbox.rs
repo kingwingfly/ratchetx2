@@ -2090,6 +2090,20 @@ impl<V: VaultStore> Engine<V> {
                                     let Some(inner) = guard.as_mut() else {
                                         return Ok(false);
                                     };
+                                    // R28-P2-4: Any `Ok` or non-`SignInRequired` server refusal
+                                    // from `SendInitialV2` proves origin auth even if the contact
+                                    // was deleted or superseded while the RPC was in flight.
+                                    if signs_in_here
+                                        && retry_res.as_ref().is_some_and(|res| {
+                                            res.is_ok()
+                                                || res.as_ref().is_err_and(|e| {
+                                                    e.is_server_refusal()
+                                                        && e.kind() != ErrorKind::SignInRequired
+                                                })
+                                        })
+                                    {
+                                        self.on_origin_auth_proven_locked(vgen, inner);
+                                    }
                                     if inner.contact(peer).is_none() {
                                         break;
                                     }
@@ -2115,9 +2129,6 @@ impl<V: VaultStore> Engine<V> {
                                     } else if let Some(retry_res) = retry_res {
                                         match retry_res {
                                             Ok(()) => {
-                                                if signs_in_here {
-                                                    self.on_origin_auth_proven_locked(vgen, inner);
-                                                }
                                                 if let Some(contact) = inner.contact(peer) {
                                                     contact.mark_greeting_confirmed();
                                                     if !greeting_unconfirmed {
@@ -2406,13 +2417,16 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Release all `ui.held` rows whose outbox entry is not an unstarted `awaits_upload`
-    /// placeholder (`R27-P2-1`), so proven sign-in clears `"waiting for server sign-in"` even when
-    /// a peer remains queued on approval backoff, rekey, or a transient error.
-    pub(super) fn release_non_waiting_held(&self, inner: &Inner<V>) {
+    /// placeholder (`R27-P2-1`), returning whether any held row was removed so proven sign-in
+    /// clears `"waiting for server sign-in"` even when a peer remains queued on approval backoff,
+    /// rekey, or a transient error.
+    pub(super) fn release_non_waiting_held(&self, inner: &Inner<V>) -> bool {
         if self.shutting_down.get() || crate::glue::lock_released() {
-            return;
+            return false;
         }
+        let mut released = false;
         self.ui.held.update(|held| {
+            let before = held.len();
             held.retain(|(p, idx)| {
                 inner.contacts.iter().any(|c| {
                     c.peer == *p
@@ -2422,30 +2436,48 @@ impl<V: VaultStore> Engine<V> {
                             .any(|o| o.history_index == *idx && o.awaits_upload)
                 })
             });
+            released = held.len() < before;
         });
+        released
     }
 
     /// Record that an authenticated same-origin RPC passed the relay's sign-in gate while `vgen`
-    /// is still live (`R26-P2-1`, `R27-P2-2`, `R27-P2-3`, `R27-P3-1`): clears all latched
-    /// origin-wide sign-in wait flags (`publish_waits_sign_in`, `farewells_wait_sign_in`, and all
-    /// peers' `waits_for_sign_in`) because `__Host-e2ee-chat` is shared origin-wide.
-    pub(super) fn on_origin_auth_proven(&self, vgen: u64) {
+    /// is still live (`R26-P2-1`, `R27-P2-2`, `R27-P2-3`, `R27-P3-1`, `R28-P2-2`): clears all
+    /// latched origin-wide sign-in wait flags (`publish_waits_sign_in`, `farewells_wait_sign_in`,
+    /// `waiting_uploads_wait_sign_in`, and all peers' `waits_for_sign_in`), resets
+    /// `declined_sign_in`, schedules waiting-upload promotion if any upload waited for sign-in,
+    /// and wakes `Engine::run` whenever any latched wait was actually cleared.
+    pub(super) fn on_origin_auth_proven(&self, vgen: u64) -> bool {
         if !self.is_live(vgen) {
-            return;
+            return false;
         }
-        self.queue.clear_all_sign_in_waits();
-        self.startup.set_publish_waits_sign_in(false);
-        self.startup.set_farewells_wait_sign_in(false);
+        let cleared_peers = self.queue.clear_all_sign_in_waits();
+        let cleared_publish = self.startup.set_publish_waits_sign_in(false);
+        let cleared_farewells = self.startup.set_farewells_wait_sign_in(false);
+        let cleared_waiting_uploads = self.uploads.set_waiting_uploads_wait_sign_in(false);
+        if cleared_waiting_uploads {
+            self.uploads.mark_start_waiting_needed();
+        }
+        self.startup.reset_declined();
+        let cleared =
+            cleared_peers || cleared_publish || cleared_farewells || cleared_waiting_uploads;
+        if cleared {
+            self.wake();
+        }
+        cleared
     }
 
     /// Locked variant of [`Self::on_origin_auth_proven`] that also releases non-`awaits_upload`
-    /// `ui.held` rows immediately under the held `Engine::inner` guard (`R27-P2-1`).
+    /// `ui.held` rows immediately under the held `Engine::inner` guard (`R27-P2-1`, `R28-P2-2`).
     pub(super) fn on_origin_auth_proven_locked(&self, vgen: u64, inner: &Inner<V>) {
         if !self.is_live(vgen) {
             return;
         }
-        self.on_origin_auth_proven(vgen);
-        self.release_non_waiting_held(inner);
+        let cleared = self.on_origin_auth_proven(vgen);
+        let released = self.release_non_waiting_held(inner);
+        if released && !cleared {
+            self.wake();
+        }
     }
 
     /// Async variant of [`Self::on_origin_auth_proven`] for callers that do not currently hold any
@@ -2454,13 +2486,16 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return;
         }
-        self.on_origin_auth_proven(vgen);
+        let cleared = self.on_origin_auth_proven(vgen);
         if self.ui.held.with_untracked(|held| !held.is_empty()) {
             let guard = self.lock_inner().await;
             if self.is_live(vgen)
                 && let Some(inner) = guard.as_ref()
             {
-                self.release_non_waiting_held(inner);
+                let released = self.release_non_waiting_held(inner);
+                if released && !cleared {
+                    self.wake();
+                }
             }
         }
     }
@@ -4573,6 +4608,8 @@ pub(super) fn is_post_auth_claim_error(
             | ErrorKind::DowngradeDetected
             | ErrorKind::PqRequired
             | ErrorKind::PeerManifestExpired
+            | ErrorKind::UnsupportedSuite
+            | ErrorKind::ClockSkew
     ) || (e.is_server_refusal() && e.kind() != ErrorKind::SignInRequired)
 }
 

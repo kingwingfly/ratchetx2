@@ -772,7 +772,16 @@ impl SignInFlow {
                 | Dialog::ShareContact(_)
                 | Dialog::Files(_)
                 | Dialog::Activity,
-            ) => None,
+            ) => {
+                // R28-P2-1: Never let background sync/transport 403s hijack open modals, while
+                // allowing explicit interactive actions inside those dialogs (Accept, Allow
+                // classical, Upgrade to PQ, New prekeys, Save settings) to open `Dialog::SignIn`.
+                if background {
+                    None
+                } else {
+                    Some(Dialog::SignIn)
+                }
+            }
         }
     }
 
@@ -1270,6 +1279,25 @@ mod tests {
         );
         assert_eq!(
             flow.on_ask_sign_in(Some(&Dialog::Settings), true, true),
+            None
+        );
+        // R28-P2-1: Explicit interactive actions (`background == false`) inside those dialogs DO
+        // open `Dialog::SignIn` (even if `declined_sign_in == true`), while cross-origin vaults
+        // still return `None`.
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Contact([2; 32])), true, false),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Identity), true, false),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Settings), true, false),
+            Some(Dialog::SignIn)
+        );
+        assert_eq!(
+            flow.on_ask_sign_in(Some(&Dialog::Contact([2; 32])), false, false),
             None
         );
         // Cross-origin vaults never show SignInDialog.

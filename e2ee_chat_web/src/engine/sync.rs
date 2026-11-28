@@ -870,10 +870,11 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
-    /// One round: recover unsaved state, refresh server info, push farewells, flush revocations,
-    /// take initial messages, publish/refill prekeys, flush write-token grants, receive the
-    /// unified mailbox, and flush per-peer outboxes. Returns whether anything happened.
-    pub(super) async fn sync(&self) -> bool {
+    /// One round: recover unsaved state, promote waiting uploads after cross-tab sign-in, refresh
+    /// server info, push farewells, flush revocations, take initial messages, publish/refill
+    /// prekeys, flush write-token grants, receive the unified mailbox, and flush per-peer
+    /// outboxes. Returns whether anything happened.
+    pub(super) async fn sync(self: &Rc<Self>) -> bool {
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
             return false;
@@ -931,6 +932,15 @@ impl<V: VaultStore> Engine<V> {
         }
         if !self.is_live(vgen) {
             return false;
+        }
+        // R28-P2-2: Promote `UPLOAD_STATE_WAITING` uploads once cross-tab sign-in is proven by an
+        // authenticated RPC so waiting uploads and messages queued behind them unblock without
+        // requiring an explicit in-tab `sign_in()` / `signed_in()` call.
+        if self.uploads.start_waiting_needed() {
+            active |= self.start_waiting_uploads().await;
+            if !self.is_live(vgen) {
+                return false;
+            }
         }
         self.refresh_server_info(false).await;
         if !self.is_live(vgen) {

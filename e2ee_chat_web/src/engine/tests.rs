@@ -34686,7 +34686,7 @@ fn r25_round25_web_engine_regressions() {
         // 4a (R25-P3-1): `start_chat` Phase-4 `SendInitialV2` 403 marks `waits_for_sign_in`.
         let mut bob_client = session::Client::new(Fetch::client(LOCAL_SERVER));
         let bob_peer = bob_client.identity_key();
-        let bob_key = key_to_text(&bob_peer);
+        let bob_key = crate::util::key_to_text(&bob_peer);
         let claimed_resp = publish_bundle_for_test(&mut bob_client, "localhost", 1).remove(0);
         let send_initial_calls = Rc::new(Cell::new(0usize));
         let sub_id = eng
@@ -35186,7 +35186,7 @@ fn r26_round26_web_engine_regressions() {
         eng.queue.clear_peer_sign_in_wait(&peer);
         let mut bob_client = session::Client::new(Fetch::client(LOCAL_SERVER));
         let bob_peer = bob_client.identity_key();
-        let bob_key = key_to_text(&bob_peer);
+        let bob_key = crate::util::key_to_text(&bob_peer);
         let bob_bundle = publish_bundle_for_test(&mut bob_client, "localhost", 1).remove(0);
         let sub_bob = eng
             .startup
@@ -35594,6 +35594,478 @@ fn r27_round27_web_engine_regressions() {
         assert!(
             eng.ui.held.with_untracked(|h| h.contains(&(peer, idx))),
             "R27-P3-2: push_events 403 must mark concurrently added non-awaits_upload head in ui.held"
+        );
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn r28_round28_web_engine_regressions() {
+    use leptos::prelude::{Set, WithUntracked};
+    use prost::Message as _;
+    use std::sync::Arc;
+
+    let _guard = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+    let mut pool = futures::executor::LocalPool::new();
+
+    let sign_in_403 = || {
+        Ok((
+            403,
+            br#"{"code":"permission_denied","message":"sign in required"}"#.to_vec(),
+        ))
+    };
+
+    // Part 1 (R28-P2-1):
+    // Interactive (`background = false`) sign-in 403 while `Dialog::Contact(peer)` is open MUST
+    // switch `ui.dialog` to `Some(Dialog::SignIn)` (even after prior decline), whereas a
+    // background (`background = true`) 403 MUST NOT hijack `Dialog::Contact(peer)`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner
+                .add(&peer, Kind::Text("modal-sign-in".into()), false)
+                .await
+                .unwrap();
+        }
+        eng.ui.dialog.set(Some(Dialog::Contact(peer)));
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PushV2") {
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            eng.flush_background(&peer).await.unwrap();
+        }
+        assert_eq!(
+            eng.ui.dialog.get_untracked(),
+            Some(Dialog::Contact(peer)),
+            "R28-P2-1: background 403 must NOT hijack open Dialog::Contact"
+        );
+
+        eng.decline_sign_in_prompts();
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PushV2") {
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            eng.flush(&peer).await.unwrap();
+        }
+        assert_eq!(
+            eng.ui.dialog.get_untracked(),
+            Some(Dialog::SignIn),
+            "R28-P2-1: explicit interactive 403 while Dialog::Contact is open must open Dialog::SignIn"
+        );
+    });
+
+    // Part 2 (R28-P2-2):
+    // Proving cross-tab sign-in via `on_origin_auth_proven*` wakes `Engine::run`, resets
+    // `declined_sign_in`, and schedules `start_waiting_uploads()` in `sync()` without looping on
+    // `LimitExceeded`.
+    pool.run_until(async {
+        let (eng, peer_a, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let cgen_a = {
+            let guard = eng.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .contacts
+                .iter()
+                .find(|c| c.peer == peer_a)
+                .unwrap()
+                .state
+                .conversation_gen
+        };
+        let peer_b = [0x42u8; 32];
+        let src = super::attachments::ChunkSource::Bytes {
+            name: "cross_tab.bin".into(),
+            mime: "application/octet-stream".into(),
+            data: Arc::new(vec![0x77u8; 32]),
+        };
+        eng.wait_for_sign_in(peer_a, cgen_a, src).await.unwrap();
+        eng.queue.mark_waits_sign_in(peer_b);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+        eng.decline_sign_in_prompts();
+        let _ = eng.queue.take_wake();
+
+        let vgen = eng.vault_gen();
+        eng.on_origin_auth_proven_async(vgen).await;
+        assert!(
+            eng.queue.take_wake(),
+            "R28-P2-2: clearing latched origin sign-in waits must wake Engine::run immediately"
+        );
+        assert!(
+            eng.uploads.start_waiting_needed(),
+            "R28-P2-2: clearing waiting_uploads_wait_sign_in must arm start_waiting_needed"
+        );
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer_b)
+                && !eng.startup.is_publish_paused()
+                && !eng.startup.farewells_wait_sign_in(),
+            "R28-P2-2: all origin sign-in waits must clear"
+        );
+        // Verify `declined_sign_in` was reset: background prompt can now open `Dialog::SignIn`.
+        eng.ui.dialog.set(None);
+        eng.ask_sign_in_background();
+        assert_eq!(
+            eng.ui.dialog.get_untracked(),
+            Some(Dialog::SignIn),
+            "R28-P2-2: on_origin_auth_proven must reset declined_sign_in"
+        );
+        eng.ui.dialog.set(None);
+
+        // Now run `sync()` with `StartUpload` returning `429 LimitExceeded` (a post-auth server
+        // refusal) and verify `start_waiting_uploads()` ran ONCE and did NOT re-arm an infinite
+        // retry loop via `on_origin_auth_proven_async`!
+        let start_hits = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let sh = start_hits.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/StartUpload") {
+                    sh.set(sh.get() + 1);
+                    return Ok((
+                        429,
+                        br#"{"code":"resource_exhausted","message":"quota full"}"#.to_vec(),
+                    ));
+                }
+                if path.ends_with("/GetServerInfo") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "localhost".into(),
+                            pq_enabled: true,
+                            supported_suites: vec![1, 2],
+                            pq_ratchet_supported: true,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/ListInitialMessages") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::ListInitialMessagesResponse::default()
+                            .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/FetchSigned") {
+                    return Ok((
+                        200,
+                        protocol::mailbox_v2::FetchSignedResponse::default().encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            let _ = eng.queue.take_wake();
+            eng.sync().await;
+        }
+        assert_eq!(
+            start_hits.get(),
+            1,
+            "R28-P2-2: sync() must invoke start_waiting_uploads() after cross-tab auth proof"
+        );
+        assert!(
+            !eng.uploads.start_waiting_needed(),
+            "R28-P2-2: StartUpload LimitExceeded refusal must NOT re-arm start_waiting_needed loop"
+        );
+        assert!(
+            !eng.queue.take_wake(),
+            "R28-P2-2: StartUpload LimitExceeded refusal must NOT re-wake Engine::run in a loop"
+        );
+    });
+
+    // Part 3 (R28-P2-3):
+    // `publish_full_locked_gated` clears origin waits and non-waiting `ui.held` immediately on
+    // `first_outcome == Ok(PublishV2Outcome::ServerPqDisabled)` (even if the second classical-OFF
+    // `PublishV2` hits a transient 5xx error) and on post-`PublishV2` `Err(DowngradeDetected)`.
+    #[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let text_idx = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let v = inner
+                .add(&peer, Kind::Text("held-before-publish".into()), false)
+                .await
+                .unwrap();
+            eng.hold(&peer, v.index);
+            v.index
+        };
+
+        // 3a: PublishV2 #1 returns Unimplemented -> GetServerInfo { pq_enabled: false } ->
+        // PublishV2 #2 returns 500 transient error.
+        eng.queue.mark_waits_sign_in(peer);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+        let pub_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let pc = pub_calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PublishV2") {
+                    let n = pc.get() + 1;
+                    pc.set(n);
+                    if n == 1 {
+                        return Ok((
+                            404,
+                            br#"{"code":"unimplemented","message":"pq disabled"}"#.to_vec(),
+                        ));
+                    }
+                    return Ok((500, br#"{"code":"internal","message":"transient"}"#.to_vec()));
+                }
+                if path.ends_with("/GetServerInfo") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "localhost".into(),
+                            pq_enabled: false,
+                            supported_suites: vec![],
+                            pq_ratchet_supported: false,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            assert!(eng.publish(true).await.is_err());
+        }
+        assert_eq!(pub_calls.get(), 2);
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer)
+                && !eng.startup.is_publish_paused()
+                && !eng.startup.farewells_wait_sign_in()
+                && !eng.ui.held.with_untracked(|h| h.contains(&(peer, text_idx))),
+            "R28-P2-3: PublishV2 #1 ServerPqDisabled must clear origin waits and non-waiting ui.held even when PublishV2 #2 fails with 5xx"
+        );
+
+        // 3b: PublishV2 #1 returns Unimplemented -> GetServerInfo returns mismatched audience
+        // (`ErrorKind::DowngradeDetected`).
+        eng.queue.mark_waits_sign_in(peer);
+        eng.startup.set_publish_waits_sign_in(true);
+        eng.startup.set_farewells_wait_sign_in(true);
+        eng.hold(&peer, text_idx);
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PublishV2") {
+                    return Ok((
+                        404,
+                        br#"{"code":"unimplemented","message":"pq disabled"}"#.to_vec(),
+                    ));
+                }
+                if path.ends_with("/GetManifest") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetManifestResponse { manifest: None }
+                            .encode_to_vec(),
+                    ));
+                }
+                if path.ends_with("/GetServerInfo") {
+                    return Ok((
+                        200,
+                        protocol::handshake_v2::GetServerInfoResponse {
+                            server_id: "evil.example".into(),
+                            pq_enabled: false,
+                            supported_suites: vec![],
+                            pq_ratchet_supported: false,
+                        }
+                        .encode_to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            assert!(eng.publish(true).await.is_err());
+        }
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer)
+                && !eng.startup.is_publish_paused()
+                && !eng.startup.farewells_wait_sign_in()
+                && !eng.ui.held.with_untracked(|h| h.contains(&(peer, text_idx))),
+            "R28-P2-3: post-PublishV2 GetServerInfo DowngradeDetected must clear origin waits and non-waiting ui.held"
+        );
+    });
+
+    // Part 4 (R28-P2-4):
+    // `flush_with_mode`'s `SendInitialV2` retry clears origin waits and non-waiting `ui.held` on
+    // post-auth server refusal (`429 LimitExceeded`) re-latched strictly AFTER `PushV2` returned
+    // `WriteTokenRejected`.
+    pool.run_until(async {
+        let (eng, _, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let peer_other = [0x99u8; 32];
+        let mut bob_client = session::Client::new(Fetch::client(LOCAL_SERVER));
+        let bob_peer = bob_client.identity_key();
+        let bob_key = crate::util::key_to_text(&bob_peer);
+        let bob_bundle = publish_bundle_for_test(&mut bob_client, "localhost", 1).remove(0);
+        let sub_bob = eng
+            .startup
+            .begin_new_chat_submit(crate::state::PendingNewChat {
+                key: bob_key.clone(),
+                name: "BobR28".into(),
+                server: None,
+                pq_pinned: false,
+                allow_classical: false,
+                auto_start: false,
+            });
+        {
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/ClaimBundle") {
+                    return Ok((200, bob_bundle.encode_to_vec()));
+                }
+                if path.ends_with("/SendInitialV2") {
+                    return Ok((
+                        503,
+                        br#"{"code":"unavailable","message":"offline"}"#.to_vec(),
+                    ));
+                }
+                Ok((200, vec![]))
+            });
+            assert_eq!(
+                eng.start_chat(sub_bob, &bob_key, "BobR28".into(), None, false, false)
+                    .await,
+                Ok(bob_peer)
+            );
+        }
+        eng.startup.finish_submission(sub_bob);
+        let text_idx = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let v = inner
+                .add(&bob_peer, Kind::Text("retry-init-429".into()), false)
+                .await
+                .unwrap();
+            v.index
+        };
+        let send_init_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let sc = send_init_calls.clone();
+            let eng_c = eng.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let sc = sc.clone();
+                let eng_c = eng_c.clone();
+                async move {
+                    if path.ends_with("/PushV2") {
+                        return Ok((
+                            409,
+                            br#"{"code":"aborted","message":"write token rejected"}"#.to_vec(),
+                        ));
+                    }
+                    if path.ends_with("/SendInitialV2") {
+                        sc.set(sc.get() + 1);
+                        // Re-latch waits strictly AFTER PushV2's 409 so ONLY SendInitialV2's
+                        // post-auth refusal handler can clear them!
+                        eng_c.queue.mark_waits_sign_in(peer_other);
+                        eng_c.startup.set_publish_waits_sign_in(true);
+                        eng_c.startup.set_farewells_wait_sign_in(true);
+                        eng_c.hold(&bob_peer, text_idx);
+                        return Ok((
+                            429,
+                            br#"{"code":"resource_exhausted","message":"rate limited"}"#.to_vec(),
+                        ));
+                    }
+                    Ok((200, vec![]))
+                }
+            });
+            let _ = eng.flush(&bob_peer).await;
+        }
+        assert_eq!(send_init_calls.get(), 1);
+        assert!(
+            !eng.queue.waits_for_sign_in(&peer_other)
+                && !eng.startup.is_publish_paused()
+                && !eng.startup.farewells_wait_sign_in()
+                && !eng.ui.held.with_untracked(|h| h.contains(&(bob_peer, text_idx))),
+            "R28-P2-4: flush_with_mode SendInitialV2 post-auth LimitExceeded must clear origin waits and non-waiting ui.held"
+        );
+    });
+
+    // Part 5 (R28-P3-1):
+    // `is_post_auth_claim_error` classifies post-claim `UnsupportedSuite` and `ClockSkew` as
+    // authenticated (while keeping pre-RPC `strict_pq && !local_pq_enabled` excluded).
+    {
+        let cfg = session::PqConfig::default();
+        assert!(super::outbox::is_post_auth_claim_error(
+            &session::Error::from(ErrorKind::UnsupportedSuite),
+            &cfg,
+            true,
+        ));
+        assert!(super::outbox::is_post_auth_claim_error(
+            &session::Error::from(ErrorKind::ClockSkew),
+            &cfg,
+            true,
+        ));
+        let strict_off = session::PqConfig {
+            strict_pq: true,
+            pq_enabled: false,
+            pq_ratchet_enabled: false,
+            ..cfg
+        };
+        assert!(!super::outbox::is_post_auth_claim_error(
+            &session::Error::from(ErrorKind::PqRequired),
+            &strict_off,
+            false,
+        ));
+        assert!(!super::outbox::is_post_auth_claim_error(
+            &session::Error::from(ErrorKind::UnsupportedSuite),
+            &strict_off,
+            false,
+        ));
+    }
+
+    // Part 6 (R28-P3-2):
+    // `resume_upload_source` on an unannounced `UPLOAD_STATE_STARTED` upload (`uploaded == 0`)
+    // calls `flush(&peer)` ONCE (via `announce`), not twice in a row.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        eng.startup.set_can_sign_in_here(true);
+        let att_id = [0xb1u8; 16];
+        let file_bytes = vec![0x55u8; 64];
+        let mut p = crate::vault::PendingUpload::default();
+        p.id = att_id.to_vec();
+        p.token = [0xb2u8; 16].to_vec();
+        p.key = [0xb3u8; 32].to_vec();
+        p.name = "unannounced_start.bin".into();
+        p.size = file_bytes.len() as u64;
+        p.uploaded = 0;
+        p.encrypted = 0;
+        p.prefix_hash = <sha2::Sha256 as sha2::Digest>::digest([]).to_vec();
+        p.announced = false;
+        p.history_index = 0;
+        p.upload_state = crate::vault::UPLOAD_STATE_STARTED;
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.vault.save_upload(&peer, &p).await.unwrap();
+        }
+        let push_calls = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        {
+            let pc = push_calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PushV2") {
+                    pc.set(pc.get() + 1);
+                    return sign_in_403();
+                }
+                if path.ends_with("/PutChunk") {
+                    return sign_in_403();
+                }
+                Ok((200, vec![]))
+            });
+            let src = super::attachments::ChunkSource::Bytes {
+                name: "unannounced_start.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: Arc::new(file_bytes),
+            };
+            let _ = eng.resume_upload_source(peer, att_id, Some(src)).await;
+        }
+        assert_eq!(
+            push_calls.get(),
+            1,
+            "R28-P3-2: resume_upload_source on unannounced UPLOAD_STATE_STARTED upload must flush exactly once, not twice"
         );
     });
 }

@@ -72,6 +72,12 @@ pub(super) struct UploadRegistry {
     /// the older pass from overwriting a newer `run_upload` cleanup request with `false`.
     uploads_restore_epoch: Cell<u64>,
     uploads_restore_completed: Cell<u64>,
+    /// Whether at least one `UPLOAD_STATE_WAITING` upload was parked for server sign-in and has
+    /// not yet been retried after a subsequent origin auth proof (`R28-P2-2`).
+    waiting_uploads_wait_sign_in: Cell<bool>,
+    /// One-shot flag consumed by `Engine::sync()` / `start_waiting_uploads()` to promote waiting
+    /// uploads once cross-tab sign-in is proven by an authenticated RPC (`R28-P2-2`).
+    start_waiting_needed: Cell<bool>,
 }
 
 impl UploadRegistry {
@@ -279,6 +285,22 @@ impl UploadRegistry {
         self.uploads_restore_completed.get() != self.uploads_restore_epoch.get()
     }
 
+    pub(super) fn set_waiting_uploads_wait_sign_in(&self, waits: bool) -> bool {
+        self.waiting_uploads_wait_sign_in.replace(waits)
+    }
+
+    pub(super) fn mark_start_waiting_needed(&self) {
+        self.start_waiting_needed.set(true);
+    }
+
+    pub(super) fn start_waiting_needed(&self) -> bool {
+        self.start_waiting_needed.get()
+    }
+
+    pub(super) fn take_start_waiting_needed(&self) -> bool {
+        self.start_waiting_needed.replace(false)
+    }
+
     pub(super) fn clear_on_teardown(&self) {
         self.files.borrow_mut().clear();
         self.running.borrow_mut().clear();
@@ -289,6 +311,8 @@ impl UploadRegistry {
         self.pending_gone.borrow_mut().clear();
         self.uploads_restore_epoch.set(0);
         self.uploads_restore_completed.set(0);
+        self.waiting_uploads_wait_sign_in.set(false);
+        self.start_waiting_needed.set(false);
     }
 
     #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -554,8 +578,11 @@ impl SendQueue {
         self.waits_sign_in.borrow_mut().remove(peer);
     }
 
-    pub(super) fn clear_all_sign_in_waits(&self) {
-        self.waits_sign_in.borrow_mut().clear();
+    pub(super) fn clear_all_sign_in_waits(&self) -> bool {
+        let mut set = self.waits_sign_in.borrow_mut();
+        let had_any = !set.is_empty();
+        set.clear();
+        had_any
     }
 
     /// Return an RAII handle to the per-peer serialization mutex for `peer`'s outbox flush,
@@ -764,16 +791,20 @@ impl StartupFlow {
         self.publish_waits_settings.get()
     }
 
-    pub(super) fn set_publish_waits_sign_in(&self, waits: bool) {
-        self.publish_waits_sign_in.set(waits);
+    pub(super) fn set_publish_waits_sign_in(&self, waits: bool) -> bool {
+        self.publish_waits_sign_in.replace(waits)
     }
 
     pub(super) fn farewells_wait_sign_in(&self) -> bool {
         self.farewells_wait_sign_in.get()
     }
 
-    pub(super) fn set_farewells_wait_sign_in(&self, waits: bool) {
-        self.farewells_wait_sign_in.set(waits);
+    pub(super) fn set_farewells_wait_sign_in(&self, waits: bool) -> bool {
+        self.farewells_wait_sign_in.replace(waits)
+    }
+
+    pub(super) fn reset_declined(&self) {
+        self.sign_in_flow.borrow_mut().reset_declined();
     }
 
     pub(super) fn set_publish_waits_settings(&self, waits: bool) {

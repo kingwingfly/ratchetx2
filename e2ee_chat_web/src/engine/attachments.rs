@@ -654,33 +654,41 @@ impl<V: VaultStore> Engine<V> {
             UploadState::Paused(WAITS_SIGN_IN.to_string()),
         );
         self.hold(&peer, waiting.history_index);
+        self.uploads.set_waiting_uploads_wait_sign_in(true);
         Ok(())
     }
 
     /// Start the uploads that waited for this browser to sign in, whose files are still here.
-    pub(super) async fn start_waiting_uploads(self: &Rc<Self>) {
+    /// Returns whether any waiting upload attempt ran.
+    pub(super) async fn start_waiting_uploads(self: &Rc<Self>) -> bool {
         let vgen = self.vault_gen();
+        let was_needed = self.uploads.take_start_waiting_needed();
+        self.uploads.set_waiting_uploads_wait_sign_in(false);
         let waiting = {
             let guard = self.lock_inner().await;
             if !self.is_live(vgen) {
-                return;
+                return false;
             }
             let Some(inner) = guard.as_ref() else {
-                return;
+                return false;
             };
             match inner.vault.uploads(None).await {
                 Ok(uploads) => uploads,
                 Err(e) => {
+                    if was_needed && self.is_live(vgen) {
+                        self.uploads.mark_start_waiting_needed();
+                    }
                     if self.is_live(vgen) {
                         self.ui.notify(describe(&e));
                     }
-                    return;
+                    return false;
                 }
             }
         };
+        let mut started_any = false;
         for (peer, pending) in waiting.into_iter().filter(|(_, p)| !p.has_started_state()) {
             if !self.is_live(vgen) {
-                return;
+                return started_any;
             }
             let Ok(id) = <[u8; 16]>::try_from(pending.id.as_slice()) else {
                 continue;
@@ -695,10 +703,10 @@ impl<V: VaultStore> Engine<V> {
                 let still_waiting = {
                     let guard = self.lock_inner().await;
                     if !self.is_live(vgen) {
-                        return;
+                        return started_any;
                     }
                     let Some(inner) = guard.as_ref() else {
-                        return;
+                        return started_any;
                     };
                     if self.is_cancelled(&id) || self.uploads.is_running(&id) {
                         false
@@ -738,6 +746,7 @@ impl<V: VaultStore> Engine<V> {
             let running_guard = scopeguard::guard(id, |id| {
                 self.uploads.stop_running(&id);
             });
+            started_any = true;
             let result = self.start_waiting_with_mode(peer, id, file, true).await;
             drop(running_guard);
             if let Err(e) = result
@@ -746,6 +755,7 @@ impl<V: VaultStore> Engine<V> {
                 self.ui.notify(e);
             }
         }
+        started_any
     }
 
     /// Start the upload `waiting`, to `peer`, of `file`, which waited for this browser to sign
@@ -870,6 +880,7 @@ impl<V: VaultStore> Engine<V> {
                     .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
                 self.show_upload(&peer, &kept, UploadState::Paused(WAITS_SIGN_IN.to_string()));
                 if same_server(&server, &origin()) {
+                    self.uploads.set_waiting_uploads_wait_sign_in(true);
                     self.ask_sign_in_for(background);
                 }
                 return Ok(());
@@ -1158,27 +1169,40 @@ impl<V: VaultStore> Engine<V> {
     }
 
     /// Send the attachment of `pending` to `peer`, unless sent already, and keep that it was.
-    /// Returns `Ok(None)` if the announcement permanently failed or was cancelled during `flush`.
-    async fn announce(
+    /// Returns `Ok(Some((pending, already_flushed)))` when kept, or `Ok(None)` if the announcement
+    /// permanently failed or was cancelled during `flush`.
+    async fn announce_with_flushed(
         &self,
         peer: &PublicKey,
         pending: PendingUpload,
-    ) -> Result<Option<PendingUpload>, AnnounceError> {
-        self.announce_for_gen(peer, pending, None).await
+    ) -> Result<Option<(PendingUpload, bool)>, AnnounceError> {
+        self.announce_for_gen_with_flushed(peer, pending, None)
+            .await
     }
 
     pub(super) async fn announce_for_gen(
         &self,
         peer: &PublicKey,
-        mut pending: PendingUpload,
+        pending: PendingUpload,
         expected_gen: Option<u64>,
     ) -> Result<Option<PendingUpload>, AnnounceError> {
+        self.announce_for_gen_with_flushed(peer, pending, expected_gen)
+            .await
+            .map(|opt| opt.map(|(p, _)| p))
+    }
+
+    async fn announce_for_gen_with_flushed(
+        &self,
+        peer: &PublicKey,
+        mut pending: PendingUpload,
+        expected_gen: Option<u64>,
+    ) -> Result<Option<(PendingUpload, bool)>, AnnounceError> {
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
             return Err(AnnounceError::NotSent("locked".into()));
         }
         if pending.has_announced_state() {
-            return Ok(Some(pending));
+            return Ok(Some((pending, false)));
         }
         let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
         // Hold one lock across scanning history for an already-persisted announcement, checking
@@ -1355,7 +1379,7 @@ impl<V: VaultStore> Engine<V> {
                 pending: Box::new(pending),
             });
         }
-        Ok(Some(pending))
+        Ok(Some((pending, added_new)))
     }
 
     /// The bytes of the file of the history entry `index` of the chat with `peer`, which are
@@ -1474,8 +1498,8 @@ impl<V: VaultStore> Engine<V> {
         }
         self.uploads.insert_file(cache_key, file.clone());
         let before_announce = pending.clone();
-        let pending = match self.announce(&peer, pending).await {
-            Ok(Some(pending)) => pending,
+        let (pending, announced_flushed) = match self.announce_with_flushed(&peer, pending).await {
+            Ok(Some(res)) => res,
             Ok(None) => return Ok(()),
             Err(err) => {
                 let msg = err.into_message();
@@ -1485,11 +1509,14 @@ impl<V: VaultStore> Engine<V> {
                 return Err(msg);
             }
         };
-        // R12-P1-4 + R13-P2-1 + R26-P2-1: Flush before chunk upload when `before_announce.uploaded
-        // == 0` (outbox announcement held until file re-attached) OR when `waits_for_sign_in` was
-        // set (so resuming an already-announced upload after cross-tab sign-in flushes the held
-        // outbox announcement immediately instead of stranding it behind a stale sign-in wait).
-        if (before_announce.uploaded == 0 || self.queue.waits_for_sign_in(&peer))
+        // R12-P1-4 + R13-P2-1 + R26-P2-1 + R28-P3-2: Flush before chunk upload when `announce`
+        // did NOT already flush (`!announced_flushed`) and either `before_announce.uploaded == 0`
+        // (outbox announcement held until file re-attached, or `SaveAfterSend` recovery) OR
+        // `waits_for_sign_in` was set (so resuming an already-announced upload after cross-tab
+        // sign-in flushes the held outbox announcement immediately without duplicating the flush
+        // just performed by `announce` for a fresh `UPLOAD_STATE_STARTED` upload).
+        if !announced_flushed
+            && (before_announce.uploaded == 0 || self.queue.waits_for_sign_in(&peer))
             && self.is_live(vgen)
             && !self.is_cancelled(&id)
             && let Err(e) = self.flush(&peer).await
