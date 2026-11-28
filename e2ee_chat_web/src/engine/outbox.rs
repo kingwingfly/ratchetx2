@@ -348,38 +348,130 @@ impl<V: VaultStore> Engine<V> {
                     let pause_sealing = contact.state.quarantined
                         || contact.state.classical_approval_needed != CLASSICAL_APPROVAL_NONE
                         || contact.state.security_alert != SECURITY_ALERT_NONE;
-                    // R12-P1-4 + R13-P2-1 + R13-P1-3: Never seal or announce an un-dispatched
-                    // attachment whose upload has 0 chunks uploaded to the server (whether
-                    // `UPLOAD_STATE_STARTED` or `UPLOAD_STATE_ANNOUNCED`, and even if its separate
-                    // upload record is missing/corrupt) without a live, non-cancelled file handle
-                    // in memory.
+                    // R12-P1-4 + R13-P2-1 + R13-P1-3 + R14-P2-2 + R14-P2-3: Never seal or announce
+                    // an un-dispatched attachment whose upload has 0 chunks uploaded to the server
+                    // (whether `UPLOAD_STATE_STARTED` or `UPLOAD_STATE_ANNOUNCED`, and even if its
+                    // separate `HistoryEntry` or `PendingUpload` record is missing/corrupt) without
+                    // a live, non-cancelled file handle in memory.
                     let mut zero_chunk_att_id: Option<[u8; 16]> = None;
                     if !outgoing.dispatched {
                         let unuploaded = inner.vault.unuploaded_started_upload_ids(peer);
                         if !unuploaded.is_empty() {
-                            match inner.vault.entry(peer, outgoing.history_index).await {
-                                _ if !self.is_live(vgen) => return Ok(false),
-                                Ok(Some(entry)) => {
-                                    if let Some(Kind::Attachment(ptr)) =
-                                        entry.content.as_ref().and_then(|c| c.kind.as_ref())
-                                        && let Ok(att_id) = <[u8; 16]>::try_from(ptr.id.as_slice())
-                                        && unuploaded.contains(&att_id)
-                                    {
-                                        if self.is_cancelled(&att_id)
-                                            || !self.uploads.has_file(peer, &att_id)
+                            let mut matched_att_id =
+                                <[u8; 16]>::try_from(outgoing.attachment_id.as_slice())
+                                    .ok()
+                                    .filter(|id| unuploaded.contains(id));
+                            if matched_att_id.is_none() {
+                                match inner.vault.entry(peer, outgoing.history_index).await {
+                                    _ if !self.is_live(vgen) => return Ok(false),
+                                    Ok(Some(entry)) => {
+                                        if let Some(Kind::Attachment(ptr)) =
+                                            entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                                            && let Ok(att_id) =
+                                                <[u8; 16]>::try_from(ptr.id.as_slice())
+                                            && unuploaded.contains(&att_id)
                                         {
-                                            step = NextPush::Done;
-                                            break;
+                                            matched_att_id = Some(att_id);
                                         }
-                                        zero_chunk_att_id = Some(att_id);
+                                    }
+                                    Ok(None) => {
+                                        // R14-P2-2: Missing `HistoryEntry` must not bypass the
+                                        // zero-chunk guard when an independent unsealed
+                                        // `OutgoingRecord` or matching checkpoint identifies the
+                                        // attachment.
+                                        if !outgoing.sealed {
+                                            match inner
+                                                .vault
+                                                .outgoing(peer, outgoing.history_index)
+                                                .await
+                                            {
+                                                _ if !self.is_live(vgen) => return Ok(false),
+                                                Ok(rec) => {
+                                                    if let Some(Kind::Attachment(ptr)) =
+                                                        Kind::from_bytes(&rec.content)
+                                                        && let Ok(att_id) =
+                                                            <[u8; 16]>::try_from(ptr.id.as_slice())
+                                                        && unuploaded.contains(&att_id)
+                                                    {
+                                                        matched_att_id = Some(att_id);
+                                                    }
+                                                }
+                                                Err(crate::vault::Error::Corrupt(_)) => {}
+                                                Err(e) => {
+                                                    result = Err(describe(&e));
+                                                    step = NextPush::Done;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        if matched_att_id.is_none() {
+                                            matched_att_id = inner
+                                                .vault
+                                                .tracked_upload_checkpoints(Some(peer))
+                                                .into_iter()
+                                                .find_map(|cp| {
+                                                    let id = <[u8; 16]>::try_from(cp.id.as_slice())
+                                                        .ok()?;
+                                                    (cp.history_index == outgoing.history_index
+                                                        && unuploaded.contains(&id))
+                                                    .then_some(id)
+                                                });
+                                        }
+                                    }
+                                    Err(e) => {
+                                        result = Err(describe(&e));
+                                        step = NextPush::Done;
+                                        break;
                                     }
                                 }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    result = Err(describe(&e));
+                            }
+                            if let Some(att_id) = matched_att_id {
+                                if self.is_cancelled(&att_id)
+                                    || !self.uploads.has_file(peer, &att_id)
+                                {
+                                    // R14-P2-3: If the separate `PendingUpload` record is missing
+                                    // or corrupt (no resumable UI card exists), fail this
+                                    // un-dispatched orphaned head cleanly and forget its
+                                    // checkpoint so later messages to `peer` are never wedged.
+                                    if !self.is_cancelled(&att_id) {
+                                        let orphan = matches!(
+                                            inner.vault.upload(peer, &att_id).await,
+                                            Ok(None) | Err(crate::vault::Error::Corrupt(_))
+                                        );
+                                        if !self.is_live(vgen) {
+                                            return Ok(false);
+                                        }
+                                        if orphan {
+                                            match self
+                                                .fail_waiting(inner, peer, outgoing.history_index)
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
+                                                    }
+                                                    let _ = inner
+                                                        .vault
+                                                        .forget_upload(peer, &att_id)
+                                                        .await;
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
+                                                    }
+                                                    changed = true;
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    result = Err(e);
+                                                    step = NextPush::Done;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
                                     step = NextPush::Done;
                                     break;
                                 }
+                                zero_chunk_att_id = Some(att_id);
                             }
                         }
                     }
@@ -606,10 +698,10 @@ impl<V: VaultStore> Engine<V> {
                                         id.as_slice() == record.session_id.as_slice()
                                     }))
                         });
-                    // R13-P1-2: Never promote and first transmit an `UNSENT` classical carried
-                    // initial after `strict_pq` (or local PQ without classical exception) was
-                    // enabled.
-                    if promoted_from_unsent
+                    // R13-P1-2 + R14-P1-1 + R14-P1-2: Never transmit a classical carried initial
+                    // (for ANY greeting delivery state: UNSENT, UNCERTAIN, or CONFIRMED `!known`)
+                    // when current local PQ policy blocks classical sessions.
+                    if !record.carried_initial.is_empty()
                         && session::protocol::mailbox_v2::decode_carried_initial(
                             &record.carried_initial,
                         )
@@ -617,16 +709,14 @@ impl<V: VaultStore> Engine<V> {
                     {
                         let strict_pq = inner.client.pq_config().strict_pq;
                         let local_pq = inner.local_pq_enabled();
-                        let blocked = strict_pq
-                            || inner.contacts.iter().any(|c| {
-                                c.peer == *peer
-                                    && (c.session.peer_pq_state().pq_pinned
-                                        || (local_pq
-                                            && !c
-                                                .session
-                                                .peer_pq_state()
-                                                .allow_classical_exception))
-                            });
+                        let blocked = inner.contacts.iter().any(|c| {
+                            c.peer == *peer
+                                && super::classical_policy_blocked(
+                                    strict_pq,
+                                    local_pq,
+                                    c.session.peer_pq_state(),
+                                )
+                        });
                         if blocked {
                             if strict_pq
                                 && let Some(c) = inner.contact(peer)
@@ -680,34 +770,38 @@ impl<V: VaultStore> Engine<V> {
                         if !self.is_live(vgen) {
                             return Ok(false);
                         }
-                        // R13-P1-3: If `cancel_upload` arrived during the `dispatched = true` IDB
-                        // save (still strictly BEFORE `PushV2` has ever been transmitted on the
-                        // wire), revert `dispatched = false` and abort without sending `PushV2`.
+                        // R13-P1-3 + R14-P1-5: If `cancel_upload` arrived during the
+                        // `dispatched = true` IDB save (still strictly BEFORE `PushV2` has ever
+                        // been transmitted on the wire), revert `dispatched = false` directly in
+                        // memory (NEVER rolling back to `true` via `with_contact_tx` on transient
+                        // IDB failure!) and mark `unsaved_state = true` if persistence fails so
+                        // waiting `cancel_upload` always sees `dispatched == false` and settles
+                        // `fail_waiting` without ever flushing the cancelled pointer.
                         if first_dispatch
                             && let Some(att_id) = zero_chunk_att_id
                             && (self.is_cancelled(&att_id) || !self.uploads.has_file(peer, &att_id))
                         {
-                            let _ = inner
-                                .with_contact_tx(peer, async |inner| {
-                                    if let Some(contact) = inner.contact(peer) {
-                                        if let Some(head) = contact.state.outbox.first_mut()
-                                            && head.history_index == target_index
-                                            && head.clock == target_clock
-                                        {
-                                            head.dispatched = false;
-                                        }
-                                        if promoted_from_unsent
-                                            && contact.state.greeting_delivery
-                                                == GREETING_DELIVERY_UNCERTAIN
-                                        {
-                                            contact.state.greeting_delivery =
-                                                GREETING_DELIVERY_UNSENT;
-                                            contact.state.greeting_sent_at = 0;
-                                        }
-                                    }
-                                    inner.save(&[]).await.map_err(|e| describe(&e))
-                                })
-                                .await;
+                            if let Some(contact) = inner.contact(peer) {
+                                if let Some(head) = contact.state.outbox.first_mut()
+                                    && head.history_index == target_index
+                                    && head.clock == target_clock
+                                {
+                                    head.dispatched = false;
+                                }
+                                if promoted_from_unsent
+                                    && contact.state.greeting_delivery
+                                        == GREETING_DELIVERY_UNCERTAIN
+                                {
+                                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                                    contact.state.greeting_sent_at = 0;
+                                }
+                            }
+                            if inner.save_state().await.is_err() {
+                                inner.unsaved_state = true;
+                            }
+                            if !self.is_live(vgen) {
+                                return Ok(false);
+                            }
                             step = NextPush::Done;
                             break;
                         }
@@ -1159,7 +1253,40 @@ impl<V: VaultStore> Engine<V> {
                             let mut retry_failed = false;
                             let mut retry_retired_spk = false;
                             let mut stale_aborted = false;
-                            if can_retry_or_probe && let Some(retry_req) = retry_initial {
+                            // R14-P1-2: Enforce current PQ policy before standalone
+                            // `SendInitialV2` fallback on `WriteTokenRejected` (matching
+                            // `retry_pending_greetings`).
+                            let retry_is_blocked_classical =
+                                retry_initial.as_ref().is_some_and(|req| {
+                                    let req_is_pq =
+                                        req.message.as_ref().is_some_and(|m| m.version >= 2);
+                                    let strict_pq = inner.client.pq_config().strict_pq;
+                                    let local_pq = inner.local_pq_enabled();
+                                    !req_is_pq
+                                        && inner.contacts.iter().any(|c| {
+                                            c.peer == *peer
+                                                && super::classical_policy_blocked(
+                                                    strict_pq,
+                                                    local_pq,
+                                                    c.session.peer_pq_state(),
+                                                )
+                                        })
+                                });
+                            if can_retry_or_probe && retry_is_blocked_classical {
+                                if inner.client.pq_config().strict_pq
+                                    && let Some(c) = inner.contact(peer)
+                                    && c.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                                {
+                                    c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                                    if inner.save_state().await.is_err() {
+                                        inner.unsaved_state = true;
+                                    }
+                                    if !self.is_live(vgen) {
+                                        return Ok(false);
+                                    }
+                                    self.refresh_contacts(inner);
+                                }
+                            } else if can_retry_or_probe && let Some(retry_req) = retry_initial {
                                 let mut retry_promoted = promoted_from_unsent;
                                 let mut ready_for_retry = true;
                                 if greeting_unconfirmed
@@ -1232,6 +1359,8 @@ impl<V: VaultStore> Engine<V> {
                                                 return Ok(false);
                                             }
                                             guard_check.as_ref().is_some_and(|inner| {
+                                                let strict_pq = inner.client.pq_config().strict_pq;
+                                                let local_pq = inner.local_pq_enabled();
                                                 inner
                                                     .contacts
                                                     .iter()
@@ -1245,6 +1374,12 @@ impl<V: VaultStore> Engine<V> {
                                                             && !c.session.needs_new_session()
                                                             && !c.session.is_known_by_peer()
                                                             && !c.session.has_pending_active_grant()
+                                                            && (retry_is_pq
+                                                                || !super::classical_policy_blocked(
+                                                                    strict_pq,
+                                                                    local_pq,
+                                                                    c.session.peer_pq_state(),
+                                                                ))
                                                             && (session_id.is_empty()
                                                                 || c.session
                                                                     .active_id()
@@ -1991,9 +2126,14 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Ok(RekeyOutcome::Aborted);
         }
-        // Re-verify contact existence, active session, AND confirmed active write-token grant
-        // immediately before transmitting `SendInitialV2` so a concurrent delete, inbound session
-        // replacement, or failed `RegisterWriteToken` never emits a phantom or unreplyable initial.
+        let outgoing_is_pq = outgoing_req
+            .message
+            .as_ref()
+            .is_some_and(|m| m.version >= 2);
+        // Re-verify contact existence, active session, confirmed active write-token grant, AND
+        // current PQ policy immediately before transmitting `SendInitialV2` so a concurrent
+        // delete, inbound session replacement, failed `RegisterWriteToken`, or mid-flight
+        // `strict_pq`/PQ toggle never emits a phantom, unreplyable, or policy-blocked initial.
         {
             let mut guard = self.lock_inner().await;
             if !self.is_live(vgen) {
@@ -2005,19 +2145,40 @@ impl<V: VaultStore> Engine<V> {
             if inner.is_isolated_peer(peer) {
                 return Ok(RekeyOutcome::ContactGone);
             }
+            let strict_pq = inner.client.pq_config().strict_pq;
+            let local_pq = inner.local_pq_enabled();
             let Some(contact) = inner.contacts.iter().find(|c| c.peer == *peer) else {
                 return Ok(RekeyOutcome::ContactGone);
             };
             if contact.session.active_id() != new_session_id.as_ref() {
                 return Ok(RekeyOutcome::Ready);
             }
-            if contact.session.has_pending_active_grant() {
-                if let Some(contact) = inner.contact(peer)
-                    && contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
-                {
-                    contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                    contact.state.greeting_sent_at = 0;
-                    let _ = inner.save_state().await;
+            let blocked_by_pq = !outgoing_is_pq
+                && super::classical_policy_blocked(
+                    strict_pq,
+                    local_pq,
+                    contact.session.peer_pq_state(),
+                );
+            if contact.session.has_pending_active_grant() || blocked_by_pq {
+                let mut changed = false;
+                if let Some(contact) = inner.contact(peer) {
+                    if contact.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                        contact.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                        contact.state.greeting_sent_at = 0;
+                        changed = true;
+                    }
+                    if blocked_by_pq
+                        && strict_pq
+                        && contact.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                    {
+                        contact.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    if inner.save_state().await.is_err() {
+                        inner.unsaved_state = true;
+                    }
                     if !self.is_live(vgen) {
                         return Ok(RekeyOutcome::Aborted);
                     }
@@ -2027,10 +2188,6 @@ impl<V: VaultStore> Engine<V> {
             }
         }
 
-        let outgoing_is_pq = outgoing_req
-            .message
-            .as_ref()
-            .is_some_and(|m| m.version >= 2);
         let send_res: session::Result<()> = Fetch::client(&server)
             .send_initial_v2(outgoing_req)
             .await
@@ -2204,6 +2361,41 @@ impl<V: VaultStore> Engine<V> {
                 let _ = inner.save_state().await;
                 return Ok(false);
             };
+            // R14-P1-2: Never promote `UNSENT -> UNCERTAIN` or transmit `PushV2` carrying a
+            // classical v1 initial message once current local PQ policy blocks classical sessions.
+            if message
+                .initial_message
+                .as_ref()
+                .and_then(|raw| session::protocol::mailbox_v2::decode_carried_initial(raw))
+                .is_some_and(|w| w.version < 2)
+            {
+                let strict_pq = inner.client.pq_config().strict_pq;
+                let local_pq = inner.local_pq_enabled();
+                let blocked = inner.contacts.iter().any(|c| {
+                    c.peer == *peer
+                        && super::classical_policy_blocked(
+                            strict_pq,
+                            local_pq,
+                            c.session.peer_pq_state(),
+                        )
+                });
+                if blocked {
+                    if strict_pq
+                        && let Some(c) = inner.contact(peer)
+                        && c.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                    {
+                        c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                        if inner.save_state().await.is_err() {
+                            inner.unsaved_state = true;
+                        }
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
+                        self.refresh_contacts(inner);
+                    }
+                    return Ok(false);
+                }
+            }
             let promoted_from_unsent = inner
                 .contacts
                 .iter()
@@ -2470,6 +2662,10 @@ impl<V: VaultStore> Inner<V> {
             // Encrypted as it goes, once its place in the chat is known, see `flush`.
             let content_bytes = content.to_bytes();
             let content_digest = crate::vault::content_kind_digest(&content_bytes);
+            let attachment_id = match &content {
+                Kind::Attachment(pointer) => pointer.id.clone(),
+                _ => vec![],
+            };
             let record = OutgoingRecord::unsealed(content_bytes);
             contact.state.last_activity = now();
             contact.state.outbox.push(Outgoing {
@@ -2479,6 +2675,7 @@ impl<V: VaultStore> Inner<V> {
                 awaits_upload,
                 content_digest,
                 dispatched: false,
+                attachment_id,
             });
             let entry = HistoryEntry {
                 outgoing: true,

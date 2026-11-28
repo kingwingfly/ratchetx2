@@ -1308,10 +1308,11 @@ impl<V: VaultStore> Engine<V> {
                         && !self.queue.is_confirmed_probe_backed_off(&peer)
                         && let Some(req) = contact.session.pending_initial_request()
                         && (req.message.as_ref().is_some_and(|m| m.version >= 2)
-                            || (!inner.client.pq_config().strict_pq
-                                && !contact.session.peer_pq_state().pq_pinned
-                                && (!inner.local_pq_enabled()
-                                    || contact.session.peer_pq_state().allow_classical_exception)))
+                            || !super::classical_policy_blocked(
+                                inner.client.pq_config().strict_pq,
+                                inner.local_pq_enabled(),
+                                contact.session.peer_pq_state(),
+                            ))
                     {
                         GreetingRetryAction::Send {
                             server: inner.server.clone(),
@@ -1345,11 +1346,12 @@ impl<V: VaultStore> Engine<V> {
                     let req_is_pq = req.message.as_ref().is_some_and(|m| m.version >= 2);
                     let strict_pq = inner.client.pq_config().strict_pq;
                     let local_pq = inner.local_pq_enabled();
-                    let allow_classical_exc =
-                        contact.session.peer_pq_state().allow_classical_exception;
-                    let pq_pinned = contact.session.peer_pq_state().pq_pinned;
                     let blocked_by_pq_policy = !req_is_pq
-                        && (strict_pq || pq_pinned || (local_pq && !allow_classical_exc));
+                        && super::classical_policy_blocked(
+                            strict_pq,
+                            local_pq,
+                            contact.session.peer_pq_state(),
+                        );
                     if blocked_by_pq_policy {
                         // R13-P1-2: Never first transmit or retry a classical greeting once
                         // `strict_pq` (or local PQ without a classical exception) is enabled.
@@ -1518,12 +1520,11 @@ impl<V: VaultStore> Engine<V> {
                                     && !c.session.is_known_by_peer()
                                     && !c.session.has_pending_active_grant()
                                     && (outgoing_is_pq_check
-                                        || (!strict_pq
-                                            && !c.session.peer_pq_state().pq_pinned
-                                            && (!local_pq
-                                                || c.session
-                                                    .peer_pq_state()
-                                                    .allow_classical_exception)))
+                                        || !super::classical_policy_blocked(
+                                            strict_pq,
+                                            local_pq,
+                                            c.session.peer_pq_state(),
+                                        ))
                                     && confirmed_greeting_probe_eligible(&c.state, now())
                             })
                     })

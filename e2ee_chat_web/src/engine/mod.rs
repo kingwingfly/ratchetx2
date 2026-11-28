@@ -97,6 +97,9 @@ pub enum StartChatError {
     SignInRequired,
     /// The peer's verified manifest explicitly disabled PQ encryption.
     ClassicalApprovalRequired,
+    /// The server/relay reported PQ encryption disabled (without asserting anything about the
+    /// peer's signed manifest, `R14-P2-8`).
+    ServerPqDisabledApprovalRequired,
     /// An existing unpinned classical chat request requires explicit classical approval before
     /// accepting under current local PQ settings (without asserting anything about the peer's
     /// current manifest, `R13-P2-6`).
@@ -119,6 +122,41 @@ pub const MEDIA_INLINE_MAX: u64 = 8 << 20;
 /// The largest file to send: as many chunks as the server takes, unless it says otherwise.
 pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_CHUNKS as usize * CHUNK_SIZE;
 pub use crate::util::{NAME_MAX, sanitize_shared_name};
+
+/// Whether current local policy forbids transmitting or accepting a classical X3DH session
+/// (`R14-P1-1`, `R14-P1-2`), matching `session/src/pq.rs`. When `!local_pq && !strict_pq`,
+/// `peer_pq.pq_pinned` is a TOFU capability record learned from the peer's manifest while
+/// classical negotiation remains allowed.
+pub(super) fn classical_policy_blocked(
+    strict_pq: bool,
+    local_pq: bool,
+    peer_pq: &session::PeerPqState,
+) -> bool {
+    strict_pq || (local_pq && (peer_pq.pq_pinned || !peer_pq.allow_classical_exception))
+}
+
+/// Whether archived classical sessions in `contact.session.others` may be retained and have
+/// relay write tokens registered (`R13-P1-1`, `R14-P1-1`). Always `false` once an active PQ
+/// session exists, `strict_pq` is enabled, or an explicit `pin_pq` invitation is being applied.
+pub(super) fn allow_earlier_classical_sessions(
+    strict_pq: bool,
+    local_pq: bool,
+    active_is_pq: bool,
+    peer_pq: &session::PeerPqState,
+    explicit_pin_pq: bool,
+    explicit_allow_classical: bool,
+) -> bool {
+    if strict_pq || explicit_pin_pq || active_is_pq {
+        return false;
+    }
+    if !local_pq {
+        return true;
+    }
+    if peer_pq.pq_pinned {
+        return false;
+    }
+    explicit_allow_classical || peer_pq.allow_classical_exception
+}
 
 /// `name`, trimmed, unless it is longer than [`NAME_MAX`].
 fn checked_name(name: &str) -> Result<String, String> {
@@ -1418,7 +1456,7 @@ impl Engine<Vault> {
     async fn unlocked(
         self: &Rc<Self>,
         vgen: u64,
-        inner: Inner,
+        mut inner: Inner,
         cancel: Option<&KdfCancelToken>,
     ) -> bool {
         let cancelled = || cancel.is_some_and(KdfCancelToken::is_cancelled);
@@ -1507,6 +1545,94 @@ impl Engine<Vault> {
                         "choose the file again, then sign in to the server"
                     };
                     self.show_upload(&peer, &pending, UploadState::Paused(reason.to_string()));
+                }
+                // R14-P2-3: Recover orphaned checkpoints whose separate `PendingUpload` record was
+                // missing or corrupt from `vault.uploads(None)` so a 0-chunk or waiting orphan
+                // never permanently wedges `Engine::flush` with no UI card to resume or cancel.
+                let present_uploads: HashSet<(PublicKey, [u8; 16])> = self
+                    .ui
+                    .uploads
+                    .get_untracked()
+                    .into_iter()
+                    .map(|u| (u.peer, u.id))
+                    .collect();
+                let mut orphaned_to_clean = Vec::new();
+                for cp in inner.vault.tracked_upload_checkpoints(None) {
+                    let Ok(cp_peer) = PublicKey::try_from(cp.peer.as_slice()) else {
+                        continue;
+                    };
+                    let Ok(cp_id) = <[u8; 16]>::try_from(cp.id.as_slice()) else {
+                        continue;
+                    };
+                    if present_uploads.contains(&(cp_peer, cp_id)) {
+                        continue;
+                    }
+                    // Double-check whether the record actually decodes (e.g. skipped above only
+                    // if already forgotten, which removes the checkpoint too).
+                    if matches!(inner.vault.upload(&cp_peer, &cp_id).await, Ok(Some(_))) {
+                        continue;
+                    }
+                    if !self.is_live(vgen) {
+                        return false;
+                    }
+                    if cancelled() {
+                        drop(inner);
+                        self.abort_cancelled_unlock(vgen).await;
+                        return false;
+                    }
+                    orphaned_to_clean.push((cp_peer, cp_id, cp));
+                }
+                for (cp_peer, cp_id, cp) in orphaned_to_clean {
+                    if !self.is_live(vgen) {
+                        return false;
+                    }
+                    if cancelled() {
+                        drop(inner);
+                        self.abort_cancelled_unlock(vgen).await;
+                        return false;
+                    }
+                    let mut outbox_match = inner.contact(&cp_peer).and_then(|c| {
+                        c.state
+                            .outbox
+                            .iter()
+                            .find(|o| {
+                                o.attachment_id.as_slice() == cp_id.as_slice()
+                                    || (cp.history_index > 0 && o.history_index == cp.history_index)
+                            })
+                            .map(|o| (o.history_index, o.dispatched, o.awaits_upload))
+                    });
+                    if outbox_match.is_none()
+                        && let Ok(Some((idx, entry))) =
+                            inner.find_attachment_entry(&cp_peer, None, &cp_id).await
+                        && entry.outgoing
+                    {
+                        if !self.is_live(vgen) {
+                            return false;
+                        }
+                        outbox_match = inner.contact(&cp_peer).and_then(|c| {
+                            c.state
+                                .outbox
+                                .iter()
+                                .find(|o| o.history_index == idx)
+                                .map(|o| (o.history_index, o.dispatched, o.awaits_upload))
+                        });
+                    }
+                    if let Some((idx, dispatched, awaits_upload)) = outbox_match
+                        && !dispatched
+                        && (awaits_upload
+                            || (cp.uploaded == 0
+                                && matches!(
+                                    cp.upload_state,
+                                    crate::vault::UPLOAD_STATE_STARTED
+                                        | crate::vault::UPLOAD_STATE_ANNOUNCED
+                                )))
+                    {
+                        let _ = self.fail_waiting(&mut inner, &cp_peer, idx).await;
+                        if !self.is_live(vgen) {
+                            return false;
+                        }
+                    }
+                    let _ = inner.vault.forget_upload(&cp_peer, &cp_id).await;
                 }
             }
             Err(e) if self.is_live(vgen) && !cancelled() => self.ui.notify(describe(&e)),
@@ -2155,15 +2281,18 @@ impl<V: VaultStore> Engine<V> {
                                 );
                             }
                         }
-                        // R13-P1-1: If accepting a PQ request under `strict_pq` or without an
-                        // explicit classical exception while local PQ is enabled, drop any
-                        // archived unapproved classical sessions from `others` BEFORE collecting
-                        // write-token hashes so they can neither be registered on the relay nor
-                        // decrypt classical follow-ups.
-                        let allow_earlier_classical = !strict_pq
-                            && !contact.session.peer_pq_state().pq_pinned
-                            && (!local_pq_enabled
-                                || contact.session.peer_pq_state().allow_classical_exception);
+                        // R13-P1-1 + R14-P1-1: If accepting a PQ request (or under `strict_pq` /
+                        // local PQ without a classical exception), drop any archived unapproved
+                        // classical sessions from `others` BEFORE collecting write-token hashes.
+                        let active_is_pq = contact.session.security().is_some_and(|s| s.is_pq);
+                        let allow_earlier_classical = allow_earlier_classical_sessions(
+                            strict_pq,
+                            local_pq_enabled,
+                            active_is_pq,
+                            contact.session.peer_pq_state(),
+                            false,
+                            false,
+                        );
                         if !allow_earlier_classical {
                             contact.session.prune_classical_earlier();
                         }
@@ -2650,6 +2779,10 @@ pub(crate) trait VaultStore: 'static {
         peer: Option<&PublicKey>,
     ) -> crate::vault::Result<Vec<(PublicKey, PendingUpload)>>;
     fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]>;
+    fn tracked_upload_checkpoints(
+        &self,
+        peer: Option<&PublicKey>,
+    ) -> Vec<crate::vault::UploadCheckpoint>;
     async fn forget<'a>(
         &self,
         state: &AppState,
@@ -2760,6 +2893,12 @@ impl VaultStore for Vault {
     }
     fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
         Vault::unuploaded_started_upload_ids(self, peer)
+    }
+    fn tracked_upload_checkpoints(
+        &self,
+        peer: Option<&PublicKey>,
+    ) -> Vec<crate::vault::UploadCheckpoint> {
+        Vault::tracked_upload_checkpoints(self, peer)
     }
     async fn forget<'a>(
         &self,
@@ -2923,7 +3062,7 @@ impl<V: VaultStore> Inner<V> {
         vault: V,
         server: String,
         audience: String,
-        state: AppState,
+        mut state: AppState,
         client: Client<Connect>,
         contacts: Vec<Contact>,
         mut isolated_contacts: Vec<ContactState>,
@@ -2956,6 +3095,12 @@ impl<V: VaultStore> Inner<V> {
                         .map(|suite| (suite, entry.until))
                 })
                 .collect();
+        if classical_fallback_probe_pending {
+            state.used_one_time_prekeys = state.used_one_time_prekeys.max(REFILL_USED);
+        }
+        if !pq_fallback_probe_pending.is_empty() {
+            state.used_pq_one_time_prekeys = state.used_pq_one_time_prekeys.max(REFILL_USED);
+        }
         let mut used_pq_by_suite = std::collections::BTreeMap::new();
         for &suite in &pq_fallback_probe_pending {
             used_pq_by_suite.insert(suite, REFILL_USED);
@@ -3178,6 +3323,25 @@ impl<V: VaultStore> Inner<V> {
 
     /// Stage a durable `RegisterWriteToken` grant on `peer`'s session using the next monotonic
     /// identity-wide `grant_version`.
+    pub(super) fn stage_write_token_revoke(&mut self, peer: &PublicKey) {
+        let peer_slot_id = self.client.peer_slot_id(peer);
+        if let Ok(min_grant_version) = self.client.allocate_grant_version() {
+            if let Some(existing) = self
+                .state
+                .pending_revokes
+                .iter_mut()
+                .find(|r| r.peer_slot_id.as_slice() == peer_slot_id.as_slice())
+            {
+                existing.min_grant_version = existing.min_grant_version.max(min_grant_version);
+            } else {
+                self.state.pending_revokes.push(PendingRevoke {
+                    peer_slot_id: peer_slot_id.to_vec(),
+                    min_grant_version,
+                });
+            }
+        }
+    }
+
     pub(super) fn stage_write_token_grant(
         &mut self,
         peer: &PublicKey,

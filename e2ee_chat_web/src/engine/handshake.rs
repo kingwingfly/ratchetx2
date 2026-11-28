@@ -586,18 +586,30 @@ pub(super) fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
         .filter(|d| preserve_digests.contains(d))
         .count();
     let mut pinned_confirmed_per_spk: BTreeMap<PublicKey, usize> = BTreeMap::new();
+    // R14-P2-6: Account for the newly committed/landed digest (`recent.last()`) in its retained
+    // SPK's per-SPK quota before pinning older candidates so an SPK with 16 existing digests plus
+    // a newly landed digest cannot retain 17 entries and starve another retained SPK's sole digest.
+    if let Some(last_digest) = recent.last()
+        && let Some(spk) = inner.client.confirmed_digest_retained_spk(last_digest)
+    {
+        *pinned_confirmed_per_spk.entry(spk).or_insert(0) += 1;
+    }
     for digest in preserve_digests.iter() {
         if let Some(spk) = inner.client.confirmed_digest_retained_spk(digest) {
             *pinned_confirmed_per_spk.entry(spk).or_insert(0) += 1;
         }
     }
     let confirmed = inner.client.confirmed_manifest_digests();
-    // R10-P2-2 + R13-P2-3: Protect up to `MAX_RECENT_MANIFEST_DIGESTS` (16) newest confirmed
-    // digests for EVERY retained SPK first (Tier 0) so surplus digests on an over-represented
-    // SPK can never crowd out another retained SPK's sole confirmed digest, then surplus confirmed
-    // retained-SPK digests (Tier 1), confirmed rolling digests (Tier 2), unconfirmed retained-SPK
-    // digests (Tier 3), and remaining unconfirmed digests (Tier 4).
-    for tier in 0..5u8 {
+    // R10-P2-2 + R13-P2-3 + R14-P2-6:
+    // - Tier 0: Guarantee at least 1 newest confirmed digest for EVERY retained SPK first (even
+    //   when 128 deferred digests leave only 15 free candidate pin slots).
+    // - Tier 1: Fill up to `MAX_RECENT_MANIFEST_DIGESTS` (16) confirmed digests per retained SPK
+    //   (inclusive of `recent.last()` and deferred pins).
+    // - Tier 2: Surplus confirmed retained-SPK digests.
+    // - Tier 3: Confirmed rolling digests.
+    // - Tier 4: Unconfirmed retained-SPK digests.
+    // - Tier 5: Remaining unconfirmed digests.
+    for tier in 0..6u8 {
         for &digest in candidates.iter().rev() {
             if pinned_candidates >= max_candidate_pins {
                 return;
@@ -608,12 +620,15 @@ pub(super) fn preserve_undrained_inbox_prekeys_for_commit<V: VaultStore>(
             let confirmed_spk = inner.client.confirmed_digest_retained_spk(&digest);
             let matches = match tier {
                 0 => confirmed_spk.is_some_and(|spk| {
+                    pinned_confirmed_per_spk.get(&spk).copied().unwrap_or(0) == 0
+                }),
+                1 => confirmed_spk.is_some_and(|spk| {
                     pinned_confirmed_per_spk.get(&spk).copied().unwrap_or(0)
                         < session::MAX_RECENT_MANIFEST_DIGESTS
                 }),
-                1 => confirmed_spk.is_some(),
-                2 => confirmed.contains(&digest),
-                3 => inner.client.is_unconfirmed_digest_for_retained_spk(&digest),
+                2 => confirmed_spk.is_some(),
+                3 => confirmed.contains(&digest),
+                4 => inner.client.is_unconfirmed_digest_for_retained_spk(&digest),
                 _ => true,
             };
             if !matches {
@@ -2906,10 +2921,23 @@ impl<V: VaultStore> Engine<V> {
         // consumption deltas, and reset `used_*` to those reconciled concurrent deltas so each
         // claim is deducted once and never twice (`R7-P3-1`, `R8-P2-8`, `R10-P2-5`), retaining
         // per-suite counts (`R7-P2-5`).
+        // R14-P2-4: Preserve the `REFILL_USED` floor for any fallback probe still pending after a
+        // partial/single-pool refill so reload does not strand a persisted probe with `used_* == 0`.
+        let final_classical_used = if inner.classical_fallback_probe_pending {
+            concurrent_classical.max(REFILL_USED)
+        } else {
+            concurrent_classical
+        };
+        let mut final_pq_used = concurrent_pq;
+        for &suite in &inner.pq_fallback_probe_pending {
+            let entry = next_used_pq_by_suite.entry(suite).or_insert(0);
+            *entry = (*entry).max(REFILL_USED);
+            final_pq_used = final_pq_used.max(REFILL_USED);
+        }
         inner.last_server_classical_opks = Some(response.classical_one_time_count);
         inner.last_server_pq_opks_by_suite = Some(server_pq_map);
-        inner.state.used_one_time_prekeys = concurrent_classical;
-        inner.state.used_pq_one_time_prekeys = concurrent_pq;
+        inner.state.used_one_time_prekeys = final_classical_used;
+        inner.state.used_pq_one_time_prekeys = final_pq_used;
         inner.used_pq_by_suite = next_used_pq_by_suite;
         if sent_pq {
             // R8-P2-10: Mirror `publish_full_locked_gated` — a successful PQ refill proves the
@@ -2985,7 +3013,7 @@ impl<V: VaultStore> Engine<V> {
             inner.last_server_classical_opks,
             inner.last_server_pq_opks_by_suite.as_ref(),
         );
-        let classical_count = raw_classical.min(classical_headroom);
+        let mut classical_count = raw_classical.min(classical_headroom);
         let mut pq_counts = Vec::with_capacity(raw_pq_per_suite.len());
         for &(suite, raw_count) in &raw_pq_per_suite {
             let take = raw_count.min(pq_headroom);
@@ -2993,6 +3021,27 @@ impl<V: VaultStore> Engine<V> {
                 pq_counts.push((suite, take));
                 pq_headroom = pq_headroom.saturating_sub(take);
             }
+        }
+        // R14-P2-5: Do not silently discard a pending fallback probe solely because a stale
+        // full-pool baseline estimates zero relay headroom (e.g. a remote claim consumed another
+        // suite's key before its greeting arrived). Issue a bounded 1-key probe to the relay first
+        // so either a free slot is used + counts refresh, or `LimitExceeded` proves the cap full
+        // and applies the 1-hour cooldown.
+        if classical_count == 0 && inner.classical_fallback_probe_pending && classical_headroom > 0
+        {
+            classical_count = 1;
+        }
+        if pq_counts.is_empty()
+            && pq_headroom > 0
+            && let Some(&probe_suite) = offered_suites.iter().find(|suite| {
+                inner.pq_fallback_probe_pending.contains(suite)
+                    && inner
+                        .last_server_pq_opks_by_suite
+                        .as_ref()
+                        .is_none_or(|m| m.get(suite).copied().unwrap_or(0) == 0)
+            })
+        {
+            pq_counts.push((probe_suite, 1));
         }
         // If server is already at its 100-key cap, reset counters so sync doesn't loop.
         if classical_count == 0 && pq_counts.is_empty() {
@@ -3308,6 +3357,9 @@ impl<V: VaultStore> Engine<V> {
             ErrorKind::SignInRequired => {
                 StartChatError::Other(format!("sign-in required: {NOT_SIGNED_IN_HERE}"))
             }
+            ErrorKind::ClassicalApprovalRequired if error.is_server_pq_disabled_approval() => {
+                StartChatError::ServerPqDisabledApprovalRequired
+            }
             ErrorKind::ClassicalApprovalRequired => StartChatError::ClassicalApprovalRequired,
             ErrorKind::DowngradeDetected => StartChatError::DowngradeDetected,
             ErrorKind::PeerManifestExpired => StartChatError::PeerManifestExpired,
@@ -3527,11 +3579,19 @@ impl<V: VaultStore> Engine<V> {
                     // `strict_pq` or without a classical exception while local PQ is enabled.
                     let strict_pq = inner.client.pq_config().strict_pq;
                     let local_pq = inner.local_pq_enabled();
+                    let active_is_pq = inner.contacts[index]
+                        .session
+                        .security()
+                        .is_some_and(|s| s.is_pq);
                     let pps = inner.contacts[index].session.peer_pq_state();
-                    let allow_earlier_classical = !strict_pq
-                        && !pin_pq
-                        && !pps.pq_pinned
-                        && (!local_pq || allow_classical || pps.allow_classical_exception);
+                    let allow_earlier_classical = super::allow_earlier_classical_sessions(
+                        strict_pq,
+                        local_pq,
+                        active_is_pq,
+                        pps,
+                        pin_pq,
+                        allow_classical,
+                    );
                     let active_token = inner.contacts[index].session.active_inbound_token_hash();
                     let earlier_tokens: Vec<[u8; 32]> = inner.contacts[index]
                         .session
@@ -3848,9 +3908,10 @@ impl<V: VaultStore> Engine<V> {
             let resumed_provisional = was_provisional && !was_request && !quarantined;
             let mut phase_b_extra_grants = false;
             let mut revoke_staged = false;
+            let prev_pending_revokes = inner.state.pending_revokes.clone();
             let strict_pq_b = inner.client.pq_config().strict_pq;
             let local_pq_b = inner.local_pq_enabled();
-            let extra_tokens: (Option<[u8; 32]>, Vec<[u8; 32]>) = {
+            let (extra_tokens, revoke_for_pruned) = {
                 let contact = &mut inner.contacts[index];
                 if pin_pq {
                     contact.session.pin_peer_pq();
@@ -3867,14 +3928,29 @@ impl<V: VaultStore> Engine<V> {
                         .approve_classical_exception();
                     contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
                 }
-                // R13-P1-1: Drop archived unapproved classical earlier sessions before accepting a
-                // PQ request so they can neither be authorized on the relay nor decrypt follow-ups.
-                let allow_earlier_classical = !strict_pq_b
-                    && !contact.session.peer_pq_state().pq_pinned
-                    && (!local_pq_b || contact.session.peer_pq_state().allow_classical_exception);
-                if accepted_now && !allow_earlier_classical {
-                    contact.session.prune_classical_earlier();
-                }
+                // R13-P1-1 + R14-P1-1 + R14-P1-4: Drop archived unapproved classical earlier
+                // sessions before accepting or resuming a PQ contact. If any pruned classical
+                // token was already registered on the relay during Phase A (`staged_tokens`) or a
+                // prior provisional start, revoke the peer slot and restage all retained tokens at
+                // strictly higher grant versions.
+                let active_is_pq = contact.session.security().is_some_and(|s| s.is_pq);
+                let allow_earlier_classical = super::allow_earlier_classical_sessions(
+                    strict_pq_b,
+                    local_pq_b,
+                    active_is_pq,
+                    contact.session.peer_pq_state(),
+                    false,
+                    false,
+                );
+                let pruned_classical =
+                    if (accepted_now || resumed_provisional) && !allow_earlier_classical {
+                        contact.session.prune_classical_earlier()
+                    } else {
+                        vec![]
+                    };
+                let revoke_pruned = !pruned_classical.is_empty()
+                    && (resumed_provisional
+                        || pruned_classical.iter().any(|h| staged_tokens.contains(h)));
                 let tokens = if accepted_now {
                     contact.state.request = false;
                     contact.state.provisional = false;
@@ -3883,12 +3959,27 @@ impl<V: VaultStore> Engine<V> {
                     let earlier: Vec<[u8; 32]> = contact
                         .session
                         .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
-                        .filter(|h| Some(*h) != active && !staged_tokens.contains(h))
+                        .filter(|h| {
+                            Some(*h) != active && (revoke_pruned || !staged_tokens.contains(h))
+                        })
                         .collect();
-                    (active.filter(|t| !staged_tokens.contains(t)), earlier)
+                    (
+                        active.filter(|t| revoke_pruned || !staged_tokens.contains(t)),
+                        earlier,
+                    )
                 } else if resumed_provisional {
                     contact.state.provisional = false;
-                    (None, vec![])
+                    if revoke_pruned {
+                        let active = contact.session.active_inbound_token_hash();
+                        let earlier: Vec<[u8; 32]> = contact
+                            .session
+                            .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
+                            .filter(|h| Some(*h) != active)
+                            .collect();
+                        (active, earlier)
+                    } else {
+                        (None, vec![])
+                    }
                 } else if flushed_grants || marked_provisional_for_accept {
                     // R10-P1-1: Contact became quarantined during Phase A (or is no longer
                     // eligible for acceptance): clear our temporary provisional flag, drop any
@@ -3904,9 +3995,13 @@ impl<V: VaultStore> Engine<V> {
                 if !name.is_empty() {
                     contact.state.name = name;
                 }
-                tokens
+                (tokens, revoke_pruned)
             };
-            if accepted_now {
+            if revoke_for_pruned {
+                stage_revoke(inner);
+                revoke_staged = true;
+            }
+            if accepted_now || (resumed_provisional && revoke_for_pruned) {
                 if let Some(token_hash) = extra_tokens.0
                     && inner
                         .stage_write_token_grant(&peer, token_hash, true)
@@ -3927,6 +4022,7 @@ impl<V: VaultStore> Engine<V> {
                 revoke_staged = true;
             }
             if let Err(e) = inner.save(&[]).await {
+                inner.state.pending_revokes = prev_pending_revokes;
                 let _ = inner.roll_back(&peer, snapshot);
                 if !self.is_live(vgen) {
                     return Err(StartChatError::Cancelled);
@@ -4527,12 +4623,23 @@ impl<V: VaultStore> Engine<V> {
                     {
                         c.state.provisional = false;
                         let can_stage = !c.state.request && !c.state.quarantined;
-                        let allow_earlier_classical = !strict_pq_now
-                            && (!local_pq_now
-                                || c.session.peer_pq_state().allow_classical_exception);
-                        if can_stage && !allow_earlier_classical {
-                            c.session.prune_classical_earlier();
-                        }
+                        let active_is_pq = c.session.security().is_some_and(|s| s.is_pq);
+                        let allow_earlier_classical = super::allow_earlier_classical_sessions(
+                            strict_pq_now,
+                            local_pq_now,
+                            active_is_pq,
+                            c.session.peer_pq_state(),
+                            pin_pq,
+                            allow_classical,
+                        );
+                        let pruned_classical = if can_stage && !allow_earlier_classical {
+                            c.session.prune_classical_earlier()
+                        } else {
+                            vec![]
+                        };
+                        let revoke_pruned = can_stage
+                            && created_inbound_token_hash
+                                .is_some_and(|h| pruned_classical.contains(&h));
                         let winning_token = can_stage
                             .then(|| c.session.active_inbound_token_hash())
                             .flatten();
@@ -4541,12 +4648,16 @@ impl<V: VaultStore> Engine<V> {
                                 .earlier_inbound_token_hashes_for_policy(allow_earlier_classical)
                                 .filter(|h| {
                                     Some(*h) != winning_token
-                                        && Some(*h) != created_inbound_token_hash
+                                        && (revoke_pruned || Some(*h) != created_inbound_token_hash)
                                 })
                                 .collect()
                         } else {
                             vec![]
                         };
+                        if revoke_pruned {
+                            inner.stage_write_token_revoke(&peer);
+                            flush_winning_grant = true;
+                        }
                         if let Some(token_hash) = winning_token
                             && inner
                                 .stage_write_token_grant(&peer, token_hash, true)
@@ -4638,15 +4749,21 @@ impl<V: VaultStore> Engine<V> {
                 // archived sessions now that we are finalizing the contact (`R13-P1-1`).
                 let strict_pq_now = inner.client.pq_config().strict_pq;
                 let local_pq_now = inner.local_pq_enabled();
-                let pq_pinned_now = contact.session.peer_pq_state().pq_pinned;
-                let allow_earlier_classical = !strict_pq_now
-                    && !pq_pinned_now
-                    && (!local_pq_now || contact.session.peer_pq_state().allow_classical_exception);
+                let active_is_pq = contact.session.security().is_some_and(|s| s.is_pq);
+                let allow_earlier_classical = super::allow_earlier_classical_sessions(
+                    strict_pq_now,
+                    local_pq_now,
+                    active_is_pq,
+                    contact.session.peer_pq_state(),
+                    pin_pq,
+                    allow_classical,
+                );
                 let classical_policy_blocked = contact.is_classical_session()
-                    && (strict_pq_now
-                        || pq_pinned_now
-                        || (local_pq_now
-                            && !contact.session.peer_pq_state().allow_classical_exception));
+                    && super::classical_policy_blocked(
+                        strict_pq_now,
+                        local_pq_now,
+                        contact.session.peer_pq_state(),
+                    );
                 let archived_crossed_tokens: Vec<[u8; 32]> = if contact.state.provisional
                     && !contact.state.request
                     && !contact.state.quarantined
@@ -4838,26 +4955,39 @@ impl<V: VaultStore> Engine<V> {
                 return Err(StartChatError::Cancelled);
             }
             if let Some(inner) = guard.as_mut() {
+                let outgoing_is_pq = outgoing_request
+                    .message
+                    .as_ref()
+                    .is_some_and(|m| m.version >= 2);
+                let strict_pq_now = inner.client.pq_config().strict_pq;
+                let local_pq_now = inner.local_pq_enabled();
                 let state_check = inner
                     .contacts
                     .iter()
                     .find(|c| c.peer == peer && c.state.conversation_gen == created_conv_gen)
                     .map(|c| {
+                        let policy_blocked = !outgoing_is_pq
+                            && super::classical_policy_blocked(
+                                strict_pq_now,
+                                local_pq_now,
+                                c.session.peer_pq_state(),
+                            );
                         (
                             c.session.active_id() == created_session_id.as_ref(),
-                            !c.state.request && !c.state.quarantined,
+                            !c.state.request && !c.state.quarantined && !policy_blocked,
+                            policy_blocked,
                         )
                     });
                 match state_check {
-                    Some((true, true)) => {}
+                    Some((true, true, _)) => {}
                     None => {
                         self.startup.end_new_chat_submit(submission_id);
                         return Err(StartChatError::Cancelled);
                     }
-                    Some((matches_active, _)) => {
+                    Some((matches_active, _, policy_blocked)) => {
                         // A newer inbound peer session won the tie-break (or quarantined/converted
-                        // the contact) while `flush_extra_grants` awaited: do NOT dispatch the
-                        // superseded/blocked `SendInitialV2`.
+                        // or PQ-policy-blocked the contact) while `flush_extra_grants` awaited: do
+                        // NOT dispatch the superseded/blocked `SendInitialV2`.
                         let mut needs_save = false;
                         if let Some(c) = inner.contact(&peer) {
                             if !matches_active
@@ -4867,12 +4997,19 @@ impl<V: VaultStore> Engine<V> {
                                 c.state.greeting_sent_at = 0;
                                 c.state.awaiting_peer_acceptance = false;
                                 needs_save = true;
-                            } else if matches_active
-                                && c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN
-                            {
-                                c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
-                                c.state.greeting_sent_at = 0;
-                                needs_save = true;
+                            } else if matches_active {
+                                if c.state.greeting_delivery == GREETING_DELIVERY_UNCERTAIN {
+                                    c.state.greeting_delivery = GREETING_DELIVERY_UNSENT;
+                                    c.state.greeting_sent_at = 0;
+                                    needs_save = true;
+                                }
+                                if policy_blocked
+                                    && strict_pq_now
+                                    && c.state.security_alert != SECURITY_ALERT_PQ_REQUIRED
+                                {
+                                    c.state.security_alert = SECURITY_ALERT_PQ_REQUIRED;
+                                    needs_save = true;
+                                }
                             }
                         }
                         if needs_save {
@@ -5504,7 +5641,8 @@ pub(super) fn refill_batch_counts_per_suite(
             }
         }
         None => {
-            if used_pq_total >= REFILL_USED {
+            if used_pq_total >= REFILL_USED || used_pq_by_suite.values().any(|&v| v >= REFILL_USED)
+            {
                 let mut remaining_budget = (REFILL_USED as usize).max(1);
                 if tracked_used_sum > 0 {
                     for (idx, &suite) in offered_suites.iter().enumerate() {

@@ -194,6 +194,7 @@ pub(super) fn VaultDialog() -> impl IntoView {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClassicalApprovalReason {
     PeerSignedOff,
+    ServerPqDisabled,
     ExistingRequest,
 }
 
@@ -209,6 +210,10 @@ fn apply_start_chat_error(
             progress.try_fail(
                 "This peer published a signed manifest disabling post-quantum encryption.",
             );
+        }
+        StartChatError::ServerPqDisabledApprovalRequired => {
+            let _ = classical_needed.try_set(Some(ClassicalApprovalReason::ServerPqDisabled));
+            progress.try_fail("This server currently has post-quantum encryption disabled.");
         }
         StartChatError::ExistingClassicalRequestApprovalRequired => {
             let _ = classical_needed.try_set(Some(ClassicalApprovalReason::ExistingRequest));
@@ -508,6 +513,9 @@ fn NewChat(key: String, name: String, server: Option<String>, pq_pinned: bool) -
                                     match reason {
                                         ClassicalApprovalReason::PeerSignedOff => {
                                             "The peer explicitly turned post-quantum encryption off. Only allow classical encryption if you expect that."
+                                        }
+                                        ClassicalApprovalReason::ServerPqDisabled => {
+                                            "This server currently has post-quantum encryption disabled. Only allow classical encryption if you expect that."
                                         }
                                         ClassicalApprovalReason::ExistingRequest => {
                                             "This pending chat request was received without post-quantum encryption. Allow classical encryption to accept it, or open the request to upgrade to post-quantum encryption."

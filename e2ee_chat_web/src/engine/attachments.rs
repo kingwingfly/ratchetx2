@@ -899,6 +899,7 @@ impl<V: VaultStore> Engine<V> {
                     if outgoing.history_index == kept.history_index {
                         outgoing.awaits_upload = false;
                         outgoing.content_digest = content_digest.clone();
+                        outgoing.attachment_id = pending.id.clone();
                     }
                 }
                 inner
@@ -1191,8 +1192,10 @@ impl<V: VaultStore> Engine<V> {
                     pending.upload_state = UPLOAD_STATE_ANNOUNCED;
                     pending.history_index = index;
                     if let Err(e) = inner.vault.save_upload(peer, &pending).await {
-                        self.show_new(inner, peer, vec![view]);
-                        self.refresh_contacts(inner);
+                        if self.is_live(vgen) {
+                            self.show_new(inner, peer, vec![view]);
+                            self.refresh_contacts(inner);
+                        }
                         return Err(AnnounceError::SaveAfterSend {
                             error: describe(&e),
                             pending: Box::new(pending),
@@ -1475,6 +1478,65 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(());
             }
             let Some(pending) = pending else {
+                // R14-P2-3: Even if the separate `PendingUpload` record is missing or corrupt,
+                // clean up any orphaned tracked upload checkpoint and its un-dispatched outbox
+                // head so subsequent messages to `peer` are never permanently wedged.
+                let orphan_cp = inner
+                    .vault
+                    .tracked_upload_checkpoints(Some(&peer))
+                    .into_iter()
+                    .find(|cp| cp.id.as_slice() == id.as_slice());
+                let Some(cp) = orphan_cp else {
+                    return Ok(());
+                };
+                let mut outbox_match = inner.contact(&peer).and_then(|c| {
+                    c.state
+                        .outbox
+                        .iter()
+                        .find(|o| {
+                            o.attachment_id.as_slice() == id.as_slice()
+                                || (cp.history_index > 0 && o.history_index == cp.history_index)
+                        })
+                        .map(|o| (o.history_index, o.dispatched))
+                });
+                if outbox_match.is_none()
+                    && let Ok(Some((idx, entry))) =
+                        inner.find_attachment_entry(&peer, None, &id).await
+                    && entry.outgoing
+                {
+                    if !self.is_live(vgen) {
+                        return Err("locked".into());
+                    }
+                    outbox_match = inner.contact(&peer).and_then(|c| {
+                        c.state
+                            .outbox
+                            .iter()
+                            .find(|o| o.history_index == idx)
+                            .map(|o| (o.history_index, o.dispatched))
+                    });
+                }
+                let mut should_flush = false;
+                if let Some((idx, dispatched)) = outbox_match {
+                    if !dispatched {
+                        self.fail_waiting(inner, &peer, idx).await?;
+                    }
+                    should_flush = true;
+                }
+                inner
+                    .vault
+                    .forget_upload(&peer, &id)
+                    .await
+                    .map_err(|e| describe(&e))?;
+                drop(guard);
+                drop(peer_guard);
+                if should_flush && self.is_live(vgen) {
+                    if let Err(e) = self.flush(&peer).await
+                        && self.is_live(vgen)
+                    {
+                        self.ui.link.set(Link::Offline(e));
+                    }
+                    self.wake();
+                }
                 return Ok(());
             };
             let upload = upload_of(&pending)?;
@@ -2044,22 +2106,34 @@ impl<V: VaultStore> Engine<V> {
                 return Err(e);
             }
         }
-        self.remove_attachment_caches(&peer, &id);
-        self.ui
-            .uploads
-            .update(|uploads| uploads.retain(|upload| upload.id != id));
         // Forgotten, with its upload token, which is no use now: deleting it takes its delete
         // token, which its key gives.
+        // R14-P2-1: Complete `forget_upload` BEFORE removing the local file handle and UI row so a
+        // concurrent `Engine::flush` on a `<= CHUNK_SIZE` (0-checkpoint-chunks) upload or a
+        // transient IndexedDB error never stalls or permanently wedges `peer`'s outbox.
         let guard = self.lock_inner().await;
         if !self.is_live(vgen) {
             return Ok(());
         }
         let inner = guard.as_ref().ok_or("locked")?;
-        inner
-            .vault
-            .forget_upload(&peer, &id)
-            .await
-            .map_err(|e| describe(&e))
+        if let Err(e) = inner.vault.forget_upload(&peer, &id).await {
+            let err = describe(&e);
+            if self.is_live(vgen) {
+                self.show_upload(&peer, &pending, UploadState::Paused(err.clone()));
+            }
+            return Err(err);
+        }
+        self.remove_attachment_caches(&peer, &id);
+        if self.is_live(vgen) {
+            self.ui
+                .uploads
+                .update(|uploads| uploads.retain(|upload| upload.id != id));
+        }
+        drop(guard);
+        if self.is_live(vgen) {
+            self.wake();
+        }
+        Ok(())
     }
 
     /// Stop the upload `id`, in the chat with `peer`, if this client uploads it, for good, as

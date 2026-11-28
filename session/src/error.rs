@@ -12,6 +12,7 @@ pub struct Error {
     source: Option<Box<dyn StdError + Send + Sync>>,
     server_refusal: bool,
     connect_error: bool,
+    server_pq_disabled_approval: bool,
 }
 
 impl Error {
@@ -21,6 +22,21 @@ impl Error {
             source: Some(source.into()),
             ..kind.into()
         }
+    }
+
+    /// Construct [`ErrorKind::ClassicalApprovalRequired`] specifically because the server reported
+    /// PQ disabled rather than because the peer's signed manifest disabled PQ (`R14-P2-8`).
+    pub(crate) fn server_pq_disabled_approval() -> Self {
+        Self {
+            server_pq_disabled_approval: true,
+            ..ErrorKind::ClassicalApprovalRequired.into()
+        }
+    }
+
+    /// Whether this [`ErrorKind::ClassicalApprovalRequired`] error resulted from the server
+    /// reporting PQ disabled (as opposed to the peer's signed manifest disabling PQ).
+    pub fn is_server_pq_disabled_approval(&self) -> bool {
+        self.server_pq_disabled_approval
     }
 
     /// The kind of this error.
@@ -76,6 +92,7 @@ impl From<ErrorKind> for Error {
             source: None,
             server_refusal: false,
             connect_error: false,
+            server_pq_disabled_approval: false,
         }
     }
 }

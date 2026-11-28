@@ -928,6 +928,8 @@ pub struct UploadCheckpoint {
     pub upload_state: u32,
     #[prost(uint64, tag = "8")]
     pub revision: u64,
+    #[prost(uint64, tag = "9")]
+    pub history_index: u64,
 }
 
 impl UploadCheckpoint {
@@ -941,6 +943,7 @@ impl UploadCheckpoint {
             sealed_chunk_hash: upload.sealed_chunk_hash.clone(),
             upload_state: upload.upload_state,
             revision,
+            history_index: upload.history_index,
         }
     }
 
@@ -952,6 +955,7 @@ impl UploadCheckpoint {
             && self.prefix_hash == upload.prefix_hash
             && self.sealed_chunk_hash == upload.sealed_chunk_hash
             && self.upload_state == upload.upload_state
+            && self.history_index == upload.history_index
     }
 }
 
@@ -1540,6 +1544,11 @@ pub struct Outgoing {
     /// duplicating delivery; cleared only on definitive relay non-delivery.
     #[prost(bool, tag = "8")]
     pub dispatched: bool,
+    /// Authenticated 16-byte attachment ID when this outbox entry announces an attachment pointer,
+    /// allowing `Engine::flush` and orphan-upload recovery to identify unuploaded 0-chunk
+    /// attachments even if the separate `HistoryEntry` record is missing (`R14-P2-2`, `R14-P2-3`).
+    #[prost(bytes = "vec", tag = "9")]
+    pub attachment_id: Vec<u8>,
 }
 
 /// What a message not pushed yet is: its content, encrypted just before it goes.
@@ -3007,6 +3016,18 @@ impl Vault {
                     None
                 }
             })
+            .collect()
+    }
+
+    /// Snapshot of all authenticated upload checkpoints tracked by the vault header (optionally
+    /// filtered to `peer`), enabling orphan-checkpoint recovery on unlock and cancel when a
+    /// separate `PendingUpload` record is missing or failed authentication (`R14-P2-3`).
+    pub fn tracked_upload_checkpoints(&self, peer: Option<&PublicKey>) -> Vec<UploadCheckpoint> {
+        self.upload_checkpoints
+            .borrow()
+            .iter()
+            .filter(|cp| peer.is_none_or(|p| cp.peer.as_slice() == p.as_slice()))
+            .cloned()
             .collect()
     }
 

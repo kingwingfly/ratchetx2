@@ -990,7 +990,7 @@ mod v2 {
                             return Err(ErrorKind::DowngradeDetected.into());
                         }
                         if !peer_state.allow_classical_exception {
-                            return Err(ErrorKind::ClassicalApprovalRequired.into());
+                            return Err(Error::server_pq_disabled_approval());
                         }
                         server_pq_disabled_fallback = true;
                         handshake
@@ -1097,7 +1097,7 @@ mod v2 {
                 return Err(ErrorKind::DowngradeDetected.into());
             }
             if local_pq_enabled && !peer_state.allow_classical_exception {
-                return Err(ErrorKind::ClassicalApprovalRequired.into());
+                return Err(Error::server_pq_disabled_approval());
             }
         }
 

@@ -432,6 +432,7 @@ struct MemoryVault {
     outbox: RefCell<HashMap<(PublicKey, u64), OutgoingRecord>>,
     chunks: RefCell<HashMap<MemoryChunkKey, Vec<u8>>>,
     uploads: RefCell<HashMap<(PublicKey, Vec<u8>), PendingUpload>>,
+    orphan_checkpoints: RefCell<Vec<crate::vault::UploadCheckpoint>>,
     fail_read_at: Cell<Option<u64>>,
     corrupt_read_at: Cell<Option<u64>>,
     fail_history: Cell<bool>,
@@ -443,6 +444,8 @@ struct MemoryVault {
     fail_forget: Cell<bool>,
     saved_manifest_seqs: std::rc::Rc<RefCell<Vec<u64>>>,
     save_count: std::rc::Rc<Cell<usize>>,
+    last_saved_dispatched: std::rc::Rc<Cell<bool>>,
+    fail_save_after_hook: std::rc::Rc<Cell<bool>>,
     on_save: RefCell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -530,6 +533,12 @@ impl VaultStore for MemoryVault {
                 .borrow_mut()
                 .push(client.manifest_seq);
         }
+        self.last_saved_dispatched.set(
+            state
+                .contacts
+                .iter()
+                .any(|c| c.outbox.first().is_some_and(|o| o.dispatched)),
+        );
         self.state.replace(state.clone());
         self.deferred.replace(deferred.clone());
         self.apply_entries(entries);
@@ -537,6 +546,9 @@ impl VaultStore for MemoryVault {
         let callback = self.on_save.borrow_mut().take();
         if let Some(mut callback) = callback {
             callback();
+            if self.fail_save_after_hook.take() {
+                self.fail_save.set(true);
+            }
         }
         Ok(())
     }
@@ -662,6 +674,12 @@ impl VaultStore for MemoryVault {
                 uploads.insert((*peer, new_upload.id.clone()), new_upload.clone());
             }
         }
+        self.last_saved_dispatched.set(
+            state
+                .contacts
+                .iter()
+                .any(|c| c.outbox.first().is_some_and(|o| o.dispatched)),
+        );
         self.state.replace(state.clone());
         self.deferred.replace(deferred.clone());
         self.apply_entries(entries);
@@ -669,6 +687,9 @@ impl VaultStore for MemoryVault {
         let callback = self.on_save.borrow_mut().take();
         if let Some(mut callback) = callback {
             callback();
+            if self.fail_save_after_hook.take() {
+                self.fail_save.set(true);
+            }
         }
         Ok(())
     }
@@ -678,6 +699,9 @@ impl VaultStore for MemoryVault {
             return Err(crate::vault::Error::Storage("forget_upload failed".into()));
         }
         self.uploads.borrow_mut().remove(&(*peer, id.to_vec()));
+        self.orphan_checkpoints
+            .borrow_mut()
+            .retain(|cp| cp.peer.as_slice() != peer.as_slice() || cp.id.as_slice() != id);
         Ok(())
     }
 
@@ -703,7 +727,8 @@ impl VaultStore for MemoryVault {
     }
 
     fn unuploaded_started_upload_ids(&self, peer: &PublicKey) -> Vec<[u8; 16]> {
-        self.uploads
+        let mut ids: Vec<[u8; 16]> = self
+            .uploads
             .borrow()
             .iter()
             .filter_map(|((p, _), upload)| {
@@ -713,7 +738,47 @@ impl VaultStore for MemoryVault {
                     None
                 }
             })
-            .collect()
+            .collect();
+        for cp in self.orphan_checkpoints.borrow().iter() {
+            if cp.peer.as_slice() == peer.as_slice()
+                && cp.uploaded == 0
+                && matches!(
+                    cp.upload_state,
+                    crate::vault::UPLOAD_STATE_STARTED | crate::vault::UPLOAD_STATE_ANNOUNCED
+                )
+                && let Ok(id) = <[u8; 16]>::try_from(cp.id.as_slice())
+                && !ids.contains(&id)
+            {
+                ids.push(id);
+            }
+        }
+        ids
+    }
+
+    fn tracked_upload_checkpoints(
+        &self,
+        peer: Option<&PublicKey>,
+    ) -> Vec<crate::vault::UploadCheckpoint> {
+        let mut cps: Vec<crate::vault::UploadCheckpoint> = self
+            .uploads
+            .borrow()
+            .iter()
+            .filter(|((p, _), _)| peer.is_none_or(|target| target == p))
+            .map(|((p, _), upload)| crate::vault::UploadCheckpoint {
+                peer: p.to_vec(),
+                id: upload.id.clone(),
+                upload_state: upload.upload_state,
+                uploaded: upload.uploaded,
+                history_index: upload.history_index,
+                ..Default::default()
+            })
+            .collect();
+        for cp in self.orphan_checkpoints.borrow().iter() {
+            if peer.is_none_or(|target| cp.peer.as_slice() == target.as_slice()) {
+                cps.push(cp.clone());
+            }
+        }
+        cps
     }
 
     async fn forget<'a>(
@@ -733,6 +798,15 @@ impl VaultStore for MemoryVault {
         self.outbox.borrow_mut().retain(|(p, _), _| p != peer);
         self.chunks.borrow_mut().retain(|(p, _, _), _| p != peer);
         self.uploads.borrow_mut().retain(|(p, _), _| p != peer);
+        self.orphan_checkpoints
+            .borrow_mut()
+            .retain(|cp| cp.peer.as_slice() != peer.as_slice());
+        self.last_saved_dispatched.set(
+            state
+                .contacts
+                .iter()
+                .any(|c| c.outbox.first().is_some_and(|o| o.dispatched)),
+        );
         self.state.replace(state.clone());
         self.deferred.replace(deferred.clone());
         self.apply_entries(entries);
@@ -740,6 +814,9 @@ impl VaultStore for MemoryVault {
         let callback = self.on_save.borrow_mut().take();
         if let Some(mut callback) = callback {
             callback();
+            if self.fail_save_after_hook.take() {
+                self.fail_save.set(true);
+            }
         }
         Ok(())
     }
@@ -3682,6 +3759,7 @@ fn contact_told_bounds_dedups_and_settles_sealed_pending_outbox_entries() {
             awaits_upload: false,
             content_digest: vec![],
             dispatched: false,
+            attachment_id: vec![],
         },
         Outgoing {
             history_index: 4,
@@ -3690,6 +3768,7 @@ fn contact_told_bounds_dedups_and_settles_sealed_pending_outbox_entries() {
             awaits_upload: false,
             content_digest: vec![],
             dispatched: false,
+            attachment_id: vec![],
         },
         Outgoing {
             history_index: 5,
@@ -3698,6 +3777,7 @@ fn contact_told_bounds_dedups_and_settles_sealed_pending_outbox_entries() {
             awaits_upload: false,
             content_digest: vec![],
             dispatched: false,
+            attachment_id: vec![],
         },
     ];
 
@@ -8337,11 +8417,16 @@ fn push_v2_releases_inner_lock_allows_peer_b_and_ui_and_handles_concurrent_delet
             .into_iter()
             .next()
             .unwrap();
-        let mut guard = engine.inner.lock().await;
-        let inner = guard.as_mut().unwrap();
+        let alice_state = {
+            let guard = engine.inner.lock().await;
+            ClientState::try_from(&proto::ClientState::from(
+                guard.as_ref().unwrap().client.state(),
+            ))
+            .unwrap()
+        };
         let mut alice_tmp = Client::restore(
             ConnectClient::new(BundleResponse("/ClaimBundle", bundle_b)),
-            ClientState::try_from(&proto::ClientState::from(inner.client.state())).unwrap(),
+            alice_state,
         );
         let prep_b = alice_tmp
             .prepare_initiate_v2(
@@ -8353,6 +8438,8 @@ fn push_v2_releases_inner_lock_allows_peer_b_and_ui_and_handles_concurrent_delet
             )
             .await
             .unwrap();
+        let mut guard = engine.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
         let mut contact_b = super::contact::Contact {
             peer: peer_b,
             session: prep_b.session,
@@ -8916,11 +9003,16 @@ fn delete_recreate_during_suspended_push_v2_preserves_per_peer_serialization_and
     );
 
     let mut bob_s2_session = pool.run_until(async {
-        let mut guard = engine.lock_inner().await;
-        let inner = guard.as_mut().unwrap();
+        let alice_state = {
+            let guard = engine.lock_inner().await;
+            ClientState::try_from(&proto::ClientState::from(
+                guard.as_ref().unwrap().client.state(),
+            ))
+            .unwrap()
+        };
         let mut alice_tmp = Client::restore(
             ConnectClient::new(BundleResponse("/ClaimBundle", bundle_a_new)),
-            ClientState::try_from(&proto::ClientState::from(inner.client.state())).unwrap(),
+            alice_state,
         );
         let prep = alice_tmp
             .prepare_initiate_v2(
@@ -8932,6 +9024,8 @@ fn delete_recreate_during_suspended_push_v2_preserves_per_peer_serialization_and
             )
             .await
             .unwrap();
+        let mut guard = engine.lock_inner().await;
+        let inner = guard.as_mut().unwrap();
         let inc = Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap();
         let AcceptedInitial::Accepted {
             session: bob_session,
@@ -10603,24 +10697,27 @@ fn r2_p1_1_upgrade_to_pq_revalidates_generation_after_delete_and_recreate() {
         bob.commit_publish_v2(pub_pq);
 
         let fresh_request_session = {
-            let mut guard = engine.inner.lock().await;
-            let inner = guard.as_mut().unwrap();
-            // Assign conversation_gen = 1 and retire so `upgrade_to_pq` proceeds past `has_healthy_pq_session`.
-            inner.contacts[0].state.conversation_gen = 1;
-            inner.state.next_conversation_gen = 2;
-            inner.contacts[0].session.retire();
-            // Build an independent inbound request session for the recreated gen-2 contact.
-            let pub_alice = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
-            let pa = &pub_alice.request;
-            let alice_bundle = ClaimBundleResponse {
-                signed_prekey: pa.manifest.as_ref().unwrap().signed_prekey.clone(),
-                signed_prekey_signature: pa.signed_prekey_signature.clone(),
-                one_time_prekey: pa.one_time_prekeys.first().cloned(),
-                pq_last_resort: pa.pq_last_resort.first().cloned(),
-                pq_one_time_prekey: pa.pq_one_time_prekeys.first().cloned(),
-                manifest: pa.manifest.clone(),
+            let (alice_id, alice_bundle) = {
+                let mut guard = engine.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                // Assign conversation_gen = 1 and retire so `upgrade_to_pq` proceeds past `has_healthy_pq_session`.
+                inner.contacts[0].state.conversation_gen = 1;
+                inner.state.next_conversation_gen = 2;
+                inner.contacts[0].session.retire();
+                // Build an independent inbound request session for the recreated gen-2 contact.
+                let pub_alice = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+                let pa = &pub_alice.request;
+                let alice_bundle = ClaimBundleResponse {
+                    signed_prekey: pa.manifest.as_ref().unwrap().signed_prekey.clone(),
+                    signed_prekey_signature: pa.signed_prekey_signature.clone(),
+                    one_time_prekey: pa.one_time_prekeys.first().cloned(),
+                    pq_last_resort: pa.pq_last_resort.first().cloned(),
+                    pq_one_time_prekey: pa.pq_one_time_prekeys.first().cloned(),
+                    manifest: pa.manifest.clone(),
+                };
+                inner.client.commit_publish_v2(pub_alice);
+                (inner.client.identity_key(), alice_bundle)
             };
-            inner.client.commit_publish_v2(pub_alice);
             let bob_proto = proto::ClientState::from(bob.state());
             let mut bob_init = Client::restore(
                 ConnectClient::new(BundleResponse("/ClaimBundle", alice_bundle)),
@@ -10629,7 +10726,7 @@ fn r2_p1_1_upgrade_to_pq_revalidates_generation_after_delete_and_recreate() {
             let prep = bob_init
                 .prepare_initiate_v2(
                     "localhost",
-                    &inner.client.identity_key(),
+                    &alice_id,
                     &Default::default(),
                     &Kind::Hello(bob_init.make_hello("Bob", 9)).to_bytes(),
                     Fetch::client(LOCAL_SERVER),
@@ -10637,6 +10734,8 @@ fn r2_p1_1_upgrade_to_pq_revalidates_generation_after_delete_and_recreate() {
                 .await
                 .unwrap();
             let inc = Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap();
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
             match inner
                 .client
                 .accept_initial_v2(
@@ -10854,19 +10953,22 @@ fn r2_p1_4_pq_isolated_envelopes_survive_30d_pruning_and_replay_on_capable_build
             guard.as_ref().unwrap().client.identity_key()
         };
         let mut bob_session = {
-            let mut guard = engine.inner.lock().await;
-            let inner = guard.as_mut().unwrap();
-            let pub_alice = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
-            let pa = &pub_alice.request;
-            let alice_bundle = protocol::handshake_v2::ClaimBundleResponse {
-                signed_prekey: pa.manifest.as_ref().unwrap().signed_prekey.clone(),
-                signed_prekey_signature: pa.signed_prekey_signature.clone(),
-                one_time_prekey: pa.one_time_prekeys.first().cloned(),
-                pq_last_resort: pa.pq_last_resort.first().cloned(),
-                pq_one_time_prekey: pa.pq_one_time_prekeys.first().cloned(),
-                manifest: pa.manifest.clone(),
+            let alice_bundle = {
+                let mut guard = engine.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let pub_alice = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+                let pa = &pub_alice.request;
+                let alice_bundle = protocol::handshake_v2::ClaimBundleResponse {
+                    signed_prekey: pa.manifest.as_ref().unwrap().signed_prekey.clone(),
+                    signed_prekey_signature: pa.signed_prekey_signature.clone(),
+                    one_time_prekey: pa.one_time_prekeys.first().cloned(),
+                    pq_last_resort: pa.pq_last_resort.first().cloned(),
+                    pq_one_time_prekey: pa.pq_one_time_prekeys.first().cloned(),
+                    manifest: pa.manifest.clone(),
+                };
+                inner.client.commit_publish_v2(pub_alice);
+                alice_bundle
             };
-            inner.client.commit_publish_v2(pub_alice);
             let bob_proto = proto::ClientState::from(bob.state());
             let mut bob_sender = Client::restore(
                 ConnectClient::new(BundleResponse("/ClaimBundle", alice_bundle)),
@@ -10883,6 +10985,8 @@ fn r2_p1_4_pq_isolated_envelopes_survive_30d_pruning_and_replay_on_capable_build
                 .await
                 .unwrap();
             let inc = Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap();
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
             let accepted = match inner
                 .client
                 .accept_initial_v2(
@@ -10968,20 +11072,23 @@ fn r2_p1_3_isolated_peer_70_envelopes_do_not_stall_healthy_peer_in_same_page() {
     pool.run_until(async {
         let (engine, healthy_peer, _bob) = established_engine_on_localhost().await;
         let (alice_id, healthy_token_hash, mut healthy_sender) = {
-            let mut guard = engine.inner.lock().await;
-            let inner = guard.as_mut().unwrap();
-            let alice_id = inner.client.identity_key();
-            let pub_alice = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
-            let pa = &pub_alice.request;
-            let alice_bundle = protocol::handshake_v2::ClaimBundleResponse {
-                signed_prekey: pa.manifest.as_ref().unwrap().signed_prekey.clone(),
-                signed_prekey_signature: pa.signed_prekey_signature.clone(),
-                one_time_prekey: pa.one_time_prekeys.first().cloned(),
-                pq_last_resort: pa.pq_last_resort.first().cloned(),
-                pq_one_time_prekey: pa.pq_one_time_prekeys.first().cloned(),
-                manifest: pa.manifest.clone(),
+            let (alice_id, alice_bundle) = {
+                let mut guard = engine.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                let alice_id = inner.client.identity_key();
+                let pub_alice = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+                let pa = &pub_alice.request;
+                let alice_bundle = protocol::handshake_v2::ClaimBundleResponse {
+                    signed_prekey: pa.manifest.as_ref().unwrap().signed_prekey.clone(),
+                    signed_prekey_signature: pa.signed_prekey_signature.clone(),
+                    one_time_prekey: pa.one_time_prekeys.first().cloned(),
+                    pq_last_resort: pa.pq_last_resort.first().cloned(),
+                    pq_one_time_prekey: pa.pq_one_time_prekeys.first().cloned(),
+                    manifest: pa.manifest.clone(),
+                };
+                inner.client.commit_publish_v2(pub_alice);
+                (alice_id, alice_bundle)
             };
-            inner.client.commit_publish_v2(pub_alice);
             let mut sender = Client::new(ConnectClient::new(BundleResponse(
                 "/ClaimBundle",
                 alice_bundle,
@@ -10998,6 +11105,8 @@ fn r2_p1_3_isolated_peer_70_envelopes_do_not_stall_healthy_peer_in_same_page() {
                 .await
                 .unwrap();
             let inc = Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap();
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
             let accepted = match inner
                 .client
                 .accept_initial_v2(
@@ -23442,9 +23551,18 @@ fn r13_p1_1_p1_2_p1_3_p2_1_p2_2_policy_greeting_and_upload_guards() {
             assert_eq!(engine.flush(&peer).await, Ok(false));
         }
 
-        // Now attach file handle (simulating live upload), and install an `on_save` hook that
-        // cancels `att_id` during the `dispatched = true` save inside `Engine::flush`: `flush`
-        // MUST abort cleanly WITHOUT transmitting `PushV2` and revert `dispatched = false`!
+        // R14-P3-2 + R14-P1-5: Pre-seal the un-dispatched attachment head BEFORE arming the
+        // one-shot `on_save` hook so the hook genuinely fires on the `dispatched = true` save
+        // (verified directly from the committed `AppState`), AND inject a transient `fail_save`
+        // error during the cancel-revert save to confirm `dispatched` still stays `false` in
+        // memory (`unsaved_state == true`) instead of rolling back to `true`!
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let _ = inner.seal_head_on_active_session(&peer).await.unwrap();
+            let c = inner.contact(&peer).unwrap();
+            assert!(c.state.outbox[0].sealed && !c.state.outbox[0].dispatched);
+        }
         engine.uploads.insert_file(
             (peer, att_id, super::attachment_key_hash(&[0x77; 32])),
             super::attachments::ChunkSource::from_bytes(
@@ -23453,13 +23571,24 @@ fn r13_p1_1_p1_2_p1_3_p2_1_p2_2_policy_greeting_and_upload_guards() {
                 vec![0u8; 16],
             ),
         );
+        let saw_dispatched_save = Rc::new(Cell::new(false));
         {
             let guard = engine.inner.lock().await;
             let inner = guard.as_ref().unwrap();
             let e_hook = engine.clone();
+            let saw = saw_dispatched_save.clone();
+            let dispatched_ref = inner.vault.last_saved_dispatched.clone();
+            let fail_after = inner.vault.fail_save_after_hook.clone();
             *inner.vault.on_save.borrow_mut() = Some(Box::new(move || {
+                assert!(
+                    dispatched_ref.get(),
+                    "R14-P3-2: on_save hook MUST fire on the dispatched = true save, not sealing"
+                );
+                saw.set(true);
                 e_hook.uploads.mark_cancelled(att_id);
                 e_hook.remove_attachment_caches(&peer, &att_id);
+                // R14-P1-5: Force the cancel-revert `save_state()` to fail transiently!
+                fail_after.set(true);
             }));
         }
         {
@@ -23468,13 +23597,21 @@ fn r13_p1_1_p1_2_p1_3_p2_1_p2_2_policy_greeting_and_upload_guards() {
             });
             assert_eq!(engine.flush(&peer).await, Ok(false));
         }
-        let guard = engine.inner.lock().await;
-        let inner = guard.as_ref().unwrap();
-        let c = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
-        assert!(
-            !c.state.outbox[0].dispatched,
-            "R13-P1-3: aborted pre-PushV2 cancel must leave outbox head undispatched"
-        );
+        assert!(saw_dispatched_save.get());
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            let c = inner.contacts.iter().find(|c| c.peer == peer).unwrap();
+            assert!(
+                !c.state.outbox[0].dispatched,
+                "R14-P1-5: aborted pre-PushV2 cancel must keep outbox head undispatched in memory even on transient save failure"
+            );
+            assert!(
+                inner.unsaved_state,
+                "R14-P1-5: transient revert save failure must flag unsaved_state"
+            );
+            inner.vault.fail_save.set(false);
+        }
     });
 }
 
@@ -23748,5 +23885,854 @@ fn r13_p2_3_p2_4_p2_5_p3_1_undrained_spk_cap_reload_probe_and_single_key_retry()
                 .contains_key(&suite_a),
             "R13-P2-5: genuinely empty suite A must NOT receive a false 1-hour cooldown"
         );
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r14_p1_1_p1_2_p1_3_p1_4_policy_gates_upgrade_prune_and_revoke() {
+    use crate::util::key_to_text;
+    use protocol::handshake_v2::{ClaimBundleResponse, PublishV2Response, SendInitialV2Response};
+    use protocol::mailbox_v2::RegisterWriteTokenResponse;
+    use std::rc::Rc;
+
+    let mut pool = futures::executor::LocalPool::new();
+
+    // Part 1 (R14-P1-1): When local PQ is disabled (`pq_enabled = false, strict_pq = false`),
+    // starting a chat with a peer whose signed manifest has PQ enabled (with `strict_pq = false`)
+    // sets `pq_pinned = true` as a TOFU capability record AND MUST still transmit `SendInitialV2`
+    // (never sticking permanently at `GREETING_DELIVERY_UNSENT`).
+    pool.run_until(async {
+        let (engine, _existing_peer, _existing_bob) = established_engine_on_localhost().await;
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut cfg = inner.client.pq_config().clone();
+            cfg.pq_enabled = false;
+            cfg.strict_pq = false;
+            inner.client.set_pq_config(cfg).unwrap();
+            inner.state.published_at = 1;
+            inner.state.needs_publish = false;
+        }
+        let mut bob = Client::new(Fetch::client(LOCAL_SERVER));
+        let bob_id = bob.identity_key();
+        let bob_key = key_to_text(&bob_id);
+        let pub_b = bob.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let m_b = pub_b.request.manifest.clone().unwrap();
+        assert!(m_b.pq_enabled && !m_b.strict_pq);
+        let bob_bundle = ClaimBundleResponse {
+            signed_prekey: m_b.signed_prekey.clone(),
+            signed_prekey_signature: pub_b.request.signed_prekey_signature.clone(),
+            one_time_prekey: pub_b.request.one_time_prekeys.first().cloned(),
+            manifest: Some(m_b),
+            pq_last_resort: pub_b.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: pub_b.request.pq_one_time_prekeys.first().cloned(),
+        };
+        bob.commit_publish_v2(pub_b);
+
+        let sent_initials = Rc::new(Cell::new(0usize));
+        {
+            let bundle = bob_bundle.clone();
+            let sent = sent_initials.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let path = path.to_string();
+                let bundle = bundle.clone();
+                let sent = sent.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        Ok((200, bundle.encode_to_vec()))
+                    } else if path.ends_with("/PublishV2") {
+                        Ok((200, PublishV2Response::default().encode_to_vec()))
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/SendInitialV2") {
+                        sent.set(sent.get() + 1);
+                        Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            let sub = engine
+                .startup
+                .begin_new_chat_submit(crate::state::PendingNewChat {
+                    key: bob_key.clone(),
+                    name: "Bob".into(),
+                    server: None,
+                    pq_pinned: false,
+                    allow_classical: false,
+                    auto_start: false,
+                });
+            assert_eq!(
+                engine
+                    .start_chat(sub, &bob_key, "Bob".into(), None, false, false)
+                    .await,
+                Ok(bob_id)
+            );
+        }
+        assert_eq!(
+            sent_initials.get(),
+            1,
+            "R14-P1-1: !local_pq classical start_chat against PQ-ON manifest must transmit SendInitialV2"
+        );
+        let guard = engine.inner.lock().await;
+        let c = guard
+            .as_ref()
+            .unwrap()
+            .contacts
+            .iter()
+            .find(|c| c.peer == bob_id)
+            .unwrap();
+        assert!(c.session.peer_pq_state().pq_pinned);
+        assert_eq!(
+            c.state.greeting_delivery,
+            crate::vault::GREETING_DELIVERY_CONFIRMED
+        );
+    });
+
+    // Part 2 (R14-P1-2): Classical `UNCERTAIN` greeting with queued text + pending events MUST NOT
+    // transmit carried initials via `Engine::flush` or `Engine::push_events` after `strict_pq` is
+    // enabled!
+    pool.run_until(async {
+        let (engine, peer, mut bob) = established_engine_on_localhost().await;
+        let mut b_off = bob.pq_config().clone();
+        b_off.pq_enabled = false;
+        b_off.strict_pq = false;
+        bob.set_pq_config(b_off).unwrap();
+        let b_pub = bob.prepare_publish_v2("localhost", 2, 0).unwrap();
+        let b_m = b_pub.request.manifest.clone().unwrap();
+        let bob_bundle = ClaimBundleResponse {
+            signed_prekey: b_m.signed_prekey.clone(),
+            signed_prekey_signature: b_pub.request.signed_prekey_signature.clone(),
+            one_time_prekey: b_pub.request.one_time_prekeys.first().cloned(),
+            manifest: Some(b_m),
+            pq_last_resort: None,
+            pq_one_time_prekey: None,
+        };
+        bob.commit_publish_v2(b_pub);
+
+        let claimed = {
+            let b = bob_bundle.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let b = b.clone();
+                let path = path.to_string();
+                async move {
+                    assert!(path.ends_with("/ClaimBundle"));
+                    Ok((200, b.encode_to_vec()))
+                }
+            });
+            let (cfg, clock) = {
+                let guard = engine.inner.lock().await;
+                let inner = guard.as_ref().unwrap();
+                (
+                    inner.client.pq_config().clone(),
+                    inner.client.clock().clone(),
+                )
+            };
+            let pps = session::PeerPqState {
+                allow_classical_exception: true,
+                ..Default::default()
+            };
+            session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                &peer,
+                &pps,
+                &cfg,
+                &clock,
+            )
+            .await
+            .unwrap()
+        };
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let pps = session::PeerPqState {
+                allow_classical_exception: true,
+                ..Default::default()
+            };
+            let hello = Kind::Hello(inner.client.make_hello("Alice", 2)).to_bytes();
+            let prep = inner
+                .client
+                .finish_prepare_initiate_v2(claimed, &pps, &hello, Fetch::client(LOCAL_SERVER))
+                .unwrap();
+            let mut cfg = inner.client.pq_config().clone();
+            cfg.pq_enabled = true;
+            cfg.strict_pq = true;
+            inner.client.set_pq_config(cfg).unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.session = prep.session;
+            if let Some(tok) = c.session.active_inbound_token_hash() {
+                c.session.remove_pending_grant(&tok, u64::MAX);
+            }
+            // Leave greeting `UNCERTAIN` (not `UNSENT`) and queue a message!
+            c.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNCERTAIN;
+            c.state.greeting_sent_at = crate::util::now().saturating_sub(60_000);
+            let _ = inner
+                .add(&peer, Kind::Text("blocked uncertain classical".into()), false)
+                .await
+                .unwrap();
+        }
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!(
+                    "R14-P1-2: flush must NEVER transmit UNCERTAIN classical carried initial under strict_pq: {path}"
+                );
+            });
+            assert_eq!(engine.flush(&peer).await, Ok(false));
+        }
+        // Now clear outbox and queue a pending read receipt event so `flush` enters `push_events`:
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.state.outbox.clear();
+            c.state.greeting_delivery = crate::vault::GREETING_DELIVERY_UNSENT;
+            c.state.events.get_or_insert_default().read.push(1);
+            inner.save_state().await.unwrap();
+        }
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!(
+                    "R14-P1-2: push_events must NEVER transmit classical initial under strict_pq: {path}"
+                );
+            });
+            assert_eq!(engine.flush(&peer).await, Ok(false));
+        }
+        let guard = engine.inner.lock().await;
+        let c = guard
+            .as_ref()
+            .unwrap()
+            .contacts
+            .iter()
+            .find(|c| c.peer == peer)
+            .unwrap();
+        assert_eq!(
+            c.state.greeting_delivery,
+            crate::vault::GREETING_DELIVERY_UNSENT
+        );
+        assert_eq!(
+            c.state.security_alert,
+            crate::vault::SECURITY_ALERT_PQ_REQUIRED
+        );
+    });
+
+    // Part 3 (R14-P1-3): Upgrading an unquarantined classical chat request to PQ MUST discard the
+    // unapproved classical session (never archiving it into `others` where it could decrypt
+    // classical ciphertexts under `strict_pq`).
+    pool.run_until(async {
+        let (engine, _existing_peer, _existing_bob) = established_engine_on_localhost().await;
+        let (alice_id, alice_off_bundle) = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut cfg = inner.client.pq_config().clone();
+            cfg.pq_enabled = false;
+            cfg.strict_pq = false;
+            inner.client.set_pq_config(cfg).unwrap();
+            let pub_a = inner.client.prepare_publish_v2("localhost", 2, 0).unwrap();
+            let m_a = pub_a.request.manifest.clone().unwrap();
+            let b = ClaimBundleResponse {
+                signed_prekey: m_a.signed_prekey.clone(),
+                signed_prekey_signature: pub_a.request.signed_prekey_signature.clone(),
+                one_time_prekey: pub_a.request.one_time_prekeys.first().cloned(),
+                manifest: Some(m_a),
+                pq_last_resort: None,
+                pq_one_time_prekey: None,
+            };
+            inner.client.commit_publish_v2(pub_a);
+            (inner.client.identity_key(), b)
+        };
+        let mut bob = Client::new(Fetch::client(LOCAL_SERVER));
+        let bob_id = bob.identity_key();
+        let (bob_cls_inc, mut bob_cls_session) = {
+            let b = alice_off_bundle.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let b = b.clone();
+                let path = path.to_string();
+                async move {
+                    assert!(path.ends_with("/ClaimBundle"));
+                    Ok((200, b.encode_to_vec()))
+                }
+            });
+            let pps = session::PeerPqState {
+                allow_classical_exception: true,
+                ..Default::default()
+            };
+            let claimed = session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                &alice_id,
+                &pps,
+                bob.pq_config(),
+                bob.clock(),
+            )
+            .await
+            .unwrap();
+            let hello = Kind::Hello(bob.make_hello("Bob", 1)).to_bytes();
+            let prep = bob
+                .finish_prepare_initiate_v2(claimed, &pps, &hello, Fetch::client(LOCAL_SERVER))
+                .unwrap();
+            (
+                Incoming::try_from(prep.request.message.as_ref().unwrap()).unwrap(),
+                prep.session,
+            )
+        };
+        let pub_b_pq = bob.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let m_b_pq = pub_b_pq.request.manifest.clone().unwrap();
+        let bob_pq_bundle = ClaimBundleResponse {
+            signed_prekey: m_b_pq.signed_prekey.clone(),
+            signed_prekey_signature: pub_b_pq.request.signed_prekey_signature.clone(),
+            one_time_prekey: pub_b_pq.request.one_time_prekeys.first().cloned(),
+            manifest: Some(m_b_pq),
+            pq_last_resort: pub_b_pq.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: pub_b_pq.request.pq_one_time_prekeys.first().cloned(),
+        };
+        bob.commit_publish_v2(pub_b_pq);
+
+        // Alice receives Bob's classical request while `pq_enabled = false` (`quarantined == false`),
+        // then enables `pq_enabled = true, strict_pq = true`, and runs `upgrade_to_pq(bob_id)`.
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let opened = inner.open_initial(&bob_id, &bob_cls_inc).unwrap();
+            assert!(!opened.session.security().is_some_and(|s| s.is_pq));
+            inner.contacts.push(super::contact::Contact {
+                peer: bob_id,
+                session: opened.session,
+                deferred_carried: 0,
+                state: ContactState {
+                    peer: bob_id.to_vec(),
+                    name: "Bob".into(),
+                    request: true,
+                    conversation_gen: 5,
+                    ..ContactState::default()
+                },
+            });
+            let mut cfg = inner.client.pq_config().clone();
+            cfg.pq_enabled = true;
+            cfg.strict_pq = true;
+            inner.client.set_pq_config(cfg).unwrap();
+        }
+        {
+            let bundle = bob_pq_bundle.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let path = path.to_string();
+                let bundle = bundle.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        Ok((200, bundle.encode_to_vec()))
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/SendInitialV2") {
+                        Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            assert_eq!(engine.upgrade_to_pq(bob_id).await, Ok(()));
+        }
+        let classical_ct = bob_cls_session
+            .encrypt(&Kind::Text("rogue classical under pq token".into()).to_bytes())
+            .unwrap();
+        let mut guard = engine.inner.lock().await;
+        let c = guard
+            .as_mut()
+            .unwrap()
+            .contacts
+            .iter_mut()
+            .find(|c| c.peer == bob_id)
+            .unwrap();
+        assert!(c.session.security().is_some_and(|s| s.is_pq));
+        assert!(
+            !c.session.has_classical_earlier(),
+            "R14-P1-3: upgrade_to_pq must discard unapproved classical request session, not archive it in others"
+        );
+        assert!(
+            c.session.decrypt_envelope(&classical_ct.message).is_err(),
+            "R14-P1-3: classical ciphertext must NOT decrypt after upgrading unapproved request to PQ"
+        );
+    });
+
+    // Part 4 (R14-P1-4): Established classical chat upgraded to PQ under `strict_pq = true` prunes
+    // the archived classical session AND schedules a slot revoke + strictly higher PQ grant version!
+    pool.run_until(async {
+        let (engine, peer, mut bob) = established_engine_on_localhost().await;
+        let mut b_off = bob.pq_config().clone();
+        b_off.pq_enabled = false;
+        b_off.strict_pq = false;
+        bob.set_pq_config(b_off).unwrap();
+        let b_pub_off = bob.prepare_publish_v2("localhost", 2, 0).unwrap();
+        let m_off = b_pub_off.request.manifest.clone().unwrap();
+        let bob_off_bundle = ClaimBundleResponse {
+            signed_prekey: m_off.signed_prekey.clone(),
+            signed_prekey_signature: b_pub_off.request.signed_prekey_signature.clone(),
+            one_time_prekey: b_pub_off.request.one_time_prekeys.first().cloned(),
+            manifest: Some(m_off),
+            pq_last_resort: None,
+            pq_one_time_prekey: None,
+        };
+        bob.commit_publish_v2(b_pub_off);
+
+        let claimed_off = {
+            let b = bob_off_bundle.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let b = b.clone();
+                let path = path.to_string();
+                async move {
+                    assert!(path.ends_with("/ClaimBundle"));
+                    Ok((200, b.encode_to_vec()))
+                }
+            });
+            let (cfg, clock) = {
+                let guard = engine.inner.lock().await;
+                let inner = guard.as_ref().unwrap();
+                (
+                    inner.client.pq_config().clone(),
+                    inner.client.clock().clone(),
+                )
+            };
+            let pps = session::PeerPqState {
+                allow_classical_exception: true,
+                ..Default::default()
+            };
+            session::claim_peer_bundle_v2(
+                &Fetch::client(LOCAL_SERVER),
+                "localhost",
+                &peer,
+                &pps,
+                &cfg,
+                &clock,
+            )
+            .await
+            .unwrap()
+        };
+        let mut b_on = bob.pq_config().clone();
+        b_on.pq_enabled = true;
+        b_on.strict_pq = false;
+        bob.set_pq_config(b_on).unwrap();
+        let b_pub_pq = bob.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let m_pq = b_pub_pq.request.manifest.clone().unwrap();
+        let bob_pq_bundle = ClaimBundleResponse {
+            signed_prekey: m_pq.signed_prekey.clone(),
+            signed_prekey_signature: b_pub_pq.request.signed_prekey_signature.clone(),
+            one_time_prekey: b_pub_pq.request.one_time_prekeys.first().cloned(),
+            manifest: Some(m_pq),
+            pq_last_resort: b_pub_pq.request.pq_last_resort.first().cloned(),
+            pq_one_time_prekey: b_pub_pq.request.pq_one_time_prekeys.first().cloned(),
+        };
+        bob.commit_publish_v2(b_pub_pq);
+
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let pps = session::PeerPqState {
+                allow_classical_exception: true,
+                ..Default::default()
+            };
+            let hello = Kind::Hello(inner.client.make_hello("Alice", 2)).to_bytes();
+            let prep = inner
+                .client
+                .finish_prepare_initiate_v2(claimed_off, &pps, &hello, Fetch::client(LOCAL_SERVER))
+                .unwrap();
+            let mut cfg = inner.client.pq_config().clone();
+            cfg.pq_enabled = true;
+            cfg.strict_pq = true;
+            inner.client.set_pq_config(cfg).unwrap();
+            let c = inner.contact(&peer).unwrap();
+            c.session = prep.session;
+            c.state.request = false;
+            c.state.quarantined = false;
+            if let Some(tok) = c.session.active_inbound_token_hash() {
+                c.session.remove_pending_grant(&tok, u64::MAX);
+            }
+        }
+        let revoke_seen = Rc::new(Cell::new(0u64));
+        let register_seen = Rc::new(Cell::new(0u64));
+        {
+            let bundle = bob_pq_bundle.clone();
+            let rev = revoke_seen.clone();
+            let reg = register_seen.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let body = body.to_vec();
+                let bundle = bundle.clone();
+                let rev = rev.clone();
+                let reg = reg.clone();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        Ok((200, bundle.encode_to_vec()))
+                    } else if path.ends_with("/RevokeWriteToken") {
+                        let req =
+                            protocol::mailbox_v2::RevokeWriteTokenRequest::decode(body.as_slice())
+                                .unwrap();
+                        rev.set(req.min_grant_version);
+                        Ok((
+                            200,
+                            protocol::mailbox_v2::RevokeWriteTokenResponse { revoked: 1 }
+                                .encode_to_vec(),
+                        ))
+                    } else if path.ends_with("/RegisterWriteToken") {
+                        let req = protocol::mailbox_v2::RegisterWriteTokenRequest::decode(
+                            body.as_slice(),
+                        )
+                        .unwrap();
+                        reg.set(req.grant_version);
+                        Ok((200, RegisterWriteTokenResponse {}.encode_to_vec()))
+                    } else if path.ends_with("/SendInitialV2") {
+                        Ok((200, SendInitialV2Response { id: 1 }.encode_to_vec()))
+                    } else {
+                        Ok((200, vec![]))
+                    }
+                }
+            });
+            assert_eq!(engine.upgrade_to_pq(peer).await, Ok(()));
+        }
+        assert!(
+            revoke_seen.get() > 0 && register_seen.get() > revoke_seen.get(),
+            "R14-P1-4: pruning an established classical session must revoke the slot (v={}) and register the PQ token at a strictly higher version (v={})",
+            revoke_seen.get(),
+            register_seen.get()
+        );
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r14_p2_1_to_p2_8_uploads_refill_probes_manifest_and_dialog_copy() {
+    use protocol::handshake_v2::{
+        GetServerInfoResponse, RefillPrekeysRequest, RefillPrekeysResponse, SuiteCount,
+    };
+    use protocol::mailbox_v2::PushV2Response;
+    use std::rc::Rc;
+
+    let mut pool = futures::executor::LocalPool::new();
+
+    // Part 1 (R14-P2-2 + R14-P2-3):
+    //   - Missing `HistoryEntry` with valid 0-chunk `PendingUpload` still blocks `Engine::flush`
+    //     (protected via authenticated `Outgoing.attachment_id`).
+    //   - Orphaned 0-chunk checkpoint with missing `PendingUpload` record fails cleanly in
+    //     `Engine::flush` and unblocks a subsequent text message.
+    pool.run_until(async {
+        let (engine, peer, _bob) = established_engine_on_localhost().await;
+        let att_id = [0xf2u8; 16];
+        let att_idx = {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let pointer = crate::content::AttachmentPointer {
+                id: att_id.to_vec(),
+                key: vec![0x55; 32],
+                size: 16,
+                name: "orphan.bin".into(),
+                mime: "application/octet-stream".into(),
+                expires: crate::util::now() + 60_000,
+            };
+            let view = inner
+                .add(&peer, Kind::Attachment(pointer), false)
+                .await
+                .unwrap();
+            let _ = inner
+                .add(&peer, Kind::Text("trailing msg".into()), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                inner.contact(&peer).unwrap().state.outbox[0].attachment_id,
+                att_id.to_vec()
+            );
+            // Delete the `HistoryEntry` to verify `R14-P2-2`!
+            inner.vault.entries.borrow_mut().remove(&(peer, view.index));
+            let mut pending = crate::vault::PendingUpload::default();
+            pending.id = att_id.to_vec();
+            pending.key = vec![0x55; 32];
+            pending.token = vec![0x66; 16];
+            pending.size = 16;
+            pending.name = "orphan.bin".into();
+            pending.mime = "application/octet-stream".into();
+            pending.expires = crate::util::now() + 60_000;
+            pending.announced = true;
+            pending.history_index = view.index;
+            pending.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+            inner.vault.save_upload(&peer, &pending).await.unwrap();
+            view.index
+        };
+        {
+            let _no_net = crate::transport::mock_fetch(|_s, path, _b| {
+                panic!("R14-P2-2: missing HistoryEntry must not bypass 0-chunk guard: {path}");
+            });
+            assert_eq!(engine.flush(&peer).await, Ok(false));
+        }
+
+        // Now remove the separate `PendingUpload` record while keeping only an orphaned 0-chunk
+        // checkpoint (`R14-P2-3`): `Engine::flush` MUST fail the un-dispatched orphan, forget the
+        // checkpoint, and push the trailing text message!
+        {
+            let guard = engine.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            inner.vault.uploads.borrow_mut().remove(&(peer, att_id.to_vec()));
+            inner
+                .vault
+                .orphan_checkpoints
+                .borrow_mut()
+                .push(crate::vault::UploadCheckpoint {
+                    peer: peer.to_vec(),
+                    id: att_id.to_vec(),
+                    upload_state: crate::vault::UPLOAD_STATE_ANNOUNCED,
+                    uploaded: 0,
+                    history_index: att_idx,
+                    ..Default::default()
+                });
+        }
+        let pushed = Rc::new(Cell::new(0usize));
+        {
+            let p = pushed.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                let path = path.to_string();
+                let p = p.clone();
+                async move {
+                    assert!(path.ends_with("/PushV2"));
+                    p.set(p.get() + 1);
+                    Ok((200, PushV2Response { sequence: 1 }.encode_to_vec()))
+                }
+            });
+            assert_eq!(engine.flush(&peer).await, Ok(true));
+        }
+        assert_eq!(
+            pushed.get(),
+            1,
+            "R14-P2-3: orphaned 0-chunk checkpoint must fail cleanly and unblock trailing text message"
+        );
+        let mut guard = engine.inner.lock().await;
+        let inner = guard.as_mut().unwrap();
+        assert!(inner.vault.tracked_upload_checkpoints(Some(&peer)).is_empty());
+        assert!(inner.contact(&peer).unwrap().state.outbox.is_empty());
+    });
+
+    // Part 2 (R14-P2-4 + R14-P2-5):
+    //   - Persisted `pq_fallback_probe_pending` with `used_pq_one_time_prekeys == 0` floors
+    //     `used_pq_one_time_prekeys >= REFILL_USED` on reload (`Inner::new`).
+    //   - Stale `{A: 0, B: 100}` estimate with `pq_fallback_probe_pending = {A}` still issues a
+    //     bounded 1-key probe `(A, 1)` instead of silently clearing the probe.
+    pool.run_until(async {
+        let (engine, _peer, _bob) = established_engine_on_localhost().await;
+        let offered = {
+            let guard = engine.inner.lock().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .client
+                .pq_config()
+                .offered_suites()
+        };
+        let suite_a = offered[0];
+        let other_suite = if suite_a == session::PqSuite::MlKem1024 {
+            session::PqSuite::MlKem768
+        } else {
+            session::PqSuite::MlKem1024
+        };
+        // Simulate reload with persisted `pq_fallback_probe_pending = [suite_a]` and
+        // `used_pq_one_time_prekeys = 0` (from an intervening classical-only refill).
+        {
+            let mut guard = engine.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let mut st = inner.app_state();
+            st.used_pq_one_time_prekeys = 0;
+            st.pq_fallback_probe_pending = vec![u32::from(suite_a.as_u8())];
+            let client_state = session::ClientState::try_from(st.client.as_ref().unwrap()).unwrap();
+            let restored = Inner::new(
+                MemoryVault::default(),
+                LOCAL_SERVER.into(),
+                "localhost".into(),
+                st,
+                Client::restore(Fetch::client(LOCAL_SERVER), client_state),
+                vec![],
+                vec![],
+                DeferredRecord::default(),
+            );
+            assert!(
+                restored.state.used_pq_one_time_prekeys >= super::REFILL_USED,
+                "R14-P2-4: Inner::new must floor used_pq_one_time_prekeys to REFILL_USED when pq_fallback_probe_pending is non-empty"
+            );
+
+            // Now set stale `{A: 0, other_suite: 100}` baseline on live engine (`R14-P2-5`).
+            let p = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+            inner.client.commit_publish_v2(p);
+            inner.state.published_at = crate::util::now();
+            inner.state.needs_publish = false;
+            inner.server_pq = ServerPqStatus::Enabled {
+                suites: offered.clone(),
+                pq_ratchet: true,
+            };
+            inner.confirmed_relay_pq_suites = Some(offered.iter().copied().collect());
+            inner.last_server_classical_opks = Some(20);
+            inner.last_server_pq_opks_by_suite = Some(
+                [(suite_a, 0u32), (other_suite, 100u32)]
+                    .into_iter()
+                    .collect(),
+            );
+            inner.pq_fallback_probe_pending.clear();
+            inner.pq_fallback_probe_pending.insert(suite_a);
+            inner.pq_fallback_probe_cooldown_until.clear();
+            inner.state.used_one_time_prekeys = 0;
+            inner.state.used_pq_one_time_prekeys = super::REFILL_USED;
+            inner.used_pq_by_suite.clear();
+            inner.used_pq_by_suite.insert(suite_a, super::REFILL_USED);
+        }
+        let probed_sizes = Rc::new(RefCell::new(Vec::<usize>::new()));
+        {
+            let ps = probed_sizes.clone();
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, body| {
+                let path = path.to_string();
+                let body = body.to_vec();
+                let ps = ps.clone();
+                async move {
+                    assert!(path.ends_with("/RefillPrekeys"));
+                    let req = RefillPrekeysRequest::decode(body.as_slice()).unwrap();
+                    ps.borrow_mut().push(req.pq_one_time_prekeys.len());
+                    Ok((
+                        200,
+                        RefillPrekeysResponse {
+                            classical_one_time_count: 20,
+                            pq_one_time_counts: vec![
+                                SuiteCount {
+                                    suite: u32::from(suite_a.as_u8()),
+                                    count: 1,
+                                },
+                                SuiteCount {
+                                    suite: u32::from(other_suite.as_u8()),
+                                    count: 98,
+                                },
+                            ],
+                        }
+                        .encode_to_vec(),
+                    ))
+                }
+            });
+            engine
+                .publish_with_rotation_gate(false, true)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            probed_sizes.borrow().as_slice(),
+            &[1],
+            "R14-P2-5: stale {{A: 0, B: 100}} estimate with pending probe for A must still issue bounded 1-key probe"
+        );
+    });
+
+    // Part 3 (R14-P2-6): With 128 deferred digests pinned + 1 older confirmed digest for retained
+    // SPK A + 15 newer confirmed digests for retained SPK B + 1 newly landed digest for SPK B,
+    // `preserve_undrained_inbox_prekeys_for_commit` MUST protect SPK A's sole confirmed digest!
+    pool.run_until(async {
+        let (mut inner, _) = unlocked_client();
+        inner.contacts.clear();
+        let pa = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let spk_a = PublicKey::try_from(pa.request.manifest.as_ref().unwrap().signed_prekey.as_ref())
+            .unwrap();
+        inner.client.commit_publish_v2(pa);
+        let d_a = *inner.client.recent_manifest_digests().last().unwrap();
+
+        let pb = inner.client.prepare_publish_v2("localhost", 2, 2).unwrap();
+        let spk_b = PublicKey::try_from(pb.request.manifest.as_ref().unwrap().signed_prekey.as_ref())
+            .unwrap();
+        assert_ne!(spk_a, spk_b);
+        inner.client.commit_publish_v2(pb);
+
+        // Create 128 distinct deferred digests + 14 additional older confirmed SPK B digests
+        // (plus `d_b` = 15 older SPK B digests) + 1 newly landed SPK B digest = 145 total!
+        let mut wire = proto::ClientState::from(inner.client.state());
+        let mut deferred_digests = Vec::with_capacity(128);
+        for i in 0u8..128 {
+            let mut d = [0u8; 32];
+            d[0] = 0xdd;
+            d[1] = i;
+            deferred_digests.push(d);
+            wire.recent_manifest_digests.push(d.to_vec());
+        }
+        wire.confirmed_manifest_digests.clear();
+        for i in 0u8..15 {
+            let mut d = [0u8; 32];
+            d[0] = 0xbb;
+            d[1] = i;
+            wire.recent_manifest_digests.push(d.to_vec());
+            wire.confirmed_manifest_digests.push(d.to_vec());
+            wire.manifest_digest_spks
+                .push(session::proto::SignedPrekeyManifestDigest {
+                    digest: d.to_vec(),
+                    signed_prekey: spk_b.to_vec(),
+                    unconfirmed: false,
+                });
+        }
+        let restored = ClientState::try_from(&wire).unwrap();
+        inner.client = Client::restore(Fetch::client(LOCAL_SERVER), restored);
+        assert!(inner.client.recent_manifest_digests().len() > session::MAX_RETAINED_MANIFEST_DIGESTS);
+
+        let mut preserve_spks = vec![];
+        let mut preserve_digests = deferred_digests.clone();
+        super::handshake::preserve_undrained_inbox_prekeys_for_commit(
+            &inner,
+            false,
+            &mut preserve_spks,
+            &mut preserve_digests,
+        );
+        assert!(
+            preserve_digests.contains(&d_a),
+            "R14-P2-6: Tier 0 must guarantee retained SPK A's sole confirmed digest even when 128 deferred digests leave only 15 free candidate slots"
+        );
+    });
+
+    // Part 4 (R14-P2-8): `ClaimBundle -> Unimplemented` + `GetServerInfo -> pq_enabled: false`
+    // MUST return `StartChatError::ServerPqDisabledApprovalRequired` (never falsely claiming the
+    // peer published a signed OFF manifest).
+    pool.run_until(async {
+        let (engine, _existing_peer, _existing_bob) = established_engine_on_localhost().await;
+        let fresh_bob = Client::new(Fetch::client(LOCAL_SERVER));
+        let bob_key = crate::util::key_to_text(&fresh_bob.identity_key());
+        {
+            let _mock = crate::transport::mock_fetch_async(move |_s, path, _body| {
+                let path = path.to_string();
+                async move {
+                    if path.ends_with("/ClaimBundle") {
+                        Ok((
+                            404,
+                            br#"{"code":"unimplemented","message":"pq disabled"}"#.to_vec(),
+                        ))
+                    } else if path.ends_with("/GetServerInfo") {
+                        Ok((
+                            200,
+                            GetServerInfoResponse {
+                                pq_enabled: false,
+                                server_id: "localhost".into(),
+                                ..Default::default()
+                            }
+                            .encode_to_vec(),
+                        ))
+                    } else {
+                        panic!("unexpected path: {path}");
+                    }
+                }
+            });
+            let sub = engine
+                .startup
+                .begin_new_chat_submit(crate::state::PendingNewChat {
+                    key: bob_key.clone(),
+                    name: "Bob".into(),
+                    server: None,
+                    pq_pinned: false,
+                    allow_classical: false,
+                    auto_start: false,
+                });
+            assert_eq!(
+                engine
+                    .start_chat(sub, &bob_key, "Bob".into(), None, false, false)
+                    .await,
+                Err(StartChatError::ServerPqDisabledApprovalRequired)
+            );
+        }
     });
 }

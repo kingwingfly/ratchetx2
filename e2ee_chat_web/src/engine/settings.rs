@@ -628,10 +628,12 @@ impl<V: VaultStore> Engine<V> {
             };
 
             let snapshot = inner.contacts[index].snapshot();
+            let prev_pending_revokes = inner.state.pending_revokes.clone();
             let old_farewell_mode = inner.contacts[index].farewell_mode();
             let old_had_session = !inner.contacts[index].session.needs_new_session();
+            let old_was_unaccepted_request = inner.contacts[index].state.request;
             let old_was_request_or_quarantined =
-                inner.contacts[index].state.request || inner.contacts[index].state.quarantined;
+                old_was_unaccepted_request || inner.contacts[index].state.quarantined;
             inner.contacts[index]
                 .session
                 .peer_pq_state_mut()
@@ -655,9 +657,12 @@ impl<V: VaultStore> Engine<V> {
             let prepared = {
                 let client = &inner.client;
                 let contact = &mut inner.contacts[index];
-                // Never archive an unapproved quarantined primary classical session into `others`:
-                // snapshot rollback still restores it if the PQ upgrade fails.
-                if contact.is_new_quarantined() {
+                // R14-P1-3: Never archive an unapproved quarantined OR unquarantined classical
+                // request session into `others`: snapshot rollback still restores it if the PQ
+                // upgrade fails.
+                if contact.is_new_quarantined()
+                    || (contact.state.request && contact.is_classical_session())
+                {
                     contact.session.discard_active();
                 }
                 client.finish_prepare_start_again_v2(claimed, &mut contact.session, &greeting)
@@ -676,6 +681,7 @@ impl<V: VaultStore> Engine<V> {
                 .is_some_and(|c| c.session.security().is_some_and(|s| s.is_pq));
             if !upgraded_is_pq {
                 inner.state.next_session_seq = prev_next_session_seq;
+                inner.state.pending_revokes = prev_pending_revokes;
                 inner.roll_back(&peer, snapshot)?;
                 if self.is_live(vgen) {
                     self.refresh_contacts(inner);
@@ -686,6 +692,20 @@ impl<V: VaultStore> Engine<V> {
                         .to_string(),
                 );
             }
+            // R14-P1-3 + R14-P1-4: Prune any archived classical sessions from `others` when
+            // upgrading a request/quarantined contact OR when `strict_pq` is active (so classical
+            // ciphertexts cannot decrypt via the new PQ write token). If an already-established
+            // contact had classical tokens pruned, revoke the slot and restage all retained PQ
+            // tokens at strictly higher grant versions.
+            let pruned_classical = if (old_was_request_or_quarantined
+                || inner.client.pq_config().strict_pq)
+                && let Some(contact) = inner.contact(&peer)
+            {
+                contact.session.prune_classical_earlier()
+            } else {
+                vec![]
+            };
+            let revoke_for_pruned = !pruned_classical.is_empty() && !old_was_unaccepted_request;
             // Preserve a durable deletion path on the previous established session until the
             // upgraded PQ greeting is confirmed delivered (e.g. if SendInitialV2 is refused and
             // the user deletes the chat before sending another message).
@@ -747,14 +767,40 @@ impl<V: VaultStore> Engine<V> {
             let new_session_id = inner
                 .contact(&peer)
                 .and_then(|c| c.session.active_id().copied());
+            if revoke_for_pruned {
+                inner.stage_write_token_revoke(&peer);
+            }
+            let retained_pq_earlier: Vec<[u8; 32]> = if revoke_for_pruned {
+                inner
+                    .contact(&peer)
+                    .map(|c| {
+                        let active = c.session.active_inbound_token_hash();
+                        c.session
+                            .earlier_inbound_token_hashes_for_policy(false)
+                            .filter(|h| Some(*h) != active)
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                vec![]
+            };
             if let Some(token_hash) = inner
                 .contact(&peer)
                 .and_then(|c| c.session.active_inbound_token_hash())
                 && let Err(e) = inner.stage_write_token_grant(&peer, token_hash, true)
             {
                 inner.state.next_session_seq = prev_next_session_seq;
+                inner.state.pending_revokes = prev_pending_revokes;
                 inner.roll_back(&peer, snapshot)?;
                 return Err(e);
+            }
+            for earlier_hash in retained_pq_earlier {
+                if let Err(e) = inner.stage_write_token_grant(&peer, earlier_hash, false) {
+                    inner.state.next_session_seq = prev_next_session_seq;
+                    inner.state.pending_revokes = prev_pending_revokes;
+                    inner.roll_back(&peer, snapshot)?;
+                    return Err(e);
+                }
             }
             // Requeue any outbox messages sealed on the previous session so they re-encrypt
             // on the new PQ session instead of pushing old-session ciphertexts with the PQ initial.
@@ -762,6 +808,7 @@ impl<V: VaultStore> Engine<V> {
                 Ok(requeued) => requeued,
                 Err(e) => {
                     inner.state.next_session_seq = prev_next_session_seq;
+                    inner.state.pending_revokes = prev_pending_revokes;
                     inner.roll_back(&peer, snapshot)?;
                     return Err(e);
                 }
@@ -770,6 +817,7 @@ impl<V: VaultStore> Engine<V> {
             history_records.extend(records(&peer, &requeued.history));
             if let Err(e) = inner.save_with(&history_records, &requeued.outbox).await {
                 inner.state.next_session_seq = prev_next_session_seq;
+                inner.state.pending_revokes = prev_pending_revokes;
                 inner.roll_back(&peer, snapshot)?;
                 return Err(describe(&e));
             }
