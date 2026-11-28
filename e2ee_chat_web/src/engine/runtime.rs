@@ -121,10 +121,6 @@ impl UploadRegistry {
         self.cancelled.borrow().contains(id)
     }
 
-    pub(super) fn has_any_cancelled(&self) -> bool {
-        !self.cancelled.borrow().is_empty()
-    }
-
     pub(super) fn mark_cancelled(&self, id: [u8; 16]) {
         self.cancelled.borrow_mut().insert(id);
     }
@@ -1412,6 +1408,7 @@ impl OpenChatState {
         peer: &PublicKey,
         contact: Option<&Contact>,
         entries: &[(u64, HistoryEntry)],
+        server_now: u64,
     ) -> Vec<(u64, u64)> {
         let mut place_updates = Vec::new();
         let mut displayed = self.displayed_rows.borrow_mut();
@@ -1433,7 +1430,7 @@ impl OpenChatState {
             if let Some(sig) = signals.remote_body
                 && let Some(contact) = contact
             {
-                let updated = contact.message(*index, entry.clone()).body;
+                let updated = contact.message_at(*index, entry.clone(), server_now).body;
                 if sig.with_untracked(|current| *current != updated) {
                     sig.set(updated);
                 }

@@ -32807,16 +32807,16 @@ fn r22_round22_web_engine_regressions() {
             let c = inner.contact(&peer9).unwrap();
             let now_ms = crate::util::now();
             let unexpired_id = [0xa1u8; 16];
-            c.record_deleted_attachment(&unexpired_id, now_ms.saturating_add(60_000));
+            c.record_deleted_attachment(&unexpired_id, now_ms.saturating_add(60_000), now_ms);
             for i in 0u16..300 {
                 let mut exp_id = [0u8; 16];
                 exp_id[..2].copy_from_slice(&i.to_be_bytes());
                 exp_id[15] = 0xee;
                 // Already expired 10 seconds ago:
-                c.record_deleted_attachment(&exp_id, now_ms.saturating_sub(10_000));
+                c.record_deleted_attachment(&exp_id, now_ms.saturating_sub(10_000), now_ms);
             }
             // Recording one more triggers pruning of all expired entries while keeping `unexpired_id`!
-            c.record_deleted_attachment(&[0xa2u8; 16], now_ms.saturating_add(60_000));
+            c.record_deleted_attachment(&[0xa2u8; 16], now_ms.saturating_add(60_000), now_ms);
             assert!(
                 c.is_attachment_deleted(&unexpired_id),
                 "R22-P3-4: unexpired tombstone must NOT be evicted by >256 expired tombstones"
@@ -32845,6 +32845,720 @@ fn r22_round22_web_engine_regressions() {
                 echo_entry.gone,
                 "R22-P3-4: incoming attachment echo past its server expiry must arrive marked gone=true"
             );
+        }
+    });
+}
+
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "ml-kem-1024", feature = "ml-kem-768")
+))]
+#[test]
+fn r23_round23_web_engine_regressions() {
+    use leptos::prelude::WithUntracked;
+    use sha2::Digest as _;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    let _guard = crate::transport::mock_fetch(|_s, _p, _b| Ok((200, vec![])));
+    let mut pool = futures::executor::LocalPool::new();
+
+    // Part 1 (R23-P2-1): Late 403 `SignInRequired` responses after chat deletion or upload
+    // cancellation MUST NOT invoke the global `REFUSED` sign-in hook or open `Dialog::SignIn`
+    // across `Engine::flush` (`PushV2`), `send_attachment` (`StartUpload`), `start_waiting`
+    // (`StartUpload` — also checking no file leak / no ghost card), and `upload_chunks`
+    // (`PutChunk` via `Fetch::reporting_without_refused_hook`).
+    pool.run_until(async {
+        let sign_in_403 = || {
+            Ok((
+                403,
+                br#"{"code":"permission_denied","message":"sign in"}"#.to_vec(),
+            ))
+        };
+
+        // 1a: `Engine::flush` (`PushV2`) late 403 after chat deletion -> no `Dialog::SignIn`.
+        {
+            let (eng, peer, _) = established_engine_on_localhost().await;
+            eng.startup.set_can_sign_in_here(true);
+            let eng_hook = eng.clone();
+            crate::transport::on_sign_in_required(move || {
+                eng_hook.refused_for_sign_in();
+            });
+            {
+                let mut guard = eng.inner.lock().await;
+                let inner = guard.as_mut().unwrap();
+                inner
+                    .add(&peer, Kind::Text("stale-push-403".into()), false)
+                    .await
+                    .unwrap();
+            }
+            assert_eq!(eng.ui.dialog.get_untracked(), None);
+            {
+                let eng_c = eng.clone();
+                let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                    let path = path.to_string();
+                    let eng_c = eng_c.clone();
+                    async move {
+                        if path.ends_with("/PushV2") {
+                            let cgen = {
+                                let guard = eng_c.inner.lock().await;
+                                guard
+                                    .as_ref()
+                                    .unwrap()
+                                    .contacts
+                                    .iter()
+                                    .find(|c| c.peer == peer)
+                                    .unwrap()
+                                    .state
+                                    .conversation_gen
+                            };
+                            eng_c.delete_for_gen(peer, cgen).await.unwrap();
+                            return sign_in_403();
+                        }
+                        Ok((200, vec![]))
+                    }
+                });
+                let _ = eng.flush(&peer).await;
+            }
+            assert_eq!(
+                eng.ui.dialog.get_untracked(),
+                None,
+                "R23-P2-1 (1a): late 403 on PushV2 after chat deletion must not open Dialog::SignIn"
+            );
+            crate::transport::on_sign_in_required(|| {});
+        }
+
+        // 1b: `send_attachment_source` (`StartUpload`) late 403 after chat deletion -> no `Dialog::SignIn`.
+        {
+            let (eng, peer, _) = established_engine_on_localhost().await;
+            eng.startup.set_can_sign_in_here(true);
+            let eng_hook = eng.clone();
+            crate::transport::on_sign_in_required(move || {
+                eng_hook.refused_for_sign_in();
+            });
+            {
+                let eng_c = eng.clone();
+                let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                    let path = path.to_string();
+                    let eng_c = eng_c.clone();
+                    async move {
+                        if path.ends_with("/StartUpload") {
+                            let cgen = {
+                                let guard = eng_c.inner.lock().await;
+                                guard
+                                    .as_ref()
+                                    .unwrap()
+                                    .contacts
+                                    .iter()
+                                    .find(|c| c.peer == peer)
+                                    .unwrap()
+                                    .state
+                                    .conversation_gen
+                            };
+                            eng_c.delete_for_gen(peer, cgen).await.unwrap();
+                            return sign_in_403();
+                        }
+                        Ok((200, vec![]))
+                    }
+                });
+                let file = super::attachments::ChunkSource::Bytes {
+                    name: "late403.bin".into(),
+                    mime: "application/octet-stream".into(),
+                    data: Arc::new(vec![0x42u8; 64]),
+                };
+                assert!(eng.send_attachment(peer, file).await.is_err());
+            }
+            assert_eq!(
+                eng.ui.dialog.get_untracked(),
+                None,
+                "R23-P2-1 (1b): late 403 on send_attachment StartUpload after chat deletion must not open Dialog::SignIn"
+            );
+            crate::transport::on_sign_in_required(|| {});
+        }
+
+        // 1c: `start_waiting` (`StartUpload`) late 403 after chat deletion -> no `Dialog::SignIn`,
+        //     no leaked file handle in `self.uploads`, and no ghost paused upload card in `ui.uploads`.
+        {
+            let (eng, peer, _) = established_engine_on_localhost().await;
+            eng.startup.set_can_sign_in_here(true);
+            let eng_hook = eng.clone();
+            crate::transport::on_sign_in_required(move || {
+                eng_hook.refused_for_sign_in();
+            });
+            let cgen = {
+                let guard = eng.inner.lock().await;
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .contacts
+                    .iter()
+                    .find(|c| c.peer == peer)
+                    .unwrap()
+                    .state
+                    .conversation_gen
+            };
+            let file = super::attachments::ChunkSource::Bytes {
+                name: "waiting403.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: Arc::new(vec![0x55u8; 32]),
+            };
+            eng.wait_for_sign_in(peer, cgen, file.clone())
+                .await
+                .unwrap();
+            let waiting_id = {
+                let guard = eng.inner.lock().await;
+                let uploads = guard
+                    .as_ref()
+                    .unwrap()
+                    .vault
+                    .uploads(Some(&peer))
+                    .await
+                    .unwrap();
+                assert_eq!(uploads.len(), 1);
+                <[u8; 16]>::try_from(uploads[0].1.id.as_slice()).unwrap()
+            };
+            {
+                let eng_c = eng.clone();
+                let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                    let path = path.to_string();
+                    let eng_c = eng_c.clone();
+                    async move {
+                        if path.ends_with("/StartUpload") {
+                            eng_c.delete_for_gen(peer, cgen).await.unwrap();
+                            return sign_in_403();
+                        }
+                        Ok((200, vec![]))
+                    }
+                });
+                eng.start_waiting(peer, waiting_id, file).await.unwrap();
+            }
+            assert_eq!(
+                eng.ui.dialog.get_untracked(),
+                None,
+                "R23-P2-1 (1c): late 403 on start_waiting after chat deletion must not open Dialog::SignIn"
+            );
+            assert!(
+                !eng.has_file(&peer, &waiting_id),
+                "R23-P2-1 (1c): late 403 on start_waiting after chat deletion must not re-cache file handle"
+            );
+            assert!(
+                eng.ui.uploads.get_untracked().is_empty(),
+                "R23-P2-1 (1c): late 403 on start_waiting after chat deletion must not show ghost upload card"
+            );
+            crate::transport::on_sign_in_required(|| {});
+        }
+
+        // 1d: `upload_chunks` (`PutChunk` via `Fetch::reporting_without_refused_hook`) late 403
+        //     after upload cancellation -> no `Dialog::SignIn`.
+        {
+            let (eng, peer, _) = established_engine_on_localhost().await;
+            eng.startup.set_can_sign_in_here(true);
+            let eng_hook = eng.clone();
+            crate::transport::on_sign_in_required(move || {
+                eng_hook.refused_for_sign_in();
+            });
+            let att_id = [0xd1u8; 16];
+            let att_tok = [0xd2u8; 16];
+            let att_key = [0xd3u8; 32];
+            let data = Arc::new(vec![0x77u8; 128]);
+            let mut pending = crate::vault::PendingUpload {
+                id: att_id.to_vec(),
+                token: att_tok.to_vec(),
+                key: att_key.to_vec(),
+                expires: crate::util::now().saturating_add(3_600_000),
+                name: "chunk403.bin".into(),
+                mime: "application/octet-stream".into(),
+                size: data.len() as u64,
+                uploaded: 0,
+                encrypted: 0,
+                prefix_hash: sha2::Sha256::digest([]).to_vec(),
+                announced: true,
+                history_index: 0,
+                upload_state: crate::vault::UPLOAD_STATE_ANNOUNCED,
+                sealed_chunk_hash: Vec::new(),
+            };
+            {
+                let guard = eng.inner.lock().await;
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .vault
+                    .save_upload(&peer, &pending)
+                    .await
+                    .unwrap();
+            }
+            let file = super::attachments::ChunkSource::Bytes {
+                name: pending.name.clone(),
+                mime: pending.mime.clone(),
+                data,
+            };
+            let upload = super::attachments::upload_of(&pending).unwrap();
+            {
+                let eng_c = eng.clone();
+                let _mock = crate::transport::mock_fetch_async(move |_s, path, _b| {
+                    let path = path.to_string();
+                    let eng_c = eng_c.clone();
+                    async move {
+                        if path.ends_with("/PutChunk") {
+                            eng_c.uploads.mark_cancelled(att_id);
+                            return sign_in_403();
+                        }
+                        Ok((200, vec![]))
+                    }
+                });
+                let _ = eng
+                    .upload_chunks(
+                        &peer,
+                        &mut pending,
+                        &upload,
+                        &file,
+                        sha2::Sha256::new(),
+                        HashMap::new(),
+                    )
+                    .await;
+            }
+            assert_eq!(
+                eng.ui.dialog.get_untracked(),
+                None,
+                "R23-P2-1 (1d): late 403 on PutChunk after upload cancellation must not open Dialog::SignIn"
+            );
+            crate::transport::on_sign_in_required(|| {});
+        }
+    });
+
+    // Part 2 (R23-P2-2): Malformed empty-token `UPLOAD_STATE_ANNOUNCED` and `UPLOAD_STATE_STARTED`
+    // records must NOT be misclassified as unstarted waiting rows by `restore_uploads_from_vault`,
+    // `prepare_cancel_uploads_for_failed`, `cancel_held_for_gen`, or `resume_upload_source`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        let ann_id = [0xe1u8; 16];
+        let ann_key = [0xe2u8; 32];
+        let started_id = [0xe3u8; 16];
+        let started_key = [0xe4u8; 32];
+        let (ann_idx, cgen) = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            let ann_idx = c.state.history_len;
+            c.state.history_len += 1;
+            let cgen = c.state.conversation_gen;
+            let mut p_ann = crate::vault::PendingUpload::default();
+            p_ann.id = ann_id.to_vec();
+            p_ann.token = Vec::new(); // malformed empty upload token!
+            p_ann.key = ann_key.to_vec();
+            p_ann.name = "empty_tok_announced.bin".into();
+            p_ann.size = 64;
+            p_ann.history_index = ann_idx;
+            p_ann.announced = true;
+            p_ann.upload_state = crate::vault::UPLOAD_STATE_ANNOUNCED;
+
+            let mut p_started = crate::vault::PendingUpload::default();
+            p_started.id = started_id.to_vec();
+            p_started.token = Vec::new(); // malformed empty upload token!
+            p_started.key = started_key.to_vec();
+            p_started.name = "empty_tok_started.bin".into();
+            p_started.size = 64;
+            p_started.history_index = 0;
+            p_started.announced = false;
+            p_started.upload_state = crate::vault::UPLOAD_STATE_STARTED;
+            inner.vault.save_upload(&peer, &p_ann).await.unwrap();
+            inner.vault.save_upload(&peer, &p_started).await.unwrap();
+            inner.save_state().await.unwrap();
+            (ann_idx, cgen)
+        };
+
+        // 2a: `restore_uploads_from_vault` preserves malformed empty-token ANNOUNCED & STARTED
+        // records instead of forgetting them as stale unstarted waiting rows!
+        eng.restore_uploads_from_vault().await.unwrap();
+        {
+            let guard = eng.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(
+                inner.vault.upload(&peer, &ann_id).await.unwrap().is_some(),
+                "R23-P2-2: restore_uploads_from_vault must not forget empty-token ANNOUNCED upload"
+            );
+            assert!(
+                inner
+                    .vault
+                    .upload(&peer, &started_id)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "R23-P2-2: restore_uploads_from_vault must not forget empty-token STARTED upload"
+            );
+        }
+
+        // 2b: `cancel_held_for_gen` at `ann_idx` (no `awaits_upload` outbox entry) must NOT treat
+        // the empty-token `UPLOAD_STATE_ANNOUNCED` record as a stale unstarted waiting row and
+        // forget its delete key!
+        eng.cancel_held_for_gen(peer, ann_idx, cgen).await.unwrap();
+        {
+            let guard = eng.inner.lock().await;
+            let inner = guard.as_ref().unwrap();
+            assert!(
+                inner.vault.upload(&peer, &ann_id).await.unwrap().is_some(),
+                "R23-P2-2: cancel_held_for_gen must not forget empty-token ANNOUNCED upload as stale waiting"
+            );
+        }
+
+        // 2c: `resume_upload_source` on empty-token `UPLOAD_STATE_STARTED` must NOT route into
+        // `start_waiting` (and must fail cleanly instead of allocating a second upload!).
+        let start_upload_calls = Rc::new(Cell::new(0usize));
+        {
+            let sc = start_upload_calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/StartUpload") {
+                    sc.set(sc.get() + 1);
+                }
+                Ok((200, vec![]))
+            });
+            let file = super::attachments::ChunkSource::Bytes {
+                name: "empty_tok_started.bin".into(),
+                mime: "application/octet-stream".into(),
+                data: Arc::new(vec![0x11u8; 64]),
+            };
+            let _ = eng
+                .resume_upload_source(peer, started_id, Some(file))
+                .await;
+        }
+        assert_eq!(
+            start_upload_calls.get(),
+            0,
+            "R23-P2-2: resume_upload_source on empty-token STARTED upload must not call StartUpload via start_waiting"
+        );
+
+        // 2d: `prepare_cancel_uploads_for_failed` recovers `DeleteCompleted(ann_key)` from
+        // `pending.key` even with NO history entry in `by_id`!
+        let jobs = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            eng.prepare_cancel_uploads_for_failed(inner, &peer, &[ann_idx])
+                .await
+        };
+        assert_eq!(
+            jobs.len(),
+            1,
+            "R23-P2-2: prepare_cancel_uploads_for_failed must recover DeleteCompleted from pending.key"
+        );
+        assert_eq!(jobs[0].id, ann_id);
+        match &jobs[0].kind {
+            super::attachments::ServerDeleteKind::DeleteCompleted(key) => {
+                assert_eq!(key.as_slice(), ann_key.as_slice());
+            }
+            super::attachments::ServerDeleteKind::CancelUpload(_) => {
+                panic!("expected DeleteCompleted fallback for empty-token ANNOUNCED upload");
+            }
+        }
+    });
+
+    // Part 3 (R23-P2-3 + R23-P3-1): ServerClock domain consistency across `add_received_at`,
+    // `record_deleted_attachment`, `message_at`, `fetching`, `rebuild_outbox`, `Engine::flush`,
+    // unexpirable tombstone preservation when `HistoryEntry.gone` save fails in `note_gone_inner`,
+    // and reactive `ui.gone` update in `settle_gone_undispatched_outbox`.
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        let local_now = crate::util::now();
+
+        // 3a: Skew `ServerClock` 5 minutes BEHIND local wall clock (`server_now = local_now - 300s`).
+        // An attachment expiring at `local_now - 60s` is STILL LIVE in server time (`expires > server_now`)!
+        let server_behind = local_now.saturating_sub(300_000);
+        let live_in_server_exp = local_now.saturating_sub(60_000);
+        let live_id = [0xf1u8; 16];
+        let live_key = [0xf2u8; 32];
+        let live_ptr = crate::content::AttachmentPointer {
+            id: live_id.to_vec(),
+            key: live_key.to_vec(),
+            name: "skew_live.bin".into(),
+            size: 16,
+            mime: "application/octet-stream".into(),
+            expires: live_in_server_exp,
+        };
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.client.clock().observe(server_behind);
+            let server_now = inner.client.clock().now();
+            assert!(
+                live_in_server_exp > server_now,
+                "precondition: pointer must be unexpired in ServerClock domain"
+            );
+            let c = inner.contact(&peer).unwrap();
+            let (idx, entry) = c
+                .add_received_at(
+                    crate::content::Content {
+                        kind: Some(Kind::Attachment(live_ptr.clone())),
+                        clock: 10,
+                        events: None,
+                    },
+                    false,
+                    server_now,
+                )
+                .unwrap();
+            assert!(
+                !entry.gone,
+                "R23-P2-3: add_received_at must use ServerClock so local clock ahead of server does not mark live attachment gone"
+            );
+            match c.message_at(idx, entry, server_now).body {
+                crate::state::Body::Remote(r) => assert!(
+                    !r.gone,
+                    "R23-P2-3: message_at must keep RemoteFile.gone=false while unexpired in ServerClock"
+                ),
+                other => panic!("expected Remote body, got {other:?}"),
+            }
+            let tomb_id = [0xf3u8; 16];
+            c.record_deleted_attachment(&tomb_id, live_in_server_exp, server_now);
+            c.record_deleted_attachment(&[0xf4u8; 16], live_in_server_exp + 10_000, server_now);
+            assert!(
+                c.is_attachment_deleted(&tomb_id),
+                "R23-P2-3: record_deleted_attachment must not prune tombstones unexpired in ServerClock"
+            );
+        }
+
+        // 3b: Failed `HistoryEntry.gone = true` save in `note_gone_inner` keeps tombstone
+        // unexpirable (`expires = 0`) even after `server_now` advances past `ptr.expires`!
+        let fail_id = [0xf5u8; 16];
+        let fail_key = [0xf6u8; 32];
+        let fail_exp = local_now.saturating_add(10_000);
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.client.clock().observe(local_now);
+            let fail_ptr = crate::content::AttachmentPointer {
+                id: fail_id.to_vec(),
+                key: fail_key.to_vec(),
+                name: "fail_save_gone.bin".into(),
+                size: 16,
+                mime: "application/octet-stream".into(),
+                expires: fail_exp,
+            };
+            let idx = {
+                let c = inner.contact(&peer).unwrap();
+                let idx = c.state.history_len;
+                c.state.history_len += 1;
+                idx
+            };
+            let entry = HistoryEntry {
+                outgoing: true,
+                at: local_now,
+                content: Some(crate::content::Content {
+                    kind: Some(Kind::Attachment(fail_ptr)),
+                    clock: 11,
+                    events: None,
+                }),
+                place: 11,
+                gone: false,
+                ..HistoryEntry::default()
+            };
+            inner.save(&[(peer, idx, entry)]).await.unwrap();
+            // Fail ONLY `inner.save(&records(...))`, allowing fallback `inner.save_state()` to commit!
+            inner
+                .vault
+                .fail_save_once_at_call
+                .set(Some(inner.vault.save_count.get()));
+            let err = eng
+                .note_gone_inner(eng.vault_gen(), inner, &peer, Some(idx), &fail_id)
+                .await
+                .unwrap_err();
+            assert!(!err.is_empty());
+            assert!(!inner.vault.entry(&peer, idx).await.unwrap().unwrap().gone);
+            let tomb = inner
+                .contact(&peer)
+                .unwrap()
+                .state
+                .deleted_attachments
+                .iter()
+                .find(|d| d.id.as_slice() == fail_id.as_slice())
+                .expect("tombstone must remain present");
+            assert_eq!(
+                tomb.expires, 0,
+                "R23-P2-3: tombstone must remain unexpirable (expires=0) when HistoryEntry.gone save fails"
+            );
+            // Advance server clock well past `fail_exp` and trigger pruning: tombstone MUST survive!
+            let future_server = fail_exp.saturating_add(600_000);
+            inner.client.clock().observe(future_server);
+            let sn = inner.client.clock().now();
+            inner
+                .contact(&peer)
+                .unwrap()
+                .record_deleted_attachment(&[0xf7u8; 16], future_server + 60_000, sn);
+            assert!(
+                inner.contact(&peer).unwrap().is_attachment_deleted(&fail_id),
+                "R23-P2-3: unexpirable tombstone must survive past ptr.expires until HistoryEntry.gone commits"
+            );
+        }
+
+        // 3c: ServerClock AHEAD of `ptr.expires` (even though local wall clock is BEHIND `ptr.expires`)
+        // marks the pointer expired in `message_at`, `fetching`, `rebuild_outbox`, AND `Engine::flush`
+        // (settling locally via `settle_gone_undispatched_outbox` with 0 PushV2 AND inserting into
+        // `ui.gone` — `R23-P3-1`!).
+        let exp_id = [0xf8u8; 16];
+        let exp_key = [0xf9u8; 32];
+        let exp_ts = local_now.saturating_add(60_000); // future in local wall clock!
+        let server_ahead = local_now.saturating_add(600_000); // past `exp_ts` in ServerClock!
+        let exp_ptr = crate::content::AttachmentPointer {
+            id: exp_id.to_vec(),
+            key: exp_key.to_vec(),
+            name: "server_expired.bin".into(),
+            size: 16,
+            mime: "application/octet-stream".into(),
+            expires: exp_ts,
+        };
+        let exp_idx = {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            inner.client.clock().observe(server_ahead);
+            let sn = inner.client.clock().now();
+            assert!(exp_ts <= sn);
+
+            let exp_kind = Kind::Attachment(exp_ptr.clone());
+            let exp_raw = exp_kind.to_bytes();
+            let c = inner.contact(&peer).unwrap();
+            let idx = c.state.history_len;
+            c.state.history_len += 1;
+            let mut entry = HistoryEntry {
+                outgoing: true,
+                at: local_now,
+                content: Some(crate::content::Content {
+                    kind: Some(exp_kind),
+                    clock: 12,
+                    events: None,
+                }),
+                place: 0,
+                gone: false,
+                ..HistoryEntry::default()
+            };
+            entry.set_delivery(Delivery::Pending);
+            match c.message_at(idx, entry.clone(), sn).body {
+                crate::state::Body::Remote(r) => assert!(
+                    r.gone,
+                    "R23-P2-3: message_at must mark attachment gone when expires <= server_now"
+                ),
+                other => panic!("expected Remote body, got {other:?}"),
+            }
+            c.state.outbox.push(crate::vault::Outgoing {
+                history_index: idx,
+                clock: 12,
+                sealed: true,
+                dispatched: false,
+                awaits_upload: false,
+                content_digest: crate::vault::content_kind_digest(&exp_raw).to_vec(),
+                attachment_id: exp_id.to_vec(),
+            });
+            inner
+                .save_with(
+                    &[(peer, idx, entry)],
+                    &[(peer, idx, Some(OutgoingRecord::unsealed(exp_raw.clone())))],
+                )
+                .await
+                .unwrap();
+
+            // `requeue_sealed` (`rebuild_outbox`) must exclude the expired pointer!
+            let rq = inner.requeue_sealed(&peer).await.unwrap();
+            assert!(
+                !rq.outbox.iter().any(|(_, i, rec)| *i == idx && rec.is_some()),
+                "R23-P2-3: rebuild_outbox must exclude attachment expired in ServerClock"
+            );
+
+            // Re-stage un-dispatched expired attachment in outbox for `Engine::flush` + `R23-P3-1`!
+            let c = inner.contact(&peer).unwrap();
+            c.state.outbox.clear();
+            c.state.outbox.push(crate::vault::Outgoing {
+                history_index: idx,
+                clock: 0,
+                sealed: false,
+                dispatched: false,
+                awaits_upload: false,
+                content_digest: crate::vault::content_kind_digest(&exp_raw).to_vec(),
+                attachment_id: exp_id.to_vec(),
+            });
+            inner
+                .save_with(&[], &[(peer, idx, Some(OutgoingRecord::unsealed(exp_raw)))])
+                .await
+                .unwrap();
+            idx
+        };
+
+        // `fetching` marks `known_gone == true` when expired in ServerClock!
+        let fetching = eng.fetching(peer, exp_idx, &exp_ptr).await.unwrap();
+        assert!(
+            fetching.known_gone,
+            "R23-P2-3: Engine::fetching must set known_gone=true when expires <= server_now"
+        );
+
+        // `Engine::flush` settles expired un-dispatched attachment locally (0 PushV2) AND
+        // inserts `(peer, exp_idx)` into reactive `self.ui.gone` (`R23-P3-1`)!
+        let push_calls = Rc::new(Cell::new(0usize));
+        {
+            let pc = push_calls.clone();
+            let _mock = crate::transport::mock_fetch(move |_s, path, _b| {
+                if path.ends_with("/PushV2") {
+                    pc.set(pc.get() + 1);
+                }
+                Ok((200, vec![]))
+            });
+            eng.flush(&peer).await.unwrap();
+        }
+        assert_eq!(
+            push_calls.get(),
+            0,
+            "R23-P2-3: Engine::flush must not seal or push an attachment expired in ServerClock"
+        );
+        assert!(
+            eng.ui
+                .gone
+                .with_untracked(|g| g.contains(&(peer, exp_idx))),
+            "R23-P3-1: settle_gone_undispatched_outbox must insert (peer, idx) into ui.gone"
+        );
+    });
+
+    // Part 4 (R23-P2-5): Crossed `start_chat(..., pin_pq = false)` observing a peer's signed
+    // `PQ-ON` manifest onto a quarantined classical contact MUST set `quarantined_was_pq_pinned`
+    // and `record_policy_error(DowngradeDetected)` (`SECURITY_ALERT_DOWNGRADE`).
+    pool.run_until(async {
+        let (eng, peer, _) = established_engine_on_localhost().await;
+        let digest = [0xabu8; 32];
+        let info = super::handshake::ClaimedManifestInfo {
+            seq: 3,
+            digest,
+            pq_enabled: true,
+            server_pq_disabled_fallback: false,
+        };
+        {
+            let mut guard = eng.inner.lock().await;
+            let inner = guard.as_mut().unwrap();
+            let c = inner.contact(&peer).unwrap();
+            // Simulate an unpinned inbound quarantined classical contact:
+            c.session.peer_pq_state_mut().pq_pinned = false;
+            c.session.peer_pq_state_mut().peer_pq_capable = false;
+            c.session.peer_pq_state_mut().downgrade_detected = false;
+            c.session.peer_pq_state_mut().pinned_manifest_seq = 0;
+            c.session.peer_pq_state_mut().pinned_manifest_digest = None;
+            c.state.quarantined = true;
+            c.state.quarantined_primary = true;
+            c.state.quarantined_was_pq_pinned = false;
+            c.state.security_alert = crate::vault::SECURITY_ALERT_NONE;
+
+            let (mutated, equivocated) =
+                super::handshake::apply_observed_start_chat_manifests(c, None, Some(info));
+            assert!(mutated);
+            assert!(!equivocated);
+            assert!(c.session.peer_pq_state().pq_pinned);
+            assert!(c.session.peer_pq_state().peer_pq_capable);
+            assert!(
+                c.state.quarantined_was_pq_pinned,
+                "R23-P2-5: observing signed PQ-ON onto a quarantined classical contact must set quarantined_was_pq_pinned"
+            );
+            assert!(
+                c.session.peer_pq_state().downgrade_detected,
+                "R23-P2-5: observing signed PQ-ON onto a quarantined classical contact must set downgrade_detected"
+            );
+            assert_eq!(
+                c.state.security_alert,
+                crate::vault::SECURITY_ALERT_DOWNGRADE,
+                "R23-P2-5: observing signed PQ-ON onto a quarantined classical contact must set SECURITY_ALERT_DOWNGRADE"
+            );
+            assert!(c.view().classical_hard_blocked);
         }
     });
 }

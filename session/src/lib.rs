@@ -2685,11 +2685,22 @@ impl<M> Session<M> {
         // manifest sequence order so accepting a newer signed PQ-OFF manifest is not clobbered.
         let was_pq_pinned = state.peer_pq.pq_pinned;
         let was_pq_capable = state.peer_pq.peer_pq_capable;
+        let keep_capable_under_downgrade = (state.peer_pq.downgrade_detected
+            || new.peer_pq.downgrade_detected)
+            && state.peer_pq.peer_pq_capable;
         state.peer_pq.pq_pinned |= new.peer_pq.pq_pinned;
         if new.peer_pq.pinned_manifest_seq > state.peer_pq.pinned_manifest_seq {
             state.peer_pq.pinned_manifest_seq = new.peer_pq.pinned_manifest_seq;
             state.peer_pq.pinned_manifest_digest = new.peer_pq.pinned_manifest_digest;
-            state.peer_pq.peer_pq_capable = new.peer_pq.peer_pq_capable;
+            // R23-P2-4: Mirror `R22-P3-1` — never let a signed PQ-OFF manifest clear
+            // `peer_pq_capable` while a live downgrade alarm is active (even when
+            // `local_pq_enabled == false`), otherwise a subsequent `approve_classical_exception()`
+            // would see `!peer_pq_capable` and erase `downgrade_detected`.
+            state.peer_pq.peer_pq_capable = if keep_capable_under_downgrade {
+                true
+            } else {
+                new.peer_pq.peer_pq_capable
+            };
         } else if new.peer_pq.pinned_manifest_seq == state.peer_pq.pinned_manifest_seq {
             if state.peer_pq.pinned_manifest_digest.is_none() {
                 state.peer_pq.pinned_manifest_digest = new.peer_pq.pinned_manifest_digest;

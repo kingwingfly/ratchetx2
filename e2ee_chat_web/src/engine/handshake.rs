@@ -46,11 +46,11 @@ const OPK_FALLBACK_PROBE_COOLDOWN_MS: u64 = 60 * 60 * 1000;
 /// `finish_existing_contact_start_chat` can commit monotonic manifest pins and detect equivocation
 /// before accepting or blocking the existing contact (`R22-P2-2`, `R22-P2-4`).
 #[derive(Clone, Copy)]
-struct ClaimedManifestInfo {
-    seq: u64,
-    digest: [u8; 32],
-    pq_enabled: bool,
-    server_pq_disabled_fallback: bool,
+pub(super) struct ClaimedManifestInfo {
+    pub(super) seq: u64,
+    pub(super) digest: [u8; 32],
+    pub(super) pq_enabled: bool,
+    pub(super) server_pq_disabled_fallback: bool,
 }
 
 impl ClaimedManifestInfo {
@@ -69,7 +69,7 @@ impl ClaimedManifestInfo {
 /// evaluating Phase-A / Phase-B PQ block policy (`R21-P2-3`, `R22-P2-2`, `R22-P2-4`).
 ///
 /// Returns `(mutated, equivocated)`.
-fn apply_observed_start_chat_manifests(
+pub(super) fn apply_observed_start_chat_manifests(
     contact: &mut Contact,
     off_pin: Option<(u64, [u8; 32])>,
     claimed: Option<ClaimedManifestInfo>,
@@ -77,6 +77,7 @@ fn apply_observed_start_chat_manifests(
     let before_pq = contact.session.peer_pq_state().clone();
     let before_alert = contact.state.security_alert;
     let before_prompt = contact.state.classical_approval_needed;
+    let before_q_pinned = contact.state.quarantined_was_pq_pinned;
     let mut equivocated = false;
 
     if let Some((seq, digest)) = off_pin {
@@ -114,6 +115,12 @@ fn apply_observed_start_chat_manifests(
                         ppq.pq_pinned = true;
                         ppq.clear_classical_exception();
                         contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                        // R23-P2-5: A verified signed PQ-ON manifest directly contradicts a
+                        // quarantined classical contact; escalate to a hard downgrade alarm.
+                        if contact.state.quarantined {
+                            contact.state.quarantined_was_pq_pinned = true;
+                            contact.record_policy_error(ErrorKind::DowngradeDetected);
+                        }
                     }
                 }
             } else if !contact.state.quarantined
@@ -163,6 +170,10 @@ fn apply_observed_start_chat_manifests(
                     ppq.pq_pinned = true;
                     ppq.clear_classical_exception();
                     contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                    if contact.state.quarantined {
+                        contact.state.quarantined_was_pq_pinned = true;
+                        contact.record_policy_error(ErrorKind::DowngradeDetected);
+                    }
                 }
             }
         }
@@ -170,7 +181,8 @@ fn apply_observed_start_chat_manifests(
 
     let mutated = *contact.session.peer_pq_state() != before_pq
         || contact.state.security_alert != before_alert
-        || contact.state.classical_approval_needed != before_prompt;
+        || contact.state.classical_approval_needed != before_prompt
+        || contact.state.quarantined_was_pq_pinned != before_q_pinned;
     (mutated, equivocated)
 }
 
@@ -1708,6 +1720,7 @@ impl<V: VaultStore> Engine<V> {
                 Content::from_bytes(&first_message).kind,
                 Some(Kind::Hello(ref hello)) if hello.pq_capable
             );
+        let server_now = inner.client.clock().now();
         let existing = inner.contacts.iter().position(|c| c.peer == *peer);
         let contact = match existing {
             Some(index) => {
@@ -1886,7 +1899,7 @@ impl<V: VaultStore> Engine<V> {
             }
         }
         // Defer read receipts until `save_initial_batch` confirms the chat is open and visible.
-        let (index, entry) = match contact.add_received(content, false) {
+        let (index, entry) = match contact.add_received_at(content, false, server_now) {
             Ok(record) => record,
             Err(reason) => {
                 self.ui.log(format!(
@@ -1900,7 +1913,7 @@ impl<V: VaultStore> Engine<V> {
             let (counts_unread, clock) = entry_read_tracking(&entry);
             batch.views.push((
                 *peer,
-                contact.message(index, entry.clone()),
+                contact.message_at(index, entry.clone(), server_now),
                 DisplayedEntry {
                     index,
                     counts_unread,

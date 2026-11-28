@@ -1514,11 +1514,13 @@ impl PendingUpload {
     }
 
     /// Whether its upload started, so that the server has it, under its ID.
+    #[cfg(test)]
     pub fn started(&self) -> bool {
         self.has_started_state() && !self.token.is_empty()
     }
 
     /// Whether the server-assigned attachment pointer has been durably announced in chat history.
+    #[cfg(test)]
     pub fn is_announced(&self) -> bool {
         self.has_announced_state() && !self.token.is_empty()
     }

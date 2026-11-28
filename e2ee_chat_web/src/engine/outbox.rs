@@ -555,7 +555,7 @@ impl<V: VaultStore> Engine<V> {
                                             // `forget_upload`), detect durable completion via
                                             // `chunks_kept`, forget the stale upload, and clear
                                             // its paused card/cache.
-                                            if pending.started()
+                                            if pending.has_started_state()
                                                 && !self.uploads.is_running(&att_id)
                                             {
                                                 let total_chunks =
@@ -721,62 +721,63 @@ impl<V: VaultStore> Engine<V> {
                                 }
                             }
                         }
-                        // R17-P1-4 + R22-P2-11: Check both in-memory cancellation AND durable
-                        // `ContactState.deleted_attachments` / `HistoryEntry.gone` before sealing
-                        // or pushing any un-dispatched attachment (even after reload once upload
-                        // checkpoints are gone).
-                        let has_deleted_attachments = inner
-                            .contacts
-                            .iter()
-                            .any(|c| c.peer == *peer && !c.state.deleted_attachments.is_empty());
+                        // R17-P1-4 + R22-P2-11 + R23-P2-3: Check in-memory cancellation, durable
+                        // `ContactState.deleted_attachments` / `HistoryEntry.gone`, AND server-clock
+                        // expiry (`ptr.expires <= server_now`) before sealing or pushing any
+                        // un-dispatched attachment (even after reload once upload checkpoints are
+                        // gone).
+                        let server_now = inner.client.clock().now();
                         let mut first_dispatch_entry_gone = false;
-                        if first_dispatch_att_id.is_some()
-                            || self.uploads.has_any_cancelled()
-                            || has_deleted_attachments
-                        {
-                            match inner.vault.entry(peer, outgoing.history_index).await {
-                                _ if !self.is_live(vgen) => return Ok(false),
-                                Ok(Some(entry)) => {
-                                    first_dispatch_entry_gone = entry.gone;
+                        let mut first_dispatch_att_expired = false;
+                        match inner.vault.entry(peer, outgoing.history_index).await {
+                            _ if !self.is_live(vgen) => return Ok(false),
+                            Ok(Some(entry)) => {
+                                first_dispatch_entry_gone = entry.gone;
+                                if let Some(Kind::Attachment(ptr)) =
+                                    entry.content.as_ref().and_then(|c| c.kind.as_ref())
+                                {
+                                    if ptr.expires > 0 && ptr.expires <= server_now {
+                                        first_dispatch_att_expired = true;
+                                    }
                                     if first_dispatch_att_id.is_none()
-                                        && let Some(Kind::Attachment(ptr)) =
-                                            entry.content.as_ref().and_then(|c| c.kind.as_ref())
                                         && let Ok(att_id) = <[u8; 16]>::try_from(ptr.id.as_slice())
                                     {
                                         first_dispatch_att_id = Some(att_id);
                                     }
                                 }
-                                Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {
-                                    if first_dispatch_att_id.is_none() && !outgoing.sealed {
-                                        match inner
-                                            .vault
-                                            .outgoing(peer, outgoing.history_index)
-                                            .await
-                                        {
-                                            _ if !self.is_live(vgen) => return Ok(false),
-                                            Ok(rec) => {
-                                                if let Some(Kind::Attachment(ptr)) =
-                                                    Kind::from_bytes(&rec.content)
+                            }
+                            Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {
+                                if !outgoing.sealed {
+                                    match inner.vault.outgoing(peer, outgoing.history_index).await {
+                                        _ if !self.is_live(vgen) => return Ok(false),
+                                        Ok(rec) => {
+                                            if let Some(Kind::Attachment(ptr)) =
+                                                Kind::from_bytes(&rec.content)
+                                            {
+                                                if ptr.expires > 0 && ptr.expires <= server_now {
+                                                    first_dispatch_att_expired = true;
+                                                }
+                                                if first_dispatch_att_id.is_none()
                                                     && let Ok(att_id) =
                                                         <[u8; 16]>::try_from(ptr.id.as_slice())
                                                 {
                                                     first_dispatch_att_id = Some(att_id);
                                                 }
                                             }
-                                            Err(crate::vault::Error::Corrupt(_)) => {}
-                                            Err(e) => {
-                                                result = Err(describe(&e));
-                                                step = NextPush::Done;
-                                                break;
-                                            }
+                                        }
+                                        Err(crate::vault::Error::Corrupt(_)) => {}
+                                        Err(e) => {
+                                            result = Err(describe(&e));
+                                            step = NextPush::Done;
+                                            break;
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    result = Err(describe(&e));
-                                    step = NextPush::Done;
-                                    break;
-                                }
+                            }
+                            Err(e) => {
+                                result = Err(describe(&e));
+                                step = NextPush::Done;
+                                break;
                             }
                         }
                         if first_dispatch_att_id.is_some_and(|id| self.is_cancelled(&id)) {
@@ -784,6 +785,7 @@ impl<V: VaultStore> Engine<V> {
                             break;
                         }
                         let durably_deleted = first_dispatch_entry_gone
+                            || first_dispatch_att_expired
                             || first_dispatch_att_id.is_some_and(|id| {
                                 inner
                                     .contacts
@@ -1450,7 +1452,7 @@ impl<V: VaultStore> Engine<V> {
                         known_at_dispatch,
                         first_dispatch,
                     } = *prepared;
-                    let push_res: session::Result<()> = Fetch::client(&server)
+                    let push_res: session::Result<()> = Fetch::client_without_refused_hook(&server)
                         .push_v2(push_req)
                         .await
                         .map(|_| ())
@@ -2415,6 +2417,11 @@ impl<V: VaultStore> Engine<V> {
             return Ok(false);
         }
         self.release(peer, idx);
+        // R23-P3-1: Mirror the newly persisted `entry.gone = true` into reactive `self.ui.gone`
+        // so the open chat immediately hides the delete control without waiting for reload.
+        self.ui.gone.update(|gone| {
+            gone.insert((*peer, idx));
+        });
         if let Some(id) = att_id {
             self.uploads.clear_server_completed(&id);
             self.remove_attachment_caches(peer, &id);
@@ -3378,6 +3385,7 @@ impl<V: VaultStore> Inner<V> {
         }
         // If saving fails, the message is forgotten: it never left.
         self.with_contact_tx(peer, async |inner| {
+            let server_now = inner.client.clock().now();
             let contact = inner
                 .contact(peer)
                 .ok_or_else(|| "no such chat".to_string())?;
@@ -3412,7 +3420,7 @@ impl<V: VaultStore> Inner<V> {
                 ..HistoryEntry::default()
             };
             contact.record_last_message(&entry);
-            let view = contact.message(index, entry.clone());
+            let view = contact.message_at(index, entry.clone(), server_now);
             inner
                 .save_with(&[(*peer, index, entry)], &[(*peer, index, Some(record))])
                 .await
@@ -3443,6 +3451,7 @@ impl<V: VaultStore> Inner<V> {
             return Err("approve classical encryption or upgrade to post-quantum first".into());
         }
         self.with_contact_tx(peer, async |inner| {
+            let server_now = inner.client.clock().now();
             let contact = inner
                 .contact(peer)
                 .ok_or_else(|| "no such chat".to_string())?;
@@ -3474,7 +3483,7 @@ impl<V: VaultStore> Inner<V> {
                 ..HistoryEntry::default()
             };
             contact.record_last_message(&entry);
-            let view = contact.message(index, entry.clone());
+            let view = contact.message_at(index, entry.clone(), server_now);
             inner
                 .promote_upload_with(
                     peer,
@@ -3961,6 +3970,7 @@ impl<V: VaultStore> Inner<V> {
                     .or_insert_with(|| o.content_digest.clone());
             }
         }
+        let server_now = self.client.clock().now();
         let mut outcome = RequeueOutcome::default();
         for &index in again.union(&sealed) {
             let entry = match entries.get(&index) {
@@ -3991,6 +4001,7 @@ impl<V: VaultStore> Inner<V> {
                 expected,
                 again.contains(&index),
                 &effective_gone,
+                server_now,
             );
         }
         // No contact state changes until every fallible history and file read has completed.
@@ -4008,6 +4019,7 @@ pub(super) struct RequeueOutcome {
     pub(super) outbox: Vec<(PublicKey, u64, Option<OutgoingRecord>)>,
     pub(super) history: Vec<(u64, HistoryEntry)>,
     dropped_missing: BTreeSet<u64>,
+    attachment_ids: BTreeMap<u64, Vec<u8>>,
 }
 
 impl RequeueOutcome {
@@ -4021,25 +4033,31 @@ impl RequeueOutcome {
         expected_digest: &[u8],
         resend: bool,
         pending_gone_ids: &std::collections::HashSet<[u8; 16]>,
+        server_now: u64,
     ) {
         let verified = match (entry, content) {
-            // R18-P1-3 + R20-P2-8: Exclude attachments durably marked `gone` OR queued in
-            // `pending_gone` after a transient save failure so unread requeue after peer deletion
-            // never resends a dead attachment pointer.
+            // R18-P1-3 + R20-P2-8 + R23-P2-3: Exclude attachments durably marked `gone`, queued
+            // in `pending_gone` / `deleted_attachments`, OR already expired according to
+            // `server_now` so unread/session requeue never resends a dead attachment pointer.
             (Some(entry), Some(kind))
                 if !entry.gone
                     && !matches!(
                         &kind,
                         Kind::Attachment(ptr)
-                            if <[u8; 16]>::try_from(ptr.id.as_slice())
-                                .is_ok_and(|id| pending_gone_ids.contains(&id))
+                            if (ptr.expires > 0 && ptr.expires <= server_now)
+                                || <[u8; 16]>::try_from(ptr.id.as_slice())
+                                    .is_ok_and(|id| pending_gone_ids.contains(&id))
                     ) =>
             {
+                let att_id = match &kind {
+                    Kind::Attachment(ptr) if !ptr.id.is_empty() => Some(ptr.id.clone()),
+                    _ => None,
+                };
                 let bytes = kind.to_bytes();
                 let digest_ok = expected_digest.len() == 32
                     && crate::vault::content_kind_digest(&bytes) == expected_digest;
                 if digest_ok {
-                    Ok((entry, bytes))
+                    Ok((entry, bytes, att_id))
                 } else {
                     Err(Some(entry))
                 }
@@ -4047,7 +4065,10 @@ impl RequeueOutcome {
             (entry, _) => Err(entry),
         };
         let record = match verified {
-            Ok((mut entry, bytes)) => {
+            Ok((mut entry, bytes, att_id)) => {
+                if let Some(id) = att_id {
+                    self.attachment_ids.insert(index, id);
+                }
                 if resend {
                     entry.set_delivery(entry.delivery().after(Step::Resent));
                     if entry.delivery() == Delivery::Pending {
@@ -4082,6 +4103,11 @@ impl RequeueOutcome {
                 outgoing.sealed = false;
                 outgoing.clock = 0;
                 outgoing.dispatched = false;
+                if outgoing.attachment_id.is_empty()
+                    && let Some(id) = self.attachment_ids.get(&index)
+                {
+                    outgoing.attachment_id = id.clone();
+                }
             }
             !self.dropped_missing.contains(&index) && !again.contains(&index)
         });
@@ -4092,6 +4118,7 @@ impl RequeueOutcome {
                 .map(|&index| Outgoing {
                     history_index: index,
                     content_digest: expected_digests.get(&index).cloned().unwrap_or_default(),
+                    attachment_id: self.attachment_ids.get(&index).cloned().unwrap_or_default(),
                     ..Default::default()
                 }),
         );

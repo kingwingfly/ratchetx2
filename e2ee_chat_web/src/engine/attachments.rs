@@ -98,13 +98,13 @@ impl ChunkSource {
 /// server deletes never freeze chat/streaming/UI.
 pub(super) struct ServerDeleteJob {
     server: String,
-    id: [u8; 16],
+    pub(super) id: [u8; 16],
     history_index: Option<u64>,
     name: String,
-    kind: ServerDeleteKind,
+    pub(super) kind: ServerDeleteKind,
 }
 
-enum ServerDeleteKind {
+pub(super) enum ServerDeleteKind {
     CancelUpload(Upload),
     DeleteCompleted(Zeroizing<[u8; attachment::KEY_LENGTH]>),
 }
@@ -379,7 +379,8 @@ impl<V: VaultStore> Engine<V> {
             (inner.server.clone(), contact.state.conversation_gen)
         };
         let signs_in_here = same_server(&server, &origin());
-        let started = session::start_upload_with(&Fetch::client(&server), size).await;
+        let started =
+            session::start_upload_with(&Fetch::client_without_refused_hook(&server), size).await;
         if !self.is_live(vgen) {
             if let Ok(upload) = started {
                 let _ = upload.cancel(&Fetch::client(&server)).await;
@@ -649,7 +650,7 @@ impl<V: VaultStore> Engine<V> {
                 }
             }
         };
-        for (peer, pending) in waiting.into_iter().filter(|(_, p)| !p.started()) {
+        for (peer, pending) in waiting.into_iter().filter(|(_, p)| !p.has_started_state()) {
             if !self.is_live(vgen) {
                 return;
             }
@@ -681,7 +682,7 @@ impl<V: VaultStore> Engine<V> {
                             .ok()
                             .flatten()
                             .is_some_and(|p| {
-                                !p.started()
+                                !p.has_started_state()
                                     && inner.contacts.iter().any(|c| {
                                         c.peer == peer
                                             && c.state.outbox.iter().any(|o| {
@@ -740,7 +741,7 @@ impl<V: VaultStore> Engine<V> {
                 .upload(&peer, &waiting)
                 .await
                 .map_err(|e| describe(&e))?
-                .filter(|pending| !pending.started())
+                .filter(|pending| !pending.has_started_state())
             else {
                 return Ok(());
             };
@@ -786,17 +787,45 @@ impl<V: VaultStore> Engine<V> {
             }
             (kept, inner.server.clone(), conv_gen)
         };
-        let started = session::start_upload_with(&Fetch::client(&server), kept.size).await;
+        let started =
+            session::start_upload_with(&Fetch::client_without_refused_hook(&server), kept.size)
+                .await;
         let upload = match started {
             Ok(upload) => upload,
             Err(e) if e.kind() == ErrorKind::SignInRequired => {
                 if !self.is_live(vgen) || self.is_cancelled(&waiting) {
                     return Ok(());
                 }
+                // R23-P2-1: Re-validate conversation generation and waiting outbox entry under
+                // `self.inner` before re-caching `file`, showing a paused card, or opening
+                // `Dialog::SignIn` so a late 403 after chat delete/recreate or cancellation never
+                // leaks file handles or pops a spurious sign-in dialog.
+                let still_awaited = {
+                    let guard = self.lock_inner().await;
+                    self.is_live(vgen)
+                        && !self.is_cancelled(&waiting)
+                        && guard.as_ref().is_some_and(|inner| {
+                            inner.contacts.iter().any(|c| {
+                                c.peer == peer
+                                    && c.state.conversation_gen == conv_gen
+                                    && c.state.outbox.iter().any(|outgoing| {
+                                        outgoing.history_index == kept.history_index
+                                            && outgoing.awaits_upload
+                                            && (outgoing.attachment_id.is_empty()
+                                                || outgoing.attachment_id == kept.id)
+                                    })
+                            })
+                        })
+                };
+                if !still_awaited || !self.is_live(vgen) || self.is_cancelled(&waiting) {
+                    return Ok(());
+                }
                 self.uploads
                     .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
                 self.show_upload(&peer, &kept, UploadState::Paused(WAITS_SIGN_IN.to_string()));
-                self.ask_sign_in();
+                if same_server(&server, &origin()) {
+                    self.ask_sign_in();
+                }
                 return Ok(());
             }
             Err(e) => {
@@ -1099,7 +1128,7 @@ impl<V: VaultStore> Engine<V> {
         if !self.is_live(vgen) {
             return Err(AnnounceError::NotSent("locked".into()));
         }
-        if pending.is_announced() {
+        if pending.has_announced_state() {
             return Ok(Some(pending));
         }
         let id_arr = <[u8; 16]>::try_from(pending.id.as_slice()).ok();
@@ -1361,7 +1390,7 @@ impl<V: VaultStore> Engine<V> {
             }
         };
         // One that waited for a sign-in starts, its message in its place.
-        if !pending.started() {
+        if !pending.has_started_state() {
             let key = (peer, id, attachment_key_hash(&[]));
             let file = file
                 .or_else(|| self.uploads.get_file(&key))
@@ -1707,11 +1736,12 @@ impl<V: VaultStore> Engine<V> {
             return Ok((delete_jobs, should_flush));
         };
         let upload = upload_of(&pending)?;
-        // R17-P2-5: Match `Outgoing.attachment_id` as well as `pending.is_announced()` so a
-        // valid `STARTED` upload whose `ANNOUNCED` save failed AND whose `HistoryEntry` is
-        // missing/corrupt still settles its un-dispatched outbox head before forgetting.
+        // R17-P2-5 + R23-P2-2: Match `Outgoing.attachment_id` as well as
+        // `pending.has_announced_state()` so a valid `STARTED` upload whose `ANNOUNCED` save
+        // failed AND whose `HistoryEntry` is missing/corrupt still settles its un-dispatched
+        // outbox head before forgetting.
         let mut announced_index = pending
-            .is_announced()
+            .has_announced_state()
             .then_some(pending.history_index)
             .or_else(|| {
                 inner.contact(peer).and_then(|c| {
@@ -1929,7 +1959,7 @@ impl<V: VaultStore> Engine<V> {
                 .await
                 .map_err(|e| describe(&e))?;
             let found = uploads.into_iter().find_map(|(_, pending)| {
-                (!pending.started() && pending.history_index == index)
+                (!pending.has_started_state() && pending.history_index == index)
                     .then(|| <[u8; 16]>::try_from(pending.id.as_slice()).ok())
                     .flatten()
             });
@@ -2111,7 +2141,7 @@ impl<V: VaultStore> Engine<V> {
                 continue;
             };
             let matched_index = by_id.get(&id).map(|item| item.index).or_else(|| {
-                (pending.is_announced() || !pending.started())
+                (pending.has_announced_state() || !pending.has_started_state())
                     .then_some(pending.history_index)
                     .filter(|idx| failed_indices.contains(idx))
             });
@@ -2124,7 +2154,7 @@ impl<V: VaultStore> Engine<V> {
             self.ui
                 .uploads
                 .update(|uploads| uploads.retain(|item| item.id != id));
-            if pending.started() {
+            if pending.has_started_state() {
                 if let Ok(upload) = upload_of(&pending) {
                     handled_ids.insert(id);
                     jobs.push(ServerDeleteJob {
@@ -2134,9 +2164,24 @@ impl<V: VaultStore> Engine<V> {
                         name: pending.name.clone(),
                         kind: ServerDeleteKind::CancelUpload(upload),
                     });
+                } else if let Some(key) =
+                    copy_zeroizing_array::<{ attachment::KEY_LENGTH }>(&pending.key)
+                {
+                    // R23-P2-2: Malformed `STARTED`/`ANNOUNCED` record (e.g. empty upload token)
+                    // still carries its 32-byte delete key: enqueue `DeleteCompleted` directly
+                    // before forgetting the record instead of treating it as unstarted.
+                    handled_ids.insert(id);
+                    jobs.push(ServerDeleteJob {
+                        server: server.clone(),
+                        id,
+                        history_index: matched_index,
+                        name: pending.name.clone(),
+                        kind: ServerDeleteKind::DeleteCompleted(key),
+                    });
                 }
-                // If `upload_of(&pending)` fails, leave `id` out of `handled_ids` so the `by_id`
-                // pass below can still attempt `attachment::delete` via `pointer.key`.
+                // If neither `upload_of(&pending)` nor `pending.key` is usable, leave `id` out of
+                // `handled_ids` so the `by_id` pass below can still attempt `attachment::delete`
+                // via `pointer.key`.
             } else {
                 handled_ids.insert(id);
             }
@@ -2311,9 +2356,11 @@ impl<V: VaultStore> Engine<V> {
             // Deleted from the server, e.g. by the peer, who did not want it: the rest need not
             // go up.
             Ok(false) => {
-                let hint = pending.is_announced().then_some(pending.history_index);
+                let hint = pending
+                    .has_announced_state()
+                    .then_some(pending.history_index);
                 let drop_res = self.drop_upload(&peer, id, hint).await;
-                if pending.is_announced() && self.is_live(vgen) {
+                if pending.has_announced_state() && self.is_live(vgen) {
                     let _ = self
                         .note_gone_by_id(&peer, Some(pending.history_index), &id)
                         .await;
@@ -2420,10 +2467,11 @@ impl<V: VaultStore> Engine<V> {
                     Ok(None) | Err(crate::vault::Error::Corrupt(_)) => {}
                     Err(e) => return Err(describe(&e)),
                 }
+                let server_now = inner.client.clock().now();
                 if let Some(contact) = inner.contact(peer) {
                     contact.state.outbox.retain(|o| o.history_index != idx);
                     if mark_gone {
-                        contact.record_deleted_attachment(id, expires);
+                        contact.record_deleted_attachment(id, expires, server_now);
                     }
                 }
                 inner
@@ -2722,12 +2770,14 @@ impl<V: VaultStore> Engine<V> {
         hint_index: Option<u64>,
         id: &[u8; 16],
     ) -> Result<(), String> {
-        // R21-P2-10 + R21-P3-3 + R22-P2-10: Record `id` in `ContactState.deleted_attachments`
-        // FIRST (before `find_all_attachment_entries`) so even a transient history read error
-        // still persists the tombstone in `AppState`.
+        // R21-P2-10 + R21-P3-3 + R22-P2-10 + R23-P2-3: Record `id` in
+        // `ContactState.deleted_attachments` FIRST (before `find_all_attachment_entries`) using
+        // `server_now` from `ServerClock`, with `expires = 0` (unexpirable) until every matching
+        // `HistoryEntry.gone = true` is confirmed persisted.
+        let server_now = inner.client.clock().now();
         let mut recorded_deleted = inner
             .contact(peer)
-            .is_some_and(|contact| contact.record_deleted_attachment(id, 0));
+            .is_some_and(|contact| contact.record_deleted_attachment(id, 0, server_now));
         // R19-P2-3 + R20-P3-2: Locate EVERY history entry carrying attachment `id` (both the
         // original outgoing message and any reflected incoming echo(es)) so deleting from either
         // direction marks all matching rows `gone = true` atomically in one save.
@@ -2737,6 +2787,9 @@ impl<V: VaultStore> Engine<V> {
         {
             Ok(entries) => entries,
             Err(e) => {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.clear_deleted_attachment_expiry(id);
+                }
                 if recorded_deleted {
                     inner.unsaved_state = true;
                     if inner.save_state().await.is_ok() {
@@ -2759,13 +2812,6 @@ impl<V: VaultStore> Engine<V> {
             )
             .max()
             .unwrap_or(0);
-        if max_expires > 0
-            && inner
-                .contact(peer)
-                .is_some_and(|contact| contact.record_deleted_attachment(id, max_expires))
-        {
-            recorded_deleted = true;
-        }
         if to_mark.is_empty() {
             if recorded_deleted && let Err(e) = inner.save_state().await {
                 inner.unsaved_state = true;
@@ -2781,10 +2827,23 @@ impl<V: VaultStore> Engine<V> {
                 to_save.push((index, entry));
             }
         }
-        // R20-P2-8: Persist `gone = true` durably BEFORE flipping `self.ui.gone` so a transient
-        // storage error never hides the delete control while leaving `gone = false` on disk.
+        if max_expires > 0
+            && inner.contact(peer).is_some_and(|contact| {
+                contact.record_deleted_attachment(id, max_expires, server_now)
+            })
+        {
+            recorded_deleted = true;
+        }
+        // R20-P2-8 + R23-P2-3: Persist `gone = true` durably BEFORE flipping `self.ui.gone` so a
+        // transient storage error never hides the delete control while leaving `gone = false` on
+        // disk. If saving `HistoryEntry` fails, revert the tombstone's `expires` to `0`
+        // (unexpirable) before persisting `AppState` so post-expiry pruning can never drop the
+        // tombstone while `HistoryEntry.gone` is still `false`.
         if !to_save.is_empty() {
             if let Err(e) = inner.save(&records(peer, &to_save)).await {
+                if let Some(contact) = inner.contact(peer) {
+                    contact.clear_deleted_attachment_expiry(id);
+                }
                 inner.unsaved_state = true;
                 if inner.save_state().await.is_ok() {
                     inner.unsaved_state = false;
@@ -2818,7 +2877,7 @@ impl<V: VaultStore> Engine<V> {
     /// chunk directly from `verified_chunks` and reading newer chunks from `file` in turn, unless
     /// the upload is cancelled. Returns whether the server still has the attachment: one deleted
     /// meanwhile, e.g. by the peer, is not found.
-    async fn upload_chunks(
+    pub(super) async fn upload_chunks(
         &self,
         peer: &PublicKey,
         pending: &mut PendingUpload,
@@ -2829,13 +2888,23 @@ impl<V: VaultStore> Engine<V> {
     ) -> Result<bool, String> {
         let vgen = self.vault_gen();
         let lock_gen = crate::glue::lock_generation();
-        let server = {
+        let (server, expected_conv_gen) = {
             let guard = self.lock_inner().await;
             if !self.is_live(vgen) {
                 return Ok(true);
             }
-            guard.as_ref().ok_or("locked")?.server.clone()
+            let inner = guard.as_ref().ok_or("locked")?;
+            let Some(conv_gen) = inner
+                .contacts
+                .iter()
+                .find(|c| c.peer == *peer)
+                .map(|c| c.state.conversation_gen)
+            else {
+                return Ok(true);
+            };
+            (inner.server.clone(), conv_gen)
         };
+        let signs_in_here = same_server(&server, &origin());
         // Each chunk shows how far it got as it goes: the bytes before it, and its share of what
         // its request sent.
         let before = Rc::new(Cell::new(0));
@@ -2854,7 +2923,7 @@ impl<V: VaultStore> Engine<V> {
                 });
             })
         };
-        let attachments = Fetch::reporting(&server, progress);
+        let attachments = Fetch::reporting_without_refused_hook(&server, progress);
         for index in pending.uploaded..upload.chunks() {
             if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
                 return Ok(true);
@@ -2890,7 +2959,16 @@ impl<V: VaultStore> Engine<V> {
                 .try_encrypt(index, plaintext.as_slice())
                 .map_err(|e| describe(&e))?;
             if !self
-                .put_chunk(peer, pending, &attachments, upload, index, &chunk)
+                .put_chunk(
+                    peer,
+                    pending,
+                    &attachments,
+                    upload,
+                    index,
+                    &chunk,
+                    expected_conv_gen,
+                    signs_in_here,
+                )
                 .await?
             {
                 return Ok(false);
@@ -2935,6 +3013,7 @@ impl<V: VaultStore> Engine<V> {
 
     /// Upload chunk `index` of `upload`, trying again while the server cannot be reached, unless
     /// the upload is cancelled meanwhile. Returns whether the server still has the attachment.
+    #[allow(clippy::too_many_arguments)]
     async fn put_chunk(
         &self,
         peer: &PublicKey,
@@ -2943,6 +3022,8 @@ impl<V: VaultStore> Engine<V> {
         upload: &Upload,
         index: u32,
         chunk: &[u8],
+        expected_conv_gen: u64,
+        signs_in_here: bool,
     ) -> Result<bool, String> {
         let vgen = self.vault_gen();
         let mut wait = RETRY_MIN;
@@ -2963,6 +3044,30 @@ impl<V: VaultStore> Engine<V> {
                     if !self.is_live(vgen) || self.is_cancelled(upload.id()) {
                         return Ok(true);
                     }
+                }
+                Err(e) if e.kind() == ErrorKind::SignInRequired => {
+                    // R23-P2-1: Open `Dialog::SignIn` ONLY when the vault is still live, the
+                    // upload is not cancelled, the server matches this origin, and the contact
+                    // still exists at `expected_conv_gen`.
+                    if signs_in_here && self.is_live(vgen) && !self.is_cancelled(upload.id()) {
+                        let still_active = {
+                            let guard = self.lock_inner().await;
+                            self.is_live(vgen)
+                                && !self.is_cancelled(upload.id())
+                                && guard.as_ref().is_some_and(|inner| {
+                                    self.may_keep_for_gen(
+                                        inner,
+                                        peer,
+                                        upload.id(),
+                                        Some(expected_conv_gen),
+                                    )
+                                })
+                        };
+                        if still_active && self.is_live(vgen) && !self.is_cancelled(upload.id()) {
+                            self.ask_sign_in();
+                        }
+                    }
+                    return Err(describe(&e));
                 }
                 Err(e) => return Err(describe(&e)),
             }
@@ -3338,18 +3443,20 @@ impl<V: VaultStore> Engine<V> {
             u32::try_from(attachment::chunk_count(pointer.size)).map_err(|_| malformed())?;
         let guard = self.lock_inner().await;
         let inner = guard.as_ref().ok_or("locked")?;
+        let server_now = inner.client.clock().now();
         let (conversation_gen, deleted_in_state) = inner
             .contacts
             .iter()
             .find(|c| c.peer == peer)
             .map(|c| (c.state.conversation_gen, c.is_attachment_deleted(&id)))
             .ok_or("no such chat")?;
-        let entry_gone = if deleted_in_state {
+        let is_expired = expired(pointer, server_now);
+        let entry_gone = if deleted_in_state || is_expired {
             true
         } else {
             matches!(inner.vault.entry(&peer, index).await, Ok(Some(entry)) if entry.gone)
         };
-        let known_gone = deleted_in_state || entry_gone;
+        let known_gone = deleted_in_state || entry_gone || is_expired;
         let unfinished = inner
             .vault
             .upload(&peer, &id)
@@ -3597,7 +3704,7 @@ impl<V: VaultStore> Engine<V> {
                 // type, as an attachment.
                 let sort = entry.sort();
                 let gone = entry.gone;
-                let message = contact.message(index, entry);
+                let message = contact.message_at(index, entry, now);
                 let (name, mime, size) = match &message.body {
                     Body::File(file) => (file.name.clone(), file.mime.clone(), file.size),
                     Body::Remote(remote) => (

@@ -139,6 +139,7 @@ impl<V: VaultStore> Engine<V> {
             check_classical_approval(inner.client.pq_config())?;
             let local_pq = inner.local_pq_enabled();
             let server = inner.server.clone();
+            let server_now = inner.client.clock().now();
             let contact = inner.contact(&peer).ok_or("no such chat")?;
             if expected_gen.is_some_and(|want_gen| contact.state.conversation_gen != want_gen) {
                 return Err("chat changed; please retry.".to_string());
@@ -274,7 +275,7 @@ impl<V: VaultStore> Engine<V> {
                         }
                     }
                     // Record as unread until persisted and confirmed visible on screen.
-                    match contact.add_received(content, false) {
+                    match contact.add_received_at(content, false, server_now) {
                         Ok(entry) => entries.push(entry),
                         Err(reason) => {
                             inner.roll_back(&peer, snapshot)?;
@@ -351,10 +352,11 @@ impl<V: VaultStore> Engine<V> {
                         }
                     })
                     .collect();
+                let server_now = inner.client.clock().now();
                 let views: Option<Vec<_>> = inner.contact(&peer).map(|contact| {
                     entries
                         .into_iter()
-                        .map(|(index, entry)| contact.message(index, entry))
+                        .map(|(index, entry)| contact.message_at(index, entry, server_now))
                         .collect()
                 });
                 if let Some(views) = views {
@@ -768,6 +770,7 @@ impl<V: VaultStore> Engine<V> {
             let mut history_records = vec![];
             let mut added_view = None;
             let mut was_quarantined = false;
+            let server_now = inner.client.clock().now();
             if let Some(contact) = inner.contact(&peer) {
                 was_quarantined = contact.state.quarantined;
                 contact.clear_quarantine_and_alerts();
@@ -802,7 +805,7 @@ impl<V: VaultStore> Engine<V> {
                 ) {
                     contact.mark_index_acked(entry_index);
                     history_records.push((peer, entry_index, entry.clone()));
-                    added_view = Some(contact.message(entry_index, entry));
+                    added_view = Some(contact.message_at(entry_index, entry, server_now));
                 }
             }
             let new_session_id = inner

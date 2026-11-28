@@ -1534,7 +1534,7 @@ impl Engine<Vault> {
                     // R17-P2-3: Never swallow transient `chunks_kept` or `forget_upload` errors;
                     // retain `uploads_restore_needed = true` so `sync()` retries cleanup.
                     let chunks = attachment::chunk_count(pending.size);
-                    if pending.started() {
+                    if pending.has_started_state() {
                         let kept = match inner.vault.chunks_kept(&peer, &pending.id).await {
                             _ if !self.is_live(vgen) => return false,
                             Ok(n) => u64::from(n),
@@ -1557,7 +1557,7 @@ impl Engine<Vault> {
                     }
                     // Stale unstarted waiting upload whose outbox entry was already promoted to a
                     // real upload (or failed/sent) before `forget_upload` committed.
-                    if !pending.started()
+                    if !pending.has_started_state()
                         && !inner.contacts.iter().any(|c| {
                             c.peer == peer
                                 && c.state.outbox.iter().any(|o| {
@@ -1589,7 +1589,7 @@ impl Engine<Vault> {
                         self.abort_cancelled_unlock(vgen).await;
                         return false;
                     }
-                    let reason = if pending.started() {
+                    let reason = if pending.has_started_state() {
                         "choose the file again to go on"
                     } else {
                         self.hold(&peer, pending.history_index);
@@ -1882,7 +1882,7 @@ impl<V: VaultStore> Engine<V> {
                     continue;
                 }
                 let chunks = attachment::chunk_count(pending.size);
-                if pending.started() {
+                if pending.has_started_state() {
                     let kept = match inner.vault.chunks_kept(&peer, &pending.id).await {
                         _ if !self.is_live(vgen) => return Ok(()),
                         Ok(n) => u64::from(n),
@@ -1923,7 +1923,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 present_uploads.insert((peer, id));
                 if !shown_ids.contains(&(peer, id)) {
-                    let reason = if pending.started() {
+                    let reason = if pending.has_started_state() {
                         "choose the file again to go on"
                     } else {
                         self.hold(&peer, pending.history_index);
@@ -2336,6 +2336,7 @@ impl<V: VaultStore> Engine<V> {
         }
         let loaded_start = before.saturating_sub(limit);
         let history = inner.vault.history(peer, before, limit).await;
+        let server_now = inner.client.clock().now();
         let Some(contact) = inner.contact(peer) else {
             return LoadedHistory::Missing;
         };
@@ -2350,7 +2351,7 @@ impl<V: VaultStore> Engine<V> {
                         counts_unread,
                         clock,
                     });
-                    messages.push(contact.message(index, entry));
+                    messages.push(contact.message_at(index, entry, server_now));
                 }
                 order(&mut messages, &inner.client.identity_key(), peer);
                 LoadedHistory::Loaded(LoadedHistoryPage {
@@ -4719,8 +4720,11 @@ impl<V: VaultStore> Engine<V> {
             return;
         }
         let me = inner.client.identity_key();
+        let server_now = inner.client.clock().now();
         let contact = inner.contacts.iter().find(|contact| contact.peer == *peer);
-        let place_updates = self.open_chat.apply_row_changes(peer, contact, entries);
+        let place_updates = self
+            .open_chat
+            .apply_row_changes(peer, contact, entries, server_now);
         if !place_updates.is_empty() {
             self.ui.messages.update(|messages| {
                 for (index, place) in place_updates {

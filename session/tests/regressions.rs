@@ -1811,3 +1811,105 @@ async fn r22_p1_2_p2_1_p3_1_pq_merge_and_policy_regressions() {
     );
     assert!(prep_off.session.peer_pq_state().downgrade_detected);
 }
+
+#[cfg(any(feature = "ml-kem-1024", feature = "ml-kem-768"))]
+#[tokio::test]
+async fn r23_p2_4_merge_preserves_peer_pq_capable_under_downgrade_when_local_pq_off() {
+    let store = SharedStore::default();
+    let (hs, _pq_server_enabled) = common::ToggleableHandshake::new(store.clone(), AUDIENCE);
+
+    let mut alice = Client::new(hs.clone());
+    alice.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+    let mut bob = Client::new(hs.clone());
+    bob.publish_v2(AUDIENCE, 5, 5).await.unwrap();
+    assert_eq!(bob.manifest_seq(), 1);
+
+    // Alice establishes a PQ session with Bob (`pq_pinned = true, peer_pq_capable = true, seq = 1`).
+    let mut live_session = alice
+        .prepare_initiate_v2(
+            AUDIENCE,
+            &bob.identity_key(),
+            &PeerPqState::default(),
+            b"alice-pq-seq1",
+            (),
+        )
+        .await
+        .unwrap()
+        .session;
+    assert!(live_session.peer_pq_state().pq_pinned);
+    assert!(live_session.peer_pq_state().peer_pq_capable);
+    assert_eq!(live_session.peer_pq_state().pinned_manifest_seq, 1);
+
+    // Bob publishes a newer signed PQ-OFF manifest (`seq = 2`).
+    bob.set_pq_config(PqConfig {
+        pq_enabled: false,
+        strict_pq: false,
+        ..PqConfig::default()
+    })
+    .unwrap();
+    bob.publish_v2(AUDIENCE, 5, 0).await.unwrap();
+    assert_eq!(bob.manifest_seq(), 2);
+
+    // Separately prepare a classical replacement session against Bob's `seq = 2` PQ-OFF manifest
+    // using `local_pq_enabled = false` from a snapshot that did not yet have `downgrade_detected`
+    // (so the replacement carries `pinned_manifest_seq = 2, peer_pq_capable = false, downgrade = false`).
+    let mut alice_pq_off = Client::restore(
+        hs.clone(),
+        session::ClientState::try_from(&session::proto::ClientState::from(alice.state())).unwrap(),
+    );
+    alice_pq_off
+        .set_pq_config(PqConfig {
+            pq_enabled: false,
+            strict_pq: false,
+            ..PqConfig::default()
+        })
+        .unwrap();
+    let pre_alarm_state = live_session.peer_pq_state().clone();
+    let claimed_seq2_off = session::claim_peer_bundle_v2(
+        &hs,
+        AUDIENCE,
+        &bob.identity_key(),
+        &pre_alarm_state,
+        alice_pq_off.pq_config(),
+        alice_pq_off.clock(),
+    )
+    .await
+    .unwrap();
+    let seq2_off_session = alice_pq_off
+        .finish_prepare_initiate_v2(claimed_seq2_off, &pre_alarm_state, b"alice-cl-seq2", ())
+        .unwrap()
+        .session;
+    assert_eq!(seq2_off_session.peer_pq_state().pinned_manifest_seq, 2);
+    assert!(!seq2_off_session.peer_pq_state().peer_pq_capable);
+    assert!(!seq2_off_session.peer_pq_state().downgrade_detected);
+
+    // Meanwhile, a live downgrade alarm trips on Alice's active session (`peer_pq_capable = true`).
+    live_session.peer_pq_state_mut().downgrade_detected = true;
+
+    // Merging `seq2_off_session` with `local_pq_enabled = false` must advance `pinned_manifest_seq`
+    // monotonically to 2 while preserving `peer_pq_capable = true` under the active downgrade alarm
+    // so a subsequent `approve_classical_exception()` cannot clear `downgrade_detected`.
+    let _ = live_session
+        .accept_replacement_with_policy(seq2_off_session, false)
+        .expect(
+            "R23-P2-4: local_pq_enabled=false merge should succeed while keeping downgrade pin",
+        );
+    assert_eq!(live_session.peer_pq_state().pinned_manifest_seq, 2);
+    assert!(live_session.peer_pq_state().downgrade_detected);
+    assert!(
+        live_session.peer_pq_state().peer_pq_capable,
+        "R23-P2-4: merge_incoming_state must preserve peer_pq_capable=true under active downgrade_detected"
+    );
+
+    live_session
+        .peer_pq_state_mut()
+        .approve_classical_exception();
+    assert!(
+        live_session.peer_pq_state().downgrade_detected,
+        "R23-P2-4: approve_classical_exception must not clear downgrade_detected once peer_pq_capable is preserved"
+    );
+    assert!(
+        !live_session.peer_pq_state().allow_classical_exception,
+        "R23-P2-4: approve_classical_exception must not grant classical exception while peer_pq_capable is true"
+    );
+}

@@ -2245,7 +2245,10 @@ impl<V: VaultStore> Engine<V> {
                                 contact.session.retire();
                                 peer_deleted.insert(peer);
                             }
-                            match contact.add_received(content, false) {
+                            let server_now = inner.client.clock().now();
+                            match inner.contacts[contact_idx]
+                                .add_received_at(content, false, server_now)
+                            {
                                 Ok(entry) => per_peer_entries.entry(peer).or_default().push(entry),
                                 Err(reason) => {
                                     process_err = Some(reason.to_string());
@@ -2510,10 +2513,11 @@ impl<V: VaultStore> Engine<V> {
                                 }
                             })
                             .collect();
+                        let server_now = inner.client.clock().now();
                         let views: Option<Vec<_>> = inner.contact(&open).map(|contact| {
                             entries
                                 .into_iter()
-                                .map(|(index, entry)| contact.message(index, entry))
+                                .map(|(index, entry)| contact.message_at(index, entry, server_now))
                                 .collect()
                         });
                         if let Some(views) = views {
@@ -2967,7 +2971,10 @@ impl<V: VaultStore> Engine<V> {
                         contact.session.retire();
                         peer_deleted.insert(peer);
                     }
-                    if let Ok(entry) = contact.add_received(content, false) {
+                    let server_now = inner.client.clock().now();
+                    if let Ok(entry) =
+                        inner.contacts[contact_idx].add_received_at(content, false, server_now)
+                    {
                         per_peer_entries.entry(peer).or_default().push(entry);
                     }
                 }
@@ -3145,10 +3152,11 @@ impl<V: VaultStore> Engine<V> {
                         }
                     })
                     .collect();
+                let server_now = inner.client.clock().now();
                 let views: Option<Vec<_>> = inner.contact(&open).map(|contact| {
                     entries
                         .into_iter()
-                        .map(|(index, entry)| contact.message(index, entry))
+                        .map(|(index, entry)| contact.message_at(index, entry, server_now))
                         .collect()
                 });
                 if let Some(views) = views {

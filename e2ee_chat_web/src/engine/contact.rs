@@ -517,11 +517,23 @@ impl Contact {
 
     /// Add `content`, received, to the history, at its place in the chat, counting it as unread
     /// unless the chat is `open`: then it is read, which the peer is told. Returns the entry and
-    /// its index.
+    /// its index. Uses `now()` for tests that construct a standalone [`Contact`].
+    #[cfg(test)]
     pub(super) fn add_received(
         &mut self,
         content: Content,
         open: bool,
+    ) -> Result<(u64, HistoryEntry), &'static str> {
+        self.add_received_at(content, open, now())
+    }
+
+    /// Add `content`, received, to the history using `server_now` (from `ServerClock`) when
+    /// comparing server-issued `AttachmentPointer.expires` timestamps (`R23-P2-3`).
+    pub(super) fn add_received_at(
+        &mut self,
+        content: Content,
+        open: bool,
+        server_now: u64,
     ) -> Result<(u64, HistoryEntry), &'static str> {
         let index = self.next_history_index()?;
         let place = place_of(content.clock, &self.state);
@@ -546,16 +558,15 @@ impl Contact {
             }
         }
         self.state.last_activity = now();
-        // R21-P3-3 + R22-P3-4: If this incoming attachment echo arrived after the attachment was
-        // already confirmed deleted/missing on the server OR after its server expiry timestamp,
-        // mark the new history row `gone = true` immediately so Files and chat views never offer
-        // the dead object again.
-        let current_ms = now();
+        // R21-P3-3 + R22-P3-4 + R23-P2-3: If this incoming attachment echo arrived after the
+        // attachment was already confirmed deleted/missing on the server OR after its server
+        // expiry timestamp (compared in the server clock domain), mark the new history row
+        // `gone = true` immediately so Files and chat views never offer the dead object again.
         let already_gone = matches!(
             &content.kind,
             Some(Kind::Attachment(ptr))
                 if self.is_attachment_deleted(&ptr.id)
-                    || (ptr.expires > 0 && ptr.expires <= current_ms)
+                    || (ptr.expires > 0 && ptr.expires <= server_now)
         );
         let entry = HistoryEntry {
             outgoing: false,
@@ -570,14 +581,18 @@ impl Contact {
     }
 
     /// Record attachment `id` as durably deleted/missing on the server (`R21-P2-10`, `R21-P3-3`,
-    /// `R22-P3-4`), pruning expired tombstones before enforcing the high-water cap. Returns `true`
-    /// if `ContactState.deleted_attachments` changed.
-    pub(super) fn record_deleted_attachment(&mut self, id: &[u8; 16], expires: u64) -> bool {
-        let current_ms = now();
+    /// `R22-P3-4`, `R23-P2-3`), pruning expired tombstones against `server_now` before enforcing
+    /// the high-water cap. Returns `true` if `ContactState.deleted_attachments` changed.
+    pub(super) fn record_deleted_attachment(
+        &mut self,
+        id: &[u8; 16],
+        expires: u64,
+        server_now: u64,
+    ) -> bool {
         let before_len = self.state.deleted_attachments.len();
         self.state
             .deleted_attachments
-            .retain(|existing| existing.expires == 0 || existing.expires > current_ms);
+            .retain(|existing| existing.expires == 0 || existing.expires > server_now);
         let mut changed = self.state.deleted_attachments.len() != before_len;
         if let Some(existing) = self
             .state
@@ -603,6 +618,27 @@ impl Contact {
             self.state.deleted_attachments.drain(..excess);
         }
         true
+    }
+
+    /// Keep tombstone `id` unexpirable (`expires = 0`) when persisting `HistoryEntry.gone = true`
+    /// fails transiently so a subsequent tombstone prune cannot discard it before reconciliation
+    /// (`R23-P2-3`).
+    pub(super) fn clear_deleted_attachment_expiry(&mut self, id: &[u8; 16]) {
+        if let Some(existing) = self
+            .state
+            .deleted_attachments
+            .iter_mut()
+            .find(|existing| existing.id.as_slice() == id.as_slice())
+        {
+            existing.expires = 0;
+        } else {
+            self.state
+                .deleted_attachments
+                .push(crate::vault::DeletedAttachment {
+                    id: id.to_vec(),
+                    expires: 0,
+                });
+        }
     }
 
     /// Whether attachment `id` has already been recorded as deleted/missing on the server.
@@ -814,8 +850,20 @@ impl Contact {
         }
     }
 
-    /// History entry `index`, as shown.
-    pub(super) fn message(&self, index: u64, mut entry: HistoryEntry) -> MessageView {
+    /// History entry `index`, as shown (using `now()` in tests without a live `ServerClock`).
+    #[cfg(test)]
+    pub(super) fn message(&self, index: u64, entry: HistoryEntry) -> MessageView {
+        self.message_at(index, entry, now())
+    }
+
+    /// History entry `index`, as shown, comparing server-issued `AttachmentPointer.expires`
+    /// against `server_now` (`R23-P2-3`).
+    pub(super) fn message_at(
+        &self,
+        index: u64,
+        mut entry: HistoryEntry,
+        server_now: u64,
+    ) -> MessageView {
         // The clock the peer sent an attachment's message at, to tell it once downloaded.
         let clock = match &entry.content {
             Some(content) if !entry.outgoing => content.clock,
@@ -877,7 +925,9 @@ impl Contact {
                 Some(Kind::Hello(hello)) => Body::Hello(super::sanitize_shared_name(&hello.name)),
                 Some(Kind::Deleted(_)) => Body::Deleted,
                 Some(Kind::Attachment(pointer)) => {
-                    let gone = entry.gone || self.is_attachment_deleted(&pointer.id);
+                    let gone = entry.gone
+                        || self.is_attachment_deleted(&pointer.id)
+                        || (pointer.expires > 0 && pointer.expires <= server_now);
                     Body::Remote(RemoteFile {
                         peer: self.peer,
                         index,

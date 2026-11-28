@@ -155,13 +155,14 @@ impl Fetch {
         })
     }
 
-    /// A client whose requests tell `progress` how far their bodies got, e.g. an attachment's
-    /// chunks.
-    pub fn reporting(server: &str, progress: Progress) -> Connect {
+    /// A progress-reporting client that suppresses the global transport-level `REFUSED` sign-in
+    /// hook so the caller can validate liveness, cancellation, and conversation generation before
+    /// opening `Dialog::SignIn` (`R23-P2-1`).
+    pub fn reporting_without_refused_hook(server: &str, progress: Progress) -> Connect {
         ConnectClient::new(Self {
             server: server.trim_end_matches('/').to_string(),
             progress: Some(progress),
-            notify_refused: true,
+            notify_refused: false,
         })
     }
 }
