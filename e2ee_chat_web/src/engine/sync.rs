@@ -754,7 +754,7 @@ impl<V: VaultStore> Engine<V> {
                             return;
                         }
                         self.clear_approval_backoff(&peer);
-                        let _ = self.flush(&peer).await;
+                        let _ = self.flush_background(&peer).await;
                     }
                     Ok(())
                 }
@@ -1009,7 +1009,7 @@ impl<V: VaultStore> Engine<V> {
             if !self.is_live(vgen) {
                 return false;
             }
-            match self.flush(&peer).await {
+            match self.flush_background(&peer).await {
                 Ok(pushed) => active |= pushed,
                 Err(e) => {
                     failure.get_or_insert(e);
@@ -1154,7 +1154,9 @@ impl<V: VaultStore> Engine<V> {
                 (inner.server.clone(), signs_in_here, farewell, v2_req)
             };
             let (server, signs_in_here, farewell, v2_req) = next;
-            let pushed: session::Result<()> = Fetch::client(&server)
+            // R24-P1-1: Suppress the global `REFUSED` sign-in hook so a background/stale farewell
+            // 403 cannot hijack an unrelated active `start_chat` or a newly unlocked vault.
+            let pushed: session::Result<()> = Fetch::client_without_refused_hook(&server)
                 .push_v2(v2_req)
                 .await
                 .map(|_| ())
@@ -1165,7 +1167,23 @@ impl<V: VaultStore> Engine<V> {
             match pushed {
                 Ok(()) => {}
                 // Pushing takes a sign-in: they wait for it, without failing the round.
-                Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => return Ok(()),
+                Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
+                    let still_queued = {
+                        let guard = self.lock_inner().await;
+                        self.is_live(vgen)
+                            && guard.as_ref().is_some_and(|inner| {
+                                inner
+                                    .state
+                                    .farewells
+                                    .iter()
+                                    .any(|f| f.push_v2 == farewell.push_v2)
+                            })
+                    };
+                    if still_queued && self.is_live(vgen) {
+                        self.ask_sign_in_background();
+                    }
+                    return Ok(());
+                }
                 // Refused for good (including WriteTokenRejected when peer already deleted/revoked).
                 Err(e)
                     if e.is_server_refusal()
@@ -1308,6 +1326,7 @@ impl<V: VaultStore> Engine<V> {
         let before_pq = contact.session.peer_pq_state().clone();
         let before_alert = contact.state.security_alert;
         let before_prompt = contact.state.classical_approval_needed;
+        let before_q_pinned = contact.state.quarantined_was_pq_pinned;
         if probe.pq_enabled {
             // R21-P2-5: An approved `ServerPqDisabled` classical fallback deliberately leaves a
             // PQ-capable peer unpinned with `allow_classical_exception = true` (`pq.rs:1134`).
@@ -1328,6 +1347,13 @@ impl<V: VaultStore> Engine<V> {
                     ppq.pq_pinned = true;
                     ppq.clear_classical_exception();
                     contact.state.classical_approval_needed = CLASSICAL_APPROVAL_NONE;
+                    // R24-P3-1: Mirror `apply_observed_start_chat_manifests` (`R23-P2-5`): if the
+                    // contact became quarantined while `GetManifest` was in flight, escalate the
+                    // quarantined classical contact to a downgrade alert.
+                    if contact.state.quarantined {
+                        contact.state.quarantined_was_pq_pinned = true;
+                        contact.record_policy_error(ErrorKind::DowngradeDetected);
+                    }
                 }
             } else {
                 contact.record_policy_error(ErrorKind::DowngradeDetected);
@@ -1361,7 +1387,8 @@ impl<V: VaultStore> Engine<V> {
         }
         let changed = *contact.session.peer_pq_state() != before_pq
             || contact.state.security_alert != before_alert
-            || contact.state.classical_approval_needed != before_prompt;
+            || contact.state.classical_approval_needed != before_prompt
+            || contact.state.quarantined_was_pq_pinned != before_q_pinned;
         if changed {
             if inner.save_state().await.is_err() {
                 inner.unsaved_state = true;
@@ -1596,7 +1623,7 @@ impl<V: VaultStore> Engine<V> {
                 GreetingRetryAction::ReclaimRetired => {
                     let mut server_deletes = Vec::new();
                     match self
-                        .ensure_session_for_outbox(vgen, &peer, &mut server_deletes)
+                        .ensure_session_for_outbox(vgen, &peer, &mut server_deletes, true)
                         .await
                     {
                         Ok(RekeyOutcome::Aborted) => return Ok(false),
@@ -1868,7 +1895,7 @@ impl<V: VaultStore> Engine<V> {
                         if e.kind() == ErrorKind::SignInRequired && signs_in_here && matches_session
                         {
                             self.queue.mark_waits_sign_in(peer);
-                            self.ask_sign_in();
+                            self.ask_sign_in_background();
                             self.refresh_contacts(inner);
                         } else if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                             // Superseded/deleted session: do not block the replacement chat.
@@ -1890,7 +1917,7 @@ impl<V: VaultStore> Engine<V> {
             if reclaim_retired {
                 let mut server_deletes = Vec::new();
                 match self
-                    .ensure_session_for_outbox(vgen, &peer, &mut server_deletes)
+                    .ensure_session_for_outbox(vgen, &peer, &mut server_deletes, true)
                     .await
                 {
                     Ok(RekeyOutcome::Aborted) => return Ok(false),
@@ -2484,6 +2511,11 @@ impl<V: VaultStore> Engine<V> {
                 }
                 for (peer, outcome) in requeued_outcomes {
                     outcome.log_missing(&self.ui, &peer);
+                    self.finalize_requeue_gone(vgen, inner, &peer, &outcome)
+                        .await;
+                    if !self.is_live(vgen) {
+                        return Ok(Vec::new());
+                    }
                 }
                 for (peer, skipped) in corrupt_receipt_indices {
                     let label = inner
@@ -3131,8 +3163,14 @@ impl<V: VaultStore> Engine<V> {
                 skipped.len()
             ));
         }
+        let vgen = self.vault_gen();
         for (peer, outcome) in requeued_outcomes {
             outcome.log_missing(&self.ui, &peer);
+            self.finalize_requeue_gone(vgen, inner, &peer, &outcome)
+                .await;
+            if !self.is_live(vgen) {
+                return Ok((BTreeSet::new(), BTreeMap::new(), BTreeSet::new()));
+            }
         }
         if let Some(open) = self.ui.open.get_untracked() {
             if let Some(changed_vec) = per_peer_changed.get(&open) {

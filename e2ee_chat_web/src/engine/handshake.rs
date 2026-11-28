@@ -1930,8 +1930,10 @@ impl<V: VaultStore> Engine<V> {
         inner: &mut Inner<impl VaultStore>,
         mut batch: InitialBatch,
     ) -> Result<BTreeMap<PublicKey, u64>, String> {
+        let vgen = self.vault_gen();
         let mut outgoing = vec![];
         let mut changed = vec![];
+        let mut requeued_outcomes = vec![];
         for peer in batch.requeue {
             match inner.requeue_sealed(&peer).await {
                 Ok(outcome) => {
@@ -1939,9 +1941,10 @@ impl<V: VaultStore> Engine<V> {
                         return Ok(BTreeMap::new());
                     }
                     outcome.log_missing(&self.ui, &peer);
-                    outgoing.extend(outcome.outbox);
+                    outgoing.extend(outcome.outbox.clone());
                     batch.records.extend(records(&peer, &outcome.history));
-                    changed.push((peer, outcome.history));
+                    changed.push((peer, outcome.history.clone()));
+                    requeued_outcomes.push((peer, outcome));
                 }
                 // replace_session set the durable gate. flush retries before pushing any ciphertext.
                 Err(e) => {
@@ -1958,6 +1961,12 @@ impl<V: VaultStore> Engine<V> {
         inner.save_inbox_changes(batch.records, outgoing).await?;
         if self.shutting_down.get() || crate::glue::lock_released() {
             return Ok(BTreeMap::new());
+        }
+        for (peer, outcome) in &requeued_outcomes {
+            self.finalize_requeue_gone(vgen, inner, peer, outcome).await;
+            if !self.is_live(vgen) {
+                return Ok(BTreeMap::new());
+            }
         }
         for (peer, history) in changed {
             self.show_changes(inner, &peer, &history);
@@ -2338,8 +2347,14 @@ impl<V: VaultStore> Engine<V> {
         // Phase 2 outside `self.inner`: transmit signed publish over the network (and handle
         // runtime `PQ_ENABLED="false"` fallback by re-acquiring `self.inner` strictly to prepare
         // and persist the classical-OFF manifest before the second RTT).
-        let first_outcome =
-            session::transmit_publish_v2_with(&Fetch::client(&server), &prepared, strict_pq).await;
+        // R24-P1-1: Suppress the global `REFUSED` sign-in hook so a background/stale publish 403
+        // cannot hijack an unrelated active `start_chat` or a newly unlocked vault.
+        let first_outcome = session::transmit_publish_v2_with(
+            &Fetch::client_without_refused_hook(&server),
+            &prepared,
+            strict_pq,
+        )
+        .await;
         if !self.is_live(vgen) {
             return Err(PublishError::locked());
         }
@@ -2398,7 +2413,7 @@ impl<V: VaultStore> Engine<V> {
                     inner.client.pq_config().strict_pq
                 };
                 let second = session::transmit_publish_v2_with(
-                    &Fetch::client(&server),
+                    &Fetch::client_without_refused_hook(&server),
                     &prepared,
                     off_strict_pq,
                 )
@@ -2596,6 +2611,9 @@ impl<V: VaultStore> Engine<V> {
         let live = !self.shutting_down.get() && !crate::glue::lock_released();
         if error.needs_sign_in() {
             self.startup.set_publish_waits_sign_in(true);
+            if live && same_server(&inner.server, &origin()) {
+                self.ask_sign_in_for(!now_anyway);
+            }
         }
         if error.rejects_settings() {
             if error.kind == Some(ErrorKind::PqRequired) {
@@ -2767,7 +2785,13 @@ impl<V: VaultStore> Engine<V> {
 
         // Phase 2 outside `self.inner`: transmit `RefillPrekeys` (and confirm `GetServerInfo` on
         // `Unimplemented` when `wants_pq`) without holding `self.inner`.
-        let refill_res = session::transmit_refill_v2_with(&Fetch::client(&server), &prepared).await;
+        // R24-P1-1: Suppress global `REFUSED` sign-in hook so background/stale refill 403s cannot
+        // hijack an active `start_chat` or newly unlocked vault.
+        let refill_res = session::transmit_refill_v2_with(
+            &Fetch::client_without_refused_hook(&server),
+            &prepared,
+        )
+        .await;
         if !self.is_live(vgen) {
             return Ok(RefillV2Outcome::Handled);
         }
@@ -2819,6 +2843,9 @@ impl<V: VaultStore> Engine<V> {
                 let outcome = match e.kind() {
                     ErrorKind::SignInRequired => {
                         self.startup.set_publish_waits_sign_in(true);
+                        if self.is_live(vgen) && same_server(&inner.server, &origin()) {
+                            self.ask_sign_in_background();
+                        }
                         Ok(RefillV2Outcome::Handled)
                     }
                     ErrorKind::LimitExceeded if sent_classical && sent_pq => {
@@ -4679,8 +4706,12 @@ impl<V: VaultStore> Engine<V> {
                 };
                 drop(guard);
 
+                // R24-P1-1: Suppress global `REFUSED` hook on `ClaimBundle`; `SignInRequired`
+                // already propagates via `StartChatError::SignInRequired` (gated on `is_live(vgen)`
+                // and `!is_submission_cancelled(submission_id)`) without colliding across
+                // concurrent `start_chat` submissions.
                 let claimed = session::claim_peer_bundle_v2(
-                    &Fetch::client(&server_url),
+                    &Fetch::client_without_refused_hook(&server_url),
                     &audience,
                     &peer,
                     &peer_state,

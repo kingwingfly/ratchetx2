@@ -87,6 +87,17 @@ impl<V: VaultStore> Engine<V> {
     /// network RPC (`ClaimBundle`, `RegisterWriteToken`, `SendInitialV2`, `PushV2`, `push_events`)
     /// so UI operations and independent peers' flushes never stall behind slow RTTs.
     pub(super) async fn flush(&self, peer: &PublicKey) -> Result<bool, String> {
+        self.flush_with_mode(peer, false).await
+    }
+
+    /// Background variant of [`Self::flush`] used by periodic `sync()` and WebSocket notification
+    /// handlers so `SignInRequired` respects `declined_sign_in` and never hijacks an unrelated
+    /// active `start_chat` (`R24-P2-4`).
+    pub(super) async fn flush_background(&self, peer: &PublicKey) -> Result<bool, String> {
+        self.flush_with_mode(peer, true).await
+    }
+
+    async fn flush_with_mode(&self, peer: &PublicKey, background: bool) -> Result<bool, String> {
         let vgen = self.vault_gen();
         if !self.is_live(vgen) {
             return Ok(false);
@@ -270,6 +281,11 @@ impl<V: VaultStore> Engine<V> {
                             return Ok(false);
                         }
                         outcome.log_missing(&self.ui, peer);
+                        self.finalize_requeue_gone(vgen, inner, peer, &outcome)
+                            .await;
+                        if !self.is_live(vgen) {
+                            return Ok(false);
+                        }
                         self.show_changes(inner, peer, &outcome.history);
                     }
                     Ok(None) => {}
@@ -605,6 +621,141 @@ impl<V: VaultStore> Engine<V> {
                                                                 return Ok(false);
                                                             }
                                                             result = Err(describe(&e));
+                                                            step = NextPush::Done;
+                                                            break;
+                                                        }
+                                                    }
+                                                } else if super::attachments::upload_of(&pending)
+                                                    .is_err()
+                                                {
+                                                    // R24-P2-1: Malformed incomplete `STARTED` /
+                                                    // `ANNOUNCED` record (e.g. empty/corrupt upload
+                                                    // token) can never resume. Recover any 32-byte
+                                                    // delete key onto `server_deletes`, atomically
+                                                    // fail the outbox item + forget the upload, and
+                                                    // clear caches/UI so flush neither ships a dead
+                                                    // partial pointer nor wedges on 0-chunk rows.
+                                                    let mut del_key =
+                                                        super::attachments::copy_zeroizing_array::<
+                                                            { session::attachment::KEY_LENGTH },
+                                                        >(
+                                                            &pending.key
+                                                        );
+                                                    if del_key.is_none() {
+                                                        match inner
+                                                            .vault
+                                                            .entry(peer, outgoing.history_index)
+                                                            .await
+                                                        {
+                                                            _ if !self.is_live(vgen) => {
+                                                                return Ok(false);
+                                                            }
+                                                            Ok(Some(entry)) => {
+                                                                if let Some(Kind::Attachment(ptr)) =
+                                                                    entry.content.as_ref().and_then(
+                                                                        |c| c.kind.as_ref(),
+                                                                    )
+                                                                {
+                                                                    del_key =
+                                                                        super::attachments::copy_zeroizing_array::<
+                                                                            {
+                                                                                session::attachment::KEY_LENGTH
+                                                                            },
+                                                                        >(
+                                                                            &ptr.key
+                                                                        );
+                                                                }
+                                                            }
+                                                            Ok(None)
+                                                            | Err(crate::vault::Error::Corrupt(
+                                                                _,
+                                                            )) => {}
+                                                            Err(e) => {
+                                                                result = Err(describe(&e));
+                                                                step = NextPush::Done;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    if del_key.is_none() && !outgoing.sealed {
+                                                        match inner
+                                                            .vault
+                                                            .outgoing(peer, outgoing.history_index)
+                                                            .await
+                                                        {
+                                                            _ if !self.is_live(vgen) => {
+                                                                return Ok(false);
+                                                            }
+                                                            Ok(rec) => {
+                                                                if let Some(Kind::Attachment(ptr)) =
+                                                                    Kind::from_bytes(&rec.content)
+                                                                {
+                                                                    del_key =
+                                                                        super::attachments::copy_zeroizing_array::<
+                                                                            {
+                                                                                session::attachment::KEY_LENGTH
+                                                                            },
+                                                                        >(
+                                                                            &ptr.key
+                                                                        );
+                                                                }
+                                                            }
+                                                            Err(crate::vault::Error::Corrupt(
+                                                                _,
+                                                            )) => {}
+                                                            Err(e) => {
+                                                                result = Err(describe(&e));
+                                                                step = NextPush::Done;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    match self
+                                                        .fail_outbox_and_forget_upload(
+                                                            vgen,
+                                                            inner,
+                                                            peer,
+                                                            outgoing.history_index,
+                                                            &att_id,
+                                                            false,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(()) => {
+                                                            if !self.is_live(vgen) {
+                                                                return Ok(false);
+                                                            }
+                                                            self.uploads.mark_cancelled(att_id);
+                                                            self.uploads
+                                                                .clear_server_completed(&att_id);
+                                                            self.remove_attachment_caches(
+                                                                peer, &att_id,
+                                                            );
+                                                            self.ui.uploads.update(|uploads| {
+                                                                uploads.retain(|u| u.id != att_id)
+                                                            });
+                                                            if let Some(key) = del_key {
+                                                                server_deletes.push(
+                                                                    ServerDeleteJob::for_completed(
+                                                                        inner.server.clone(),
+                                                                        att_id,
+                                                                        Some(
+                                                                            outgoing.history_index,
+                                                                        ),
+                                                                        pending.name.clone(),
+                                                                        key,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            self.refresh_contacts(inner);
+                                                            changed = true;
+                                                            continue;
+                                                        }
+                                                        Err(e) => {
+                                                            if !self.is_live(vgen) {
+                                                                return Ok(false);
+                                                            }
+                                                            result = Err(e);
                                                             step = NextPush::Done;
                                                             break;
                                                         }
@@ -955,6 +1106,13 @@ impl<V: VaultStore> Engine<V> {
                                                     return Ok(false);
                                                 }
                                                 outcome.log_missing(&self.ui, peer);
+                                                self.finalize_requeue_gone(
+                                                    vgen, inner, peer, &outcome,
+                                                )
+                                                .await;
+                                                if !self.is_live(vgen) {
+                                                    return Ok(false);
+                                                }
                                                 self.show_changes(inner, peer, &outcome.history);
                                             }
                                             Ok(None) => {
@@ -1008,6 +1166,11 @@ impl<V: VaultStore> Engine<V> {
                                     return Ok(false);
                                 }
                                 outcome.log_missing(&self.ui, peer);
+                                self.finalize_requeue_gone(vgen, inner, peer, &outcome)
+                                    .await;
+                                if !self.is_live(vgen) {
+                                    return Ok(false);
+                                }
                                 self.show_changes(inner, peer, &outcome.history);
                             }
                             Ok(None) => {}
@@ -1074,6 +1237,11 @@ impl<V: VaultStore> Engine<V> {
                                                 return Ok(false);
                                             }
                                             outcome.log_missing(&self.ui, peer);
+                                            self.finalize_requeue_gone(vgen, inner, peer, &outcome)
+                                                .await;
+                                            if !self.is_live(vgen) {
+                                                return Ok(false);
+                                            }
                                             self.show_changes(inner, peer, &outcome.history);
                                         }
                                         Ok(None) => {
@@ -1204,6 +1372,13 @@ impl<V: VaultStore> Engine<V> {
                                                         return Ok(false);
                                                     }
                                                     outcome.log_missing(&self.ui, peer);
+                                                    self.finalize_requeue_gone(
+                                                        vgen, inner, peer, &outcome,
+                                                    )
+                                                    .await;
+                                                    if !self.is_live(vgen) {
+                                                        return Ok(false);
+                                                    }
                                                     self.show_changes(
                                                         inner,
                                                         peer,
@@ -1413,7 +1588,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 NextPush::NeedsNewSession => {
                     match self
-                        .ensure_session_for_outbox(vgen, peer, &mut server_deletes)
+                        .ensure_session_for_outbox(vgen, peer, &mut server_deletes, background)
                         .await
                     {
                         Ok(RekeyOutcome::Aborted) => return Ok(false),
@@ -2080,7 +2255,7 @@ impl<V: VaultStore> Engine<V> {
                                                 {
                                                     self.queue.mark_waits_sign_in(*peer);
                                                     self.hold(peer, outgoing.history_index);
-                                                    self.ask_sign_in();
+                                                    self.ask_sign_in_for(background);
                                                     self.refresh_contacts(inner);
                                                 } else if retry_err.kind()
                                                     == ErrorKind::SignInRequired
@@ -2142,7 +2317,7 @@ impl<V: VaultStore> Engine<V> {
                         Err(e) if e.kind() == ErrorKind::SignInRequired && signs_in_here => {
                             self.queue.mark_waits_sign_in(*peer);
                             self.hold(peer, outgoing.history_index);
-                            self.ask_sign_in();
+                            self.ask_sign_in_for(background);
                             break;
                         }
                         // The same, but this page cannot sign in to the server: it never will go.
@@ -2243,7 +2418,7 @@ impl<V: VaultStore> Engine<V> {
             && !self.queue.waits_for_sign_in(peer)
             && !self.queue.is_approval_backed_off(peer)
         {
-            match self.push_events(vgen, peer).await {
+            match self.push_events(vgen, peer, background).await {
                 Ok(told) => changed |= told,
                 Err(e) => result = Err(e),
             }
@@ -2370,7 +2545,7 @@ impl<V: VaultStore> Engine<V> {
     /// deleted/gone (`R22-P2-11`), removing it from the outbox, marking its history row refused +
     /// gone, deleting its `OutgoingRecord`, and forgetting any surviving upload checkpoint without
     /// transmitting it on the wire. Returns `Ok(true)` if settled, `Ok(false)` if vault locked.
-    async fn settle_gone_undispatched_outbox(
+    pub(super) async fn settle_gone_undispatched_outbox(
         &self,
         vgen: u64,
         inner: &mut Inner<V>,
@@ -2423,6 +2598,10 @@ impl<V: VaultStore> Engine<V> {
             gone.insert((*peer, idx));
         });
         if let Some(id) = att_id {
+            // R24-P2-2: Mark cancelled so any active multi-chunk `upload_chunks` task stops
+            // immediately instead of resurrecting the cleared `UploadView` card, `PendingUpload`,
+            // or sign-in dialog.
+            self.uploads.mark_cancelled(id);
             self.uploads.clear_server_completed(&id);
             self.remove_attachment_caches(peer, &id);
             self.ui
@@ -2439,6 +2618,7 @@ impl<V: VaultStore> Engine<V> {
     /// Map a `session::Error` from `claim_peer_bundle_v2` or `finish_prepare_start_again_v2`
     /// during outbox rekey into [`RekeyOutcome`] while holding `inner` (after rolling back any
     /// in-memory mutations).
+    #[allow(clippy::too_many_arguments)]
     async fn handle_rekey_session_error(
         &self,
         vgen: u64,
@@ -2447,6 +2627,7 @@ impl<V: VaultStore> Engine<V> {
         clock: &session::ServerClock,
         error: session::Error,
         server_deletes: &mut Vec<ServerDeleteJob>,
+        background: bool,
     ) -> Result<RekeyOutcome, String> {
         let kind = error.kind();
         if matches!(kind, ErrorKind::NotFound | ErrorKind::InvalidKeys) {
@@ -2486,7 +2667,7 @@ impl<V: VaultStore> Engine<V> {
         if kind == ErrorKind::SignInRequired {
             if same_server(&inner.server, &origin()) {
                 self.queue.mark_waits_sign_in(*peer);
-                self.ask_sign_in();
+                self.ask_sign_in_for(background);
                 self.refresh_contacts(inner);
                 return Ok(RekeyOutcome::Paused);
             }
@@ -2584,6 +2765,7 @@ impl<V: VaultStore> Engine<V> {
         vgen: u64,
         peer: &PublicKey,
         server_deletes: &mut Vec<ServerDeleteJob>,
+        background: bool,
     ) -> Result<RekeyOutcome, String> {
         const MAX_CONFIG_RETRIES: usize = 2;
         let mut attempt = 0usize;
@@ -2689,7 +2871,15 @@ impl<V: VaultStore> Engine<V> {
                 Ok(claimed) => claimed,
                 Err(e) => {
                     return self
-                        .handle_rekey_session_error(vgen, inner, peer, &clock, e, server_deletes)
+                        .handle_rekey_session_error(
+                            vgen,
+                            inner,
+                            peer,
+                            &clock,
+                            e,
+                            server_deletes,
+                            background,
+                        )
                         .await;
                 }
             };
@@ -2722,7 +2912,15 @@ impl<V: VaultStore> Engine<V> {
                     inner.state.next_session_seq = prev_next_session_seq;
                     inner.roll_back(peer, snapshot)?;
                     return self
-                        .handle_rekey_session_error(vgen, inner, peer, &clock, e, server_deletes)
+                        .handle_rekey_session_error(
+                            vgen,
+                            inner,
+                            peer,
+                            &clock,
+                            e,
+                            server_deletes,
+                            background,
+                        )
                         .await;
                 }
             };
@@ -2773,6 +2971,11 @@ impl<V: VaultStore> Engine<V> {
                 return Ok(RekeyOutcome::Aborted);
             }
             requeued.log_missing(&self.ui, peer);
+            self.finalize_requeue_gone(vgen, inner, peer, &requeued)
+                .await;
+            if !self.is_live(vgen) {
+                return Ok(RekeyOutcome::Aborted);
+            }
             self.show_changes(inner, peer, &requeued.history);
             self.refresh_contacts(inner);
             break (
@@ -2919,7 +3122,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                     self.queue.mark_waits_sign_in(*peer);
-                    self.ask_sign_in();
+                    self.ask_sign_in_for(background);
                     self.refresh_contacts(inner);
                     return Ok(RekeyOutcome::Paused);
                 }
@@ -2943,7 +3146,12 @@ impl<V: VaultStore> Engine<V> {
     /// saved once under `self.inner`, then pushed outside `self.inner` so slow RTTs never stall
     /// UI or other peers. Once pushed, clearing `sealed_events` is persisted immediately to the
     /// vault after validating `is_live(vgen)`, contact existence, and matching `session_id`.
-    async fn push_events(&self, vgen: u64, peer: &PublicKey) -> Result<bool, String> {
+    async fn push_events(
+        &self,
+        vgen: u64,
+        peer: &PublicKey,
+        background: bool,
+    ) -> Result<bool, String> {
         if !self.is_live(vgen) {
             return Ok(false);
         }
@@ -3262,7 +3470,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 self.queue.mark_waits_sign_in(*peer);
                 if signs_in_here {
-                    self.ask_sign_in();
+                    self.ask_sign_in_for(background);
                 }
                 return Ok(false);
             }
@@ -4019,6 +4227,8 @@ pub(super) struct RequeueOutcome {
     pub(super) outbox: Vec<(PublicKey, u64, Option<OutgoingRecord>)>,
     pub(super) history: Vec<(u64, HistoryEntry)>,
     dropped_missing: BTreeSet<u64>,
+    pub(super) gone_indices: BTreeSet<u64>,
+    pub(super) gone_attachment_ids: Vec<[u8; 16]>,
     attachment_ids: BTreeMap<u64, Vec<u8>>,
 }
 
@@ -4035,20 +4245,22 @@ impl RequeueOutcome {
         pending_gone_ids: &std::collections::HashSet<[u8; 16]>,
         server_now: u64,
     ) {
+        let excluded_gone_att_id = match (&entry, &content) {
+            (Some(entry), Some(Kind::Attachment(ptr)))
+                if entry.gone
+                    || (ptr.expires > 0 && ptr.expires <= server_now)
+                    || <[u8; 16]>::try_from(ptr.id.as_slice())
+                        .is_ok_and(|id| pending_gone_ids.contains(&id)) =>
+            {
+                Some(<[u8; 16]>::try_from(ptr.id.as_slice()).ok())
+            }
+            _ => None,
+        };
         let verified = match (entry, content) {
             // R18-P1-3 + R20-P2-8 + R23-P2-3: Exclude attachments durably marked `gone`, queued
             // in `pending_gone` / `deleted_attachments`, OR already expired according to
             // `server_now` so unread/session requeue never resends a dead attachment pointer.
-            (Some(entry), Some(kind))
-                if !entry.gone
-                    && !matches!(
-                        &kind,
-                        Kind::Attachment(ptr)
-                            if (ptr.expires > 0 && ptr.expires <= server_now)
-                                || <[u8; 16]>::try_from(ptr.id.as_slice())
-                                    .is_ok_and(|id| pending_gone_ids.contains(&id))
-                    ) =>
-            {
+            (Some(entry), Some(kind)) if excluded_gone_att_id.is_none() && !entry.gone => {
                 let att_id = match &kind {
                     Kind::Attachment(ptr) if !ptr.id.is_empty() => Some(ptr.id.clone()),
                     _ => None,
@@ -4059,10 +4271,10 @@ impl RequeueOutcome {
                 if digest_ok {
                     Ok((entry, bytes, att_id))
                 } else {
-                    Err(Some(entry))
+                    Err((Some(entry), false))
                 }
             }
-            (entry, _) => Err(entry),
+            (entry, _) => Err((entry, excluded_gone_att_id.is_some())),
         };
         let record = match verified {
             Ok((mut entry, bytes, att_id)) => {
@@ -4078,10 +4290,24 @@ impl RequeueOutcome {
                 }
                 Some(OutgoingRecord::unsealed(bytes))
             }
-            Err(entry) => {
+            Err((entry, is_gone_attachment)) => {
                 if let Some(mut entry) = entry {
                     entry.set_delivery(Delivery::Failed);
+                    if is_gone_attachment {
+                        // R24-P2-5: Heal `entry.gone = true` durably when requeue drops an
+                        // expired or `deleted_attachments`-tombstoned attachment so it no longer
+                        // depends on an unexpirable tombstone and immediately reflects gone in UI.
+                        entry.gone = true;
+                    }
                     self.history.push((index, entry));
+                }
+                if is_gone_attachment {
+                    self.gone_indices.insert(index);
+                    if let Some(Some(att_id)) = excluded_gone_att_id
+                        && !self.gone_attachment_ids.contains(&att_id)
+                    {
+                        self.gone_attachment_ids.push(att_id);
+                    }
                 }
                 self.dropped_missing.insert(index);
                 None
@@ -4125,11 +4351,52 @@ impl RequeueOutcome {
     }
 
     pub(super) fn log_missing(&self, ui: &Ui, peer: &PublicKey) {
-        for index in &self.dropped_missing {
+        for index in self.dropped_missing.difference(&self.gone_indices) {
             ui.log(format!(
                 "Dropped pending message #{index} for {}: original history content missing or failed integrity check",
                 short(peer)
             ));
+        }
+    }
+}
+
+impl<V: VaultStore> Engine<V> {
+    /// Complete post-commit cleanup for any expired or `deleted_attachments`-tombstoned outbox
+    /// attachments dropped during requeue (`R24-P2-5`): release sign-in holds, update reactive
+    /// `self.ui.gone`, mark surviving uploads cancelled to stop active chunk loops, clear caches/UI
+    /// upload cards, and forget any leftover `PendingUpload` record.
+    pub(super) async fn finalize_requeue_gone(
+        &self,
+        vgen: u64,
+        inner: &mut Inner<impl VaultStore>,
+        peer: &PublicKey,
+        outcome: &RequeueOutcome,
+    ) {
+        if !self.is_live(vgen)
+            || (outcome.gone_indices.is_empty() && outcome.gone_attachment_ids.is_empty())
+        {
+            return;
+        }
+        for &idx in &outcome.gone_indices {
+            self.release(peer, idx);
+        }
+        if !outcome.gone_indices.is_empty() {
+            self.ui.gone.update(|gone| {
+                for &idx in &outcome.gone_indices {
+                    gone.insert((*peer, idx));
+                }
+            });
+        }
+        for &att_id in &outcome.gone_attachment_ids {
+            self.uploads.mark_cancelled(att_id);
+            self.uploads.clear_server_completed(&att_id);
+            self.remove_attachment_caches(peer, &att_id);
+            self.ui
+                .uploads
+                .update(|uploads| uploads.retain(|u| u.id != att_id));
+            if self.is_live(vgen) {
+                let _ = inner.vault.forget_upload(peer, &att_id).await;
+            }
         }
     }
 }

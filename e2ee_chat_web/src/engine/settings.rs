@@ -339,6 +339,11 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
             requeued.log_missing(&self.ui, &peer);
+            self.finalize_requeue_gone(vgen, inner, &peer, &requeued)
+                .await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             self.show_changes(inner, &peer, &requeued.history);
             if self.ui.open.get_untracked() == Some(peer) {
                 let displayed_entries: Vec<_> = entries
@@ -494,6 +499,11 @@ impl<V: VaultStore> Engine<V> {
         }
         if PqConfig::compiled_suites().is_empty() {
             return Err("Post-quantum encryption is not compiled into this build.".to_string());
+        }
+        // R24-P2-4: Automatic background upgrades back off while this peer waits for sign-in so
+        // repeated sync/mailbox passes do not hammer `ClaimBundle` and re-prompt the user.
+        if require_approved && self.queue.waits_for_sign_in(&peer) {
+            return Ok(());
         }
         let peer_lock = self.queue.peer_flush_lock(&peer);
         let _peer_guard = peer_lock.lock().await;
@@ -651,7 +661,10 @@ impl<V: VaultStore> Engine<V> {
                     if e.kind() == ErrorKind::SignInRequired
                         && super::same_server(&inner.server, &super::origin())
                     {
-                        self.ask_sign_in();
+                        if require_approved {
+                            self.queue.mark_waits_sign_in(peer);
+                        }
+                        self.ask_sign_in_for(require_approved);
                     }
                     return Err(self.handle_upgrade_pq_error(vgen, inner, &peer, e).await);
                 }
@@ -869,6 +882,11 @@ impl<V: VaultStore> Engine<V> {
                 return Err("locked".into());
             }
             requeued.log_missing(&self.ui, &peer);
+            self.finalize_requeue_gone(vgen, inner, &peer, &requeued)
+                .await;
+            if !self.is_live(vgen) {
+                return Err("locked".into());
+            }
             self.show_changes(inner, &peer, &requeued.history);
             if let Some(view) = added_view {
                 self.show_new(inner, &peer, vec![view]);
@@ -1001,7 +1019,7 @@ impl<V: VaultStore> Engine<V> {
                 }
                 if e.kind() == ErrorKind::SignInRequired && signs_in_here {
                     self.queue.mark_waits_sign_in(peer);
-                    self.ask_sign_in();
+                    self.ask_sign_in_for(require_approved);
                 } else {
                     self.check_send_initial_protocol_error(inner, outgoing_is_pq, &e);
                 }

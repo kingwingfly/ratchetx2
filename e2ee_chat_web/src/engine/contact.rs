@@ -622,15 +622,19 @@ impl Contact {
 
     /// Keep tombstone `id` unexpirable (`expires = 0`) when persisting `HistoryEntry.gone = true`
     /// fails transiently so a subsequent tombstone prune cannot discard it before reconciliation
-    /// (`R23-P2-3`).
-    pub(super) fn clear_deleted_attachment_expiry(&mut self, id: &[u8; 16]) {
+    /// (`R23-P2-3`, `R24-P2-3`). Returns `true` if `ContactState.deleted_attachments` changed.
+    pub(super) fn clear_deleted_attachment_expiry(&mut self, id: &[u8; 16]) -> bool {
         if let Some(existing) = self
             .state
             .deleted_attachments
             .iter_mut()
             .find(|existing| existing.id.as_slice() == id.as_slice())
         {
-            existing.expires = 0;
+            if existing.expires != 0 {
+                existing.expires = 0;
+                return true;
+            }
+            false
         } else {
             self.state
                 .deleted_attachments
@@ -638,6 +642,7 @@ impl Contact {
                     id: id.to_vec(),
                     expires: 0,
                 });
+            true
         }
     }
 

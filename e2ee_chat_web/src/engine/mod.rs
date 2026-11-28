@@ -971,6 +971,33 @@ impl<V: VaultStore> Engine<V> {
         }
     }
 
+    /// Ask the user to sign in from a background/automatic task (sync, publish, refill, farewell,
+    /// greeting retry, auto-upgrade, or background chunk upload): respects `declined_sign_in`
+    /// ("Not now"/Escape) and never cancels or hijacks an unrelated active `start_chat`
+    /// submission (`R24-P1-1`, `R24-P2-4`).
+    pub(super) fn ask_sign_in_background(&self) {
+        if self.shutting_down.get() || crate::glue::lock_released() {
+            return;
+        }
+        let next = self
+            .ui
+            .dialog
+            .with_untracked(|current| self.startup.on_ask_sign_in_background(current.as_ref()));
+        if let Some(dialog) = next {
+            self.show_dialog_if_changed(dialog);
+        }
+    }
+
+    /// Route a sign-in prompt to either interactive [`Self::ask_sign_in`] or background-respecting
+    /// [`Self::ask_sign_in_background`].
+    pub(super) fn ask_sign_in_for(&self, background: bool) {
+        if background {
+            self.ask_sign_in_background();
+        } else {
+            self.ask_sign_in();
+        }
+    }
+
     /// The server refused a call, whichever, as this browser is not signed in to it, which every
     /// write takes: ask, unless the user put it off or cancelled the in-flight startup submission.
     fn refused_for_sign_in(&self) {

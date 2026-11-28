@@ -128,6 +128,22 @@ impl ServerDeleteJob {
             kind: ServerDeleteKind::CancelUpload(upload),
         })
     }
+
+    pub(super) fn for_completed(
+        server: String,
+        id: [u8; 16],
+        history_index: Option<u64>,
+        name: String,
+        key: Zeroizing<[u8; attachment::KEY_LENGTH]>,
+    ) -> Self {
+        Self {
+            server,
+            id,
+            history_index,
+            name,
+            kind: ServerDeleteKind::DeleteCompleted(key),
+        }
+    }
 }
 
 /// Verified prefix hash, cached plaintext chunks, and per-chunk SHA-256 digests for resuming an
@@ -255,7 +271,7 @@ pub(super) fn expected_chunk_len(total_size: u64, index: u32, chunks: u32) -> Op
 }
 
 /// Copy `bytes` directly into a `Zeroizing<[u8; N]>` without creating an unzeroized stack array.
-fn copy_zeroizing_array<const N: usize>(bytes: &[u8]) -> Option<Zeroizing<[u8; N]>> {
+pub(super) fn copy_zeroizing_array<const N: usize>(bytes: &[u8]) -> Option<Zeroizing<[u8; N]>> {
     if bytes.len() != N {
         return None;
     }
@@ -710,7 +726,7 @@ impl<V: VaultStore> Engine<V> {
             let running_guard = scopeguard::guard(id, |id| {
                 self.uploads.stop_running(&id);
             });
-            let result = self.start_waiting(peer, id, file).await;
+            let result = self.start_waiting_with_mode(peer, id, file, true).await;
             drop(running_guard);
             if let Err(e) = result
                 && self.is_live(vgen)
@@ -728,6 +744,17 @@ impl<V: VaultStore> Engine<V> {
         peer: PublicKey,
         waiting: [u8; 16],
         file: ChunkSource,
+    ) -> Result<(), String> {
+        self.start_waiting_with_mode(peer, waiting, file, false)
+            .await
+    }
+
+    async fn start_waiting_with_mode(
+        self: &Rc<Self>,
+        peer: PublicKey,
+        waiting: [u8; 16],
+        file: ChunkSource,
+        background: bool,
     ) -> Result<(), String> {
         let vgen = self.vault_gen();
         let (kept, server, conv_gen) = {
@@ -824,7 +851,7 @@ impl<V: VaultStore> Engine<V> {
                     .insert_file((peer, waiting, attachment_key_hash(&kept.key)), file);
                 self.show_upload(&peer, &kept, UploadState::Paused(WAITS_SIGN_IN.to_string()));
                 if same_server(&server, &origin()) {
-                    self.ask_sign_in();
+                    self.ask_sign_in_for(background);
                 }
                 return Ok(());
             }
@@ -1396,6 +1423,15 @@ impl<V: VaultStore> Engine<V> {
                 .or_else(|| self.uploads.get_file(&key))
                 .ok_or("choose the file again")?;
             return self.start_waiting(peer, id, file).await;
+        }
+        // R24-P1-2: Validate upload metadata (`id`, `token`, `key`, `chunks`) BEFORE checking,
+        // caching the file handle, or announcing so a malformed empty-token `UPLOAD_STATE_STARTED`
+        // record with valid `prefix_hash` can never announce and flush a dead pointer to the peer.
+        if let Err(e) = upload_of(&pending) {
+            if self.is_live(vgen) && !self.is_cancelled(&id) {
+                self.show_upload(&peer, &pending, UploadState::Paused(e.clone()));
+            }
+            return Err(e);
         }
         let cache_key = (peer, id, attachment_key_hash(&pending.key));
         let file = file
@@ -2438,7 +2474,7 @@ impl<V: VaultStore> Engine<V> {
     /// Atomically remove an un-dispatched attachment outbox item, mark its history entry refused
     /// (and optionally `gone`), delete its `OutgoingRecord`, and forget the upload/checkpoint in
     /// one vault transaction (`R18-P1-3`, `R18-P2-4`).
-    async fn fail_outbox_and_forget_upload(
+    pub(super) async fn fail_outbox_and_forget_upload(
         &self,
         vgen: u64,
         inner: &mut Inner<V>,
@@ -2787,10 +2823,13 @@ impl<V: VaultStore> Engine<V> {
         {
             Ok(entries) => entries,
             Err(e) => {
-                if let Some(contact) = inner.contact(peer) {
-                    contact.clear_deleted_attachment_expiry(id);
-                }
-                if recorded_deleted {
+                // R24-P2-3: Always persist `expires = 0` when clearing an existing non-zero
+                // tombstone expiry even if `record_deleted_attachment(id, 0, server_now)` returned
+                // `false` because `id` was already present.
+                let cleared_expiry = inner
+                    .contact(peer)
+                    .is_some_and(|contact| contact.clear_deleted_attachment_expiry(id));
+                if recorded_deleted || cleared_expiry {
                     inner.unsaved_state = true;
                     if inner.save_state().await.is_ok() {
                         inner.unsaved_state = false;
@@ -3064,7 +3103,7 @@ impl<V: VaultStore> Engine<V> {
                                 })
                         };
                         if still_active && self.is_live(vgen) && !self.is_cancelled(upload.id()) {
-                            self.ask_sign_in();
+                            self.ask_sign_in_background();
                         }
                     }
                     return Err(describe(&e));

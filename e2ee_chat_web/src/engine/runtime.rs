@@ -801,6 +801,23 @@ impl StartupFlow {
         )
     }
 
+    /// Background sign-in prompt (`R24-P1-1`, `R24-P2-4`): honors `declined_sign_in` ("Not now" /
+    /// Escape) and skips whenever an unrelated `start_chat` submission is currently in flight so
+    /// background sync/publish/refill/farewell/auto-upgrade 403s never hijack or cancel it.
+    pub(super) fn on_ask_sign_in_background(
+        &self,
+        current_dialog: Option<&Dialog>,
+    ) -> Option<Dialog> {
+        if self.in_flight_start_chat.get().is_some() {
+            return None;
+        }
+        self.sign_in_flow.borrow_mut().on_ask_sign_in(
+            current_dialog,
+            self.can_sign_in_here.get(),
+            true,
+        )
+    }
+
     pub(super) fn on_refused_for_sign_in(&self, current_dialog: Option<&Dialog>) -> Option<Dialog> {
         if let Some((id, greeting_only)) = self.in_flight_start_chat.get() {
             if self.is_submission_cancelled(id) {
